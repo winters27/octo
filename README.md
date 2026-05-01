@@ -1,14 +1,34 @@
 <div align="center">
 
-<img src="octo/Assets/octo_logo.png" alt="Octo" width="280" />
+<img src="octo/Assets/octo_logo.png" alt="Octo — self-hosted music discovery for Navidrome" width="280" />
 
 # Octo
 
-**Add discovery and downloads to your Navidrome library.**
+**Self-hosted music discovery for Navidrome.**
+Search and stream songs you don't own. Heart what you like — Octo grabs the FLAC and adds it to your library forever.
+
+[![License: GPL v3](https://img.shields.io/badge/License-GPL_v3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![.NET 9](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
+[![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED)](https://docs.docker.com/compose/)
+[![CI](https://github.com/winters27/octo/actions/workflows/ci.yml/badge.svg)](https://github.com/winters27/octo/actions/workflows/ci.yml)
 
 </div>
 
 ---
+
+## Who is this for
+
+If you self-host your music with Navidrome (or any Subsonic-compatible server), you've already opted out of streaming-service lock-in. The downside: your library is only as interesting as the music you've already collected. Searching for something new just gets you "no results."
+
+Octo is for people who want both. Your music, on your hardware — and a working discovery engine that finds new songs you'd like, lets you preview them, and one-clicks them into permanent FLAC.
+
+Built for:
+
+- **Self-hosters** running [Navidrome](https://www.navidrome.org/) who miss Spotify-style discovery.
+- **Music nerds** who want full FLAC quality, not 320kbps streaming.
+- **Subsonic app users** (Feishin, Arpeggi, Narjo) who want their existing apps to suddenly be smarter.
+- **People canceling Spotify / Apple Music / Tidal** who need a real replacement, not "well, I'll just listen to less music."
+- **Plexamp / Roon refugees** who like the discovery features but don't want the proprietary stack.
 
 ## What it does
 
@@ -68,8 +88,44 @@ Every setting has a form, every backing service has a live status indicator, and
 
 ---
 
+## Frequently asked questions
+
+### Is Octo a self-hosted Spotify alternative?
+
+It's the discovery half. Octo doesn't replace your music *server* — that's still Navidrome — but it adds the search-and-listen-to-anything experience that streaming services do well. With Octo plugged in, your Subsonic app behaves more like Spotify or Apple Music: search returns recommendations, radio works on any song, and you can preview tracks you don't own. The difference is that "I want to keep this" downloads it as a real FLAC into your library, instead of renting it.
+
+### Does this work with Plex / Plexamp?
+
+No. Octo speaks the Subsonic API, not the Plex API. If you're a Plex user looking for self-hosted alternatives with discovery, the move is Navidrome + Octo + a Subsonic client like Feishin or Arpeggi.
+
+### How is this different from Navidrome's built-in radio?
+
+Navidrome's radio plays songs from your existing library. Octo's radio reaches *outside* your library — Last.fm finds similar tracks, YouTube provides the preview, and Soulseek provides the keep-it-forever path. Navidrome alone gives you a great library player; Octo turns that library into a launchpad for discovery.
+
+### Is my data going anywhere?
+
+No. Octo runs entirely on your hardware. It calls Last.fm (for similar-tracks data), YouTube via yt-dlp (for audio previews), and Soulseek peers (for downloads). Those are outbound queries — nothing about your library or listening history is shipped anywhere.
+
+### Do downloaded songs get tagged correctly?
+
+Yes. Soulseek peers share full FLAC files with their existing ID3 tags intact. Octo organizes them per your `FolderStructure` setting (`Flat` or `Organized`), then triggers a Navidrome rescan so they appear in your library exactly like everything else you own.
+
+### What if I don't want to use Soulseek?
+
+Set `Subsonic__DownloadOnStar=false` in `.env`. Hearting a song will still register the favorite, but won't trigger any download. You'll keep search and radio enrichment via YouTube preview — useful if you only want the discovery layer and prefer to acquire FLACs another way.
+
+### Can it run on a Raspberry Pi?
+
+Yes — multi-arch images are published for amd64 and arm64. The yt-dlp sidecar does most of the CPU work; a Pi 4 or Pi 5 handles a single household's listening fine.
+
+### Why is Octo a refactor of [octo-radiostarr](https://github.com/winters27/octo-radiostarr)?
+
+The earlier project leaned on SquidWTF (a public TIDAL proxy) for streaming. In April 2026 Tidal hardened their API and broke every TIDAL proxy at once. Rather than patch around it, Octo was rebuilt on two sources that don't depend on a single fragile vendor API — YouTube via yt-dlp, and Soulseek via slskd. The old repo is archived; new development happens here.
+
+---
+
 <details>
-<summary><b>Advanced — architecture, technical details, FAQ</b></summary>
+<summary><b>Advanced — architecture, technical details, more FAQ</b></summary>
 
 ### Background
 
