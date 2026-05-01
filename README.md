@@ -20,7 +20,7 @@ Search and stream songs you don't own. Heart what you like — Octo grabs the FL
 
 If you self-host your music with Navidrome (or any Subsonic-compatible server), you've already opted out of streaming-service lock-in. The downside: your library is only as interesting as the music you've already collected. Searching for something new just gets you "no results."
 
-Octo is for people who want both. Your music, on your hardware — and a working discovery engine that finds new songs you'd like, lets you preview them, and one-clicks them into permanent FLAC.
+Octo is for people who want both — your music on your hardware, plus a working discovery engine that lets you **preview anything for free and keep only what you decide you want.**
 
 Built for:
 
@@ -29,6 +29,8 @@ Built for:
 - **Subsonic app users** (Feishin, Arpeggi, Narjo) who want their existing apps to suddenly be smarter.
 - **People canceling Spotify / Apple Music / Tidal** who need a real replacement, not "well, I'll just listen to less music."
 - **Plexamp / Roon refugees** who like the discovery features but don't want the proprietary stack.
+
+> **Note:** if you already pay for Qobuz, Deezer, or Yandex Music and want a Subsonic frontend that ingests your paid catalog into your library, [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta) is closer to what you want — it downloads from those APIs directly. Octo is the *no-paid-streaming-required* path: previews come from YouTube, downloads come from Soulseek.
 
 ## What it does
 
@@ -121,6 +123,17 @@ Yes — multi-arch images are published for amd64 and arm64. The yt-dlp sidecar 
 ### Why is Octo a refactor of [octo-radiostarr](https://github.com/winters27/octo-radiostarr)?
 
 The earlier project leaned on SquidWTF (a public TIDAL proxy) for streaming. In April 2026 Tidal hardened their API and broke every TIDAL proxy at once. Rather than patch around it, Octo was rebuilt on two sources that don't depend on a single fragile vendor API — YouTube via yt-dlp, and Soulseek via slskd. The old repo is archived; new development happens here.
+
+### How is Octo different from [octo-fiesta](https://github.com/V1ck3s/octo-fiesta)?
+
+Octo's earliest commits descended from [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta) (via [bransoned/octo-fiestarr](https://github.com/bransoned/octo-fiestarr)), so the *concept* is the same: a Subsonic proxy that fills in songs you don't own. The implementation has diverged completely:
+
+- **Octo-fiesta's model:** when you play an unowned song, it hits the Qobuz / Deezer / Yandex API with your paid streaming credentials, decrypts the audio, and writes the FLAC to disk permanently. Every play = a downloaded file. Excellent if you have a paid streaming sub and want a unified Subsonic UX over your subscription catalog.
+- **Octo's model:** when you play an unowned song, you get a *YouTube preview* with zero disk impact. If you decide you want to keep it, you star it and Octo grabs the FLAC from Soulseek peers. Preview is free, ownership is opt-in.
+
+Different audience. If you pay for streaming and want every play to enrich your library, octo-fiesta is the right tool. If you don't pay for streaming and want discovery + selective FLAC ownership, Octo is the right tool.
+
+Other practical differences in Octo: a real admin UI, multi-peer Soulseek retry, HTTP Range support for iOS clients, Last.fm-driven discovery and radio, an interactive installer.
 
 ---
 
@@ -260,4 +273,5 @@ Project layout:
 - [**slskd**](https://github.com/slskd/slskd) — Soulseek with a REST API.
 - [**yt-dlp**](https://github.com/yt-dlp/yt-dlp) — makes YouTube preview feasible.
 - [**Last.fm**](https://www.last.fm/api) — similar-tracks API.
-- [**octo-fiestarr**](https://github.com/bransoned/octo-fiestarr) — original codebase Octo's earliest commits descended from.
+- [**V1ck3s/octo-fiesta**](https://github.com/V1ck3s/octo-fiesta) — the upstream root of this lineage. The Qobuz/Deezer/Yandex Subsonic-proxy concept that Octo eventually rebuilt around YouTube + Soulseek started here.
+- [**bransoned/octo-fiestarr**](https://github.com/bransoned/octo-fiestarr) — the intermediate fork of octo-fiesta whose codebase Octo's earliest commits descended from.
