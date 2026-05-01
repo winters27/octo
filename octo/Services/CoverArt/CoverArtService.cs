@@ -35,26 +35,43 @@ public class CoverArtService
             if (_logoLoadAttempted) return _octoLogo;
             _logoLoadAttempted = true;
 
-            // Asset is copied into the publish output via <CopyToOutputDirectory> in
-            // the .csproj. AppContext.BaseDirectory is the directory the running .dll
-            // is loaded from, which inside the container is the publish output root.
-            var path = System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "octo_logo.png");
-            try
+            // The logo can land in either Assets/ or wwwroot/Assets/ in the
+            // publish output depending on how the csproj globs play out
+            // (sometimes the wwwroot/<Content Link=> entry overrides the
+            // Assets/<None> entry and only one copy actually ships). Try both
+            // so adding the logo isn't tied to which MSBuild quirk wins this
+            // build. AppContext.BaseDirectory is the publish root at runtime.
+            string[] candidates = new[]
             {
-                if (File.Exists(path))
+                System.IO.Path.Combine(AppContext.BaseDirectory, "Assets", "octo_logo.png"),
+                System.IO.Path.Combine(AppContext.BaseDirectory, "wwwroot", "Assets", "octo_logo.png"),
+            };
+            string? loadedFrom = null;
+            foreach (var path in candidates)
+            {
+                try
                 {
-                    _octoLogo = Image.Load<Rgba32>(path);
-                    _logger.LogInformation("Octo logo loaded from {Path} ({W}x{H})",
-                        path, _octoLogo.Width, _octoLogo.Height);
+                    if (File.Exists(path))
+                    {
+                        _octoLogo = Image.Load<Rgba32>(path);
+                        loadedFrom = path;
+                        break;
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    _logger.LogWarning("Octo logo not found at {Path}; radio cover badges disabled", path);
+                    _logger.LogWarning(ex, "Failed to load Octo logo from {Path}", path);
                 }
             }
-            catch (Exception ex)
+            if (loadedFrom != null && _octoLogo != null)
             {
-                _logger.LogWarning(ex, "Failed to load Octo logo from {Path}", path);
+                _logger.LogInformation("Octo logo loaded from {Path} ({W}x{H})",
+                    loadedFrom, _octoLogo.Width, _octoLogo.Height);
+            }
+            else
+            {
+                _logger.LogWarning("Octo logo not found at any of: {Paths}; radio cover badges disabled",
+                    string.Join(", ", candidates));
             }
 
             return _octoLogo;
