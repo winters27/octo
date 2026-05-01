@@ -49,7 +49,8 @@ public class LocalLibraryServiceTests : IDisposable
         var subsonicSettings = Options.Create(new SubsonicSettings { Url = "http://localhost:4533" });
         var mockLogger = new Mock<ILogger<LocalLibraryService>>();
 
-        _service = new LocalLibraryService(configuration, _mockHttpClientFactory.Object, subsonicSettings, mockLogger.Object);
+        var idRegistry = new Octo.Services.Soulseek.ExternalIdRegistry();
+        _service = new LocalLibraryService(configuration, _mockHttpClientFactory.Object, subsonicSettings, idRegistry, mockLogger.Object);
     }
 
     public void Dispose()

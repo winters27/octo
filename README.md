@@ -4,34 +4,28 @@
 
 # Octo
 
-**The discovery layer your Navidrome library is missing.**
-
-Search for music you don't own and hear it instantly. Heart what you like — Octo grabs the FLAC and adds it to your library forever.
+**Add discovery and downloads to your Navidrome library.**
 
 </div>
 
 ---
 
-## What is this
+## What it does
 
-If you self-host **[Navidrome](https://www.navidrome.org/)**, you already know the catch: your library is only as interesting as the music you've already collected. Searching for something new just gets you "no results."
+- **Search finds music you don't own.** Tap a result to hear it instantly via YouTube preview.
+- **Radio works on every song.** Owned tracks play at full FLAC; missing ones preview from YouTube.
+- **Heart to keep.** Star a previewed song and Octo grabs the FLAC from Soulseek, adds it to your library, and tells Navidrome to rescan. Within a minute, the song is yours forever.
 
-Octo fixes that. It plugs into your existing Navidrome and your existing Subsonic apps (Feishin, Arpeggi, Narjo, etc.) and adds three things:
-
-- **Search finds new music.** Type "Tame Impala" — your owned tracks come back at the top, plus 150 Last.fm recommendations below. Tap any of them to hear it instantly via YouTube preview.
-- **Radio works on every song.** Hit the radio/similar button on any track. Songs you already own play at full FLAC quality from your library; songs you don't preview from YouTube.
-- **Heart to keep.** Like a song you don't own? Octo grabs the FLAC from Soulseek, adds it to your music folder, and triggers a Navidrome rescan. Within a minute, the song is permanently yours.
-
-You don't switch apps. You don't change your library. You point your Subsonic apps at Octo instead of directly at Navidrome and everything else stays the same.
+Plug Octo in front of your Navidrome. Point your Subsonic apps (Feishin, Arpeggi, Narjo, etc.) at Octo instead. Nothing else changes.
 
 ## Get started
 
 You need:
 
-- **A box with [Docker](https://docs.docker.com/engine/install/) installed.**
-- **An existing Navidrome server** (Octo doesn't replace it, it sits in front of it).
-- **A free [Last.fm API key](https://www.last.fm/api/account/create)** — 30 seconds to make one.
-- **A free [Soulseek account](https://www.slsknet.org/news/node/1)** — also 30 seconds.
+- A box with [Docker](https://docs.docker.com/engine/install/) installed.
+- An existing [Navidrome](https://www.navidrome.org/) server.
+- A free [Last.fm API key](https://www.last.fm/api/account/create).
+- A free [Soulseek account](https://www.slsknet.org/news/node/1).
 
 Then:
 
@@ -41,9 +35,7 @@ cd octo
 ./install.sh
 ```
 
-The installer asks you four questions (Navidrome URL, music folder, Last.fm key, Soulseek login), brings everything up, and prints the address you point your apps at. That's it.
-
-When you're done, point your Subsonic clients at `http://<your-host>:5274` instead of your Navidrome server.
+The installer asks for those four things, brings the stack up, and prints the address. Point your Subsonic apps at `http://<your-host>:5274` and you're going.
 
 ## Compatible apps
 
@@ -53,7 +45,7 @@ When you're done, point your Subsonic clients at `http://<your-host>:5274` inste
 | ✅ | [Arpeggi](https://www.reddit.com/r/arpeggiApp/) (iOS) |
 | ✅ | [Narjo](https://www.reddit.com/r/NarjoApp/) (iOS) |
 | ✅ | most other Subsonic apps |
-| ❌ | Symfonium — works offline-first, never asks the server for searches |
+| ❌ | Symfonium — offline-first, doesn't query the server for searches |
 
 ## Updating
 
@@ -61,22 +53,20 @@ When you're done, point your Subsonic clients at `http://<your-host>:5274` inste
 git pull && ./install.sh
 ```
 
-The installer remembers your previous answers — re-running just refreshes the stack.
+Re-running the installer keeps your existing answers.
 
 ## Settings
 
-Once it's running, open **`http://<your-host>:5274/admin`** in a browser. Every setting has a form. Status of every backing service shows on the dashboard. No need to edit config files by hand.
+Open `http://<your-host>:5274/admin` for the admin UI. Every setting has a form, every backing service has a status indicator. No need to edit config files.
 
 ---
 
 <details>
 <summary><b>Advanced — architecture, technical details, FAQ</b></summary>
 
-### Why Octo exists
+### Background
 
-This is a full refactor of an earlier project, **[octo-radiostarr](https://github.com/winters27/octo-radiostarr)**. That project was built around SquidWTF + Tidal and broke in April 2026 when Tidal hardened their API. Every public-facing TIDAL proxy went down with it.
-
-Octo pivots to two sources that don't go away — **YouTube via yt-dlp** for instant previews, **Soulseek via slskd** for permanent FLAC downloads. It's a clean rebuild with a real installer, an admin UI, multi-peer retry, and the API quirks that off-the-shelf Subsonic clients need.
+Octo is a full refactor of [octo-radiostarr](https://github.com/winters27/octo-radiostarr). That earlier project ran on SquidWTF + Tidal and broke when Tidal hardened their API in April 2026. Octo pivots to **YouTube via yt-dlp** for previews and **Soulseek via slskd** for downloads — neither of which depends on a single fragile public API.
 
 ### Architecture
 
@@ -137,7 +127,7 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 
 ### Soulseek download details
 
-When you star a YouTube-previewed song, Octo:
+When a song is starred, Octo:
 
 1. Searches Soulseek for `<artist> <title>` (cleaned of `[brackets]` and redundant `Artist - ` prefixes).
 2. Falls back to title-only search if the first query returns nothing usable.
@@ -146,7 +136,7 @@ When you star a YouTube-previewed song, Octo:
 5. Verifies the file landed on disk (slskd's polling endpoint sometimes drops successful transfers between polls).
 6. Renames per `FolderStructure` setting and triggers a Navidrome rescan.
 
-Around 30-50% of Soulseek peer requests get rejected naturally ("overwhelmed", queue full, banned). Single-peer-try downloads were too fragile — multi-peer is the difference between "downloads sometimes work" and "downloads reliably work."
+Around 30–50% of Soulseek peer requests get rejected ("overwhelmed", queue full, banned). Single-peer-try downloads were too fragile — multi-peer is the difference between "downloads sometimes work" and "downloads reliably work."
 
 ### Cover art aggregator
 
@@ -160,26 +150,24 @@ Cached cross-source so a queue scroll doesn't trigger N external API calls per v
 
 ### FAQ
 
-**Do my downloaded songs get tagged?**
-Yes — slskd downloads are full FLACs from peer libraries that already have ID3 tags. Octo organizes them per your `FolderStructure`, then triggers a Navidrome rescan.
+**Do downloaded songs get tagged?**
+Yes — slskd downloads are full FLACs from peer libraries that already have ID3 tags. Octo organizes them per `FolderStructure`, then triggers a Navidrome rescan.
 
 **What if all 5 Soulseek peers reject?**
-Octo throws an error and your star icon stays filled (UI feedback). Try again later or hand-grab the file. Real failures are rare in practice.
+Octo throws an error and the star icon stays filled. Try again later or grab the file by hand. Real failures are rare.
 
-**Can I run this without Soulseek?**
-Yes — set `Subsonic__DownloadOnStar=false`. Star fills the heart icon but won't trigger a download. Search and radio enrichment still work via YouTube.
+**Can it run without Soulseek?**
+Yes — set `Subsonic__DownloadOnStar=false`. Star fills the heart but won't trigger a download. Search and radio enrichment still work.
 
-**Can I run this without Last.fm?**
-Yes, but search and radio fall back to local-only — no discovery layer. The free Last.fm key takes 30 seconds to make.
-
-**Is this the same as octo-radiostarr?**
-No — that project was Tidal-based and broke when Tidal hardened their API. Octo is a clean refactor on YouTube + Soulseek with a real admin UI, multi-peer retry, Range support, and an installer.
+**Can it run without Last.fm?**
+Yes, but search and radio fall back to local-only — no discovery layer. The free Last.fm key takes 30 seconds.
 
 ### Development
 
 ```bash
 dotnet restore
 dotnet build
+dotnet test
 ```
 
 Project layout:
@@ -209,4 +197,4 @@ Project layout:
 - [**slskd**](https://github.com/slskd/slskd) — Soulseek with a REST API.
 - [**yt-dlp**](https://github.com/yt-dlp/yt-dlp) — makes YouTube preview feasible.
 - [**Last.fm**](https://www.last.fm/api) — similar-tracks API.
-- [**octo-fiestarr**](https://github.com/bransoned/octo-fiestarr) — original Subsonic-Deezer/Qobuz proxy whose codebase Octo's earliest commits descended from.
+- [**octo-fiestarr**](https://github.com/bransoned/octo-fiestarr) — original codebase Octo's earliest commits descended from.
