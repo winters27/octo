@@ -191,15 +191,66 @@ public class AdminController : ControllerBase
     }
 
     /// <summary>
-    /// Returns the raw settings.json file contents (or "{}" if it doesn't yet
-    /// exist). Used by the Raw Config tab so power users can edit the file
-    /// directly without going through the form-by-form UI. Read-write
-    /// counterpart is PUT /api/admin/raw-config.
+    /// Returns the *effective* configuration as a JSON document, with values
+    /// pulled from the live IOptionsMonitor (so what the app actually sees).
+    /// Anything explicitly persisted to settings.json sits on top of env vars
+    /// and appsettings.json defaults; that merged result is what we return so
+    /// the Raw Config editor shows the full picture rather than only the
+    /// sparse overrides file.
+    ///
+    /// On PUT, the entire body is written wholesale to settings.json, which
+    /// is a no-op if the user just hits Save without editing (values match
+    /// env) and a real override otherwise.
     /// </summary>
     [HttpGet("raw-config")]
     public IActionResult GetRawConfig()
     {
-        var json = _settings.Load().ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        var subsonic = _subsonicOpts.CurrentValue;
+        var soulseek = _soulseekOpts.CurrentValue;
+        var lastfm = _lastFmOpts.CurrentValue;
+
+        var effective = new JsonObject
+        {
+            ["Subsonic"] = new JsonObject
+            {
+                ["Url"] = subsonic.Url ?? "",
+                ["StorageMode"] = subsonic.StorageMode.ToString(),
+                ["DownloadMode"] = subsonic.DownloadMode.ToString(),
+                ["DownloadOnStar"] = subsonic.DownloadOnStar,
+                ["FolderStructure"] = subsonic.FolderStructure.ToString(),
+                ["UseLocalStaging"] = subsonic.UseLocalStaging,
+                ["ExplicitFilter"] = subsonic.ExplicitFilter.ToString(),
+                ["CacheDurationHours"] = subsonic.CacheDurationHours,
+                ["EnableExternalPlaylists"] = subsonic.EnableExternalPlaylists,
+                ["PlaylistsDirectory"] = subsonic.PlaylistsDirectory,
+            },
+            ["Library"] = new JsonObject
+            {
+                ["DownloadPath"] = _config["Library:DownloadPath"] ?? "/music",
+            },
+            ["Soulseek"] = new JsonObject
+            {
+                ["BaseUrl"] = soulseek.BaseUrl ?? "",
+                ["Username"] = soulseek.Username ?? "",
+                ["Password"] = soulseek.Password ?? "",
+                ["SearchWaitSeconds"] = soulseek.SearchWaitSeconds,
+                ["MinFileSizeBytes"] = soulseek.MinFileSizeBytes,
+                ["PreferredExtension"] = soulseek.PreferredExtension,
+                ["DownloadTimeoutSeconds"] = soulseek.DownloadTimeoutSeconds,
+            },
+            ["YouTube"] = new JsonObject
+            {
+                ["ShimUrl"] = _config["YouTube:ShimUrl"] ?? "",
+            },
+            ["LastFm"] = new JsonObject
+            {
+                ["ApiKey"] = lastfm.ApiKey ?? "",
+                ["EnableRadio"] = lastfm.EnableRadio,
+                ["RadioTrackCount"] = lastfm.RadioTrackCount,
+                ["RadioCacheDurationHours"] = lastfm.RadioCacheDurationHours,
+            },
+        };
+        var json = effective.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
         return Content(json, "application/json");
     }
 

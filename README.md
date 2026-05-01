@@ -35,7 +35,12 @@ cd octo
 ./install.sh
 ```
 
-The installer asks for those four things, brings the stack up, and prints the address. Point your Subsonic apps at `http://<your-host>:5274` and you're going.
+The installer asks for those four things, brings the stack up, and prints the address.
+
+**When it's done:**
+
+- Point your Subsonic apps at `http://<your-host>:5274`.
+- Open the admin dashboard at **`http://<your-host>:5274/admin`** to manage every setting from the browser — no editing config files by hand.
 
 ## Compatible apps
 
@@ -55,9 +60,11 @@ git pull && ./install.sh
 
 Re-running the installer keeps your existing answers.
 
-## Settings
+## Admin dashboard
 
-Open `http://<your-host>:5274/admin` for the admin UI. Every setting has a form, every backing service has a status indicator. No need to edit config files.
+`http://<your-host>:5274/admin`
+
+Every setting has a form, every backing service has a live status indicator, and the **Raw Config** tab lets you edit the whole effective configuration as a JSON file if you'd rather work that way. Changes hot-reload — no rebuild, no restart for most settings.
 
 ---
 
