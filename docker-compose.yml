@@ -1,0 +1,84 @@
+services:
+  octorr:
+    build: .
+    container_name: octorr
+    restart: unless-stopped
+    ports:
+      - "5274:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+
+      # ----- Subsonic / Navidrome upstream -----
+      Subsonic__Url: ${SUBSONIC_URL:-http://localhost:4533}
+      Subsonic__StorageMode: ${STORAGE_MODE:-Stream}
+      Subsonic__DownloadMode: ${DOWNLOAD_MODE:-Track}
+      Subsonic__DownloadOnStar: ${DOWNLOAD_ON_STAR:-true}
+      Subsonic__FolderStructure: ${FOLDER_STRUCTURE:-Flat}
+      Subsonic__UseLocalStaging: ${USE_LOCAL_STAGING:-false}
+      Subsonic__ExplicitFilter: ${EXPLICIT_FILTER:-All}
+      Subsonic__CacheDurationHours: ${CACHE_DURATION_HOURS:-1}
+      Subsonic__EnableExternalPlaylists: ${ENABLE_EXTERNAL_PLAYLISTS:-false}
+
+      # Where downloaded FLACs land (bind-mount below)
+      Library__DownloadPath: /music
+
+      # ----- yt-dlp shim sidecar (internal stream-preview source) -----
+      YouTube__ShimUrl: http://yt-dlp-shim:8080
+
+      # ----- slskd (Soulseek) sidecar -----
+      Soulseek__BaseUrl: http://slskd:5030
+      Soulseek__Username: ${SLSKD_USERNAME:-slskd}
+      Soulseek__Password: ${SLSKD_PASSWORD:-slskd}
+      Soulseek__SearchWaitSeconds: ${SLSKD_SEARCH_WAIT_SECONDS:-6}
+      Soulseek__MinFileSizeBytes: ${SLSKD_MIN_FILE_SIZE_BYTES:-5242880}
+      Soulseek__PreferredExtension: ${SLSKD_PREFERRED_EXTENSION:-flac}
+      Soulseek__DownloadTimeoutSeconds: ${SLSKD_DOWNLOAD_TIMEOUT_SECONDS:-180}
+
+      # ----- Last.fm radio -----
+      LastFm__ApiKey: ${LASTFM_API_KEY:-}
+      LastFm__EnableRadio: ${LASTFM_ENABLE_RADIO:-true}
+      LastFm__RadioTrackCount: ${LASTFM_RADIO_TRACK_COUNT:-50}
+      LastFm__RadioCacheDurationHours: ${LASTFM_RADIO_CACHE_HOURS:-24}
+    volumes:
+      - ${DOWNLOAD_PATH:-./downloads}:/music
+      # Editable settings file — admin UI writes here, ASP.NET hot-reloads on
+      # change. Bind-mounted to host so values survive `docker compose up`.
+      - ./octo-config:/app/config
+    depends_on:
+      - yt-dlp-shim
+      - slskd
+
+  # Wraps yt-dlp behind /search and /stream HTTP endpoints. Isolating the binary
+  # in its own container prevents .NET process-management quirks from wedging
+  # the parent (see Brain/projects/Flaccy.md, 2026-04-29 LXC wedge note).
+  yt-dlp-shim:
+    build: ./yt-dlp-shim
+    container_name: yt-dlp-shim
+    restart: unless-stopped
+    environment:
+      MAX_CONCURRENT_YTDLP: ${YTDLP_MAX_CONCURRENT:-5}
+      SEARCH_CACHE_MAX: ${YTDLP_SEARCH_CACHE_MAX:-1024}
+      URL_CACHE_MAX: ${YTDLP_URL_CACHE_MAX:-512}
+      URL_CACHE_TTL: ${YTDLP_URL_CACHE_TTL:-3600}
+    expose:
+      - "8080"
+
+  # Soulseek client (slskd). Web UI on 5030, peer port 50300.
+  # State (config, db, downloads-in-progress) persisted to ./slskd-state so the
+  # account survives recreate. Final FLACs land in the same /music as Octo.
+  slskd:
+    image: slskd/slskd:latest
+    container_name: slskd
+    restart: unless-stopped
+    ports:
+      - "5030:5030"
+      - "50300:50300"
+    environment:
+      SLSKD_REMOTE_CONFIGURATION: "true"
+      SLSKD_SLSK_USERNAME: ${SLSKD_SOULSEEK_USERNAME:-}
+      SLSKD_SLSK_PASSWORD: ${SLSKD_SOULSEEK_PASSWORD:-}
+      SLSKD_USERNAME: ${SLSKD_USERNAME:-slskd}
+      SLSKD_PASSWORD: ${SLSKD_PASSWORD:-slskd}
+    volumes:
+      - ./slskd-state:/app
+      - ${DOWNLOAD_PATH:-./downloads}:/music

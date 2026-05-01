@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Octo</title>
+  <!-- Absolute paths so the page renders correctly whether the browser is at
+       /admin, /admin/, or /admin/index.html. -->
+  <link rel="stylesheet" href="/admin/admin.css" />
+  <link rel="icon" type="image/png" href="/Assets/octo_logo.png" />
+  <link rel="preconnect" href="https://rsms.me" />
+  <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- ══════════════════════════════════════════════════════════ -->
+    <!--  SIDEBAR                                                    -->
+    <!-- ══════════════════════════════════════════════════════════ -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <img src="/Assets/octo_logo.png" alt="" class="sidebar-logo" />
+        <div class="sidebar-brand-text">
+          <div class="sidebar-brand-name">Octo</div>
+          <div class="sidebar-brand-tag">Admin</div>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav">
+        <div class="sidebar-nav-section">
+          <div class="sidebar-nav-label">Overview</div>
+          <button class="sidebar-nav-item active" data-tab="status">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="1.5" fill="currentColor"/>
+            </svg>
+            <span>Status</span>
+            <span class="sidebar-nav-badge" data-status-badge></span>
+          </button>
+        </div>
+
+        <div class="sidebar-nav-section">
+          <div class="sidebar-nav-label">Settings</div>
+          <button class="sidebar-nav-item" data-tab="library">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M2.5 3.5h11v9h-11z"/><path d="M5.5 6.5v3M8 6.5v3M10.5 6.5v3"/>
+            </svg>
+            <span>Library</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="subsonic">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="8" cy="8" r="5.5"/><path d="M3 8a5 5 0 0 1 10 0"/>
+            </svg>
+            <span>Subsonic</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="lastfm">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M2 9.5v0a4 4 0 1 1 4-4l2 6a4 4 0 1 0 4-4"/>
+            </svg>
+            <span>Last.fm</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="soulseek">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="7" cy="7" r="4"/><path d="m10 10 3 3"/>
+            </svg>
+            <span>Soulseek</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="youtube">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="m6.5 6.5 3 1.5-3 1.5z" fill="currentColor"/>
+            </svg>
+            <span>YouTube</span>
+          </button>
+        </div>
+
+        <div class="sidebar-nav-section">
+          <div class="sidebar-nav-label">Advanced</div>
+          <button class="sidebar-nav-item" data-tab="raw">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="m6 4-3 4 3 4M10 4l3 4-3 4"/>
+            </svg>
+            <span>Raw config</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="sources">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <rect x="2.5" y="3" width="11" height="2.5"/>
+              <rect x="2.5" y="6.75" width="11" height="2.5"/>
+              <rect x="2.5" y="10.5" width="11" height="2.5"/>
+            </svg>
+            <span>Config sources</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="about">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="8" cy="8" r="5.5"/><path d="M8 7v3M8 5v.5"/>
+            </svg>
+            <span>About</span>
+          </button>
+        </div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button id="restart-btn" class="btn btn-ghost btn-block" title="Restart container so settings flagged 'restart required' take effect">
+          <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2v3h-3"/>
+          </svg>
+          <span>Restart</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- ══════════════════════════════════════════════════════════ -->
+    <!--  CONTENT                                                    -->
+    <!-- ══════════════════════════════════════════════════════════ -->
+    <main class="content">
+
+      <!-- ─── STATUS ──────────────────────────────────────────── -->
+      <section data-pane="status" class="active">
+        <header class="page-header">
+          <div>
+            <h1>Status</h1>
+            <p>Live health of every component.</p>
+          </div>
+          <button class="btn btn-ghost" id="status-refresh" aria-label="Refresh status">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2v3h-3"/>
+            </svg>
+          </button>
+        </header>
+
+        <div class="status-grid" id="status-grid">
+          <article class="status-card" data-svc="octo">
+            <div class="status-card-head">
+              <span class="status-dot pending"></span>
+              <span class="status-card-title">Octo</span>
+            </div>
+            <div class="status-card-body">probing…</div>
+            <div class="status-card-foot">octo · main app</div>
+          </article>
+          <article class="status-card" data-svc="navidrome">
+            <div class="status-card-head">
+              <span class="status-dot pending"></span>
+              <span class="status-card-title">Navidrome</span>
+            </div>
+            <div class="status-card-body">probing…</div>
+            <div class="status-card-foot">your music library server</div>
+          </article>
+          <article class="status-card" data-svc="slskd">
+            <div class="status-card-head">
+              <span class="status-dot pending"></span>
+              <span class="status-card-title">Soulseek</span>
+            </div>
+            <div class="status-card-body">probing…</div>
+            <div class="status-card-foot">slskd · downloads on star</div>
+          </article>
+          <article class="status-card" data-svc="ytDlpShim">
+            <div class="status-card-head">
+              <span class="status-dot pending"></span>
+              <span class="status-card-title">yt-dlp shim</span>
+            </div>
+            <div class="status-card-body">probing…</div>
+            <div class="status-card-foot">YouTube preview source</div>
+          </article>
+          <article class="status-card" data-svc="lastfm">
+            <div class="status-card-head">
+              <span class="status-dot pending"></span>
+              <span class="status-card-title">Last.fm</span>
+            </div>
+            <div class="status-card-body">probing…</div>
+            <div class="status-card-foot">radio + discovery</div>
+          </article>
+        </div>
+
+        <div class="status-meta">
+          <span class="status-meta-label">Last refreshed</span>
+          <span class="status-meta-time" id="status-last-checked">—</span>
+        </div>
+      </section>
+
+      <!-- ─── LIBRARY ────────────────────────────────────────── -->
+      <section data-pane="library">
+        <header class="page-header">
+          <div>
+            <h1>Library &amp; downloads</h1>
+            <p>Where Octo writes downloaded songs and how it organizes them on disk.</p>
+          </div>
+        </header>
+
+        <form data-section="library" class="settings-card">
+          <h3 class="settings-card-title">Storage</h3>
+          <div class="field">
+            <label for="f-download-path">Download path</label>
+            <input id="f-download-path" name="Library.DownloadPath" data-restart="true" placeholder="/music" />
+            <div class="field-help">Container path where downloaded files land. Must be a bind-mount that Navidrome scans.</div>
+          </div>
+        </form>
+
+        <form data-section="subsonic-storage" class="settings-card">
+          <h3 class="settings-card-title">File layout</h3>
+          <div class="field">
+            <label for="f-folder-structure">Folder structure</label>
+            <select id="f-folder-structure" name="Subsonic.FolderStructure">
+              <option value="Flat">Flat — Artist - Title.flac (no folder)</option>
+              <option value="Organized">Organized — Artist/Title/file.flac</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="f-storage-mode">Storage mode</label>
+            <select id="f-storage-mode" name="Subsonic.StorageMode">
+              <option value="Stream">Stream — preview only, download on star</option>
+              <option value="Permanent">Permanent — download every played track</option>
+              <option value="Cache">Cache — temporary, auto-cleanup</option>
+            </select>
+          </div>
+          <div class="field field-check">
+            <input type="checkbox" id="f-download-on-star" name="Subsonic.DownloadOnStar" />
+            <label for="f-download-on-star">
+              <span class="field-check-label">Download a song when starred</span>
+              <span class="field-help">Stream/Cache modes only. Permanent already downloads every play.</span>
+            </label>
+          </div>
+          <div class="field">
+            <label for="f-cache-hours">Cache duration (hours)</label>
+            <input id="f-cache-hours" name="Subsonic.CacheDurationHours" type="number" min="1" />
+            <div class="field-help">How long Cache-mode files live before auto-cleanup.</div>
+          </div>
+          <div class="field field-check">
+            <input type="checkbox" id="f-local-staging" name="Subsonic.UseLocalStaging" />
+            <label for="f-local-staging">
+              <span class="field-check-label">Use local staging</span>
+              <span class="field-help">Required when download path is a cloud/FUSE mount (rclone, pCloud).</span>
+            </label>
+          </div>
+        </form>
+      </section>
+
+      <!-- ─── SUBSONIC ───────────────────────────────────────── -->
+      <section data-pane="subsonic">
+        <header class="page-header">
+          <div>
+            <h1>Subsonic / Navidrome</h1>
+            <p>The upstream music server Octo proxies. Required.</p>
+          </div>
+        </header>
+
+        <form data-section="subsonic" class="settings-card">
+          <h3 class="settings-card-title">Connection</h3>
+          <div class="field">
+            <label for="f-subsonic-url">Navidrome URL</label>
+            <input id="f-subsonic-url" name="Subsonic.Url" data-restart="true" placeholder="http://192.168.1.10:4533" />
+            <div class="field-help">Use the LAN IP if Octo and Navidrome are on the same docker network.</div>
+          </div>
+        </form>
+
+        <form data-section="subsonic-behavior" class="settings-card">
+          <h3 class="settings-card-title">Behavior</h3>
+          <div class="field">
+            <label for="f-download-mode">Download mode</label>
+            <select id="f-download-mode" name="Subsonic.DownloadMode">
+              <option value="Track">Track — only the played song</option>
+              <option value="Album">Album — fetch the whole album in background</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="f-explicit">Explicit content</label>
+            <select id="f-explicit" name="Subsonic.ExplicitFilter">
+              <option value="All">All</option>
+              <option value="ExplicitOnly">Explicit only</option>
+              <option value="CleanOnly">Clean only</option>
+            </select>
+          </div>
+          <div class="field field-check">
+            <input type="checkbox" id="f-playlists" name="Subsonic.EnableExternalPlaylists" />
+            <label for="f-playlists">
+              <span class="field-check-label">External playlist search</span>
+              <span class="field-help">Discover and download playlists from streaming providers.</span>
+            </label>
+          </div>
+          <div class="field">
+            <label for="f-playlists-dir">Playlists directory</label>
+            <input id="f-playlists-dir" name="Subsonic.PlaylistsDirectory" placeholder="playlists" />
+          </div>
+        </form>
+      </section>
+
+      <!-- ─── LAST.FM ────────────────────────────────────────── -->
+      <section data-pane="lastfm">
+        <header class="page-header">
+          <div>
+            <h1>Last.fm</h1>
+            <p>Powers radio (similar songs) and search-result discovery. <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener">Get a free key →</a></p>
+          </div>
+        </header>
+
+        <form data-section="lastfm" class="settings-card">
+          <h3 class="settings-card-title">Account</h3>
+          <div class="field">
+            <label for="f-lastfm-key">API key</label>
+            <input id="f-lastfm-key" name="LastFm.ApiKey" type="password" autocomplete="off" placeholder="32-char hex string" />
+            <div class="field-help">Required. Without it, search and radio fall back to local-only.</div>
+          </div>
+        </form>
+
+        <form data-section="lastfm-radio" class="settings-card">
+          <h3 class="settings-card-title">Radio</h3>
+          <div class="field field-check">
+            <input type="checkbox" id="f-lastfm-radio" name="LastFm.EnableRadio" />
+            <label for="f-lastfm-radio">
+              <span class="field-check-label">Enable radio</span>
+              <span class="field-help">Powers <code>/rest/getSimilarSongs2</code> in your Subsonic clients.</span>
+            </label>
+          </div>
+          <div class="field">
+            <label for="f-lastfm-count">Track count</label>
+            <input id="f-lastfm-count" name="LastFm.RadioTrackCount" type="number" min="5" max="200" />
+            <div class="field-help">How many similar tracks Last.fm returns per radio request.</div>
+          </div>
+          <div class="field">
+            <label for="f-lastfm-cache">Cache (hours)</label>
+            <input id="f-lastfm-cache" name="LastFm.RadioCacheDurationHours" type="number" min="0" />
+            <div class="field-help">How long Last.fm responses are cached server-side.</div>
+          </div>
+        </form>
+      </section>
+
+      <!-- ─── SOULSEEK ───────────────────────────────────────── -->
+      <section data-pane="soulseek">
+        <header class="page-header">
+          <div>
+            <h1>Soulseek</h1>
+            <p>Downloads FLACs when you star a song. slskd web UI: <a id="slskd-link" target="_blank" rel="noopener">port 5030</a>.</p>
+          </div>
+        </header>
+
+        <form data-section="soulseek-conn" class="settings-card">
+          <h3 class="settings-card-title">Connection</h3>
+          <div class="field">
+            <label for="f-slskd-url">Base URL</label>
+            <input id="f-slskd-url" name="Soulseek.BaseUrl" data-restart="true" placeholder="http://slskd:5030" />
+            <div class="field-help">Default works inside the docker network.</div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="f-slskd-user">Web admin username</label>
+              <input id="f-slskd-user" name="Soulseek.Username" data-restart="true" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="f-slskd-pass">Web admin password</label>
+              <input id="f-slskd-pass" name="Soulseek.Password" type="password" data-restart="true" autocomplete="off" />
+            </div>
+          </div>
+          <div class="field-help" style="margin-top: -8px;">These authenticate Octo against slskd's API. Not your Soulseek-network account — that's set in <code>SLSKD_SOULSEEK_USERNAME/PASSWORD</code> in <code>.env</code>.</div>
+        </form>
+
+        <form data-section="soulseek-search" class="settings-card">
+          <h3 class="settings-card-title">Search &amp; download</h3>
+          <div class="field-row">
+            <div class="field">
+              <label for="f-slskd-wait">Search wait (s)</label>
+              <input id="f-slskd-wait" name="Soulseek.SearchWaitSeconds" type="number" min="2" max="30" />
+              <div class="field-help">Time to wait for peer responses before picking.</div>
+            </div>
+            <div class="field">
+              <label for="f-slskd-timeout">Per-peer timeout (s)</label>
+              <input id="f-slskd-timeout" name="Soulseek.DownloadTimeoutSeconds" type="number" min="30" />
+              <div class="field-help">Octo tries up to 5 peers in sequence.</div>
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="f-slskd-minsize">Min file size (bytes)</label>
+              <input id="f-slskd-minsize" name="Soulseek.MinFileSizeBytes" type="number" min="0" />
+              <div class="field-help">Filters out clip-sized fakes.</div>
+            </div>
+            <div class="field">
+              <label for="f-slskd-ext">Extension</label>
+              <input id="f-slskd-ext" name="Soulseek.PreferredExtension" placeholder="flac" />
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <!-- ─── YOUTUBE ────────────────────────────────────────── -->
+      <section data-pane="youtube">
+        <header class="page-header">
+          <div>
+            <h1>YouTube preview</h1>
+            <p>Sidecar service that resolves YouTube audio for instant streaming.</p>
+          </div>
+        </header>
+
+        <form data-section="youtube" class="settings-card">
+          <h3 class="settings-card-title">Shim</h3>
+          <div class="field">
+            <label for="f-yt-url">Shim URL</label>
+            <input id="f-yt-url" name="YouTube.ShimUrl" data-restart="true" placeholder="http://yt-dlp-shim:8080" />
+            <div class="field-help">Default works inside the docker network.</div>
+          </div>
+        </form>
+
+        <div class="info-card">
+          <h3 class="info-card-title">How it works</h3>
+          <p>The shim is its own container running yt-dlp behind a tiny Flask wrapper. Process isolation keeps yt-dlp's quirks — and YouTube's frequent extractor breakage — from affecting Octo. Concurrent yt-dlp slots and cache size are configured via env vars on the <code>yt-dlp-shim</code> service in <code>docker-compose.yml</code>.</p>
+        </div>
+      </section>
+
+      <!-- ─── RAW CONFIG ─────────────────────────────────────── -->
+      <section data-pane="raw">
+        <header class="page-header">
+          <div>
+            <h1>Raw config</h1>
+            <p>Edit the settings file directly. Same JSON the form-by-form UI writes to — useful for power-users who'd rather hand-write a section than click through tabs, or for diffing/copying config across hosts.</p>
+          </div>
+        </header>
+
+        <div class="info-card">
+          <h3 class="info-card-title">File path</h3>
+          <p>The file lives at <code id="raw-config-path">/app/config/settings.json</code> inside the container. The host bind-mount is at <code>./octo-config/settings.json</code> next to your <code>docker-compose.yml</code> — you can <code>vim</code>/<code>nano</code> it there too. Changes hot-reload within ~500ms; settings flagged restart-required still need a restart.</p>
+        </div>
+
+        <form id="raw-form" class="settings-card">
+          <h3 class="settings-card-title">settings.json</h3>
+          <div class="field">
+            <label for="raw-editor">JSON content</label>
+            <textarea id="raw-editor" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" placeholder="{}"></textarea>
+            <div class="field-help">
+              Top-level keys: <code>Subsonic</code>, <code>Library</code>, <code>Soulseek</code>, <code>YouTube</code>, <code>LastFm</code>.
+              Anything you set here overrides the corresponding env var until removed.
+            </div>
+          </div>
+          <div id="raw-error" class="raw-error" hidden></div>
+          <div class="form-actions">
+            <button type="submit" class="btn btn-primary">Save file</button>
+            <button type="button" class="btn btn-ghost" id="raw-reload">Reload from disk</button>
+            <span class="saved-status" id="raw-saved-status"></span>
+          </div>
+        </form>
+      </section>
+
+      <!-- ─── CONFIG SOURCES ─────────────────────────────────── -->
+      <section data-pane="sources">
+        <header class="page-header">
+          <div>
+            <h1>Config sources</h1>
+            <p>What value the app actually sees for each setting, after merging env vars and the settings file. Useful for figuring out why a UI change isn't taking effect — usually because something downstream captured the value at startup and needs a restart.</p>
+          </div>
+        </header>
+
+        <div class="info-card">
+          <h3 class="info-card-title">Resolution order (highest first)</h3>
+          <ol class="ordered-list">
+            <li><code>settings.json</code> — what the admin UI writes to. Highest priority.</li>
+            <li>Environment variables — set in <code>docker-compose.yml</code> / <code>.env</code> at container startup.</li>
+            <li><code>appsettings.json</code> — built-in defaults shipped with the image.</li>
+          </ol>
+        </div>
+
+        <div class="settings-card">
+          <h3 class="settings-card-title">Effective values</h3>
+          <div class="config-table" id="config-table">
+            <div class="config-row config-row-head">
+              <span>Key</span>
+              <span>Value</span>
+            </div>
+            <div class="config-loading">Loading…</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─── ABOUT ──────────────────────────────────────────── -->
+      <section data-pane="about">
+        <header class="page-header">
+          <div>
+            <h1>About</h1>
+            <p>What this is and where things live.</p>
+          </div>
+        </header>
+
+        <div class="info-card">
+          <p>Octo is a Subsonic API proxy that augments your existing Navidrome library with discovery and on-demand downloading. Search includes external recommendations alongside your local songs; "Radio" on any song fans out via Last.fm and previews via YouTube; star a song you don't own and Octo grabs it via Soulseek.</p>
+        </div>
+
+        <div class="info-card">
+          <h3 class="info-card-title">Settings file</h3>
+          <p>Anything you change in this UI is persisted to <code id="meta-config-path">/app/config/settings.json</code>. That file overrides env vars on next read. Editing it by hand also works — changes hot-reload.</p>
+        </div>
+
+        <div class="info-card">
+          <h3 class="info-card-title">Hot-reload vs restart</h3>
+          <p>Most settings (storage mode, folder structure, filters) take effect immediately. Settings flagged <span class="restart-badge restart-badge-inline">restart required</span> bake into HTTP clients at startup; use the <strong>Restart</strong> button in the sidebar to apply them.</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script src="/admin/admin.js"></script>
+</body>
+</html>

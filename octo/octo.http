@@ -1,0 +1,6 @@
+@octo_HostAddress = http://localhost:5274
+
+GET {{octo_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
