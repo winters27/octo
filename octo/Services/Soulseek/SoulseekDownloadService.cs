@@ -159,8 +159,11 @@ public class SoulseekDownloadService : BaseDownloadService
             case DownloadSource.YouTube:
                 return await DownloadViaYouTubeAsync(routing, cancellationToken);
             case DownloadSource.SoulseekThenYouTube:
+                // The filter matters: a cancelled token means nobody is waiting for
+                // this any more, so falling back would start a second download only
+                // to have it throw on the same token.
                 try { return await DownloadViaSoulseekAsync(routing, cancellationToken); }
-                catch (Exception ex)
+                catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
                 {
                     Logger.LogWarning("Soulseek download failed ({Msg}); falling back to YouTube MP3", ex.Message);
                     return await DownloadViaYouTubeAsync(routing, cancellationToken);
@@ -259,7 +262,26 @@ public class SoulseekDownloadService : BaseDownloadService
                 continue;
             }
 
-            var state = await _slskd.WaitForCompletionAsync(hit.Username, hit.Filename, PerAttemptTimeoutSeconds, cancellationToken);
+            // Cancelling the WAIT must never cancel the TRANSFER. slskd already
+            // accepted the enqueue and keeps going on its own, so letting this
+            // throw straight out of the loop is what used to lose a finished
+            // download: the disk check, the move, the registration and the
+            // rescan were all skipped while the file quietly landed anyway.
+            SoulseekTransferState? state = null;
+            Exception? waitError = null;
+            try
+            {
+                state = await _slskd.WaitForCompletionAsync(hit.Username, hit.Filename, PerAttemptTimeoutSeconds, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                waitError = ex;
+            }
+
+            // An slskd HTTP timeout and a client disconnect both surface as
+            // TaskCanceledException, so the token is the only reliable way to
+            // tell "the caller left" from "slskd was slow".
+            var callerGaveUp = cancellationToken.IsCancellationRequested;
 
             // Regardless of slskd's reported final state, the authoritative
             // signal is the filesystem. slskd sometimes drops successful
@@ -267,7 +289,11 @@ public class SoulseekDownloadService : BaseDownloadService
             // polls, so we'd see Errored/timeout even though the file landed
             // on disk a second ago. Check disk first; fall back to "this
             // peer failed, try the next" only when the file truly isn't there.
-            var localPath = ResolveLocalPath(hit.Filename, hit.Size);
+            //
+            // The usual 64KB size tolerance absorbs slskd's own size drift, but
+            // an interrupted transfer is far more likely to be genuinely
+            // truncated, so demand an exact match before promoting one.
+            var localPath = ResolveLocalPath(hit.Filename, hit.Size, requireExactSize: callerGaveUp);
             if (!string.IsNullOrEmpty(localPath))
             {
                 // Apply the configured FolderStructure: slskd dumps to whatever
@@ -276,9 +302,20 @@ public class SoulseekDownloadService : BaseDownloadService
                 // to the canonical location now so Navidrome scans it under a
                 // consistent layout.
                 localPath = MoveToConfiguredLayout(localPath, routing) ?? localPath;
-                Logger.LogInformation("Soulseek download complete (attempt {N}, slskd state={State}): {Path}",
-                    attemptIdx, state, localPath);
+                Logger.LogInformation("Soulseek download complete (attempt {N}, slskd state={State}{Aborted}): {Path}",
+                    attemptIdx, state?.ToString() ?? "interrupted", callerGaveUp ? ", caller had already left" : "", localPath);
                 return localPath;
+            }
+
+            if (waitError is not null)
+            {
+                // Nothing on disk and the caller is gone: no later peer attempt
+                // has anywhere to be delivered, so stop instead of burning the
+                // rest of the list.
+                if (callerGaveUp) throw waitError;
+                Logger.LogWarning("Soulseek attempt {N} wait failed ({Msg}); advancing", attemptIdx, waitError.Message);
+                lastError = waitError;
+                continue;
             }
 
             Logger.LogInformation("Soulseek attempt {N} failed (state={State}, no file on disk), advancing", attemptIdx, state);
@@ -476,7 +513,11 @@ public class SoulseekDownloadService : BaseDownloadService
         return tokens.Any(t => fn.Contains(t));
     }
 
-    private string? ResolveLocalPath(string remoteFilename, long expectedSize)
+    /// <param name="requireExactSize">
+    /// Drop the usual near-miss tolerance. Used when a transfer was interrupted,
+    /// where a slightly-short file is more likely truncated than size drift.
+    /// </param>
+    private string? ResolveLocalPath(string remoteFilename, long expectedSize, bool requireExactSize = false)
     {
         var segments = remoteFilename
             .Replace('\\', '/')
@@ -495,10 +536,10 @@ public class SoulseekDownloadService : BaseDownloadService
             if (parent != null)
             {
                 var candidate = Path.Combine(root, parent, leaf);
-                if (FileMatches(candidate, expectedSize)) return candidate;
+                if (FileMatches(candidate, expectedSize, requireExactSize)) return candidate;
             }
             var flat = Path.Combine(root, leaf);
-            if (FileMatches(flat, expectedSize)) return flat;
+            if (FileMatches(flat, expectedSize, requireExactSize)) return flat;
         }
 
         foreach (var root in roots)
@@ -508,7 +549,7 @@ public class SoulseekDownloadService : BaseDownloadService
             {
                 var matches = Directory
                     .EnumerateFiles(root, leaf, SearchOption.AllDirectories)
-                    .Where(p => FileMatches(p, expectedSize))
+                    .Where(p => FileMatches(p, expectedSize, requireExactSize))
                     .OrderByDescending(p => IOFile.GetCreationTimeUtc(p))
                     .ToList();
                 if (matches.Count > 0) return matches[0];
@@ -522,13 +563,14 @@ public class SoulseekDownloadService : BaseDownloadService
         return null;
     }
 
-    private static bool FileMatches(string path, long expectedSize)
+    private static bool FileMatches(string path, long expectedSize, bool requireExactSize = false)
     {
         try
         {
             if (!IOFile.Exists(path)) return false;
             var actual = new FileInfo(path).Length;
-            return actual == expectedSize || Math.Abs(actual - expectedSize) < 64 * 1024;
+            if (actual == expectedSize) return true;
+            return !requireExactSize && Math.Abs(actual - expectedSize) < 64 * 1024;
         }
         catch
         {
