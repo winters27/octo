@@ -43,7 +43,12 @@ public interface IDownloadService
     /// point, since a client giving up must never cancel a transfer slskd will finish.
     /// </summary>
     Task<string> ExecuteAcquisitionAsync(string externalProvider, string externalId,
-        bool triggerAlbumDownload, bool forcePermanent, CancellationToken cancellationToken);
+        bool triggerAlbumDownload, bool forcePermanent, DownloadSource? sourceOverride,
+        CancellationToken cancellationToken);
+
+    /// <summary>Runs one direct source for every missing track in an album.</summary>
+    Task<bool> DownloadAlbumWithSourceAsync(string externalProvider, string albumExternalId,
+        DownloadSource source, bool suppressSummary, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Checks if a song is currently being downloaded

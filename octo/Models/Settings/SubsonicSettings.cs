@@ -93,7 +93,31 @@ public enum DownloadSource
     YouTube,
 
     /// <summary>Try Soulseek FLAC first; fall back to YouTube MP3 if it fails.</summary>
-    SoulseekThenYouTube
+    SoulseekThenYouTube,
+
+    /// <summary>
+    /// Submit external track/album hearts to an existing Lidarr instance. Lidarr is
+    /// album-oriented, so a track heart acquires the track's full album. Non-heart
+    /// permanent downloads continue to use Soulseek.
+    /// </summary>
+    Lidarr
+}
+
+/// <summary>A source that can participate in the ordered heart-acquisition chain.</summary>
+public enum HeartDownloadSource
+{
+    Soulseek,
+    YouTube,
+    Lidarr,
+}
+
+public sealed class HeartDownloadStep
+{
+    public HeartDownloadSource Source { get; set; }
+    /// <summary>Legacy single switch; used only when the per-heart switches are absent.</summary>
+    public bool? Enabled { get; set; }
+    public bool? SongEnabled { get; set; }
+    public bool? AlbumEnabled { get; set; }
 }
 
 public class SubsonicSettings
@@ -145,16 +169,16 @@ public class SubsonicSettings
     public ExplicitFilter ExplicitFilter { get; set; } = ExplicitFilter.All;
     
     /// <summary>
-    /// Download mode for tracks (default: Track)
+    /// Legacy direct-download mode (default: Track), retained for playlist jobs.
     /// Environment variable: DOWNLOAD_MODE
-    /// Values: "Track" (download only played track), "Album" (download full album when playing a track)
+    /// Values: "Track" or "Album"
     /// </summary>
     public DownloadMode DownloadMode { get; set; } = DownloadMode.Track;
     
     /// <summary>
-    /// Storage mode for downloaded files (default: Permanent)
+    /// Legacy storage mode for direct-download jobs (default: Permanent).
     /// Environment variable: STORAGE_MODE
-    /// Values: "Permanent" (files saved to library), "Cache" (temporary files, auto-cleanup)
+    /// Ordinary external playback always streams from YouTube unless lossless waiting is enabled.
     /// </summary>
     public StorageMode StorageMode { get; set; } = StorageMode.Permanent;
     
@@ -235,11 +259,64 @@ public class SubsonicSettings
     public FolderStructure FolderStructure { get; set; } = FolderStructure.Flat;
 
     /// <summary>
-    /// Source for permanent downloads (default: Soulseek).
+    /// Download source (default: Soulseek). Lidarr applies to hearts only.
     /// Environment variable: DOWNLOAD_SOURCE
-    /// Values: "Soulseek" (FLAC), "YouTube" (MP3), "SoulseekThenYouTube" (FLAC with MP3 fallback)
+    /// Values: "Soulseek" (FLAC), "YouTube" (MP3), "SoulseekThenYouTube"
+    /// (FLAC with MP3 fallback), or "Lidarr" (heart-only, full album).
     /// </summary>
     public DownloadSource DownloadSource { get; set; } = DownloadSource.Soulseek;
+
+    /// <summary>
+    /// Ordered sources for explicit track and album hearts. Empty keeps older
+    /// DOWNLOAD_SOURCE configurations working; Lidarr remains last by default.
+    /// </summary>
+    public List<HeartDownloadStep> HeartDownloadSources { get; set; } = [];
+
+    public IReadOnlyList<HeartDownloadStep> EffectiveHeartDownloadSources()
+    {
+        var configured = HeartDownloadSources
+            .Where(step => Enum.IsDefined(step.Source))
+            .GroupBy(step => step.Source)
+            .Select(group =>
+            {
+                var step = group.First();
+                return new HeartDownloadStep
+                {
+                    Source = step.Source,
+                    SongEnabled = step.SongEnabled ?? step.Enabled ?? false,
+                    AlbumEnabled = step.AlbumEnabled ?? step.Enabled ?? false,
+                };
+            })
+            .ToList();
+        if (configured.Count > 0)
+        {
+            foreach (var source in Enum.GetValues<HeartDownloadSource>())
+                if (configured.All(step => step.Source != source))
+                    configured.Add(new HeartDownloadStep
+                    {
+                        Source = source,
+                        SongEnabled = false,
+                        AlbumEnabled = false,
+                    });
+            return configured;
+        }
+
+        return DownloadSource switch
+        {
+            DownloadSource.YouTube => DefaultHeartSources(false, true, false),
+            DownloadSource.SoulseekThenYouTube => DefaultHeartSources(true, true, false),
+            DownloadSource.Lidarr => DefaultHeartSources(false, false, true),
+            _ => DefaultHeartSources(true, false, false),
+        };
+    }
+
+    private IReadOnlyList<HeartDownloadStep> DefaultHeartSources(
+        bool soulseek, bool youtube, bool lidarr) =>
+        [
+            new() { Source = HeartDownloadSource.Soulseek, SongEnabled = soulseek && DownloadOnStar, AlbumEnabled = soulseek && DownloadAlbumOnStar },
+            new() { Source = HeartDownloadSource.YouTube, SongEnabled = youtube && DownloadOnStar, AlbumEnabled = youtube && DownloadAlbumOnStar },
+            new() { Source = HeartDownloadSource.Lidarr, SongEnabled = lidarr && DownloadOnStar, AlbumEnabled = lidarr && DownloadAlbumOnStar },
+        ];
     
     /// <summary>
     /// Use local staging for cloud storage mounts (default: false)

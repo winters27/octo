@@ -151,7 +151,9 @@ public class SoulseekDownloadService : BaseDownloadService
     // =========================================================================
     private const int MaxPeerAttempts = 5;
 
-    protected override async Task<string> DownloadTrackAsync(string trackId, Song song, bool suppressNotify, CancellationToken cancellationToken)
+    protected override async Task<string> DownloadTrackAsync(
+        string trackId, Song song, bool suppressNotify,
+        DownloadSource? sourceOverride, CancellationToken cancellationToken)
     {
         var routing = _idRegistry.Lookup(song.ExternalId ?? "") ?? SoulseekMetadataService.TryDecodeExternalId(song.ExternalId ?? "");
         if (routing is null || !routing.HasArtistTitle)
@@ -159,7 +161,7 @@ public class SoulseekDownloadService : BaseDownloadService
                 $"Cannot download '{song.Artist} - {song.Title}': missing artist/title in external id");
 
         // DownloadOnStar decides WHETHER to download; DownloadSource decides FROM WHERE.
-        switch (SubsonicSettings.DownloadSource)
+        switch (sourceOverride ?? SubsonicSettings.DownloadSource)
         {
             case DownloadSource.YouTube:
                 return await DownloadViaYouTubeAsync(routing, suppressNotify, announceStart: true, cancellationToken);

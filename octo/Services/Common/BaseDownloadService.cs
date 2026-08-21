@@ -134,8 +134,19 @@ public abstract class BaseDownloadService : IDownloadService
     }
     
     public Task<string> ExecuteAcquisitionAsync(string externalProvider, string externalId,
-        bool triggerAlbumDownload, bool forcePermanent, CancellationToken cancellationToken) =>
-        DownloadSongInternalAsync(externalProvider, externalId, triggerAlbumDownload, cancellationToken, forcePermanent);
+        bool triggerAlbumDownload, bool forcePermanent, DownloadSource? sourceOverride,
+        CancellationToken cancellationToken) =>
+        DownloadSongInternalAsync(externalProvider, externalId, triggerAlbumDownload,
+            cancellationToken, forcePermanent, sourceOverride: sourceOverride);
+
+    public Task<bool> DownloadAlbumWithSourceAsync(string externalProvider, string albumExternalId,
+        DownloadSource source, bool suppressSummary, CancellationToken cancellationToken = default)
+    {
+        if (externalProvider != ProviderName)
+            return Task.FromResult(false);
+        return DownloadRemainingAlbumTracksAsync(albumExternalId, "", source, suppressSummary,
+            cancellationToken);
+    }
 
     public DownloadInfo? GetDownloadStatus(string songId)
     {
@@ -212,7 +223,8 @@ public abstract class BaseDownloadService : IDownloadService
     /// <param name="suppressNotify">Mute per-track notifications (album walk, cache fills)</param>
     /// <param name="cancellationToken">Cancellation token</param>
     /// <returns>Local file path where the track was saved</returns>
-    protected abstract Task<string> DownloadTrackAsync(string trackId, Song song, bool suppressNotify, CancellationToken cancellationToken);
+    protected abstract Task<string> DownloadTrackAsync(string trackId, Song song, bool suppressNotify,
+        DownloadSource? sourceOverride, CancellationToken cancellationToken);
 
     /// <summary>Record a completed download in the fetched-songs log. Best-effort:
     /// format + source are derived from the file extension (flac -> Soulseek/lossless,
@@ -319,7 +331,10 @@ public abstract class BaseDownloadService : IDownloadService
     /// Mute per-track notifications. Set by the album walk, which fires one summary
     /// at the end instead of a ping per track.
     /// </param>
-    protected async Task<string> DownloadSongInternalAsync(string externalProvider, string externalId, bool triggerAlbumDownload, CancellationToken cancellationToken = default, bool forcePermanent = false, bool suppressNotify = false)
+    protected async Task<string> DownloadSongInternalAsync(string externalProvider, string externalId,
+        bool triggerAlbumDownload, CancellationToken cancellationToken = default,
+        bool forcePermanent = false, bool suppressNotify = false,
+        DownloadSource? sourceOverride = null)
     {
         if (externalProvider != ProviderName)
         {
@@ -437,7 +452,8 @@ public abstract class BaseDownloadService : IDownloadService
             // orphan that Octo has no record of. A client giving up on a slow
             // download used to abort exactly here, which is why a completed
             // download could never be played.
-            var localPath = await DownloadTrackAsync(externalId, song, silence, cancellationToken);
+            var localPath = await DownloadTrackAsync(
+                externalId, song, silence, sourceOverride, cancellationToken);
 
             downloadInfo.Status = DownloadStatus.Completed;
             downloadInfo.LocalPath = localPath;
@@ -495,7 +511,20 @@ public abstract class BaseDownloadService : IDownloadService
                     if (!string.IsNullOrEmpty(albumExternalId))
                     {
                         Logger.LogInformation("Download mode is Album, triggering background download for album {AlbumId}", albumExternalId);
-                        DownloadRemainingAlbumTracksInBackground(externalProvider, albumExternalId, externalId);
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await DownloadRemainingAlbumTracksAsync(
+                                    albumExternalId, externalId, sourceOverride);
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.LogError(ex,
+                                    "Failed to download remaining album tracks for album {AlbumId}",
+                                    albumExternalId);
+                            }
+                        });
                     }
                 }
             }
@@ -523,7 +552,10 @@ public abstract class BaseDownloadService : IDownloadService
         }
     }
 
-    protected async Task DownloadRemainingAlbumTracksAsync(string albumExternalId, string excludeTrackExternalId)
+    protected async Task<bool> DownloadRemainingAlbumTracksAsync(
+        string albumExternalId, string excludeTrackExternalId,
+        DownloadSource? sourceOverride = null, bool suppressSummary = false,
+        CancellationToken cancellationToken = default)
     {
         Logger.LogInformation("Starting background download for album {AlbumId} (excluding track {TrackId})", 
             albumExternalId, excludeTrackExternalId);
@@ -532,7 +564,7 @@ public abstract class BaseDownloadService : IDownloadService
         if (album == null)
         {
             Logger.LogWarning("Album {AlbumId} not found, cannot download remaining tracks", albumExternalId);
-            return;
+            return false;
         }
 
         var tracksToDownload = album.Songs
@@ -576,7 +608,10 @@ public abstract class BaseDownloadService : IDownloadService
                 }
 
                 Logger.LogInformation("Downloading track '{Title}' from album '{Album}'", track.Title, album.Title);
-                var path = await DownloadSongInternalAsync(ProviderName, track.ExternalId!, triggerAlbumDownload: false, CancellationToken.None, forcePermanent: true, suppressNotify: true);
+                var path = await DownloadSongInternalAsync(
+                    ProviderName, track.ExternalId!, triggerAlbumDownload: false,
+                    cancellationToken, forcePermanent: true, suppressNotify: true,
+                    sourceOverride: sourceOverride);
                 succeeded++;
                 if (path.EndsWith(".flac", StringComparison.OrdinalIgnoreCase)) lossless++;
 
@@ -596,7 +631,10 @@ public abstract class BaseDownloadService : IDownloadService
         Logger.LogInformation("Completed background download for album '{AlbumTitle}'", album.Title);
 
         var summary = BuildAlbumSummary(album, succeeded, lossless, failed);
-        if (summary is not null) Notifications.Notify(summary);
+        // Hide an intermediate failure while another source remains, but still report
+        // success when an earlier priority step completes the album acquisition.
+        if ((!suppressSummary || failed == 0) && summary is not null) Notifications.Notify(summary);
+        return failed == 0;
     }
 
     /// <summary>

@@ -50,6 +50,15 @@ services:
       Soulseek__PreferredExtension: ${SLSKD_PREFERRED_EXTENSION:-flac}
       Soulseek__DownloadTimeoutSeconds: ${SLSKD_DOWNLOAD_TIMEOUT_SECONDS:-180}
 
+      # ----- existing Lidarr (optional heart-download source) -----
+      Lidarr__BaseUrl: ${LIDARR_URL:-}
+      Lidarr__ApiKey: ${LIDARR_API_KEY:-}
+      Lidarr__RootFolderPath: ${LIDARR_ROOT_FOLDER_PATH:-}
+      Lidarr__QualityProfileId: ${LIDARR_QUALITY_PROFILE_ID:-0}
+      Lidarr__MetadataProfileId: ${LIDARR_METADATA_PROFILE_ID:-0}
+      Lidarr__CompletionMode: ${LIDARR_COMPLETION_MODE:-Accepted}
+      Lidarr__ImportTimeoutSeconds: ${LIDARR_IMPORT_TIMEOUT_SECONDS:-1800}
+
       # ----- Last.fm radio -----
       LastFm__ApiKey: ${LASTFM_API_KEY:-}
       LastFm__EnableRadio: ${LASTFM_ENABLE_RADIO:-true}

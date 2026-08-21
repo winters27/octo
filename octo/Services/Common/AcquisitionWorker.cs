@@ -58,6 +58,7 @@ public sealed class AcquisitionWorker : BackgroundService
                 var path = await _downloads.ExecuteAcquisitionAsync(
                     request.Provider, request.ExternalId,
                     request.TriggerAlbumDownload, request.ForcePermanent,
+                    request.SourceOverride,
                     CancellationToken.None);
 
                 request.Completion.TrySetResult(path);
@@ -73,7 +74,10 @@ public sealed class AcquisitionWorker : BackgroundService
                 // a terminal failure surfaces exactly once per gesture (album-walk
                 // per-track failures are caught inside the walk and aggregate into
                 // its summary instead).
-                if (request.IsStar) NotifyFailed(request, ex);
+                if (request.IsStar && request.NotifyOnFailure) NotifyFailed(request, ex);
+                // Release before completing the task: an ordered heart fallback may
+                // immediately enqueue the same track for its next source.
+                _queue.Release(request);
                 request.Completion.TrySetException(ex);
             }
             finally

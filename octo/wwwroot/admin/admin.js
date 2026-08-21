@@ -79,10 +79,12 @@ async function refreshStatus() {
 function setStatusCard(svc, probe) {
   const card = document.querySelector(`.status-card[data-svc="${svc}"]`);
   if (!card) return;
-  card.classList.toggle('bad', !probe.ok);
+  const state = probe.warning ? 'warn' : probe.ok ? 'ok' : 'bad';
+  card.classList.toggle('bad', state === 'bad');
+  card.classList.toggle('warn', state === 'warn');
   const dot = card.querySelector('.status-dot');
   const body = card.querySelector('.status-card-body');
-  if (dot)  dot.className  = `status-dot ${probe.ok ? 'ok' : 'bad'}`;
+  if (dot)  dot.className  = `status-dot ${state}`;
   if (body) body.textContent = probe.detail || (probe.ok ? 'online' : 'unreachable');
 }
 
@@ -109,9 +111,14 @@ async function loadSettings() {
     const [section, key] = el.name.split('.');
     const value = currentSettings?.[section]?.[key];
     if (value === undefined || value === null) return;
-    if (el.type === 'checkbox') el.checked = !!value;
+    if (el.dataset.json === 'true') el.value = JSON.stringify(value ?? []);
+    else if (el.type === 'checkbox') el.checked = !!value;
     else el.value = value;
   });
+
+  syncPlaybackSourceControl();
+  updateStreamSettings();
+  renderHeartSourceOrder(currentSettings?.Subsonic?.HeartDownloadSources);
 
   // Meta references
   const cfgPath = document.getElementById('meta-config-path');
@@ -132,6 +139,9 @@ async function loadSettings() {
   updateDiscoveryBanner();
   buildSegments();
   syncSegments(false);
+  if (currentSettings?.Lidarr?.BaseUrl && currentSettings?.Lidarr?.ApiKey) {
+    loadLidarrOptions();
+  }
 
   // Initial dirty-check pass: all forms start clean.
   document.querySelectorAll('form[data-section]').forEach(form => {
@@ -148,6 +158,7 @@ function ensureSaveBar(form) {
   actions.className = 'form-actions';
   actions.innerHTML = `
     <button type="submit" class="btn btn-primary">Save</button>
+    ${form.id === 'lidarr-connection-form' ? '<button type="button" class="btn btn-ghost" id="lidarr-test-connection">Test connection</button>' : ''}
     <span class="saved-status"></span>
     <span class="restart-hint">
       <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -176,11 +187,15 @@ document.querySelectorAll('form[data-section]').forEach(form => {
 
     form.querySelectorAll('[name]').forEach(el => {
       if (!el.name?.includes('.')) return;
+      if (el.disabled) return;
       const [section, key] = el.name.split('.');
       patch[section] = patch[section] || {};
       let value;
-      if (el.type === 'checkbox') value = el.checked;
-      else if (el.type === 'number') {
+      if (el.dataset.json === 'true') {
+        try { value = JSON.parse(el.value || '[]'); }
+        catch { value = []; }
+      } else if (el.type === 'checkbox') value = el.checked;
+      else if (el.type === 'number' || el.dataset.number === 'true') {
         value = el.value === '' ? null : Number(el.value);
         if (Number.isNaN(value)) value = null;
       } else value = el.value;
@@ -205,7 +220,11 @@ document.querySelectorAll('form[data-section]').forEach(form => {
       const result = await r.json();
       if (!r.ok) throw new Error(result.error || `HTTP ${r.status}`);
 
+      // The JSON configuration provider reloads asynchronously after the atomic
+      // write. Give it one watcher tick before testing a newly saved connection.
+      if (form.id === 'lidarr-connection-form') await new Promise(resolve => setTimeout(resolve, 600));
       currentSettings = await (await fetch('/api/admin/settings')).json();
+      if (form.id === 'lidarr-connection-form') await loadLidarrOptions();
       status.textContent = `Saved · ${new Date().toLocaleTimeString()}`;
       form.querySelector('.form-actions')?.classList.remove('dirty');
       toast(needsRestart
@@ -220,6 +239,270 @@ document.querySelectorAll('form[data-section]').forEach(form => {
   });
 });
 
+// Heart acquisition is a short priority chain, not a workflow graph. Keep all
+// sources visible so disabling one never destroys the user's chosen order.
+const heartSourceMeta = {
+  Soulseek: { title: 'Soulseek', detail: 'Lossless FLAC from slskd peers' },
+  YouTube: { title: 'YouTube', detail: 'Lossy MP3 from the yt-dlp shim' },
+  Lidarr: { title: 'Lidarr', detail: 'Album automation through your Lidarr server' },
+};
+let heartSourceSteps = [];
+let draggedHeartSourceRow = null;
+let draggedHeartSourcePointer = null;
+let heartSourceDragGhost = null;
+
+function normalizeHeartSourceSteps(steps) {
+  const seen = new Set();
+  const normalized = [];
+  (Array.isArray(steps) ? steps : []).forEach(step => {
+    const source = step?.Source ?? step?.source;
+    if (!heartSourceMeta[source] || seen.has(source)) return;
+    seen.add(source);
+    const legacyEnabled = step?.Enabled ?? step?.enabled ?? false;
+    normalized.push({
+      Source: source,
+      SongEnabled: Boolean(step?.SongEnabled ?? step?.songEnabled ?? legacyEnabled),
+      AlbumEnabled: Boolean(step?.AlbumEnabled ?? step?.albumEnabled ?? legacyEnabled),
+    });
+  });
+  ['Soulseek', 'YouTube', 'Lidarr'].forEach(source => {
+    if (!seen.has(source)) normalized.push({
+      Source: source,
+      SongEnabled: source === 'Soulseek',
+      AlbumEnabled: source === 'Soulseek',
+    });
+  });
+  return normalized;
+}
+
+function renderHeartSourceOrder(steps = heartSourceSteps) {
+  const list = document.getElementById('heart-source-order');
+  if (!list) return;
+  heartSourceSteps = normalizeHeartSourceSteps(steps);
+  list.innerHTML = heartSourceSteps.map((step, index) => {
+    const meta = heartSourceMeta[step.Source];
+    return `
+      <div class="source-priority-row${step.SongEnabled || step.AlbumEnabled ? '' : ' is-disabled'}"
+           data-source="${step.Source}" data-index="${index}">
+        <button type="button" class="source-drag" draggable="true"
+                aria-label="Drag ${meta.title} to reorder. Use arrow keys to move it."
+                title="Drag to reorder; arrow keys also work">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3h1M10 3h1M5 8h1M10 8h1M5 13h1M10 13h1"/></svg>
+        </button>
+        <span class="source-step" aria-hidden="true">${index + 1}</span>
+        <span class="source-copy">
+          <span class="source-title">${meta.title}</span>
+          <span class="source-detail">${meta.detail}</span>
+        </span>
+        <span class="source-heart-controls" role="group" aria-label="${meta.title} heart types">
+          <span class="source-heart-choice">
+            <span class="source-heart-label">Song hearts
+              ${step.Source === 'Lidarr' ? `
+                <span class="source-info" tabindex="0" role="img"
+                      aria-label="A song heart asks Lidarr to acquire the entire album. Enable this if you want Lidarr to handle single-song requests anyway."
+                      data-tooltip="A song heart asks Lidarr to acquire the entire album. Enable this if you want Lidarr to handle single-song requests anyway.">
+                  <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 7v4M8 4.8v.1"/></svg>
+                </span>` : ''}
+            </span>
+            <label class="switch source-kind-switch">
+              <input type="checkbox" data-heart-kind="SongEnabled" aria-label="Use ${meta.title} for song hearts" ${step.SongEnabled ? 'checked' : ''} />
+              <span class="sw-track"></span><span class="sw-thumb"></span>
+            </label>
+          </span>
+          <span class="source-heart-choice">
+            <span class="source-heart-label">Album hearts</span>
+            <label class="switch source-kind-switch">
+              <input type="checkbox" data-heart-kind="AlbumEnabled" aria-label="Use ${meta.title} for album hearts" ${step.AlbumEnabled ? 'checked' : ''} />
+              <span class="sw-track"></span><span class="sw-thumb"></span>
+            </label>
+          </span>
+        </span>
+      </div>`;
+  }).join('');
+  syncHeartSourceInput();
+}
+
+function updateStreamSettings() {
+  const waitForLossless = document.getElementById('f-wait-for-lossless-on-play')?.checked;
+  const activeSource = waitForLossless ? 'Lossless' : 'YouTube';
+  document.querySelectorAll('[data-stream-source]').forEach(section => {
+    section.hidden = section.dataset.streamSource !== activeSource;
+  });
+}
+
+function syncPlaybackSourceControl() {
+  const control = document.getElementById('f-playback-source');
+  const wait = document.getElementById('f-wait-for-lossless-on-play');
+  if (!control || !wait) return;
+  control.value = wait.checked ? 'Lossless' : 'YouTube';
+}
+
+document.getElementById('f-playback-source')?.addEventListener('change', event => {
+  const wait = document.getElementById('f-wait-for-lossless-on-play');
+  if (!wait) return;
+  wait.checked = event.target.value === 'Lossless';
+  wait.dispatchEvent(new Event('input', { bubbles: true }));
+  updateStreamSettings();
+});
+
+document.querySelectorAll('[data-open-tab]').forEach(button => {
+  button.addEventListener('click', () => activateTab(button.dataset.openTab));
+});
+
+function syncHeartSourceInput() {
+  const input = document.getElementById('f-heart-download-sources');
+  const help = document.getElementById('heart-source-order-help');
+  if (input) {
+    input.value = JSON.stringify(heartSourceSteps);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  if (help) {
+    const noneEnabled = !heartSourceSteps.some(step => step.SongEnabled || step.AlbumEnabled);
+    help.hidden = !noneEnabled;
+    help.textContent = noneEnabled
+      ? 'No heart download sources are enabled. Hearts will not acquire files.'
+      : '';
+  }
+}
+
+function moveHeartSource(from, to) {
+  if (from === to || from < 0 || to < 0 ||
+      from >= heartSourceSteps.length || to >= heartSourceSteps.length) return;
+  const [step] = heartSourceSteps.splice(from, 1);
+  heartSourceSteps.splice(to, 0, step);
+  renderHeartSourceOrder();
+  document.querySelector(`.source-priority-row[data-index="${to}"] .source-drag`)?.focus();
+}
+
+const heartSourceList = document.getElementById('heart-source-order');
+heartSourceList?.addEventListener('change', event => {
+  if (!event.target.matches('[data-heart-kind]')) return;
+  const row = event.target.closest('.source-priority-row');
+  heartSourceSteps[Number(row.dataset.index)][event.target.dataset.heartKind] = event.target.checked;
+  const step = heartSourceSteps[Number(row.dataset.index)];
+  row.classList.toggle('is-disabled', !step.SongEnabled && !step.AlbumEnabled);
+  syncHeartSourceInput();
+});
+heartSourceList?.addEventListener('keydown', event => {
+  const handle = event.target.closest('.source-drag');
+  if (!handle || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+  event.preventDefault();
+  const from = Number(handle.closest('.source-priority-row').dataset.index);
+  moveHeartSource(from, from + (event.key === 'ArrowUp' ? -1 : 1));
+});
+heartSourceList?.addEventListener('dragstart', event => {
+  const handle = event.target.closest('.source-drag');
+  if (!handle) return;
+  const row = handle.closest('.source-priority-row');
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', row.dataset.source);
+  const bounds = row.getBoundingClientRect();
+  heartSourceDragGhost = row.cloneNode(true);
+  heartSourceDragGhost.classList.add('source-drag-ghost');
+  heartSourceDragGhost.setAttribute('aria-hidden', 'true');
+  heartSourceDragGhost.style.width = `${bounds.width}px`;
+  document.body.appendChild(heartSourceDragGhost);
+  event.dataTransfer.setDragImage(
+    heartSourceDragGhost,
+    Math.max(0, Math.min(bounds.width, event.clientX - bounds.left)),
+    Math.max(0, Math.min(bounds.height, event.clientY - bounds.top)));
+  draggedHeartSourceRow = row;
+  row.classList.add('is-dragging');
+});
+heartSourceList?.addEventListener('dragend', event => {
+  event.target.closest('.source-priority-row')?.classList.remove('is-dragging');
+  syncHeartSourceOrderFromDom();
+  draggedHeartSourceRow = null;
+  heartSourceDragGhost?.remove();
+  heartSourceDragGhost = null;
+});
+heartSourceList?.addEventListener('dragover', event => {
+  const target = event.target.closest('.source-priority-row');
+  if (!target || !draggedHeartSourceRow || target === draggedHeartSourceRow) return;
+  event.preventDefault();
+  previewHeartSourceRowMove(target, event.clientY);
+});
+heartSourceList?.addEventListener('drop', event => {
+  event.preventDefault();
+});
+heartSourceList?.addEventListener('pointerdown', event => {
+  const handle = event.target.closest('.source-drag');
+  if (!handle || event.pointerType === 'mouse') return;
+  event.preventDefault();
+  draggedHeartSourcePointer = event.pointerId;
+  draggedHeartSourceRow = handle.closest('.source-priority-row');
+  draggedHeartSourceRow.classList.add('is-dragging');
+  handle.setPointerCapture(event.pointerId);
+});
+heartSourceList?.addEventListener('pointermove', event => {
+  if (event.pointerId !== draggedHeartSourcePointer || !draggedHeartSourceRow) return;
+  const target = document.elementFromPoint(event.clientX, event.clientY)
+    ?.closest('.source-priority-row');
+  if (target) previewHeartSourceRowMove(target, event.clientY);
+});
+heartSourceList?.addEventListener('pointerup', finishHeartSourcePointerDrag);
+heartSourceList?.addEventListener('pointercancel', finishHeartSourcePointerDrag);
+
+function finishHeartSourcePointerDrag(event) {
+  if (event.pointerId !== draggedHeartSourcePointer) return;
+  draggedHeartSourceRow?.classList.remove('is-dragging');
+  syncHeartSourceOrderFromDom();
+  draggedHeartSourceRow = null;
+  draggedHeartSourcePointer = null;
+}
+
+function previewHeartSourceRowMove(target, clientY) {
+  if (!heartSourceList || !draggedHeartSourceRow || target === draggedHeartSourceRow) return;
+  const afterTarget = clientY > target.getBoundingClientRect().top + target.offsetHeight / 2;
+  heartSourceList.insertBefore(draggedHeartSourceRow, afterTarget ? target.nextSibling : target);
+  refreshHeartSourceRowNumbers();
+}
+
+function refreshHeartSourceRowNumbers() {
+  heartSourceList?.querySelectorAll('.source-priority-row').forEach((row, index) => {
+    row.dataset.index = index;
+    const number = row.querySelector('.source-step');
+    if (number) number.textContent = String(index + 1);
+  });
+}
+
+function syncHeartSourceOrderFromDom() {
+  if (!heartSourceList) return;
+  const bySource = new Map(heartSourceSteps.map(step => [step.Source, step]));
+  heartSourceSteps = [...heartSourceList.querySelectorAll('.source-priority-row')]
+    .map(row => bySource.get(row.dataset.source))
+    .filter(Boolean);
+  refreshHeartSourceRowNumbers();
+  syncHeartSourceInput();
+}
+
+document.getElementById('lidarr-test-connection')?.addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  const form = document.getElementById('lidarr-connection-form');
+  const status = form?.querySelector('.saved-status');
+  const baseUrl = document.getElementById('f-lidarr-url')?.value ?? '';
+  const apiKey = document.getElementById('f-lidarr-key')?.value ?? '';
+  button.disabled = true;
+  if (status) status.textContent = 'Testing…';
+  try {
+    const r = await fetch('/api/admin/lidarr/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ baseUrl, apiKey }),
+    });
+    const result = await r.json();
+    if (!r.ok) throw new Error(result.error || `HTTP ${r.status}`);
+    populateLidarrOptions(result.options || {});
+    if (status) status.textContent = result.message || 'Connected to Lidarr.';
+    toast(result.message || 'Connected to Lidarr.', 'ok');
+  } catch (err) {
+    if (status) status.textContent = `Test failed: ${err.message}`;
+    toast(`Lidarr test failed: ${err.message}`, 'error');
+  } finally {
+    button.disabled = false;
+  }
+});
+
 function isFieldDirty(el) {
   if (!currentSettings || !el.name?.includes('.')) return false;
   const [section, key] = el.name.split('.');
@@ -231,6 +514,58 @@ function isFieldDirty(el) {
   if ((saved === null || saved === undefined || saved === '') &&
       (live === null || live === undefined || live === '')) return false;
   return saved != live;
+}
+
+// Lidarr owns these choices. Keep them disabled until a saved connection can
+// supply real values; this avoids persisting a made-up profile id.
+async function loadLidarrOptions() {
+  const status = document.getElementById('lidarr-options-status');
+  const root = document.getElementById('f-lidarr-root');
+  const quality = document.getElementById('f-lidarr-quality');
+  const metadata = document.getElementById('f-lidarr-metadata');
+  if (!root || !quality || !metadata) return;
+
+  if (status) status.textContent = 'Loading choices…';
+  [root, quality, metadata].forEach(el => { el.disabled = true; });
+  try {
+    const r = await fetch('/api/admin/lidarr/options', { cache: 'no-store' });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+
+    populateLidarrOptions(data);
+  } catch (err) {
+    if (status) status.textContent = `Could not load choices: ${err.message}`;
+  }
+}
+
+function populateLidarrOptions(data) {
+  const status = document.getElementById('lidarr-options-status');
+  const root = document.getElementById('f-lidarr-root');
+  const quality = document.getElementById('f-lidarr-quality');
+  const metadata = document.getElementById('f-lidarr-metadata');
+  if (!root || !quality || !metadata) return;
+  const selectedRoot = root.value || currentSettings?.Lidarr?.RootFolderPath || '';
+  const selectedQuality = quality.value !== '0'
+    ? quality.value : String(currentSettings?.Lidarr?.QualityProfileId ?? 0);
+  const selectedMetadata = metadata.value !== '0'
+    ? metadata.value : String(currentSettings?.Lidarr?.MetadataProfileId ?? 0);
+  root.innerHTML = '<option value="">Choose a root folder</option>' +
+    (data.rootFolders || []).map(x => `<option value="${esc(x.path)}">${esc(x.path)}</option>`).join('');
+  quality.innerHTML = '<option value="0">Choose a quality profile</option>' +
+    (data.qualityProfiles || []).map(x => `<option value="${x.id}">${esc(x.name)}</option>`).join('');
+  metadata.innerHTML = '<option value="0">Choose a metadata profile</option>' +
+    (data.metadataProfiles || []).map(x => `<option value="${x.id}">${esc(x.name)}</option>`).join('');
+  root.value = selectedRoot;
+  quality.value = selectedQuality;
+  metadata.value = selectedMetadata;
+  [root, quality, metadata].forEach(el => { el.disabled = false; });
+  const empty = [];
+  if (!(data.rootFolders || []).length) empty.push('root folders');
+  if (!(data.qualityProfiles || []).length) empty.push('quality profiles');
+  if (!(data.metadataProfiles || []).length) empty.push('metadata profiles');
+  if (status) status.textContent = empty.length
+    ? `Connected, but Lidarr returned no ${empty.join(', ')}.`
+    : 'Connected. Choices loaded from Lidarr.';
 }
 
 // ────────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ using Octo.Services.Validation;
 using Octo.Services.Subsonic;
 using Octo.Services.Common;
 using Octo.Services.LastFm;
+using Octo.Services.Lidarr;
 using Octo.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -40,6 +41,8 @@ builder.Services.Configure<SubsonicSettings>(
     builder.Configuration.GetSection("Subsonic"));
 builder.Services.Configure<SoulseekSettings>(
     builder.Configuration.GetSection("Soulseek"));
+builder.Services.Configure<LidarrSettings>(
+    builder.Configuration.GetSection("Lidarr"));
 builder.Services.Configure<LastFmSettings>(
     builder.Configuration.GetSection("LastFm"));
 builder.Services.Configure<NotificationSettings>(
@@ -98,6 +101,9 @@ builder.Services.AddHttpClient(Octo.Services.Metadata.DeezerRateLimiter.ClientNa
 
 builder.Services.AddSingleton<IMusicMetadataService, SoulseekMetadataService>();
 builder.Services.AddSingleton<IDownloadService, SoulseekDownloadService>();
+builder.Services.AddSingleton<LidarrClient>();
+builder.Services.AddSingleton<ILidarrHeartAcquisitionService, LidarrHeartAcquisitionService>();
+builder.Services.AddSingleton<HeartAcquisitionCoordinator>();
 
 // Discovery results are built once per query and shared. Clients fire several search
 // calls for one typed query, and they all resolve to the same routing objects, so without

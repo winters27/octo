@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
+using Octo.Models.Settings;
 
 namespace Octo.Services.Common;
 
@@ -10,10 +11,12 @@ public sealed class AcquisitionRequest
     public required string ExternalId { get; init; }
 
     /// <summary>Carried per request rather than inferred from whoever won a race:
-    /// a star wants the album walk and a forced permanent copy, a play does not.</summary>
+    /// heart routing decides song-versus-album scope, while playback never expands to an album.</summary>
     public bool TriggerAlbumDownload { get; init; }
     public bool ForcePermanent { get; init; }
     public bool IsStar { get; init; }
+    public DownloadSource? SourceOverride { get; init; }
+    public bool NotifyOnFailure { get; init; } = true;
 
     /// <summary>
     /// RunContinuationsAsynchronously is required. Without it, completing this runs the
@@ -74,7 +77,8 @@ public sealed class TrackAcquisitionQueue
     /// care may ignore it entirely.
     /// </summary>
     public Task<string> Enqueue(string provider, string externalId, bool isStar,
-        bool triggerAlbumDownload, bool forcePermanent)
+        bool triggerAlbumDownload, bool forcePermanent,
+        DownloadSource? sourceOverride = null, bool notifyOnFailure = true)
     {
         var request = new AcquisitionRequest
         {
@@ -83,6 +87,8 @@ public sealed class TrackAcquisitionQueue
             IsStar = isStar,
             TriggerAlbumDownload = triggerAlbumDownload,
             ForcePermanent = forcePermanent,
+            SourceOverride = sourceOverride,
+            NotifyOnFailure = notifyOnFailure,
         };
 
         var existing = _inFlight.GetOrAdd(request.Key, request);

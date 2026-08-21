@@ -44,6 +44,7 @@ public class SubsonicController : ControllerBase
     private readonly CoverArtAggregator? _coverArtAggregator;
     private readonly ExternalIdRegistry _idRegistry;
     private readonly Octo.Services.Common.TrackAcquisitionQueue _acquisitions;
+    private readonly HeartAcquisitionCoordinator _heartAcquisitions;
     private readonly Octo.Services.Common.ExternalSearchService _externalSearch;
     private readonly RadioQueueStore _radioQueueStore;
     private readonly NavidromeIdentityService _navIdentity;
@@ -60,6 +61,7 @@ public class SubsonicController : ControllerBase
         SubsonicProxyService proxyService,
         ExternalIdRegistry idRegistry,
         Octo.Services.Common.TrackAcquisitionQueue acquisitions,
+        HeartAcquisitionCoordinator heartAcquisitions,
         Octo.Services.Common.ExternalSearchService externalSearch,
         RadioQueueStore radioQueueStore,
         NavidromeIdentityService navIdentity,
@@ -80,6 +82,7 @@ public class SubsonicController : ControllerBase
         _proxyService = proxyService;
         _idRegistry = idRegistry;
         _acquisitions = acquisitions;
+        _heartAcquisitions = heartAcquisitions;
         _externalSearch = externalSearch;
         _radioQueueStore = radioQueueStore;
         _navIdentity = navIdentity;
@@ -576,43 +579,21 @@ public class SubsonicController : ControllerBase
 
         try
         {
-            // Permanent mode keeps a copy of anything played. Queue it and carry on: the
-            // fetch runs on the acquisition worker, on a token that has nothing to do with
-            // this request, so the client hanging up can no longer destroy it.
-            Task<string>? acquisition = null;
-            if (_subsonicSettings.StorageMode == StorageMode.Permanent)
+            // Lossless-on-play remains an explicit opt-in. Normal playback never starts
+            // acquisition: owned ids already went to Navidrome above, and missing ids
+            // stream from YouTube below. Hearts are the normal permanent-copy gesture.
+            if (_subsonicSettings.WaitForLosslessOnPlay)
             {
-                acquisition = _acquisitions.Enqueue(provider!, externalId!, isStar: false,
+                var acquisition = _acquisitions.Enqueue(provider!, externalId!, isStar: false,
                     triggerAlbumDownload: false, forcePermanent: true);
-            }
-
-            if (acquisition is not null && _subsonicSettings.WaitForLosslessOnPlay)
-            {
                 return await ServeAcquiredAsync(acquisition, provider!, externalId!, id, format,
                     allowPreviewFallback: true);
-            }
-
-            // Cache mode is deliberately left on its original path. It skips library
-            // registration, so routing it through the queue would make every play
-            // re-download the same track forever.
-            if (_subsonicSettings.StorageMode == StorageMode.Cache)
-            {
-                var downloadStream = await _downloadService.DownloadAndStreamAsync(provider!, externalId!, HttpContext.RequestAborted);
-                return File(downloadStream, "audio/mpeg", enableRangeProcessing: true);
             }
 
             var direct = await TryDirectStreamAsync(provider!, externalId!, id);
             if (direct is not null) return direct;
 
             _logger.LogWarning("Direct stream not available for {Id}", id);
-
-            // No YouTube match. Wait on the SAME queued acquisition rather than starting a
-            // second one; without a lossless copy on the way there is nothing to serve.
-            // The preview already failed above, so a timeout fallback has nothing to serve.
-            if (acquisition is not null)
-                return await ServeAcquiredAsync(acquisition, provider!, externalId!, id, format,
-                    allowPreviewFallback: false);
-
             return _responseBuilder.CreateError(format, 70, "No playable source found for this track");
         }
         catch (OperationCanceledException)
@@ -1376,9 +1357,10 @@ public class SubsonicController : ControllerBase
         if (!string.IsNullOrEmpty(albumCandidate)
             && _idRegistry.Lookup(albumCandidate)?.Kind == RoutingKind.Album)
         {
-            if (!_subsonicSettings.DownloadAlbumOnStar)
+            if (!_subsonicSettings.EffectiveHeartDownloadSources()
+                    .Any(step => step.AlbumEnabled == true))
             {
-                _logger.LogInformation("Starred album {AlbumId} but DownloadAlbumOnStar is off; ignoring", albumCandidate);
+                _logger.LogInformation("Starred album {AlbumId} but no album-heart source is enabled; ignoring", albumCandidate);
                 return _responseBuilder.CreateResponse(format, "starred", new { });
             }
 
@@ -1409,7 +1391,7 @@ public class SubsonicController : ControllerBase
 
             // An empty exclude means "download every track". The engine already skips
             // tracks that are downloaded or in flight and isolates per-track failures.
-            _downloadService.DownloadRemainingAlbumTracksInBackground(albumProviderName, albumCandidate, "");
+            _heartAcquisitions.QueueAlbum(albumProviderName, albumCandidate);
 
             // Navidrome has never seen this id, so relaying the star would just error.
             return _responseBuilder.CreateResponse(format, "starred", new { });
@@ -1418,7 +1400,8 @@ public class SubsonicController : ControllerBase
         // Check if this is an external song (enables download-on-star)
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(itemId);
         
-        if (isExternal && _subsonicSettings.DownloadOnStar)
+        if (isExternal && _subsonicSettings.EffectiveHeartDownloadSources()
+                .Any(step => step.SongEnabled == true))
         {
             // No storage-mode gate any more. It used to exclude Permanent on the grounds
             // that playing a track there already downloads it, but that was only ever true
@@ -1430,8 +1413,7 @@ public class SubsonicController : ControllerBase
             // than inheriting whatever a concurrent play happened to ask for.
             _logger.LogInformation("Starring external song {SongId}, queueing permanent download", itemId);
 
-            _ = _acquisitions.Enqueue(provider!, externalId!, isStar: true,
-                triggerAlbumDownload: true, forcePermanent: true);
+            _heartAcquisitions.QueueTrack(provider!, externalId!);
 
             // Return success response immediately
             return _responseBuilder.CreateResponse(format, "starred", new { });

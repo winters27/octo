@@ -163,6 +163,7 @@ echo "What you'll need handy:"
 echo "  • A Navidrome server URL (running already)"
 echo "  • A free Last.fm API key — https://www.last.fm/api/account/create"
 echo "  • A free Soulseek (slsknet.org) account"
+echo "  • Optionally, an existing Lidarr server"
 echo
 require_docker
 green "✓ Docker + Compose v2 ready"
@@ -228,6 +229,28 @@ SLSKD_SOULSEEK_PASSWORD=$(ask_secret "Your Soulseek password" "$(existing SLSKD_
 echo
 
 # ─────────────────────────────────────────────────────────────────
+# Optional Lidarr heart source
+# ─────────────────────────────────────────────────────────────────
+bold "─── Heart download source ──────────────────────────────────"
+echo "  Soulseek — individual lossless tracks (default)"
+echo "  Lidarr   — your existing Lidarr server; always fetches the full album"
+DOWNLOAD_SOURCE=$(ask "Heart download source" "$(existing DOWNLOAD_SOURCE || echo "Soulseek")")
+LIDARR_URL="$(existing LIDARR_URL)"
+LIDARR_API_KEY="$(existing LIDARR_API_KEY)"
+LIDARR_ROOT_FOLDER_PATH="$(existing LIDARR_ROOT_FOLDER_PATH)"
+LIDARR_QUALITY_PROFILE_ID="$(existing LIDARR_QUALITY_PROFILE_ID || echo "0")"
+LIDARR_METADATA_PROFILE_ID="$(existing LIDARR_METADATA_PROFILE_ID || echo "0")"
+LIDARR_COMPLETION_MODE="$(existing LIDARR_COMPLETION_MODE || echo "Accepted")"
+LIDARR_IMPORT_TIMEOUT_SECONDS="$(existing LIDARR_IMPORT_TIMEOUT_SECONDS || echo "1800")"
+if [ "${DOWNLOAD_SOURCE,,}" = "lidarr" ]; then
+  echo "  Lidarr must already have working indexers and a download client."
+  LIDARR_URL=$(ask "Lidarr URL (reachable from the Octo container)" "$LIDARR_URL")
+  LIDARR_API_KEY=$(ask_secret "Lidarr API key" "$LIDARR_API_KEY")
+  dim "  Choose the Lidarr root folder and profiles in Octo's admin UI after startup."
+fi
+echo
+
+# ─────────────────────────────────────────────────────────────────
 # Storage / layout (keep the simple defaults visible)
 # ─────────────────────────────────────────────────────────────────
 bold "─── Storage / layout ───────────────────────────────────────"
@@ -278,9 +301,19 @@ SLSKD_DOWNLOAD_TIMEOUT_SECONDS=180
 SLSKD_SOULSEEK_USERNAME=$SLSKD_SOULSEEK_USERNAME
 SLSKD_SOULSEEK_PASSWORD="$SLSKD_SOULSEEK_PASSWORD"
 
+# === Existing Lidarr (optional) ===
+LIDARR_URL=$LIDARR_URL
+LIDARR_API_KEY=$LIDARR_API_KEY
+LIDARR_ROOT_FOLDER_PATH=$LIDARR_ROOT_FOLDER_PATH
+LIDARR_QUALITY_PROFILE_ID=$LIDARR_QUALITY_PROFILE_ID
+LIDARR_METADATA_PROFILE_ID=$LIDARR_METADATA_PROFILE_ID
+LIDARR_COMPLETION_MODE=$LIDARR_COMPLETION_MODE
+LIDARR_IMPORT_TIMEOUT_SECONDS=$LIDARR_IMPORT_TIMEOUT_SECONDS
+
 # === Storage / layout ===
 STORAGE_MODE=$STORAGE_MODE
 DOWNLOAD_MODE=Track
+DOWNLOAD_SOURCE=$DOWNLOAD_SOURCE
 DOWNLOAD_ON_STAR=true
 DOWNLOAD_ALBUM_ON_STAR=true
 WAIT_FOR_LOSSLESS_ON_PLAY=false
@@ -353,6 +386,9 @@ check_svc "Navidrome"  "navidrome"
 check_svc "Last.fm"    "lastfm"
 check_svc "yt-dlp shim" "ytDlpShim"
 check_svc "slskd"      "slskd"
+if [ "${DOWNLOAD_SOURCE,,}" = "lidarr" ]; then
+  check_svc "Lidarr" "lidarr"
+fi
 
 # ─────────────────────────────────────────────────────────────────
 # Done
@@ -370,7 +406,11 @@ echo "     Use your existing Navidrome credentials — Octo just proxies."
 echo
 echo "  3. Test it: search for an artist you don't fully own. Owned tracks come"
 echo "     up first; recommendations from Last.fm fill the rest. Tap one to hear"
-echo "     the YouTube preview. Heart it to download via Soulseek."
+if [ "${DOWNLOAD_SOURCE,,}" = "lidarr" ]; then
+  echo "     the YouTube preview. Heart it to send its full album to Lidarr."
+else
+  echo "     the YouTube preview. Heart it to download via Soulseek."
+fi
 echo
 dim "  slskd web UI:    http://<this-host>:5030    (admin / shown above)"
 dim "  Stop:            docker compose down"

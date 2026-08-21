@@ -5,6 +5,7 @@ using System.Text.Json.Nodes;
 using Octo.Models.Settings;
 using Octo.Services.Admin;
 using Octo.Services.LastFm;
+using Octo.Services.Lidarr;
 using Octo.Services.Soulseek;
 using Octo.Services.Subsonic;
 
@@ -28,11 +29,13 @@ public class AdminController : ControllerBase
     private readonly SettingsFileWriter _settings;
     private readonly IOptionsMonitor<SubsonicSettings> _subsonicOpts;
     private readonly IOptionsMonitor<SoulseekSettings> _soulseekOpts;
+    private readonly IOptionsMonitor<LidarrSettings> _lidarrOpts;
     private readonly IOptionsMonitor<LastFmSettings> _lastFmOpts;
     private readonly IOptionsMonitor<NotificationSettings> _notificationOpts;
     private readonly Octo.Services.Notifications.NotificationService _notifications;
     private readonly IConfiguration _config;
     private readonly SoulseekClient _slskd;
+    private readonly LidarrClient _lidarr;
     private readonly SubsonicProxyService _proxy;
     private readonly SubsonicDiscoveryService _discovery;
     private readonly NavidromeIdentityService _navIdentity;
@@ -49,11 +52,13 @@ public class AdminController : ControllerBase
         SettingsFileWriter settings,
         IOptionsMonitor<SubsonicSettings> subsonicOpts,
         IOptionsMonitor<SoulseekSettings> soulseekOpts,
+        IOptionsMonitor<LidarrSettings> lidarrOpts,
         IOptionsMonitor<LastFmSettings> lastFmOpts,
         IOptionsMonitor<NotificationSettings> notificationOpts,
         Octo.Services.Notifications.NotificationService notifications,
         IConfiguration config,
         SoulseekClient slskd,
+        LidarrClient lidarr,
         SubsonicProxyService proxy,
         SubsonicDiscoveryService discovery,
         NavidromeIdentityService navIdentity,
@@ -71,11 +76,13 @@ public class AdminController : ControllerBase
         _settings = settings;
         _subsonicOpts = subsonicOpts;
         _soulseekOpts = soulseekOpts;
+        _lidarrOpts = lidarrOpts;
         _lastFmOpts = lastFmOpts;
         _notificationOpts = notificationOpts;
         _notifications = notifications;
         _config = config;
         _slskd = slskd;
+        _lidarr = lidarr;
         _proxy = proxy;
         _discovery = discovery;
         _navIdentity = navIdentity;
@@ -287,6 +294,7 @@ public class AdminController : ControllerBase
     {
         var subsonic = _subsonicOpts.CurrentValue;
         var soulseek = _soulseekOpts.CurrentValue;
+        var lidarr = _lidarrOpts.CurrentValue;
         var lastfm = _lastFmOpts.CurrentValue;
         var notif = _notificationOpts.CurrentValue;
 
@@ -308,6 +316,13 @@ public class AdminController : ControllerBase
                 // These two are rendered by the dashboard but were missing here, so their
                 // fields never pre-filled with the saved value.
                 ["DownloadSource"] = subsonic.DownloadSource.ToString(),
+                ["HeartDownloadSources"] = subsonic.EffectiveHeartDownloadSources()
+                    .Select(step => new Dictionary<string, object>
+                    {
+                        ["Source"] = step.Source.ToString(),
+                        ["SongEnabled"] = step.SongEnabled == true,
+                        ["AlbumEnabled"] = step.AlbumEnabled == true,
+                    }).ToList(),
                 ["AutoDetectDownloadPath"] = subsonic.AutoDetectDownloadPath,
                 ["LibraryPath"] = subsonic.LibraryPath,
                 ["FolderStructure"] = subsonic.FolderStructure.ToString(),
@@ -330,6 +345,16 @@ public class AdminController : ControllerBase
                 ["MinFileSizeBytes"] = soulseek.MinFileSizeBytes,
                 ["PreferredExtension"] = soulseek.PreferredExtension,
                 ["DownloadTimeoutSeconds"] = soulseek.DownloadTimeoutSeconds,
+            },
+            ["Lidarr"] = new Dictionary<string, object>
+            {
+                ["BaseUrl"] = lidarr.BaseUrl ?? "",
+                ["ApiKey"] = lidarr.ApiKey ?? "",
+                ["RootFolderPath"] = lidarr.RootFolderPath ?? "",
+                ["QualityProfileId"] = lidarr.QualityProfileId,
+                ["MetadataProfileId"] = lidarr.MetadataProfileId,
+                ["CompletionMode"] = lidarr.CompletionMode.ToString(),
+                ["ImportTimeoutSeconds"] = lidarr.ImportTimeoutSeconds,
             },
             ["YouTube"] = new Dictionary<string, object>
             {
@@ -426,6 +451,7 @@ public class AdminController : ControllerBase
     {
         var subsonic = _subsonicOpts.CurrentValue;
         var soulseek = _soulseekOpts.CurrentValue;
+        var lidarr = _lidarrOpts.CurrentValue;
         var lastfm = _lastFmOpts.CurrentValue;
         var notif = _notificationOpts.CurrentValue;
 
@@ -441,6 +467,14 @@ public class AdminController : ControllerBase
                 ["WaitForLosslessOnPlay"] = subsonic.WaitForLosslessOnPlay,
                 ["LosslessWaitTimeoutSeconds"] = subsonic.LosslessWaitTimeoutSeconds,
                 ["DownloadSource"] = subsonic.DownloadSource.ToString(),
+                ["HeartDownloadSources"] = new JsonArray(
+                    subsonic.EffectiveHeartDownloadSources()
+                        .Select(step => (JsonNode)new JsonObject
+                        {
+                            ["Source"] = step.Source.ToString(),
+                            ["SongEnabled"] = step.SongEnabled == true,
+                            ["AlbumEnabled"] = step.AlbumEnabled == true,
+                        }).ToArray()),
                 ["AutoDetectDownloadPath"] = subsonic.AutoDetectDownloadPath,
                 ["LibraryPath"] = subsonic.LibraryPath,
                 ["FolderStructure"] = subsonic.FolderStructure.ToString(),
@@ -463,6 +497,16 @@ public class AdminController : ControllerBase
                 ["MinFileSizeBytes"] = soulseek.MinFileSizeBytes,
                 ["PreferredExtension"] = soulseek.PreferredExtension,
                 ["DownloadTimeoutSeconds"] = soulseek.DownloadTimeoutSeconds,
+            },
+            ["Lidarr"] = new JsonObject
+            {
+                ["BaseUrl"] = lidarr.BaseUrl ?? "",
+                ["ApiKey"] = lidarr.ApiKey ?? "",
+                ["RootFolderPath"] = lidarr.RootFolderPath ?? "",
+                ["QualityProfileId"] = lidarr.QualityProfileId,
+                ["MetadataProfileId"] = lidarr.MetadataProfileId,
+                ["CompletionMode"] = lidarr.CompletionMode.ToString(),
+                ["ImportTimeoutSeconds"] = lidarr.ImportTimeoutSeconds,
             },
             ["YouTube"] = new JsonObject
             {
@@ -564,6 +608,9 @@ public class AdminController : ControllerBase
             "Soulseek:BaseUrl", "Soulseek:Username", "Soulseek:Password",
             "Soulseek:SearchWaitSeconds", "Soulseek:MinFileSizeBytes",
             "Soulseek:PreferredExtension", "Soulseek:DownloadTimeoutSeconds",
+            "Lidarr:BaseUrl", "Lidarr:ApiKey", "Lidarr:RootFolderPath",
+            "Lidarr:QualityProfileId", "Lidarr:MetadataProfileId",
+            "Lidarr:CompletionMode", "Lidarr:ImportTimeoutSeconds",
             "YouTube:ShimUrl",
             "LastFm:ApiKey", "LastFm:EnableRadio", "LastFm:RadioTrackCount",
             "LastFm:RadioCacheDurationHours",
@@ -601,7 +648,7 @@ public class AdminController : ControllerBase
     /// <summary>
     /// Quick health snapshot for each backing service. The UI shows a status
     /// dot per service; the user can tell at a glance whether Octo can reach
-    /// Navidrome, slskd, the yt-dlp shim, and Last.fm.
+    /// Navidrome, slskd, Lidarr, the yt-dlp shim, and Last.fm.
     /// </summary>
     [HttpGet("status")]
     public async Task<IActionResult> GetStatus(CancellationToken ct)
@@ -611,6 +658,7 @@ public class AdminController : ControllerBase
         {
             ["navidrome"] = ProbeNavidromeAsync(ct),
             ["slskd"] = ProbeSlskdAsync(ct),
+            ["lidarr"] = ProbeLidarrAsync(ct),
             ["ytDlpShim"] = ProbeYouTubeShimAsync(ct),
             ["lastfm"] = ProbeLastFmAsync(ct),
         };
@@ -626,6 +674,30 @@ public class AdminController : ControllerBase
             services = results,
             time = DateTimeOffset.UtcNow.ToString("O"),
         });
+    }
+
+    /// <summary>Choices owned by the connected Lidarr instance for add-album defaults.</summary>
+    [HttpGet("lidarr/options")]
+    public async Task<IActionResult> GetLidarrOptions(CancellationToken ct)
+    {
+        try { return new JsonResult(await _lidarr.GetOptionsAsync(ct)); }
+        catch (Exception ex) { return BadRequest(new { error = ex.Message }); }
+    }
+
+    public record LidarrConnectionTestRequest(string? BaseUrl, string? ApiKey);
+
+    /// <summary>Tests entered credentials without persisting them.</summary>
+    [HttpPost("lidarr/test")]
+    public async Task<IActionResult> TestLidarrConnection(
+        [FromBody] LidarrConnectionTestRequest request, CancellationToken ct)
+    {
+        try
+        {
+            var options = await _lidarr.TestConnectionAsync(
+                request.BaseUrl ?? "", request.ApiKey ?? "", ct);
+            return Ok(new { ok = true, message = "Connected to Lidarr. Choices loaded.", options });
+        }
+        catch (Exception ex) { return BadRequest(new { ok = false, error = ex.Message }); }
     }
 
     /// <summary>
@@ -677,6 +749,28 @@ public class AdminController : ControllerBase
         catch (Exception ex) { return new ServiceProbe(false, ex.Message); }
     }
 
+    private async Task<ServiceProbe> ProbeLidarrAsync(CancellationToken ct)
+    {
+        var settings = _lidarrOpts.CurrentValue;
+        var lidarrEnabled = _subsonicOpts.CurrentValue.EffectiveHeartDownloadSources()
+            .Any(step => step.Source == HeartDownloadSource.Lidarr
+                         && (step.SongEnabled == true || step.AlbumEnabled == true));
+        if (string.IsNullOrWhiteSpace(settings.BaseUrl) || string.IsNullOrWhiteSpace(settings.ApiKey))
+            return lidarrEnabled
+                ? new ServiceProbe(false, "selected but not configured")
+                : new ServiceProbe(true, "not configured (optional)", Warning: true);
+        if (lidarrEnabled
+            && (string.IsNullOrWhiteSpace(settings.RootFolderPath)
+                || settings.QualityProfileId <= 0 || settings.MetadataProfileId <= 0))
+            return new ServiceProbe(false, "select a root folder and profiles");
+        try
+        {
+            var ok = await _lidarr.IsReachableAsync(ct);
+            return new ServiceProbe(ok, ok ? "reachable" : "unreachable / API key invalid");
+        }
+        catch (Exception ex) { return new ServiceProbe(false, ex.Message); }
+    }
+
     private async Task<ServiceProbe> ProbeYouTubeShimAsync(CancellationToken ct)
     {
         try
@@ -707,7 +801,7 @@ public class AdminController : ControllerBase
         catch (Exception ex) { return new ServiceProbe(false, ex.Message); }
     }
 
-    private record ServiceProbe(bool Ok, string Detail);
+    private record ServiceProbe(bool Ok, string Detail, bool Warning = false);
 
     /// <summary>The release this build came from, e.g. "2026.07.29". Falls back to the
     /// assembly version if the informational version was not stamped.</summary>
