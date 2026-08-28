@@ -42,6 +42,7 @@ public class NavidromeIdentityService
     private string? _subsonicToken;
     private string? _subsonicSalt;
     private string? _username;
+    private readonly Dictionary<string, string> _nativeUsers = new(StringComparer.Ordinal);
 
     private string? _detectedFolder;
     private List<NavidromeLibrary> _libraries = new();
@@ -106,7 +107,18 @@ public class NavidromeIdentityService
             if (root.ValueKind != JsonValueKind.Object) return;
             var token = root.TryGetProperty("token", out var t) ? t.GetString() : null;
             var isAdmin = root.TryGetProperty("isAdmin", out var a) && a.ValueKind == JsonValueKind.True;
-            if (string.IsNullOrEmpty(token) || !isAdmin) return;
+            var loginUsername = root.TryGetProperty("username", out var loginUser) ? loginUser.GetString() : null;
+            if (string.IsNullOrEmpty(token)) return;
+
+            if (!string.IsNullOrEmpty(loginUsername))
+            {
+                lock (_lock)
+                {
+                    _nativeUsers[token] = loginUsername;
+                    while (_nativeUsers.Count > 100) _nativeUsers.Remove(_nativeUsers.Keys.First());
+                }
+            }
+            if (!isAdmin) return;
 
             lock (_lock)
             {
@@ -120,6 +132,14 @@ public class NavidromeIdentityService
             _ = Task.Run(() => DetectMusicFolderAsync(force: true));
         }
         catch { /* not a login response we understand; ignore */ }
+    }
+
+    /// <summary>Returns the user associated with a native login token captured while
+    /// proxying /auth/login. Tokens and mappings are memory-only.</summary>
+    public string? UsernameForNativeToken(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token)) return null;
+        lock (_lock) return _nativeUsers.GetValueOrDefault(token);
     }
 
     /// <summary>

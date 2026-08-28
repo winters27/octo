@@ -45,6 +45,9 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
+      - name: Install Radio transcoder
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Restore dependencies
         run: dotnet restore
 

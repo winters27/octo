@@ -879,8 +879,8 @@ section[data-pane].active { display: block; }
 .set-row.stack { flex-direction: column; align-items: stretch; gap: 12px; }
 
 .set-info { min-width: 0; }
-.set-info-t { font-size: 13px; font-weight: 500; color: var(--fg); }
-.set-info-d { margin-top: 3px; font-size: 12px; color: var(--fg-soft); line-height: 1.5; max-width: 52ch; }
+.set-info-t { display: block; font-size: 13px; font-weight: 500; color: var(--fg); }
+.set-info-d { display: block; margin-top: 3px; font-size: 12px; color: var(--fg-soft); line-height: 1.5; max-width: 52ch; }
 .set-opt { color: var(--fg-faint); font-weight: 400; }
 .set-ctrl { flex-shrink: 0; display: flex; align-items: center; gap: 8px; }
 
@@ -899,6 +899,8 @@ section[data-pane].active { display: block; }
 .set-input::placeholder { color: var(--fg-faint); }
 .set-input:hover { border-color: var(--border-strong); }
 .set-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring); }
+.set-input:disabled { opacity: 0.5; cursor: not-allowed; }
+.set-row.is-disabled .set-info { opacity: 0.58; }
 .set-inline { display: flex; gap: 8px; }
 .set-inline .set-input { flex: 1 1 auto; min-width: 0; }
 .set-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
@@ -1096,6 +1098,51 @@ section[data-pane].active { display: block; }
 }
 .set-card .form-actions .btn-primary {
   padding: 7px 18px;
+}
+
+/* ── Last.fm personalized + pinned Radio ── */
+.radio-advanced { border-top: 1px solid rgba(151, 177, 185, 0.10); }
+.radio-advanced summary {
+  min-height: 44px; display: flex; align-items: center; padding: 0 18px;
+  color: var(--fg-soft); font-size: 13px; font-weight: 500; cursor: pointer;
+}
+.radio-advanced summary:focus-visible { outline: 2px solid var(--accent-hover); outline-offset: -3px; }
+.radio-preset-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.radio-preset-actions .btn, .radio-row-actions .btn { min-height: 44px; }
+.radio-discovery-list { display: grid; gap: 10px; }
+.radio-discovery-row {
+  display: grid; grid-template-columns: minmax(220px, 1fr) 44px auto;
+  align-items: center; gap: 12px; padding: 12px;
+  border: 1px solid var(--border); border-radius: var(--r-2); background: var(--bg-2);
+}
+.radio-discovery-row.is-disabled .radio-discovery-fields { opacity: .58; }
+.radio-discovery-fields { display: grid; grid-template-columns: minmax(150px, .7fr) minmax(220px, 1.3fr); gap: 10px; }
+.radio-discovery-fields label { display: grid; gap: 5px; color: var(--fg-mute); font-size: 11.5px; }
+.radio-row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.field-error { color: var(--bad); font-size: 12.5px; line-height: 1.5; }
+.radio-status { min-height: 92px; padding: 16px 18px; border-top: 1px solid rgba(151, 177, 185, 0.08); }
+.radio-state-copy { margin: 0 0 12px; color: var(--fg-soft); line-height: 1.5; }
+.radio-station-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.radio-station-item { padding: 13px; border: 1px solid var(--border); border-radius: var(--r-2); background: var(--bg-2); }
+.radio-station-item div { display: flex; justify-content: space-between; gap: 12px; }
+.radio-station-item strong { color: var(--fg); font-size: 13.5px; }
+.radio-station-item span { color: var(--fg-mute); font-size: 11.5px; white-space: nowrap; }
+.radio-station-item p { margin: 8px 0 0; color: var(--fg-soft); font-size: 12px; line-height: 1.55; }
+.radio-empty { padding: 22px; color: var(--fg-mute); text-align: center; line-height: 1.5; }
+.radio-status-toolbar .set-ctrl { min-width: min(100%, 380px); }
+.radio-status-toolbar select { min-width: 190px; }
+.radio-reset-row { border-top: 1px solid rgba(151, 177, 185, 0.08); }
+
+@media (max-width: 760px) {
+  .radio-discovery-row { grid-template-columns: 1fr 44px; }
+  .radio-discovery-fields { grid-column: 1 / -1; grid-template-columns: 1fr; }
+  .radio-discovery-row > .switch { grid-column: 2; grid-row: 2; justify-self: end; }
+  .radio-row-actions { grid-column: 1; grid-row: 2; justify-content: stretch; }
+  .radio-row-actions .btn { flex: 1 1 calc(50% - 8px); }
+  .radio-station-grid { grid-template-columns: 1fr; }
+  .radio-status-toolbar, .radio-reset-row { align-items: stretch; flex-direction: column; }
+  .radio-status-toolbar .set-ctrl { width: 100%; min-width: 0; flex-wrap: wrap; }
+  .radio-status-toolbar select, .radio-status-toolbar .btn, .radio-reset-row .btn { width: 100%; min-height: 44px; }
 }
 
 /* ── Fetched songs (download log) ── */

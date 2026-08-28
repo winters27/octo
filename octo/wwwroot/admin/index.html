@@ -465,7 +465,7 @@
         <header class="page-header">
           <div>
             <h1>Last.fm</h1>
-            <p>Powers radio (similar songs) and search-result discovery. <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener">Get a free key →</a></p>
+            <p>Powers start-from-a-song queues, dynamic and pinned stations, and search-result discovery. <a href="https://www.last.fm/api/account/create" target="_blank" rel="noopener">Get a free key →</a></p>
           </div>
         </header>
 
@@ -488,30 +488,129 @@
         </div>
 
         <div class="set-section">
-          <div class="set-head"><h3 class="set-title">Radio</h3></div>
+          <div class="set-head">
+            <h3 class="set-title">Radio basics</h3>
+            <p class="set-desc">Song radio is a one-time queue requested by a client. Dynamic and pinned radio are reusable stations.</p>
+          </div>
           <form data-section="lastfm-radio" class="set-card">
             <div class="set-row">
               <div class="set-info">
-                <div class="set-info-t">Enable radio</div>
-                <div class="set-info-d">Powers <code>/rest/getSimilarSongs2</code> in your Subsonic clients.</div>
+                <div class="set-info-t">Enable Last.fm radio</div>
+                <div class="set-info-d">Master switch for start-from-a-song queues and all dynamic or pinned stations.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-lastfm-radio" name="LastFm.EnableRadio" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row stack">
               <div class="set-info">
-                <div class="set-info-t">Track count</div>
-                <div class="set-info-d">How many similar tracks Last.fm returns per radio request.</div>
+                <div class="set-info-t">Tracks per station or queue</div>
+                <div class="set-info-d">Maximum tracks in start-from-a-song queues and in dynamic or pinned station snapshots.</div>
               </div>
-              <input class="set-input" id="f-lastfm-count" name="LastFm.RadioTrackCount" type="number" min="5" max="200" />
+              <input class="set-input" id="f-lastfm-count" name="LastFm.RadioTrackCount" type="number" min="10" max="100" />
             </div>
             <div class="set-row stack">
               <div class="set-info">
-                <div class="set-info-t">Cache (hours)</div>
-                <div class="set-info-d">How long Last.fm responses are cached server-side.</div>
+                <div class="set-info-t">Last.fm lookup cache (hours)</div>
+                <div class="set-info-d">How long Octo reuses recommendation responses across radio features.</div>
               </div>
               <input class="set-input" id="f-lastfm-cache" name="LastFm.RadioCacheDurationHours" type="number" min="0" />
             </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Refresh stations every (hours)</div>
+                <div class="set-info-d">Rebuilds dynamic and pinned station queues in the background. The current snapshot stays playable until its replacement is ready. Default: 12 hours.</div>
+              </div>
+              <input class="set-input" name="LastFm.RefreshIntervalHours" type="number" min="1" max="168" />
+            </div>
           </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">How stations play</h3>
+            <p class="set-desc">Applies to dynamic and pinned stations only. Enable either playback method or both; song radio remains a client-created track queue.</p>
+          </div>
+          <form data-section="lastfm-publication" class="set-card">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Playlist method</div><div class="set-info-d">Shows each station in the client's Playlists section. This provides full track controls and preserves normal local-song quality; heart a discovery track to fetch a permanent lossless copy.</div></div>
+              <label class="switch"><input type="checkbox" name="LastFm.ExposeRadioAsPlaylists" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Streaming method</div><div class="set-info-d">Shows each station in the client's Radio section as one continuous MP3 stream. Tracks are transcoded to the quality selected below.</div></div>
+              <label class="switch"><input type="checkbox" id="f-radio-streams" name="LastFm.ExposeRadioAsStreams" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="notice notice-warn">
+              <strong>Radio streams cannot add songs to your library.</strong> A client sees one continuous stream rather than individual songs, so liking or hearting the current track cannot trigger an Octo download. Open the station in Playlists when you want to heart a song and add it.
+            </div>
+            <div class="set-row stack" id="radio-stream-quality-row">
+              <div class="set-info"><div class="set-info-t">Internet radio quality</div><div class="set-info-d">MP3 bitrate for new continuous streams. Reconnect to apply a change. This does not affect playlist playback or downloaded quality.</div></div>
+              <select class="set-input" id="f-radio-stream-quality" name="LastFm.RadioStreamBitrateKbps" data-number="true">
+                <option value="96">96 kbps</option>
+                <option value="128">128 kbps</option>
+                <option value="192">192 kbps</option>
+                <option value="256">256 kbps</option>
+                <option value="320">320 kbps</option>
+              </select>
+            </div>
+            <div class="set-row" id="radio-icy-metadata-row">
+              <div class="set-info"><div class="set-info-t">Now-playing metadata</div><div class="set-info-d">Embeds Octo's existing station artist and title in the MP3 stream for radio clients that request ICY metadata. Reconnect after changing this setting.</div></div>
+              <label class="switch"><input type="checkbox" id="f-radio-icy-metadata" name="LastFm.EnableIcyMetadata" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Dynamic stations</h3>
+            <p class="set-desc">Builds read-only stations from each listener's completed plays. Listening history stays private in Octo.</p>
+          </div>
+          <form data-section="lastfm-personalized" class="set-card">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Enable dynamic stations</div><div class="set-info-d">Starts with Starter Radio, then grows into Your Mix, discovery, artist, and genre stations.</div></div>
+              <label class="switch"><input type="checkbox" name="LastFm.EnablePersonalizedStations" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Discovery balance</div><div class="set-info-d">Percentage of Your Mix reserved for less-familiar recommendations.</div></div>
+              <input class="set-input" name="LastFm.DiscoveryPercent" type="number" min="0" max="100" />
+            </div>
+            <details class="radio-advanced">
+              <summary>Personalization threshold and history</summary>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">Completed plays before Your Mix</div><div class="set-info-d">Before this many completed plays, Octo offers Starter Radio. Afterward it can build Your Mix plus discovery, artist, and genre stations. Default: 10 plays.</div></div><input class="set-input" name="LastFm.MinimumPlays" type="number" min="3" max="100" /></div>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">Keep completed plays for (days)</div><div class="set-info-d">Older plays stop influencing dynamic stations and are removed from Octo's local listening history. Downloaded music is unaffected. Default: 90 days.</div></div><input class="set-input" name="LastFm.HistoryRetentionDays" type="number" min="7" max="365" /></div>
+            </details>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head"><h3 class="set-title">Pinned stations</h3><p class="set-desc">You choose fixed names and tag categories; Octo refreshes the tracks inside them automatically. Add up to 12, each combining up to five Last.fm tags.</p></div>
+          <form data-section="lastfm-discovery" class="set-card" id="radio-discovery-form">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Show pinned stations</div><div class="set-info-d">Hiding these stations preserves their definitions and snapshots.</div></div>
+              <label class="switch"><input type="checkbox" name="LastFm.EnableDiscoveryStations" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="radio-preset-actions" aria-label="Add a discovery station">
+                <button class="btn btn-ghost" type="button" data-radio-preset="rock">+ Rock</button>
+                <button class="btn btn-ghost" type="button" data-radio-preset="jazz">+ Jazz</button>
+                <button class="btn btn-ghost" type="button" data-radio-preset="electronic">+ Electronic</button>
+                <button class="btn btn-ghost" type="button" id="radio-add-custom">+ Custom</button>
+              </div>
+              <div id="radio-discovery-list" class="radio-discovery-list" aria-live="polite"></div>
+              <input type="hidden" id="radio-discovery-json" name="LastFm.DiscoveryStations" data-json="true" />
+              <div id="radio-discovery-error" class="field-error" role="alert" hidden></div>
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head"><h3 class="set-title">Station status</h3><p class="set-desc">Last good snapshots stay available during refreshes and provider outages.</p></div>
+          <div class="set-card radio-status-card">
+            <div class="set-row radio-status-toolbar">
+              <label class="set-info" for="radio-user"><span class="set-info-t">Listener</span><span class="set-info-d" id="radio-listener-summary">Appears after a Subsonic client signs in through Octo.</span></label>
+              <div class="set-ctrl"><select class="set-input" id="radio-user" aria-label="Radio listener" hidden></select></div>
+            </div>
+            <div id="radio-status" class="radio-status" aria-live="polite">Loading radio status…</div>
+            <div class="set-row radio-reset-row"><div class="set-info"><div class="set-info-t">Reset this listener's Radio history</div><div class="set-info-d">Removes learned signals and station snapshots only. Downloaded music is untouched.</div></div><button class="btn btn-ghost" id="radio-reset" type="button" disabled>Reset history</button></div>
+          </div>
         </div>
       </section>
 
@@ -755,6 +854,7 @@
             <textarea id="raw-editor" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" placeholder="{}"></textarea>
             <div class="field-help">
               Top-level keys: <code>Subsonic</code>, <code>Library</code>, <code>Soulseek</code>, <code>Lidarr</code>, <code>YouTube</code>, <code>LastFm</code>, <code>Metadata</code>.
+              Radio remains inside <code>LastFm</code>; pinned rows are the ordered <code>LastFm.DiscoveryStations</code> array and should be edited as complete objects with stable <code>Id</code>, <code>Name</code>, <code>Enabled</code>, and <code>Tags</code> fields.
               Anything you set here overrides the corresponding env var until removed.
             </div>
           </div>

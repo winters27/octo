@@ -59,11 +59,20 @@ services:
       Lidarr__CompletionMode: ${LIDARR_COMPLETION_MODE:-Accepted}
       Lidarr__ImportTimeoutSeconds: ${LIDARR_IMPORT_TIMEOUT_SECONDS:-1800}
 
-      # ----- Last.fm radio -----
+      # ----- Last.fm radio (core Octo feature; no separate Radio service) -----
       LastFm__ApiKey: ${LASTFM_API_KEY:-}
       LastFm__EnableRadio: ${LASTFM_ENABLE_RADIO:-true}
       LastFm__RadioTrackCount: ${LASTFM_RADIO_TRACK_COUNT:-50}
       LastFm__RadioCacheDurationHours: ${LASTFM_RADIO_CACHE_HOURS:-24}
+      LastFm__EnablePersonalizedStations: ${LASTFM_ENABLE_PERSONALIZED_STATIONS:-true}
+      LastFm__EnableDiscoveryStations: ${LASTFM_ENABLE_DISCOVERY_STATIONS:-true}
+      LastFm__ExposeRadioAsPlaylists: ${LASTFM_EXPOSE_AS_PLAYLISTS:-true}
+      LastFm__ExposeRadioAsStreams: ${LASTFM_EXPOSE_AS_STREAMS:-true}
+      LastFm__RadioStreamBitrateKbps: ${LASTFM_RADIO_STREAM_BITRATE_KBPS:-192}
+      LastFm__HistoryRetentionDays: ${LASTFM_HISTORY_RETENTION_DAYS:-90}
+      LastFm__DiscoveryPercent: ${LASTFM_DISCOVERY_PERCENT:-35}
+      LastFm__RefreshIntervalHours: ${LASTFM_REFRESH_INTERVAL_HOURS:-12}
+      LastFm__MinimumPlays: ${LASTFM_MINIMUM_PLAYS:-10}
 
       # ----- Metadata language (genre tags etc. from Deezer / Last.fm) -----
       Metadata__Language: ${METADATA_LANGUAGE:-en}

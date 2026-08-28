@@ -91,6 +91,14 @@ public class CacheCleanupService : BackgroundService
                 if (cancellationToken.IsCancellationRequested)
                     break;
 
+                // Continuous Radio owns this sub-cache. Its prepared starter tracks
+                // must outlive the generic one-hour download cache so every issued
+                // (12-hour) station URL keeps its immediate-start guarantee.
+                var relativePath = Path.GetRelativePath(cachePath, filePath);
+                if (relativePath.StartsWith($"radio{Path.DirectorySeparatorChar}",
+                        StringComparison.OrdinalIgnoreCase))
+                    continue;
+
                 try
                 {
                     var fileInfo = new FileInfo(filePath);

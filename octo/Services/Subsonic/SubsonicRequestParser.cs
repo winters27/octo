@@ -9,6 +9,27 @@ namespace Octo.Services.Subsonic;
 /// </summary>
 public class SubsonicRequestParser
 {
+    /// <summary>Reads every occurrence of a parameter without changing the legacy
+    /// dictionary parser, whose comma-joined behavior is relied on by relays.</summary>
+    public async Task<IReadOnlyList<string>> ExtractParameterValuesAsync(HttpRequest request,
+        string name, CancellationToken cancellationToken = default)
+    {
+        var values = new List<string>();
+        if (request.Query.TryGetValue(name, out var query))
+            values.AddRange(query.Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value!));
+        if (request.HasFormContentType)
+        {
+            try
+            {
+                var form = await request.ReadFormAsync(cancellationToken);
+                if (form.TryGetValue(name, out var body))
+                    values.AddRange(body.Where(value => !string.IsNullOrWhiteSpace(value)).Select(value => value!));
+            }
+            catch { /* the regular parser retains its existing fallback behavior */ }
+        }
+        return values;
+    }
+
     /// <summary>
     /// Extracts all parameters from an HTTP request (query parameters + body parameters).
     /// Supports multiple content types: application/x-www-form-urlencoded and application/json.

@@ -3,6 +3,7 @@ using System.Xml.Linq;
 using System.Text.Json;
 using Octo.Models.Domain;
 using Octo.Models.Subsonic;
+using Octo.Models.Radio;
 using Octo.Services.Soulseek;
 
 namespace Octo.Services.Subsonic;
@@ -134,6 +135,46 @@ public class SubsonicResponseBuilder
             )
         );
         return new ContentResult { Content = doc.ToString(), ContentType = "application/xml" };
+    }
+
+    public Dictionary<string, object> RadioPlaylistFields(LastFmRadioStation station)
+    {
+        var fields = new Dictionary<string, object>
+        {
+            ["id"] = station.Id, ["name"] = station.Name, ["owner"] = station.Owner,
+            ["public"] = false, ["songCount"] = station.Tracks.Count,
+            ["duration"] = station.Tracks.Sum(track => track.Duration ?? 180),
+            ["created"] = station.CreatedUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+            ["changed"] = station.ChangedUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+            ["coverArt"] = "octo-radio", ["readonly"] = true,
+            ["validUntil"] = station.ValidUntilUtc.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+        };
+        return fields;
+    }
+
+    public IActionResult CreateRadioPlaylistResponse(string format, LastFmRadioStation station,
+        IReadOnlyList<Song> songs)
+    {
+        var fields = RadioPlaylistFields(station);
+        fields["songCount"] = songs.Count;
+        fields["duration"] = songs.Sum(song => song.Duration ?? 180);
+        if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
+        {
+            var playlist = new Dictionary<string, object>(fields)
+            {
+                ["entry"] = songs.Select(ConvertSongToJson).ToList()
+            };
+            return CreateJsonResponse(new Dictionary<string, object>
+            {
+                ["status"] = "ok", ["version"] = SubsonicVersion, ["playlist"] = playlist
+            });
+        }
+        var ns = XNamespace.Get(SubsonicNamespace);
+        var document = new XDocument(new XElement(ns + "subsonic-response",
+            new XAttribute("status", "ok"), new XAttribute("version", SubsonicVersion),
+            new XElement(ns + "playlist", Attributes(fields),
+                songs.Select(song => ConvertSongToXml(song, ns)))));
+        return new ContentResult { Content = document.ToString(), ContentType = "application/xml" };
     }
 
     /// <summary>
@@ -401,7 +442,7 @@ public class SubsonicResponseBuilder
             ["id"] = song.Id,
             ["parent"] = albumId,
             ["isDir"] = false,
-            ["title"] = song.Title,
+            ["title"] = song.Title ?? "",
             ["album"] = albumName,
             ["artist"] = song.Artist ?? "",
             ["track"] = track,

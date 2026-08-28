@@ -8,6 +8,7 @@ using Octo.Models.Domain;
 using Octo.Models.Settings;
 using Octo.Models.Download;
 using Octo.Models.Search;
+using Octo.Models.Radio;
 using Octo.Models.Subsonic;
 using Octo.Services;
 using Octo.Services.Common;
@@ -39,7 +40,9 @@ public class SubsonicController : ControllerBase
     private readonly SubsonicProxyService _proxyService;
     private readonly PlaylistSyncService? _playlistSyncService;
     private readonly LastFmService? _lastFmService;
-    private readonly LastFmSettings _lastFmSettings;
+    private readonly LastFmRadioTrackResolver _radioTrackResolver;
+    private readonly IOptionsMonitor<LastFmSettings> _lastFmSettingsOptions;
+    private LastFmSettings _lastFmSettings => _lastFmSettingsOptions.CurrentValue;
     private readonly CoverArtService? _coverArtService;
     private readonly CoverArtAggregator? _coverArtAggregator;
     private readonly ExternalIdRegistry _idRegistry;
@@ -49,6 +52,10 @@ public class SubsonicController : ControllerBase
     private readonly RadioQueueStore _radioQueueStore;
     private readonly NavidromeIdentityService _navIdentity;
     private readonly ILogger<SubsonicController> _logger;
+    private readonly LastFmRadioStateStore? _radioStateStore;
+    private readonly LastFmRadioRefreshQueue? _radioRefreshQueue;
+    private readonly LastFmRadioStreamSessionStore _radioStreamSessions;
+    private readonly LastFmRadioStreamService _radioStreams;
 
     public SubsonicController(
         IOptionsMonitor<SubsonicSettings> subsonicSettings,
@@ -65,12 +72,17 @@ public class SubsonicController : ControllerBase
         Octo.Services.Common.ExternalSearchService externalSearch,
         RadioQueueStore radioQueueStore,
         NavidromeIdentityService navIdentity,
+        LastFmRadioTrackResolver radioTrackResolver,
         ILogger<SubsonicController> logger,
-        IOptions<LastFmSettings> lastFmSettings,
+        IOptionsMonitor<LastFmSettings> lastFmSettings,
+        LastFmRadioStreamSessionStore radioStreamSessions,
+        LastFmRadioStreamService radioStreams,
         PlaylistSyncService? playlistSyncService = null,
         LastFmService? lastFmService = null,
         CoverArtService? coverArtService = null,
-        CoverArtAggregator? coverArtAggregator = null)
+        CoverArtAggregator? coverArtAggregator = null,
+        LastFmRadioStateStore? radioStateStore = null,
+        LastFmRadioRefreshQueue? radioRefreshQueue = null)
     {
         subsonicSettingsOptions = subsonicSettings;
         _metadataService = metadataService;
@@ -86,12 +98,17 @@ public class SubsonicController : ControllerBase
         _externalSearch = externalSearch;
         _radioQueueStore = radioQueueStore;
         _navIdentity = navIdentity;
+        _radioTrackResolver = radioTrackResolver;
         _playlistSyncService = playlistSyncService;
         _lastFmService = lastFmService;
-        _lastFmSettings = lastFmSettings.Value;
+        _lastFmSettingsOptions = lastFmSettings;
         _coverArtService = coverArtService;
         _coverArtAggregator = coverArtAggregator;
         _logger = logger;
+        _radioStateStore = radioStateStore;
+        _radioRefreshQueue = radioRefreshQueue;
+        _radioStreamSessions = radioStreamSessions;
+        _radioStreams = radioStreams;
         // No hard throw on a missing/blank Subsonic URL: that made every request
         // fail opaquely. Misconfiguration is now reported per-request with an
         // actionable message (see Ping and OctoNotConfiguredException), and the
@@ -181,8 +198,8 @@ public class SubsonicController : ControllerBase
                 // Collaboration tracks tagged "ArtistA • ArtistB" / "ArtistA & ArtistB" /
                 // "ArtistA feat. ArtistB" don't exist in Last.fm as compound artists.
                 // Strip to the primary artist so we get back useful similars.
-                seedArtist = NormalizeSeedArtist(seedArtist);
-                seedTitle  = NormalizeSeedTitle(seedTitle);
+                seedArtist = LastFmRadioSeedNormalizer.Artist(seedArtist);
+                seedTitle  = LastFmRadioSeedNormalizer.Title(seedTitle);
             }
         }
         catch (Exception ex)
@@ -238,34 +255,6 @@ public class SubsonicController : ControllerBase
         };
     }
 
-    private static string? NormalizeSeedArtist(string? artist)
-    {
-        if (string.IsNullOrWhiteSpace(artist)) return artist;
-        // Common collaboration separators. We want only the FIRST artist for
-        // Last.fm similar-tracks lookups; Last.fm doesn't index compound names.
-        var separators = new[] { " • ", " · ", " & ", " feat. ", " feat ", " ft. ", " ft ", " x ", " X ", " / ", ", ", " with " };
-        var s = artist;
-        foreach (var sep in separators)
-        {
-            var idx = s.IndexOf(sep, StringComparison.OrdinalIgnoreCase);
-            if (idx > 0) s = s[..idx];
-        }
-        return s.Trim();
-    }
-
-    private static string? NormalizeSeedTitle(string? title)
-    {
-        if (string.IsNullOrWhiteSpace(title)) return title;
-        // Strip "(feat. X)", "[feat X]", "(with Y)" parentheticals from the title
-        // so the seed lookup matches the canonical Last.fm track name.
-        var s = System.Text.RegularExpressions.Regex.Replace(
-            title,
-            @"\s*[\(\[](?:feat\.?|featuring|with|ft\.?)[^\)\]]*[\)\]]\s*",
-            "",
-            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        return s.Trim();
-    }
-
     private IActionResult BuildRandomSongsResponse(string format, List<Song> songs)
     {
         if (format == "json")
@@ -281,6 +270,468 @@ public class SubsonicController : ControllerBase
         // XML fallback (rare; Arpeggio uses JSON)
         return _responseBuilder.CreateResponse(format, "randomSongs", new { song = songs });
     }
+
+    [HttpGet, HttpPost]
+    [Route("rest/getPlaylists")]
+    [Route("rest/getPlaylists.view")]
+    public async Task<IActionResult> GetPlaylists()
+    {
+        var parameters = await ExtractAllParameters();
+        var format = parameters.GetValueOrDefault("f", "xml");
+        var relay = await _proxyService.RelaySafeAsync("rest/getPlaylists", parameters);
+        if (!relay.Success || relay.Body is not { Length: > 0 }
+            || !IsSuccessfulSubsonicResponse(relay.Body, format))
+            return relay.Body is { Length: > 0 }
+                ? File(relay.Body, relay.ContentType ?? $"application/{format}")
+                : _responseBuilder.CreateError(format, 0, "Unable to authenticate with Navidrome");
+
+        var username = parameters.GetValueOrDefault("u", "");
+        await BootstrapRadioProfileAsync(username, parameters);
+        var stations = PlaylistStations(username);
+        QueueRefreshIfStale(username);
+        if (stations.Count == 0) return File(relay.Body, relay.ContentType ?? $"application/{format}");
+        try
+        {
+            if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
+            {
+                var root = JsonNode.Parse(relay.Body)!.AsObject();
+                var response = root["subsonic-response"]!.AsObject();
+                var playlists = response["playlists"] as JsonObject ?? new JsonObject();
+                response["playlists"] = playlists;
+                var rows = playlists["playlist"] as JsonArray ?? new JsonArray();
+                playlists["playlist"] = rows;
+                foreach (var station in stations)
+                    rows.Add(JsonSerializer.SerializeToNode(_responseBuilder.RadioPlaylistFields(station)));
+                return File(Encoding.UTF8.GetBytes(root.ToJsonString()), "application/json");
+            }
+            var document = XDocument.Parse(Encoding.UTF8.GetString(relay.Body));
+            var responseElement = document.Root!;
+            var ns = responseElement.Name.Namespace;
+            var playlistsElement = responseElement.Elements().FirstOrDefault(element => element.Name.LocalName == "playlists");
+            if (playlistsElement is null) { playlistsElement = new XElement(ns + "playlists"); responseElement.Add(playlistsElement); }
+            foreach (var station in stations)
+                playlistsElement.Add(new XElement(ns + "playlist",
+                    _responseBuilder.RadioPlaylistFields(station).Select(pair =>
+                        new XAttribute(pair.Key, XmlValue(pair.Value)))));
+            return File(Encoding.UTF8.GetBytes(document.ToString()), "application/xml");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not merge Radio stations into getPlaylists");
+            return File(relay.Body, relay.ContentType ?? $"application/{format}");
+        }
+    }
+
+    [HttpGet, HttpPost]
+    [Route("rest/getPlaylist")]
+    [Route("rest/getPlaylist.view")]
+    public async Task<IActionResult> GetPlaylist()
+    {
+        var parameters = await ExtractAllParameters();
+        var format = parameters.GetValueOrDefault("f", "xml");
+        var id = parameters.GetValueOrDefault("id", "");
+        var username = parameters.GetValueOrDefault("u", "");
+        var station = PlaylistStations(username).FirstOrDefault(item => item.Id == id);
+        if (station is null)
+        {
+            var relay = await _proxyService.RelaySafeAsync("rest/getPlaylist", parameters);
+            return relay.Success && relay.Body is not null
+                ? File(relay.Body, relay.ContentType ?? $"application/{format}")
+                : _responseBuilder.CreateError(format, 0, "Playlist not found");
+        }
+        var auth = parameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+        auth.Remove("id");
+        var ping = await _proxyService.RelaySafeAsync("rest/ping", auth);
+        if (!ping.Success || ping.Body is null || !IsSuccessfulSubsonicResponse(ping.Body, format))
+            return _responseBuilder.CreateError(format, 40, "Wrong username or password");
+
+        var songs = await MaterializeStationAsync(station, parameters);
+        _radioQueueStore.Register(songs.Select(song => song.Id));
+        _ = _metadataService.PrewarmYouTubeIdsAsync(songs, topN: 8);
+        QueueRefreshIfStale(username);
+        return _responseBuilder.CreateRadioPlaylistResponse(format, station, songs);
+    }
+
+    [HttpGet, HttpPost]
+    [Route("rest/getInternetRadioStations")]
+    [Route("rest/getInternetRadioStations.view")]
+    public async Task<IActionResult> GetInternetRadioStations()
+    {
+        var parameters = await ExtractAllParameters();
+        var format = parameters.GetValueOrDefault("f", "xml");
+        var relay = await _proxyService.RelaySafeAsync("rest/getInternetRadioStations", parameters);
+        if (!relay.Success || relay.Body is not { Length: > 0 }
+            || !IsSuccessfulSubsonicResponse(relay.Body, format))
+            return relay.Body is { Length: > 0 }
+                ? File(relay.Body, relay.ContentType ?? $"application/{format}")
+                : _responseBuilder.CreateError(format, 0, "Unable to authenticate with Navidrome");
+
+        var username = parameters.GetValueOrDefault("u", "");
+        await BootstrapRadioProfileAsync(username, parameters);
+        var stations = StreamStations(username);
+        _logger.LogInformation(
+            "Continuous Radio discovery requested for {User}: {StationCount} eligible stations",
+            username, stations.Count);
+        QueueRefreshIfStale(username);
+        if (stations.Count == 0) return File(relay.Body, relay.ContentType ?? $"application/{format}");
+
+        var coldSessions = new List<LastFmRadioStreamSession>();
+
+        (LastFmRadioStation Station, string Token)? PublishCachedStation(
+            LastFmRadioStation station)
+        {
+            var token = _radioStreamSessions.Issue(username, station.Id, parameters);
+            var session = _radioStreamSessions.Get(token)!;
+            var readyPool = _radioStreams.GetReadyPool(session);
+            if (readyPool.Count == 0)
+            {
+                // Station-list requests are latency-sensitive and some clients cancel
+                // them after only a few seconds. Warm every cache miss independently,
+                // but never make an already-ready station wait for slower siblings.
+                coldSessions.Add(session);
+                _radioStreamSessions.Remove(token);
+                return null;
+            }
+            if (!_radioStreamSessions.AttachReadyPool(token, readyPool))
+            {
+                _radioStreamSessions.Remove(token);
+                return null;
+            }
+            if (readyPool.Count < LastFmRadioStreamService.ReadyPoolSize)
+                _radioStreams.WarmReadyPool(_radioStreamSessions.Get(token)!);
+            return (station, token);
+        }
+
+        async Task<(LastFmRadioStation Station, string Token)?> PrepareStarter(
+            LastFmRadioStation station)
+        {
+            var token = _radioStreamSessions.Issue(username, station.Id, parameters);
+            var session = _radioStreamSessions.Get(token)!;
+            var readyPool = await _radioStreams.PrepareForPublicationAsync(
+                session, HttpContext.RequestAborted);
+            if (readyPool.Count == 0) { _radioStreamSessions.Remove(token); return null; }
+            if (!_radioStreamSessions.AttachReadyPool(token, readyPool))
+            {
+                _radioStreamSessions.Remove(token);
+                return null;
+            }
+            if (readyPool.Count < LastFmRadioStreamService.ReadyPoolSize)
+                _radioStreams.WarmReadyPool(_radioStreamSessions.Get(token)!);
+            return (station, token);
+        }
+
+        try
+        {
+            var prepared = stations.Select(PublishCachedStation)
+                .Where(item => item is not null).Select(item => item!.Value).ToList();
+            // A completely cold install still publishes one usable starter in the
+            // same response. The remaining stations are already warming above and
+            // will appear on the client's next ordinary refresh.
+            if (prepared.Count == 0)
+            {
+                var starter = await PrepareStarter(stations[0]);
+                if (starter is not null) prepared.Add(starter.Value);
+
+                // PrepareStarter owns this station's cold-path production and starts
+                // its runway warm only after the publication pool is attached. Do not
+                // race it with the cache-miss warmer discovered above.
+                coldSessions.RemoveAll(session => session.StationId == stations[0].Id);
+            }
+            foreach (var coldSession in coldSessions)
+                _radioStreams.WarmReadyPool(coldSession);
+            _logger.LogInformation(
+                "Continuous Radio discovery published {ReadyCount}/{StationCount} ready stations for {User}",
+                prepared.Count, stations.Count, username);
+            string StreamUrl(string token) =>
+                $"{Request.Scheme}://{Request.Host}{Request.PathBase}/radio/stream/{token}";
+            if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
+            {
+                var root = JsonNode.Parse(relay.Body)!.AsObject();
+                var response = root["subsonic-response"]!.AsObject();
+                var container = response["internetRadioStations"] as JsonObject ?? new JsonObject();
+                response["internetRadioStations"] = container;
+                var rows = container["internetRadioStation"] as JsonArray ?? new JsonArray();
+                container["internetRadioStation"] = rows;
+                foreach (var (station, token) in prepared)
+                    rows.Add(new JsonObject
+                    {
+                        ["id"] = station.Id,
+                        ["name"] = station.Name,
+                        ["streamUrl"] = StreamUrl(token),
+                        ["coverArt"] = station.Id,
+                    });
+                return File(Encoding.UTF8.GetBytes(root.ToJsonString()), "application/json");
+            }
+
+            var document = XDocument.Parse(Encoding.UTF8.GetString(relay.Body));
+            var responseElement = document.Root!;
+            var ns = responseElement.Name.Namespace;
+            var containerElement = responseElement.Elements()
+                .FirstOrDefault(element => element.Name.LocalName == "internetRadioStations");
+            if (containerElement is null)
+            {
+                containerElement = new XElement(ns + "internetRadioStations");
+                responseElement.Add(containerElement);
+            }
+            foreach (var (station, token) in prepared)
+                containerElement.Add(new XElement(ns + "internetRadioStation",
+                    new XAttribute("id", station.Id), new XAttribute("name", station.Name),
+                    new XAttribute("streamUrl", StreamUrl(token)),
+                    new XAttribute("coverArt", station.Id)));
+            return File(Encoding.UTF8.GetBytes(document.ToString()), "application/xml");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not merge Octo stations into getInternetRadioStations");
+            return File(relay.Body, relay.ContentType ?? $"application/{format}");
+        }
+    }
+
+    [HttpGet, HttpHead]
+    [Route("radio/stream/{token:length(48)}")]
+    public async Task StreamGeneratedRadio(string token)
+    {
+        var session = _radioStreamSessions.Get(token);
+        var station = session is null ? null : _radioStreams.Resolve(session);
+        if (session is null || station is null)
+        {
+            Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
+        Response.StatusCode = StatusCodes.Status200OK;
+        Response.ContentType = "audio/mpeg";
+        Response.Headers.CacheControl = "no-store, no-transform";
+        Response.Headers["Accept-Ranges"] = "none";
+        Response.Headers["icy-name"] = station.Name;
+        Response.Headers["icy-br"] = _lastFmSettings.EffectiveRadioStreamBitrateKbps.ToString();
+        var includeIcyMetadata = _lastFmSettings.EnableIcyMetadata
+            && Request.Headers["Icy-MetaData"].ToString().Trim() == "1";
+        if (includeIcyMetadata)
+            Response.Headers["icy-metaint"] = IcyMetadataStream.DefaultInterval.ToString();
+        if (HttpMethods.IsHead(Request.Method)) return;
+        _logger.LogInformation("Continuous Radio stream opened for {Station} by {User}",
+            station.Name, session.Username);
+        try
+        {
+            await Response.StartAsync(HttpContext.RequestAborted);
+            await _radioStreams.StreamAsync(session, Response.Body, HttpContext.RequestAborted,
+                includeIcyMetadata);
+        }
+        catch (OperationCanceledException) when (HttpContext.RequestAborted.IsCancellationRequested)
+        {
+            // A radio stream normally ends because the listener stopped playback.
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Continuous Radio stream failed for station {Station}", station.Id);
+            if (!Response.HasStarted) Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            else HttpContext.Abort();
+        }
+    }
+
+    [HttpGet, HttpPost]
+    [Route("rest/createInternetRadioStation")]
+    [Route("rest/createInternetRadioStation.view")]
+    [Route("rest/updateInternetRadioStation")]
+    [Route("rest/updateInternetRadioStation.view")]
+    [Route("rest/deleteInternetRadioStation")]
+    [Route("rest/deleteInternetRadioStation.view")]
+    public async Task<IActionResult> MutateInternetRadioStation()
+    {
+        var parameters = await ExtractAllParameters();
+        var format = parameters.GetValueOrDefault("f", "xml");
+        var id = parameters.GetValueOrDefault("id", "");
+        if (id.StartsWith("or", StringComparison.Ordinal) && id.Length == 22)
+            return _responseBuilder.CreateError(format, 70, "Octo Radio stations are read-only");
+        var endpoint = Request.Path.Value?.Split('/').LastOrDefault()?.Replace(".view", "")
+            ?? "updateInternetRadioStation";
+        var relay = await _proxyService.RelaySafeAsync("rest/" + endpoint, parameters);
+        return relay.Success && relay.Body is not null
+            ? File(relay.Body, relay.ContentType ?? $"application/{format}")
+            : _responseBuilder.CreateError(format, 0, "Unable to update internet radio station");
+    }
+
+    [HttpGet, HttpPost]
+    [Route("rest/createPlaylist")]
+    [Route("rest/createPlaylist.view")]
+    [Route("rest/updatePlaylist")]
+    [Route("rest/updatePlaylist.view")]
+    [Route("rest/deletePlaylist")]
+    [Route("rest/deletePlaylist.view")]
+    public async Task<IActionResult> MutatePlaylist()
+    {
+        var parameters = await ExtractAllParameters();
+        var format = parameters.GetValueOrDefault("f", "xml");
+        var id = parameters.GetValueOrDefault("playlistId", parameters.GetValueOrDefault("id", ""));
+        if (id.StartsWith("or", StringComparison.Ordinal) && id.Length == 22)
+            return _responseBuilder.CreateError(format, 70, "Octo Radio stations are read-only");
+        var endpoint = Request.Path.Value?.Split('/').LastOrDefault()?.Replace(".view", "") ?? "updatePlaylist";
+        var relay = await _proxyService.RelaySafeAsync("rest/" + endpoint, parameters);
+        return relay.Success && relay.Body is not null
+            ? File(relay.Body, relay.ContentType ?? $"application/{format}")
+            : _responseBuilder.CreateError(format, 0, "Unable to update playlist");
+    }
+
+    private List<LastFmRadioStation> VisibleStations(string username)
+    {
+        if (_radioStateStore is null || !_lastFmSettings.EnableRadio || username.Length == 0) return [];
+        return _radioStateStore.GetUser(username).Stations.Where(station =>
+            station.Personalized ? _lastFmSettings.EnablePersonalizedStations
+                : _lastFmSettings.EnableDiscoveryStations).ToList();
+    }
+
+    private List<LastFmRadioStation> PlaylistStations(string username) =>
+        _lastFmSettings.ExposeRadioAsPlaylists ? VisibleStations(username) : [];
+
+    private List<LastFmRadioStation> StreamStations(string username) =>
+        _lastFmSettings.ExposeRadioAsStreams ? VisibleStations(username) : [];
+
+    private void QueueRefreshIfStale(string username)
+    {
+        if (_radioStateStore is null || _radioRefreshQueue is null || username.Length == 0) return;
+        var user = _radioStateStore.GetUser(username);
+        if (user.Stations.Count == 0 || LastFmRadioRefreshPolicy.IsStale(user, _lastFmSettings))
+            _radioRefreshQueue.Enqueue(username);
+    }
+
+    private async Task BootstrapRadioProfileAsync(string username,
+        IReadOnlyDictionary<string, string> authenticatedParameters)
+    {
+        if (_radioStateStore is null || username.Length == 0 || !_lastFmSettings.EnableRadio
+            || !_lastFmSettings.EnablePersonalizedStations
+            || _radioStateStore.GetUser(username).Plays.Count > 0) return;
+
+        async Task<List<(Song song, bool learned)>> Fetch(string endpoint, string container,
+            bool learned)
+        {
+            var parameters = authenticatedParameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+            parameters["f"] = "json";
+            if (endpoint == "rest/getRandomSongs") parameters["size"] = "12";
+            var result = await _proxyService.RelaySafeAsync(endpoint, parameters);
+            if (!result.Success || result.Body is not { Length: > 0 }) return [];
+            try
+            {
+                using var doc = JsonDocument.Parse(result.Body);
+                var response = doc.RootElement.GetProperty("subsonic-response");
+                if (!response.TryGetProperty(container, out var parent)
+                    || !parent.TryGetProperty("song", out var values)
+                    || values.ValueKind != JsonValueKind.Array) return [];
+                return values.EnumerateArray().Take(20).Select(item => (new Song
+                {
+                    Id = item.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
+                    Artist = item.TryGetProperty("artist", out var artist) ? artist.GetString() ?? "" : "",
+                    Title = item.TryGetProperty("title", out var title) ? title.GetString() ?? "" : "",
+                    Album = item.TryGetProperty("album", out var album) ? album.GetString() ?? "" : "",
+                    Genre = item.TryGetProperty("genre", out var genre) ? genre.GetString() : null,
+                    Duration = item.TryGetProperty("duration", out var duration) && duration.TryGetInt32(out var seconds) ? seconds : null,
+                    IsLocal = true
+                }, learned)).ToList();
+            }
+            catch { return []; }
+        }
+
+        var seeds = await Fetch("rest/getStarred2", "starred2", true);
+        if (seeds.Count < _lastFmSettings.EffectiveMinimumPlays)
+        {
+            async Task<List<(Song song, bool learned)>> FetchAlbumSignals(string type)
+            {
+                var query = authenticatedParameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+                query["f"] = "json"; query["type"] = type; query["size"] = "3";
+                var result = await _proxyService.RelaySafeAsync("rest/getAlbumList2", query);
+                if (!result.Success || result.Body is not { Length: > 0 }) return [];
+                try
+                {
+                    using var document = JsonDocument.Parse(result.Body);
+                    var albums = document.RootElement.GetProperty("subsonic-response")
+                        .GetProperty("albumList2").GetProperty("album");
+                    var output = new List<(Song song, bool learned)>();
+                    foreach (var album in albums.EnumerateArray().Take(3))
+                    {
+                        var albumQuery = authenticatedParameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+                        albumQuery["f"] = "json"; albumQuery["id"] = album.GetProperty("id").GetString() ?? "";
+                        var detail = await _proxyService.RelaySafeAsync("rest/getAlbum", albumQuery);
+                        if (!detail.Success || detail.Body is not { Length: > 0 }) continue;
+                        using var detailDoc = JsonDocument.Parse(detail.Body);
+                        var songs = detailDoc.RootElement.GetProperty("subsonic-response")
+                            .GetProperty("album").GetProperty("song");
+                        foreach (var item in songs.EnumerateArray().Take(4))
+                            output.Add((new Song
+                            {
+                                Id = item.GetProperty("id").GetString() ?? "",
+                                Artist = item.TryGetProperty("artist", out var artist) ? artist.GetString() ?? "" : "",
+                                Title = item.TryGetProperty("title", out var title) ? title.GetString() ?? "" : "",
+                                Album = item.TryGetProperty("album", out var albumName) ? albumName.GetString() ?? "" : "",
+                                Genre = item.TryGetProperty("genre", out var genre) ? genre.GetString() : null,
+                                Duration = item.TryGetProperty("duration", out var duration) && duration.TryGetInt32(out var seconds) ? seconds : null,
+                                IsLocal = true
+                            }, true));
+                    }
+                    return output;
+                }
+                catch { return []; }
+            }
+            seeds.AddRange(await FetchAlbumSignals("frequent"));
+            seeds.AddRange(await FetchAlbumSignals("recent"));
+        }
+        if (seeds.Count == 0) seeds = await Fetch("rest/getRandomSongs", "randomSongs", false);
+        var offset = 0;
+        foreach (var (song, learned) in seeds)
+            _radioStateStore.RecordPlay(username, new LastFmRadioPlay
+            {
+                SongId = song.Id, Artist = song.Artist, Title = song.Title, Album = song.Album,
+                Genre = song.Genre, Duration = song.Duration, IsLocal = true, Hearted = learned,
+                LearnedSignal = learned, Source = learned ? "bootstrap-star" : "bootstrap-random",
+                PlayedAtUtc = DateTime.UtcNow.AddMinutes(-(offset++ * 6))
+            });
+    }
+
+    private async Task<List<Song>> MaterializeStationAsync(LastFmRadioStation station,
+        IReadOnlyDictionary<string, string> parameters)
+    {
+        using var gate = new SemaphoreSlim(4, 4);
+        var tasks = station.Tracks.Select(async track =>
+        {
+            await gate.WaitAsync(HttpContext.RequestAborted);
+            try
+            {
+                return await _radioTrackResolver.ResolveAsync(track.Artist, track.Title, track.Duration,
+                    parameters, HttpContext.RequestAborted) ?? new Song
+                {
+                    Id = track.ResolvedId ?? "", Artist = track.Artist, Title = track.Title,
+                    Album = track.Album ?? track.Title, Genre = track.Genre, Duration = track.Duration,
+                    Year = track.Year, IsLocal = false, ExternalProvider = track.ExternalProvider,
+                    ExternalId = track.ResolvedId
+                };
+            }
+            finally { gate.Release(); }
+        });
+        var resolved = (await Task.WhenAll(tasks)).Where(song => song.Id.Length > 0)
+            .Where(song => _subsonicSettings.ExplicitFilter switch
+            {
+                ExplicitFilter.CleanOnly => song.ExplicitContentLyrics is not 1,
+                ExplicitFilter.ExplicitOnly => song.ExplicitContentLyrics is not 3,
+                _ => true
+            }).ToList();
+        var spaced = new List<Song>(resolved.Count);
+        string? previousArtist = null, previousAlbumKey = null;
+        foreach (var song in resolved)
+        {
+            var albumKey = string.IsNullOrWhiteSpace(song.Album) ? null : song.Artist + "|" + song.Album;
+            if (string.Equals(previousArtist, song.Artist, StringComparison.OrdinalIgnoreCase)
+                || (albumKey is not null
+                    && string.Equals(previousAlbumKey, albumKey, StringComparison.OrdinalIgnoreCase))) continue;
+            spaced.Add(song); previousArtist = song.Artist; previousAlbumKey = albumKey;
+        }
+        return spaced;
+    }
+
+    private static string XmlValue(object value) => value switch
+    {
+        bool boolean => boolean ? "true" : "false",
+        IFormattable formatted => formatted.ToString(null, System.Globalization.CultureInfo.InvariantCulture),
+        _ => value.ToString() ?? ""
+    };
 
     // Extract all parameters (query + body)
     private async Task<Dictionary<string, string>> ExtractAllParameters()
@@ -1103,6 +1554,23 @@ public class SubsonicController : ControllerBase
             return NotFound();
         }
 
+        // Stable, cached Octo-branded station artwork. Deliberately static: playlist
+        // requests never perform a live cover mosaic build.
+        if (id.Equals("octo-radio", StringComparison.OrdinalIgnoreCase))
+            return ServePlaceholder();
+
+        // Generated radio IDs already resolve through the per-user state store,
+        // so station artwork follows the current station name without creating
+        // a parallel metadata record or exposing that name in the cover ID.
+        var radioStation = _radioStateStore?.FindStation(
+            parameters.GetValueOrDefault("u", ""), id);
+        if (radioStation is not null)
+        {
+            var bytes = _coverArtService?.GetRadioStationCover(radioStation.Name);
+            if (bytes is not null && bytes.Length > 0) return File(bytes, "image/jpeg");
+            return ServePlaceholder();
+        }
+
         // Playlist covers haven't changed — keep the existing path.
         if (PlaylistIdHelper.IsExternalPlaylist(id))
         {
@@ -1423,6 +1891,13 @@ public class SubsonicController : ControllerBase
         try
         {
             var result = await _proxyService.RelayAsync("rest/star", parameters);
+            if (_radioStateStore is not null && IsSuccessfulSubsonicResponse(result.Body, format)
+                && parameters.GetValueOrDefault("u") is { Length: > 0 } username
+                && !string.IsNullOrEmpty(itemId))
+            {
+                var song = await _radioTrackResolver.ResolveScrobbleAsync(itemId, parameters);
+                if (song is not null) _radioStateStore.MarkHeart(username, itemId, song.Artist, song.Title);
+            }
             var contentType = result.ContentType ?? $"application/{format}";
             return File(result.Body, contentType);
         }
@@ -1446,6 +1921,7 @@ public class SubsonicController : ControllerBase
         var id = parameters.GetValueOrDefault("id", "");
         var format = parameters.GetValueOrDefault("f", "xml");
         var count = int.TryParse(parameters.GetValueOrDefault("count", "50"), out var c) ? c : 50;
+        count = Math.Clamp(count, 1, _lastFmSettings.EffectiveRadioTrackCount);
 
         // Subsonic spec: getSimilarSongs.view → key "similarSongs"; getSimilarSongs2.view → "similarSongs2".
         // Clients (Arpeggi) parse the v2 key strictly and ignore v1-shaped responses
@@ -1522,12 +1998,12 @@ public class SubsonicController : ControllerBase
         if (string.IsNullOrEmpty(artistName) || string.IsNullOrEmpty(trackTitle))
         {
             _logger.LogWarning("Could not get artist/title for song {Id}", id);
-            return _responseBuilder.CreateResponse(format, "similarSongs", new { });
+            return _responseBuilder.CreateResponse(format, responseKey, new { });
         }
 
         // Strip collab/feature decoration so Last.fm finds the canonical artist.
-        var lookupArtist = NormalizeSeedArtist(artistName) ?? artistName;
-        var lookupTitle  = NormalizeSeedTitle(trackTitle) ?? trackTitle;
+        var lookupArtist = LastFmRadioSeedNormalizer.Artist(artistName) ?? artistName;
+        var lookupTitle  = LastFmRadioSeedNormalizer.Title(trackTitle) ?? trackTitle;
         _logger.LogInformation("Getting similar songs for {Artist} - {Title} (lookup: {LookA} - {LookT})",
             artistName, trackTitle, lookupArtist, lookupTitle);
 
@@ -1536,7 +2012,7 @@ public class SubsonicController : ControllerBase
         if (similarTracks.Count == 0)
         {
             _logger.LogInformation("No similar tracks found from Last.fm");
-            return _responseBuilder.CreateResponse(format, "similarSongs", new { });
+            return _responseBuilder.CreateResponse(format, responseKey, new { });
         }
 
         _logger.LogInformation("Found {Count} similar tracks from Last.fm; building radio queue",
@@ -1554,15 +2030,8 @@ public class SubsonicController : ControllerBase
             await sem.WaitAsync();
             try
             {
-                var local = await TryFindLocalMatchAsync(track.Artist, track.Title, parameters);
-                if (local != null) return local;
-                // Forward Last.fm-provided duration so the client's scrub bar
-                // shows the real song length on first play. Without this every
-                // external song defaulted to 180s and ran past total length on
-                // anything longer than 3 minutes.
-                var hits = await _metadataService.SearchSongsByArtistTitleAsync(
-                    track.Artist, track.Title, 1, track.Duration);
-                return hits.Count > 0 ? hits[0] : null;
+                return await _radioTrackResolver.ResolveAsync(
+                    track.Artist, track.Title, track.Duration, parameters);
             }
             catch (Exception ex)
             {
@@ -1592,76 +2061,6 @@ public class SubsonicController : ControllerBase
         _ = _metadataService.PrewarmYouTubeIdsAsync(resolvedSongs, topN: 8);
 
         return BuildSimilarSongsResponse(format, resolvedSongs, responseKey);
-    }
-
-    /// <summary>
-    /// Ask Navidrome whether we already have a song matching this artist+title.
-    /// Returns a Song built from the local match (with <c>IsLocal=true</c> so
-    /// the merger and stream path treat it as a real library track), or null
-    /// when no good match exists.
-    ///
-    /// "Good match" = top hit's artist contains the expected artist (case
-    /// insensitive) AND top hit's title contains the expected title. Navidrome's
-    /// search is fuzzy — without that filter we'd match almost anything.
-    /// </summary>
-    private async Task<Song?> TryFindLocalMatchAsync(string artist, string title, Dictionary<string, string> baseParams)
-    {
-        try
-        {
-            var query = $"{artist} {title}";
-            var navParams = new Dictionary<string, string>(baseParams)
-            {
-                ["query"] = query,
-                ["songCount"] = "3",
-                ["albumCount"] = "0",
-                ["artistCount"] = "0",
-                ["f"] = "json",
-            };
-            var result = await _proxyService.RelaySafeAsync("rest/search3", navParams);
-            if (!result.Success || result.Body == null || result.Body.Length == 0) return null;
-            using var doc = JsonDocument.Parse(result.Body);
-            if (!doc.RootElement.TryGetProperty("subsonic-response", out var resp)
-                || !resp.TryGetProperty("searchResult3", out var sr)
-                || !sr.TryGetProperty("song", out var songs)
-                || songs.ValueKind != JsonValueKind.Array
-                || songs.GetArrayLength() == 0) return null;
-
-            foreach (var s in songs.EnumerateArray())
-            {
-                var hitArtist = s.TryGetProperty("artist", out var a) ? a.GetString() ?? "" : "";
-                var hitTitle = s.TryGetProperty("title", out var t) ? t.GetString() ?? "" : "";
-                var hitId = s.TryGetProperty("id", out var idEl) ? idEl.GetString() ?? "" : "";
-                if (string.IsNullOrEmpty(hitId)) continue;
-                if (!ArtistOrTitleContains(hitArtist, artist)) continue;
-                if (!ArtistOrTitleContains(hitTitle, title)) continue;
-                return new Song
-                {
-                    Id = hitId,
-                    Title = hitTitle,
-                    Artist = hitArtist,
-                    ArtistId = s.TryGetProperty("artistId", out var aid) ? aid.GetString() : null,
-                    Album = s.TryGetProperty("album", out var al) ? al.GetString() ?? "" : "",
-                    AlbumId = s.TryGetProperty("albumId", out var alid) ? alid.GetString() : null,
-                    Duration = s.TryGetProperty("duration", out var d) && d.ValueKind == JsonValueKind.Number ? d.GetInt32() : null,
-                    Year = s.TryGetProperty("year", out var yr) && yr.ValueKind == JsonValueKind.Number ? yr.GetInt32() : null,
-                    Track = s.TryGetProperty("track", out var tr) && tr.ValueKind == JsonValueKind.Number ? tr.GetInt32() : null,
-                    Genre = s.TryGetProperty("genre", out var g) ? g.GetString() : null,
-                    IsLocal = true,
-                };
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogDebug(ex, "local match lookup failed for {A} - {T}", artist, title);
-        }
-        return null;
-    }
-
-    private static bool ArtistOrTitleContains(string haystack, string needle)
-    {
-        if (string.IsNullOrEmpty(haystack) || string.IsNullOrEmpty(needle)) return false;
-        return haystack.Contains(needle, StringComparison.OrdinalIgnoreCase)
-            || needle.Contains(haystack, StringComparison.OrdinalIgnoreCase);
     }
 
     private IActionResult BuildSimilarSongsResponse(string format, List<Song> songs, string responseKey)
@@ -1713,8 +2112,12 @@ public class SubsonicController : ControllerBase
     [Route("rest/scrobble.view")]
     public async Task<IActionResult> Scrobble()
     {
+        var ids = await _requestParser.ExtractParameterValuesAsync(Request, "id", HttpContext.RequestAborted);
+        var submissions = await _requestParser.ExtractParameterValuesAsync(Request, "submission", HttpContext.RequestAborted);
+        var times = await _requestParser.ExtractParameterValuesAsync(Request, "time", HttpContext.RequestAborted);
         var parameters = await ExtractAllParameters();
-        var id = parameters.GetValueOrDefault("id", "");
+        if (ids.Count == 0 && parameters.GetValueOrDefault("id") is { Length: > 0 } singleId) ids = [singleId];
+        var id = ids.FirstOrDefault() ?? "";
         var format = parameters.GetValueOrDefault("f", "xml");
 
         if (!string.IsNullOrEmpty(id))
@@ -1730,7 +2133,14 @@ public class SubsonicController : ControllerBase
         // Always pass through so Navidrome's last-played/Now Playing stays accurate.
         try
         {
-            var result = await _proxyService.RelayAsync("rest/scrobble", parameters);
+            var relayParameters = parameters
+                .Where(pair => pair.Key is not ("id" or "submission" or "time")).ToList();
+            relayParameters.AddRange(ids.Select(value => new KeyValuePair<string, string>("id", value)));
+            relayParameters.AddRange(submissions.Select(value => new KeyValuePair<string, string>("submission", value)));
+            relayParameters.AddRange(times.Select(value => new KeyValuePair<string, string>("time", value)));
+            var result = await _proxyService.RelayAsync("rest/scrobble", relayParameters);
+            if (IsSuccessfulSubsonicResponse(result.Body, format))
+                await LearnFromScrobblesAsync(ids, submissions, times, parameters);
             return File(result.Body, result.ContentType ?? $"application/{format}");
         }
         catch (HttpRequestException)
@@ -1739,6 +2149,64 @@ public class SubsonicController : ControllerBase
             // doesn't think scrobble is broken — the prewarm side already fired.
             return _responseBuilder.CreateResponse(format, "scrobble", new { });
         }
+    }
+
+    private async Task LearnFromScrobblesAsync(IReadOnlyList<string> ids,
+        IReadOnlyList<string> submissions, IReadOnlyList<string> times,
+        IReadOnlyDictionary<string, string> authenticatedParameters)
+    {
+        if (_radioStateStore is null || !_lastFmSettings.EnableRadio
+            || !_lastFmSettings.EnablePersonalizedStations) return;
+        var username = authenticatedParameters.GetValueOrDefault("u", "").Trim();
+        if (username.Length == 0) return;
+        var recorded = false;
+        for (var index = 0; index < ids.Count; index++)
+        {
+            // Explicit start/now-playing scrobbles are not completed plays. Clients that
+            // omit submission are accepted because many only send one credible event.
+            if (index < submissions.Count && !IsTrue(submissions[index])) continue;
+            try
+            {
+                var song = await _radioTrackResolver.ResolveScrobbleAsync(ids[index], authenticatedParameters);
+                if (song is null || song.Artist.Length == 0 || song.Title.Length == 0) continue;
+                var playedAt = DateTime.UtcNow;
+                if (index < times.Count && long.TryParse(times[index], out var unix))
+                {
+                    try { playedAt = DateTimeOffset.FromUnixTimeMilliseconds(unix).UtcDateTime; }
+                    catch (ArgumentOutOfRangeException) { /* retain now */ }
+                }
+                recorded |= _radioStateStore.RecordPlay(username, new LastFmRadioPlay
+                {
+                    SongId = ids[index], Artist = song.Artist, Title = song.Title,
+                    Album = song.Album, Genre = song.Genre, Duration = song.Duration,
+                    IsLocal = song.IsLocal, PlayedAtUtc = playedAt, Source = "scrobble"
+                });
+            }
+            catch (Exception ex) { _logger.LogDebug(ex, "Radio ignored unreadable scrobble {Id}", ids[index]); }
+        }
+        if (!recorded || _radioRefreshQueue is null) return;
+        var user = _radioStateStore.GetUser(username);
+        if (LastFmRadioRefreshPolicy.ShouldRefreshAfterPlay(user, _lastFmSettings))
+            _radioRefreshQueue.Enqueue(username);
+    }
+
+    private static bool IsTrue(string value) => value.Equals("true", StringComparison.OrdinalIgnoreCase)
+        || value == "1";
+
+    private static bool IsSuccessfulSubsonicResponse(byte[] body, string format)
+    {
+        try
+        {
+            if (format.Equals("json", StringComparison.OrdinalIgnoreCase))
+            {
+                using var doc = JsonDocument.Parse(body);
+                return doc.RootElement.TryGetProperty("subsonic-response", out var response)
+                    && response.TryGetProperty("status", out var status) && status.GetString() == "ok";
+            }
+            var document = XDocument.Parse(Encoding.UTF8.GetString(body));
+            return document.Root?.Attribute("status")?.Value == "ok";
+        }
+        catch { return false; }
     }
 
     // OpenSubsonic transcoding extension. Feishin posts here before /rest/stream
@@ -1947,6 +2415,9 @@ public class SubsonicController : ControllerBase
         var parameters = await ExtractAllParameters();
         var format = parameters.GetValueOrDefault("f", "xml");
 
+        var nativeRadio = await TryServeNativeRadioAsync(endpoint, parameters);
+        if (nativeRadio != null) return nativeRadio;
+
         // Safety net (client-agnostic): any endpoint we don't explicitly handle,
         // called with one of our external ids, would relay to Navidrome and come
         // back "data not found" — Navidrome has no such id. Degrade to a graceful
@@ -2025,6 +2496,116 @@ public class SubsonicController : ControllerBase
         }
         return false;
     }
+
+    private async Task<IActionResult?> TryServeNativeRadioAsync(string endpoint,
+        Dictionary<string, string> parameters)
+    {
+        const string prefix = "api/playlist";
+        if (!endpoint.Equals(prefix, StringComparison.OrdinalIgnoreCase)
+            && !endpoint.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase)) return null;
+
+        var tail = endpoint.Length == prefix.Length ? "" : endpoint[(prefix.Length + 1)..].Trim('/');
+        var id = tail.Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+        var reserved = id.StartsWith("or", StringComparison.Ordinal) && id.Length == 22;
+        if (reserved && !HttpMethods.IsGet(Request.Method))
+            return StatusCode(StatusCodes.Status405MethodNotAllowed,
+                new { error = "Octo Radio stations are read-only" });
+        if (tail.Length > 0 && !reserved) return null;
+
+        // A successful upstream list validates the native bearer token before Octo
+        // reveals per-user state. The JWT payload only identifies the profile after
+        // Navidrome has accepted its signature and expiry.
+        var relayEndpoint = tail.Length == 0 ? endpoint : prefix;
+        var relayParameters = new Dictionary<string, string>(parameters);
+        if (tail.Length == 0 && HttpMethods.IsGet(Request.Method))
+        {
+            // Page after merging, so Radio rows cannot disappear merely because the
+            // upstream page was already full.
+            relayParameters["_start"] = "0";
+            relayParameters["_end"] = "1000";
+        }
+        var raw = await _proxyService.RelayRawAsync(relayEndpoint, relayParameters);
+        if (raw.Status is < 200 or >= 300)
+        {
+            Response.StatusCode = raw.Status;
+            return File(raw.Body, raw.ContentType ?? "application/json");
+        }
+        var username = NativeUsername(parameters);
+        var stations = PlaylistStations(username);
+        if (tail.Length == 0)
+        {
+            try
+            {
+                var node = JsonNode.Parse(raw.Body);
+                var rows = node as JsonArray;
+                if (rows is null) return File(raw.Body, raw.ContentType ?? "application/json");
+                foreach (var station in stations) rows.Add(NativeStation(station));
+                var total = rows.Count;
+                var start = Math.Max(0, parameters.TryGetValue("_start", out var startText)
+                    && int.TryParse(startText, out var parsedStart) ? parsedStart : 0);
+                var end = parameters.TryGetValue("_end", out var endText)
+                    && int.TryParse(endText, out var parsedEnd) ? parsedEnd : total;
+                var page = new JsonArray(rows.Skip(start).Take(Math.Max(0, end - start))
+                    .Select(row => row?.DeepClone()).ToArray());
+                Response.Headers["X-Total-Count"] = total.ToString();
+                QueueRefreshIfStale(username);
+                return File(Encoding.UTF8.GetBytes(page.ToJsonString()), "application/json");
+            }
+            catch { return File(raw.Body, raw.ContentType ?? "application/json"); }
+        }
+
+        var stationMatch = stations.FirstOrDefault(station => station.Id == id);
+        if (stationMatch is null) return NotFound(new { error = "Radio station not found for this user" });
+        if (tail.EndsWith("/tracks", StringComparison.OrdinalIgnoreCase))
+        {
+            var songs = await MaterializeStationAsync(stationMatch, parameters);
+            _radioQueueStore.Register(songs.Select(song => song.Id));
+            _ = _metadataService.PrewarmYouTubeIdsAsync(songs, 8);
+            var start = Math.Max(0, parameters.TryGetValue("_start", out var startText)
+                && int.TryParse(startText, out var parsedStart) ? parsedStart : 0);
+            var end = parameters.TryGetValue("_end", out var endText)
+                && int.TryParse(endText, out var parsedEnd) ? parsedEnd : songs.Count;
+            var page = new JsonArray(songs.Skip(start).Take(Math.Max(0, end - start))
+                .Select(song => (JsonNode)BuildNativeSongObject(song)).ToArray());
+            Response.Headers["X-Total-Count"] = songs.Count.ToString();
+            return File(Encoding.UTF8.GetBytes(page.ToJsonString()), "application/json");
+        }
+        return File(Encoding.UTF8.GetBytes(NativeStation(stationMatch).ToJsonString()), "application/json");
+    }
+
+    private string NativeUsername(IReadOnlyDictionary<string, string> parameters)
+    {
+        if (parameters.GetValueOrDefault("u") is { Length: > 0 } username) return username;
+        var header = Request.Headers["X-Nd-Authorization"].FirstOrDefault()
+            ?? Request.Headers.Authorization.FirstOrDefault();
+        var token = header?.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase) == true
+            ? header[7..] : header;
+        if (_navIdentity.UsernameForNativeToken(token) is { Length: > 0 } captured) return captured;
+        try
+        {
+            var payload = token?.Split('.')[1].Replace('-', '+').Replace('_', '/');
+            if (payload is not null)
+            {
+                payload = payload.PadRight(payload.Length + (4 - payload.Length % 4) % 4, '=');
+                using var doc = JsonDocument.Parse(Convert.FromBase64String(payload));
+                foreach (var claim in new[] { "username", "preferred_username", "user", "name", "sub" })
+                    if (doc.RootElement.TryGetProperty(claim, out var value) && value.GetString() is { Length: > 0 } found)
+                        return found;
+            }
+        }
+        catch { /* an accepted but opaque token simply exposes no Radio rows */ }
+        return "";
+    }
+
+    private static JsonObject NativeStation(LastFmRadioStation station) => new()
+    {
+        ["id"] = station.Id, ["name"] = station.Name, ["comment"] = "Generated by Octo Radio",
+        ["ownerName"] = station.Owner, ["public"] = false, ["songCount"] = station.Tracks.Count,
+        ["duration"] = station.Tracks.Sum(track => track.Duration ?? 180),
+        ["createdAt"] = station.CreatedUtc, ["updatedAt"] = station.ChangedUtc,
+        ["path"] = "", ["smartPlaylist"] = true, ["readonly"] = true,
+        ["validUntil"] = station.ValidUntilUtc
+    };
 
     /// <summary>rest/getSomething -> "something"; best-effort element name for an
     /// empty-ok response (JSON ignores it; XML just needs a well-formed element).</summary>

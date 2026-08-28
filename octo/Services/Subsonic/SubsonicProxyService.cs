@@ -35,6 +35,12 @@ public class SubsonicProxyService
     public async Task<(byte[] Body, string? ContentType)> RelayAsync(
         string endpoint, 
         Dictionary<string, string> parameters)
+        => await RelayAsync(endpoint, parameters.AsEnumerable());
+
+    /// <summary>Relay overload for batch endpoints whose repeated keys cannot be
+    /// represented by the legacy request dictionary.</summary>
+    public async Task<(byte[] Body, string? ContentType)> RelayAsync(
+        string endpoint, IEnumerable<KeyValuePair<string, string>> parameters)
     {
         if (string.IsNullOrWhiteSpace(_subsonicSettings.Url)
             || !Uri.TryCreate(_subsonicSettings.Url, UriKind.Absolute, out _))
@@ -237,6 +243,60 @@ public class SubsonicProxyService
             {
                 StatusCode = 500
             };
+        }
+    }
+
+    /// <summary>Opens a full upstream track body without binding it to the current
+    /// HTTP response. Continuous Radio feeds this stream into its in-process
+    /// transcoder, so it must own the upstream response until the track ends.</summary>
+    public async Task<DirectStreamInfo?> OpenAudioStreamAsync(
+        IReadOnlyDictionary<string, string> parameters,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(_subsonicSettings.Url)
+            || !Uri.TryCreate(_subsonicSettings.Url, UriKind.Absolute, out _)) return null;
+        var query = string.Join("&", parameters.Select(pair =>
+            $"{Uri.EscapeDataString(pair.Key)}={Uri.EscapeDataString(pair.Value)}"));
+        var url = $"{_subsonicSettings.Url.TrimEnd('/')}/rest/stream?{query}";
+        var response = await _httpClient.SendAsync(new HttpRequestMessage(HttpMethod.Get, url),
+            HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            response.Dispose();
+            return null;
+        }
+        var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        return new DirectStreamInfo
+        {
+            AudioStream = new ResponseOwnedStream(stream, response),
+            ContentType = response.Content.Headers.ContentType?.ToString() ?? "application/octet-stream",
+            ContentLength = response.Content.Headers.ContentLength,
+            Quality = "navidrome-raw",
+        };
+    }
+
+    private sealed class ResponseOwnedStream(Stream inner, HttpResponseMessage owner) : Stream
+    {
+        public override bool CanRead => inner.CanRead;
+        public override bool CanSeek => inner.CanSeek;
+        public override bool CanWrite => false;
+        public override long Length => inner.Length;
+        public override long Position { get => inner.Position; set => inner.Position = value; }
+        public override void Flush() => inner.Flush();
+        public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer,
+            CancellationToken cancellationToken = default) => inner.ReadAsync(buffer, cancellationToken);
+        public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { inner.Dispose(); owner.Dispose(); }
+            base.Dispose(disposing);
+        }
+        public override async ValueTask DisposeAsync()
+        {
+            await inner.DisposeAsync(); owner.Dispose(); GC.SuppressFinalize(this);
         }
     }
 }

@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.HttpOverrides;
 using Octo.Models.Settings;
 using Octo.Services;
 using Octo.Services.Soulseek;
@@ -26,6 +27,18 @@ builder.Services.AddHttpClient();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddHttpContextAccessor();
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    // Octo normally runs one hop behind a container ingress or tunnel. Only
+    // accept the original scheme, which is required when generating absolute
+    // Radio stream URLs; client IP and Host continue to come from ASP.NET's
+    // direct request data. The proxy address is dynamic in container networks,
+    // so it cannot be represented by the loopback-only defaults.
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedProto;
+    options.ForwardLimit = 1;
+    options.KnownNetworks.Clear();
+    options.KnownProxies.Clear();
+});
 builder.Services.AddSingleton<Octo.Services.Admin.SettingsFileWriter>(
     sp => new Octo.Services.Admin.SettingsFileWriter(SettingsFilePath));
 // Running log of fetched songs, stored next to the settings file (same
@@ -33,6 +46,11 @@ builder.Services.AddSingleton<Octo.Services.Admin.SettingsFileWriter>(
 builder.Services.AddSingleton(sp => new Octo.Services.Local.DownloadHistoryService(
     System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "downloads-history.json"),
     sp.GetRequiredService<ILogger<Octo.Services.Local.DownloadHistoryService>>()));
+builder.Services.AddSingleton(sp => new LastFmRadioStateStore(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "lastfm-radio-state.json"),
+    sp.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<LastFmSettings>>(),
+    sp.GetRequiredService<ExternalIdRegistry>(),
+    sp.GetRequiredService<ILogger<LastFmRadioStateStore>>()));
 
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
 builder.Services.AddProblemDetails();
@@ -56,6 +74,17 @@ builder.Services.AddSingleton<SubsonicRequestParser>();
 builder.Services.AddSingleton<SubsonicResponseBuilder>();
 builder.Services.AddSingleton<SubsonicModelMapper>();
 builder.Services.AddScoped<SubsonicProxyService>();
+builder.Services.AddScoped<LastFmRadioTrackResolver>();
+builder.Services.AddScoped<LastFmRadioRecommendationService>();
+builder.Services.AddScoped<LastFmRadioStreamService>();
+builder.Services.AddSingleton<LastFmRadioRefreshQueue>();
+builder.Services.AddSingleton<LastFmRadioStreamSessionStore>();
+builder.Services.AddSingleton<LastFmRadioTrackCache>();
+builder.Services.AddSingleton<ILastFmRadioAudioTranscoder, FfmpegLastFmRadioAudioTranscoder>();
+builder.Services.AddSingleton<LastFmRadioWarmupService>();
+builder.Services.AddHostedService<LastFmRadioWarmupService>(provider =>
+    provider.GetRequiredService<LastFmRadioWarmupService>());
+builder.Services.AddHostedService<LastFmRadioRefreshWorker>();
 
 // Soulseek (FLAC source) + YouTube (instant-preview stream source).
 builder.Services.AddSingleton<SoulseekClient>();
@@ -209,6 +238,8 @@ _ = Task.Run(async () =>
         .DetectMusicFolderAsync(force: true);
 });
 
+// This must run before any middleware or controller reads Request.Scheme.
+app.UseForwardedHeaders();
 app.UseExceptionHandler(_ => { });
 
 // Capture the raw request body for body-carrying methods so the proxy can
