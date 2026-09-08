@@ -831,7 +831,8 @@ public class SubsonicController : ControllerBase
         // local floor used to be a flat 20, which is also the spec default for
         // songCount, so the most common search in the wild left nothing for
         // discovery at all (#14).
-        var (localSongTarget, externalTarget) = SearchBudget.Compute(requestedSongs);
+        var (localSongTarget, externalTarget) =
+            SearchBudget.Compute(requestedSongs, _subsonicSettings.EnableSearchDiscovery);
 
         // A client that asked for a handful of songs is searching as the user types. The
         // song side already costs nothing there (the budget leaves no room for discovery),
@@ -843,7 +844,7 @@ public class SubsonicController : ControllerBase
         // Album discovery runs concurrently with the song fan-out below so it costs no
         // serial latency. It needs no Last.fm key (Deezer's catalog is keyless), so albums
         // still appear for a user who has not set one up.
-        var albumTask = requestedAlbums > 0 && !isTypeAheadProbe
+        var albumTask = requestedAlbums > 0 && !isTypeAheadProbe && _subsonicSettings.EnableSearchDiscovery
             ? _metadataService.SearchAlbumsAsync(cleanQuery, Math.Min(requestedAlbums, 20))
             : Task.FromResult(new List<Album>());
 

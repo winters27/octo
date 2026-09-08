@@ -197,6 +197,19 @@ public class SubsonicSettings
     /// Playlists appear as "albums" in search results with genre "Playlist"
     /// </summary>
     public bool EnableExternalPlaylists { get; set; } = true;
+
+    /// <summary>
+    /// Include Last.fm/Deezer discovery songs and albums in search3/search2 results
+    /// (default: true).
+    /// Environment variable: ENABLE_SEARCH_DISCOVERY
+    ///
+    /// Off, search returns only local library matches: every result plays straight from
+    /// Navidrome instead of resolving through the YouTube shim on first tap, and a search
+    /// no longer waits on Deezer/Last.fm at all. This only changes what search3/search2
+    /// hands back; radio (getSimilarSongs2) and the Last.fm personalized/discovery
+    /// stations are unaffected either way.
+    /// </summary>
+    public bool EnableSearchDiscovery { get; set; } = true;
     
     /// <summary>
     /// Directory name for storing playlist .m3u files (default: "playlists")

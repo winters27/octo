@@ -106,4 +106,27 @@ public class SearchBudgetTests
         Assert.Equal(int.MaxValue / 4, local);
         Assert.Equal(SearchBudget.ExternalCeiling, external);
     }
+
+    [Theory]
+    // discoveryEnabled: false sends the whole request to local and drops external to
+    // zero regardless of size, so the call site's Last.fm/Deezer fan-out never fires.
+    [InlineData(0, 0)]
+    [InlineData(5, 5)]
+    [InlineData(20, 20)]
+    [InlineData(1000, 1000)]
+    public void Compute_DiscoveryDisabled_ReturnsAllSlotsLocal(int requested, int expectedLocal)
+    {
+        var (local, external) = SearchBudget.Compute(requested, discoveryEnabled: false);
+
+        Assert.Equal(expectedLocal, local);
+        Assert.Equal(0, external);
+    }
+
+    [Fact]
+    public void Compute_DiscoveryDefaultsToEnabled()
+    {
+        // The three-arg and two-arg forms must agree, so a caller upgraded to pass the
+        // flag explicitly can't silently change behaviour by getting the default wrong.
+        Assert.Equal(SearchBudget.Compute(20), SearchBudget.Compute(20, discoveryEnabled: true));
+    }
 }

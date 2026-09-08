@@ -34,6 +34,7 @@ services:
       Subsonic__ExplicitFilter: ${EXPLICIT_FILTER:-All}
       Subsonic__CacheDurationHours: ${CACHE_DURATION_HOURS:-1}
       Subsonic__EnableExternalPlaylists: ${ENABLE_EXTERNAL_PLAYLISTS:-false}
+      Subsonic__EnableSearchDiscovery: ${ENABLE_SEARCH_DISCOVERY:-true}
 
       # Where downloaded FLACs land (bind-mount below)
       Library__DownloadPath: /music

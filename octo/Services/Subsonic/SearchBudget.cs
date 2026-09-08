@@ -43,12 +43,22 @@ public static class SearchBudget
     /// The client's songCount. Negative values are treated as zero; the previous
     /// expression sanitised those only by accident, through its flat floor.
     /// </param>
+    /// <param name="discoveryEnabled">
+    /// <see cref="Models.Settings.SubsonicSettings.EnableSearchDiscovery"/>. False sends the
+    /// whole request to the local target and skips discovery entirely, which is what lets
+    /// the call site skip its Last.fm/Deezer fan-out too instead of just discarding it.
+    /// </param>
     /// <returns>
     /// Local and external targets. Their sum never exceeds <paramref name="requestedSongs"/>.
     /// </returns>
-    public static (int Local, int External) Compute(int requestedSongs)
+    public static (int Local, int External) Compute(int requestedSongs, bool discoveryEnabled = true)
     {
         var requested = Math.Max(0, requestedSongs);
+
+        if (!discoveryEnabled)
+        {
+            return (requested, 0);
+        }
 
         // Locals still scale with big requests through the quarter rule, which is what
         // keeps behaviour identical for the large counts radio-style clients send. The
