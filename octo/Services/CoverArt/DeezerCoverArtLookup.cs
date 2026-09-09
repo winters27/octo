@@ -36,20 +36,20 @@ public class DeezerCoverArtLookup : ICoverArtSource
         _logger = logger;
     }
 
-    public async Task<byte[]?> TryFetchAsync(SoulseekRouting routing, CancellationToken ct = default)
+    public async Task<byte[]?> TryFetchAsync(SoulseekRouting routing, bool background = false, CancellationToken ct = default)
     {
         var artist = (routing.Artist ?? "").Trim();
         try
         {
             string? coverUrl = routing.Kind switch
             {
-                RoutingKind.Album   => await ResolveAlbumCoverAsync(artist, (routing.Album ?? routing.Title ?? "").Trim(), ct),
-                RoutingKind.Artist  => await ResolveArtistCoverAsync(artist, ct),
-                _                   => await ResolveTrackCoverAsync(artist, (routing.Title ?? "").Trim(), ct),
+                RoutingKind.Album   => await ResolveAlbumCoverAsync(artist, (routing.Album ?? routing.Title ?? "").Trim(), background, ct),
+                RoutingKind.Artist  => await ResolveArtistCoverAsync(artist, background, ct),
+                _                   => await ResolveTrackCoverAsync(artist, (routing.Title ?? "").Trim(), background, ct),
             };
             if (string.IsNullOrEmpty(coverUrl)) return null;
 
-            using var resp = await _http.GetAsync(coverUrl, ct);
+            using var resp = await SendAsync(coverUrl, background, ct);
             if (!resp.IsSuccessStatusCode) return null;
             return await resp.Content.ReadAsByteArrayAsync(ct);
         }
@@ -61,40 +61,40 @@ public class DeezerCoverArtLookup : ICoverArtSource
         }
     }
 
-    private async Task<string?> ResolveTrackCoverAsync(string artist, string title, CancellationToken ct)
+    private async Task<string?> ResolveTrackCoverAsync(string artist, string title, bool background, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(artist) || string.IsNullOrEmpty(title)) return null;
         // Deezer's q= supports field-qualified queries like `artist:"X" track:"Y"` for
         // higher precision than a flat keyword query.
         var q = $"artist:\"{artist}\" track:\"{title}\"";
         var url = $"https://api.deezer.com/search?q={Uri.EscapeDataString(q)}&limit=5";
-        var doc = await GetJsonAsync(url, ct);
+        var doc = await GetJsonAsync(url, background, ct);
         if (doc is null) return null;
         if (!doc.RootElement.TryGetProperty("data", out var data) || data.GetArrayLength() == 0)
             return null;
         return PickBestAlbumCover(data, artist);
     }
 
-    private async Task<string?> ResolveAlbumCoverAsync(string artist, string album, CancellationToken ct)
+    private async Task<string?> ResolveAlbumCoverAsync(string artist, string album, bool background, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(artist) || string.IsNullOrEmpty(album)) return null;
         var q = $"artist:\"{artist}\" album:\"{album}\"";
         var url = $"https://api.deezer.com/search/album?q={Uri.EscapeDataString(q)}&limit=5";
-        var doc = await GetJsonAsync(url, ct);
+        var doc = await GetJsonAsync(url, background, ct);
         if (doc is null) return null;
         if (!doc.RootElement.TryGetProperty("data", out var data) || data.GetArrayLength() == 0)
         {
             // Fallback to a track-based search for "albums" that are really singles.
-            return await ResolveTrackCoverAsync(artist, album, ct);
+            return await ResolveTrackCoverAsync(artist, album, background, ct);
         }
         return PickBestDirectCover(data, artist);
     }
 
-    private async Task<string?> ResolveArtistCoverAsync(string artist, CancellationToken ct)
+    private async Task<string?> ResolveArtistCoverAsync(string artist, bool background, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(artist)) return null;
         var url = $"https://api.deezer.com/search/artist?q={Uri.EscapeDataString(artist)}&limit=5";
-        var doc = await GetJsonAsync(url, ct);
+        var doc = await GetJsonAsync(url, background, ct);
         if (doc is null) return null;
         if (!doc.RootElement.TryGetProperty("data", out var data) || data.GetArrayLength() == 0)
             return null;
@@ -116,13 +116,26 @@ public class DeezerCoverArtLookup : ICoverArtSource
         return best;
     }
 
-    private async Task<JsonDocument?> GetJsonAsync(string url, CancellationToken ct)
+    private async Task<JsonDocument?> GetJsonAsync(string url, bool background, CancellationToken ct)
     {
-        using var resp = await _http.GetAsync(url, ct);
+        using var resp = await SendAsync(url, background, ct);
         if (!resp.IsSuccessStatusCode) return null;
         var json = await resp.Content.ReadAsStringAsync(ct);
         try { return JsonDocument.Parse(json); }
         catch { return null; }
+    }
+
+    /// <summary>
+    /// GETs through the shared Deezer client, marking the request for the background
+    /// rate-limit lane when this call is a prewarm. Only api.deezer.com is metered by
+    /// <see cref="Octo.Services.Metadata.DeezerRateLimitHandler"/>, so setting this option
+    /// on a CDN image request is harmless but pointless; done uniformly for simplicity.
+    /// </summary>
+    private Task<HttpResponseMessage> SendAsync(string url, bool background, CancellationToken ct)
+    {
+        var req = new HttpRequestMessage(HttpMethod.Get, url);
+        req.Options.Set(Octo.Services.Metadata.DeezerRateLimitHandler.BackgroundLane, background);
+        return _http.SendAsync(req, ct);
     }
 
     /// <summary>Pick best track-result cover by artist scoring; reads from <c>album.cover_xl</c>.</summary>

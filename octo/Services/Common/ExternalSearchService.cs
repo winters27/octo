@@ -39,7 +39,18 @@ public sealed class ExternalSearchService
     /// </summary>
     private static readonly TimeSpan BuildTimeout = TimeSpan.FromSeconds(10);
 
-    private readonly SingleFlight<string, List<Song>> _flight = new();
+    /// <summary>Deadline for one album build. Deezer's own client timeout already bounds
+    /// the call inside it; this is the ceiling on the whole build.</summary>
+    private static readonly TimeSpan AlbumBuildTimeout = TimeSpan.FromSeconds(10);
+
+    // Amperfy (and most Subsonic clients' type-ahead) fires one search3 call per
+    // keystroke, uncancelled. Plain SingleFlight only collapses two callers asking for
+    // the SAME query; it does nothing for the sequence "cage", "cage t", "cage the",
+    // where each keystroke is a distinct key racing the same rate-limited lane as the
+    // query the user actually meant. SupersedableBuildCoordinator adds prefix-based
+    // cancellation on top of that collapsing.
+    private readonly SupersedableBuildCoordinator<List<Song>> _songBuilds = new();
+    private readonly SupersedableBuildCoordinator<List<Album>> _albumBuilds = new();
     private readonly IMusicMetadataService _metadata;
     private readonly LastFmService? _lastFm;
     private readonly ILogger<ExternalSearchService> _logger;
@@ -66,23 +77,34 @@ public sealed class ExternalSearchService
         // the search results too.
         if (_lastFm is null || !_lastFm.HasApiKey) return Array.Empty<Song>();
 
-        // Key on the query alone. The build size is constant, so two callers wanting
-        // different row counts still want the same work done.
-        var key = query.Trim().ToLowerInvariant();
+        return await _songBuilds.RunAsync(
+            query.Trim(),
+            token => BuildAsync(query, token),
+            BuildTimeout,
+            fallback: new List<Song>(),
+            onFailure: (q, ex) =>
+                // Discovery is an addition to search, never a precondition for it. The
+                // steps inside the build are individually best-effort, but the deadline is
+                // not: the enrichment fan-out waits on its semaphore outside its own try, so
+                // a timeout there would otherwise escape and take local results down with it.
+                _logger.LogDebug("external search '{Q}' failed: {M}", q, ex.Message));
+    }
 
-        try
-        {
-            return await _flight.RunAsync(key, token => BuildAsync(query, token), BuildTimeout);
-        }
-        catch (Exception ex)
-        {
-            // Discovery is an addition to search, never a precondition for it. The steps
-            // inside the build are individually best-effort, but the deadline is not: the
-            // enrichment fan-out waits on its semaphore outside its own try, so a timeout
-            // there would otherwise escape and take the user's local results down with it.
-            _logger.LogDebug("external search '{Q}' failed: {M}", query, ex.Message);
-            return Array.Empty<Song>();
-        }
+    /// <summary>
+    /// Up to <paramref name="limit"/> external albums for this query, via the same
+    /// prefix-supersession as <see cref="GetAsync"/>. Needs no Last.fm key: Deezer's
+    /// album catalog is keyless.
+    /// </summary>
+    public async Task<IReadOnlyList<Album>> GetAlbumsAsync(string query, int limit, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(query) || limit <= 0) return Array.Empty<Album>();
+
+        return await _albumBuilds.RunAsync(
+            query,
+            token => _metadata.SearchAlbumsAsync(query, limit, token),
+            AlbumBuildTimeout,
+            fallback: new List<Album>(),
+            onFailure: (q, ex) => _logger.LogDebug("external album search '{Q}' failed: {M}", q, ex.Message));
     }
 
     /// <summary>
@@ -147,6 +169,12 @@ public sealed class ExternalSearchService
         // the loser could leave a song advertising the length of a video that would not be
         // the one played.
         _ = _metadata.PrewarmYouTubeIdsAsync(songs, topN: 12);
+
+        // Same reasoning, for cover art: a client renders the first screen of results a
+        // moment after this returns, and without a prewarm each row's getCoverArt call
+        // pays for the Deezer/iTunes/Last.fm chain itself, one row at a time. 24 covers
+        // more than a screenful so scrolling a little still finds a warm cache.
+        _ = _metadata.PrewarmCoverArtAsync(songs, topN: 24);
 
         return songs;
     }

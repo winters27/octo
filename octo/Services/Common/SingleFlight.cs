@@ -14,10 +14,27 @@ namespace Octo.Services.Common;
 /// </summary>
 public sealed class SingleFlight<TKey, TValue> where TKey : notnull
 {
-    private readonly ConcurrentDictionary<TKey, TaskCompletionSource<TValue>> _inFlight = new();
+    private sealed class Entry
+    {
+        public readonly TaskCompletionSource<TValue> Source =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>
+        /// Callers currently sharing this execution, including the owner. A supersession
+        /// policy (see <see cref="SupersedableBuildCoordinator{TValue}"/>) reads this to
+        /// decide whether cancelling this key would only hurt its own caller or would also
+        /// take a joined caller down with it.
+        /// </summary>
+        public int Joins = 1;
+    }
+
+    private readonly ConcurrentDictionary<TKey, Entry> _inFlight = new();
 
     /// <summary>Number of executions currently running. Exposed for tests and logging.</summary>
     public int InFlightCount => _inFlight.Count;
+
+    /// <summary>How many callers are currently sharing the execution for <paramref name="key"/>, or 0 if none is running.</summary>
+    public int GetJoinCount(TKey key) => _inFlight.TryGetValue(key, out var entry) ? entry.Joins : 0;
 
     /// <summary>
     /// Run <paramref name="factory"/> for <paramref name="key"/>, or join the execution
@@ -34,28 +51,26 @@ public sealed class SingleFlight<TKey, TValue> where TKey : notnull
         Func<CancellationToken, Task<TValue>> factory,
         TimeSpan timeout)
     {
-        // RunContinuationsAsynchronously is required. Without it, completing this source
-        // runs every joined request's continuation — response headers, body writes, the
-        // whole serialisation — inline on whichever thread finished the work.
-        var mine = new TaskCompletionSource<TValue>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mine = new Entry();
 
         var existing = _inFlight.GetOrAdd(key, mine);
         if (!ReferenceEquals(existing, mine))
         {
             // Someone else owns this key. Join them rather than doing the work twice.
-            return await existing.Task;
+            Interlocked.Increment(ref existing.Joins);
+            return await existing.Source.Task;
         }
 
         try
         {
             using var cts = new CancellationTokenSource(timeout);
-            mine.SetResult(await factory(cts.Token));
+            mine.Source.SetResult(await factory(cts.Token));
         }
         catch (Exception ex)
         {
             // Every joiner sees the failure, and the finally below removes the entry, so
             // the next caller retries rather than inheriting a permanently faulted task.
-            mine.SetException(ex);
+            mine.Source.SetException(ex);
         }
         finally
         {
@@ -65,6 +80,6 @@ public sealed class SingleFlight<TKey, TValue> where TKey : notnull
             _inFlight.TryRemove(key, out _);
         }
 
-        return await mine.Task;
+        return await mine.Source.Task;
     }
 }

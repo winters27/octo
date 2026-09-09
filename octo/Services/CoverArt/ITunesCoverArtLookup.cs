@@ -33,7 +33,7 @@ public class ITunesCoverArtLookup : ICoverArtSource
         _logger = logger;
     }
 
-    public async Task<byte[]?> TryFetchAsync(SoulseekRouting routing, CancellationToken ct = default)
+    public async Task<byte[]?> TryFetchAsync(SoulseekRouting routing, bool background = false, CancellationToken ct = default)
     {
         var artist = (routing.Artist ?? "").Trim();
         if (routing.Kind == RoutingKind.Album)

@@ -65,11 +65,22 @@ public interface IMusicMetadataService
     /// </summary>
     Task PrewarmYouTubeIdsForSongIdsAsync(IEnumerable<string> songIds, int topN, CancellationToken ct = default)
         => Task.CompletedTask;
-    
+
+    /// <summary>
+    /// Best-effort pre-fetch of cover art for the first N songs of a freshly-built
+    /// search result, so a client that renders them a moment later finds the image
+    /// already cached instead of triggering the fetch itself. Fire-and-forget, on
+    /// each source's background rate-limit lane so it never queues behind a live
+    /// search or cover request. Default no-op preserves source compatibility for
+    /// any provider that doesn't need it.
+    /// </summary>
+    Task PrewarmCoverArtAsync(IEnumerable<Song> songs, int topN, CancellationToken ct = default)
+        => Task.CompletedTask;
+
     /// <summary>
     /// Searches for albums on external providers
     /// </summary>
-    Task<List<Album>> SearchAlbumsAsync(string query, int limit = 20);
+    Task<List<Album>> SearchAlbumsAsync(string query, int limit = 20, CancellationToken ct = default);
     
     /// <summary>
     /// Searches for artists on external providers

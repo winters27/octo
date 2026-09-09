@@ -36,7 +36,7 @@ public class LastFmCoverArtLookup : ICoverArtSource
         _logger = logger;
     }
 
-    public async Task<byte[]?> TryFetchAsync(SoulseekRouting routing, CancellationToken ct = default)
+    public async Task<byte[]?> TryFetchAsync(SoulseekRouting routing, bool background = false, CancellationToken ct = default)
     {
         if (string.IsNullOrEmpty(_settings.ApiKey)) return null;
         var artist = (routing.Artist ?? "").Trim();

@@ -844,8 +844,8 @@ public class SubsonicController : ControllerBase
         // serial latency. It needs no Last.fm key (Deezer's catalog is keyless), so albums
         // still appear for a user who has not set one up.
         var albumTask = requestedAlbums > 0 && !isTypeAheadProbe
-            ? _metadataService.SearchAlbumsAsync(cleanQuery, Math.Min(requestedAlbums, 20))
-            : Task.FromResult(new List<Album>());
+            ? _externalSearch.GetAlbumsAsync(cleanQuery, Math.Min(requestedAlbums, 20))
+            : Task.FromResult<IReadOnlyList<Album>>(new List<Album>());
 
         // One build per query, shared by every caller. Clients routinely fire several
         // search calls for a single typed query, and those calls resolve to the same
@@ -902,7 +902,7 @@ public class SubsonicController : ControllerBase
 
         // Degrade to no albums rather than failing the whole search if Deezer is slow,
         // throttled or unreachable.
-        List<Album> externalAlbums;
+        IReadOnlyList<Album> externalAlbums;
         try { externalAlbums = await albumTask; }
         catch (Exception ex)
         {
@@ -913,7 +913,7 @@ public class SubsonicController : ControllerBase
         var externalResult = new SearchResult
         {
             Songs = externalSongs,
-            Albums = externalAlbums,
+            Albums = externalAlbums.ToList(),
             Artists = new List<Artist>(),
         };
 

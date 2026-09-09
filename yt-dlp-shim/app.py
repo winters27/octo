@@ -465,6 +465,7 @@ def meta():
         abort(400, "missing q")
     hint_str = request.args.get("duration", "").strip()
     duration_hint = int(hint_str) if hint_str.isdigit() else None
+    bg = _is_bg()
 
     key = _norm_q(q)
     # Hot front: exact repeat within this process.
@@ -483,7 +484,7 @@ def meta():
 
     if duration_hint is not None:
         out = _run([f"ytsearch5:{q}", "--flat-playlist", "--print", "%(.{id,title,duration})j"],
-                   timeout=20, label="meta5")
+                   timeout=20, label="meta5", bg=bg)
         cands = []
         for ln in (out or "").strip().split("\n"):
             ln = ln.strip()
@@ -499,7 +500,7 @@ def meta():
         data = cands[0]
     else:
         out = _run([f"ytsearch1:{q}", "--flat-playlist", "--print", "%(.{id,title,duration})j"],
-                   timeout=15, label="meta")
+                   timeout=15, label="meta", bg=bg)
         if out is None:
             return jsonify(error="search_failed"), 502
         line = next((ln.strip() for ln in out.strip().split("\n") if ln.strip()), "")
@@ -709,10 +710,20 @@ def stream():
     # range requests on an audio/mp4 container — without this passthrough they
     # silently drop the song from the queue. Browsers and Feishin don't care
     # about Range for short clips, hence why those clients worked anyway.
+    #
+    # A caller that sends NO Range at all still needs one synthesized upstream:
+    # googlevideo serves a plain unranged GET at ~30KB/s (a whole song's worth
+    # of trickle) but the exact same bytes at multiple MB/s the instant the
+    # request carries any Range header, even a fully open-ended "bytes=0-".
+    # Measured 2026-09-08: unranged GET of a 3.6MB track topped out at 32KB/s
+    # and never finished in 60s; "Range: bytes=0-" pulled the whole file in
+    # 1.1s. Since the caller never asked for a partial response here, we
+    # translate upstream's 206 back to a plain 200 below so this stays
+    # invisible to clients that did not request a range themselves.
     upstream_headers = {}
     incoming_range = request.headers.get("Range")
-    if incoming_range:
-        upstream_headers["Range"] = incoming_range
+    synthesized_range = not incoming_range
+    upstream_headers["Range"] = incoming_range if incoming_range else "bytes=0-"
     if _UPSTREAM_UA:
         upstream_headers["User-Agent"] = _UPSTREAM_UA
 
@@ -778,16 +789,27 @@ def stream():
 
     # Reflect upstream's status (200 for full body, 206 for partial). Forward
     # the metadata that AVPlayer / Subsonic clients need to seek correctly.
+    #
+    # A synthesized Range (see above) makes upstream answer 206 to a request
+    # the caller never made as partial. Report 200 to the caller instead and
+    # drop Content-Range: upstream's Content-Length already equals the full
+    # size here since the synthesized range always starts at byte 0.
+    response_status = upstream.status_code
     headers = {
         "Content-Type": upstream.headers.get("Content-Type", "audio/mp4"),
         "Accept-Ranges": "bytes",
         "Cache-Control": "no-store",
     }
+    skip_headers = {"Content-Range"} if synthesized_range and upstream.status_code == 206 else set()
+    if synthesized_range and upstream.status_code == 206:
+        response_status = 200
     for h in ("Content-Length", "Content-Range"):
+        if h in skip_headers:
+            continue
         v = upstream.headers.get(h)
         if v is not None:
             headers[h] = v
-    return Response(generator(), headers=headers, status=upstream.status_code)
+    return Response(generator(), headers=headers, status=response_status)
 
 
 @app.get("/download")

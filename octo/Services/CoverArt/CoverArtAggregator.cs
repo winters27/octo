@@ -42,7 +42,7 @@ public class CoverArtAggregator : IDisposable
             _sources.Count, string.Join(", ", _sources.Select(s => s.Name)));
     }
 
-    public async Task<byte[]?> GetCoverAsync(SoulseekRouting routing, CancellationToken ct = default)
+    public async Task<byte[]?> GetCoverAsync(SoulseekRouting routing, bool background = false, CancellationToken ct = default)
     {
         var cacheKey = MakeCacheKey(routing);
         if (_cache.TryGetValue(cacheKey, out Entry? cached)) return cached!.Bytes;
@@ -52,7 +52,7 @@ public class CoverArtAggregator : IDisposable
             byte[]? bytes;
             try
             {
-                bytes = await source.TryFetchAsync(routing, ct);
+                bytes = await source.TryFetchAsync(routing, background, ct);
             }
             catch (Exception ex)
             {

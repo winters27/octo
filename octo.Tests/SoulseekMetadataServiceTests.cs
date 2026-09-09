@@ -2,6 +2,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Moq.Protected;
+using Octo.Services.CoverArt;
 using Octo.Services.Metadata;
 using Octo.Services.Soulseek;
 using Octo.Services.YouTube;
@@ -43,8 +44,11 @@ public class SoulseekMetadataServiceTests
             TestOptions.Monitor(new Octo.Models.Settings.MetadataSettings()),
             new Mock<ILogger<DeezerMetadataService>>().Object);
 
+        var coverArt = new CoverArtAggregator(
+            Array.Empty<ICoverArtSource>(), new Mock<ILogger<CoverArtAggregator>>().Object);
+
         return new SoulseekMetadataService(
-            youtube, _registry, deezer, new Mock<ILogger<SoulseekMetadataService>>().Object);
+            youtube, _registry, deezer, coverArt, new Mock<ILogger<SoulseekMetadataService>>().Object);
     }
 
     private const string AlbumSearchJson = @"{""data"":[

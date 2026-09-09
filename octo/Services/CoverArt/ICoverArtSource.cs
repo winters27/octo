@@ -21,5 +21,10 @@ public interface ICoverArtSource
     /// or transport error. Bytes returned should be a decodable image (caller
     /// will composite a watermark, so don't pre-encode).
     /// </summary>
-    Task<byte[]?> TryFetchAsync(SoulseekRouting routing, CancellationToken ct = default);
+    /// <param name="background">
+    /// True only for fire-and-forget prewarm. Sources with a shared rate-limited
+    /// lane (Deezer) route this onto the background lane so prewarm traffic
+    /// cannot make an interactive search or cover fetch queue behind it.
+    /// </param>
+    Task<byte[]?> TryFetchAsync(SoulseekRouting routing, bool background = false, CancellationToken ct = default);
 }

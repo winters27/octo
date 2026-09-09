@@ -92,11 +92,17 @@ public class YouTubeResolver
     /// resolution). Returns the top video's id + duration for showing an accurate
     /// length without paying the full /search extraction.
     /// </summary>
-    public async Task<YouTubeHit?> MetaAsync(string query, int? durationHint = null, CancellationToken ct = default)
+    /// <param name="background">
+    /// Same meaning as on <see cref="SearchAsync"/>: true only for fire-and-forget
+    /// prewarm, so the shim's gate never makes an interactive caller queue behind it.
+    /// </param>
+    public async Task<YouTubeHit?> MetaAsync(string query, int? durationHint = null,
+        bool background = false, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(query)) return null;
         var url = $"{_baseUrl}/meta?q={Uri.EscapeDataString(query)}"
-            + (durationHint is int dh && dh > 0 ? $"&duration={dh}" : "");
+            + (durationHint is int dh && dh > 0 ? $"&duration={dh}" : "")
+            + (background ? "&bg=1" : "");
         try
         {
             var http = _httpClientFactory.CreateClient(SearchClientName);
