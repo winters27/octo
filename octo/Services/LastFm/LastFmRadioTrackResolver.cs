@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Octo.Models.Domain;
+using Octo.Services.Common;
 using Octo.Services.Subsonic;
 using Octo.Services.Soulseek;
 
@@ -63,7 +64,10 @@ public sealed class LastFmRadioTrackResolver
         {
             var parameters = authenticatedParameters.ToDictionary(kv => kv.Key, kv => kv.Value);
             parameters["query"] = $"{artist} {title}";
-            parameters["songCount"] = "3";
+            // Wide enough that an owned copy ranked below a remix, a live take or a
+            // compilation is still seen. Everything here is filtered by TitleMatch
+            // below, so a wider net costs one Navidrome query, not accuracy.
+            parameters["songCount"] = "10";
             parameters["albumCount"] = "0";
             parameters["artistCount"] = "0";
             parameters["f"] = "json";
@@ -84,8 +88,8 @@ public sealed class LastFmRadioTrackResolver
                 var hitTitle = String(song, "title");
                 var id = String(song, "id");
                 if (string.IsNullOrEmpty(id)
-                    || !ContainsEither(hitArtist, artist)
-                    || !ContainsEither(hitTitle, title))
+                    || !TitleMatch.ContainsEither(hitArtist, artist)
+                    || !TitleMatch.ContainsEither(hitTitle, title))
                     continue;
 
                 return new Song
@@ -110,11 +114,6 @@ public sealed class LastFmRadioTrackResolver
         }
         return null;
     }
-
-    private static bool ContainsEither(string left, string right) =>
-        !string.IsNullOrEmpty(left) && !string.IsNullOrEmpty(right)
-        && (left.Contains(right, StringComparison.OrdinalIgnoreCase)
-            || right.Contains(left, StringComparison.OrdinalIgnoreCase));
 
     private static string String(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) ? value.GetString() ?? "" : "";

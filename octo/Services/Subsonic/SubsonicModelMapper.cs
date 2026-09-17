@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Xml.Linq;
 using Octo.Models.Search;
 using Octo.Models.Subsonic;
+using Octo.Services.Common;
 
 namespace Octo.Services.Subsonic;
 
@@ -143,7 +144,7 @@ public class SubsonicModelMapper
         
         // Albums, deduplicated by artist+name so an album you own is not listed twice.
         // Playlists follow, appearing as albums with genre "Playlist".
-        var localAlbumKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var localAlbumKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var album in localAlbums)
         {
             if (album is not Dictionary<string, object> dict) continue;
@@ -161,12 +162,12 @@ public class SubsonicModelMapper
             .ToList();
         
         // Deduplicate artists by name - prefer local artists over external ones
-        var localArtistNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var localArtistNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var artist in localArtists)
         {
             if (artist is Dictionary<string, object> dict && dict.TryGetValue("name", out var nameObj))
             {
-                localArtistNames.Add(nameObj?.ToString() ?? "");
+                localArtistNames.Add(TitleMatch.Key(nameObj?.ToString()));
             }
         }
         
@@ -174,7 +175,7 @@ public class SubsonicModelMapper
         foreach (var externalArtist in externalResult.Artists)
         {
             // Only add external artist if no local artist with same name exists
-            if (!localArtistNames.Contains(externalArtist.Name))
+            if (!localArtistNames.Contains(TitleMatch.Key(externalArtist.Name)))
             {
                 mergedArtists.Add(_responseBuilder.ConvertArtistToJson(externalArtist));
             }
@@ -193,7 +194,7 @@ public class SubsonicModelMapper
         var ns = XNamespace.Get("http://subsonic.org/restapi");
         
         // Deduplicate artists by name - prefer local artists over external ones
-        var localArtistNamesXml = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var localArtistNamesXml = new HashSet<string>(StringComparer.Ordinal);
         var mergedArtists = new List<object>();
         
         foreach (var artist in localArtists.Cast<XElement>())
@@ -201,7 +202,7 @@ public class SubsonicModelMapper
             var name = artist.Attribute("name")?.Value;
             if (!string.IsNullOrEmpty(name))
             {
-                localArtistNamesXml.Add(name);
+                localArtistNamesXml.Add(TitleMatch.Key(name));
             }
             artist.Name = ns + "artist";
             mergedArtists.Add(artist);
@@ -210,14 +211,14 @@ public class SubsonicModelMapper
         foreach (var artist in externalResult.Artists)
         {
             // Only add external artist if no local artist with same name exists
-            if (!localArtistNamesXml.Contains(artist.Name))
+            if (!localArtistNamesXml.Contains(TitleMatch.Key(artist.Name)))
             {
                 mergedArtists.Add(_responseBuilder.ConvertArtistToXml(artist, ns));
             }
         }
         
         // Albums, deduplicated by artist+name so an album you own is not listed twice.
-        var localAlbumKeysXml = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var localAlbumKeysXml = new HashSet<string>(StringComparer.Ordinal);
         var mergedAlbums = new List<object>();
         foreach (var album in localAlbums.Cast<XElement>())
         {
@@ -255,8 +256,10 @@ public class SubsonicModelMapper
     
     /// <summary>Dedup key for an album. Null when there is not enough to compare on,
     /// which means "never treat this as a duplicate".</summary>
+    // Typography-insensitive: a provider writing "Hoes Ain’t Shit" must not add a
+    // second copy of the album the library already returned as "Hoes Ain't Shit".
     private static string? AlbumKey(string? artist, string? name)
-        => string.IsNullOrWhiteSpace(name) ? null : $"{artist?.Trim()}|{name.Trim()}";
+        => TitleMatch.AlbumKey(artist, name);
 
     /// <summary>
     /// Converts an ExternalPlaylist to a JSON object representing an album.

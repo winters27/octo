@@ -1351,19 +1351,19 @@ public class SubsonicController : ControllerBase
             }
         }
 
-        var localAlbumNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var localAlbumNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var album in localAlbums)
         {
             if (album is Dictionary<string, object> dict && dict.TryGetValue("name", out var nameObj))
             {
-                localAlbumNames.Add(nameObj?.ToString() ?? "");
+                localAlbumNames.Add(TitleMatch.Key(nameObj?.ToString()));
             }
         }
 
         var mergedAlbums = localAlbums.ToList();
         foreach (var deezerAlbum in deezerAlbums)
         {
-            if (!localAlbumNames.Contains(deezerAlbum.Title))
+            if (!localAlbumNames.Contains(TitleMatch.Key(deezerAlbum.Title)))
             {
                 mergedAlbums.Add(_responseBuilder.ConvertAlbumToJson(deezerAlbum));
             }
@@ -1530,19 +1530,22 @@ public class SubsonicController : ControllerBase
 
         if (deezerAlbum != null && deezerAlbum.Songs.Count > 0)
         {
-            var localSongTitles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Keys, not raw titles: Navidrome returns whatever the file's tags say and
+            // the provider returns its own typography, so "What It’s Like" and
+            // "What It's Like" are the same track arriving twice. See TitleMatch.
+            var localSongTitles = new HashSet<string>(StringComparer.Ordinal);
             foreach (var song in localSongs)
             {
                 if (song is Dictionary<string, object> dict && dict.TryGetValue("title", out var titleObj))
                 {
-                    localSongTitles.Add(titleObj?.ToString() ?? "");
+                    localSongTitles.Add(TitleMatch.Key(titleObj?.ToString()));
                 }
             }
 
             var mergedSongs = localSongs.ToList();
             foreach (var deezerSong in deezerAlbum.Songs)
             {
-                if (!localSongTitles.Contains(deezerSong.Title))
+                if (!localSongTitles.Contains(TitleMatch.Key(deezerSong.Title)))
                 {
                     mergedSongs.Add(_responseBuilder.ConvertSongToJson(deezerSong));
                 }
@@ -2889,19 +2892,20 @@ public class SubsonicController : ControllerBase
             libraryId = parsedLib;
 
         // Don't inject an album the library already returned.
-        var localKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var localKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var node in realArr)
         {
             if (node is not JsonObject o) continue;
             var name = o.TryGetPropertyValue("name", out var n) ? n?.ToString() : null;
             var aa = o.TryGetPropertyValue("albumArtist", out var v) ? v?.ToString() : null;
-            if (!string.IsNullOrWhiteSpace(name)) localKeys.Add($"{aa?.Trim()}|{name.Trim()}");
+            if (TitleMatch.AlbumKey(aa, name) is string key) localKeys.Add(key);
         }
 
         var added = 0;
         foreach (var album in externalAlbums)
         {
-            if (localKeys.Contains($"{album.Artist?.Trim()}|{album.Title?.Trim()}")) continue;
+            if (TitleMatch.AlbumKey(album.Artist, album.Title) is string albumKey
+                && localKeys.Contains(albumKey)) continue;
             realArr.Add(BuildNativeAlbumObject(album, libraryId));
             added++;
         }
