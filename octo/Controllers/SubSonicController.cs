@@ -42,6 +42,7 @@ public class SubsonicController : ControllerBase
     private readonly LastFmService? _lastFmService;
     private readonly LastFmRadioTrackResolver _radioTrackResolver;
     private readonly Octo.Services.ListenBrainz.ListenBrainzService? _listenBrainz;
+    private readonly Octo.Services.MusicBrainz.MusicBrainzArtistCredits? _artistCredits;
     private readonly IOptionsMonitor<LastFmSettings> _lastFmSettingsOptions;
     private LastFmSettings _lastFmSettings => _lastFmSettingsOptions.CurrentValue;
     private readonly CoverArtService? _coverArtService;
@@ -84,9 +85,11 @@ public class SubsonicController : ControllerBase
         CoverArtAggregator? coverArtAggregator = null,
         LastFmRadioStateStore? radioStateStore = null,
         LastFmRadioRefreshQueue? radioRefreshQueue = null,
-        Octo.Services.ListenBrainz.ListenBrainzService? listenBrainz = null)
+        Octo.Services.ListenBrainz.ListenBrainzService? listenBrainz = null,
+        Octo.Services.MusicBrainz.MusicBrainzArtistCredits? artistCredits = null)
     {
         _listenBrainz = listenBrainz;
+        _artistCredits = artistCredits;
         subsonicSettingsOptions = subsonicSettings;
         _metadataService = metadataService;
         _localLibraryService = localLibraryService;
@@ -184,6 +187,7 @@ public class SubsonicController : ControllerBase
         // 1. Ask Navidrome for ONE random song to use as a Last.fm seed.
         string? seedArtist = null;
         string? seedTitle = null;
+        string? seedMbid = null;
         try
         {
             var seedParams = new Dictionary<string, string>(parameters) { ["size"] = "1", ["f"] = "json" };
@@ -198,6 +202,7 @@ public class SubsonicController : ControllerBase
                 var seed = seedSongs[0];
                 seedArtist = seed.TryGetProperty("artist", out var a) ? a.GetString() : null;
                 seedTitle = seed.TryGetProperty("title", out var t) ? t.GetString() : null;
+                seedMbid = seed.TryGetProperty("musicBrainzId", out var sm) ? sm.GetString() : null;
                 // Collaboration tracks tagged "ArtistA • ArtistB" / "ArtistA & ArtistB" /
                 // "ArtistA feat. ArtistB" don't exist in Last.fm as compound artists.
                 // Strip to the primary artist so we get back useful similars.
@@ -220,7 +225,8 @@ public class SubsonicController : ControllerBase
                 // Cap resolution count: Arpeggio's HTTP client times out around 20-30s. Each
                 // YouTube search costs 2-8s through the shim's gate, so we need a tight bound.
                 var resolveCap = Math.Min(size, 6);
-                var similar = await _lastFmService.GetSimilarTracksAsync(seedArtist!, seedTitle!, resolveCap);
+                var similar = await _lastFmService.GetSimilarTracksWithCreditFallbackAsync(
+                    seedArtist!, seedTitle!, seedMbid, _artistCredits, resolveCap);
                 if (similar.Count > 0)
                 {
                     var resolveTasks = similar.Take(resolveCap).Select(async t =>
@@ -1994,6 +2000,7 @@ public class SubsonicController : ControllerBase
         // Get the seed song metadata
         string artistName = "";
         string trackTitle = "";
+        string? recordingMbid = null;
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(id);
 
@@ -2028,6 +2035,7 @@ public class SubsonicController : ControllerBase
                 {
                     artistName = songElement.TryGetProperty("artist", out var artist) ? artist.GetString() ?? "" : "";
                     trackTitle = songElement.TryGetProperty("title", out var title) ? title.GetString() ?? "" : "";
+                    recordingMbid = songElement.TryGetProperty("musicBrainzId", out var mbid) ? mbid.GetString() : null;
                 }
             }
             catch (Exception ex)
@@ -2049,7 +2057,10 @@ public class SubsonicController : ControllerBase
         _logger.LogInformation("Getting similar songs for {Artist} - {Title} (lookup: {LookA} - {LookT})",
             artistName, trackTitle, lookupArtist, lookupTitle);
 
-        var similarTracks = await _lastFmService.GetSimilarTracksAsync(lookupArtist, lookupTitle, count);
+        // Renamed artists (MusicBrainz "Ye", Last.fm "Kanye West") find nothing under the tag
+        // name; retry under the recording's MusicBrainz credits before giving up.
+        var similarTracks = await _lastFmService.GetSimilarTracksWithCreditFallbackAsync(
+            lookupArtist, lookupTitle, recordingMbid, _artistCredits, count);
 
         if (similarTracks.Count == 0)
         {

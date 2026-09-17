@@ -166,6 +166,16 @@ builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSe
 builder.Services.AddHttpClient<LastFmService>();
 builder.Services.AddSingleton<LastFmService>();
 
+// MusicBrainz artist credits: the fallback when Last.fm knows a renamed artist only by an
+// older name. MusicBrainz requires a descriptive User-Agent and allows one request per
+// second from anonymous clients; the service paces itself to that.
+builder.Services.AddHttpClient(Octo.Services.MusicBrainz.MusicBrainzArtistCredits.ClientName, c =>
+{
+    c.Timeout = TimeSpan.FromSeconds(10);
+    c.DefaultRequestHeaders.UserAgent.ParseAdd("Octo/1.0 (+https://github.com/winters27/octo)");
+});
+builder.Services.AddSingleton<Octo.Services.MusicBrainz.MusicBrainzArtistCredits>();
+
 // Push notifications (ntfy / Discord webhook). The orchestrator takes
 // IEnumerable<INotificationSink>, so adding a transport is one registration line.
 // Short timeout on purpose: a slow notification server must never be felt

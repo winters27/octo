@@ -36,8 +36,12 @@ public class LastFmService
 
     public record SimilarTrack(string Artist, string Title, double Match, int? Duration = null);
 
-    public async Task<List<SimilarTrack>> GetSimilarTracksAsync(string artist, string title, int limit = 50,
-        CancellationToken cancellationToken = default)
+    public Task<List<SimilarTrack>> GetSimilarTracksAsync(string artist, string title, int limit = 50,
+        CancellationToken cancellationToken = default) =>
+        GetSimilarTracksCoreAsync(artist, title, limit, useSimilarArtistFallback: true, cancellationToken);
+
+    private async Task<List<SimilarTrack>> GetSimilarTracksCoreAsync(string artist, string title, int limit,
+        bool useSimilarArtistFallback, CancellationToken cancellationToken)
     {
         var cacheKey = $"{artist}|{title}".ToLowerInvariant();
         
@@ -120,7 +124,7 @@ public class LastFmService
             _cache[cacheKey] = (DateTime.UtcNow.AddHours(_settings.EffectiveRadioCacheDurationHours), tracks);
             
             // If no similar tracks found, try getting top tracks from similar artists
-            if (tracks.Count == 0)
+            if (tracks.Count == 0 && useSimilarArtistFallback)
             {
                 _logger.LogInformation("No similar tracks found, trying similar artists for {Artist}", artist);
                 tracks = await GetTopTracksFromSimilarArtistsAsync(artist, limit, cancellationToken);
@@ -133,6 +137,48 @@ public class LastFmService
             _logger.LogError(ex, "Error fetching similar tracks from Last.fm for {Artist} - {Title}", artist, title);
             return new List<SimilarTrack>();
         }
+    }
+
+    /// <summary>
+    /// <see cref="GetSimilarTracksAsync"/>, retried under the artist's other names when the
+    /// library's tag name finds nothing. A renamed artist is tagged with the new name from
+    /// MusicBrainz ("Ye") while Last.fm still files the catalogue under the old one
+    /// ("Kanye West"), so the first lookup is empty for reasons unrelated to the music. The
+    /// retry needs the seed's recording MBID; without one, or without
+    /// <paramref name="credits"/>, this is exactly <see cref="GetSimilarTracksAsync"/>.
+    /// </summary>
+    public async Task<List<SimilarTrack>> GetSimilarTracksWithCreditFallbackAsync(string artist, string title,
+        string? recordingMbid, Octo.Services.MusicBrainz.MusicBrainzArtistCredits? credits, int limit = 50,
+        CancellationToken cancellationToken = default)
+    {
+        // Track similarity under the tag name first, WITHOUT the similar-artists guess: for a
+        // renamed artist that guess runs on the wrong name and returns confident nonsense
+        // (similar artists of "Ye" are not Kanye West's), which would hide the real answer.
+        var tracks = await GetSimilarTracksCoreAsync(artist, title, limit, useSimilarArtistFallback: false,
+            cancellationToken);
+        if (tracks.Count > 0) return tracks;
+
+        IReadOnlyList<string> names = credits is null || string.IsNullOrWhiteSpace(recordingMbid)
+            ? []
+            : await credits.GetAlternateArtistNamesAsync(recordingMbid, artist, cancellationToken);
+
+        foreach (var name in names)
+        {
+            var retry = await GetSimilarTracksCoreAsync(name, title, limit, useSimilarArtistFallback: false,
+                cancellationToken);
+            if (retry.Count == 0) continue;
+
+            _logger.LogInformation(
+                "Last.fm had no similar tracks for {Artist} - {Title}; found {Count} under MusicBrainz credit {Credit}",
+                artist, title, retry.Count, name);
+            return retry;
+        }
+
+        // No name matched the track itself. Fall back to similar artists, as GetSimilarTracksAsync
+        // does, but under the credited name when there is one.
+        var fallbackArtist = names.Count > 0 ? names[0] : artist;
+        _logger.LogInformation("No similar tracks found, trying similar artists for {Artist}", fallbackArtist);
+        return await GetTopTracksFromSimilarArtistsAsync(fallbackArtist, limit, cancellationToken);
     }
 
     private async Task<List<SimilarTrack>> GetTopTracksFromSimilarArtistsAsync(string artist, int limit,
