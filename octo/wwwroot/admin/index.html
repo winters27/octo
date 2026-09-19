@@ -410,6 +410,98 @@
             </div>
           </form>
         </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Genre normalization</h3>
+            <p class="set-desc">Downloads arrive with whatever genre the source had: YouTube categories like &ldquo;Music&rdquo; or &ldquo;People &amp; Blogs&rdquo;, hyper-specific tags, or seven genres at once. This collapses them into a list you can browse. Rules are tried <strong>top to bottom and the first match wins</strong>, so put the specific ones above the general ones. Applies to new downloads; files already in the library keep their tags.</p>
+          </div>
+          <form data-section="genre" class="set-card" id="genre-form">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Normalize genres</div><div class="set-info-d">Off by default, because this rewrites a tag you may have curated.</div></div>
+              <label class="switch"><input type="checkbox" name="Genre.Enabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Genres per track</div><div class="set-info-d">The default keeps what a file already has, so switching normalisation on does not throw away accurate tags. Set it to 1 for one broad genre per track, which is what makes browsing useful on a library whose tags are a mess.</div></div>
+              <input class="set-input" name="Genre.MaxGenres" type="number" min="1" max="10" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">When nothing is left</div><div class="set-info-d"><strong>Clear removes the genre</strong>, which is the point: without it, junk that maps to nothing survives forever. Leave keeps whatever was there, and Unknown writes a label instead.</div></div>
+              <select class="set-input" id="f-genre-on-empty" name="Genre.OnEmpty">
+                <option value="Clear">Clear the genre</option>
+                <option value="Leave">Leave it alone</option>
+                <option value="Unknown">Write a label</option>
+              </select>
+            </div>
+            <div class="set-row stack" id="genre-unknown-row" hidden>
+              <div class="set-info"><div class="set-info-t">Label for unknown genres</div></div>
+              <input class="set-input" name="Genre.UnknownLabel" placeholder="Unknown" maxlength="60" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Fallback source</div><div class="set-info-d">Where to look when a file has no usable genre left. Last.fm uses the top tags it already caches, and needs an API key but not radio.</div></div>
+              <select class="set-input" name="Genre.Fallback">
+                <option value="None">Leave it empty</option>
+                <option value="LastFm">Last.fm top tags</option>
+                <option value="MusicBrainz">MusicBrainz genres</option>
+              </select>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Blocklist</div><div class="set-info-d">Extra values that are never a genre, comma separated. YouTube categories, format tags and years are already handled.</div></div>
+              <input class="set-input" id="f-genre-blocklist" placeholder="my rip, needs replacing" />
+              <input type="hidden" id="genre-blocklist-json" name="Genre.Blocklist" data-json="true" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Mapping rules</div>
+                <div class="set-info-d">Drag to reorder, or focus a handle and use the arrow keys. A rule with an empty genre drops the value instead of mapping it.</div>
+              </div>
+              <div class="genre-preset-actions">
+                <button class="btn btn-ghost" type="button" id="genre-preset-broad">+ Broad genres</button>
+                <button class="btn btn-ghost" type="button" id="genre-add-custom">+ Custom rule</button>
+              </div>
+              <div id="genre-mapping-list" class="genre-mapping-list"></div>
+              <input type="hidden" id="genre-mappings-json" name="Genre.Mappings" data-json="true" />
+              <div id="genre-mapping-error" class="field-error" role="alert" hidden></div>
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Re-tag the existing library</h3>
+            <p class="set-desc">The settings above only apply to new downloads. This applies them to files that are already in your library. Start with a preview: nothing is written until you look at the list and say so.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Which files</div>
+                <div class="set-info-d">&ldquo;Downloads Octo made&rdquo; only touches files Octo created. &ldquo;The whole library&rdquo; also rewrites your own rips and purchases, and asks you to type the music path to confirm.</div>
+              </div>
+              <select class="set-input" id="genre-backfill-scope">
+                <option value="OctoDownloads">Downloads Octo made</option>
+                <option value="WholeLibrary">The whole library</option>
+              </select>
+            </div>
+            <div class="notice notice-warn">
+              <strong>There is no undo for anything but the genre.</strong> Writing a tag rewrites the whole tag block, so an unusual field the tag library does not understand is lost on the first save and cannot be restored. Undo is matched by file path, so a file you move afterwards stays changed. Your own backup of the music folder is the only complete safety net.
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Preview</div><div class="set-info-d">Walks every file and shows what would change. Writes nothing.</div></div>
+              <button class="btn btn-ghost" type="button" id="genre-backfill-preview">Preview changes</button>
+            </div>
+            <div id="genre-backfill-status" class="set-row stack" aria-live="polite"></div>
+            <div id="genre-backfill-results"></div>
+            <div class="set-row" id="genre-backfill-actions">
+              <div class="set-info"><div class="set-info-t">Apply</div><div class="set-info-d">Available once a preview has finished.</div></div>
+              <div class="genre-preset-actions">
+                <button class="btn" type="button" id="genre-backfill-apply" hidden>Apply these changes</button>
+                <button class="btn btn-ghost" type="button" id="genre-backfill-resume" hidden>Resume</button>
+                <button class="btn btn-ghost" type="button" id="genre-backfill-cancel" hidden>Cancel</button>
+                <button class="btn btn-ghost" type="button" id="genre-backfill-undo" hidden>Undo the last run</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- ─── SUBSONIC ───────────────────────────────────────── -->

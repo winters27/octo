@@ -55,6 +55,8 @@ builder.Services.AddSingleton(sp => new LastFmRadioStateStore(
 builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
 builder.Services.AddProblemDetails();
 
+builder.Services.Configure<GenreSettings>(
+    builder.Configuration.GetSection("Genre"));
 builder.Services.Configure<SubsonicSettings>(
     builder.Configuration.GetSection("Subsonic"));
 builder.Services.Configure<SoulseekSettings>(
@@ -151,6 +153,20 @@ builder.Services.AddSingleton(sp => new RejectedPeerRegistry(
     // A Func rather than a captured value, so changing the TTL takes effect without a restart.
     () => sp.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<SoulseekSettings>>()
         .CurrentValue.EffectiveRejectedPeerTtlDays));
+
+// Genre backfill state lives beside the other config-dir files so a run survives a restart
+// and can be resumed deliberately rather than silently restarting.
+builder.Services.AddSingleton(sp => new Octo.Services.Metadata.GenreBackfillStore(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "genre-backfill.json"),
+    sp.GetRequiredService<ILogger<Octo.Services.Metadata.GenreBackfillStore>>()));
+builder.Services.AddSingleton(sp => new Octo.Services.Metadata.GenreBackfillJournal(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "genre-backfill-journal.jsonl"),
+    sp.GetRequiredService<ILogger<Octo.Services.Metadata.GenreBackfillJournal>>()));
+// Singleton AND hosted, the same instance both ways, so the controller can enqueue into the
+// worker the host is running rather than a second copy of it.
+builder.Services.AddSingleton<Octo.Services.Metadata.GenreBackfillWorker>();
+builder.Services.AddHostedService(sp =>
+    sp.GetRequiredService<Octo.Services.Metadata.GenreBackfillWorker>());
 
 builder.Services.AddSingleton<Octo.Services.Fingerprint.AudioFingerprinter>();
 

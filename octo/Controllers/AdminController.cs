@@ -5,6 +5,7 @@ using System.Text.Json.Nodes;
 using Octo.Models.Settings;
 using Octo.Services.Admin;
 using Octo.Services.LastFm;
+using Octo.Services.Metadata;
 using Octo.Services.Lidarr;
 using Octo.Services.Soulseek;
 using Octo.Services.Subsonic;
@@ -34,6 +35,9 @@ public class AdminController : ControllerBase
     private readonly IOptionsMonitor<NotificationSettings> _notificationOpts;
     private readonly IOptionsMonitor<MetadataSettings> _metadataOpts;
     private readonly Octo.Services.Soulseek.RejectedPeerRegistry _rejectedPeers;
+    private readonly IOptionsMonitor<GenreSettings> _genreOpts;
+    private readonly Octo.Services.Metadata.GenreBackfillWorker _genreBackfill;
+    private readonly Octo.Services.Metadata.GenreBackfillJournal _genreJournal;
     private readonly IOptionsMonitor<ServerSettings> _serverOpts;
     private readonly IOptionsMonitor<ListenBrainzSettings>? _listenBrainzOpts;
     private readonly Octo.Services.ListenBrainz.ListenBrainzService? _listenBrainz;
@@ -63,6 +67,9 @@ public class AdminController : ControllerBase
         IOptionsMonitor<LastFmSettings> lastFmOpts,
         IOptionsMonitor<NotificationSettings> notificationOpts,
         IOptionsMonitor<MetadataSettings> metadataOpts,
+        IOptionsMonitor<GenreSettings> genreOpts,
+        Octo.Services.Metadata.GenreBackfillWorker genreBackfill,
+        Octo.Services.Metadata.GenreBackfillJournal genreJournal,
         IOptionsMonitor<ServerSettings> serverOpts,
         Octo.Services.Notifications.NotificationService notifications,
         IConfiguration config,
@@ -97,6 +104,9 @@ public class AdminController : ControllerBase
         _notificationOpts = notificationOpts;
         _metadataOpts = metadataOpts;
         _rejectedPeers = rejectedPeers;
+        _genreOpts = genreOpts;
+        _genreBackfill = genreBackfill;
+        _genreJournal = genreJournal;
         _serverOpts = serverOpts;
         _notifications = notifications;
         _config = config;
@@ -398,6 +408,7 @@ public class AdminController : ControllerBase
         var soulseek = _soulseekOpts.CurrentValue;
         var lidarr = _lidarrOpts.CurrentValue;
         var lastfm = _lastFmOpts.CurrentValue;
+        var genre = _genreOpts.CurrentValue;
         var notif = _notificationOpts.CurrentValue;
 
         // Use Dictionary<string, object> so System.Text.Json doesn't camelCase
@@ -503,6 +514,20 @@ public class AdminController : ControllerBase
             {
                 ["Language"] = _metadataOpts.CurrentValue.Language ?? "",
             },
+            ["Genre"] = new Dictionary<string, object>
+            {
+                ["Enabled"] = genre.Enabled,
+                ["MaxGenres"] = genre.MaxGenres,
+                ["OnEmpty"] = genre.OnEmpty.ToString(),
+                ["Fallback"] = genre.Fallback.ToString(),
+                ["UnknownLabel"] = genre.UnknownLabel ?? "",
+                ["Blocklist"] = genre.Blocklist ?? [],
+                // Read from the raw file, the same call DiscoveryStations makes above and for
+                // the same reason: EffectiveMappings() drops rows, and the editor has to show
+                // the user what they typed rather than what survived.
+                ["Mappings"] = (_settings.Load()["Genre"] as JsonObject)?["Mappings"]?.DeepClone()
+                    ?? JsonSerializer.SerializeToNode(genre.Mappings)!,
+            },
             ["Notifications"] = new Dictionary<string, object>
             {
                 ["NtfyUrl"] = notif.NtfyUrl ?? "",
@@ -566,6 +591,13 @@ public class AdminController : ControllerBase
         // up persisted to disk.
         patch.Remove("_meta");
 
+        if (patch["Genre"] is JsonObject genrePatch
+            && genrePatch["Mappings"] is JsonArray genreMappings)
+        {
+            var mappingError = ValidateGenreMappings(genreMappings);
+            if (mappingError is not null) return BadRequest(new { error = mappingError });
+        }
+
         if (patch["LastFm"] is JsonObject lastFmPatch
             && lastFmPatch["DiscoveryStations"] is JsonArray discovery)
         {
@@ -586,6 +618,176 @@ public class AdminController : ControllerBase
             return StatusCode(500, new { error = ex.Message });
         }
     }
+
+    /// <summary>
+    /// The POST path is untyped, so nothing checks a mapping table's shape unless this does.
+    /// Mirrors ValidateDiscoveryStations, and is the second of three layers: the editor
+    /// validates in the browser and EffectiveMappings() sanitises again at read time.
+    /// </summary>
+    private static string? ValidateGenreMappings(JsonArray mappings)
+    {
+        if (mappings.Count > 200) return "Genre.Mappings supports at most 200 rules";
+        var patterns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var node in mappings)
+        {
+            if (node is not JsonObject rule) return "Every genre rule must be an object";
+            var pattern = rule["Pattern"]?.GetValue<string>()?.Trim() ?? "";
+            var genre = rule["Genre"]?.GetValue<string>()?.Trim() ?? "";
+            var match = rule["Match"]?.GetValue<string>()?.Trim() ?? "Contains";
+
+            if (pattern.Length is 0 or > 60) return "Every genre rule needs a pattern of at most 60 characters";
+            if (!patterns.Add(pattern)) return $"Duplicate genre rule pattern '{pattern}': only the first could ever fire";
+            if (genre.Length > 60) return $"The genre for '{pattern}' must be at most 60 characters";
+            if (!Enum.TryParse<GenreMatchMode>(match, ignoreCase: true, out _))
+                return $"The match mode for '{pattern}' must be Contains or Exact";
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// One place that answers "is this caller a verified Navidrome admin?".
+    ///
+    /// Cookie first, the way the dashboard authenticates; header second so the endpoint stays
+    /// usable from curl. /api/admin has no authentication of its own, so every endpoint below
+    /// that rewrites or deletes a tag is gated on this rather than being the second
+    /// unauthenticated destructive surface.
+    /// </summary>
+    private bool HasBrowseSession(string? headerToken) =>
+        _browseSessions.Validate(Request.Cookies[BrowseCookieName] ?? headerToken);
+
+    public sealed record GenreBackfillStartRequest(string? Scope, bool DryRun, string? Confirm);
+
+    /// <summary>
+    /// Start a backfill, or a preview of one.
+    ///
+    /// DryRun is the default path in the UI: the button says "Preview changes" and only the
+    /// preview screen offers to apply. A whole-library APPLY additionally requires the caller
+    /// to type the library path back, because that run rewrites files Octo never created and a
+    /// drive-by POST must not be able to start it.
+    /// </summary>
+    [HttpPost("genre/backfill")]
+    public IActionResult StartGenreBackfill([FromBody] GenreBackfillStartRequest request,
+        [FromHeader(Name = "X-Octo-Browse-Token")] string? token)
+    {
+        if (!HasBrowseSession(token))
+            return Unauthorized(new { error = "Sign in with your Navidrome admin account first." });
+
+        if (!Enum.TryParse<GenreBackfillScope>(request.Scope, ignoreCase: true, out var scope))
+            scope = GenreBackfillScope.OctoDownloads;
+
+        if (!_genreOpts.CurrentValue.Enabled)
+            return BadRequest(new { error = "Turn genre normalization on first, or a run would change nothing." });
+
+        var root = _config["Library:DownloadPath"] ?? "./downloads";
+        if (scope == GenreBackfillScope.WholeLibrary && !request.DryRun
+            && !string.Equals(request.Confirm?.Trim(), root, StringComparison.Ordinal))
+            return BadRequest(new { error = $"To rewrite the whole library, type the music path exactly: {root}" });
+
+        if (!_genreBackfill.TryEnqueue(new GenreBackfillRequest(scope, request.DryRun)))
+            return Conflict(new { error = "A genre backfill is already running." });
+
+        _logger.LogInformation("Genre backfill requested: scope {Scope}, dryRun {DryRun}", scope, request.DryRun);
+        return Accepted(new { started = true, scope = scope.ToString(), dryRun = request.DryRun });
+    }
+
+    [HttpGet("genre/backfill")]
+    public IActionResult GetGenreBackfill([FromHeader(Name = "X-Octo-Browse-Token")] string? token)
+    {
+        if (!HasBrowseSession(token))
+            return Unauthorized(new { error = "Sign in with your Navidrome admin account first." });
+
+        var run = _genreBackfill.Current;
+        return Ok(new
+        {
+            run.RunId,
+            status = run.Status.ToString(),
+            scope = run.Scope.ToString(),
+            run.DryRun,
+            run.StartedUtc,
+            run.FinishedUtc,
+            run.Total,
+            run.Processed,
+            run.Changed,
+            run.Cleared,
+            run.Skipped,
+            run.Failed,
+            run.LastPath,
+            run.Reason,
+            run.Errors,
+            run.Preview,
+            canResume = run.CanResume,
+            canUndo = _genreJournal.Exists,
+            musicPath = _config["Library:DownloadPath"] ?? "./downloads",
+        });
+    }
+
+    [HttpPost("genre/backfill/cancel")]
+    public IActionResult CancelGenreBackfill([FromHeader(Name = "X-Octo-Browse-Token")] string? token)
+    {
+        if (!HasBrowseSession(token))
+            return Unauthorized(new { error = "Sign in with your Navidrome admin account first." });
+
+        _genreBackfill.RequestCancel();
+        return Accepted(new { cancelling = true });
+    }
+
+    [HttpPost("genre/backfill/resume")]
+    public IActionResult ResumeGenreBackfill([FromHeader(Name = "X-Octo-Browse-Token")] string? token)
+    {
+        if (!HasBrowseSession(token))
+            return Unauthorized(new { error = "Sign in with your Navidrome admin account first." });
+
+        var run = _genreBackfill.Current;
+        if (!run.CanResume) return BadRequest(new { error = "There is nothing to resume." });
+        if (!_genreBackfill.TryEnqueue(new GenreBackfillRequest(run.Scope, run.DryRun)))
+            return Conflict(new { error = "A genre backfill is already running." });
+
+        return Accepted(new { resumed = true });
+    }
+
+    /// <summary>
+    /// Put every genre frame the last backfill changed back the way it was.
+    ///
+    /// The journal is the only real undo, and it covers the genre frame only. TagLib's Save()
+    /// rewrites the whole tag block, so anything it does not round-trip was lost on the first
+    /// save; entries are keyed by path, so a moved file stays rewritten; and if the journal is
+    /// gone there is no undo at all. The dashboard says all three next to the button.
+    /// </summary>
+    [HttpPost("genre/backfill/undo")]
+    public IActionResult UndoGenreBackfill([FromHeader(Name = "X-Octo-Browse-Token")] string? token)
+    {
+        if (!HasBrowseSession(token))
+            return Unauthorized(new { error = "Sign in with your Navidrome admin account first." });
+
+        if (!_genreJournal.Exists) return BadRequest(new { error = "There is no backfill to undo." });
+        if (!_genreBackfill.TryEnqueue(new GenreBackfillRequest(GenreBackfillScope.WholeLibrary, DryRun: false, Undo: true)))
+            return Conflict(new { error = "A genre backfill is already running." });
+
+        _logger.LogInformation("Genre backfill undo requested");
+        return Accepted(new { started = true });
+    }
+
+    /// <summary>
+    /// The broad-genre preset, served from the one place it is defined. A second copy in
+    /// admin.js would be a table the dashboard and the tests could disagree about.
+    /// </summary>
+    [HttpGet("genre/presets")]
+    public IActionResult GetGenrePresets() => Ok(new Dictionary<string, object>
+    {
+        // Dictionary and an explicit projection, not Ok(new { ... }): the default serializer
+        // camelCases property names and writes an enum as a NUMBER, and this payload is posted
+        // straight back to the settings API, which reads exact PascalCase and an enum NAME.
+        // Emitted any other way the shipped preset cannot be saved, which is how it shipped
+        // the first time.
+        ["broad"] = GenreSettings.BroadGenrePreset().Select(rule => new Dictionary<string, object>
+        {
+            ["Id"] = rule.Id,
+            ["Pattern"] = rule.Pattern,
+            ["Genre"] = rule.Genre,
+            ["Match"] = rule.Match.ToString(),
+            ["Enabled"] = rule.Enabled,
+        }).ToList(),
+    });
 
     private static string? ValidateDiscoveryStations(JsonArray stations)
     {
@@ -626,6 +828,7 @@ public class AdminController : ControllerBase
         var soulseek = _soulseekOpts.CurrentValue;
         var lidarr = _lidarrOpts.CurrentValue;
         var lastfm = _lastFmOpts.CurrentValue;
+        var genre = _genreOpts.CurrentValue;
         var notif = _notificationOpts.CurrentValue;
         var server = _serverOpts.CurrentValue;
 
@@ -729,6 +932,17 @@ public class AdminController : ControllerBase
             {
                 ["Language"] = _metadataOpts.CurrentValue.Language ?? "",
             },
+            ["Genre"] = new JsonObject
+            {
+                ["Enabled"] = genre.Enabled,
+                ["MaxGenres"] = genre.MaxGenres,
+                ["OnEmpty"] = genre.OnEmpty.ToString(),
+                ["Fallback"] = genre.Fallback.ToString(),
+                ["UnknownLabel"] = genre.UnknownLabel ?? "",
+                ["Blocklist"] = JsonSerializer.SerializeToNode(genre.Blocklist ?? [])!,
+                ["Mappings"] = (_settings.Load()["Genre"] as JsonObject)?["Mappings"]?.DeepClone()
+                    ?? JsonSerializer.SerializeToNode(genre.Mappings)!,
+            },
             ["Notifications"] = new JsonObject
             {
                 ["NtfyUrl"] = notif.NtfyUrl ?? "",
@@ -831,6 +1045,9 @@ public class AdminController : ControllerBase
             "Soulseek:PreferredExtension", "Soulseek:DownloadTimeoutSeconds",
             "Soulseek:RejectedPeerTtlDays", "Soulseek:FingerprintSeconds",
             "Soulseek:FingerprintTimeoutSeconds", "Soulseek:AcoustIdTimeoutSeconds",
+            "Genre:BackfillMaxConsecutiveFailures", "Genre:BackfillExtensions",
+            "Genre:Enabled", "Genre:MaxGenres", "Genre:OnEmpty", "Genre:Fallback",
+            "Genre:UnknownLabel", "Genre:Mappings", "Genre:Blocklist",
             "Soulseek:VerifyDownloads", "Soulseek:AcoustIdApiKey",
             "Soulseek:MinMatchScore", "Soulseek:TagFromMusicBrainz",
             "Lidarr:BaseUrl", "Lidarr:ApiKey", "Lidarr:RootFolderPath",

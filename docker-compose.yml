@@ -90,6 +90,17 @@ services:
       LastFm__RefreshIntervalHours: ${LASTFM_REFRESH_INTERVAL_HOURS:-12}
       LastFm__MinimumPlays: ${LASTFM_MINIMUM_PLAYS:-10}
 
+      # ----- Genre normalization -----
+      # Collapses the genres downloads arrive with into a browsable list. Off by
+      # default. The mapping table itself lives in the dashboard / settings.json,
+      # because encoding structured rows in .env is brittle.
+      Genre__Enabled: ${GENRE_NORMALIZE:-false}
+      Genre__MaxGenres: ${GENRE_MAX:-10}
+      Genre__OnEmpty: ${GENRE_ON_EMPTY:-Clear}
+      Genre__Fallback: ${GENRE_FALLBACK:-None}
+      Genre__UnknownLabel: ${GENRE_UNKNOWN_LABEL:-Unknown}
+      Genre__BackfillMaxConsecutiveFailures: ${GENRE_BACKFILL_MAX_FAILURES:-25}
+
       # ----- Metadata language (genre tags etc. from Deezer / Last.fm) -----
       Metadata__Language: ${METADATA_LANGUAGE:-en}
 

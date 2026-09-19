@@ -122,6 +122,9 @@ async function loadSettings() {
   renderHeartSourceOrder(currentSettings?.Subsonic?.HeartDownloadSources);
   renderRadioDiscovery(currentSettings?.LastFm?.DiscoveryStations);
   renderRejectedPeerCount();
+  renderGenreMappings(currentSettings?.Genre?.Mappings);
+  renderGenreBlocklist(currentSettings?.Genre?.Blocklist);
+  syncGenreUnknownRow();
   // retry: false, so a page load never pops a sign-in prompt. Without a session the section
   // simply stays empty until the user asks for a preview.
   loadGenreBackfill();
@@ -524,6 +527,366 @@ document.getElementById('rejected-peers-clear')?.addEventListener('click', async
   } catch (error) {
     toast(`Could not clear: ${error.message}`, 'err');
   }
+});
+
+// ---- Genre mapping rules -------------------------------------------------
+//
+// An ORDERED list, not the pinned-stations editor: "applied in order, first match wins" is
+// the whole semantics of the table, and an unordered editor cannot express it. Drag plus
+// arrow keys, so reordering is never mouse-only.
+
+let genreRules = [];
+
+// Spread ...rule so a field a newer Octo adds is not erased when an older browser session
+// edits a row, the same guard normalizeRadioStation makes.
+function normalizeGenreRule(rule = {}) {
+  return {
+    ...rule,
+    Id: rule.Id ?? rule.id ?? '',
+    Pattern: rule.Pattern ?? rule.pattern ?? '',
+    Genre: rule.Genre ?? rule.genre ?? '',
+    Match: rule.Match ?? rule.match ?? 'Contains',
+    Enabled: (rule.Enabled ?? rule.enabled ?? true) !== false,
+  };
+}
+
+function escapeGenreAttr(value) {
+  return String(value ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+function renderGenreMappings(rules = genreRules) {
+  const list = document.getElementById('genre-mapping-list');
+  if (!list) return;
+  genreRules = (Array.isArray(rules) ? rules : []).map(normalizeGenreRule);
+  list.innerHTML = genreRules.map((rule, index) => `
+      <div class="source-priority-row genre-mapping-row${rule.Enabled ? '' : ' is-disabled'}" data-index="${index}">
+        <button type="button" class="source-drag" draggable="true"
+                aria-label="Drag rule ${index + 1} to reorder. Use arrow keys to move it."
+                title="Drag to reorder; arrow keys also work">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3h1M10 3h1M5 8h1M10 8h1M5 13h1M10 13h1"/></svg>
+        </button>
+        <span class="source-step" aria-hidden="true">${index + 1}</span>
+        <input class="set-input" data-genre-field="Pattern" value="${escapeGenreAttr(rule.Pattern)}"
+               placeholder="pattern" aria-label="Rule ${index + 1} pattern" />
+        <input class="set-input" data-genre-field="Genre" value="${escapeGenreAttr(rule.Genre)}"
+               placeholder="genre (empty drops it)" aria-label="Rule ${index + 1} genre" />
+        <select class="set-input" data-genre-field="Match" aria-label="Rule ${index + 1} match mode">
+          <option value="Contains"${rule.Match === 'Contains' ? ' selected' : ''}>contains</option>
+          <option value="Exact"${rule.Match === 'Exact' ? ' selected' : ''}>exact</option>
+        </select>
+        <label class="switch source-kind-switch">
+          <input type="checkbox" data-genre-field="Enabled" aria-label="Enable rule ${index + 1}" ${rule.Enabled ? 'checked' : ''} />
+          <span class="sw-track"></span><span class="sw-thumb"></span>
+        </label>
+        <button class="btn btn-ghost" type="button" data-genre-remove aria-label="Remove rule ${index + 1}">Remove</button>
+      </div>`).join('');
+  syncGenreMappingsInput(false);
+}
+
+function readGenreMappingRows() {
+  document.querySelectorAll('#genre-mapping-list .source-priority-row').forEach(row => {
+    const rule = genreRules[Number(row.dataset.index)];
+    if (!rule) return;
+    row.querySelectorAll('[data-genre-field]').forEach(input => {
+      const field = input.dataset.genreField;
+      rule[field] = field === 'Enabled' ? input.checked : input.value;
+    });
+  });
+}
+
+function syncGenreMappingsInput(showErrors = true) {
+  readGenreMappingRows();
+  const input = document.getElementById('genre-mappings-json');
+  const error = document.getElementById('genre-mapping-error');
+  if (!input) return true;
+
+  let message = '';
+  const seen = new Set();
+  for (const rule of genreRules) {
+    const pattern = (rule.Pattern || '').trim().toLowerCase();
+    if (!pattern) { message = 'Every rule needs a pattern.'; break; }
+    if (pattern.length > 60) { message = `"${pattern}" is longer than 60 characters.`; break; }
+    // A later duplicate could never fire, so it is a mistake rather than a preference.
+    if (seen.has(pattern)) { message = `"${pattern}" appears twice; only the first would ever match.`; break; }
+    seen.add(pattern);
+    if ((rule.Genre || '').trim().length > 60) { message = `The genre for "${pattern}" is longer than 60 characters.`; break; }
+  }
+  if (genreRules.length > 200) message = 'At most 200 rules.';
+
+  if (error) {
+    error.textContent = message;
+    error.hidden = !message || !showErrors;
+  }
+  if (message) return false;
+
+  input.value = JSON.stringify(genreRules.map(rule => ({
+    ...rule,
+    Pattern: (rule.Pattern || '').trim(),
+    Genre: (rule.Genre || '').trim(),
+  })));
+  return true;
+}
+
+function moveGenreRule(from, to) {
+  if (from === to || from < 0 || to < 0 || from >= genreRules.length || to >= genreRules.length) return;
+  const [rule] = genreRules.splice(from, 1);
+  genreRules.splice(to, 0, rule);
+  renderGenreMappings();
+  document.querySelector(`#genre-mapping-list .source-priority-row[data-index="${to}"] .source-drag`)?.focus();
+}
+
+function syncGenreUnknownRow() {
+  const row = document.getElementById('genre-unknown-row');
+  if (row) row.hidden = document.getElementById('f-genre-on-empty')?.value !== 'Unknown';
+}
+
+function renderGenreBlocklist(values) {
+  const visible = document.getElementById('f-genre-blocklist');
+  if (visible) visible.value = (Array.isArray(values) ? values : []).join(', ');
+  syncGenreBlocklistInput();
+}
+
+function syncGenreBlocklistInput() {
+  const visible = document.getElementById('f-genre-blocklist');
+  const hidden = document.getElementById('genre-blocklist-json');
+  if (!visible || !hidden) return;
+  const entries = visible.value.split(',')
+    .map(entry => entry.trim().replace(/\s+/g, ' ').toLowerCase())
+    .filter(Boolean);
+  hidden.value = JSON.stringify([...new Set(entries)]);
+}
+
+const genreMappingList = document.getElementById('genre-mapping-list');
+genreMappingList?.addEventListener('input', () => syncGenreMappingsInput());
+genreMappingList?.addEventListener('change', event => {
+  if (event.target.matches('[data-genre-field="Enabled"]')) {
+    readGenreMappingRows();
+    renderGenreMappings();
+    return;
+  }
+  syncGenreMappingsInput();
+});
+genreMappingList?.addEventListener('click', event => {
+  if (!event.target.closest('[data-genre-remove]')) return;
+  const row = event.target.closest('.source-priority-row');
+  readGenreMappingRows();
+  genreRules.splice(Number(row.dataset.index), 1);
+  renderGenreMappings();
+});
+genreMappingList?.addEventListener('keydown', event => {
+  const handle = event.target.closest('.source-drag');
+  if (!handle || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+  event.preventDefault();
+  readGenreMappingRows();
+  const from = Number(handle.closest('.source-priority-row').dataset.index);
+  moveGenreRule(from, from + (event.key === 'ArrowUp' ? -1 : 1));
+});
+
+let draggedGenreRuleIndex = null;
+genreMappingList?.addEventListener('dragstart', event => {
+  const handle = event.target.closest('.source-drag');
+  if (!handle) return;
+  const row = handle.closest('.source-priority-row');
+  readGenreMappingRows();
+  draggedGenreRuleIndex = Number(row.dataset.index);
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', String(draggedGenreRuleIndex));
+  row.classList.add('is-dragging');
+});
+genreMappingList?.addEventListener('dragover', event => {
+  if (draggedGenreRuleIndex === null) return;
+  if (event.target.closest('.source-priority-row')) event.preventDefault();
+});
+genreMappingList?.addEventListener('drop', event => {
+  const target = event.target.closest('.source-priority-row');
+  if (draggedGenreRuleIndex === null || !target) return;
+  event.preventDefault();
+  moveGenreRule(draggedGenreRuleIndex, Number(target.dataset.index));
+  draggedGenreRuleIndex = null;
+});
+genreMappingList?.addEventListener('dragend', event => {
+  event.target.closest('.source-priority-row')?.classList.remove('is-dragging');
+  draggedGenreRuleIndex = null;
+});
+
+// Fetched, never duplicated here: a second copy of the preset in JS is a table the dashboard
+// and the tests could disagree about.
+document.getElementById('genre-preset-broad')?.addEventListener('click', async () => {
+  try {
+    const response = await fetch('/api/admin/genre/presets');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json();
+    renderGenreMappings(body.broad);
+    toast(`Loaded ${body.broad.length} rules. Save to apply.`);
+  } catch (error) {
+    toast(`Could not load the preset: ${error.message}`, 'err');
+  }
+});
+document.getElementById('genre-add-custom')?.addEventListener('click', () => {
+  readGenreMappingRows();
+  genreRules.push(normalizeGenreRule({ Pattern: '', Genre: '' }));
+  renderGenreMappings();
+});
+document.getElementById('f-genre-on-empty')?.addEventListener('change', syncGenreUnknownRow);
+document.getElementById('f-genre-blocklist')?.addEventListener('input', syncGenreBlocklistInput);
+
+// ---- Genre backfill ------------------------------------------------------
+//
+// Every call here is gated on a verified Navidrome admin session, because /api/admin has no
+// authentication of its own and this one rewrites tags. A 401 prompts for credentials once
+// and retries, reusing the browse sign-in the directory picker already uses.
+
+let genreBackfillPoll = null;
+
+async function genreBackfillFetch(url, options = {}, retry = true) {
+  const response = await fetch(url, { credentials: 'same-origin', ...options });
+  if (response.status === 401 && retry) {
+    const holder = document.getElementById('genre-backfill-status');
+    if (await browseAuthenticate(holder ?? document.createElement('div'))) {
+      return genreBackfillFetch(url, options, false);
+    }
+  }
+  return response;
+}
+
+function renderGenreBackfill(run) {
+  const status = document.getElementById('genre-backfill-status');
+  const results = document.getElementById('genre-backfill-results');
+  if (!status || !results) return;
+
+  const running = run.status === 'Running';
+  const previewed = run.status === 'Completed' && run.dryRun;
+
+  document.getElementById('genre-backfill-cancel').hidden = !running;
+  document.getElementById('genre-backfill-apply').hidden = !previewed || run.changed === 0;
+  document.getElementById('genre-backfill-resume').hidden = !run.canResume;
+  document.getElementById('genre-backfill-undo').hidden = !run.canUndo || running;
+  document.getElementById('genre-backfill-preview').disabled = running;
+
+  if (run.status === 'Idle') {
+    status.innerHTML = '';
+    results.innerHTML = '';
+    return;
+  }
+
+  const label = {
+    Running: run.dryRun ? 'Previewing' : 'Applying',
+    Completed: run.dryRun ? 'Preview finished' : 'Finished',
+    Cancelled: 'Cancelled',
+    Interrupted: 'Interrupted',
+    Failed: 'Stopped',
+  }[run.status] ?? run.status;
+
+  const counts = [
+    `${run.processed} of ${run.total} files`,
+    `${run.changed} would change`,
+    run.cleared ? `${run.cleared} cleared` : null,
+    run.skipped ? `${run.skipped} skipped` : null,
+    run.failed ? `${run.failed} failed` : null,
+  ].filter(Boolean).join(' · ');
+
+  status.innerHTML = `
+    <div class="set-info">
+      <div class="set-info-t">${esc(label)}${run.dryRun ? '' : ' (writing)'}</div>
+      <div class="set-info-d">${esc(counts)}${run.reason ? ` — ${esc(run.reason)}` : ''}</div>
+    </div>`;
+
+  if (!run.preview?.length) {
+    results.innerHTML = run.errors?.length
+      ? `<div class="field-error" role="alert">${esc(run.errors[run.errors.length - 1])}</div>`
+      : '';
+    return;
+  }
+
+  // Reuses the config-sources table shell, which is a grid rather than a real <table>.
+  const rows = run.preview.slice(0, 200).map(change => `
+    <div class="config-row genre-change-row">
+      <span class="key">${esc(change.path)}</span>
+      <span class="value">${esc((change.before || []).join(', ')) || '<em>none</em>'}</span>
+      <span class="value${change.action === 'Clear' ? ' empty' : ''}">${change.action === 'Clear' ? 'cleared' : esc((change.after || []).join(', '))}</span>
+      <span class="value">${esc(change.rule || '')}</span>
+    </div>`).join('');
+
+  results.innerHTML = `
+    <div class="config-table">
+      <div class="config-row config-row-head genre-change-row">
+        <span>File</span><span>Before</span><span>After</span><span>Rule</span>
+      </div>
+      ${rows}
+    </div>
+    ${run.preview.length > 200 ? `<p class="set-info-d">Showing the first 200 of ${run.preview.length} changes.</p>` : ''}`;
+}
+
+async function loadGenreBackfill(retry = false) {
+  const response = await genreBackfillFetch('/api/admin/genre/backfill', {}, retry);
+  if (!response.ok) return null;
+  const run = await response.json();
+  renderGenreBackfill(run);
+
+  // Poll only while something is happening, so an idle dashboard is not making a request a
+  // second forever.
+  if (run.status === 'Running') {
+    if (!genreBackfillPoll) genreBackfillPoll = setInterval(() => loadGenreBackfill(), 2000);
+  } else if (genreBackfillPoll) {
+    clearInterval(genreBackfillPoll);
+    genreBackfillPoll = null;
+  }
+  return run;
+}
+
+async function startGenreBackfill(dryRun) {
+  const scope = document.getElementById('genre-backfill-scope')?.value ?? 'OctoDownloads';
+
+  let confirmPath = null;
+  if (scope === 'WholeLibrary' && !dryRun) {
+    const current = await loadGenreBackfill();
+    const expected = current?.musicPath ?? '';
+    confirmPath = prompt(
+      `This rewrites tags on every audio file under:\n\n${expected}\n\n` +
+      'including music Octo never downloaded. Type that path exactly to continue.');
+    if (confirmPath === null) return;
+  }
+
+  const response = await genreBackfillFetch('/api/admin/genre/backfill', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ scope, dryRun, confirm: confirmPath }),
+  });
+
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    toast(body.error || `Could not start: HTTP ${response.status}`, 'err');
+    return;
+  }
+  toast(dryRun ? 'Previewing. Nothing is being written.' : 'Applying changes.');
+  await loadGenreBackfill();
+}
+
+document.getElementById('genre-backfill-preview')?.addEventListener('click', () => startGenreBackfill(true));
+document.getElementById('genre-backfill-apply')?.addEventListener('click', async () => {
+  const run = await loadGenreBackfill();
+  if (!run) return;
+  if (!confirm(`Write ${run.changed} file(s)? The genre frame is recorded so this can be undone; nothing else is.`)) return;
+  await startGenreBackfill(false);
+});
+document.getElementById('genre-backfill-cancel')?.addEventListener('click', async () => {
+  await genreBackfillFetch('/api/admin/genre/backfill/cancel', { method: 'POST' });
+  toast('Cancelling after the current file.');
+  await loadGenreBackfill();
+});
+document.getElementById('genre-backfill-resume')?.addEventListener('click', async () => {
+  const response = await genreBackfillFetch('/api/admin/genre/backfill/resume', { method: 'POST' });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) { toast(body.error || 'Could not resume.', 'err'); return; }
+  await loadGenreBackfill();
+});
+document.getElementById('genre-backfill-undo')?.addEventListener('click', async () => {
+  if (!confirm('Put every genre back the way it was before the last run? Only the genre is restored.')) return;
+  const response = await genreBackfillFetch('/api/admin/genre/backfill/undo', { method: 'POST' });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) { toast(body.error || 'Could not undo.', 'err'); return; }
+  toast('Restoring genres.');
+  await loadGenreBackfill();
 });
 
 document.getElementById('lidarr-test-connection')?.addEventListener('click', async (event) => {

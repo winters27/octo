@@ -35,6 +35,7 @@ public class SoulseekDownloadService : BaseDownloadService
         ILocalLibraryService localLibraryService,
         IMusicMetadataService metadataService,
         IOptionsMonitor<SubsonicSettings> subsonicSettings,
+        IOptionsMonitor<GenreSettings> genreSettings,
         IOptions<SoulseekSettings> soulseekSettings,
         SoulseekClient slskd,
         YouTubeResolver youtube,
@@ -47,7 +48,7 @@ public class SoulseekDownloadService : BaseDownloadService
         Octo.Services.Fingerprint.DownloadVerificationService verification,
         IServiceProvider serviceProvider,
         ILogger<SoulseekDownloadService> logger)
-        : base(configuration, localLibraryService, metadataService, subsonicSettings, navIdentity, history, notifications, serviceProvider, logger)
+        : base(configuration, localLibraryService, metadataService, subsonicSettings, genreSettings, navIdentity, history, notifications, serviceProvider, logger)
     {
         _slskd = slskd;
         _rejectedPeers = rejectedPeers;

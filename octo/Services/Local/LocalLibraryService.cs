@@ -202,6 +202,12 @@ public class LocalLibraryService : ILocalLibraryService
 
     public string GetDownloadDirectory() => _downloadDirectory;
 
+    public async Task<IReadOnlyList<LocalSongMapping>> GetMappingsAsync()
+    {
+        var mappings = await LoadMappingsAsync();
+        return mappings.Values.ToList();
+    }
+
     public async Task<bool> TriggerLibraryScanAsync(bool force = false)
     {
         // Debounce: avoid triggering too many successive scans. A forced call skips it —
@@ -302,4 +308,5 @@ public class LocalSongMapping
     public string Artist { get; set; } = string.Empty;
     public string Album { get; set; } = string.Empty;
     public DateTime DownloadedAt { get; set; }
+
 }

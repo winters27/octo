@@ -274,6 +274,31 @@ bounded 24-hour/512 MiB temporary cache. Unplayable tracks are rejected for 24 h
 and replaced through the normal refresh path; no prepared track is added to the music
 library. **Start radio from this song** remains a one-time `getSimilarSongs[2]` queue.
 
+`GENRE_NORMALIZE` collapses the genres downloads arrive with into a list you can browse.
+Rules are a pattern-to-genre table applied **in order, first match wins**, edited in the
+dashboard (or as `Genre.Mappings` in settings JSON) because encoding structured rows in
+`.env` is brittle; a broad-genre preset is one click away. A built-in blocklist drops
+YouTube categories, format tags and years, and `GENRE_BLOCKLIST` adds to it. `GENRE_MAX`
+caps how many genres a track keeps, and defaults to keeping what is already there so
+switching normalisation on is not itself destructive; set it to 1 for one broad genre per
+track. `GENRE_ON_EMPTY` decides what happens when nothing
+survives: `Clear` removes the genre and is the default, because genre was previously only
+ever written when non-empty and never cleared, so junk like "People & Blogs" survived
+forever; `Leave` keeps it and `Unknown` writes `GENRE_UNKNOWN_LABEL`. A file that had no
+genre and resolved to none is left untouched either way. `GENRE_FALLBACK=LastFm` fills a
+blank genre from Last.fm's top tags, which needs `LASTFM_API_KEY` but not radio. This
+applies to new downloads. To apply it to files already in the library, the Library tab has a
+re-tag tool: pick a scope, **Preview changes** walks every file and writes nothing, and only
+then can you apply. Every one of its endpoints requires signing in with a Navidrome admin
+account, because `/api/admin` has no authentication of its own and this rewrites tags.
+
+Applying records each changed genre frame in `/app/config/genre-backfill-journal.jsonl`, which
+backs a one-click undo. **Undo restores the genre and nothing else**: writing a tag rewrites the
+whole tag block, so an unusual field the tag library does not model is lost on the first save;
+entries are matched by file path, so a file moved afterwards stays changed; and if that journal
+is gone there is no undo at all. Keep your own backup of the music folder. A run that is
+interrupted by a restart is never resumed automatically, since restarting may be how you
+stopped it.
 
 `SLSKD_VERIFY_DOWNLOADS` fingerprints each finished Soulseek download with Chromaprint and
 identifies it through AcoustID before it joins the library, using the free key in

@@ -6,6 +6,7 @@ using Octo.Models.Download;
 using Octo.Models.Search;
 using Octo.Models.Subsonic;
 using Octo.Services.Local;
+using Octo.Services.Metadata;
 using Octo.Services.Subsonic;
 using TagLib;
 using IOFile = System.IO.File;
@@ -72,12 +73,19 @@ public abstract class BaseDownloadService : IDownloadService
     /// Provider name (e.g., "deezer", "qobuz")
     /// </summary>
     protected abstract string ProviderName { get; }
+
+    private readonly IOptionsMonitor<GenreSettings> _genreOptions;
+
+    /// <summary>Read through the monitor, never captured: a settings change has to reach a
+    /// singleton without a restart.</summary>
+    protected GenreSettings GenreSettings => _genreOptions.CurrentValue;
     
     protected BaseDownloadService(
         IConfiguration configuration,
         ILocalLibraryService localLibraryService,
         IMusicMetadataService metadataService,
         IOptionsMonitor<SubsonicSettings> subsonicSettings,
+        IOptionsMonitor<GenreSettings> genreSettings,
         NavidromeIdentityService navIdentity,
         DownloadHistoryService history,
         Octo.Services.Notifications.NotificationService notifications,
@@ -85,6 +93,7 @@ public abstract class BaseDownloadService : IDownloadService
         ILogger logger)
     {
         Configuration = configuration;
+        _genreOptions = genreSettings;
         LocalLibraryService = localLibraryService;
         MetadataService = metadataService;
         _subsonicOptions = subsonicSettings;
@@ -731,6 +740,52 @@ public abstract class BaseDownloadService : IDownloadService
         return stripped.Length == 0 ? (title ?? string.Empty).Trim() : stripped;
     }
 
+    /// <summary>
+    /// Last resort for a file with no usable genre: the listener-supplied tags Last.fm already
+    /// caches for radio.
+    ///
+    /// Gated on HasApiKey, NOT on IsRadioEnabled. A user who turned radio off still configured
+    /// a key, and tagging is not radio - the same split LastFmService documents on those two
+    /// properties. Last.fm tags are also the rawest input the normaliser ever sees, so they go
+    /// through radio's own vocabulary first: that list filters Last.fm data, which is exactly
+    /// what it was written for, without the genre settings having to own it.
+    /// </summary>
+    private async Task<IReadOnlyList<string>> ResolveGenreFallbackAsync(
+        Song song, GenreSettings settings, CancellationToken cancellationToken)
+    {
+        if (settings.Fallback == GenreFallbackSource.MusicBrainz)
+        {
+            // The MusicBrainz option rides the AcoustID lookup's meta= response rather than a
+            // second client. Until that is wired up it behaves as Last.fm and says so, because
+            // a setting that appears to work and silently does nothing is worse than one that
+            // is missing.
+            Logger.LogInformation(
+                "MusicBrainz genres are not wired up yet; using Last.fm top tags for {Artist} - {Title}",
+                song.Artist, song.Title);
+        }
+
+        try
+        {
+            var lastFm = _serviceProvider.GetService<Octo.Services.LastFm.LastFmService>();
+            if (lastFm is null || !lastFm.HasApiKey) return [];
+
+            var tags = await lastFm.GetTrackTopTagsAsync(song.Artist ?? "", song.Title ?? "", 8, cancellationToken);
+            if (tags.Count == 0 && !string.IsNullOrEmpty(song.Artist))
+                tags = await lastFm.GetArtistTopTagsAsync(song.Artist, 8, cancellationToken);
+
+            return tags
+                .Select(Octo.Services.LastFm.LastFmRadioRecommendationService.CanonicalTag)
+                .Where(tag => tag.Length > 0)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug("genre fallback lookup failed for {Artist} - {Title}: {M}",
+                song.Artist, song.Title, ex.Message);
+            return [];
+        }
+    }
+
     protected async Task WriteMetadataAsync(string filePath, Song song, CancellationToken cancellationToken)
     {
         try
@@ -766,8 +821,56 @@ public abstract class BaseDownloadService : IDownloadService
             if (song.Year.HasValue)
                 tagFile.Tag.Year = (uint)song.Year.Value;
             
-            if (!string.IsNullOrEmpty(song.Genre))
+            // Genre is the one tag that must be able to write NOTHING.
+            //
+            // Before this, genre was written ONLY when song.Genre was non-empty, and was never
+            // cleared. So when Deezer missed and the source had no genre, whatever multi-value
+            // frame the Soulseek peer's file or the yt-dlp output already carried survived
+            // untouched: "People & Blogs" and seven-genres-at-once reached the library through
+            // the ABSENCE of a write, not a bad one. The fix has to read the existing frame,
+            // normalise it, and write the result back.
+            var genreSettings = GenreSettings;
+            if (genreSettings.Enabled)
+            {
+                var existing = tagFile.Tag.Genres ?? [];
+                var plan = GenreNormalizer.Plan(existing, song.Genre, genreSettings);
+
+                // Only pay for the lookup when nothing usable survived. Last.fm's top tags are
+                // weaker evidence than a real genre frame and earn a turn only when there is
+                // no frame left.
+                if (plan.Action != GenreTagAction.Write
+                    && genreSettings.Fallback != GenreFallbackSource.None)
+                {
+                    var fallback = await ResolveGenreFallbackAsync(song, genreSettings, cancellationToken);
+                    if (fallback.Count > 0)
+                        plan = GenreNormalizer.Plan(existing, song.Genre, genreSettings, fallback);
+                }
+
+                switch (plan.Action)
+                {
+                    case GenreTagAction.Write:
+                        tagFile.Tag.Genres = plan.Genres.ToArray();
+                        song.Genre = plan.Primary;
+                        break;
+                    case GenreTagAction.Clear:
+                        // Destructive and not undoable per file, so it is logged below at
+                        // Information: a user who regrets their mapping table can at least see
+                        // what left.
+                        tagFile.Tag.Genres = [];
+                        song.Genre = null;
+                        break;
+                }
+
+                if (plan.Action != GenreTagAction.None)
+                    Logger.LogInformation("Genre normalised for {Path}: [{Before}] -> [{After}]{Rule}",
+                        filePath, string.Join(", ", existing), string.Join(", ", plan.Genres),
+                        plan.MatchedRule is null ? "" : $" via {plan.MatchedRule}");
+            }
+            else if (!string.IsNullOrEmpty(song.Genre))
+            {
+                // Feature off: byte-for-byte the behaviour that shipped before this.
                 tagFile.Tag.Genres = new[] { song.Genre };
+            }
             
             if (song.Bpm.HasValue)
                 tagFile.Tag.BeatsPerMinute = (uint)song.Bpm.Value;

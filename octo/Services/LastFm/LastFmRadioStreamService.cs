@@ -407,8 +407,9 @@ public sealed class LastFmRadioStreamService
         return tags.Select(LastFmRadioRecommendationService.CanonicalTag)
             .Where(tag => tag.Length > 0
                 && !tag.Equals(artistTag, StringComparison.OrdinalIgnoreCase)
-                && !(tag.Length == 4 && tag.All(char.IsAsciiDigit))
-                && !tag.EndsWith("0s", StringComparison.Ordinal))
+                // One year rule, shared with the genre normaliser. Two hand-rolled copies is
+                // how one of them quietly stops dropping "2020s" when someone fixes the other.
+                && !Octo.Services.Metadata.GenreNormalizer.IsYearLike(tag))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Take(8)
             .ToList();

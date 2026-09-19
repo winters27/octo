@@ -676,6 +676,15 @@ section[data-pane].active { display: block; }
   font-size: 13px;
 }
 
+/* Genre backfill preview: the config-sources shell with four columns instead of two. */
+.genre-change-row { grid-template-columns: 2fr 1fr 1fr 1fr; gap: 12px; }
+#genre-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin-top: 12px; }
+
+@media (max-width: 860px) {
+  .genre-change-row { grid-template-columns: 1fr 1fr; }
+  .genre-change-row > span:first-child { grid-column: 1 / -1; }
+}
+
 /* ─── Toast ──────────────────────────────────────────────────── */
 #toast {
   position: fixed;
@@ -1060,6 +1069,33 @@ section[data-pane].active { display: block; }
 .source-kind-switch { height: 44px; }
 .source-kind-switch .sw-track { inset: 10px 0; }
 .source-kind-switch .sw-thumb { top: 13px; }
+
+/* Genre mapping rules. Shares .source-priority-row's chrome for the frame, drag handle and
+   step number, but needs its own grid: a rule row carries seven children, not four. */
+.genre-mapping-list {
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  overflow: visible;
+  background: rgba(12, 12, 13, 0.34);
+}
+.genre-mapping-list:empty { display: none; }
+.genre-mapping-row {
+  min-height: 60px;
+  grid-template-columns: 44px 28px minmax(110px, 1fr) minmax(110px, 1fr) 104px auto auto;
+}
+.genre-mapping-row .set-input { min-width: 0; }
+.genre-preset-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.genre-preset-actions .btn { min-height: 44px; }
+
+@media (max-width: 860px) {
+  .genre-mapping-row {
+    grid-template-columns: 44px 28px minmax(0, 1fr) minmax(0, 1fr);
+    row-gap: 8px;
+  }
+  .genre-mapping-row > select[data-genre-field] { grid-column: 3; }
+  .genre-mapping-row > label.source-kind-switch { grid-column: 4; justify-self: end; }
+  .genre-mapping-row > button[data-genre-remove] { grid-column: 4; justify-self: end; }
+}
 
 @media (max-width: 760px) {
   .playback-source-row { flex-direction: column; align-items: stretch; }

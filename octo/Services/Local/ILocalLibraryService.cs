@@ -46,6 +46,13 @@ public interface ILocalLibraryService
     /// e.g. after each track of an album download so the album fills in progressively
     /// and the final tracks are never left stranded by a swallowed trigger.
     /// </param>
+    /// <summary>
+    /// Every download Octo has a record of. The genre backfill uses this to scope a run to
+    /// files Octo itself created, which is the only scope where rewriting a tag is rewriting
+    /// our own output rather than someone's hand-curated rip.
+    /// </summary>
+    Task<IReadOnlyList<LocalSongMapping>> GetMappingsAsync();
+
     Task<bool> TriggerLibraryScanAsync(bool force = false);
     
     /// <summary>
