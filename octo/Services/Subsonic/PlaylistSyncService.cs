@@ -72,10 +72,15 @@ public class PlaylistSyncService
     }
     
     /// <summary>
-    /// Gets the metadata service for the specified provider
+    /// Gets the metadata service for the specified provider.
+    ///
+    /// Which providers exist is decided by PlaylistIdHelper, not here, so the set that
+    /// makes an ID "external" and the set that can resolve one cannot drift apart.
     /// </summary>
     private IMusicMetadataService? GetMetadataServiceForProvider(string provider)
     {
+        if (!PlaylistIdHelper.IsKnownProvider(provider)) return null;
+
         return provider.ToLower() switch
         {
             "deezer" => _deezerMetadataService,
