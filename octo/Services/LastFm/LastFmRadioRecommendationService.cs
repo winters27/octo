@@ -139,27 +139,30 @@ public sealed class LastFmRadioRecommendationService
             var learned = plays.Where(play => play.LearnedSignal).Sum(SourceWeight)
                 >= settings.EffectiveMinimumPlays;
             var mixKey = learned ? "your-mix" : "starter";
-            var mixCandidates = await TracksFromSeeds(trackSeeds.Take(6), 12, ct);
-            var familiar = plays.Select(ToCandidate).ToList();
-            // The familiar share of the mix is a quota the walk enforces, so both halves
-            // are drawn over their whole pools rather than the top of each list.
-            int? familiarQuota = mixCandidates.Count == 0
-                ? null
-                : settings.EffectiveRadioTrackCount
-                    - (int)Math.Round(settings.EffectiveRadioTrackCount * settings.EffectiveDiscoveryPercent / 100d);
-            if (mixCandidates.Count == 0) mixCandidates.AddRange(familiar);
-            stations.Add(Create(username, mixKey,
-                learned ? "Your Mix" : "Starter Radio",
-                learned ? LastFmRadioStationKind.YourMix : LastFmRadioStationKind.Starter,
-                true, trackSeeds.Select(seed => seed.Artist),
-                Shape(familiar.Concat(mixCandidates), plays, settings, unavailable, random, Previous(mixKey),
-                    ArtistCap(settings, LastFmRadioStationKind.YourMix), familiarQuota: familiarQuota)));
+            if (settings.EnableYourMix)
+            {
+                var mixCandidates = await TracksFromSeeds(trackSeeds.Take(6), 12, ct);
+                var familiar = plays.Select(ToCandidate).ToList();
+                // The familiar share of the mix is a quota the walk enforces, so both halves
+                // are drawn over their whole pools rather than the top of each list.
+                int? familiarQuota = mixCandidates.Count == 0
+                    ? null
+                    : settings.EffectiveRadioTrackCount
+                        - (int)Math.Round(settings.EffectiveRadioTrackCount * settings.EffectiveDiscoveryPercent / 100d);
+                if (mixCandidates.Count == 0) mixCandidates.AddRange(familiar);
+                stations.Add(Create(username, mixKey,
+                    learned ? "Your Mix" : "Starter Radio",
+                    learned ? LastFmRadioStationKind.YourMix : LastFmRadioStationKind.Starter,
+                    true, trackSeeds.Select(seed => seed.Artist),
+                    Shape(familiar.Concat(mixCandidates), plays, settings, unavailable, random, Previous(mixKey),
+                        ArtistCap(settings, LastFmRadioStationKind.YourMix), familiarQuota: familiarQuota)));
+            }
 
             if (learned)
             {
                 var topTags = tags.OrderByDescending(pair => pair.Value).ThenBy(pair => pair.Key)
                     .Select(pair => pair.Key).Take(3).ToList();
-                if (topTags.Count > 0)
+                if (settings.EnableDiscoveryMix && topTags.Count > 0)
                 {
                     var discovery = await TracksFromTags(topTags, candidateTarget, ct);
                     if (discovery.Count >= 5)
@@ -169,7 +172,7 @@ public sealed class LastFmRadioRecommendationService
                                 ArtistCap(settings, LastFmRadioStationKind.Discovery), excludeRecent: true)));
                 }
 
-                foreach (var artist in artistScores.Take(2).Select(pair => pair.Key))
+                foreach (var artist in artistScores.Take(settings.EffectiveArtistStationCount).Select(pair => pair.Key))
                 {
                     var candidates = await TracksFromArtist(artist, candidateTarget, ct);
                     var stationKey = "artist-" + Key(artist);
@@ -180,7 +183,8 @@ public sealed class LastFmRadioRecommendationService
                                 ArtistCap(settings, LastFmRadioStationKind.Artist))));
                 }
 
-                foreach (var tag in tags.OrderByDescending(pair => pair.Value).Select(pair => pair.Key).Take(3))
+                foreach (var tag in tags.OrderByDescending(pair => pair.Value).Select(pair => pair.Key)
+                             .Take(settings.EffectiveGenreStationCount))
                 {
                     var candidates = await TracksFromTags([tag], candidateTarget, ct);
                     var stationKey = "genre-" + Key(tag);

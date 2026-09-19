@@ -602,8 +602,28 @@ public class SubsonicController : ControllerBase
     {
         if (_radioStateStore is null || !_lastFmSettings.EnableRadio || username.Length == 0) return [];
         return _radioStateStore.GetUser(username).Stations.Where(station =>
-            station.Personalized ? _lastFmSettings.EnablePersonalizedStations
+            station.Personalized ? PersonalizedStationVisible(station)
                 : _lastFmSettings.EnableDiscoveryStations).ToList();
+    }
+
+    /// <summary>
+    /// Read-time half of the per-type station settings. The build gate decides what gets
+    /// made; this decides what a client sees, so switching a type off takes effect on the
+    /// next request instead of waiting for a rebuild. Same two-layer arrangement
+    /// EnablePersonalizedStations already uses.
+    /// </summary>
+    private bool PersonalizedStationVisible(LastFmRadioStation station)
+    {
+        if (!_lastFmSettings.EnablePersonalizedStations) return false;
+        return station.Kind switch
+        {
+            LastFmRadioStationKind.Starter or LastFmRadioStationKind.YourMix
+                => _lastFmSettings.EnableYourMix,
+            LastFmRadioStationKind.Discovery => _lastFmSettings.EnableDiscoveryMix,
+            LastFmRadioStationKind.Artist => _lastFmSettings.EffectiveArtistStationCount > 0,
+            LastFmRadioStationKind.Genre => _lastFmSettings.EffectiveGenreStationCount > 0,
+            _ => true,
+        };
     }
 
     private List<LastFmRadioStation> PlaylistStations(string username) =>

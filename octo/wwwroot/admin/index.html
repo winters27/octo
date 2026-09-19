@@ -605,6 +605,22 @@
               <div class="set-info"><div class="set-info-t">Enable dynamic stations</div><div class="set-info-d">Starts with Starter Radio, then grows into Your Mix, discovery, artist, and genre stations.</div></div>
               <label class="switch"><input type="checkbox" name="LastFm.EnablePersonalizedStations" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Your Mix</div><div class="set-info-d">The listener's own mix, drawn from what they actually play. Before Octo has learned enough this is Starter Radio, which is the only station a brand-new listener gets.</div></div>
+              <label class="switch"><input type="checkbox" name="LastFm.EnableYourMix" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Discovery Mix</div><div class="set-info-d">One station of less-familiar music, seeded from the listener's most-played tags.</div></div>
+              <label class="switch"><input type="checkbox" name="LastFm.EnableDiscoveryMix" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Artist stations</div><div class="set-info-d">One station per most-played artist. Set to 0 to build none.</div></div>
+              <input class="set-input" name="LastFm.ArtistStationCount" type="number" min="0" max="5" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Genre stations</div><div class="set-info-d">One station per top tag in the listener's history. Set to 0 to build none.</div></div>
+              <input class="set-input" name="LastFm.GenreStationCount" type="number" min="0" max="5" />
+            </div>
             <div class="set-row stack">
               <div class="set-info"><div class="set-info-t">Discovery balance</div><div class="set-info-d">Percentage of Your Mix reserved for less-familiar recommendations.</div></div>
               <input class="set-input" name="LastFm.DiscoveryPercent" type="number" min="0" max="100" />

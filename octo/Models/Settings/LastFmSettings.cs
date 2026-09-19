@@ -25,6 +25,32 @@ public class LastFmSettings
     /// <summary>Automatically learn per-user stations from completed plays.</summary>
     public bool EnablePersonalizedStations { get; set; } = true;
 
+    /// <summary>
+    /// Build the listener's own mix. When they have not been learned from yet this is
+    /// Starter Radio, which is the only station a new user gets, so turning it off can
+    /// leave them with nothing at all until plays accumulate.
+    /// Environment variable: LASTFM_ENABLE_YOUR_MIX
+    /// </summary>
+    public bool EnableYourMix { get; set; } = true;
+
+    /// <summary>
+    /// Build the Discovery Mix, seeded from the listener's top tags.
+    /// Environment variable: LASTFM_ENABLE_DISCOVERY_MIX
+    /// </summary>
+    public bool EnableDiscoveryMix { get; set; } = true;
+
+    /// <summary>
+    /// How many per-artist radios to build, most-played first. 0 disables them.
+    /// Environment variable: LASTFM_ARTIST_STATION_COUNT
+    /// </summary>
+    public int ArtistStationCount { get; set; } = 2;
+
+    /// <summary>
+    /// How many per-genre radios to build, from the listener's top tags. 0 disables them.
+    /// Environment variable: LASTFM_GENRE_STATION_COUNT
+    /// </summary>
+    public int GenreStationCount { get; set; } = 3;
+
     /// <summary>Expose administrator-pinned Last.fm tag stations.</summary>
     public bool EnableDiscoveryStations { get; set; } = true;
 
@@ -68,6 +94,25 @@ public class LastFmSettings
     public int EffectiveDiscoveryPercent => Math.Clamp(DiscoveryPercent, 0, 100);
     public int EffectiveRefreshIntervalHours => Math.Clamp(RefreshIntervalHours, 1, 168);
     public int EffectiveMinimumPlays => Math.Clamp(MinimumPlays, 3, 100);
+    public int EffectiveArtistStationCount => Math.Clamp(ArtistStationCount, 0, 5);
+    public int EffectiveGenreStationCount => Math.Clamp(GenreStationCount, 0, 5);
+
+    /// <summary>
+    /// Whether the settings ask for nothing to be built: dynamic stations are on, every
+    /// individual kind is off, and no pinned station is contributing either.
+    ///
+    /// Narrow on purpose. The refresh worker treats an empty build as a provider failure
+    /// and keeps the last good snapshot rather than replacing it with nothing, which is
+    /// the behaviour that stops a bad Last.fm response from wiping a listener's stations.
+    /// Switching every kind off is the one empty build that is a choice rather than a
+    /// failure, so only that case is excused; every configuration that predates the
+    /// per-type settings keeps the old guard exactly.
+    /// </summary>
+    public bool StationsExplicitlyEmpty => EnablePersonalizedStations
+        && !EnableYourMix && !EnableDiscoveryMix
+        && EffectiveArtistStationCount == 0 && EffectiveGenreStationCount == 0
+        && !(EnableDiscoveryStations && EffectiveDiscoveryStations().Any(station => station.Enabled));
+
     public double? EffectiveRadioLoudnessTarget => RadioLoudnessTargetLufs == 0
         ? null
         : Math.Clamp(RadioLoudnessTargetLufs, -23, -9);

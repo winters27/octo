@@ -274,6 +274,15 @@ bounded 24-hour/512 MiB temporary cache. Unplayable tracks are rejected for 24 h
 and replaced through the normal refresh path; no prepared track is added to the music
 library. **Start radio from this song** remains a one-time `getSimilarSongs[2]` queue.
 
+
+Each kind of dynamic station is configured on its own, so a listener can keep Your Mix
+without collecting an artist radio per favourite band. `LASTFM_ENABLE_YOUR_MIX` and
+`LASTFM_ENABLE_DISCOVERY_MIX` (both default true) switch those two stations,
+`LASTFM_ARTIST_STATION_COUNT` (default 2) and `LASTFM_GENRE_STATION_COUNT` (default 3)
+say how many of each to build, and 0 builds none. The defaults are what Octo has always
+produced. All four take effect without a restart, and switching one off removes those
+stations from clients on the next request.
+
 Other Radio defaults use
 `LASTFM_ENABLE_PERSONALIZED_STATIONS`, `LASTFM_ENABLE_DISCOVERY_STATIONS`,
 `LASTFM_HISTORY_RETENTION_DAYS`, `LASTFM_DISCOVERY_PERCENT`,

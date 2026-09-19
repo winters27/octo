@@ -17,7 +17,7 @@ public sealed class LastFmRadioRefreshWorker : BackgroundService
     private readonly LastFmRadioWarmupService? _warmup;
     private Dictionary<string, string> _definitions;
     private bool _radioEnabled;
-    private bool _personalizedEnabled;
+    private string _personalizedShape;
     public int InFlightCount => _singleFlight.InFlightCount;
 
     public LastFmRadioRefreshWorker(LastFmRadioRefreshQueue queue, IServiceScopeFactory scopes,
@@ -28,14 +28,14 @@ public sealed class LastFmRadioRefreshWorker : BackgroundService
         _warmup = warmup;
         _definitions = Fingerprints(settings.CurrentValue);
         _radioEnabled = settings.CurrentValue.EnableRadio;
-        _personalizedEnabled = settings.CurrentValue.EnablePersonalizedStations;
+        _personalizedShape = PersonalizedShape(settings.CurrentValue);
         settings.OnChange(changed =>
         {
             var next = Fingerprints(changed);
             var removed = _definitions.Keys.Except(next.Keys, StringComparer.OrdinalIgnoreCase).Any();
             var rebuildAll = removed
                 || (!_radioEnabled && changed.EnableRadio)
-                || (_personalizedEnabled != changed.EnablePersonalizedStations);
+                || (_personalizedShape != PersonalizedShape(changed));
             foreach (var user in _state.KnownUsers())
             {
                 if (rebuildAll) _queue.Enqueue(user);
@@ -45,9 +45,22 @@ public sealed class LastFmRadioRefreshWorker : BackgroundService
             }
             _definitions = next;
             _radioEnabled = changed.EnableRadio;
-            _personalizedEnabled = changed.EnablePersonalizedStations;
+            _personalizedShape = PersonalizedShape(changed);
         });
     }
+
+    /// <summary>
+    /// Everything that decides WHICH personalized stations get built, as one value.
+    ///
+    /// A change to any of it has to force a rebuild, because the station list is only
+    /// recomputed on a refresh. Without this, turning artist radios off leaves them in
+    /// every client until the next scheduled refresh hours later, and the setting reads
+    /// as broken. One fingerprint rather than a flag per setting, so a new station type
+    /// cannot be added without this noticing.
+    /// </summary>
+    private static string PersonalizedShape(LastFmSettings settings) => string.Join('|',
+        settings.EnablePersonalizedStations, settings.EnableYourMix, settings.EnableDiscoveryMix,
+        settings.EffectiveArtistStationCount, settings.EffectiveGenreStationCount);
 
     private static Dictionary<string, string> Fingerprints(LastFmSettings settings) =>
         settings.EffectiveDiscoveryStations().Where(definition => definition.Enabled).ToDictionary(definition => definition.Id,
@@ -138,7 +151,11 @@ public sealed class LastFmRadioRefreshWorker : BackgroundService
             merged.Add(replacement);
             stations = merged;
         }
-        if (stations.Count == 0 && _state.GetUser(job.Username).Stations.Count > 0)
+        // An empty build normally means the provider failed, and replacing a user's stations
+        // with nothing is worse than keeping a stale snapshot. Switching every station kind
+        // off is the one empty build that is a choice, so it is the only one excused here.
+        if (stations.Count == 0 && _state.GetUser(job.Username).Stations.Count > 0
+            && !settings.StationsExplicitlyEmpty)
             throw new InvalidOperationException("Provider returned no usable replacement stations");
         _state.ReplaceStations(job.Username, stations);
         _warmup?.QueueUser(job.Username);

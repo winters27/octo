@@ -87,6 +87,58 @@ public class LastFmRadioCoreTests
     }
 
     [Theory]
+    [InlineData(-3, 0)]
+    [InlineData(0, 0)]
+    [InlineData(2, 2)]
+    [InlineData(99, 5)]
+    public void StationCounts_AreClampedAtReadTime(int configured, int effective)
+    {
+        var settings = new LastFmSettings
+            { ArtistStationCount = configured, GenreStationCount = configured };
+        Assert.Equal(effective, settings.EffectiveArtistStationCount);
+        Assert.Equal(effective, settings.EffectiveGenreStationCount);
+    }
+
+    /// <summary>
+    /// The refresh worker refuses to replace a user's stations with an empty build, because
+    /// an empty build normally means the provider failed. Once every station type can be
+    /// switched off, empty is also what the user asked for, and the worker needs to tell
+    /// the two apart or turning everything off throws and reads as an outage.
+    /// </summary>
+    [Fact]
+    public void StationsExplicitlyEmpty_ExcusesOnlyAnAllKindsOffConfiguration()
+    {
+        var allOff = new LastFmSettings
+        {
+            EnablePersonalizedStations = true, EnableYourMix = false, EnableDiscoveryMix = false,
+            ArtistStationCount = 0, GenreStationCount = 0, EnableDiscoveryStations = false,
+        };
+        Assert.True(allOff.StationsExplicitlyEmpty);
+
+        Assert.False(new LastFmSettings().StationsExplicitlyEmpty);
+
+        var onlyGenre = new LastFmSettings
+        {
+            EnablePersonalizedStations = true, EnableYourMix = false, EnableDiscoveryMix = false,
+            ArtistStationCount = 0, GenreStationCount = 1, EnableDiscoveryStations = false,
+        };
+        Assert.False(onlyGenre.StationsExplicitlyEmpty);
+
+        // A pinned station still counts, so an empty build is still a provider failure.
+        var pinnedSurvives = new LastFmSettings
+        {
+            EnablePersonalizedStations = true, EnableYourMix = false, EnableDiscoveryMix = false,
+            ArtistStationCount = 0, GenreStationCount = 0, EnableDiscoveryStations = true,
+            DiscoveryStations = [new() { Id = "rock", Name = "Rock", Tags = ["rock"] }],
+        };
+        Assert.False(pinnedSurvives.StationsExplicitlyEmpty);
+
+        // Every configuration that predates the per-type settings keeps the old guard.
+        var personalizedOff = new LastFmSettings { EnablePersonalizedStations = false };
+        Assert.False(personalizedOff.StationsExplicitlyEmpty);
+    }
+
+    [Theory]
     [InlineData(1, 96)]
     [InlineData(120, 128)]
     [InlineData(192, 192)]
@@ -998,6 +1050,76 @@ public class LastFmRadioRecommendationTests
         }
         finally { try { Directory.Delete(directory, true); } catch { } }
     }
+
+    /// <summary>
+    /// Each dynamic station type is configured on its own (issue #39). Before this the
+    /// four types shared one switch and the counts were literals in BuildAsync, so a
+    /// listener who wanted Your Mix also got an artist radio per favourite band.
+    /// </summary>
+    [Fact]
+    public async Task StationTypeToggles_BuildOnlyTheEnabledKinds()
+    {
+        var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "octo-radio-kinds-" + Guid.NewGuid());
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var settings = TestOptions.Monitor(Learned());
+            var state = new LastFmRadioStateStore(System.IO.Path.Combine(directory, "state.json"), settings,
+                new ExternalIdRegistry(), new Mock<ILogger<LastFmRadioStateStore>>().Object);
+            for (var index = 0; index < 12; index++) state.RecordPlay("alice", new LastFmRadioPlay
+                { Artist = "Artist " + index % 3, Title = "T" + index, Genre = "rock" });
+            var service = RecommendationService(settings, state, new RecommendationHandler());
+
+            var all = await service.BuildAsync("alice");
+            Assert.Contains(all, station => station.Kind == LastFmRadioStationKind.Artist);
+            Assert.Contains(all, station => station.Kind == LastFmRadioStationKind.Genre);
+
+            var trimmed = Learned();
+            trimmed.EnableYourMix = false;
+            trimmed.ArtistStationCount = 0;
+            trimmed.GenreStationCount = 0;
+            settings.Set(trimmed);
+
+            var discoveryOnly = await service.BuildAsync("alice");
+            Assert.DoesNotContain(discoveryOnly, station => station.Kind == LastFmRadioStationKind.Artist);
+            Assert.DoesNotContain(discoveryOnly, station => station.Kind == LastFmRadioStationKind.Genre);
+            Assert.DoesNotContain(discoveryOnly, station => station.Kind == LastFmRadioStationKind.YourMix
+                || station.Kind == LastFmRadioStationKind.Starter);
+        }
+        finally { try { Directory.Delete(directory, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task ArtistStationCount_DecidesHowManyArtistRadiosAreBuilt()
+    {
+        var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "octo-radio-count-" + Guid.NewGuid());
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var one = Learned();
+            one.ArtistStationCount = 1;
+            one.GenreStationCount = 0;
+            var settings = TestOptions.Monitor(one);
+            var state = new LastFmRadioStateStore(System.IO.Path.Combine(directory, "state.json"), settings,
+                new ExternalIdRegistry(), new Mock<ILogger<LastFmRadioStateStore>>().Object);
+            for (var index = 0; index < 12; index++) state.RecordPlay("alice", new LastFmRadioPlay
+                { Artist = "Artist " + index % 3, Title = "T" + index, Genre = "rock" });
+            var service = RecommendationService(settings, state, new RecommendationHandler());
+
+            var stations = await service.BuildAsync("alice");
+            Assert.Single(stations, station => station.Kind == LastFmRadioStationKind.Artist);
+        }
+        finally { try { Directory.Delete(directory, true); } catch { } }
+    }
+
+    /// <summary>Enough plays that BuildAsync takes the learned branch and builds all four kinds.
+    /// The key has to be set: without one LastFmService short-circuits every tag lookup, so
+    /// the discovery and genre stations have nothing to be built from.</summary>
+    private static LastFmSettings Learned() => new()
+    {
+        ApiKey = "test-key", EnablePersonalizedStations = true, EnableDiscoveryStations = false,
+        MinimumPlays = 3,
+    };
 
     private static LastFmRadioRecommendationService RecommendationService(
         TestOptionsMonitor<LastFmSettings> settings, LastFmRadioStateStore state,

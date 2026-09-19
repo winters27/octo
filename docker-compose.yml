@@ -66,6 +66,10 @@ services:
       LastFm__RadioTrackCount: ${LASTFM_RADIO_TRACK_COUNT:-50}
       LastFm__RadioCacheDurationHours: ${LASTFM_RADIO_CACHE_HOURS:-24}
       LastFm__EnablePersonalizedStations: ${LASTFM_ENABLE_PERSONALIZED_STATIONS:-true}
+      LastFm__EnableYourMix: ${LASTFM_ENABLE_YOUR_MIX:-true}
+      LastFm__EnableDiscoveryMix: ${LASTFM_ENABLE_DISCOVERY_MIX:-true}
+      LastFm__ArtistStationCount: ${LASTFM_ARTIST_STATION_COUNT:-2}
+      LastFm__GenreStationCount: ${LASTFM_GENRE_STATION_COUNT:-3}
       LastFm__EnableDiscoveryStations: ${LASTFM_ENABLE_DISCOVERY_STATIONS:-true}
       LastFm__ExposeRadioAsPlaylists: ${LASTFM_EXPOSE_AS_PLAYLISTS:-true}
       LastFm__ExposeRadioAsStreams: ${LASTFM_EXPOSE_AS_STREAMS:-true}
