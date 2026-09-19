@@ -55,4 +55,10 @@ public sealed record NotificationEvent
     public int? TrackCount { get; init; }
     public int? LosslessCount { get; init; }
     public int? FailedCount { get; init; }
+
+    /// <summary>
+    /// Who asked for this, when Octo could tell. Empty for an acquisition Octo started
+    /// itself, and for every event when the setting is off.
+    /// </summary>
+    public IReadOnlyList<string>? RequestedBy { get; init; }
 }

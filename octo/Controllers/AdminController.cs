@@ -435,6 +435,7 @@ public class AdminController : ControllerBase
                 ["DownloadMode"] = subsonic.DownloadMode.ToString(),
                 ["DownloadOnStar"] = subsonic.DownloadOnStar,
                 ["DownloadAlbumOnStar"] = subsonic.DownloadAlbumOnStar,
+                ["RecordRequestedBy"] = subsonic.RecordRequestedBy,
                 ["WaitForLosslessOnPlay"] = subsonic.WaitForLosslessOnPlay,
                 ["LosslessWaitTimeoutSeconds"] = subsonic.LosslessWaitTimeoutSeconds,
                 // These two are rendered by the dashboard but were missing here, so their
@@ -999,6 +1000,7 @@ public class AdminController : ControllerBase
                 ["DownloadMode"] = subsonic.DownloadMode.ToString(),
                 ["DownloadOnStar"] = subsonic.DownloadOnStar,
                 ["DownloadAlbumOnStar"] = subsonic.DownloadAlbumOnStar,
+                ["RecordRequestedBy"] = subsonic.RecordRequestedBy,
                 ["WaitForLosslessOnPlay"] = subsonic.WaitForLosslessOnPlay,
                 ["LosslessWaitTimeoutSeconds"] = subsonic.LosslessWaitTimeoutSeconds,
                 ["DownloadSource"] = subsonic.DownloadSource.ToString(),
@@ -1216,6 +1218,7 @@ public class AdminController : ControllerBase
         {
             "Subsonic:Url", "Subsonic:StorageMode", "Subsonic:DownloadMode",
             "Subsonic:DownloadOnStar", "Subsonic:DownloadAlbumOnStar",
+            "Subsonic:RecordRequestedBy",
             "Subsonic:WaitForLosslessOnPlay", "Subsonic:LosslessWaitTimeoutSeconds",
             "Subsonic:DownloadSource", "Subsonic:AutoDetectDownloadPath", "Subsonic:LibraryPath",
             "Subsonic:FolderStructure",

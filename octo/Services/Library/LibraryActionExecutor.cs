@@ -36,12 +36,14 @@ public sealed class LibraryActionExecutor
     private readonly TrackAcquisitionQueue _acquisitions;
     private readonly IOptionsMonitor<LibraryActionSettings> _settings;
     private readonly IOptionsMonitor<SoulseekSettings> _soulseek;
+    private readonly IOptionsMonitor<SubsonicSettings> _subsonicSettings;
     private readonly ILogger<LibraryActionExecutor> _logger;
 
     public LibraryActionExecutor(NavidromeSongPathResolver resolver, LibraryActionQuarantine quarantine,
         LibraryActionJournal journal, ILocalLibraryService library, ExternalIdRegistry ids,
         RejectedPeerRegistry rejectedPeers, TrackAcquisitionQueue acquisitions,
         IOptionsMonitor<LibraryActionSettings> settings, IOptionsMonitor<SoulseekSettings> soulseek,
+        IOptionsMonitor<SubsonicSettings> subsonicSettings,
         ILogger<LibraryActionExecutor> logger)
     {
         _resolver = resolver;
@@ -53,6 +55,7 @@ public sealed class LibraryActionExecutor
         _acquisitions = acquisitions;
         _settings = settings;
         _soulseek = soulseek;
+        _subsonicSettings = subsonicSettings;
         _logger = logger;
     }
 
@@ -153,7 +156,11 @@ public sealed class LibraryActionExecutor
             var replacement = await _acquisitions.Enqueue(
                 SoulseekMetadataService.ProviderName, externalId, isStar: true,
                 triggerAlbumDownload: false, forcePermanent: true,
-                sourceOverride: null, notifyOnFailure: false);
+                sourceOverride: null, notifyOnFailure: false,
+                // The person who asked for the replacement owns the new file the same way
+                // they would have owned a star for it.
+                requestedBy: _subsonicSettings.CurrentValue.RecordRequestedBy
+                    ? request.Username : null);
 
             var problem = Unacceptable(request.Action, replacement, original);
             if (problem is null)

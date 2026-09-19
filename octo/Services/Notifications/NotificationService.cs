@@ -219,6 +219,10 @@ public sealed class NotificationService
                 Add("Bitrate", $"≈{b * 8 / dur / 1000:N0} kbps");
         }
         if (evt.Year is int year and > 0) Add("Year", year.ToString());
+        // Last, because on a single-user library it is always the same name and the
+        // fields above are what anyone is actually reading.
+        if (evt.RequestedBy is { Count: > 0 } askers)
+            Add("Requested by", string.Join(", ", askers));
         return fields;
     }
 

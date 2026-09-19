@@ -18,6 +18,25 @@ public sealed class AcquisitionRequest
     public DownloadSource? SourceOverride { get; init; }
     public bool NotifyOnFailure { get; init; } = true;
 
+    private readonly ConcurrentDictionary<string, byte> _requestedBy =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Every user who asked for this track, not only the one who asked first.
+    ///
+    /// A star for a track already in flight joins this request rather than queueing a second
+    /// transfer, so whoever wins that race is an accident of timing. Attributing the file to
+    /// them alone would drop everyone else who asked for the same thing.
+    /// </summary>
+    public IReadOnlyList<string> RequestedBy =>
+        _requestedBy.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList();
+
+    /// <summary>Record one more asker. Safe to call after the request is already queued.</summary>
+    internal void AddRequester(string? username)
+    {
+        if (!string.IsNullOrWhiteSpace(username)) _requestedBy.TryAdd(username.Trim(), 0);
+    }
+
     /// <summary>
     /// RunContinuationsAsynchronously is required. Without it, completing this runs the
     /// waiting request's continuation — response headers, body writes, the client's whole
@@ -78,7 +97,8 @@ public sealed class TrackAcquisitionQueue
     /// </summary>
     public Task<string> Enqueue(string provider, string externalId, bool isStar,
         bool triggerAlbumDownload, bool forcePermanent,
-        DownloadSource? sourceOverride = null, bool notifyOnFailure = true)
+        DownloadSource? sourceOverride = null, bool notifyOnFailure = true,
+        string? requestedBy = null)
     {
         var request = new AcquisitionRequest
         {
@@ -90,11 +110,15 @@ public sealed class TrackAcquisitionQueue
             SourceOverride = sourceOverride,
             NotifyOnFailure = notifyOnFailure,
         };
+        request.AddRequester(requestedBy);
 
         var existing = _inFlight.GetOrAdd(request.Key, request);
         if (!ReferenceEquals(existing, request))
         {
-            // Already queued or running. Join it rather than fetching the same file twice.
+            // Already queued or running. Join it rather than fetching the same file twice,
+            // and record this caller on the request that is actually going to run, so the
+            // file is attributed to everyone who asked and not just to whoever was first.
+            existing.AddRequester(requestedBy);
             return existing.Completion.Task;
         }
 

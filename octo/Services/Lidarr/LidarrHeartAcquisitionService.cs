@@ -14,9 +14,11 @@ namespace Octo.Services.Lidarr;
 public interface ILidarrHeartAcquisitionService
 {
     Task<bool> TryAcquireTrackAsync(
-        string provider, string externalId, bool notifyFailure = true);
+        string provider, string externalId, bool notifyFailure = true,
+        string? requestedBy = null);
     Task<bool> TryAcquireAlbumAsync(
-        string provider, string externalId, bool notifyFailure = true);
+        string provider, string externalId, bool notifyFailure = true,
+        string? requestedBy = null);
 }
 
 /// <summary>
@@ -38,6 +40,12 @@ public sealed class LidarrHeartAcquisitionService : ILidarrHeartAcquisitionServi
     private readonly ILogger<LidarrHeartAcquisitionService> _logger;
     private readonly ConcurrentDictionary<string, Lazy<Task>> _albumJobs = new();
     private readonly ConcurrentDictionary<string, byte> _recordedPaths = new(StringComparer.OrdinalIgnoreCase);
+
+    // Who asked for each album, by Lidarr foreign id. Separate from _albumJobs because the
+    // same dedup applies: a second user starring an album Lidarr is already working on joins
+    // that job, and the import can land minutes later, so the set is read when the file is
+    // recorded rather than captured when the job started.
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _albumRequesters = new();
 
     public LidarrHeartAcquisitionService(
         LidarrClient client,
@@ -68,7 +76,8 @@ public sealed class LidarrHeartAcquisitionService : ILidarrHeartAcquisitionServi
     }
 
     public Task<bool> TryAcquireTrackAsync(
-        string provider, string externalId, bool notifyFailure = true) =>
+        string provider, string externalId, bool notifyFailure = true,
+        string? requestedBy = null) =>
         TryAcquireAsync(async () =>
         {
             var song = await _metadata.GetSongAsync(provider, externalId)
@@ -90,24 +99,40 @@ public sealed class LidarrHeartAcquisitionService : ILidarrHeartAcquisitionServi
                 CoverArtUrl = enriched?.AlbumCoverUrl,
                 Songs = new List<Song> { song },
             };
-            await QueueResolvedAlbumAsync(album);
+            await QueueResolvedAlbumAsync(album, requestedBy);
         }, "track", externalId, notifyFailure);
 
     public Task<bool> TryAcquireAlbumAsync(
-        string provider, string externalId, bool notifyFailure = true) =>
+        string provider, string externalId, bool notifyFailure = true,
+        string? requestedBy = null) =>
         TryAcquireAsync(async () =>
         {
             var album = await _metadata.GetAlbumAsync(provider, externalId)
                 ?? throw new InvalidOperationException("The starred external album is no longer available.");
-            await QueueResolvedAlbumAsync(album);
+            await QueueResolvedAlbumAsync(album, requestedBy);
         }, "album", externalId, notifyFailure);
 
-    private async Task QueueResolvedAlbumAsync(Album album)
+    private void AddRequester(string albumKey, string? username)
+    {
+        if (string.IsNullOrWhiteSpace(username)) return;
+        _albumRequesters
+            .GetOrAdd(albumKey, _ => new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase))
+            .TryAdd(username.Trim(), 0);
+    }
+
+    private IReadOnlyList<string>? RequestersFor(string albumKey) =>
+        _albumRequesters.TryGetValue(albumKey, out var set) && !set.IsEmpty
+            ? set.Keys.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList()
+            : null;
+
+    private async Task QueueResolvedAlbumAsync(Album album, string? requestedBy = null)
     {
         if (string.IsNullOrWhiteSpace(album.Artist) || string.IsNullOrWhiteSpace(album.Title))
             throw new InvalidOperationException("Lidarr requires an album artist and title.");
 
         var candidate = await _client.ResolveAlbumAsync(album.Artist, album.Title, album.Year);
+        // Before GetOrAdd, so a caller that joins an existing job is still recorded.
+        AddRequester(candidate.ForeignAlbumId, requestedBy);
         var lazy = _albumJobs.GetOrAdd(candidate.ForeignAlbumId,
             _ => new Lazy<Task>(() => SubmitAndStartReconciliationAsync(candidate, album),
                 LazyThreadSafetyMode.ExecutionAndPublication));
@@ -144,7 +169,7 @@ public sealed class LidarrHeartAcquisitionService : ILidarrHeartAcquisitionServi
         {
             try
             {
-                await ReconcileImportsAsync(albumId, album, snapshot);
+                await ReconcileImportsAsync(albumId, album, snapshot, candidate.ForeignAlbumId);
             }
             catch (Exception ex)
             {
@@ -171,7 +196,8 @@ public sealed class LidarrHeartAcquisitionService : ILidarrHeartAcquisitionServi
         });
     }
 
-    private async Task ReconcileImportsAsync(int albumId, Album album, LidarrSettings settings)
+    private async Task ReconcileImportsAsync(int albumId, Album album, LidarrSettings settings,
+        string albumKey)
     {
         var timeout = TimeSpan.FromSeconds(Math.Max(1, settings.ImportTimeoutSeconds));
         var poll = TimeSpan.FromSeconds(Math.Clamp(settings.ImportTimeoutSeconds / 30, 1, 10));
@@ -202,7 +228,7 @@ public sealed class LidarrHeartAcquisitionService : ILidarrHeartAcquisitionServi
                 if (!_recordedPaths.TryAdd(localPath, 0)) continue;
                 try
                 {
-                    await RecordImportAsync(album, track, localPath);
+                    await RecordImportAsync(album, track, localPath, RequestersFor(albumKey));
                     imported++;
                 }
                 catch
@@ -254,7 +280,8 @@ public sealed class LidarrHeartAcquisitionService : ILidarrHeartAcquisitionServi
         }
     }
 
-    private async Task RecordImportAsync(Album album, LidarrImportedTrack imported, string localPath)
+    private async Task RecordImportAsync(Album album, LidarrImportedTrack imported, string localPath,
+        IReadOnlyList<string>? requestedBy = null)
     {
         var song = MatchSong(album, imported) ?? new Song
         {
@@ -284,6 +311,7 @@ public sealed class LidarrHeartAcquisitionService : ILidarrHeartAcquisitionServi
             CoverArtUrl = song.CoverArtUrlLarge ?? song.CoverArtUrl ?? album.CoverArtUrl,
             SizeBytes = size,
             DownloadedAt = DateTime.UtcNow.ToString("o"),
+            RequestedBy = requestedBy is { Count: > 0 } ? [.. requestedBy] : null,
         });
     }
 

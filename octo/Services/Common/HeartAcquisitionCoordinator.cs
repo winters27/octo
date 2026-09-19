@@ -24,17 +24,18 @@ public sealed class HeartAcquisitionCoordinator
         _logger = logger;
     }
 
-    public void QueueTrack(string provider, string externalId)
+    public void QueueTrack(string provider, string externalId, string? requestedBy = null)
     {
-        _ = AcquireTrackAsync(provider, externalId);
+        _ = AcquireTrackAsync(provider, externalId, requestedBy);
     }
 
-    public void QueueAlbum(string provider, string albumExternalId)
+    public void QueueAlbum(string provider, string albumExternalId, string? requestedBy = null)
     {
-        _ = AcquireAlbumAsync(provider, albumExternalId);
+        _ = AcquireAlbumAsync(provider, albumExternalId, requestedBy);
     }
 
-    internal async Task AcquireTrackAsync(string provider, string externalId)
+    internal async Task AcquireTrackAsync(string provider, string externalId,
+        string? requestedBy = null)
     {
         var steps = EnabledSteps(albumHeart: false);
         for (var index = 0; index < steps.Count; index++)
@@ -42,7 +43,7 @@ public sealed class HeartAcquisitionCoordinator
             var isLast = index == steps.Count - 1;
             if (steps[index] == HeartDownloadSource.Lidarr)
             {
-                if (await _lidarr.TryAcquireTrackAsync(provider, externalId, isLast)) return;
+                if (await _lidarr.TryAcquireTrackAsync(provider, externalId, isLast, requestedBy)) return;
                 continue;
             }
 
@@ -50,7 +51,10 @@ public sealed class HeartAcquisitionCoordinator
             {
                 await _directQueue.Enqueue(provider, externalId, isStar: true,
                     triggerAlbumDownload: false, forcePermanent: true,
-                    sourceOverride: ToDirectSource(steps[index]), notifyOnFailure: isLast);
+                    sourceOverride: ToDirectSource(steps[index]), notifyOnFailure: isLast,
+                    // Passed on every step, not only the first. A track that fails its way
+                    // down the source chain is still the same person's star.
+                    requestedBy: requestedBy);
                 return;
             }
             catch (Exception ex)
@@ -65,7 +69,8 @@ public sealed class HeartAcquisitionCoordinator
         }
     }
 
-    internal async Task AcquireAlbumAsync(string provider, string albumExternalId)
+    internal async Task AcquireAlbumAsync(string provider, string albumExternalId,
+        string? requestedBy = null)
     {
         var steps = EnabledSteps(albumHeart: true);
         for (var index = 0; index < steps.Count; index++)
@@ -73,7 +78,7 @@ public sealed class HeartAcquisitionCoordinator
             var isLast = index == steps.Count - 1;
             if (steps[index] == HeartDownloadSource.Lidarr)
             {
-                if (await _lidarr.TryAcquireAlbumAsync(provider, albumExternalId, isLast)) return;
+                if (await _lidarr.TryAcquireAlbumAsync(provider, albumExternalId, isLast, requestedBy)) return;
                 continue;
             }
 
@@ -81,7 +86,8 @@ public sealed class HeartAcquisitionCoordinator
             {
                 if (await _directDownloads.DownloadAlbumWithSourceAsync(
                         provider, albumExternalId, ToDirectSource(steps[index]),
-                        suppressSummary: !isLast))
+                        suppressSummary: !isLast,
+                        requestedBy: requestedBy is null ? null : [requestedBy]))
                     return;
             }
             catch (Exception ex)

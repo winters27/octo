@@ -1138,7 +1138,8 @@ public class SubsonicController : ControllerBase
             if (_subsonicSettings.WaitForLosslessOnPlay)
             {
                 var acquisition = _acquisitions.Enqueue(provider!, externalId!, isStar: false,
-                    triggerAlbumDownload: false, forcePermanent: true);
+                    triggerAlbumDownload: false, forcePermanent: true,
+                    requestedBy: RequesterFor(parameters));
                 return await ServeAcquiredAsync(acquisition, provider!, externalId!, id, format,
                     allowPreviewFallback: true);
             }
@@ -1961,7 +1962,8 @@ public class SubsonicController : ControllerBase
 
             // An empty exclude means "download every track". The engine already skips
             // tracks that are downloaded or in flight and isolates per-track failures.
-            _heartAcquisitions.QueueAlbum(albumProviderName, albumCandidate);
+            _heartAcquisitions.QueueAlbum(albumProviderName, albumCandidate,
+                RequesterFor(parameters));
 
             // Navidrome has never seen this id, so relaying the star would just error.
             return _responseBuilder.CreateResponse(format, "starred", new { });
@@ -1983,7 +1985,7 @@ public class SubsonicController : ControllerBase
             // than inheriting whatever a concurrent play happened to ask for.
             _logger.LogInformation("Starring external song {SongId}, queueing permanent download", itemId);
 
-            _heartAcquisitions.QueueTrack(provider!, externalId!);
+            _heartAcquisitions.QueueTrack(provider!, externalId!, RequesterFor(parameters));
 
             // Return success response immediately
             return _responseBuilder.CreateResponse(format, "starred", new { });
@@ -2747,6 +2749,19 @@ public class SubsonicController : ControllerBase
             return File(Encoding.UTF8.GetBytes(page.ToJsonString()), "application/json");
         }
         return File(Encoding.UTF8.GetBytes(NativeStation(stationMatch).ToJsonString()), "application/json");
+    }
+
+    /// <summary>
+    /// The user to attribute an acquisition to, or null when attribution is off.
+    ///
+    /// Gated here rather than at the history write, so with the setting off no username is
+    /// captured in the first place and nothing downstream is ever holding one.
+    /// </summary>
+    private string? RequesterFor(IReadOnlyDictionary<string, string> parameters)
+    {
+        if (!_subsonicSettings.RecordRequestedBy) return null;
+        var username = NativeUsername(parameters);
+        return string.IsNullOrWhiteSpace(username) ? null : username;
     }
 
     private string NativeUsername(IReadOnlyDictionary<string, string> parameters)

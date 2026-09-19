@@ -384,6 +384,13 @@
               </div>
               <input class="set-input" id="f-lossless-wait-timeout" name="Subsonic.LosslessWaitTimeoutSeconds" type="number" min="0" />
             </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Record who asked</div>
+                <div class="set-info-d">Names the Subsonic user who starred a track on its entry in Fetched songs and on the download notification, so on a shared library you can tell one person's downloads from another's. Turning this off stops the name being captured at all; entries already written keep theirs.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-record-requested-by" name="Subsonic.RecordRequestedBy" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
           </form>
         </div>
         <div class="set-section">

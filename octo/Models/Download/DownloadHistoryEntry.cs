@@ -26,4 +26,15 @@ public class DownloadHistoryEntry
 
     /// <summary>When it was saved (ISO 8601, UTC).</summary>
     public string DownloadedAt { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Who asked for this file, when Octo could tell. A star or a play carries the Subsonic
+    /// username; an acquisition Octo started itself carries nobody, and so does every entry
+    /// written before this field existed.
+    ///
+    /// A list rather than one name, because a second user starring a track that is already
+    /// being fetched joins that transfer instead of starting another. Recording only whoever
+    /// got there first would attribute the file to one of them and silently drop the rest.
+    /// </summary>
+    public List<string>? RequestedBy { get; set; }
 }

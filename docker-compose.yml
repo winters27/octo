@@ -26,6 +26,8 @@ services:
       Subsonic__DownloadMode: ${DOWNLOAD_MODE:-Track}
       Subsonic__DownloadOnStar: ${DOWNLOAD_ON_STAR:-true}
       Subsonic__DownloadAlbumOnStar: ${DOWNLOAD_ALBUM_ON_STAR:-true}
+      # Name the user who starred a track on its history entry and notification.
+      Subsonic__RecordRequestedBy: ${RECORD_REQUESTED_BY:-true}
       Subsonic__WaitForLosslessOnPlay: ${WAIT_FOR_LOSSLESS_ON_PLAY:-false}
       Subsonic__LosslessWaitTimeoutSeconds: ${LOSSLESS_WAIT_TIMEOUT_SECONDS:-0}
       Subsonic__FolderStructure: ${FOLDER_STRUCTURE:-Flat}

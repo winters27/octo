@@ -59,7 +59,11 @@ public sealed class AcquisitionWorker : BackgroundService
                     request.Provider, request.ExternalId,
                     request.TriggerAlbumDownload, request.ForcePermanent,
                     request.SourceOverride,
-                    CancellationToken.None);
+                    CancellationToken.None,
+                    // Read here rather than at enqueue time: a second user can join this
+                    // request right up until it is dequeued, and they asked for the file
+                    // just as much as whoever queued it.
+                    request.RequestedBy);
 
                 request.Completion.TrySetResult(path);
                 _logger.LogInformation("Acquisition finished for {Provider}:{Id} -> {Path}",
@@ -110,6 +114,9 @@ public sealed class AcquisitionWorker : BackgroundService
                 Title = routing?.Title,
                 Album = routing?.Album,
                 Detail = ex.Message,
+                // A failed star is the one notification where knowing whose it was
+                // matters most, since nothing else will tell them.
+                RequestedBy = request.RequestedBy is { Count: > 0 } askers ? askers : null,
             });
         }
         catch (Exception nex)

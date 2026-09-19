@@ -42,13 +42,18 @@ public interface IDownloadService
     /// which supplies a token unrelated to any HTTP request — that separation is the whole
     /// point, since a client giving up must never cancel a transfer slskd will finish.
     /// </summary>
+    /// <param name="requestedBy">
+    /// The users who asked for this track, for the history entry and the notification.
+    /// Empty when Octo started the acquisition itself or when attribution is switched off.
+    /// </param>
     Task<string> ExecuteAcquisitionAsync(string externalProvider, string externalId,
         bool triggerAlbumDownload, bool forcePermanent, DownloadSource? sourceOverride,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken, IReadOnlyList<string>? requestedBy = null);
 
     /// <summary>Runs one direct source for every missing track in an album.</summary>
     Task<bool> DownloadAlbumWithSourceAsync(string externalProvider, string albumExternalId,
-        DownloadSource source, bool suppressSummary, CancellationToken cancellationToken = default);
+        DownloadSource source, bool suppressSummary, CancellationToken cancellationToken = default,
+        IReadOnlyList<string>? requestedBy = null);
 
     /// <summary>
     /// Checks if a song is currently being downloaded

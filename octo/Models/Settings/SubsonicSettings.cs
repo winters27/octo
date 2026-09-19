@@ -243,6 +243,16 @@ public class SubsonicSettings
     public bool DownloadAlbumOnStar { get; set; } = true;
 
     /// <summary>
+    /// Record which Subsonic user asked for each download (default: true)
+    /// Environment variable: RECORD_REQUESTED_BY
+    /// The username reaches the fetched-songs log and the download notification, so on a
+    /// shared library you can tell one person's acquisitions from another's. Turning it off
+    /// stops the name being captured at all rather than hiding it afterwards, so nothing
+    /// downstream ever holds it. Entries written while it was on keep their names.
+    /// </summary>
+    public bool RecordRequestedBy { get; set; } = true;
+
+    /// <summary>
     /// In Permanent mode, block the first play until the lossless copy has been fetched
     /// (default: false).
     /// Environment variable: WAIT_FOR_LOSSLESS_ON_PLAY

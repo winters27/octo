@@ -17,9 +17,9 @@ public class HeartAcquisitionCoordinatorTests
     {
         var lidarr = new Mock<ILidarrHeartAcquisitionService>();
         var direct = new Mock<IDownloadService>();
-        lidarr.Setup(x => x.TryAcquireTrackAsync("soulseek", "track-id", true))
+        lidarr.Setup(x => x.TryAcquireTrackAsync("soulseek", "track-id", true, It.IsAny<string?>()))
             .ReturnsAsync(true);
-        lidarr.Setup(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true))
+        lidarr.Setup(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true, It.IsAny<string?>()))
             .ReturnsAsync(true);
         var queue = new TrackAcquisitionQueue(new Mock<ILogger<TrackAcquisitionQueue>>().Object);
         var coordinator = new HeartAcquisitionCoordinator(
@@ -29,8 +29,8 @@ public class HeartAcquisitionCoordinatorTests
         await coordinator.AcquireTrackAsync("soulseek", "track-id");
         await coordinator.AcquireAlbumAsync("soulseek", "album-id");
 
-        lidarr.Verify(x => x.TryAcquireTrackAsync("soulseek", "track-id", true), Times.Once);
-        lidarr.Verify(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true), Times.Once);
+        lidarr.Verify(x => x.TryAcquireTrackAsync("soulseek", "track-id", true, It.IsAny<string?>()), Times.Once);
+        lidarr.Verify(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true, It.IsAny<string?>()), Times.Once);
         direct.Verify(x => x.DownloadRemainingAlbumTracksInBackground(
             It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>()), Times.Never);
     }
@@ -41,7 +41,8 @@ public class HeartAcquisitionCoordinatorTests
         var lidarr = new Mock<ILidarrHeartAcquisitionService>();
         var direct = new Mock<IDownloadService>();
         direct.Setup(x => x.DownloadAlbumWithSourceAsync(
-                "soulseek", "album-id", DownloadSource.Soulseek, false, It.IsAny<CancellationToken>()))
+                "soulseek", "album-id", DownloadSource.Soulseek, false, It.IsAny<CancellationToken>(),
+                It.IsAny<IReadOnlyList<string>?>()))
             .ReturnsAsync(true);
         var queue = new TrackAcquisitionQueue(new Mock<ILogger<TrackAcquisitionQueue>>().Object);
         var coordinator = new HeartAcquisitionCoordinator(
@@ -52,7 +53,7 @@ public class HeartAcquisitionCoordinatorTests
 
         direct.Verify(x => x.DownloadAlbumWithSourceAsync(
             "soulseek", "album-id", DownloadSource.Soulseek, false,
-            It.IsAny<CancellationToken>()), Times.Once);
+            It.IsAny<CancellationToken>(), It.IsAny<IReadOnlyList<string>?>()), Times.Once);
         lidarr.VerifyNoOtherCalls();
     }
 
@@ -63,9 +64,9 @@ public class HeartAcquisitionCoordinatorTests
         var direct = new Mock<IDownloadService>();
         direct.Setup(x => x.DownloadAlbumWithSourceAsync(
                 "soulseek", "first-album", DownloadSource.Soulseek, false,
-                It.IsAny<CancellationToken>()))
+                It.IsAny<CancellationToken>(), It.IsAny<IReadOnlyList<string>?>()))
             .ReturnsAsync(true);
-        lidarr.Setup(x => x.TryAcquireAlbumAsync("soulseek", "second-album", true))
+        lidarr.Setup(x => x.TryAcquireAlbumAsync("soulseek", "second-album", true, It.IsAny<string?>()))
             .ReturnsAsync(true);
         var queue = new TrackAcquisitionQueue(new Mock<ILogger<TrackAcquisitionQueue>>().Object);
         var settings = TestOptions.Monitor(
@@ -78,8 +79,8 @@ public class HeartAcquisitionCoordinatorTests
 
         direct.Verify(x => x.DownloadAlbumWithSourceAsync(
             "soulseek", "first-album", DownloadSource.Soulseek, false,
-            It.IsAny<CancellationToken>()), Times.Once);
-        lidarr.Verify(x => x.TryAcquireAlbumAsync("soulseek", "second-album", true), Times.Once);
+            It.IsAny<CancellationToken>(), It.IsAny<IReadOnlyList<string>?>()), Times.Once);
+        lidarr.Verify(x => x.TryAcquireAlbumAsync("soulseek", "second-album", true, It.IsAny<string?>()), Times.Once);
     }
 
     [Fact]
@@ -89,7 +90,7 @@ public class HeartAcquisitionCoordinatorTests
         var direct = new Mock<IDownloadService>();
         direct.Setup(x => x.DownloadAlbumWithSourceAsync(
                 "soulseek", "album-id", DownloadSource.Soulseek, true,
-                It.IsAny<CancellationToken>()))
+                It.IsAny<CancellationToken>(), It.IsAny<IReadOnlyList<string>?>()))
             .ReturnsAsync(true);
         var settings = TestOptions.Monitor(new SubsonicSettings
         {
@@ -116,9 +117,9 @@ public class HeartAcquisitionCoordinatorTests
         var direct = new Mock<IDownloadService>();
         direct.Setup(x => x.DownloadAlbumWithSourceAsync(
                 "soulseek", "album-id", DownloadSource.Soulseek, true,
-                It.IsAny<CancellationToken>()))
+                It.IsAny<CancellationToken>(), It.IsAny<IReadOnlyList<string>?>()))
             .ReturnsAsync(false);
-        lidarr.Setup(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true))
+        lidarr.Setup(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true, It.IsAny<string?>()))
             .ReturnsAsync(true);
         var settings = TestOptions.Monitor(new SubsonicSettings
         {
@@ -135,10 +136,10 @@ public class HeartAcquisitionCoordinatorTests
 
         await coordinator.AcquireAlbumAsync("soulseek", "album-id");
 
-        lidarr.Verify(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true), Times.Once);
+        lidarr.Verify(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true, It.IsAny<string?>()), Times.Once);
         direct.Verify(x => x.DownloadAlbumWithSourceAsync(
             It.IsAny<string>(), It.IsAny<string>(), DownloadSource.YouTube,
-            It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
+            It.IsAny<bool>(), It.IsAny<CancellationToken>(), It.IsAny<IReadOnlyList<string>?>()), Times.Never);
     }
 
     [Fact]
@@ -148,8 +149,9 @@ public class HeartAcquisitionCoordinatorTests
         var direct = new Mock<IDownloadService>();
         direct.Setup(x => x.DownloadAlbumWithSourceAsync(
                 "soulseek", "album-id", It.IsAny<DownloadSource>(),
-                It.IsAny<bool>(), It.IsAny<CancellationToken>()))
-            .ReturnsAsync((string _, string _, DownloadSource source, bool _, CancellationToken _) =>
+                It.IsAny<bool>(), It.IsAny<CancellationToken>(), It.IsAny<IReadOnlyList<string>?>()))
+            .ReturnsAsync((string _, string _, DownloadSource source, bool _, CancellationToken _,
+                IReadOnlyList<string>? _) =>
             {
                 attempts.Add(source);
                 return source == DownloadSource.YouTube;
@@ -191,7 +193,7 @@ public class HeartAcquisitionCoordinatorTests
     public async Task TrackPriorityFallsThroughFromSoulseekToLidarr()
     {
         var lidarr = new Mock<ILidarrHeartAcquisitionService>();
-        lidarr.Setup(x => x.TryAcquireTrackAsync("soulseek", "track-id", true))
+        lidarr.Setup(x => x.TryAcquireTrackAsync("soulseek", "track-id", true, It.IsAny<string?>()))
             .ReturnsAsync(true);
         var queue = new TrackAcquisitionQueue(new Mock<ILogger<TrackAcquisitionQueue>>().Object);
         var settings = TestOptions.Monitor(new SubsonicSettings
@@ -215,7 +217,7 @@ public class HeartAcquisitionCoordinatorTests
         request.Completion.TrySetException(new InvalidOperationException("no peer"));
         await acquisition;
 
-        lidarr.Verify(x => x.TryAcquireTrackAsync("soulseek", "track-id", true), Times.Once);
+        lidarr.Verify(x => x.TryAcquireTrackAsync("soulseek", "track-id", true, It.IsAny<string?>()), Times.Once);
     }
 
     [Fact]
@@ -242,7 +244,7 @@ public class HeartAcquisitionCoordinatorTests
     public async Task SongAndAlbumHeartsUseTheirOwnPerSourceSwitches()
     {
         var lidarr = new Mock<ILidarrHeartAcquisitionService>();
-        lidarr.Setup(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true))
+        lidarr.Setup(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true, It.IsAny<string?>()))
             .ReturnsAsync(true);
         var direct = new Mock<IDownloadService>();
         var queue = new TrackAcquisitionQueue(new Mock<ILogger<TrackAcquisitionQueue>>().Object);
@@ -267,7 +269,7 @@ public class HeartAcquisitionCoordinatorTests
         await coordinator.AcquireAlbumAsync("soulseek", "album-id");
 
         lidarr.Verify(x => x.TryAcquireTrackAsync(
-            It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>()), Times.Never);
-        lidarr.Verify(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true), Times.Once);
+            It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<string?>()), Times.Never);
+        lidarr.Verify(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true, It.IsAny<string?>()), Times.Once);
     }
 }

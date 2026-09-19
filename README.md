@@ -204,6 +204,14 @@ Lidarr works at album level, so enabling it for song hearts still fetches the so
 
 To stop downloading altogether, turn off both heart types for every source. On an env-only installation, set `Subsonic__DownloadOnStar=false` and `Subsonic__DownloadAlbumOnStar=false`. Hearts still register as favorites without acquiring files.
 
+`RECORD_REQUESTED_BY` (on by default) names the Subsonic user who asked for each download on
+its entry in **Fetched songs** and on the download notification, so on a shared library you can
+tell one person's acquisitions from another's. A track that two people star while it is still
+downloading lists both, because the second star joins the transfer already running rather than
+starting a second one. Acquisitions Octo starts itself are unattributed, as are all entries
+written before this existed. Turning it off stops the username being captured at all rather
+than hiding it afterwards, so nothing downstream holds it; names already written stay.
+
 ### Can it run on a Raspberry Pi?
 
 Yes — multi-arch images are published for amd64 and arm64. The yt-dlp sidecar does most of the CPU work; a Pi 4 or Pi 5 handles a single household's listening fine.

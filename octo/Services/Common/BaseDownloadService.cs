@@ -144,17 +144,19 @@ public abstract class BaseDownloadService : IDownloadService
     
     public Task<string> ExecuteAcquisitionAsync(string externalProvider, string externalId,
         bool triggerAlbumDownload, bool forcePermanent, DownloadSource? sourceOverride,
-        CancellationToken cancellationToken) =>
+        CancellationToken cancellationToken, IReadOnlyList<string>? requestedBy = null) =>
         DownloadSongInternalAsync(externalProvider, externalId, triggerAlbumDownload,
-            cancellationToken, forcePermanent, sourceOverride: sourceOverride);
+            cancellationToken, forcePermanent, sourceOverride: sourceOverride,
+            requestedBy: requestedBy);
 
     public Task<bool> DownloadAlbumWithSourceAsync(string externalProvider, string albumExternalId,
-        DownloadSource source, bool suppressSummary, CancellationToken cancellationToken = default)
+        DownloadSource source, bool suppressSummary, CancellationToken cancellationToken = default,
+        IReadOnlyList<string>? requestedBy = null)
     {
         if (externalProvider != ProviderName)
             return Task.FromResult(false);
         return DownloadRemainingAlbumTracksAsync(albumExternalId, "", source, suppressSummary,
-            cancellationToken);
+            cancellationToken, requestedBy);
     }
 
     public DownloadInfo? GetDownloadStatus(string songId)
@@ -238,7 +240,8 @@ public abstract class BaseDownloadService : IDownloadService
     /// <summary>Record a completed download in the fetched-songs log. Best-effort:
     /// format + source are derived from the file extension (flac -> Soulseek/lossless,
     /// otherwise -> YouTube/lossy), which matches Octo's two download sources.</summary>
-    private async Task RecordHistoryAsync(Song song, string localPath, bool suppressNotify)
+    private async Task RecordHistoryAsync(Song song, string localPath, bool suppressNotify,
+        IReadOnlyList<string>? requestedBy = null)
     {
         try
         {
@@ -280,6 +283,7 @@ public abstract class BaseDownloadService : IDownloadService
                 CoverArtUrl = cover,
                 SizeBytes = size,
                 DownloadedAt = DateTime.UtcNow.ToString("o"),
+                RequestedBy = requestedBy is { Count: > 0 } ? [.. requestedBy] : null,
             });
 
             // Same chokepoint as the fetched-songs log, reusing the locals it just
@@ -301,6 +305,7 @@ public abstract class BaseDownloadService : IDownloadService
                     // Deezer-enriched values the file itself was tagged with.
                     DurationSeconds = song.Duration,
                     Year = song.Year,
+                    RequestedBy = requestedBy is { Count: > 0 } ? requestedBy : null,
                 });
             }
         }
@@ -343,7 +348,7 @@ public abstract class BaseDownloadService : IDownloadService
     protected async Task<string> DownloadSongInternalAsync(string externalProvider, string externalId,
         bool triggerAlbumDownload, CancellationToken cancellationToken = default,
         bool forcePermanent = false, bool suppressNotify = false,
-        DownloadSource? sourceOverride = null)
+        DownloadSource? sourceOverride = null, IReadOnlyList<string>? requestedBy = null)
     {
         if (externalProvider != ProviderName)
         {
@@ -513,7 +518,7 @@ public abstract class BaseDownloadService : IDownloadService
             if (!isCache)
             {
                 await LocalLibraryService.RegisterDownloadedSongAsync(song, localPath);
-                await RecordHistoryAsync(song, localPath, silence);
+                await RecordHistoryAsync(song, localPath, silence, requestedBy);
 
                 // Trigger a Subsonic library rescan (with debounce)
                 _ = Task.Run(async () =>
@@ -540,7 +545,10 @@ public abstract class BaseDownloadService : IDownloadService
                             try
                             {
                                 await DownloadRemainingAlbumTracksAsync(
-                                    albumExternalId, externalId, sourceOverride);
+                                    albumExternalId, externalId, sourceOverride,
+                                    // The album walk is still this user's star, so every
+                                    // track it pulls in is attributed to them too.
+                                    requestedBy: requestedBy);
                             }
                             catch (Exception ex)
                             {
@@ -579,7 +587,8 @@ public abstract class BaseDownloadService : IDownloadService
     protected async Task<bool> DownloadRemainingAlbumTracksAsync(
         string albumExternalId, string excludeTrackExternalId,
         DownloadSource? sourceOverride = null, bool suppressSummary = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        IReadOnlyList<string>? requestedBy = null)
     {
         Logger.LogInformation("Starting background download for album {AlbumId} (excluding track {TrackId})", 
             albumExternalId, excludeTrackExternalId);
@@ -635,7 +644,7 @@ public abstract class BaseDownloadService : IDownloadService
                 var path = await DownloadSongInternalAsync(
                     ProviderName, track.ExternalId!, triggerAlbumDownload: false,
                     cancellationToken, forcePermanent: true, suppressNotify: true,
-                    sourceOverride: sourceOverride);
+                    sourceOverride: sourceOverride, requestedBy: requestedBy);
                 succeeded++;
                 if (path.EndsWith(".flac", StringComparison.OrdinalIgnoreCase)) lossless++;
 

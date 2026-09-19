@@ -1253,3 +1253,5 @@ section[data-pane].active { display: block; }
 .dl-badge.mp3  { background: rgba(151, 177, 185, 0.14); color: var(--accent-hover); }
 .dl-source { font-size: 12px; color: var(--fg-soft); }
 .dl-sub { font-size: 11.5px; color: var(--fg-mute); font-variant-numeric: tabular-nums; }
+/* A username is not a number, so it opts out of the tabular figures around it. */
+.dl-asker { font-variant-numeric: normal; }

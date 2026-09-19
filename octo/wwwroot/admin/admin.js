@@ -1759,6 +1759,12 @@ async function loadFetched() {
         ? `<img class="dl-art" src="${escapeHtml(d.coverArtUrl)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'dl-art dl-art-ph'}))">`
         : `<div class="dl-art dl-art-ph"></div>`;
       const size = fmtSize(d.sizeBytes);
+      // Absent on entries written before attribution existed, and whenever the setting
+      // is off, so the row has to read the same with and without it.
+      const askers = Array.isArray(d.requestedBy) ? d.requestedBy.filter(Boolean) : [];
+      const who = askers.length
+        ? `<span class="dl-asker">${escapeHtml(askers.join(', '))}</span>`
+        : '';
       return `<div class="dl-item">
         ${art}
         <div class="dl-main">
@@ -1767,7 +1773,7 @@ async function loadFetched() {
         </div>
         <div class="dl-side">
           <div class="dl-tags"><span class="dl-badge ${badgeClass}">${escapeHtml(fmt)}</span><span class="dl-source">${escapeHtml(d.source)}</span></div>
-          <div class="dl-sub">${escapeHtml(relTime(d.downloadedAt))}${size ? ' · ' + size : ''}</div>
+          <div class="dl-sub">${escapeHtml(relTime(d.downloadedAt))}${size ? ' · ' + size : ''}${who ? ' · ' + who : ''}</div>
         </div>
       </div>`;
     }).join('');
