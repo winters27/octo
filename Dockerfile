@@ -20,7 +20,10 @@ WORKDIR /app
 # Continuous Subsonic Radio normalizes mixed FLAC/M4A sources into one stable
 # MP3 response inside the core Octo process. This is a runtime dependency, not a
 # Radio sidecar or service boundary.
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core \
+# fpcalc (libchromaprint-tools) is the other half of download verification: it turns a
+# finished download into the Chromaprint fingerprint AcoustID is asked about. Absent, the
+# feature degrades to a no-op and logs once; it never fails a download.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core libchromaprint-tools \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /app/downloads
 

@@ -21,6 +21,8 @@ namespace Octo.Services.Soulseek;
 public class SoulseekDownloadService : BaseDownloadService
 {
     private readonly SoulseekClient _slskd;
+    private readonly RejectedPeerRegistry _rejectedPeers;
+    private readonly Octo.Services.Fingerprint.DownloadVerificationService _verification;
     private readonly SoulseekSettings _settings;
     private readonly YouTubeResolver _youtube;
     private readonly ExternalIdRegistry _idRegistry;
@@ -41,11 +43,15 @@ public class SoulseekDownloadService : BaseDownloadService
         NavidromeIdentityService navIdentity,
         DownloadHistoryService history,
         Octo.Services.Notifications.NotificationService notifications,
+        RejectedPeerRegistry rejectedPeers,
+        Octo.Services.Fingerprint.DownloadVerificationService verification,
         IServiceProvider serviceProvider,
         ILogger<SoulseekDownloadService> logger)
         : base(configuration, localLibraryService, metadataService, subsonicSettings, navIdentity, history, notifications, serviceProvider, logger)
     {
         _slskd = slskd;
+        _rejectedPeers = rejectedPeers;
+        _verification = verification;
         _settings = soulseekSettings.Value;
         _youtube = youtube;
         _idRegistry = idRegistry;
@@ -169,7 +175,7 @@ public class SoulseekDownloadService : BaseDownloadService
                 // The filter matters: a cancelled token means nobody is waiting for
                 // this any more, so falling back would start a second download only
                 // to have it throw on the same token.
-                try { return await DownloadViaSoulseekAsync(routing, suppressNotify, cancellationToken); }
+                try { return await DownloadViaSoulseekAsync(routing, song, suppressNotify, cancellationToken); }
                 catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
                 {
                     Logger.LogWarning("Soulseek download failed ({Msg}); falling back to YouTube MP3", ex.Message);
@@ -191,7 +197,7 @@ public class SoulseekDownloadService : BaseDownloadService
                     return await DownloadViaYouTubeAsync(routing, suppressNotify, announceStart: false, cancellationToken);
                 }
             default:
-                return await DownloadViaSoulseekAsync(routing, suppressNotify, cancellationToken);
+                return await DownloadViaSoulseekAsync(routing, song, suppressNotify, cancellationToken);
         }
     }
 
@@ -246,7 +252,7 @@ public class SoulseekDownloadService : BaseDownloadService
 
     // Lossless FLAC via Soulseek/slskd: walk the top-N peers in quality order,
     // first successful transfer wins.
-    private async Task<string> DownloadViaSoulseekAsync(SoulseekRouting routing, bool suppressNotify, CancellationToken cancellationToken)
+    private async Task<string> DownloadViaSoulseekAsync(SoulseekRouting routing, Song song, bool suppressNotify, CancellationToken cancellationToken)
     {
         // Clean the title before searching Soulseek. Last.fm's track.search
         // sometimes returns `title="Adele - Hello"` with the artist redundantly
@@ -283,6 +289,20 @@ public class SoulseekDownloadService : BaseDownloadService
                 cancellationToken,
                 enough: h => RankCandidates(h.ToList(), routing.Title!, routing.Duration, titleOnlySearch: true).Count >= 3);
             ranked = RankCandidates(hits, routing.Title!, routing.Duration, titleOnlySearch: true);
+        }
+
+        // Logged here rather than inside RankCandidates, which the search's `enough:` predicate
+        // calls on every batch of peer responses. This is the line that explains a track that
+        // used to download and now does not.
+        if (_verification.RemembersRejections)
+        {
+            var denied = hits.Count(h => _rejectedPeers.IsDenied(h.Username, h.Filename));
+            if (denied > 0)
+                Logger.LogInformation(
+                    "Soulseek: {Denied} of {Total} hits for '{Artist} - {Title}' were downloaded before and "
+                    + "rejected as the wrong recording, so they are skipped. Use 'Forget rejected peers' on "
+                    + "the Soulseek admin page if that is wrong.",
+                    denied, hits.Count, routing.Artist, routing.Title);
         }
 
         if (ranked.Count == 0)
@@ -393,6 +413,7 @@ public class SoulseekDownloadService : BaseDownloadService
                         + "{Actual}s against an expected {Expected}s; discarding and advancing",
                         attemptIdx, routing.Artist, routing.Title, actualSecs, routing.Duration);
                     DiscardRejectedDownload(localPath, attemptStartedUtc);
+                    DenyCandidate(hit, routing, $"delivered {actualSecs}s for a {routing.Duration}s track");
                     lastError = new Exception(
                         $"peer delivered a {actualSecs}s file for a {routing.Duration}s track");
                     continue;
@@ -403,6 +424,40 @@ public class SoulseekDownloadService : BaseDownloadService
                 // the Mack/05 ...flac"), which is unpredictable per-peer. Move
                 // to the canonical location now so Navidrome scans it under a
                 // consistent layout.
+                // Same job as the duration check, one layer deeper: that one proves the file
+                // is the right LENGTH, and a cover, a live take or an unrelated song of the
+                // same runtime all survive it. This asks what the audio actually IS.
+                //
+                // Second on purpose. The check above reads a TagLib header; this one spawns a
+                // process and makes a network call, and neither is worth spending on a file
+                // already known to be wrong.
+                var verdict = await _verification.VerifyAsync(localPath, routing.Artist, routing.Title);
+                if (verdict.Verdict == Octo.Services.Fingerprint.VerificationVerdict.Mismatch)
+                {
+                    Logger.LogWarning(
+                        "Soulseek attempt {N} delivered {Actual} for a request of '{Artist} - {Title}' "
+                        + "(AcoustID score {Score:P0}); discarding, remembering the peer and advancing",
+                        attemptIdx, verdict.Describe(), routing.Artist, routing.Title, verdict.Score);
+                    DiscardRejectedDownload(localPath, attemptStartedUtc);
+                    DenyCandidate(hit, routing, verdict.DenyReason);
+                    lastError = new Exception($"AcoustID identified the file as {verdict.Describe()}");
+                    continue;
+                }
+
+                // No-op unless the match was confirmed AND TagFromMusicBrainz is on. Reads and
+                // writes the Song, never the routing, so the file's name and layout below are
+                // decided exactly as they were before this setting existed.
+                //
+                // This reaches the tagger because DownloadSongInternalAsync passes ONE Song
+                // instance to DownloadTrackAsync and then to EnrichAndTagAsync
+                // (BaseDownloadService 455 and 468), and that one fills only missing fields.
+                // A refactor that clones the song between those two calls turns this setting
+                // into a silent no-op.
+                verdict.ApplyTagsTo(song);
+
+                // Write down who delivered this. It is the only chance: after the transfer
+                // ends nothing else in Octo remembers, and "Wrong song" needs it to blacklist
+                // the peer rather than re-rolling the same search.
                 localPath = MoveToConfiguredLayout(localPath, routing) ?? localPath;
                 Logger.LogInformation("Soulseek download complete (attempt {N}, slskd state={State}{Aborted}): {Path}",
                     attemptIdx, state?.ToString() ?? "interrupted", callerGaveUp ? ", caller had already left" : "", localPath);
@@ -579,8 +634,12 @@ public class SoulseekDownloadService : BaseDownloadService
     /// carries none of these and a candidate does, it is the wrong version. This is the
     /// only signal that separates "Group Four" from "Group Four (Security Forces dub)",
     /// whose runtimes are two seconds apart.
+    ///
+    /// Shared with TrackMatchComparer, which asks the same question of the title AcoustID
+    /// identified rather than of a filename. One list, so ranking and verification cannot
+    /// disagree about what a different take looks like.
     /// </summary>
-    private static readonly string[] VariantMarkers =
+    internal static readonly string[] VariantMarkers =
     {
         "dub", "remix", "live", "instrumental", "acoustic", "edit", "mix",
         "version", "demo", "session", "karaoke", "cover", "reprise",
@@ -591,6 +650,11 @@ public class SoulseekDownloadService : BaseDownloadService
     {
         var wanted = SoulseekClient.NormalizeExtension(_settings.PreferredExtension, "");
         return hits
+            // First because it is the cheapest filter and the only one backed by evidence
+            // from a completed transfer: these exact files were downloaded, inspected and
+            // found to be the wrong recording. Offering them again spends a whole transfer
+            // to reach the same verdict.
+            .Where(h => CandidateAllowed(h, _rejectedPeers, _verification.RemembersRejections))
             .Where(h => string.Equals(h.Extension, wanted, StringComparison.OrdinalIgnoreCase))
             .Where(h => h.Size >= _settings.MinFileSizeBytes)
             .Where(h => FilenamePlausiblyMatchesTitle(h.Filename, title, requirePhrase: titleOnlySearch))
@@ -864,6 +928,32 @@ public class SoulseekDownloadService : BaseDownloadService
     /// name and approximate size across the whole library, so without that guard a bad
     /// match could delete a file the user already owned.
     /// </summary>
+    /// <summary>
+    /// Is this candidate still allowed, given what a previous download proved about it?
+    ///
+    /// Static and separate so the deny-list can be driven in tests without a download
+    /// service. The failure it guards against is invisible from outside: a filter that denies
+    /// everything leaves every track unfetchable and looks exactly like Soulseek having no
+    /// copies.
+    /// </summary>
+    internal static bool CandidateAllowed(SoulseekFileHit hit, RejectedPeerRegistry? denyList, bool enabled)
+        => !enabled || denyList is null || !denyList.IsDenied(hit.Username, hit.Filename);
+
+    /// <summary>
+    /// Remember a peer and file we downloaded and rejected, so RankCandidates never offers it
+    /// again. Before this, a rejection was deleted and the fact thrown away: the next star
+    /// re-ran the same search, ranked the same peer first for the same reasons, and paid for
+    /// the same wrong file again.
+    ///
+    /// Gated on VerifyDownloads so that with the flag off, which is the default, nothing about
+    /// the existing behaviour changes, including the memory.
+    /// </summary>
+    private void DenyCandidate(SoulseekFileHit hit, SoulseekRouting routing, string reason)
+    {
+        if (!_verification.RemembersRejections) return;
+        _rejectedPeers.Deny(hit.Username, hit.Filename, reason, $"{routing.Artist} - {routing.Title}");
+    }
+
     private void DiscardRejectedDownload(string path, DateTime attemptStartedUtc)
     {
         try

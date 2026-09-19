@@ -142,6 +142,42 @@ builder.Services.AddTransient<Octo.Services.Metadata.DeezerRateLimitHandler>();
 builder.Services.AddHttpClient(Octo.Services.Metadata.DeezerRateLimiter.ClientName)
     .AddHttpMessageHandler<Octo.Services.Metadata.DeezerRateLimitHandler>();
 
+// Rejected-peer memory for download verification. Next to the settings file for the same
+// reason external-ids.json is: it is knowledge earned by a completed transfer, and losing it
+// on every container recreate means re-earning it by re-downloading the same wrong files.
+builder.Services.AddSingleton(sp => new RejectedPeerRegistry(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "rejected-peers.json"),
+    sp.GetRequiredService<ILogger<RejectedPeerRegistry>>(),
+    // A Func rather than a captured value, so changing the TTL takes effect without a restart.
+    () => sp.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<SoulseekSettings>>()
+        .CurrentValue.EffectiveRejectedPeerTtlDays));
+
+builder.Services.AddSingleton<Octo.Services.Fingerprint.AudioFingerprinter>();
+
+// AcoustID allows 3 requests/second and, like Deezer, signals refusal with an error envelope
+// rather than reliably a 429. Here that parses as "no match", which this feature reads as
+// "accept the file", so going over budget would silently switch verification off.
+builder.Services.AddSingleton<Octo.Services.Fingerprint.AcoustIdRateLimiter>();
+builder.Services.AddTransient<Octo.Services.Fingerprint.AcoustIdRateLimitHandler>();
+builder.Services.AddHttpClient(Octo.Services.Fingerprint.AcoustIdRateLimiter.ClientName, c =>
+    {
+        c.BaseAddress = new Uri("https://api.acoustid.org/");
+        // Verification sits between a finished transfer and the file joining the library.
+        // A slow AcoustID must cost seconds, never the download.
+        c.Timeout = TimeSpan.FromSeconds(10);
+    })
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    {
+        // meta=...+compress asks AcoustID to gzip the body. Without this it arrives
+        // compressed, fails to parse, and reads as "no match" - silently accepting
+        // everything, which is the worst outcome this feature can have.
+        AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate,
+    })
+    .AddHttpMessageHandler<Octo.Services.Fingerprint.AcoustIdRateLimitHandler>();
+
+builder.Services.AddSingleton<Octo.Services.Fingerprint.AcoustIdClient>();
+builder.Services.AddSingleton<Octo.Services.Fingerprint.DownloadVerificationService>();
+
 builder.Services.AddSingleton<IMusicMetadataService, SoulseekMetadataService>();
 builder.Services.AddSingleton<IDownloadService, SoulseekDownloadService>();
 builder.Services.AddSingleton<LidarrClient>();

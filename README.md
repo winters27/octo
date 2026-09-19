@@ -275,6 +275,18 @@ and replaced through the normal refresh path; no prepared track is added to the 
 library. **Start radio from this song** remains a one-time `getSimilarSongs[2]` queue.
 
 
+`SLSKD_VERIFY_DOWNLOADS` fingerprints each finished Soulseek download with Chromaprint and
+identifies it through AcoustID before it joins the library, using the free key in
+`ACOUSTID_API_KEY`. A file identified as a different recording is deleted and its peer and
+filename are remembered in `/app/config/rejected-peers.json`, so that exact file is never
+downloaded again; entries lapse after 30 days and the Soulseek admin page can forget them all
+at once. `SLSKD_MIN_MATCH_SCORE` (50-99, default 85) is how sure AcoustID must be before its
+answer may reject anything, so raising it makes Octo *more* permissive, because weaker matches
+are ignored rather than acted on. A track with no AcoustID entry at all is always accepted.
+`SLSKD_TAG_FROM_MUSICBRAINZ` writes the matched recording's MusicBrainz title, artist, album
+and year over the peer's own tags. Verification needs `fpcalc` in the runtime image
+(`libchromaprint-tools`); without it the feature logs once and accepts everything.
+
 Each kind of dynamic station is configured on its own, so a listener can keep Your Mix
 without collecting an artist radio per favourite band. `LASTFM_ENABLE_YOUR_MIX` and
 `LASTFM_ENABLE_DISCOVERY_MIX` (both default true) switch those two stations,

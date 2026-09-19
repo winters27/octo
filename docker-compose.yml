@@ -50,6 +50,17 @@ services:
       Soulseek__MinFileSizeBytes: ${SLSKD_MIN_FILE_SIZE_BYTES:-5242880}
       Soulseek__PreferredExtension: ${SLSKD_PREFERRED_EXTENSION:-flac}
       Soulseek__DownloadTimeoutSeconds: ${SLSKD_DOWNLOAD_TIMEOUT_SECONDS:-180}
+      # Fingerprint every finished download and identify it before it joins the
+      # library. A peer that sends a different recording gets that file remembered
+      # and never tried again. Needs the free AcoustID key; inert without one.
+      Soulseek__VerifyDownloads: ${SLSKD_VERIFY_DOWNLOADS:-false}
+      Soulseek__AcoustIdApiKey: ${ACOUSTID_API_KEY:-}
+      Soulseek__MinMatchScore: ${SLSKD_MIN_MATCH_SCORE:-85}
+      Soulseek__TagFromMusicBrainz: ${SLSKD_TAG_FROM_MUSICBRAINZ:-false}
+      Soulseek__RejectedPeerTtlDays: ${SLSKD_REJECTED_PEER_DAYS:-30}
+      Soulseek__FingerprintSeconds: ${SLSKD_FINGERPRINT_SECONDS:-120}
+      Soulseek__FingerprintTimeoutSeconds: ${SLSKD_FINGERPRINT_TIMEOUT_SECONDS:-30}
+      Soulseek__AcoustIdTimeoutSeconds: ${SLSKD_ACOUSTID_TIMEOUT_SECONDS:-10}
 
       # ----- existing Lidarr (optional heart-download source) -----
       Lidarr__BaseUrl: ${LIDARR_URL:-}

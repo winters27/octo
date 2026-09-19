@@ -121,6 +121,10 @@ async function loadSettings() {
   updateRadioPublicationSettings();
   renderHeartSourceOrder(currentSettings?.Subsonic?.HeartDownloadSources);
   renderRadioDiscovery(currentSettings?.LastFm?.DiscoveryStations);
+  renderRejectedPeerCount();
+  // retry: false, so a page load never pops a sign-in prompt. Without a session the section
+  // simply stays empty until the user asks for a preview.
+  loadGenreBackfill();
   loadRadioStatus();
 
   // Meta references
@@ -187,6 +191,8 @@ document.querySelectorAll('form[data-section]').forEach(form => {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (form.id === 'radio-discovery-form' && !syncRadioDiscoveryInput()) return;
+    if (form.id === 'genre-form' && !syncGenreMappingsInput()) return;
+    if (form.id === 'library-actions-list-form' && !syncLibraryActionsInput()) return;
     const patch = {};
     let needsRestart = false;
 
@@ -493,6 +499,32 @@ function syncHeartSourceOrderFromDom() {
   refreshHeartSourceRowNumbers();
   syncHeartSourceInput();
 }
+
+// The count comes from _meta rather than a second fetch, so the button says how much it
+// would actually forget. A button labelled "Forget rejected peers" on an empty list looks
+// broken when clicking it changes nothing.
+function renderRejectedPeerCount() {
+  const button = document.getElementById('rejected-peers-clear');
+  if (!button) return;
+  const count = currentSettings?._meta?.RejectedPeerCount ?? 0;
+  button.textContent = count > 0 ? `Forget ${count} rejected peer${count === 1 ? '' : 's'}` : 'Nothing rejected yet';
+  button.disabled = count === 0;
+}
+
+document.getElementById('rejected-peers-clear')?.addEventListener('click', async () => {
+  const count = currentSettings?._meta?.RejectedPeerCount ?? 0;
+  if (!count) return;
+  if (!confirm(`Forget ${count} rejected peer${count === 1 ? '' : 's'}? Those files become downloadable again.`)) return;
+  try {
+    const response = await fetch('/api/admin/soulseek/rejected-peers/clear', { method: 'POST' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json();
+    toast(`Forgot ${body.cleared} rejected peer${body.cleared === 1 ? '' : 's'}.`);
+    await loadSettings();
+  } catch (error) {
+    toast(`Could not clear: ${error.message}`, 'err');
+  }
+});
 
 document.getElementById('lidarr-test-connection')?.addEventListener('click', async (event) => {
   const button = event.currentTarget;

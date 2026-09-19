@@ -845,6 +845,51 @@
             </div>
           </form>
         </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Verify downloads</h3>
+            <p class="set-desc">Fingerprints each finished download and asks AcoustID what it actually is before it joins the library. A peer that sends a different recording gets that file remembered and never tried again. Off by default.</p>
+          </div>
+          <form data-section="soulseek-verify" class="set-card">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Verify downloads</div>
+                <div class="set-info-d">Catches covers, karaoke versions, live takes and mislabelled compilation tracks, which all survive the existing length check. A track AcoustID has never heard of is always accepted, never rejected.</div>
+              </div>
+              <label class="switch"><input type="checkbox" name="Soulseek.VerifyDownloads" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">AcoustID API key</div>
+                <div class="set-info-d">Free from <a href="https://acoustid.org/new-application" target="_blank" rel="noopener">acoustid.org/new-application</a>. Without a key the fingerprint lookup is skipped; the length check and its rejection memory still work.</div>
+              </div>
+              <input class="set-input" type="password" name="Soulseek.AcoustIdApiKey" autocomplete="off" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Minimum match score <span class="set-opt">percent</span></div>
+                <div class="set-info-d">How sure AcoustID must be before its answer may reject a file. <strong>Raising this makes Octo more permissive</strong>, not less: weaker matches are ignored rather than acted on. Default: 85.</div>
+              </div>
+              <input class="set-input" name="Soulseek.MinMatchScore" type="number" min="50" max="99" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Tag from MusicBrainz</div>
+                <div class="set-info-d">On a confident match, write the matched recording's title, artist, album and year over the peer's own tags instead of trusting them.</div>
+              </div>
+              <label class="switch"><input type="checkbox" name="Soulseek.TagFromMusicBrainz" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Rejected peers</div>
+                <div class="set-info-d">Files a download proved were the wrong recording. Entries lapse on their own after 30 days; clear them if a track has stopped being fetchable and you think this list is why.</div>
+              </div>
+              <button class="btn btn-ghost" id="rejected-peers-clear" type="button">Forget rejected peers</button>
+            </div>
+          </form>
+        </div>
+      </section>
       </section>
 
       <!-- ─── LIDARR ─────────────────────────────────────────── -->

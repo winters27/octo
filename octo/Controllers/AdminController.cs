@@ -33,6 +33,7 @@ public class AdminController : ControllerBase
     private readonly IOptionsMonitor<LastFmSettings> _lastFmOpts;
     private readonly IOptionsMonitor<NotificationSettings> _notificationOpts;
     private readonly IOptionsMonitor<MetadataSettings> _metadataOpts;
+    private readonly Octo.Services.Soulseek.RejectedPeerRegistry _rejectedPeers;
     private readonly IOptionsMonitor<ServerSettings> _serverOpts;
     private readonly IOptionsMonitor<ListenBrainzSettings>? _listenBrainzOpts;
     private readonly Octo.Services.ListenBrainz.ListenBrainzService? _listenBrainz;
@@ -75,6 +76,7 @@ public class AdminController : ControllerBase
         Octo.Services.Local.DownloadHistoryService history,
         Octo.Services.Metadata.DeezerMetadataService deezer,
         Octo.Services.CoverArt.CoverArtAggregator coverArt,
+        Octo.Services.Soulseek.RejectedPeerRegistry rejectedPeers,
         IHttpClientFactory httpFactory,
         IHostApplicationLifetime lifetime,
         ILogger<AdminController> logger,
@@ -94,6 +96,7 @@ public class AdminController : ControllerBase
         _lastFmOpts = lastFmOpts;
         _notificationOpts = notificationOpts;
         _metadataOpts = metadataOpts;
+        _rejectedPeers = rejectedPeers;
         _serverOpts = serverOpts;
         _notifications = notifications;
         _config = config;
@@ -448,6 +451,14 @@ public class AdminController : ControllerBase
                 ["MinFileSizeBytes"] = soulseek.MinFileSizeBytes,
                 ["PreferredExtension"] = soulseek.PreferredExtension,
                 ["DownloadTimeoutSeconds"] = soulseek.DownloadTimeoutSeconds,
+                ["VerifyDownloads"] = soulseek.VerifyDownloads,
+                ["AcoustIdApiKey"] = soulseek.AcoustIdApiKey ?? "",
+                ["MinMatchScore"] = soulseek.MinMatchScore,
+                ["TagFromMusicBrainz"] = soulseek.TagFromMusicBrainz,
+                ["RejectedPeerTtlDays"] = soulseek.RejectedPeerTtlDays,
+                ["FingerprintSeconds"] = soulseek.FingerprintSeconds,
+                ["FingerprintTimeoutSeconds"] = soulseek.FingerprintTimeoutSeconds,
+                ["AcoustIdTimeoutSeconds"] = soulseek.AcoustIdTimeoutSeconds,
             },
             ["Lidarr"] = new Dictionary<string, object>
             {
@@ -513,6 +524,9 @@ public class AdminController : ControllerBase
             ["_meta"] = new Dictionary<string, object>
             {
                 ["ConfigFilePath"] = _settings.FilePath,
+                // Drives the "Forget rejected peers" button's label, so an empty list is
+                // visibly empty rather than a button that looks like it did nothing.
+                ["RejectedPeerCount"] = _rejectedPeers.Count,
                 ["ConfigFileExists"] = System.IO.File.Exists(_settings.FilePath),
                 // So a bug report can name a build. Comes from <InformationalVersion>
                 // in octo.csproj, which is bumped when a release is tagged.
@@ -664,6 +678,14 @@ public class AdminController : ControllerBase
                 ["MinFileSizeBytes"] = soulseek.MinFileSizeBytes,
                 ["PreferredExtension"] = soulseek.PreferredExtension,
                 ["DownloadTimeoutSeconds"] = soulseek.DownloadTimeoutSeconds,
+                ["VerifyDownloads"] = soulseek.VerifyDownloads,
+                ["AcoustIdApiKey"] = soulseek.AcoustIdApiKey ?? "",
+                ["MinMatchScore"] = soulseek.MinMatchScore,
+                ["TagFromMusicBrainz"] = soulseek.TagFromMusicBrainz,
+                ["RejectedPeerTtlDays"] = soulseek.RejectedPeerTtlDays,
+                ["FingerprintSeconds"] = soulseek.FingerprintSeconds,
+                ["FingerprintTimeoutSeconds"] = soulseek.FingerprintTimeoutSeconds,
+                ["AcoustIdTimeoutSeconds"] = soulseek.AcoustIdTimeoutSeconds,
             },
             ["Lidarr"] = new JsonObject
             {
@@ -807,6 +829,10 @@ public class AdminController : ControllerBase
             "Soulseek:BaseUrl", "Soulseek:Username", "Soulseek:Password",
             "Soulseek:SearchWaitSeconds", "Soulseek:MinFileSizeBytes",
             "Soulseek:PreferredExtension", "Soulseek:DownloadTimeoutSeconds",
+            "Soulseek:RejectedPeerTtlDays", "Soulseek:FingerprintSeconds",
+            "Soulseek:FingerprintTimeoutSeconds", "Soulseek:AcoustIdTimeoutSeconds",
+            "Soulseek:VerifyDownloads", "Soulseek:AcoustIdApiKey",
+            "Soulseek:MinMatchScore", "Soulseek:TagFromMusicBrainz",
             "Lidarr:BaseUrl", "Lidarr:ApiKey", "Lidarr:RootFolderPath",
             "Lidarr:QualityProfileId", "Lidarr:MetadataProfileId",
             "Lidarr:CompletionMode", "Lidarr:ImportTimeoutSeconds",
@@ -1036,6 +1062,21 @@ public class AdminController : ControllerBase
     /// instance matters, because a poisoned entry surviving in one of them would outlive
     /// the very button meant to remove it.
     /// </summary>
+    /// <summary>
+    /// Forget every peer and file that download verification rejected.
+    ///
+    /// The recovery lever for a wrong denial. Entries lapse on their own after 30 days, but a
+    /// user watching a track stop being fetchable should not have to wait a month to find out
+    /// whether this list is why.
+    /// </summary>
+    [HttpPost("soulseek/rejected-peers/clear")]
+    public IActionResult ClearRejectedPeers()
+    {
+        var cleared = _rejectedPeers.Clear();
+        _logger.LogInformation("Rejected-peer memory cleared by admin request ({Count} entries)", cleared);
+        return Ok(new { cleared });
+    }
+
     [HttpPost("clear-metadata-cache")]
     public IActionResult ClearMetadataCache()
     {
