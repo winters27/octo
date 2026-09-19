@@ -685,6 +685,16 @@ section[data-pane].active { display: block; }
   .genre-change-row > span:first-child { grid-column: 1 / -1; }
 }
 
+/* Library action rows: the priority-row chrome with four columns of its own. */
+.library-action-row { grid-template-columns: minmax(180px, 1.4fr) minmax(120px, 1fr) 128px auto; }
+.library-action-row .set-input { min-width: 0; }
+#library-actions-history .config-table { max-height: 380px; overflow-y: auto; margin-top: 12px; }
+
+@media (max-width: 860px) {
+  .library-action-row { grid-template-columns: 1fr 1fr; }
+  .library-action-row > .source-copy { grid-column: 1 / -1; }
+}
+
 /* ─── Toast ──────────────────────────────────────────────────── */
 #toast {
   position: fixed;

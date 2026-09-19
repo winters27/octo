@@ -5,6 +5,7 @@ using System.Text.Json.Nodes;
 using Octo.Models.Settings;
 using Octo.Services.Admin;
 using Octo.Services.LastFm;
+using Octo.Services.Library;
 using Octo.Services.Metadata;
 using Octo.Services.Lidarr;
 using Octo.Services.Soulseek;
@@ -38,6 +39,9 @@ public class AdminController : ControllerBase
     private readonly IOptionsMonitor<GenreSettings> _genreOpts;
     private readonly Octo.Services.Metadata.GenreBackfillWorker _genreBackfill;
     private readonly Octo.Services.Metadata.GenreBackfillJournal _genreJournal;
+    private readonly Octo.Services.Library.NavidromeSongPathResolver _songPaths;
+    private readonly IOptionsMonitor<LibraryActionSettings> _libraryActionOpts;
+    private readonly Octo.Services.Library.LibraryActionJournal _libraryActionJournal;
     private readonly IOptionsMonitor<ServerSettings> _serverOpts;
     private readonly IOptionsMonitor<ListenBrainzSettings>? _listenBrainzOpts;
     private readonly Octo.Services.ListenBrainz.ListenBrainzService? _listenBrainz;
@@ -70,6 +74,9 @@ public class AdminController : ControllerBase
         IOptionsMonitor<GenreSettings> genreOpts,
         Octo.Services.Metadata.GenreBackfillWorker genreBackfill,
         Octo.Services.Metadata.GenreBackfillJournal genreJournal,
+        Octo.Services.Library.NavidromeSongPathResolver songPaths,
+        IOptionsMonitor<LibraryActionSettings> libraryActionOpts,
+        Octo.Services.Library.LibraryActionJournal libraryActionJournal,
         IOptionsMonitor<ServerSettings> serverOpts,
         Octo.Services.Notifications.NotificationService notifications,
         IConfiguration config,
@@ -107,6 +114,9 @@ public class AdminController : ControllerBase
         _genreOpts = genreOpts;
         _genreBackfill = genreBackfill;
         _genreJournal = genreJournal;
+        _songPaths = songPaths;
+        _libraryActionOpts = libraryActionOpts;
+        _libraryActionJournal = libraryActionJournal;
         _serverOpts = serverOpts;
         _notifications = notifications;
         _config = config;
@@ -409,6 +419,7 @@ public class AdminController : ControllerBase
         var lidarr = _lidarrOpts.CurrentValue;
         var lastfm = _lastFmOpts.CurrentValue;
         var genre = _genreOpts.CurrentValue;
+        var actions = _libraryActionOpts.CurrentValue;
         var notif = _notificationOpts.CurrentValue;
 
         // Use Dictionary<string, object> so System.Text.Json doesn't camelCase
@@ -510,6 +521,32 @@ public class AdminController : ControllerBase
                 ["DiscoveryStations"] = (_settings.Load()["LastFm"] as JsonObject)?["DiscoveryStations"]?.DeepClone()
                     ?? JsonSerializer.SerializeToNode(lastfm.DiscoveryStations)!,
             },
+            ["LibraryActions"] = new Dictionary<string, object>
+            {
+                ["Enabled"] = actions.Enabled,
+                ["PlaylistsEnabled"] = actions.PlaylistsEnabled,
+                ["RatingsEnabled"] = actions.RatingsEnabled,
+                ["PlaylistPrefix"] = actions.PlaylistPrefix ?? "",
+                ["DryRun"] = actions.DryRun,
+                ["QuarantineDirectory"] = actions.QuarantineDirectory ?? "",
+                ["QuarantineRetentionDays"] = actions.QuarantineRetentionDays,
+                ["PollIntervalSeconds"] = actions.PollIntervalSeconds,
+                ["MaxActionsPerCycle"] = actions.MaxActionsPerCycle,
+                ["KeepReplacedOriginals"] = actions.KeepReplacedOriginals,
+                ["AllowedUsers"] = actions.AllowedUsers ?? [],
+                // Effective rather than raw, because the editor needs every action present
+                // even when the config names only some of them. Projected so the enum lands as
+                // its NAME: serialized directly it becomes a number, and the editor looks the
+                // action up by name to label the row.
+                ["Actions"] = JsonSerializer.SerializeToNode(actions.EffectiveActions()
+                    .Select(action => new
+                    {
+                        Action = action.Action.ToString(),
+                        action.Name,
+                        action.Enabled,
+                        action.Rating,
+                    }))!,
+            },
             ["Metadata"] = new Dictionary<string, object>
             {
                 ["Language"] = _metadataOpts.CurrentValue.Language ?? "",
@@ -591,6 +628,12 @@ public class AdminController : ControllerBase
         // up persisted to disk.
         patch.Remove("_meta");
 
+        if (patch["LibraryActions"] is JsonObject actionsPatch)
+        {
+            var actionsError = ValidateLibraryActions(actionsPatch, _libraryActionOpts.CurrentValue);
+            if (actionsError is not null) return BadRequest(new { error = actionsError });
+        }
+
         if (patch["Genre"] is JsonObject genrePatch
             && genrePatch["Mappings"] is JsonArray genreMappings)
         {
@@ -624,6 +667,44 @@ public class AdminController : ControllerBase
     /// Mirrors ValidateDiscoveryStations, and is the second of three layers: the editor
     /// validates in the browser and EffectiveMappings() sanitises again at read time.
     /// </summary>
+    /// <summary>
+    /// The one rule with teeth: the dashboard must not be able to produce a live but
+    /// unrestricted configuration. An empty allowlist means nobody, so enabling the feature
+    /// without naming anyone is a mistake rather than a permissive choice.
+    /// </summary>
+    private static string? ValidateLibraryActions(JsonObject actions, LibraryActionSettings current)
+    {
+        var enabled = actions["Enabled"]?.GetValue<bool>() ?? current.Enabled;
+        var allowed = actions["AllowedUsers"] as JsonArray;
+        var allowedCount = allowed is not null
+            ? allowed.Count(entry => !string.IsNullOrWhiteSpace(entry?.GetValue<string>()))
+            : (current.AllowedUsers ?? []).Count;
+
+        if (enabled && allowedCount == 0)
+            return "Library actions need at least one allowed user. An empty list means nobody.";
+
+        if (allowed is not null && allowed.Count > 50)
+            return "LibraryActions.AllowedUsers supports at most 50 entries";
+
+        if (actions["Actions"] is JsonArray definitions)
+        {
+            if (definitions.Count > 4) return "There are only four library actions";
+            var ratings = new HashSet<int>();
+            foreach (var node in definitions)
+            {
+                if (node is not JsonObject definition) return "Every library action must be an object";
+                var name = definition["Name"]?.GetValue<string>()?.Trim() ?? "";
+                if (name.Length > 80) return $"'{name}' is longer than 80 characters";
+
+                var rating = definition["Rating"]?.GetValue<int>() ?? 0;
+                if (rating is < 0 or > 5) return "A star rating must be between 0 and 5";
+                if (rating > 0 && !ratings.Add(rating))
+                    return $"Two actions both use {rating} star(s); a rating can only mean one thing";
+            }
+        }
+        return null;
+    }
+
     private static string? ValidateGenreMappings(JsonArray mappings)
     {
         if (mappings.Count > 200) return "Genre.Mappings supports at most 200 rules";
@@ -642,6 +723,82 @@ public class AdminController : ControllerBase
                 return $"The match mode for '{pattern}' must be Contains or Exact";
         }
         return null;
+    }
+
+    /// <summary>
+    /// Every file library actions have moved, who asked, and where it went.
+    ///
+    /// Session-gated, because it lists filenames and usernames. Read-only: there is deliberately
+    /// no endpoint here that deletes a quarantined file or applies an action on demand, since
+    /// /api/admin has no authentication of its own and those would be the wrong things to leave
+    /// reachable.
+    /// </summary>
+    [HttpGet("library-actions")]
+    public IActionResult GetLibraryActions([FromHeader(Name = "X-Octo-Browse-Token")] string? token)
+    {
+        if (!HasBrowseSession(token))
+            return Unauthorized(new { error = "Sign in with your Navidrome admin account first." });
+
+        var settings = _libraryActionOpts.CurrentValue;
+        return Ok(new
+        {
+            settings.Enabled,
+            settings.DryRun,
+            hasAdminIdentity = _navIdentity.HasAdminIdentity,
+            allowedUsers = settings.AllowedUsers ?? [],
+            quarantine = Path.Combine(_songPaths.MusicRoot(), settings.EffectiveQuarantineDirectory),
+            entries = _libraryActionJournal.Recent(200).Select(entry => new
+            {
+                action = entry.Action.ToString(),
+                entry.NavidromeId,
+                entry.Username,
+                entry.Title,
+                entry.Artist,
+                entry.Album,
+                state = entry.State.ToString(),
+                entry.Detail,
+                entry.DryRun,
+                entry.SourcePath,
+                entry.QuarantinePath,
+                resolution = entry.Resolution?.ToString(),
+                entry.AtUtc,
+            }),
+        });
+    }
+
+    /// <summary>
+    /// Ask what file a Navidrome song id resolves to, and say which leg answered.
+    ///
+    /// Read-only, and deliberately shipped before anything that acts on the answer: Navidrome's
+    /// Subsonic `path` is synthesised from tags unless a player opts in, so on some libraries it
+    /// names a file that exists and is a different recording. This is how that gets checked
+    /// against a real library before any of it is load-bearing.
+    ///
+    /// Session-gated because the answer is a filesystem path.
+    /// </summary>
+    [HttpGet("library/resolve")]
+    public async Task<IActionResult> ResolveLibrarySong([FromQuery] string? id,
+        [FromHeader(Name = "X-Octo-Browse-Token")] string? token, CancellationToken ct)
+    {
+        if (!HasBrowseSession(token))
+            return Unauthorized(new { error = "Sign in with your Navidrome admin account first." });
+        if (string.IsNullOrWhiteSpace(id))
+            return BadRequest(new { error = "Pass the Navidrome song id as ?id=" });
+
+        var resolved = await _songPaths.ResolveAsync(id, ct);
+        return Ok(new
+        {
+            id,
+            resolved = resolved is not null,
+            musicRoot = _songPaths.MusicRoot(),
+            hasAdminIdentity = _navIdentity.HasAdminIdentity,
+            path = resolved?.AbsolutePath,
+            source = resolved?.Source.ToString() ?? PathSource.None.ToString(),
+            sizeBytes = resolved?.SizeBytes,
+            artist = resolved?.Artist,
+            title = resolved?.Title,
+            album = resolved?.Album,
+        });
     }
 
     /// <summary>
@@ -829,6 +986,7 @@ public class AdminController : ControllerBase
         var lidarr = _lidarrOpts.CurrentValue;
         var lastfm = _lastFmOpts.CurrentValue;
         var genre = _genreOpts.CurrentValue;
+        var actions = _libraryActionOpts.CurrentValue;
         var notif = _notificationOpts.CurrentValue;
         var server = _serverOpts.CurrentValue;
 
@@ -927,6 +1085,32 @@ public class AdminController : ControllerBase
                 ["RefreshIntervalHours"] = lastfm.RefreshIntervalHours,
                 ["MinimumPlays"] = lastfm.MinimumPlays,
                 ["DiscoveryStations"] = JsonSerializer.SerializeToNode(lastfm.DiscoveryStations),
+            },
+            ["LibraryActions"] = new JsonObject
+            {
+                ["Enabled"] = actions.Enabled,
+                ["PlaylistsEnabled"] = actions.PlaylistsEnabled,
+                ["RatingsEnabled"] = actions.RatingsEnabled,
+                ["PlaylistPrefix"] = actions.PlaylistPrefix ?? "",
+                ["DryRun"] = actions.DryRun,
+                ["QuarantineDirectory"] = actions.QuarantineDirectory ?? "",
+                ["QuarantineRetentionDays"] = actions.QuarantineRetentionDays,
+                ["PollIntervalSeconds"] = actions.PollIntervalSeconds,
+                ["MaxActionsPerCycle"] = actions.MaxActionsPerCycle,
+                ["KeepReplacedOriginals"] = actions.KeepReplacedOriginals,
+                ["AllowedUsers"] = JsonSerializer.SerializeToNode(actions.AllowedUsers ?? [])!,
+                // Effective rather than raw, because the editor needs every action present
+                // even when the config names only some of them. Projected so the enum lands as
+                // its NAME: serialized directly it becomes a number, and the editor looks the
+                // action up by name to label the row.
+                ["Actions"] = JsonSerializer.SerializeToNode(actions.EffectiveActions()
+                    .Select(action => new
+                    {
+                        Action = action.Action.ToString(),
+                        action.Name,
+                        action.Enabled,
+                        action.Rating,
+                    }))!,
             },
             ["Metadata"] = new JsonObject
             {
@@ -1046,6 +1230,12 @@ public class AdminController : ControllerBase
             "Soulseek:RejectedPeerTtlDays", "Soulseek:FingerprintSeconds",
             "Soulseek:FingerprintTimeoutSeconds", "Soulseek:AcoustIdTimeoutSeconds",
             "Genre:BackfillMaxConsecutiveFailures", "Genre:BackfillExtensions",
+            "LibraryActions:Enabled", "LibraryActions:PlaylistsEnabled",
+            "LibraryActions:RatingsEnabled", "LibraryActions:PlaylistPrefix",
+            "LibraryActions:DryRun", "LibraryActions:QuarantineDirectory",
+            "LibraryActions:QuarantineRetentionDays", "LibraryActions:PollIntervalSeconds",
+            "LibraryActions:MaxActionsPerCycle", "LibraryActions:KeepReplacedOriginals",
+            "LibraryActions:Actions", "LibraryActions:AllowedUsers",
             "Genre:Enabled", "Genre:MaxGenres", "Genre:OnEmpty", "Genre:Fallback",
             "Genre:UnknownLabel", "Genre:Mappings", "Genre:Blocklist",
             "Soulseek:VerifyDownloads", "Soulseek:AcoustIdApiKey",

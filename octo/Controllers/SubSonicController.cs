@@ -44,6 +44,12 @@ public class SubsonicController : ControllerBase
     private readonly Octo.Services.ListenBrainz.ListenBrainzService? _listenBrainz;
     private readonly IOptionsMonitor<LastFmSettings> _lastFmSettingsOptions;
     private LastFmSettings _lastFmSettings => _lastFmSettingsOptions.CurrentValue;
+    private readonly IOptionsMonitor<LibraryActionSettings> _libraryActionSettings;
+
+    /// <summary>Optional so the controller still resolves where the library-action workers are
+    /// not registered. Null means a rating simply never triggers anything.</summary>
+    private readonly Octo.Services.Library.LibraryActionRatingWorker? _ratingActions;
+    private readonly Octo.Services.Library.LibraryActionPlaylistProvisioner? _actionPlaylists;
     private readonly CoverArtService? _coverArtService;
     private readonly CoverArtAggregator? _coverArtAggregator;
     private readonly ExternalIdRegistry _idRegistry;
@@ -78,7 +84,10 @@ public class SubsonicController : ControllerBase
         IOptionsMonitor<LastFmSettings> lastFmSettings,
         LastFmRadioStreamSessionStore radioStreamSessions,
         LastFmRadioStreamService radioStreams,
+        IOptionsMonitor<LibraryActionSettings> libraryActionSettings,
         PlaylistSyncService? playlistSyncService = null,
+        Octo.Services.Library.LibraryActionRatingWorker? ratingActions = null,
+        Octo.Services.Library.LibraryActionPlaylistProvisioner? actionPlaylists = null,
         LastFmService? lastFmService = null,
         CoverArtService? coverArtService = null,
         CoverArtAggregator? coverArtAggregator = null,
@@ -105,6 +114,9 @@ public class SubsonicController : ControllerBase
         _playlistSyncService = playlistSyncService;
         _lastFmService = lastFmService;
         _lastFmSettingsOptions = lastFmSettings;
+        _libraryActionSettings = libraryActionSettings;
+        _ratingActions = ratingActions;
+        _actionPlaylists = actionPlaylists;
         _coverArtService = coverArtService;
         _coverArtAggregator = coverArtAggregator;
         _logger = logger;
@@ -289,6 +301,13 @@ public class SubsonicController : ControllerBase
                 : _responseBuilder.CreateError(format, 0, "Unable to authenticate with Navidrome");
 
         var username = parameters.GetValueOrDefault("u", "");
+
+        // Navidrome answered ok above, so `u` is authenticated. Ensure this user's action
+        // playlists exist, using the body we already have so the common case costs no extra
+        // request. Fire-and-forget: creating a playlist must never delay the listing.
+        if (_actionPlaylists is not null)
+            _ = _actionPlaylists.EnsureAsync(username, PlaylistNames(relay.Body, format), parameters);
+
         await BootstrapRadioProfileAsync(username, parameters);
         var stations = PlaylistStations(username);
         QueueRefreshIfStale(username);
@@ -596,6 +615,27 @@ public class SubsonicController : ControllerBase
         return relay.Success && relay.Body is not null
             ? File(relay.Body, relay.ContentType ?? $"application/{format}")
             : _responseBuilder.CreateError(format, 0, "Unable to update playlist");
+    }
+
+    /// <summary>
+    /// The playlist names in a relayed getPlaylists body, so provisioning can tell what is
+    /// already there without a second request. Best-effort: an unreadable body simply means
+    /// nothing is known to exist, and creating a duplicate is refused by Navidrome anyway.
+    /// </summary>
+    private static IReadOnlyCollection<string> PlaylistNames(byte[]? body, string format)
+    {
+        if (body is not { Length: > 0 }) return [];
+        try
+        {
+            if (!format.Equals("json", StringComparison.OrdinalIgnoreCase)) return [];
+            var rows = JsonNode.Parse(body)?["subsonic-response"]?["playlists"]?["playlist"];
+            if (rows is not JsonArray array) return [];
+            return array.Select(row => row?["name"]?.GetValue<string>())
+                .Where(name => !string.IsNullOrEmpty(name))
+                .Select(name => name!)
+                .ToList();
+        }
+        catch { return []; }
     }
 
     private List<LastFmRadioStation> VisibleStations(string username)
@@ -1967,6 +2007,68 @@ public class SubsonicController : ControllerBase
         {
             return _responseBuilder.CreateError(format, 0, $"Error connecting to Subsonic server: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Star ratings.
+    ///
+    /// Two jobs, in this order and never the other way round:
+    ///
+    /// 1. ALWAYS relay to Navidrome and return ITS response verbatim. A rating the server did
+    ///    not record snaps back in the client on the next refresh, and rating a track is a
+    ///    legitimate thing to do for its own sake. Octo reading meaning into it must never cost
+    ///    the user the rating itself.
+    /// 2. Only then, if library actions are on, the rating maps to an enabled action and the
+    ///    user is on the allowlist, queue it. Queue, not execute: nothing that removes a file
+    ///    runs inside a request.
+    ///
+    /// Before this there was no handler at all and setRating fell through to the catch-all,
+    /// where an Octo id became a synthetic OK that never reached Navidrome. That behaviour is
+    /// preserved exactly.
+    /// </summary>
+    [HttpGet, HttpPost]
+    [Route("rest/setRating")]
+    [Route("rest/setRating.view")]
+    public async Task<IActionResult> SetRating()
+    {
+        var parameters = await ExtractAllParameters();
+        var format = parameters.GetValueOrDefault("f", "xml");
+        var itemId = parameters.GetValueOrDefault("id", "");
+        var ratingText = parameters.GetValueOrDefault("rating", "");
+
+        // An external id is not a Navidrome song, and relaying one errors "data not found".
+        if (!string.IsNullOrEmpty(itemId) && _localLibraryService.ParseSongId(itemId).isExternal)
+            return _responseBuilder.CreateResponse(format, "setRating", new { });
+
+        byte[] body;
+        string? contentType;
+        try
+        {
+            var result = await _proxyService.RelayAsync("rest/setRating", parameters);
+            (body, contentType) = (result.Body, result.ContentType);
+        }
+        catch (HttpRequestException ex)
+        {
+            return _responseBuilder.CreateError(format, 0, $"Error connecting to Subsonic server: {ex.Message}");
+        }
+
+        if (_ratingActions is not null
+            && IsSuccessfulSubsonicResponse(body, format)
+            && int.TryParse(ratingText, out var rating)
+            && !string.IsNullOrEmpty(itemId)
+            && parameters.GetValueOrDefault("u") is { Length: > 0 } username
+            && parameters.GetValueOrDefault("t") is { Length: > 0 } token
+            && parameters.GetValueOrDefault("s") is { Length: > 0 } salt
+            && _libraryActionSettings.CurrentValue.ActionForRating(rating) is { } definition)
+        {
+            // Navidrome answered ok to a call carrying this u/t/s, which IS the auth check.
+            // Octo does not validate the password itself; it trusts it exactly as far as
+            // Navidrome just did, the same idiom getPlaylist and star already use.
+            _ratingActions.TryEnqueue(new Octo.Services.Library.RatingActionRequest(
+                definition.Action, itemId, username, username, token, salt));
+        }
+
+        return File(body, contentType ?? $"application/{format}");
     }
 
     /// <summary>

@@ -300,6 +300,27 @@ is gone there is no undo at all. Keep your own backup of the music folder. A run
 interrupted by a restart is never resumed automatically, since restarting may be how you
 stopped it.
 
+Library actions let a user fix a wrong download from the player they are already using, by
+adding the track to an action playlist Octo keeps (`LIBRARY_ACTIONS_PLAYLISTS`) or, if they
+turn it on, by rating it (`LIBRARY_ACTIONS_RATINGS`). `LIBRARY_ACTIONS_ENABLED` is off by
+default, and the feature stays inert even when on until at least one username is added to the
+allowlist in the dashboard: **an empty allowlist means nobody, never everybody.** The action
+names, which actions exist, and which star count maps to which action are all editable, and
+five stars is deliberately unmapped so the top of the scale is never destructive.
+
+`LIBRARY_ACTIONS_DRY_RUN` is on by default, so the first run of a newly enabled install is a
+rehearsal you can read before anything is real. Nothing is ever deleted outright: removed files
+move to `LIBRARY_ACTIONS_TRASH_DIR` under the music folder, with a sidecar manifest so a restore
+works even if the action journal is lost, and only the retention sweep
+(`LIBRARY_ACTIONS_TRASH_DAYS`, 0 to keep forever) really deletes. `LIBRARY_ACTIONS_POLL_SECONDS`
+and `LIBRARY_ACTIONS_MAX_PER_CYCLE` bound how fast actions are noticed and applied.
+
+Two things to know before turning ratings on. Clearing a rating afterwards needs the rating
+owner's own credentials, because Subsonic ratings are per user, so **Octo caches a replayable
+Subsonic auth triplet per user in memory** for as long as it runs. And because no client asks
+for confirmation before setting a star, a mis-tap is a request. The playlists carry no such
+risk, which is why they are the default.
+
 `SLSKD_VERIFY_DOWNLOADS` fingerprints each finished Soulseek download with Chromaprint and
 identifies it through AcoustID before it joins the library, using the free key in
 `ACOUSTID_API_KEY`. A file identified as a different recording is deleted and its peer and

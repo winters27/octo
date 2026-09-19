@@ -461,6 +461,21 @@ public abstract class BaseDownloadService : IDownloadService
             // orphan that Octo has no record of. A client giving up on a slow
             // download used to abort exactly here, which is why a completed
             // download could never be played.
+            // A user who asked for this track to be removed meant it. Resolved through the
+            // service provider rather than the constructor, because the journal's owner depends
+            // on the acquisition queue this class sits underneath.
+            var actionJournal = _serviceProvider
+                .GetService<Octo.Services.Library.LibraryActionJournal>();
+            if (actionJournal?.IsNeverRequested(song.Artist, song.Title) == true)
+            {
+                Logger.LogInformation(
+                    "Skipping '{Artist} - {Title}': it was removed with a library action, so it is "
+                    + "not requested again. Clear that entry from the dashboard to allow it.",
+                    song.Artist, song.Title);
+                throw new InvalidOperationException(
+                    $"'{song.Artist} - {song.Title}' was deleted with a library action");
+            }
+
             var localPath = await DownloadTrackAsync(
                 externalId, song, silence, sourceOverride, cancellationToken);
 

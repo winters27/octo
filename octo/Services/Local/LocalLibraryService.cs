@@ -92,7 +92,9 @@ public class LocalLibraryService : ILocalLibraryService
                 Title = song.Title,
                 Artist = song.Artist,
                 Album = song.Album,
-                DownloadedAt = DateTime.UtcNow
+                DownloadedAt = DateTime.UtcNow,
+                SourcePeer = song.SourcePeer,
+                SourceFile = song.SourceFile,
             };
             
             await SaveMappingsAsync(mappings);
@@ -202,6 +204,53 @@ public class LocalLibraryService : ILocalLibraryService
 
     public string GetDownloadDirectory() => _downloadDirectory;
 
+    /// <summary>
+    /// Drop the mapping for a path Octo no longer owns.
+    ///
+    /// Without this, DownloadSongInternalAsync's existing-file short-circuit keeps pointing a
+    /// re-acquire at the file that was just quarantined, and the replacement never happens.
+    /// </summary>
+    public async Task<bool> ForgetMappingAsync(string localPath)
+    {
+        if (string.IsNullOrWhiteSpace(localPath)) return false;
+
+        var mappings = await LoadMappingsAsync();
+        await _lock.WaitAsync();
+        try
+        {
+            var stale = mappings
+                .Where(pair => string.Equals(pair.Value.LocalPath, localPath, StringComparison.OrdinalIgnoreCase))
+                .Select(pair => pair.Key).ToList();
+            if (stale.Count == 0) return false;
+
+            foreach (var key in stale) mappings.Remove(key);
+            await SaveMappingsAsync(mappings);
+            return true;
+        }
+        finally { _lock.Release(); }
+    }
+
+    public async Task<LocalSongMapping?> FindMappingByTagsAsync(string? artist, string? title, string? album)
+    {
+        if (string.IsNullOrWhiteSpace(artist) || string.IsNullOrWhiteSpace(title)) return null;
+
+        var mappings = await LoadMappingsAsync();
+        var matches = mappings.Values
+            .Where(mapping =>
+                string.Equals(mapping.Artist?.Trim(), artist.Trim(), StringComparison.OrdinalIgnoreCase)
+                && string.Equals(mapping.Title?.Trim(), title.Trim(), StringComparison.OrdinalIgnoreCase)
+                // Album only narrows when both sides have one; a mapping written before album
+                // enrichment should not be excluded for lacking it.
+                && (string.IsNullOrWhiteSpace(album) || string.IsNullOrWhiteSpace(mapping.Album)
+                    || string.Equals(mapping.Album.Trim(), album.Trim(), StringComparison.OrdinalIgnoreCase))
+                && !string.IsNullOrEmpty(mapping.LocalPath)
+                && File.Exists(mapping.LocalPath))
+            .Take(2)
+            .ToList();
+
+        return matches.Count == 1 ? matches[0] : null;
+    }
+
     public async Task<IReadOnlyList<LocalSongMapping>> GetMappingsAsync()
     {
         var mappings = await LoadMappingsAsync();
@@ -309,4 +358,8 @@ public class LocalSongMapping
     public string Album { get; set; } = string.Empty;
     public DateTime DownloadedAt { get; set; }
 
+    /// <summary>Who delivered this file, when it came from Soulseek. Optional, so mappings
+    /// written before this existed still load.</summary>
+    public string? SourcePeer { get; set; }
+    public string? SourceFile { get; set; }
 }

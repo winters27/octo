@@ -101,6 +101,19 @@ services:
       Genre__UnknownLabel: ${GENRE_UNKNOWN_LABEL:-Unknown}
       Genre__BackfillMaxConsecutiveFailures: ${GENRE_BACKFILL_MAX_FAILURES:-25}
 
+      # ----- Library actions (fix a wrong download from any client) -----
+      # Off by default: these actions remove files Octo did not create. The action
+      # names, the star mapping and who may trigger them live in the dashboard.
+      LibraryActions__Enabled: ${LIBRARY_ACTIONS_ENABLED:-false}
+      LibraryActions__PlaylistsEnabled: ${LIBRARY_ACTIONS_PLAYLISTS:-true}
+      LibraryActions__RatingsEnabled: ${LIBRARY_ACTIONS_RATINGS:-false}
+      LibraryActions__DryRun: ${LIBRARY_ACTIONS_DRY_RUN:-true}
+      LibraryActions__QuarantineDirectory: ${LIBRARY_ACTIONS_TRASH_DIR:-.octo-trash}
+      LibraryActions__QuarantineRetentionDays: ${LIBRARY_ACTIONS_TRASH_DAYS:-30}
+      LibraryActions__PollIntervalSeconds: ${LIBRARY_ACTIONS_POLL_SECONDS:-60}
+      LibraryActions__MaxActionsPerCycle: ${LIBRARY_ACTIONS_MAX_PER_CYCLE:-20}
+      LibraryActions__KeepReplacedOriginals: ${LIBRARY_ACTIONS_KEEP_REPLACED:-true}
+
       # ----- Metadata language (genre tags etc. from Deezer / Last.fm) -----
       Metadata__Language: ${METADATA_LANGUAGE:-en}
 

@@ -87,6 +87,12 @@
             </svg>
             <span>Soulseek</span>
           </button>
+          <button class="sidebar-nav-item" data-tab="libraryactions">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M2.5 4.5h11v8h-11z"/><path d="M6 7.5h4M8 7.5v3"/>
+            </svg>
+            <span>Library actions</span>
+          </button>
           <button class="sidebar-nav-item" data-tab="lidarr">
             <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
               <path d="M3 3.5h10v9H3z"/><path d="M5.5 6h5M5.5 8.5h5M5.5 11h3"/>
@@ -982,6 +988,107 @@
           </form>
         </div>
       </section>
+
+      <!-- ─── LIBRARY ACTIONS ────────────────────────────────── -->
+      <section data-pane="libraryactions">
+        <header class="page-header">
+          <div>
+            <h1>Library actions</h1>
+            <p>Fix a wrong download from the player you are already using, instead of coming back here. Add the track to one of Octo's action playlists and it gets handled.</p>
+          </div>
+        </header>
+
+        <div class="notice notice-warn">
+          <strong>This removes files.</strong> Nothing is deleted outright: a removed file moves to a quarantine folder inside your music directory and is only really deleted once it is older than the retention window. Even so, this acts on files Octo did not download, on one tap in a music client with no confirmation dialog. Leave the rehearsal mode on until you have read a run.
+        </div>
+
+        <div class="set-section">
+          <div class="set-head"><h3 class="set-title">Who and how</h3></div>
+          <form data-section="library-actions" class="set-card" id="library-actions-form">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Enable library actions</div><div class="set-info-d">Off by default. Needs a Navidrome admin credential under Subsonic, because finding the file behind a track is an admin-only lookup. <strong>Takes effect after a restart</strong>, so arming this is a deliberate act rather than a stray click.</div></div>
+              <label class="switch"><input type="checkbox" name="LibraryActions.Enabled" data-restart="true" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Rehearsal mode</div><div class="set-info-d">Do everything except touch a file, and write down what would have happened. Turn this off only once a run looks right.</div></div>
+              <label class="switch"><input type="checkbox" name="LibraryActions.DryRun" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Who may trigger actions</div>
+                <div class="set-info-d">Navidrome usernames, comma separated. <strong>An empty list means nobody</strong>, which is why the feature will not save as enabled without at least one name here.</div>
+              </div>
+              <input class="set-input" id="f-action-users" placeholder="alice, bob" />
+              <input type="hidden" id="action-users-json" name="LibraryActions.AllowedUsers" data-json="true" />
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Action playlists</div><div class="set-info-d">Octo keeps one private playlist per enabled action for each allowed user. Adding a track to one requests that action.</div></div>
+              <label class="switch"><input type="checkbox" name="LibraryActions.PlaylistsEnabled" data-restart="true" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Playlist name prefix</div><div class="set-info-d">So the action playlists sort together. Leave empty for none.</div></div>
+              <input class="set-input" name="LibraryActions.PlaylistPrefix" maxlength="16" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Star ratings as commands</div>
+                <div class="set-info-d"><strong>Worth leaving off.</strong> A star is a one-tap gesture with no confirmation in any client, and rating a track you dislike is an ordinary thing to do. Five stars is never mapped, so the top of the scale is always safe.</div>
+              </div>
+              <label class="switch"><input type="checkbox" name="LibraryActions.RatingsEnabled" data-restart="true" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">The actions</h3>
+            <p class="set-desc">Rename them, switch them on individually, and choose which star count asks for each. Set a rating to 0 to leave that action playlist-only.</p>
+          </div>
+          <form data-section="library-actions-list" class="set-card" id="library-actions-list-form">
+            <div id="library-action-list" class="genre-mapping-list"></div>
+            <input type="hidden" id="library-actions-json" name="LibraryActions.Actions" data-json="true" />
+            <div id="library-action-error" class="field-error" role="alert" hidden></div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head"><h3 class="set-title">Quarantine and pacing</h3></div>
+          <form data-section="library-actions-quarantine" class="set-card">
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Quarantine folder</div><div class="set-info-d">Inside your music folder. The leading dot keeps it out of Navidrome's scan.</div></div>
+              <input class="set-input" name="LibraryActions.QuarantineDirectory" maxlength="60" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Keep removed files for <span class="set-opt">days</span></div><div class="set-info-d">The only step that really deletes. <strong>0 keeps them forever</strong>, so you can manage the space yourself.</div></div>
+              <input class="set-input" name="LibraryActions.QuarantineRetentionDays" type="number" min="0" max="3650" />
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Keep the original after a replacement</div><div class="set-info-d">Off means the retention window is the only safety net for a replaced file.</div></div>
+              <label class="switch"><input type="checkbox" name="LibraryActions.KeepReplacedOriginals" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Check every <span class="set-opt">seconds</span> / at most <span class="set-opt">per check</span></div><div class="set-info-d">How quickly an action is noticed, and a ceiling on how many are applied at once so a client that dumps thousands of tracks cannot run away with your library.</div></div>
+              <div class="set-grid2">
+                <input class="set-input" name="LibraryActions.PollIntervalSeconds" type="number" min="15" max="3600" data-number="true" />
+                <input class="set-input" name="LibraryActions.MaxActionsPerCycle" type="number" min="1" max="200" data-number="true" />
+              </div>
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Recent actions</h3>
+            <p class="set-desc">Every file this has moved, who asked for it, and where it went. Logs scroll away; this does not.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">History</div><div class="set-info-d">Signing in with your Navidrome admin account is required, the same as the folder picker.</div></div>
+              <button class="btn btn-ghost" type="button" id="library-actions-refresh">Show history</button>
+            </div>
+            <div id="library-actions-history"></div>
+          </div>
+        </div>
       </section>
 
       <!-- ─── LIDARR ─────────────────────────────────────────── -->

@@ -22,6 +22,14 @@ public class Song
     public int? TotalTracks { get; set; }
     public int? Year { get; set; }
     public string? Genre { get; set; }
+
+    /// <summary>
+    /// The Soulseek peer and remote filename this came from, when it came from Soulseek.
+    /// Carried so it can be written down at registration: "Wrong song" needs to know who
+    /// delivered the file, and nothing else in Octo records that after the transfer ends.
+    /// </summary>
+    public string? SourcePeer { get; set; }
+    public string? SourceFile { get; set; }
     public string? CoverArtUrl { get; set; }
     
     /// <summary>

@@ -256,6 +256,29 @@ public class NavidromeIdentityService
         }
     }
 
+    /// <summary>
+    /// Public because library actions need the same standing admin identity music-folder
+    /// detection does, and they need it from a background worker rather than from inside
+    /// DetectMusicFolderAsync. Still best-effort: null when there are neither configured admin
+    /// credentials nor a captured admin login.
+    /// </summary>
+    public Task<string?> EnsureAdminJwtAsync(CancellationToken ct = default) => EnsureJwtAsync(ct);
+
+    /// <summary>
+    /// True when either credential route is currently usable. Feature gates read this at
+    /// startup so a missing credential is one clear log line, not one silent failure per
+    /// action.
+    /// </summary>
+    public bool HasAdminIdentity
+    {
+        get
+        {
+            lock (_lock) { if (!string.IsNullOrEmpty(_jwt)) return true; }
+            return !string.IsNullOrEmpty(_settings.AdminUsername)
+                && !string.IsNullOrEmpty(_settings.AdminPassword);
+        }
+    }
+
     /// <summary>Ensure a usable admin JWT: a captured one, else a fresh login with
     /// configured admin creds. Returns the token or null when neither is available.</summary>
     private async Task<string?> EnsureJwtAsync(CancellationToken ct)

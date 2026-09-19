@@ -222,6 +222,8 @@ public class GenreBackfillEndpointTests
         { "POST", "/api/admin/genre/backfill/undo" },
         // Library actions list filenames and usernames, and the resolver answers with a real
         // path, so both are gated the same way.
+        { "GET", "/api/admin/library-actions" },
+        { "GET", "/api/admin/library/resolve?id=abc" },
     };
 
     [Theory]

@@ -57,6 +57,8 @@ builder.Services.AddProblemDetails();
 
 builder.Services.Configure<GenreSettings>(
     builder.Configuration.GetSection("Genre"));
+builder.Services.Configure<LibraryActionSettings>(
+    builder.Configuration.GetSection("LibraryActions"));
 builder.Services.Configure<SubsonicSettings>(
     builder.Configuration.GetSection("Subsonic"));
 builder.Services.Configure<SoulseekSettings>(
@@ -167,6 +169,27 @@ builder.Services.AddSingleton(sp => new Octo.Services.Metadata.GenreBackfillJour
 builder.Services.AddSingleton<Octo.Services.Metadata.GenreBackfillWorker>();
 builder.Services.AddHostedService(sp =>
     sp.GetRequiredService<Octo.Services.Metadata.GenreBackfillWorker>());
+
+// Resolves a Navidrome song id to a verified file on disk. Read-only and non-destructive on
+// its own; it exists first because nothing that acts on a library file can be trusted until
+// this is proven against a real library.
+builder.Services.AddSingleton<Octo.Services.Library.NavidromeSongPathResolver>();
+
+// Recovery before anything that needs recovering from: the quarantine and the journal land
+// with the settings, and only then does anything act on a library file.
+builder.Services.AddSingleton<Octo.Services.Library.LibraryActionQuarantine>();
+builder.Services.AddSingleton<Octo.Services.Library.LibraryActionExecutor>();
+// Scoped, because SubsonicProxyService is: it depends on IHttpContextAccessor.
+builder.Services.AddScoped<Octo.Services.Library.LibraryActionPlaylistProvisioner>();
+builder.Services.AddHostedService<Octo.Services.Library.LibraryActionPlaylistWorker>();
+// Singleton AND hosted, the same instance both ways, so the controller enqueues into the
+// worker the host is running rather than a second copy of it.
+builder.Services.AddSingleton<Octo.Services.Library.LibraryActionRatingWorker>();
+builder.Services.AddHostedService(sp =>
+    sp.GetRequiredService<Octo.Services.Library.LibraryActionRatingWorker>());
+builder.Services.AddSingleton(sp => new Octo.Services.Library.LibraryActionJournal(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "library-actions.json"),
+    sp.GetRequiredService<ILogger<Octo.Services.Library.LibraryActionJournal>>()));
 
 builder.Services.AddSingleton<Octo.Services.Fingerprint.AudioFingerprinter>();
 

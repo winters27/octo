@@ -125,6 +125,8 @@ async function loadSettings() {
   renderGenreMappings(currentSettings?.Genre?.Mappings);
   renderGenreBlocklist(currentSettings?.Genre?.Blocklist);
   syncGenreUnknownRow();
+  renderLibraryActions(currentSettings?.LibraryActions?.Actions);
+  renderLibraryActionUsers(currentSettings?.LibraryActions?.AllowedUsers);
   // retry: false, so a page load never pops a sign-in prompt. Without a session the section
   // simply stays empty until the user asks for a preview.
   loadGenreBackfill();
@@ -887,6 +889,140 @@ document.getElementById('genre-backfill-undo')?.addEventListener('click', async 
   if (!response.ok) { toast(body.error || 'Could not undo.', 'err'); return; }
   toast('Restoring genres.');
   await loadGenreBackfill();
+});
+
+// ---- Library actions -----------------------------------------------------
+
+let libraryActions = [];
+
+const libraryActionLabels = {
+  Delete: 'Delete the file and never ask for it again',
+  WrongSong: 'Wrong song: replace it, and blacklist the peer that sent it',
+  WrongVersion: 'Wrong version: find the plain recording instead',
+  BetterQuality: 'Better quality: upgrade only to a larger lossless copy',
+};
+
+function normalizeLibraryAction(action = {}) {
+  return {
+    ...action,
+    Action: action.Action ?? action.action ?? '',
+    Name: action.Name ?? action.name ?? '',
+    Enabled: (action.Enabled ?? action.enabled ?? false) === true,
+    // null and 0 mean different things: unset takes the built-in mapping, 0 means no rating
+    // ever triggers this. Keep null as null rather than coercing it to a number.
+    Rating: action.Rating ?? action.rating ?? null,
+  };
+}
+
+function renderLibraryActions(actions = libraryActions) {
+  const list = document.getElementById('library-action-list');
+  if (!list) return;
+  libraryActions = (Array.isArray(actions) ? actions : []).map(normalizeLibraryAction);
+
+  list.innerHTML = libraryActions.map((action, index) => `
+      <div class="source-priority-row library-action-row${action.Enabled ? '' : ' is-disabled'}" data-index="${index}">
+        <span class="source-copy">
+          <span class="source-title">${esc(action.Action)}</span>
+          <span class="source-detail">${esc(libraryActionLabels[action.Action] || '')}</span>
+        </span>
+        <input class="set-input" data-action-field="Name" value="${esc(action.Name)}"
+               placeholder="playlist name" aria-label="${esc(action.Action)} playlist name" />
+        <select class="set-input" data-action-field="Rating" aria-label="${esc(action.Action)} star rating">
+          <option value="0"${Number(action.Rating) === 0 ? ' selected' : ''}>no rating</option>
+          ${[1, 2, 3, 4, 5].map(star =>
+            `<option value="${star}"${Number(action.Rating) === star ? ' selected' : ''}>${star} star${star === 1 ? '' : 's'}</option>`).join('')}
+        </select>
+        <label class="switch source-kind-switch">
+          <input type="checkbox" data-action-field="Enabled" aria-label="Enable ${esc(action.Action)}" ${action.Enabled ? 'checked' : ''} />
+          <span class="sw-track"></span><span class="sw-thumb"></span>
+        </label>
+      </div>`).join('');
+  syncLibraryActionsInput(false);
+}
+
+function syncLibraryActionsInput(showErrors = true) {
+  document.querySelectorAll('#library-action-list .library-action-row').forEach(row => {
+    const action = libraryActions[Number(row.dataset.index)];
+    if (!action) return;
+    row.querySelectorAll('[data-action-field]').forEach(input => {
+      const field = input.dataset.actionField;
+      if (field === 'Enabled') action.Enabled = input.checked;
+      else if (field === 'Rating') action.Rating = Number(input.value);
+      else action[field] = input.value;
+    });
+  });
+
+  const input = document.getElementById('library-actions-json');
+  const error = document.getElementById('library-action-error');
+  if (!input) return true;
+
+  let message = '';
+  const ratings = new Set();
+  for (const action of libraryActions) {
+    if ((action.Name || '').trim().length > 80) { message = `"${action.Action}" has a name longer than 80 characters.`; break; }
+    const rating = Number(action.Rating) || 0;
+    // A rating can only mean one thing, so two actions on the same star count is a mistake.
+    if (rating > 0 && ratings.has(rating)) { message = `Two actions both use ${rating} star(s).`; break; }
+    if (rating > 0) ratings.add(rating);
+  }
+
+  if (error) { error.textContent = message; error.hidden = !message || !showErrors; }
+  if (message) return false;
+
+  input.value = JSON.stringify(libraryActions);
+  return true;
+}
+
+function renderLibraryActionUsers(users) {
+  const visible = document.getElementById('f-action-users');
+  if (visible) visible.value = (Array.isArray(users) ? users : []).join(', ');
+  syncLibraryActionUsers();
+}
+
+function syncLibraryActionUsers() {
+  const visible = document.getElementById('f-action-users');
+  const hidden = document.getElementById('action-users-json');
+  if (!visible || !hidden) return;
+  const entries = visible.value.split(',').map(entry => entry.trim()).filter(Boolean);
+  hidden.value = JSON.stringify([...new Set(entries)]);
+}
+
+const libraryActionList = document.getElementById('library-action-list');
+libraryActionList?.addEventListener('input', () => syncLibraryActionsInput());
+libraryActionList?.addEventListener('change', event => {
+  if (event.target.matches('[data-action-field="Enabled"]')) { renderLibraryActions(libraryActions); return; }
+  syncLibraryActionsInput();
+});
+document.getElementById('f-action-users')?.addEventListener('input', syncLibraryActionUsers);
+
+document.getElementById('library-actions-refresh')?.addEventListener('click', async () => {
+  const holder = document.getElementById('library-actions-history');
+  if (!holder) return;
+  try {
+    let response = await fetch('/api/admin/library-actions', { credentials: 'same-origin' });
+    if (response.status === 401 && await browseAuthenticate(holder)) {
+      response = await fetch('/api/admin/library-actions', { credentials: 'same-origin' });
+    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json();
+
+    if (!body.entries?.length) { holder.innerHTML = '<p class="set-info-d">Nothing yet.</p>'; return; }
+    holder.innerHTML = `
+      <div class="config-table">
+        <div class="config-row config-row-head genre-change-row">
+          <span>Track</span><span>Action</span><span>Who</span><span>Result</span>
+        </div>
+        ${body.entries.map(entry => `
+          <div class="config-row genre-change-row">
+            <span class="key">${esc(entry.artist)} - ${esc(entry.title)}</span>
+            <span class="value">${esc(entry.action)}${entry.dryRun ? ' (rehearsal)' : ''}</span>
+            <span class="value">${esc(entry.username)}</span>
+            <span class="value">${esc(entry.state)}${entry.detail ? `: ${esc(entry.detail)}` : ''}</span>
+          </div>`).join('')}
+      </div>`;
+  } catch (error) {
+    holder.innerHTML = `<div class="field-error" role="alert">${esc(error.message)}</div>`;
+  }
 });
 
 document.getElementById('lidarr-test-connection')?.addEventListener('click', async (event) => {

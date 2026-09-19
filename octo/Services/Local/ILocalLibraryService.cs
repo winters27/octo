@@ -53,6 +53,17 @@ public interface ILocalLibraryService
     /// </summary>
     Task<IReadOnlyList<LocalSongMapping>> GetMappingsAsync();
 
+    /// <summary>
+    /// The mapping whose tags match, or null when there is no match OR more than one.
+    /// Ambiguity is a failure, not a coin flip: this feeds a delete, and picking arbitrarily
+    /// between two candidates is how you delete the wrong one.
+    /// </summary>
+    Task<LocalSongMapping?> FindMappingByTagsAsync(string? artist, string? title, string? album);
+
+    /// <summary>Drop the mapping for a path Octo no longer owns, so a re-acquire is not
+    /// short-circuited by a file that has just been moved out of the library.</summary>
+    Task<bool> ForgetMappingAsync(string localPath);
+
     Task<bool> TriggerLibraryScanAsync(bool force = false);
     
     /// <summary>

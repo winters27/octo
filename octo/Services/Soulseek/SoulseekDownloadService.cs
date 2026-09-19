@@ -459,6 +459,9 @@ public class SoulseekDownloadService : BaseDownloadService
                 // Write down who delivered this. It is the only chance: after the transfer
                 // ends nothing else in Octo remembers, and "Wrong song" needs it to blacklist
                 // the peer rather than re-rolling the same search.
+                song.SourcePeer = hit.Username;
+                song.SourceFile = hit.Filename;
+
                 localPath = MoveToConfiguredLayout(localPath, routing) ?? localPath;
                 Logger.LogInformation("Soulseek download complete (attempt {N}, slskd state={State}{Aborted}): {Path}",
                     attemptIdx, state?.ToString() ?? "interrupted", callerGaveUp ? ", caller had already left" : "", localPath);
