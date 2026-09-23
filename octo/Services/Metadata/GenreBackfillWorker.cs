@@ -1,3 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
 using System.Threading.Channels;
 using Microsoft.Extensions.Options;
 using Octo.Models.Settings;
@@ -37,6 +40,11 @@ public sealed class GenreBackfillWorker : BackgroundService
 
     private volatile bool _cancelRequested;
 
+    // 1 from the moment a request is accepted until the worker has finished with it. The store
+    // only says Running once enumeration is done, which on a large library is minutes; without
+    // this a second request in that window was accepted and ran afterwards, unconfirmed.
+    private int _pending;
+
     public GenreBackfillWorker(GenreBackfillStore store, GenreBackfillJournal journal,
         IOptionsMonitor<GenreSettings> settings, IConfiguration configuration,
         IServiceScopeFactory scopes, ILogger<GenreBackfillWorker> logger)
@@ -55,12 +63,32 @@ public sealed class GenreBackfillWorker : BackgroundService
     /// talk to rather than needing the store as well.</summary>
     public GenreBackfillRun Current => _store.Current;
 
-    /// <summary>False when a run is already going, which the controller turns into a 409.</summary>
+    /// <summary>False when a run is already going or waiting to start, which the controller
+    /// turns into a 409. A full bounded channel in DropWrite mode reports a dropped write as a
+    /// success, so the channel alone could not say no.</summary>
     public bool TryEnqueue(GenreBackfillRequest request)
     {
-        if (IsRunning) return false;
-        return _queue.Writer.TryWrite(request);
+        if (IsRunning || Interlocked.CompareExchange(ref _pending, 1, 0) != 0) return false;
+        if (_queue.Writer.TryWrite(request)) return true;
+        Interlocked.Exchange(ref _pending, 0);
+        return false;
     }
+
+    /// <summary>A short, stable fingerprint of the genre settings a run is planned from.</summary>
+    /// Only what decides a file's new genre and which files are walked: the failure ceiling is
+    /// how long a run keeps trying, not what it writes.
+    internal static string HashSettings(GenreSettings settings) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new
+        {
+            settings.Enabled,
+            settings.Mappings,
+            settings.Blocklist,
+            settings.Fallback,
+            settings.MaxGenres,
+            settings.OnEmpty,
+            settings.UnknownLabel,
+            settings.BackfillExtensions,
+        }))))[..16];
 
     public void RequestCancel() => _cancelRequested = true;
 
@@ -86,6 +114,10 @@ public sealed class GenreBackfillWorker : BackgroundService
                     run.FinishedUtc = DateTime.UtcNow;
                 });
             }
+            finally
+            {
+                Interlocked.Exchange(ref _pending, 0);
+            }
         }
     }
 
@@ -93,9 +125,17 @@ public sealed class GenreBackfillWorker : BackgroundService
     {
         _cancelRequested = false;
 
+        // Snapshot the settings at run start rather than reading per file, so a run's results
+        // are explainable: a mid-run settings edit would otherwise produce a file where half
+        // the library followed one table and half followed another.
+        var settings = _settings.CurrentValue;
+
+        // Resuming continues a run under the settings it started with; after a rules edit the
+        // only honest option is a fresh run.
         var resuming = request.Scope == _store.Current.Scope
             && request.DryRun == _store.Current.DryRun
-            && _store.Current.CanResume;
+            && _store.Current.CanResume
+            && (_store.Current.SettingsHash is null || _store.Current.SettingsHash == HashSettings(settings));
 
         List<string> queue;
         if (resuming)
@@ -121,15 +161,12 @@ public sealed class GenreBackfillWorker : BackgroundService
                 StartedUtc = DateTime.UtcNow,
                 Total = queue.Count,
                 Queue = queue,
+                SettingsHash = HashSettings(settings),
             });
             _logger.LogInformation("Genre backfill started: {Count} file(s), scope {Scope}, dryRun {DryRun}",
                 queue.Count, request.Scope, request.DryRun);
         }
 
-        // Snapshot the settings at run start rather than reading per file, so a run's results
-        // are explainable: a mid-run settings edit would otherwise produce a file where half
-        // the library followed one table and half followed another.
-        var settings = _settings.CurrentValue;
         var runId = _store.Current.RunId;
         var dryRun = _store.Current.DryRun;
         var consecutiveFailures = 0;
@@ -239,17 +276,26 @@ public sealed class GenreBackfillWorker : BackgroundService
         // Newest first. A file changed twice is restored to the frame the OLDEST entry saw,
         // because that one is applied last.
         var restored = 0;
+        var stoppedEarly = false;
+        var outcomes = new Dictionary<int, bool?>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var entry in entries)
+        for (var index = 0; index < entries.Count; index++)
         {
-            if (stoppingToken.IsCancellationRequested || _cancelRequested) break;
+            if (stoppingToken.IsCancellationRequested || _cancelRequested)
+            {
+                stoppedEarly = true;
+                break;
+            }
 
+            var entry = entries[index];
             try
             {
                 if (!File.Exists(entry.Path))
                 {
-                    // Keyed by path, so a file moved since the run cannot be found and stays
-                    // rewritten. Counted as skipped rather than failed: nothing went wrong here.
+                    // Keyed by path, so a file moved since the run cannot be found. Kept in the
+                    // journal: a music folder on a mount that is down right now looks exactly
+                    // like this, and dropping the entries would lose the undo for all of it.
+                    outcomes[index] = null;
                     _store.Update(run => run.Skipped++);
                     continue;
                 }
@@ -258,10 +304,12 @@ public sealed class GenreBackfillWorker : BackgroundService
                 tagFile.Tag.Genres = entry.Before.ToArray();
                 tagFile.Save();
                 restored++;
+                outcomes[index] = true;
                 if (seen.Add(entry.Path)) _store.Update(run => run.Changed++);
             }
             catch (Exception ex)
             {
+                outcomes[index] = false;
                 _store.Update(run =>
                 {
                     run.Failed++;
@@ -274,16 +322,53 @@ public sealed class GenreBackfillWorker : BackgroundService
             }
         }
 
-        _journal.Clear();
+        // Only what was actually put back leaves the journal. Clearing it outright here used to
+        // throw away the undo for every file a cancel, a shutdown or an unreadable file left
+        // behind.
+        var remaining = Remaining(entries, outcomes);
+        if (remaining.Count == 0) _journal.Clear();
+        else _journal.Rewrite(remaining);
+
         _store.Update(run =>
         {
-            run.Status = GenreBackfillStatus.Completed;
+            run.Status = stoppedEarly ? GenreBackfillStatus.Cancelled : GenreBackfillStatus.Completed;
             run.FinishedUtc = DateTime.UtcNow;
-            run.Reason = $"Restored the genre frame on {restored} file(s).";
+            run.Reason = remaining.Count == 0
+                ? $"Restored the genre frame on {restored} file(s)."
+                : $"Restored {restored} file(s). {remaining.Count} not restored yet (missing, unreadable or not reached); "
+                  + "they stay in the journal, so Undo again once they are back.";
         });
-        _logger.LogInformation("Genre backfill undo finished: {Count} restored", restored);
+        _logger.LogInformation("Genre backfill undo finished: {Count} restored, {Left} left in the journal",
+            restored, remaining.Count);
 
         if (restored > 0) await RescanAsync();
+    }
+
+    /// <summary>
+    /// The journal entries an undo has not dealt with, oldest first, ready to be written back.
+    ///
+    /// <paramref name="outcomes"/> is keyed by index into <paramref name="newestFirst"/>: true
+    /// restored, false failed, null skipped; an index with no entry was never reached. A restore
+    /// supersedes every NEWER entry for the same file, because the older entry's before-state is
+    /// the original; keeping a newer one that had failed would put an in-between genre back on
+    /// the next undo.
+    /// </summary>
+    internal static List<GenreJournalEntry> Remaining(IReadOnlyList<GenreJournalEntry> newestFirst,
+        IReadOnlyDictionary<int, bool?> outcomes)
+    {
+        var keep = new List<GenreJournalEntry>();
+        for (var index = 0; index < newestFirst.Count; index++)
+        {
+            var entry = newestFirst[index];
+            if (outcomes.TryGetValue(index, out var outcome) && outcome == true)
+                // Exact: journal paths come from the same walk, and on Linux a.flac and A.flac
+                // are different files.
+                keep.RemoveAll(newer => string.Equals(newer.Path, entry.Path, StringComparison.Ordinal));
+            else
+                keep.Add(entry);
+        }
+        keep.Reverse();
+        return keep;
     }
 
     private enum FileOutcome { Unchanged, Changed, Skipped, Failed }

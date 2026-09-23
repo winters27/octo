@@ -58,6 +58,11 @@ public sealed class GenreBackfillRun
     public List<string> Errors { get; set; } = [];
     public List<GenreBackfillChange> Preview { get; set; } = [];
 
+    /// <summary>Which genre settings this run used (GenreBackfillWorker.HashSettings). Apply
+    /// re-plans from the settings in force when it runs, so a preview is only a true description
+    /// of an apply while these still match. Null on runs recorded before this existed.</summary>
+    public string? SettingsHash { get; set; }
+
     /// <summary>The queue this run walks, persisted so a resume does not re-enumerate into a
     /// different order and skip files.</summary>
     public List<string> Queue { get; set; } = [];

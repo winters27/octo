@@ -102,6 +102,37 @@ public sealed class GenreBackfillJournal
         return entries;
     }
 
+    /// <summary>
+    /// Replace the journal with these entries, oldest first. Used after a partial undo, so what
+    /// was not restored stays undoable instead of vanishing with the entries that were. Written
+    /// to a temporary file and moved into place, so a crash mid-write leaves the old journal.
+    /// </summary>
+    public void Rewrite(IEnumerable<GenreJournalEntry> oldestFirst)
+    {
+        if (_path is null) return;
+        var entries = oldestFirst.ToList();
+        if (entries.Count == 0)
+        {
+            Clear();
+            return;
+        }
+
+        try
+        {
+            lock (_lock)
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+                var tmp = _path + ".tmp";
+                File.WriteAllLines(tmp, entries.Select(entry => JsonSerializer.Serialize(entry)));
+                File.Move(tmp, _path, overwrite: true);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogWarning("genre backfill journal could not be rewritten: {M}", ex.Message);
+        }
+    }
+
     public void Clear()
     {
         if (_path is null) return;
