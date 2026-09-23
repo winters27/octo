@@ -842,9 +842,13 @@ internal sealed class RadioUpstreamHandler : HttpMessageHandler
             var ordinal = search.Contains("Four", StringComparison.OrdinalIgnoreCase) ? "four"
                 : search.Contains("Three", StringComparison.OrdinalIgnoreCase) ? "three"
                 : search.Contains("Two", StringComparison.OrdinalIgnoreCase) ? "two" : "one";
-            var id = "local-" + ordinal;
-            var artist = "Artist " + char.ToUpperInvariant(ordinal[0]) + ordinal[1..];
-            var title = "Song " + char.ToUpperInvariant(ordinal[0]) + ordinal[1..];
+            // Answer with the recording that was asked for. This fake used to answer "New Artist
+            // One - New Song One" with "Artist One - Song One", which only matched because radio
+            // compared artists by substring, the bug that played a different owned song.
+            var prefix = search.StartsWith("New ", StringComparison.OrdinalIgnoreCase) ? "New " : "";
+            var id = "local-" + (prefix.Length > 0 ? "new-" : "") + ordinal;
+            var artist = prefix + "Artist " + char.ToUpperInvariant(ordinal[0]) + ordinal[1..];
+            var title = prefix + "Song " + char.ToUpperInvariant(ordinal[0]) + ordinal[1..];
             return Result(OkJson($"\"searchResult3\":{{\"song\":[{{\"id\":\"{id}\",\"artist\":\"{artist}\",\"title\":\"{title}\",\"album\":\"Album\",\"duration\":180}}]}}"));
         }
         if (path.Equals("rest/getPlaylists", StringComparison.OrdinalIgnoreCase))

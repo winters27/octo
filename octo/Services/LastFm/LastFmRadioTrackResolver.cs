@@ -1,5 +1,7 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Octo.Models.Domain;
+using Octo.Services.Fingerprint;
 using Octo.Services.Subsonic;
 using Octo.Services.Soulseek;
 
@@ -83,9 +85,7 @@ public sealed class LastFmRadioTrackResolver
                 var hitArtist = String(song, "artist");
                 var hitTitle = String(song, "title");
                 var id = String(song, "id");
-                if (string.IsNullOrEmpty(id)
-                    || !ContainsEither(hitArtist, artist)
-                    || !ContainsEither(hitTitle, title))
+                if (string.IsNullOrEmpty(id) || !IsSameRecording(artist, title, hitArtist, hitTitle))
                     continue;
 
                 return new Song
@@ -111,10 +111,61 @@ public sealed class LastFmRadioTrackResolver
         return null;
     }
 
-    private static bool ContainsEither(string left, string right) =>
-        !string.IsNullOrEmpty(left) && !string.IsNullOrEmpty(right)
-        && (left.Contains(right, StringComparison.OrdinalIgnoreCase)
-            || right.Contains(left, StringComparison.OrdinalIgnoreCase));
+    /// <summary>
+    /// Whether a library hit is the recording Last.fm recommended.
+    ///
+    /// Biased to NO, the opposite of the download verifier: a false no plays the external copy
+    /// instead, a false yes silently plays a different song you own. Substring matching in
+    /// either direction was doing exactly that ("Air" matched "Airbourne", "Intro" matched every
+    /// intro). Artists must share a whole credit; titles go through the verifier's comparison
+    /// after the annotations that never make a different recording are removed.
+    /// </summary>
+    internal static bool IsSameRecording(string wantArtist, string wantTitle, string hitArtist, string hitTitle)
+    {
+        var want = NeutralAnnotation.Replace(wantTitle ?? "", "");
+        var hit = NeutralAnnotation.Replace(hitTitle ?? "", "");
+        if (TrackMatchComparer.Core(want).Length == 0 || TrackMatchComparer.Core(hit).Length == 0) return false;
+
+        var wantCredits = Credits(wantArtist);
+        var hitCredits = Credits(hitArtist);
+        if (wantCredits.Count == 0 || hitCredits.Count == 0 || !wantCredits.Overlaps(hitCredits)) return false;
+
+        return TrackMatchComparer.TitleMatches(want, hit);
+    }
+
+    // Separators between the artists of one credit. Word-bounded on both sides, or "Ftown"
+    // splits into "ft" and "own".
+    private static readonly Regex CreditSeparator = new(
+        @"\s*(?:,|&|;|/|\bfeat\b\.?|\bft\b\.?|\bfeaturing\b|\bwith\b|\bx\b)\s*",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    // Tags that name the same recording. The verifier's variant markers include "mix",
+    // "version" and "edit", which would otherwise stop an owned "Strobe (Original Mix)" or
+    // "Song (Album Version)" from ever matching.
+    private static readonly Regex NeutralAnnotation = new(
+        @"\s*(?:[\(\[]\s*|-\s+)(?:original mix|album version|single version|radio edit|(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?(?:\s+version)?)\s*[\)\]]?",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>The whole credit plus each named artist in it, normalized, with and without a
+    /// leading "the".</summary>
+    private static HashSet<string> Credits(string? artist)
+    {
+        var credits = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var part in CreditSeparator.Split(artist ?? "").Prepend(artist ?? ""))
+        {
+            var normalized = TrackMatchComparer.Normalize(part);
+            if (normalized.Length == 0) continue;
+            credits.Add(normalized);
+            // Only a leading "the" WORD: stripping the letters turned "Them" into "m".
+            var raw = part.Trim();
+            if (raw.StartsWith("the ", StringComparison.OrdinalIgnoreCase))
+            {
+                var bare = TrackMatchComparer.Normalize(raw[4..]);
+                if (bare.Length > 0) credits.Add(bare);
+            }
+        }
+        return credits;
+    }
 
     private static string String(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) ? value.GetString() ?? "" : "";
