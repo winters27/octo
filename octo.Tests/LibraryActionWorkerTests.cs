@@ -234,6 +234,97 @@ public class LibraryActionJournalTests
         finally { try { File.Delete(source); } catch { } }
     }
 
+    // ---- Reconcile after a crash mid-replacement --------------------------------------------
+    //
+    // The executor now records the quarantine path on the Pending entry as soon as the move
+    // lands, before a replacement is fetched. These are the states a crash in that window leaves.
+
+    private static string TempFile()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "octo-recon-" + Guid.NewGuid() + ".flac");
+        File.WriteAllBytes(path, new byte[8]);
+        return path;
+    }
+
+    private static string Detail(LibraryActionJournal journal) => journal.Recent(1)[0].Detail ?? "";
+
+    [Fact]
+    public void Reconcile_InterruptedReplacement_PutsTheOriginalBack()
+    {
+        var quarantine = TempFile();
+        try
+        {
+            var journal = new LibraryActionJournal();
+            journal.Record(Entry(LibraryAction.WrongVersion, "song-r", LibraryActionState.Pending)
+                with { SourcePath = "/music/gone.flac", QuarantinePath = quarantine });
+            string? restored = null;
+
+            journal.Reconcile(path => { restored = path; return true; });
+
+            Assert.Equal(quarantine, restored);
+            Assert.Contains("original was put back", Detail(journal));
+            Assert.Empty(journal.Pending());
+        }
+        finally { try { File.Delete(quarantine); } catch { } }
+    }
+
+    [Fact]
+    public void Reconcile_InterruptedReplacement_ThatCannotBeRestored_SaysWhereTheOriginalIs()
+    {
+        var quarantine = TempFile();
+        try
+        {
+            var journal = new LibraryActionJournal();
+            journal.Record(Entry(LibraryAction.WrongSong, "song-s", LibraryActionState.Pending)
+                with { SourcePath = "/music/gone.flac", QuarantinePath = quarantine });
+
+            journal.Reconcile(_ => false);
+
+            Assert.Contains(quarantine, Detail(journal));
+        }
+        finally { try { File.Delete(quarantine); } catch { } }
+    }
+
+    /// <summary>A replacement may have landed at the original path. Restoring would overwrite
+    /// it, so neither file is touched and the user is told both exist.</summary>
+    [Fact]
+    public void Reconcile_ReplacementWithAFileBackAtTheSource_TouchesNothing()
+    {
+        var quarantine = TempFile();
+        var source = TempFile();
+        try
+        {
+            var journal = new LibraryActionJournal();
+            journal.Record(Entry(LibraryAction.BetterQuality, "song-q", LibraryActionState.Pending)
+                with { SourcePath = source, QuarantinePath = quarantine });
+            var restoreCalled = false;
+
+            journal.Reconcile(_ => restoreCalled = true);
+
+            Assert.False(restoreCalled);
+            Assert.Contains("compare them", Detail(journal));
+        }
+        finally
+        {
+            try { File.Delete(quarantine); } catch { }
+            try { File.Delete(source); } catch { }
+        }
+    }
+
+    /// <summary>Used to read "nothing was changed" while the file was gone from its path.</summary>
+    [Fact]
+    public void Reconcile_SourceGoneAndNoQuarantineRecorded_DoesNotClaimNothingChanged()
+    {
+        var journal = new LibraryActionJournal();
+        journal.Record(Entry(LibraryAction.Delete, "song-g", LibraryActionState.Pending)
+            with { SourcePath = "/music/gone-" + Guid.NewGuid() + ".flac", QuarantinePath = null });
+
+        journal.Reconcile();
+
+        Assert.DoesNotContain("nothing was changed", Detail(journal));
+        Assert.Contains("check the quarantine folder", Detail(journal));
+    }
+
     [Fact]
     public void Entries_SurviveARestart()
     {

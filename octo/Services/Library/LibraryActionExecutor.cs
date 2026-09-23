@@ -38,6 +38,7 @@ public sealed class LibraryActionExecutor
     private readonly IOptionsMonitor<SoulseekSettings> _soulseek;
     private readonly IOptionsMonitor<SubsonicSettings> _subsonicSettings;
     private readonly ILogger<LibraryActionExecutor> _logger;
+    private int _reconciled;
 
     public LibraryActionExecutor(NavidromeSongPathResolver resolver, LibraryActionQuarantine quarantine,
         LibraryActionJournal journal, ILocalLibraryService library, ExternalIdRegistry ids,
@@ -64,6 +65,12 @@ public sealed class LibraryActionExecutor
         var settings = _settings.CurrentValue;
 
         if (!settings.Enabled) return new(LibraryActionState.Skipped, "Library actions are off.");
+
+        // Reconcile once per process before the first action. The playlist worker does this at
+        // startup, but an install with only star ratings enabled never starts that worker, so an
+        // interrupted action there was never looked at again.
+        if (Interlocked.Exchange(ref _reconciled, 1) == 0)
+            _journal.Reconcile(path => _quarantine.Restore(path).Moved);
         if (!settings.IsAllowed(request.Username))
             return new(LibraryActionState.Skipped, $"{request.Username} is not on the allowlist.");
 
@@ -104,6 +111,13 @@ public sealed class LibraryActionExecutor
         // Written BEFORE the file is touched. A crash between the two leaves this Pending, and
         // startup reconciles it against the filesystem rather than blindly re-running.
         _journal.Record(pending);
+        if (!_journal.Flush())
+        {
+            // The whole safety story rests on this entry being on disk before the file moves.
+            const string unrecorded = "Could not write the action journal, so the file was not touched.";
+            _journal.Complete(key, LibraryActionState.Failed, unrecorded);
+            return new(LibraryActionState.Failed, unrecorded);
+        }
 
         var musicRoot = _resolver.MusicRoot();
         var moved = _quarantine.Move(resolved, musicRoot, request.Action, request.Username);
@@ -112,6 +126,12 @@ public sealed class LibraryActionExecutor
             _journal.Complete(key, LibraryActionState.Failed, moved.Error);
             return new(LibraryActionState.Failed, moved.Error);
         }
+
+        // Recorded, and on disk, before the replacement fetch, which can take minutes. Without the
+        // quarantine path on the Pending entry, a crash in that window reconciled as "nothing was
+        // changed" while the file sat in quarantine and the original was never put back.
+        _journal.Complete(key, LibraryActionState.Pending, "Moved to quarantine; finishing.", moved.QuarantinePath);
+        _journal.Flush();
 
         await _library.ForgetMappingAsync(resolved.AbsolutePath);
 
@@ -123,6 +143,9 @@ public sealed class LibraryActionExecutor
         };
 
         _journal.Complete(key, outcome.State, outcome.Detail, moved.QuarantinePath);
+        // Written now rather than on the next tick: a restart in between would leave this Pending,
+        // and reconciling a finished replacement would put the original back beside it.
+        _journal.Flush();
         return outcome;
     }
 

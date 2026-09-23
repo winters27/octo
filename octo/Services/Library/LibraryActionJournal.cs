@@ -53,6 +53,8 @@ public sealed class LibraryActionJournal : IDisposable
     private readonly ILogger<LibraryActionJournal>? _logger;
     private readonly Timer? _flushTimer;
     private readonly object _lock = new();
+    private readonly object _reconcileLock = new();
+    private readonly object _flushLock = new();
     private readonly ConcurrentDictionary<string, LibraryActionEntry> _byKey = new(StringComparer.Ordinal);
     private readonly List<string> _order = [];
     private int _dirty;
@@ -155,35 +157,74 @@ public sealed class LibraryActionJournal : IDisposable
     /// <summary>
     /// Decide what a Pending entry actually means, by looking at the filesystem rather than
     /// guessing. A half-written action must never re-delete and never re-download.
+    ///
+    /// The executor records the quarantine path on the Pending entry as soon as the move lands,
+    /// before a replacement is fetched, so a crash during that minutes-long fetch is recognisable
+    /// here. <paramref name="restoreOriginal"/> puts a quarantined file back; a replacement that
+    /// never finished should not leave the user without the track. Runs under a lock because the
+    /// playlist worker and the executor can both reconcile at startup, and a second restore of
+    /// the same entry would overwrite the first's result with a wrong one.
     /// </summary>
-    public int Reconcile()
+    public int Reconcile(Func<string, bool>? restoreOriginal = null)
     {
-        var reconciled = 0;
-        foreach (var entry in Pending())
+        lock (_reconcileLock)
         {
-            var movedAway = entry.QuarantinePath is { Length: > 0 } quarantine
-                && File.Exists(quarantine)
-                && (entry.SourcePath is null || !File.Exists(entry.SourcePath));
+            var reconciled = 0;
+            foreach (var entry in Pending())
+            {
+                var quarantine = entry.QuarantinePath is { Length: > 0 } recorded && File.Exists(recorded)
+                    ? recorded : null;
+                var sourcePresent = entry.SourcePath is { Length: > 0 } source && File.Exists(source);
+                var (state, detail) = Resolve(entry, quarantine, sourcePresent, restoreOriginal);
+                Complete(entry.Key, state, detail);
+                reconciled++;
+            }
 
-            if (movedAway)
+            if (reconciled > 0)
             {
-                // The move landed. Only the bookkeeping after it was lost, so the action is
-                // done and the sweep just has to finish removing the track.
-                Complete(entry.Key, LibraryActionState.Applied, "Reconciled after a restart.");
+                Flush();
+                _logger?.LogInformation("Library actions reconciled {Count} interrupted entr(ies)", reconciled);
             }
-            else
-            {
-                // The file is still where it was, so nothing happened. Marking it Failed rather
-                // than leaving it Pending stops it being retried as though it were in flight.
-                Complete(entry.Key, LibraryActionState.Failed,
-                    "Octo stopped before this action was applied; nothing was changed.");
-            }
-            reconciled++;
+            return reconciled;
+        }
+    }
+
+    private static (LibraryActionState State, string Detail) Resolve(LibraryActionEntry entry,
+        string? quarantine, bool sourcePresent, Func<string, bool>? restoreOriginal)
+    {
+        if (quarantine is null)
+        {
+            return sourcePresent
+                // The file is still where it was, so nothing happened. Failed rather than left
+                // Pending, so it is not treated as in flight forever.
+                ? (LibraryActionState.Failed, "Octo stopped before this action was applied; nothing was changed.")
+                : (LibraryActionState.Failed,
+                    $"Octo stopped partway through. The file is no longer at {entry.SourcePath}; check the quarantine folder.");
         }
 
-        if (reconciled > 0)
-            _logger?.LogInformation("Library actions reconciled {Count} interrupted entr(ies)", reconciled);
-        return reconciled;
+        if (entry.Action == LibraryAction.Delete)
+        {
+            return sourcePresent
+                ? (LibraryActionState.Failed,
+                    $"Octo stopped partway. The file is back at its path and a copy is in quarantine at {quarantine}.")
+                // The move landed and only the bookkeeping after it was lost: the removal is done.
+                : (LibraryActionState.Applied, "Reconciled after a restart.");
+        }
+
+        // A replacement was being fetched when Octo stopped.
+        if (sourcePresent)
+        {
+            // Something is at the original path again (a replacement may have landed). Putting
+            // the original back would overwrite it, so leave both for the user to compare.
+            return (LibraryActionState.Failed,
+                "Octo stopped while replacing this track. A file is at the original path and the original "
+                + $"is also in quarantine at {quarantine}; compare them before removing either.");
+        }
+
+        return restoreOriginal?.Invoke(quarantine) == true
+            ? (LibraryActionState.Failed, "Octo stopped while replacing this track. The original was put back.")
+            : (LibraryActionState.Failed,
+                $"Octo stopped while replacing this track. The original is in quarantine at {quarantine}.");
     }
 
     private void Trim()
@@ -223,10 +264,22 @@ public sealed class LibraryActionJournal : IDisposable
         }
     }
 
-    private void Flush()
+    /// <summary>
+    /// Write the journal to disk now rather than on the next timer tick. The executor calls this
+    /// around moving a file, because an entry that only exists in memory when Octo stops cannot
+    /// be reconciled. Serialised, since the timer can flush at the same moment.
+    /// </summary>
+    /// <returns>False only when there was something to write and it could not be written.</returns>
+    public bool Flush()
     {
-        if (_path is null) return;
-        if (Interlocked.Exchange(ref _dirty, 0) == 0) return;
+        if (_path is null) return true;
+        lock (_flushLock)
+            return FlushLocked(_path);
+    }
+
+    private bool FlushLocked(string path)
+    {
+        if (Interlocked.Exchange(ref _dirty, 0) == 0) return true;
         try
         {
             List<LibraryActionEntry> entries;
@@ -234,15 +287,17 @@ public sealed class LibraryActionJournal : IDisposable
                 entries = _order.Select(key => _byKey.TryGetValue(key, out var entry) ? entry : null)
                     .Where(entry => entry is not null).Select(entry => entry!).ToList();
 
-            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-            var tmp = _path + ".tmp";
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            var tmp = path + ".tmp";
             File.WriteAllText(tmp, JsonSerializer.Serialize(entries));
-            File.Move(tmp, _path, overwrite: true);
+            File.Move(tmp, path, overwrite: true);
+            return true;
         }
         catch (Exception ex)
         {
             Interlocked.Exchange(ref _dirty, 1);
             _logger?.LogWarning("library action journal could not be written: {M}", ex.Message);
+            return false;
         }
     }
 

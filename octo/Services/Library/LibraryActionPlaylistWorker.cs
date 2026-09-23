@@ -66,7 +66,7 @@ public sealed class LibraryActionPlaylistWorker : BackgroundService
         }
 
         // Decide what half-finished actions meant before doing anything new.
-        _journal.Reconcile();
+        _journal.Reconcile(path => _quarantine.Restore(path).Moved);
 
         using var timer = new PeriodicTimer(settings.EffectivePollInterval);
         while (!stoppingToken.IsCancellationRequested)
