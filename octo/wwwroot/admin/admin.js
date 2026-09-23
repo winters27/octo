@@ -1,39 +1,93 @@
 // Octo admin UI. Vanilla JS, no build step.
 
+// Every call to Octo's admin API goes through here. Writes carry X-Octo-Admin, which a page on
+// another origin cannot add without a preflight Octo refuses, so a site you happen to visit
+// cannot change settings or restart Octo on your behalf. It is not a login: see README.
+function api(url, options = {}) {
+  const method = (options.method || 'GET').toUpperCase();
+  const headers = new Headers(options.headers || {});
+  if (method !== 'GET' && method !== 'HEAD') headers.set('X-Octo-Admin', '1');
+  return fetch(url, { credentials: 'same-origin', ...options, headers });
+}
+
 // ────────────────────────────────────────────────────────────────
 // Sidebar nav: tab switching
 // ────────────────────────────────────────────────────────────────
 const navItems = document.querySelectorAll('.sidebar-nav-item');
 const panes    = document.querySelectorAll('section[data-pane]');
 
-function activateTab(name) {
-  navItems.forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+// focus: true when the user chose the pane, so keyboard and screen-reader focus follows them
+// to its heading instead of being left on a sidebar button that no longer describes the page.
+function activateTab(name, { focus = false } = {}) {
+  navItems.forEach(b => {
+    const on = b.dataset.tab === name;
+    b.classList.toggle('active', on);
+    if (on) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+    // On a phone the nav is a sideways strip; keep the current pill in view.
+    if (on && window.matchMedia('(max-width: 760px)').matches) {
+      b.scrollIntoView({ block: 'nearest', inline: 'center' });
+    }
+  });
   panes.forEach(p => p.classList.toggle('active', p.dataset.pane === name));
-  if (location.hash !== `#${name}`) location.hash = name;
+  if (location.hash !== `#${name}`) history.replaceState(null, '', `#${name}`);
   // Segmented thumbs can only be measured once their pane is visible.
   if (typeof syncSegments === 'function') syncSegments(false);
+  // Panes that show live data reload whenever they are opened, so they are never stale.
   if (name === 'fetched' && typeof loadFetched === 'function') loadFetched();
+  if (name === 'raw' && typeof loadRawConfig === 'function') loadRawConfig();
+  if (name === 'sources' && typeof loadConfigSources === 'function') loadConfigSources();
+  if (name === 'lastfm' && typeof loadRadioStatus === 'function') loadRadioStatus();
+  if (focus) {
+    window.scrollTo({ top: 0 });
+    const heading = document.querySelector(`section[data-pane="${name}"] h1`);
+    if (heading) {
+      heading.setAttribute('tabindex', '-1');
+      heading.focus({ preventScroll: true });
+    }
+  }
 }
 
-navItems.forEach(btn => btn.addEventListener('click', () => activateTab(btn.dataset.tab)));
-
-// Honor #hash on load
-if (location.hash) {
-  const target = location.hash.slice(1);
-  if (document.querySelector(`section[data-pane="${target}"]`)) activateTab(target);
+// A pane change is a history entry, so Back returns to the previous pane.
+function openTab(name) {
+  if (!document.querySelector(`section[data-pane="${name}"]`)) return;
+  if (location.hash !== `#${name}`) history.pushState(null, '', `#${name}`);
+  activateTab(name, { focus: true });
 }
+
+navItems.forEach(btn => btn.addEventListener('click', () => openTab(btn.dataset.tab)));
+
+// Back/forward, and a typed or linked #pane. Both events can fire for one change, and
+// activating the active pane again is harmless.
+function followHash() {
+  const target = location.hash.slice(1) || 'status';
+  const pane = document.querySelector(`section[data-pane="${target}"]`);
+  if (pane && !pane.classList.contains('active')) activateTab(target);
+}
+window.addEventListener('popstate', followHash);
+window.addEventListener('hashchange', followHash);
+// The #pane in the address on load is honoured at Boot, once every pane's loader exists.
 
 // ────────────────────────────────────────────────────────────────
 // Toast helper
 // ────────────────────────────────────────────────────────────────
 const toastEl = document.getElementById('toast');
 let toastTimer = null;
+const srAlert = document.getElementById('sr-alert');
 function toast(msg, kind = 'ok') {
+  const tone = kind === 'err' ? 'error' : kind;
   toastEl.textContent = msg;
-  toastEl.className = `show ${kind}`;
+  toastEl.className = `show ${tone}`;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { toastEl.className = ''; }, 3500);
+  // An error stays long enough to read, and is also put in an assertive region: changing the
+  // polite toast's role on the fly is not reliably announced.
+  toastTimer = setTimeout(() => { toastEl.className = ''; }, tone === 'error' ? 8000 : 3500);
+  if (tone === 'error' && srAlert) {
+    srAlert.textContent = '';
+    setTimeout(() => { srAlert.textContent = msg; }, 50);
+  }
 }
+toastEl.addEventListener('click', () => { toastEl.className = ''; });
 
 // ────────────────────────────────────────────────────────────────
 // Status grid + sidebar badge
@@ -43,45 +97,52 @@ const statusLastChecked = document.getElementById('status-last-checked');
 
 async function refreshStatus() {
   try {
-    const r = await fetch('/api/admin/status');
+    const r = await api('/api/admin/status');
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
 
     setStatusCard('octo', data.octo);
     Object.entries(data.services || {}).forEach(([k, v]) => setStatusCard(k, v));
 
-    // Update sidebar badge with bad count, if any
+    // Update sidebar badge with bad count, if any. An optional service nobody set up reports
+    // ok, so it never counts here.
     const all = [data.octo, ...Object.values(data.services || {})];
     const badCount = all.filter(s => !s?.ok).length;
-    if (statusBadge) {
-      if (badCount > 0) {
-        statusBadge.className = 'sidebar-nav-badge bad';
-        statusBadge.textContent = String(badCount);
-      } else {
-        statusBadge.className = 'sidebar-nav-badge';
-        statusBadge.textContent = '';
-      }
-    }
+    setStatusBadge(badCount > 0 ? String(badCount) : '',
+      `${badCount} service${badCount === 1 ? '' : 's'} need${badCount === 1 ? 's' : ''} attention`);
     if (statusLastChecked) {
       statusLastChecked.textContent = new Date().toLocaleTimeString();
     }
+    lastStatus = data;
+    renderSetupChecklist();
   } catch (e) {
     document.querySelectorAll('.status-card').forEach(card => {
       card.classList.add('bad');
+      card.classList.remove('off');
       const dot = card.querySelector('.status-dot');
       const body = card.querySelector('.status-card-body');
       if (dot) dot.className = 'status-dot bad';
-      if (body) body.textContent = `probe failed: ${e.message}`;
+      if (body) body.textContent = `Octo did not answer: ${e.message}`;
     });
+    setStatusBadge('!', 'Octo did not answer the status check');
   }
+}
+
+function setStatusBadge(text, label) {
+  if (!statusBadge) return;
+  statusBadge.className = text ? 'sidebar-nav-badge bad' : 'sidebar-nav-badge';
+  statusBadge.textContent = text;
+  if (text) statusBadge.setAttribute('aria-label', label);
+  else statusBadge.removeAttribute('aria-label');
 }
 
 function setStatusCard(svc, probe) {
   const card = document.querySelector(`.status-card[data-svc="${svc}"]`);
   if (!card) return;
-  const state = probe.warning ? 'warn' : probe.ok ? 'ok' : 'bad';
+  const state = probe.warning ? 'warn' : probe.configured === false ? 'off' : probe.ok ? 'ok' : 'bad';
   card.classList.toggle('bad', state === 'bad');
   card.classList.toggle('warn', state === 'warn');
+  card.classList.toggle('off', state === 'off');
   const dot = card.querySelector('.status-dot');
   const body = card.querySelector('.status-card-body');
   if (dot)  dot.className  = `status-dot ${state}`;
@@ -90,20 +151,47 @@ function setStatusCard(svc, probe) {
 
 document.getElementById('status-refresh')?.addEventListener('click', refreshStatus);
 refreshStatus();
-setInterval(refreshStatus, 30_000);
+// No point probing every service while nobody is looking; catch up when the tab returns.
+setInterval(() => { if (!document.hidden) refreshStatus(); }, 30_000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshStatus(); });
 
 // ────────────────────────────────────────────────────────────────
 // Settings: load -> populate forms -> save on submit
 // ────────────────────────────────────────────────────────────────
 let currentSettings = null;
+let lastStatus = null;
+let lastLibraryStatus = null;
+
+// Without the saved values every form still holds its HTML defaults, and saving one would write
+// blanks and false over real settings. So when they cannot be loaded, saving is switched off.
+function setSettingsAvailable(ok, reason = '') {
+  const banner = document.getElementById('settings-unavailable');
+  if (banner) {
+    banner.hidden = ok;
+    const msg = banner.querySelector('.msg');
+    if (msg) msg.textContent = ok ? '' : `Octo could not load its settings (${reason}).`;
+  }
+  document.querySelectorAll('form[data-section] button[type="submit"], #raw-form button[type="submit"]')
+    .forEach(button => { button.disabled = !ok; });
+}
+document.getElementById('settings-retry')?.addEventListener('click', () => loadSettings());
 
 async function loadSettings() {
-  const r = await fetch('/api/admin/settings');
+  let r;
+  try {
+    r = await api('/api/admin/settings', { cache: 'no-store' });
+  } catch (e) {
+    setSettingsAvailable(false, e.message || 'no answer');
+    return;
+  }
   if (!r.ok) {
-    toast(`Failed to load settings: HTTP ${r.status}`, 'error');
+    setSettingsAvailable(false, `HTTP ${r.status}`);
     return;
   }
   currentSettings = await r.json();
+  setSettingsAvailable(true);
+  const invalid = document.getElementById('config-invalid-banner');
+  if (invalid) invalid.hidden = currentSettings?._meta?.ConfigFileValid !== false;
 
   // Populate every <input>/<select> whose name="Section.Key" matches.
   document.querySelectorAll('[name]').forEach(el => {
@@ -156,11 +244,116 @@ async function loadSettings() {
     loadLidarrOptions();
   }
 
-  // Initial dirty-check pass: all forms start clean.
+  bindSecretPlaceholders();
+  renderRestartPending();
+  renderSetupChecklist();
+
+  // Everything above has filled the forms from what is saved, so this is what "unchanged" means.
   document.querySelectorAll('form[data-section]').forEach(form => {
     form.querySelector('.form-actions')?.classList.remove('dirty');
+    markClean(form);
   });
 }
+
+// A saved admin password comes back as a placeholder. Selecting it on focus means typing
+// replaces it; appending to it would save the placeholder plus the typing as the password.
+function bindSecretPlaceholders() {
+  const placeholder = currentSettings?._meta?.SecretPlaceholder;
+  if (!placeholder) return;
+  document.querySelectorAll('input[type="password"]').forEach(input => {
+    if (input.dataset.placeholderBound) return;
+    input.dataset.placeholderBound = '1';
+    input.addEventListener('focus', () => { if (input.value === placeholder) input.select(); });
+  });
+}
+
+// ── Restart pending ─────────────────────────────────────────────────────────
+// Computed by Octo from what it started with, not remembered by this page, so it is right in
+// every tab and after a reload, and it clears itself once Octo restarts.
+function settingLabel(configKey) {
+  const name = configKey.replace(':', '.');
+  const field = document.querySelector(`[name="${name}"]`);
+  if (field?.dataset.restartLabel) return field.dataset.restartLabel;
+  const title = field?.closest('.set-row')?.querySelector('.set-info-t');
+  if (!title) return configKey;
+  const copy = title.cloneNode(true);
+  copy.querySelectorAll('.restart-badge, .set-opt').forEach(el => el.remove());
+  return copy.textContent.trim() || configKey;
+}
+
+function renderRestartPending() {
+  const banner = document.getElementById('restart-pending');
+  const restartButton = document.getElementById('restart-btn');
+  const pending = currentSettings?._meta?.RestartPending ?? [];
+  restartButton?.classList.toggle('needs-restart', pending.length > 0);
+  if (!banner) return;
+  banner.hidden = pending.length === 0;
+  if (!pending.length) return;
+  const labels = [...new Set(pending.map(settingLabel))];
+  banner.innerHTML = `<span><strong>Restart Octo to apply:</strong> ${esc(labels.join(', '))}.</span>
+    <button type="button" class="btn btn-ghost" id="restart-pending-now">Restart now</button>`;
+  document.getElementById('restart-pending-now')
+    ?.addEventListener('click', () => document.getElementById('restart-btn')?.click());
+}
+
+// ── Unsaved changes ─────────────────────────────────────────────────────────
+// A form's fingerprint is what its visible controls hold. Heart rows carry their source name,
+// because reordering them changes no value, only the order.
+function formFingerprint(form) {
+  return JSON.stringify(Array.from(form.querySelectorAll('input:not([type="hidden"]), select, textarea'))
+    .map(el => `${el.closest('.source-priority-row')?.querySelector('.source-title')?.textContent ?? ''}|${el.name || el.id}|${el.type === 'checkbox' ? el.checked : el.value}`));
+}
+
+function markClean(form) {
+  form.dataset.saved = formFingerprint(form);
+  updateDirty(form);
+}
+
+// For code that refills a form after load (Lidarr's choices, the library picker): that is not
+// the user changing anything, so a form that was clean stays clean.
+function markCleanIfWasClean(form, fill) {
+  const wasClean = !form || !form.classList.contains('unsaved');
+  fill();
+  if (form && wasClean) markClean(form);
+}
+
+function updateDirty(form) {
+  if (form.dataset.saved === undefined) return;
+  const unsaved = formFingerprint(form) !== form.dataset.saved;
+  form.classList.toggle('unsaved', unsaved);
+  const actions = form.querySelector('.form-actions');
+  actions?.classList.toggle('unsaved', unsaved);
+  const note = actions?.querySelector('.unsaved-status');
+  const noteText = unsaved ? 'Unsaved changes' : '';
+  // Only when it changes: rewriting it swaps the text node, which the form's MutationObserver
+  // would take as an edit and check again, every frame, and a live region would re-announce.
+  if (note && note.textContent !== noteText) note.textContent = noteText;
+  updateNavDirty();
+}
+
+function updateNavDirty() {
+  navItems.forEach(item => {
+    const pane = document.querySelector(`section[data-pane="${item.dataset.tab}"]`);
+    const unsaved = !!pane?.querySelector('form.unsaved');
+    item.classList.toggle('has-unsaved', unsaved);
+    let hint = item.querySelector('.unsaved-hint');
+    if (unsaved && !hint) {
+      hint = document.createElement('span');
+      hint.className = 'visually-hidden unsaved-hint';
+      hint.textContent = ' (unsaved changes)';
+      item.appendChild(hint);
+    } else if (!unsaved && hint) {
+      hint.remove();
+    }
+  });
+}
+
+window.addEventListener('beforeunload', event => {
+  if (document.querySelector('form.unsaved') || rawDirty) {
+    event.preventDefault();
+    event.returnValue = '';
+  }
+});
 
 // ────────────────────────────────────────────────────────────────
 // Inject Save bar into every settings card
@@ -170,8 +363,9 @@ function ensureSaveBar(form) {
   const actions = document.createElement('div');
   actions.className = 'form-actions';
   actions.innerHTML = `
-    <button type="submit" class="btn btn-primary">Save</button>
+    <button type="submit" class="btn btn-primary" ${currentSettings ? '' : 'disabled'}>Save</button>
     ${form.id === 'lidarr-connection-form' ? '<button type="button" class="btn btn-ghost" id="lidarr-test-connection">Test connection</button>' : ''}
+    <span class="unsaved-status" aria-live="polite"></span>
     <span class="saved-status"></span>
     <span class="restart-hint">
       <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -183,44 +377,93 @@ function ensureSaveBar(form) {
   form.appendChild(actions);
 }
 
+// Builds the settings patch a form saves. A JSON field that does not parse stops the save
+// rather than being sent as an empty list: that used to wipe every ListenBrainz per-user token
+// on a single typo.
+function collectPatch(form) {
+  const patch = {};
+  let needsRestart = false;
+  let invalid = null;
+
+  form.querySelectorAll('[name]').forEach(el => {
+    if (invalid || !el.name?.includes('.')) return;
+    if (el.disabled) return;
+    // A select nobody could choose from has nothing to say; saving "" would clear a setting.
+    if (el.tagName === 'SELECT' && el.options.length === 0) return;
+    const [section, key] = el.name.split('.');
+    patch[section] = patch[section] || {};
+    let value;
+    if (el.dataset.json === 'true') {
+      try {
+        value = JSON.parse(el.value || el.dataset.jsonEmpty || '[]');
+        if (el.dataset.jsonEmpty === '{}'
+            && (value === null || typeof value !== 'object' || Array.isArray(value))) {
+          throw new Error('expected an object');
+        }
+      } catch {
+        invalid = el;
+        return;
+      }
+    } else if (el.type === 'checkbox') value = el.checked;
+    else if (el.type === 'number' || el.dataset.number === 'true') {
+      value = el.value === '' ? null : Number(el.value);
+      if (Number.isNaN(value)) value = null;
+    } else value = el.value;
+    patch[section][key] = value;
+
+    if (el.dataset.restart === 'true' && isFieldDirty(el)) {
+      needsRestart = true;
+    }
+  });
+
+  return { patch, needsRestart, invalid };
+}
+
 document.querySelectorAll('form[data-section]').forEach(form => {
   ensureSaveBar(form);
 
-  // Mark form dirty whenever a restart-required input changes.
-  form.addEventListener('input', () => {
-    const dirty = Array.from(form.querySelectorAll('[data-restart="true"]'))
-      .some(el => isFieldDirty(el));
-    form.querySelector('.form-actions')?.classList.toggle('dirty', dirty);
-  });
+  // Restart hint: shown while a restart-required field differs from what is saved.
+  // Unsaved changes: re-checked on every edit, and on row changes that fire no input event
+  // (drag to reorder, a preset loaded, a rule removed), coalesced to one check per frame.
+  let pendingCheck = false;
+  const scheduleDirtyCheck = () => {
+    if (pendingCheck) return;
+    pendingCheck = true;
+    requestAnimationFrame(() => {
+      pendingCheck = false;
+      const dirty = Array.from(form.querySelectorAll('[data-restart="true"]'))
+        .some(el => isFieldDirty(el));
+      form.querySelector('.form-actions')?.classList.toggle('dirty', dirty);
+      updateDirty(form);
+    });
+  };
+  form.addEventListener('input', scheduleDirtyCheck);
+  form.addEventListener('change', scheduleDirtyCheck);
+  new MutationObserver(scheduleDirtyCheck).observe(form, { childList: true, subtree: true });
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (form.id === 'radio-discovery-form' && !syncRadioDiscoveryInput()) return;
     if (form.id === 'genre-form' && !syncGenreMappingsInput()) return;
     if (form.id === 'library-actions-list-form' && !syncLibraryActionsInput()) return;
-    const patch = {};
-    let needsRestart = false;
+    if (form.id === 'library-actions-form') {
+      const dry = form.querySelector('[name="LibraryActions.DryRun"]');
+      if (currentSettings?.LibraryActions?.DryRun && dry && !dry.checked
+          && !confirm('Turn off rehearsal mode? From the next check, a track added to an action playlist, or rated if ratings are on, moves a real file into quarantine.')) return;
+    }
 
-    form.querySelectorAll('[name]').forEach(el => {
-      if (!el.name?.includes('.')) return;
-      if (el.disabled) return;
-      const [section, key] = el.name.split('.');
-      patch[section] = patch[section] || {};
-      let value;
-      if (el.dataset.json === 'true') {
-        try { value = JSON.parse(el.value || '[]'); }
-        catch { value = []; }
-      } else if (el.type === 'checkbox') value = el.checked;
-      else if (el.type === 'number' || el.dataset.number === 'true') {
-        value = el.value === '' ? null : Number(el.value);
-        if (Number.isNaN(value)) value = null;
-      } else value = el.value;
-      patch[section][key] = value;
-
-      if (el.dataset.restart === 'true' && isFieldDirty(el)) {
-        needsRestart = true;
+    const { patch, needsRestart, invalid } = collectPatch(form);
+    if (invalid) {
+      const holder = invalid.dataset.errorFor ? document.getElementById(invalid.dataset.errorFor) : null;
+      const message = "This isn't valid JSON, so nothing was saved.";
+      if (holder) {
+        holder.textContent = message;
+        holder.hidden = false;
       }
-    });
+      toast(message, 'error');
+      return;
+    }
+    form.querySelectorAll('.field-error[data-json-error]').forEach(el => { el.hidden = true; });
 
     const status = form.querySelector('.saved-status');
     const submit = form.querySelector('button[type="submit"]');
@@ -228,22 +471,40 @@ document.querySelectorAll('form[data-section]').forEach(form => {
     status.textContent = 'Saving…';
 
     try {
-      const r = await fetch('/api/admin/settings', {
+      const r = await api('/api/admin/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch),
       });
-      const result = await r.json();
+      const result = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(result.error || `HTTP ${r.status}`);
 
       // The JSON configuration provider reloads asynchronously after the atomic
-      // write. Give it one watcher tick before testing a newly saved connection.
-      if (form.id === 'lidarr-connection-form') await new Promise(resolve => setTimeout(resolve, 600));
-      currentSettings = await (await fetch('/api/admin/settings')).json();
+      // write. Give it one watcher tick before testing a newly saved connection, and before
+      // asking which saved settings are still waiting on a restart.
+      if (form.id === 'lidarr-connection-form' || needsRestart) {
+        await new Promise(resolve => setTimeout(resolve, 600));
+      }
+      try {
+        currentSettings = await (await api('/api/admin/settings', { cache: 'no-store' })).json();
+      } catch {
+        // Saved, but the page could not re-read the result; say which, rather than "Save failed".
+        toast('Saved. Reload the page to see the current values.', 'ok');
+      }
       if (form.id === 'lidarr-connection-form') await loadLidarrOptions();
       renderOctoAddresses();
+      renderRestartPending();
+      renderSetupChecklist();
       status.textContent = `Saved · ${new Date().toLocaleTimeString()}`;
       form.querySelector('.form-actions')?.classList.remove('dirty');
+      // A saved admin password is only ever shown as the placeholder; the typed value should
+      // not stay in the page after it has been saved.
+      form.querySelectorAll('input[type="password"][name]').forEach(input => {
+        const [section, key] = input.name.split('.');
+        const saved = currentSettings?.[section]?.[key];
+        if (saved && saved === currentSettings?._meta?.SecretPlaceholder) input.value = saved;
+      });
+      markClean(form);
       toast(needsRestart
         ? 'Saved. Restart for these to take effect.'
         : 'Settings saved.', 'ok');
@@ -374,8 +635,10 @@ function updateRadioPublicationSettings() {
 
 document.getElementById('f-radio-streams')?.addEventListener('change', updateRadioPublicationSettings);
 
-document.querySelectorAll('[data-open-tab]').forEach(button => {
-  button.addEventListener('click', () => activateTab(button.dataset.openTab));
+// Delegated, so buttons rendered later (the setup checklist) work the same way.
+document.addEventListener('click', event => {
+  const opener = event.target.closest('[data-open-tab]');
+  if (opener) openTab(opener.dataset.openTab);
 });
 
 function syncHeartSourceInput() {
@@ -521,11 +784,13 @@ document.getElementById('rejected-peers-clear')?.addEventListener('click', async
   if (!count) return;
   if (!confirm(`Forget ${count} rejected peer${count === 1 ? '' : 's'}? Those files become downloadable again.`)) return;
   try {
-    const response = await fetch('/api/admin/soulseek/rejected-peers/clear', { method: 'POST' });
+    const response = await api('/api/admin/soulseek/rejected-peers/clear', { method: 'POST' });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const body = await response.json();
     toast(`Forgot ${body.cleared} rejected peer${body.cleared === 1 ? '' : 's'}.`);
-    await loadSettings();
+    // Only the count changed. Reloading every form here threw away unsaved edits elsewhere.
+    currentSettings = await (await api('/api/admin/settings', { cache: 'no-store' })).json();
+    renderRejectedPeerCount();
   } catch (error) {
     toast(`Could not clear: ${error.message}`, 'err');
   }
@@ -714,8 +979,11 @@ genreMappingList?.addEventListener('dragend', event => {
 // Fetched, never duplicated here: a second copy of the preset in JS is a table the dashboard
 // and the tests could disagree about.
 document.getElementById('genre-preset-broad')?.addEventListener('click', async () => {
+  readGenreMappingRows();
+  const existing = genreRules.filter(rule => rule.Pattern || rule.Genre).length;
+  if (existing > 0 && !confirm(`Replace your ${existing} rule${existing === 1 ? '' : 's'} with the broad preset? Nothing is saved until you press Save.`)) return;
   try {
-    const response = await fetch('/api/admin/genre/presets');
+    const response = await api('/api/admin/genre/presets');
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const body = await response.json();
     renderGenreMappings(body.broad);
@@ -739,9 +1007,13 @@ document.getElementById('f-genre-blocklist')?.addEventListener('input', syncGenr
 // and retries, reusing the browse sign-in the directory picker already uses.
 
 let genreBackfillPoll = null;
+let lastBackfillRun = null;
+let backfillScopeInitialised = false;
+
+const backfillScopeLabels = { OctoDownloads: 'downloads Octo made', WholeLibrary: 'the whole library' };
 
 async function genreBackfillFetch(url, options = {}, retry = true) {
-  const response = await fetch(url, { credentials: 'same-origin', ...options });
+  const response = await api(url, options);
   if (response.status === 401 && retry) {
     const holder = document.getElementById('genre-backfill-status');
     if (await browseAuthenticate(holder ?? document.createElement('div'))) {
@@ -758,10 +1030,22 @@ function renderGenreBackfill(run) {
 
   const running = run.status === 'Running';
   const previewed = run.status === 'Completed' && run.dryRun;
+  const scopeSelect = document.getElementById('genre-backfill-scope');
+  // Apply writes whatever the CURRENT scope and rules produce, so it is only offered while both
+  // still match what this preview was made from.
+  const scopeChanged = previewed && scopeSelect && scopeSelect.value !== run.scope;
+  const rulesChanged = previewed && run.settingsChanged === true;
+  const hint = document.getElementById('genre-backfill-scope-hint');
+  if (hint) {
+    hint.hidden = !(scopeChanged || rulesChanged);
+    hint.textContent = rulesChanged
+      ? 'Your genre rules changed after this preview. Preview again before applying.'
+      : 'You changed which files. Preview again before applying.';
+  }
 
   document.getElementById('genre-backfill-cancel').hidden = !running;
-  document.getElementById('genre-backfill-apply').hidden = !previewed || run.changed === 0;
-  document.getElementById('genre-backfill-resume').hidden = !run.canResume;
+  document.getElementById('genre-backfill-apply').hidden = !previewed || run.changed === 0 || scopeChanged || rulesChanged;
+  document.getElementById('genre-backfill-resume').hidden = !run.canResume || run.settingsChanged === true;
   document.getElementById('genre-backfill-undo').hidden = !run.canUndo || running;
   document.getElementById('genre-backfill-preview').disabled = running;
 
@@ -823,7 +1107,23 @@ async function loadGenreBackfill(retry = false) {
   const response = await genreBackfillFetch('/api/admin/genre/backfill', {}, retry);
   if (!response.ok) return null;
   const run = await response.json();
+  const previous = lastBackfillRun;
+  lastBackfillRun = run;
+
+  // Open on the scope of a finished preview, so the Apply it offers is the one it describes.
+  const scopeSelect = document.getElementById('genre-backfill-scope');
+  if (!backfillScopeInitialised && scopeSelect && run.status === 'Completed' && run.dryRun && run.scope) {
+    scopeSelect.value = run.scope;
+  }
+  backfillScopeInitialised = true;
   renderGenreBackfill(run);
+
+  // The status line is not a live region (it rewrites every two seconds while running), so the
+  // end of a run is announced once, here.
+  if (previous?.status === 'Running' && run.status !== 'Running') {
+    toast(`${run.dryRun ? 'Preview' : 'Genre run'} ${run.status === 'Completed' ? 'finished' : run.status.toLowerCase()}: ${run.changed} file(s)${run.dryRun ? ' would change' : ' changed'}.`,
+      run.status === 'Failed' ? 'error' : 'ok');
+  }
 
   // Poll only while something is happening, so an idle dashboard is not making a request a
   // second forever.
@@ -836,8 +1136,8 @@ async function loadGenreBackfill(retry = false) {
   return run;
 }
 
-async function startGenreBackfill(dryRun) {
-  const scope = document.getElementById('genre-backfill-scope')?.value ?? 'OctoDownloads';
+async function startGenreBackfill(dryRun, scopeOverride = null) {
+  const scope = scopeOverride ?? document.getElementById('genre-backfill-scope')?.value ?? 'OctoDownloads';
 
   let confirmPath = null;
   if (scope === 'WholeLibrary' && !dryRun) {
@@ -857,7 +1157,7 @@ async function startGenreBackfill(dryRun) {
 
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    toast(body.error || `Could not start: HTTP ${response.status}`, 'err');
+    toast(body.error || `Could not start: HTTP ${response.status}`, 'error');
     return;
   }
   toast(dryRun ? 'Previewing. Nothing is being written.' : 'Applying changes.');
@@ -865,28 +1165,42 @@ async function startGenreBackfill(dryRun) {
 }
 
 document.getElementById('genre-backfill-preview')?.addEventListener('click', () => startGenreBackfill(true));
+document.getElementById('genre-backfill-scope')?.addEventListener('change', () => {
+  if (lastBackfillRun) renderGenreBackfill(lastBackfillRun);
+});
 document.getElementById('genre-backfill-apply')?.addEventListener('click', async () => {
   const run = await loadGenreBackfill();
-  if (!run) return;
-  if (!confirm(`Write ${run.changed} file(s)? The genre frame is recorded so this can be undone; nothing else is.`)) return;
-  await startGenreBackfill(false);
+  if (!run || run.settingsChanged) return;
+  const scopeLabel = backfillScopeLabels[run.scope] ?? run.scope;
+  if (!confirm(`Write new genres to ${run.changed} file(s) in ${scopeLabel}? Only the genre is recorded for undo; anything else the tag library cannot round-trip is lost.`)) return;
+  // The previewed scope, not whatever the dropdown says by now.
+  await startGenreBackfill(false, run.scope);
 });
 document.getElementById('genre-backfill-cancel')?.addEventListener('click', async () => {
-  await genreBackfillFetch('/api/admin/genre/backfill/cancel', { method: 'POST' });
+  const response = await genreBackfillFetch('/api/admin/genre/backfill/cancel', { method: 'POST' });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    toast(body.error || `Could not cancel: HTTP ${response.status}`, 'error');
+    return;
+  }
   toast('Cancelling after the current file.');
   await loadGenreBackfill();
 });
 document.getElementById('genre-backfill-resume')?.addEventListener('click', async () => {
+  const run = lastBackfillRun;
+  // Resuming a preview writes nothing; resuming an apply writes tags, so it asks again.
+  if (run && !run.dryRun
+      && !confirm(`Resume writing genres from file ${run.processed + 1} of ${run.total}?`)) return;
   const response = await genreBackfillFetch('/api/admin/genre/backfill/resume', { method: 'POST' });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) { toast(body.error || 'Could not resume.', 'err'); return; }
+  if (!response.ok) { toast(body.error || 'Could not resume.', 'error'); return; }
   await loadGenreBackfill();
 });
 document.getElementById('genre-backfill-undo')?.addEventListener('click', async () => {
-  if (!confirm('Put every genre back the way it was before the last run? Only the genre is restored.')) return;
+  if (!confirm('Put back the genre on every file changed since the last undo? Only the genre is restored, and files moved since then stay changed.')) return;
   const response = await genreBackfillFetch('/api/admin/genre/backfill/undo', { method: 'POST' });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) { toast(body.error || 'Could not undo.', 'err'); return; }
+  if (!response.ok) { toast(body.error || 'Could not undo.', 'error'); return; }
   toast('Restoring genres.');
   await loadGenreBackfill();
 });
@@ -999,9 +1313,9 @@ document.getElementById('library-actions-refresh')?.addEventListener('click', as
   const holder = document.getElementById('library-actions-history');
   if (!holder) return;
   try {
-    let response = await fetch('/api/admin/library-actions', { credentials: 'same-origin' });
+    let response = await api('/api/admin/library-actions', { credentials: 'same-origin' });
     if (response.status === 401 && await browseAuthenticate(holder)) {
-      response = await fetch('/api/admin/library-actions', { credentials: 'same-origin' });
+      response = await api('/api/admin/library-actions', { credentials: 'same-origin' });
     }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const body = await response.json();
@@ -1034,7 +1348,7 @@ document.getElementById('lidarr-test-connection')?.addEventListener('click', asy
   button.disabled = true;
   if (status) status.textContent = 'Testing…';
   try {
-    const r = await fetch('/api/admin/lidarr/test', {
+    const r = await api('/api/admin/lidarr/test', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ baseUrl, apiKey }),
@@ -1077,7 +1391,7 @@ async function loadLidarrOptions() {
   if (status) status.textContent = 'Loading choices…';
   [root, quality, metadata].forEach(el => { el.disabled = true; });
   try {
-    const r = await fetch('/api/admin/lidarr/options', { cache: 'no-store' });
+    const r = await api('/api/admin/lidarr/options', { cache: 'no-store' });
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
 
@@ -1088,6 +1402,12 @@ async function loadLidarrOptions() {
 }
 
 function populateLidarrOptions(data) {
+  const root = document.getElementById('f-lidarr-root');
+  if (!root) return;
+  markCleanIfWasClean(root.closest('form'), () => fillLidarrOptions(data));
+}
+
+function fillLidarrOptions(data) {
   const status = document.getElementById('lidarr-options-status');
   const root = document.getElementById('f-lidarr-root');
   const quality = document.getElementById('f-lidarr-quality');
@@ -1123,22 +1443,28 @@ function populateLidarrOptions(data) {
 const rawEditor = document.getElementById('raw-editor');
 const rawError  = document.getElementById('raw-error');
 const rawForm   = document.getElementById('raw-form');
+// Edits in the Raw editor survive switching away and back; only an explicit reload replaces them.
+let rawDirty = false;
 
-async function loadRawConfig() {
+async function loadRawConfig(force = false) {
   if (!rawEditor) return;
+  if (rawDirty && !force) return;
   try {
-    const r = await fetch('/api/admin/raw-config');
+    const r = await api('/api/admin/raw-config', { cache: 'no-store' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     rawEditor.value = await r.text();
     rawError.hidden = true;
+    rawDirty = false;
   } catch (e) {
-    rawEditor.value = '// failed to load: ' + e.message;
+    rawError.textContent = `Could not load the settings file: ${e.message}`;
+    rawError.hidden = false;
   }
 }
 
 if (rawForm) {
   // Live JSON validation as the user types — surface errors before save.
   rawEditor.addEventListener('input', () => {
+    rawDirty = true;
     const val = rawEditor.value.trim();
     if (!val) { rawError.hidden = true; return; }
     try {
@@ -1166,13 +1492,14 @@ if (rawForm) {
       toast('Fix JSON errors before saving.', 'error');
       return;
     }
+    if (!confirm('Replace settings.json with exactly this text? Every value shown here, including ones that came from environment variables, is written into the file and overrides .env from now on. Every settings card reloads afterwards.')) return;
 
     const submit = rawForm.querySelector('button[type="submit"]');
     submit.disabled = true;
     if (rawSavedStatus) rawSavedStatus.textContent = 'Saving…';
 
     try {
-      const r = await fetch('/api/admin/raw-config', {
+      const r = await api('/api/admin/raw-config', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: val,
@@ -1180,6 +1507,7 @@ if (rawForm) {
       const result = await r.json();
       if (!r.ok) throw new Error(result.error || `HTTP ${r.status}`);
       if (rawSavedStatus) rawSavedStatus.textContent = `Saved · ${new Date().toLocaleTimeString()} · ${result.bytes} bytes`;
+      rawDirty = false;
       toast('Settings file saved.', 'ok');
       // Refresh the form-by-form view so any open tab reflects changes.
       await loadSettings();
@@ -1192,7 +1520,8 @@ if (rawForm) {
   });
 
   document.getElementById('raw-reload')?.addEventListener('click', async () => {
-    await loadRawConfig();
+    if (rawDirty && !confirm('Discard your edits and reload settings.json from disk?')) return;
+    await loadRawConfig(true);
     if (rawSavedStatus) rawSavedStatus.textContent = `Reloaded · ${new Date().toLocaleTimeString()}`;
     toast('Reloaded from disk.', 'ok');
   });
@@ -1206,7 +1535,7 @@ const configTable = document.getElementById('config-table');
 async function loadConfigSources() {
   if (!configTable) return;
   try {
-    const r = await fetch('/api/admin/config-sources');
+    const r = await api('/api/admin/config-sources');
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     // Wipe everything except the header row.
@@ -1218,7 +1547,7 @@ async function loadConfigSources() {
       const valueClass = row.IsSecret ? 'value secret' : (row.Value === '' ? 'value empty' : 'value');
       const valueText = row.Value === '' ? '(unset)' : row.Value;
       div.innerHTML = `
-        <span class="key">${row.Key}</span>
+        <span class="key">${escapeHtml(row.Key)}</span>
         <span class="${valueClass}">${escapeHtml(valueText)}</span>
       `;
       configTable.appendChild(div);
@@ -1228,41 +1557,31 @@ async function loadConfigSources() {
   }
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-  })[c]);
-}
-
-// Re-load these whenever their tab activates so they're never stale.
-navItems.forEach(btn => btn.addEventListener('click', () => {
-  if (btn.dataset.tab === 'raw') loadRawConfig();
-  if (btn.dataset.tab === 'sources') loadConfigSources();
-  if (btn.dataset.tab === 'lastfm') loadRadioStatus();
-}));
-// If the page boots straight into one of these tabs, prime it.
-if (location.hash === '#raw') loadRawConfig();
-if (location.hash === '#sources') loadConfigSources();
+// Raw config, Config sources and radio status reload in activateTab whenever their pane opens.
 
 // ────────────────────────────────────────────────────────────────
 // Restart button
 // ────────────────────────────────────────────────────────────────
 document.getElementById('restart-btn').addEventListener('click', async () => {
-  if (!confirm('Restart the Octo container? In-flight requests drop. Service comes back in 5-10s.')) return;
+  const unsavedCards = document.querySelectorAll('form.unsaved').length;
+  const unsavedNote = unsavedCards
+    ? `\n\nYou have unsaved changes on ${unsavedCards} card${unsavedCards === 1 ? '' : 's'}; restarting discards them.`
+    : '';
+  if (!confirm(`Restart the Octo container? In-flight requests drop. Service comes back in 5-10s.${unsavedNote}`)) return;
   const btn = document.getElementById('restart-btn');
   const label = btn.querySelector('span');
   btn.disabled = true;
   if (label) label.textContent = 'Restarting…';
   toast('Restart triggered. Waiting for service…');
 
-  try { await fetch('/api/admin/restart', { method: 'POST' }); }
+  try { await api('/api/admin/restart', { method: 'POST' }); }
   catch { /* expected — connection drops */ }
 
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 1500));
     try {
-      const r = await fetch('/api/admin/status', { cache: 'no-store' });
+      const r = await api('/api/admin/status', { cache: 'no-store' });
       if (r.ok) {
         toast('Octo is back online.', 'ok');
         btn.disabled = false;
@@ -1384,7 +1703,7 @@ async function loadRadioStatus() {
   if (!output || !select) return; output.textContent = 'Loading radio status…';
   try {
     const query = select.value ? `?user=${encodeURIComponent(select.value)}` : '';
-    const response = await fetch(`/api/admin/lastfm/radio${query}`); if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const response = await api(`/api/admin/lastfm/radio${query}`); if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json(); const previous = select.value; const users = data.users || [];
     select.innerHTML = users.map(user => `<option value="${escapeHtml(user.username)}">${escapeHtml(user.username)}</option>`).join('');
     select.value = users.some(user => user.username === previous) ? previous : (data.selectedUser || '');
@@ -1416,10 +1735,11 @@ async function loadRadioStatus() {
 document.getElementById('radio-user')?.addEventListener('change', loadRadioStatus);
 document.getElementById('radio-reset')?.addEventListener('click', async event => {
   const user = document.getElementById('radio-user')?.value; if (!user || !confirm(`Reset Radio history for “${user}”? Downloaded music will not be removed.`)) return;
-  event.currentTarget.disabled = true;
-  try { const response = await fetch(`/api/admin/lastfm/radio/history?user=${encodeURIComponent(user)}`, { method: 'DELETE' }); const data = await response.json();
+  const button = event.currentTarget;
+  button.disabled = true;
+  try { const response = await api(`/api/admin/lastfm/radio/history?user=${encodeURIComponent(user)}`, { method: 'DELETE' }); const data = await response.json();
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`); toast(data.message || 'Radio history reset.'); await loadRadioStatus();
-  } catch (error) { toast(`Reset failed: ${error.message}`, 'error'); } finally { event.currentTarget.disabled = false; }
+  } catch (error) { toast(`Reset failed: ${error.message}`, 'error'); } finally { button.disabled = false; }
 });
 
 // ────────────────────────────────────────────────────────────────
@@ -1435,8 +1755,13 @@ document.getElementById('btn-check-listenbrainz')?.addEventListener('click', asy
   try {
     // Check what is typed, saved or not, so a typo is caught before Save.
     const typed = document.getElementById('f-lb-token')?.value?.trim() ?? '';
-    const r = await fetch('/api/admin/listenbrainz/validate' + (typed ? `?token=${encodeURIComponent(typed)}` : ''));
+    const r = await api('/api/admin/listenbrainz/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: typed || null }),
+    });
     const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
     box.textContent = !d.configured ? d.detail : d.valid ? `Valid · ${d.userName}` : `Not valid — ${d.detail}`;
     box.classList.toggle('notice-error', !d.valid);
   } catch (e) {
@@ -1455,8 +1780,9 @@ document.getElementById('btn-test-notification')?.addEventListener('click', asyn
   box.textContent = 'Sending…';
   btn.disabled = true;
   try {
-    const r = await fetch('/api/admin/test-notification', { method: 'POST' });
-    const d = await r.json();
+    const r = await api('/api/admin/test-notification', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
     const parts = (d.results || []).map(s =>
       `${s.sink}: ${!s.configured ? 'not configured' : s.ok ? 'OK' : 'failed — ' + s.detail}`);
     box.textContent = parts.length ? parts.join('  ·  ') : 'No transports registered.';
@@ -1485,10 +1811,12 @@ async function refreshLibraryStatus() {
   const pick = document.getElementById('f-library-path');
   if (!row || !out) return;
   try {
-    const r = await fetch('/api/admin/library-status', { cache: 'no-store' });
+    const r = await api('/api/admin/library-status', { cache: 'no-store' });
     if (!r.ok) return;
     const s = await r.json();
     effectiveLibraryPath = s.effectiveDownloadPath || '';
+    lastLibraryStatus = s;
+    renderSetupChecklist();
 
     const bits = [];
     if (s.navidromeReports) {
@@ -1510,13 +1838,20 @@ async function refreshLibraryStatus() {
     // Only ask which library when there is genuinely a choice to make.
     const libs = s.libraries || [];
     if (pick && pickRow && libs.length > 1) {
-      pick.innerHTML = [`<option value="">First library Navidrome reports</option>`]
-        .concat(libs.map(l => {
-          const label = `${l.name || l.folder}${l.visible ? '' : ' (not visible to Octo)'}`;
-          return `<option value="${esc(l.folder)}">${esc(label)}</option>`;
-        })).join('');
-      pick.value = s.pinnedLibraryPath || '';
-      pickRow.hidden = false;
+      markCleanIfWasClean(pick.closest('form'), () => {
+        pick.innerHTML = [`<option value="">First library Navidrome reports</option>`]
+          .concat(libs.map(l => {
+            const label = `${l.name || l.folder}${l.visible ? '' : ' (not visible to Octo)'}`;
+            return `<option value="${esc(l.folder)}">${esc(label)}</option>`;
+          })).join('');
+        pick.value = s.pinnedLibraryPath || '';
+        pick.disabled = false;
+        pickRow.hidden = false;
+      });
+    } else if (pick) {
+      // With one library there is nothing to choose, and an empty select would save "" over a
+      // pinned library. Disabled fields are not saved.
+      pick.disabled = true;
     }
   } catch { /* status is informational; never block the settings UI on it */ }
 }
@@ -1537,7 +1872,7 @@ let effectiveLibraryPath = '';
 async function browseFetch(path) {
   const url = '/api/admin/browse' + (path ? `?path=${encodeURIComponent(path)}` : '');
   // same-origin credentials carry the session cookie; nothing to attach by hand.
-  return fetch(url, { cache: 'no-store', credentials: 'same-origin' });
+  return api(url, { cache: 'no-store' });
 }
 
 // Resolves to {username, password} or null if dismissed. A native prompt() was
@@ -1555,6 +1890,10 @@ function askCredentials() {
   user.value = '';
   pass.value = '';
   err.textContent = '';
+  // Keep focus and assistive tech inside the dialog: the page behind it is inert while it is open.
+  const opener = document.activeElement;
+  const app = document.querySelector('.app');
+  if (app) app.inert = true;
   modal.hidden = false;
   // Focus straight away rather than inside requestAnimationFrame: rAF only runs
   // when the page is producing frames, so a background or non-compositing tab
@@ -1566,6 +1905,8 @@ function askCredentials() {
   return new Promise(resolve => {
     const close = (value) => {
       modal.hidden = true;
+      if (app) app.inert = false;
+      if (opener && typeof opener.focus === 'function') opener.focus();
       submit.removeEventListener('click', onSubmit);
       cancel.removeEventListener('click', onCancel);
       modal.removeEventListener('keydown', onKey);
@@ -1582,8 +1923,20 @@ function askCredentials() {
     };
     const onCancel = () => close(null);
     const onKey = (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); onSubmit(); }
-      if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+      if (e.key === 'Escape') { e.preventDefault(); onCancel(); return; }
+      // Enter submits from a field or the Sign in button. On Cancel it cancels, like a click.
+      if (e.key === 'Enter' && (e.target.tagName === 'INPUT' || e.target === submit)) {
+        e.preventDefault();
+        onSubmit();
+        return;
+      }
+      if (e.key === 'Tab') {
+        const stops = Array.from(modal.querySelectorAll('input, button')).filter(el => !el.disabled);
+        const first = stops[0];
+        const last = stops[stops.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
     };
     // Clicking the backdrop dismisses, but only the backdrop itself — a drag
     // that starts inside the card must not count as an outside click.
@@ -1598,8 +1951,12 @@ function askCredentials() {
 
 async function browseAuthenticate(result) {
   const creds = await askCredentials();
-  if (!creds) return false;
-  const r = await fetch('/api/admin/browse/auth', {
+  if (!creds) {
+    // Without this the area that asked kept saying "Loading…" forever.
+    result.textContent = 'Sign-in cancelled. This needs a Navidrome admin account.';
+    return false;
+  }
+  const r = await api('/api/admin/browse/auth', {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
@@ -1689,7 +2046,7 @@ detectBtn?.addEventListener('click', async () => {
   detectBtn.textContent = 'Scanning…';
   if (result) { result.hidden = false; result.textContent = 'Scanning the local network…'; }
   try {
-    const r = await fetch('/api/admin/discover-servers', { cache: 'no-store' });
+    const r = await api('/api/admin/discover-servers', { cache: 'no-store' });
     const data = await r.json();
     const servers = data.servers || [];
     if (!servers.length) {
@@ -1699,10 +2056,10 @@ detectBtn?.addEventListener('click', async () => {
       urlInput.value = servers[0].url;
       urlInput.dispatchEvent(new Event('input', { bubbles: true }));
       if (result) result.innerHTML =
-        `Found <strong>${servers[0].type || 'Subsonic'}</strong> ${servers[0].serverVersion || ''} at <code>${servers[0].url}</code> — filled in above. Save to apply.`;
+        `Found <strong>${esc(servers[0].type || 'Subsonic')}</strong> ${esc(servers[0].serverVersion || '')} at <code>${esc(servers[0].url)}</code>, filled in above. Save to apply.`;
     } else {
       const rows = servers.map(s =>
-        `<button type="button" class="btn btn-ghost detect-pick" data-url="${s.url}">${s.url} <span class="detect-tag">${s.type || 'subsonic'} ${s.serverVersion || ''}</span></button>`).join('');
+        `<button type="button" class="btn btn-ghost detect-pick" data-url="${esc(s.url)}">${esc(s.url)} <span class="detect-tag">${esc(s.type || 'subsonic')} ${esc(s.serverVersion || '')}</span></button>`).join('');
       if (result) result.innerHTML = `Found ${servers.length} servers — pick one:<div class="detect-list">${rows}</div>`;
       result.querySelectorAll('.detect-pick').forEach(b =>
         b.addEventListener('click', () => {
@@ -1745,11 +2102,12 @@ async function loadFetched() {
   const list = document.getElementById('fetched-list');
   if (!list) return;
   try {
-    const r = await fetch('/api/admin/downloads', { cache: 'no-store' });
+    const r = await api('/api/admin/downloads', { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     const items = data.downloads || [];
     if (!items.length) {
-      list.innerHTML = '<div class="dl-empty">No downloads yet. Star a song in your music app and it will appear here.</div>';
+      list.innerHTML = '<div class="dl-empty">Nothing fetched yet. Heart a song Octo found for you in your music app, and it shows up here once it is in your library.</div>';
       return;
     }
     list.innerHTML = items.map(d => {
@@ -1792,6 +2150,10 @@ function buildSegments() {
     if (seg.dataset.built) return;
     const sel = document.getElementById(seg.dataset.segFor);
     if (!sel) return;
+    seg.setAttribute('role', 'group');
+    const title = seg.closest('.set-row')?.querySelector('.set-info-t');
+    if (title?.id) seg.setAttribute('aria-labelledby', title.id);
+    else if (sel.getAttribute('aria-label')) seg.setAttribute('aria-label', sel.getAttribute('aria-label'));
     Array.from(sel.options).forEach(opt => {
       const b = document.createElement('button');
       b.type = 'button';
@@ -1816,6 +2178,7 @@ function syncSegment(seg, animate) {
   seg.querySelectorAll('button').forEach(b => {
     const on = b.dataset.value === sel.value;
     b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', String(on));
     if (on) active = b;
   });
   if (active && thumb && active.offsetWidth) {
@@ -1829,6 +2192,7 @@ function syncSegment(seg, animate) {
 function syncSegments(animate) {
   document.querySelectorAll('.seg[data-seg-for]').forEach(s => syncSegment(s, animate));
 }
+labelSettingControls();
 buildSegments();
 window.addEventListener('resize', () => syncSegments(false));
 
@@ -1883,6 +2247,131 @@ bindCopy('copy-octo-public-address',
 renderOctoAddresses();
 
 // ────────────────────────────────────────────────────────────────
+// Accessible names and restart chips
+// ────────────────────────────────────────────────────────────────
+// Most rows describe their control in a sibling .set-info rather than a <label>, which left
+// switches and inputs with no accessible name. Wire each one to its row's own title and text,
+// and mark every restart-only setting where it is edited, not only after saving it.
+function labelSettingControls() {
+  let n = 0;
+  document.querySelectorAll('.set-row').forEach(row => {
+    const title = row.querySelector(':scope > .set-info .set-info-t');
+    if (!title) return;
+    if (!title.id) title.id = `set-t-${++n}`;
+    const desc = row.querySelector(':scope > .set-info .set-info-d');
+    if (desc && !desc.id) desc.id = `set-d-${n}`;
+    row.querySelectorAll('input:not([type="hidden"]), select, textarea').forEach(ctrl => {
+      if (ctrl.closest('.source-priority-row, .radio-discovery-row')) return;
+      // A switch's <label> wraps only the track and thumb, so it gives no name of its own.
+      const namedByLabel = Array.from(ctrl.labels || []).some(label => label.textContent.trim());
+      if (namedByLabel || ctrl.hasAttribute('aria-label') || ctrl.hasAttribute('aria-labelledby')) return;
+      ctrl.setAttribute('aria-labelledby', title.id);
+      if (desc) ctrl.setAttribute('aria-describedby', desc.id);
+    });
+    if (row.querySelector('[data-restart="true"]') && !title.querySelector('.restart-badge')) {
+      title.insertAdjacentHTML('beforeend',
+        ' <span class="restart-badge restart-badge-inline" title="Takes effect after Octo restarts">Restart</span>');
+    }
+  });
+}
+
+// ────────────────────────────────────────────────────────────────
+// Setup checklist (Status)
+// ────────────────────────────────────────────────────────────────
+// Built only from answers Octo already gives (status, settings, library status), so it can
+// never disagree with the pages it links to.
+function heartSourceReachable() {
+  const services = lastStatus?.services || {};
+  const steps = currentSettings?.Subsonic?.HeartDownloadSources || [];
+  const enabled = steps.filter(step => step.SongEnabled || step.AlbumEnabled).map(step => step.Source);
+  if (!enabled.length) return { ok: false, detail: 'No heart source is switched on, so a heart downloads nothing.' };
+  const reachable = enabled.filter(source => {
+    if (source === 'Soulseek') return services.slskd?.ok;
+    if (source === 'YouTube') return services.ytDlpShim?.ok;
+    if (source === 'Lidarr') return services.lidarr?.ok && services.lidarr?.configured !== false && !services.lidarr?.warning;
+    return false;
+  });
+  return reachable.length
+    ? { ok: true, detail: `${reachable.join(', ')} answering.` }
+    : { ok: false, detail: `${enabled.join(', ')} ${enabled.length === 1 ? 'is' : 'are'} switched on but not answering.` };
+}
+
+function renderSetupChecklist() {
+  const holder = document.getElementById('setup-checklist');
+  const summary = document.getElementById('setup-summary');
+  const wrap = document.getElementById('setup-checklist-wrap');
+  if (!holder || !summary || !wrap) return;
+  const services = lastStatus?.services;
+  const pending = { state: 'pending', detail: 'Checking…' };
+  const heart = services && currentSettings ? heartSourceReachable() : null;
+  const notificationsOn = !!(currentSettings?.Notifications?.NtfyUrl || currentSettings?.Notifications?.DiscordWebhookUrl);
+
+  const rows = [
+    {
+      title: 'Music server', required: true, tab: 'subsonic',
+      ...(services ? (services.navidrome?.ok
+        ? { state: 'ok', detail: 'Navidrome answers.' }
+        : { state: 'bad', detail: services.navidrome?.detail || 'Not answering.' }) : pending),
+    },
+    {
+      title: 'A library folder Octo can write to', required: true, tab: 'library',
+      ...(lastLibraryStatus ? (lastLibraryStatus.writable
+        ? { state: 'ok', detail: `Downloads go to ${lastLibraryStatus.effectiveDownloadPath || 'the configured folder'}.` }
+        : { state: 'bad', detail: 'Octo cannot write to the download folder.' }) : pending),
+    },
+    {
+      title: 'A heart source that answers', required: true, tab: 'downloads',
+      ...(heart ? { state: heart.ok ? 'ok' : 'bad', detail: heart.detail } : pending),
+    },
+    {
+      title: 'Song discovery and radio', required: false, tab: 'lastfm',
+      ...(services ? (services.lastfm?.configured === false
+        ? { state: 'optional', detail: 'Optional. A Last.fm key adds songs you do not own to search, and radio.' }
+        : services.lastfm?.ok ? { state: 'ok', detail: 'Last.fm answers.' }
+          : { state: 'bad', detail: services.lastfm?.detail || 'Last.fm is not answering.' }) : pending),
+    },
+    {
+      title: 'Notifications', required: false, tab: 'notifications',
+      ...(currentSettings ? (notificationsOn
+        ? { state: 'ok', detail: 'A transport is set. Send a test from Notifications.' }
+        : { state: 'optional', detail: 'Optional. The only way to hear that a heart failed.' }) : pending),
+    },
+  ];
+
+  const stateLabel = { ok: 'Done', bad: 'Needs attention', optional: 'Optional', pending: 'Checking' };
+  const markup = `<ol class="setup-list">${rows.map(row => `
+    <li class="setup-row">
+      <span class="setup-state ${row.state}" aria-hidden="true"></span>
+      <span class="setup-copy">
+        <span class="setup-title">${esc(row.title)}<span class="visually-hidden">: ${stateLabel[row.state]}</span></span>
+        <span class="setup-detail">${esc(row.detail)}</span>
+      </span>
+      <button type="button" class="btn btn-ghost" data-open-tab="${row.tab}" aria-label="Open ${esc(row.title)}">Open</button>
+    </li>`).join('')}</ol>`;
+  // Only when something changed, so a status refresh does not pull focus off a button.
+  if (holder.dataset.rendered !== markup) {
+    holder.innerHTML = markup;
+    holder.dataset.rendered = markup;
+  }
+
+  const required = rows.filter(row => row.required);
+  const missing = required.filter(row => row.state === 'bad');
+  const checking = required.some(row => row.state === 'pending');
+  summary.textContent = checking ? 'Checking setup…'
+    : missing.length ? `Setup: ${missing.length} of ${required.length} required step${required.length === 1 ? '' : 's'} need${missing.length === 1 ? 's' : ''} attention`
+      : 'Setup complete. Point your apps at the address below.';
+  wrap.classList.toggle('needs-attention', missing.length > 0);
+  // Open when something required is missing; otherwise stay out of the way, unless the user
+  // opened it themselves.
+  if (!wrap.dataset.userToggled) wrap.open = missing.length > 0;
+}
+// Once the user opens or closes it themselves, stop opening and closing it for them.
+document.getElementById('setup-summary')?.addEventListener('click', () => {
+  document.getElementById('setup-checklist-wrap').dataset.userToggled = '1';
+});
+
+// ────────────────────────────────────────────────────────────────
 // Boot
 // ────────────────────────────────────────────────────────────────
+if (location.hash) followHash();
 loadSettings();

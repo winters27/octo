@@ -25,7 +25,7 @@
         </div>
       </div>
 
-      <nav class="sidebar-nav">
+      <nav class="sidebar-nav" aria-label="Sections">
         <div class="sidebar-nav-section">
           <div class="sidebar-nav-label">Overview</div>
           <button class="sidebar-nav-item active" data-tab="status">
@@ -44,42 +44,28 @@
         </div>
 
         <div class="sidebar-nav-section">
-          <div class="sidebar-nav-label">Settings</div>
-          <button class="sidebar-nav-item" data-tab="library">
-            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M2.5 3.5h11v9h-11z"/><path d="M5.5 6.5v3M8 6.5v3M10.5 6.5v3"/>
-            </svg>
-            <span>Library</span>
-          </button>
-          <button class="sidebar-nav-item" data-tab="downloads">
-            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M8 2.5v7M5 7l3 3 3-3M3.5 13h9"/>
-            </svg>
-            <span>Streams &amp; downloads</span>
-          </button>
+          <div class="sidebar-nav-label">Setup</div>
           <button class="sidebar-nav-item" data-tab="subsonic">
             <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
               <circle cx="8" cy="8" r="5.5"/><path d="M3 8a5 5 0 0 1 10 0"/>
             </svg>
-            <span>Subsonic</span>
+            <span>Music server</span>
           </button>
-          <button class="sidebar-nav-item" data-tab="lastfm">
+          <button class="sidebar-nav-item" data-tab="library">
             <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M2 9.5v0a4 4 0 1 1 4-4l2 6a4 4 0 1 0 4-4"/>
+              <path d="M2.5 3.5h11v9h-11z"/><path d="M5.5 6.5v3M8 6.5v3M10.5 6.5v3"/>
             </svg>
-            <span>Last.fm</span>
+            <span>Library folder</span>
           </button>
-          <button class="sidebar-nav-item" data-tab="listenbrainz">
+        </div>
+
+        <div class="sidebar-nav-section">
+          <div class="sidebar-nav-label">Hearts &amp; downloads</div>
+          <button class="sidebar-nav-item" data-tab="downloads">
             <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M3 12V4M6.5 12V7M10 12V5M13.5 12V9"/>
+              <path d="M8 2.5v7M5 7l3 3 3-3M3.5 13h9"/>
             </svg>
-            <span>ListenBrainz</span>
-          </button>
-          <button class="sidebar-nav-item" data-tab="notifications">
-            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M8 2a4 4 0 0 0-4 4v3L2.5 11h11L12 9V6a4 4 0 0 0-4-4z"/><path d="M6.5 13a1.5 1.5 0 0 0 3 0"/>
-            </svg>
-            <span>Notifications</span>
+            <span>Streams &amp; hearts</span>
           </button>
           <button class="sidebar-nav-item" data-tab="soulseek">
             <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -87,17 +73,49 @@
             </svg>
             <span>Soulseek</span>
           </button>
-          <button class="sidebar-nav-item" data-tab="libraryactions">
-            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M2.5 4.5h11v8h-11z"/><path d="M6 7.5h4M8 7.5v3"/>
-            </svg>
-            <span>Library actions</span>
-          </button>
           <button class="sidebar-nav-item" data-tab="lidarr">
             <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
               <path d="M3 3.5h10v9H3z"/><path d="M5.5 6h5M5.5 8.5h5M5.5 11h3"/>
             </svg>
             <span>Lidarr</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="notifications">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M8 2a4 4 0 0 0-4 4v3L2.5 11h11L12 9V6a4 4 0 0 0-4-4z"/><path d="M6.5 13a1.5 1.5 0 0 0 3 0"/>
+            </svg>
+            <span>Notifications</span>
+          </button>
+        </div>
+
+        <div class="sidebar-nav-section">
+          <div class="sidebar-nav-label">Discovery</div>
+          <button class="sidebar-nav-item" data-tab="lastfm">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <circle cx="8" cy="8" r="1.5"/><path d="M5.2 10.8a4 4 0 0 1 0-5.6M10.8 5.2a4 4 0 0 1 0 5.6M3.1 12.9a7 7 0 0 1 0-9.8M12.9 3.1a7 7 0 0 1 0 9.8"/>
+            </svg>
+            <span>Last.fm radio</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="listenbrainz">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M3 12V4M6.5 12V7M10 12V5M13.5 12V9"/>
+            </svg>
+            <span>ListenBrainz</span>
+          </button>
+        </div>
+
+        <div class="sidebar-nav-section">
+          <div class="sidebar-nav-label">Maintenance</div>
+          <button class="sidebar-nav-item" data-tab="tags">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M2.5 8.5 8 3h5v5l-5.5 5.5z"/><circle cx="10.5" cy="5.5" r="1"/>
+            </svg>
+            <span>Tags &amp; genres</span>
+          </button>
+          <button class="sidebar-nav-item" data-tab="libraryactions">
+            <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M2.5 4.5h11v8h-11z"/><path d="M6 7.5h4M8 7.5v3"/>
+            </svg>
+            <span>Library actions</span>
           </button>
         </div>
 
@@ -140,13 +158,21 @@
     <!--  CONTENT                                                    -->
     <!-- ══════════════════════════════════════════════════════════ -->
     <main class="content">
+      <div class="notice notice-error app-banner" id="settings-unavailable" role="alert" hidden>
+        <span><span class="msg"></span> Saving is off until they load, so nothing blank is written over them.</span>
+        <button type="button" class="btn btn-ghost" id="settings-retry">Try again</button>
+      </div>
+      <div class="notice notice-warn app-banner" id="config-invalid-banner" role="alert" hidden>
+        <span><strong>settings.json can't be read,</strong> so Octo won't save over it, and changes stored there may not be in effect. Fix it under <button type="button" class="link-button" data-open-tab="raw">Raw config</button>.</span>
+      </div>
+      <div class="notice notice-warn app-banner" id="restart-pending" role="status" hidden></div>
 
       <!-- ─── STATUS ──────────────────────────────────────────── -->
       <section data-pane="status" class="active">
         <header class="page-header">
           <div>
             <h1>Status</h1>
-            <p>Live health of every component.</p>
+            <p>What Octo needs, what it can reach, and where to point your music apps.</p>
           </div>
           <button class="btn btn-ghost" id="status-refresh" aria-label="Refresh status">
             <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -154,6 +180,11 @@
             </svg>
           </button>
         </header>
+
+        <details class="set-card setup-checklist" id="setup-checklist-wrap">
+          <summary id="setup-summary">Checking setup…</summary>
+          <div id="setup-checklist"></div>
+        </details>
 
         <div class="callout callout-accent" id="point-at-octo">
           <div class="callout-title">Point your music apps here, not at Navidrome</div>
@@ -173,7 +204,7 @@
           </div>
           <p class="callout-fine">
             Use your Subsonic username and password as usual. If an app points straight at Navidrome
-            it bypasses Octo, and discovery and download-on-star won't work.
+            it bypasses Octo, and discovery and download-on-heart won't work.
           </p>
           <form data-section="server" class="callout-form">
             <label class="callout-address-label" for="f-public-url">
@@ -209,7 +240,7 @@
               <span class="status-card-title">Soulseek</span>
             </div>
             <div class="status-card-body">probing…</div>
-            <div class="status-card-foot">slskd · downloads on star</div>
+            <div class="status-card-foot">slskd · downloads on heart</div>
           </article>
           <article class="status-card" data-svc="lidarr">
             <div class="status-card-head">
@@ -233,7 +264,7 @@
               <span class="status-card-title">Last.fm</span>
             </div>
             <div class="status-card-body">probing…</div>
-            <div class="status-card-foot">radio + discovery</div>
+            <div class="status-card-foot">optional · song discovery and radio</div>
           </article>
         </div>
 
@@ -248,7 +279,7 @@
         <header class="page-header">
           <div>
             <h1>Fetched songs</h1>
-            <p>A running log of every song Octo has pulled into your library, newest first. Each one is tagged with real album metadata and cover art on the way in. See its source, format, save path, size, and when it landed.</p>
+            <p>A running log of every song Octo has pulled into your library, newest first, with its source, format, save path, size, and when it landed. A heart that failed never appears here; turn on <em>Download failed</em> under <button type="button" class="link-button" data-open-tab="notifications">Notifications</button> to hear about those.</p>
           </div>
           <button class="btn btn-ghost" id="fetched-refresh" aria-label="Refresh">
             <svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -263,7 +294,7 @@
       <section data-pane="library">
         <header class="page-header">
           <div>
-            <h1>Library &amp; downloads</h1>
+            <h1>Library folder</h1>
             <p>Where Octo writes downloaded songs and how it organizes them on disk.</p>
           </div>
         </header>
@@ -284,7 +315,7 @@
                 <div class="set-info-t">Navidrome library</div>
                 <div class="set-info-d">This server has more than one library. Pick the one Octo should download into; otherwise it uses whichever Navidrome lists first.</div>
               </div>
-              <select class="set-input" id="f-library-path" name="Subsonic.LibraryPath" data-restart="true"></select>
+              <select class="set-input" id="f-library-path" name="Subsonic.LibraryPath" data-restart="true" disabled></select>
             </div>
             <div class="set-row">
               <div class="set-info">
@@ -339,8 +370,8 @@
       <section data-pane="downloads">
         <header class="page-header">
           <div>
-            <h1>Streams &amp; downloads</h1>
-            <p>Choose how missing tracks play and where hearts acquire permanent copies.</p>
+            <h1>Streams &amp; hearts</h1>
+            <p>How a song you don't own plays, and where a heart gets a permanent copy. Some apps draw the heart as a star.</p>
           </div>
         </header>
 
@@ -387,7 +418,7 @@
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t">Record who asked</div>
-                <div class="set-info-d">Names the Subsonic user who starred a track on its entry in Fetched songs and on the download notification, so on a shared library you can tell one person's downloads from another's. Turning this off stops the name being captured at all; entries already written keep theirs.</div>
+                <div class="set-info-d">Names the Subsonic user who hearted a track on its entry in Fetched songs and on the download notification, so on a shared library you can tell one person's downloads from another's. Turning this off stops the name being captured at all; entries already written keep theirs.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-record-requested-by" name="Subsonic.RecordRequestedBy" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -411,118 +442,14 @@
           </form>
         </div>
 
-        <div class="set-section">
-          <div class="set-head"><h3 class="set-title">Metadata</h3></div>
-          <form data-section="metadata" class="set-card">
-            <div class="set-row stack">
-              <div class="set-info">
-                <div class="set-info-t">Tag language</div>
-                <div class="set-info-d">Language for genre and other text fetched from metadata providers (Deezer, Last.fm) and written into a download's tags. Without it, providers pick a language from the server's IP address. Two-letter code like <code>en</code>, <code>de</code>, <code>fr</code>; empty lets the provider decide. New lookups use it right away; results cached in the last 12 hours keep their old language until they expire.</div>
-              </div>
-              <input class="set-input" id="f-metadata-language" name="Metadata.Language" placeholder="en" maxlength="16" />
-            </div>
-          </form>
-        </div>
-
-        <div class="set-section">
-          <div class="set-head">
-            <h3 class="set-title">Genre normalization</h3>
-            <p class="set-desc">Downloads arrive with whatever genre the source had: YouTube categories like &ldquo;Music&rdquo; or &ldquo;People &amp; Blogs&rdquo;, hyper-specific tags, or seven genres at once. This collapses them into a list you can browse. Rules are tried <strong>top to bottom and the first match wins</strong>, so put the specific ones above the general ones. Applies to new downloads; files already in the library keep their tags.</p>
-          </div>
-          <form data-section="genre" class="set-card" id="genre-form">
-            <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Normalize genres</div><div class="set-info-d">Off by default, because this rewrites a tag you may have curated.</div></div>
-              <label class="switch"><input type="checkbox" name="Genre.Enabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
-            </div>
-            <div class="set-row stack">
-              <div class="set-info"><div class="set-info-t">Genres per track</div><div class="set-info-d">The default keeps what a file already has, so switching normalisation on does not throw away accurate tags. Set it to 1 for one broad genre per track, which is what makes browsing useful on a library whose tags are a mess.</div></div>
-              <input class="set-input" name="Genre.MaxGenres" type="number" min="1" max="10" />
-            </div>
-            <div class="set-row stack">
-              <div class="set-info"><div class="set-info-t">When nothing is left</div><div class="set-info-d"><strong>Clear removes the genre</strong>, which is the point: without it, junk that maps to nothing survives forever. Leave keeps whatever was there, and Unknown writes a label instead.</div></div>
-              <select class="set-input" id="f-genre-on-empty" name="Genre.OnEmpty">
-                <option value="Clear">Clear the genre</option>
-                <option value="Leave">Leave it alone</option>
-                <option value="Unknown">Write a label</option>
-              </select>
-            </div>
-            <div class="set-row stack" id="genre-unknown-row" hidden>
-              <div class="set-info"><div class="set-info-t">Label for unknown genres</div></div>
-              <input class="set-input" name="Genre.UnknownLabel" placeholder="Unknown" maxlength="60" />
-            </div>
-            <div class="set-row stack">
-              <div class="set-info"><div class="set-info-t">Fallback source</div><div class="set-info-d">Where to look when a file has no usable genre left. Last.fm uses the top tags it already caches, and needs an API key but not radio.</div></div>
-              <select class="set-input" name="Genre.Fallback">
-                <option value="None">Leave it empty</option>
-                <option value="LastFm">Last.fm top tags</option>
-                <option value="MusicBrainz">MusicBrainz genres</option>
-              </select>
-            </div>
-            <div class="set-row stack">
-              <div class="set-info"><div class="set-info-t">Blocklist</div><div class="set-info-d">Extra values that are never a genre, comma separated. YouTube categories, format tags and years are already handled.</div></div>
-              <input class="set-input" id="f-genre-blocklist" placeholder="my rip, needs replacing" />
-              <input type="hidden" id="genre-blocklist-json" name="Genre.Blocklist" data-json="true" />
-            </div>
-            <div class="set-row stack">
-              <div class="set-info">
-                <div class="set-info-t">Mapping rules</div>
-                <div class="set-info-d">Drag to reorder, or focus a handle and use the arrow keys. A rule with an empty genre drops the value instead of mapping it.</div>
-              </div>
-              <div class="genre-preset-actions">
-                <button class="btn btn-ghost" type="button" id="genre-preset-broad">+ Broad genres</button>
-                <button class="btn btn-ghost" type="button" id="genre-add-custom">+ Custom rule</button>
-              </div>
-              <div id="genre-mapping-list" class="genre-mapping-list"></div>
-              <input type="hidden" id="genre-mappings-json" name="Genre.Mappings" data-json="true" />
-              <div id="genre-mapping-error" class="field-error" role="alert" hidden></div>
-            </div>
-          </form>
-        </div>
-
-        <div class="set-section">
-          <div class="set-head">
-            <h3 class="set-title">Re-tag the existing library</h3>
-            <p class="set-desc">The settings above only apply to new downloads. This applies them to files that are already in your library. Start with a preview: nothing is written until you look at the list and say so.</p>
-          </div>
-          <div class="set-card">
-            <div class="set-row stack">
-              <div class="set-info">
-                <div class="set-info-t">Which files</div>
-                <div class="set-info-d">&ldquo;Downloads Octo made&rdquo; only touches files Octo created. &ldquo;The whole library&rdquo; also rewrites your own rips and purchases, and asks you to type the music path to confirm.</div>
-              </div>
-              <select class="set-input" id="genre-backfill-scope">
-                <option value="OctoDownloads">Downloads Octo made</option>
-                <option value="WholeLibrary">The whole library</option>
-              </select>
-            </div>
-            <div class="notice notice-warn">
-              <strong>There is no undo for anything but the genre.</strong> Writing a tag rewrites the whole tag block, so an unusual field the tag library does not understand is lost on the first save and cannot be restored. Undo is matched by file path, so a file you move afterwards stays changed. Your own backup of the music folder is the only complete safety net.
-            </div>
-            <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Preview</div><div class="set-info-d">Walks every file and shows what would change. Writes nothing.</div></div>
-              <button class="btn btn-ghost" type="button" id="genre-backfill-preview">Preview changes</button>
-            </div>
-            <div id="genre-backfill-status" class="set-row stack" aria-live="polite"></div>
-            <div id="genre-backfill-results"></div>
-            <div class="set-row" id="genre-backfill-actions">
-              <div class="set-info"><div class="set-info-t">Apply</div><div class="set-info-d">Available once a preview has finished.</div></div>
-              <div class="genre-preset-actions">
-                <button class="btn" type="button" id="genre-backfill-apply" hidden>Apply these changes</button>
-                <button class="btn btn-ghost" type="button" id="genre-backfill-resume" hidden>Resume</button>
-                <button class="btn btn-ghost" type="button" id="genre-backfill-cancel" hidden>Cancel</button>
-                <button class="btn btn-ghost" type="button" id="genre-backfill-undo" hidden>Undo the last run</button>
-              </div>
-            </div>
-          </div>
-        </div>
       </section>
 
       <!-- ─── SUBSONIC ───────────────────────────────────────── -->
       <section data-pane="subsonic">
         <header class="page-header">
           <div>
-            <h1>Subsonic / Navidrome</h1>
-            <p>The upstream music server Octo proxies. Required.</p>
+            <h1>Music server</h1>
+            <p>Navidrome, or another Subsonic-compatible server. Octo sits in front of it. Required.</p>
           </div>
         </header>
 
@@ -543,11 +470,11 @@
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t">Admin credentials <span class="set-opt">optional</span></div>
-                <div class="set-info-d">Lets Octo detect the music folder and run authenticated rescans on its own. Leave blank to have Octo learn an admin token from a client sign-in instead.</div>
+                <div class="set-info-d">Lets Octo detect the music folder and run authenticated rescans on its own, and library actions need them. Leave blank to have Octo learn an admin token from a client sign-in instead. A saved password is never shown here; leave it as it is to keep it.</div>
               </div>
               <div class="set-grid2">
-                <input class="set-input" id="f-admin-user" name="Subsonic.AdminUsername" placeholder="admin username" autocomplete="off" />
-                <input class="set-input" id="f-admin-pass" name="Subsonic.AdminPassword" type="password" placeholder="••••••••" autocomplete="off" />
+                <input class="set-input" id="f-admin-user" name="Subsonic.AdminUsername" placeholder="admin username" autocomplete="off" aria-label="Navidrome admin username" />
+                <input class="set-input" id="f-admin-pass" name="Subsonic.AdminPassword" type="password" placeholder="••••••••" autocomplete="new-password" aria-label="Navidrome admin password" />
               </div>
             </div>
           </form>
@@ -608,9 +535,9 @@
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t">API key</div>
-                <div class="set-info-d">Required for discovery. Without it, search and radio fall back to your local library only.</div>
+                <div class="set-info-d">Required for discovery, and otherwise optional. Without it, search shows your library plus albums from Deezer, and radio falls back to Navidrome. Search and radio use a new key right away; cover art from Last.fm picks it up after a restart.</div>
               </div>
-              <input class="set-input" id="f-lastfm-key" name="LastFm.ApiKey" type="password" autocomplete="off" placeholder="32-char hex string" />
+              <input class="set-input" id="f-lastfm-key" name="LastFm.ApiKey" type="password" autocomplete="new-password" placeholder="32-char hex string" />
             </div>
           </form>
         </div>
@@ -799,14 +726,14 @@
                 <div class="set-info-t">ntfy access token <span class="set-opt">optional</span></div>
                 <div class="set-info-d">Only needed on servers with access control. Sent as a Bearer token.</div>
               </div>
-              <input class="set-input" id="f-ntfy-token" name="Notifications.NtfyToken" type="password" autocomplete="off" />
+              <input class="set-input" id="f-ntfy-token" name="Notifications.NtfyToken" type="password" autocomplete="new-password" />
             </div>
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t">Discord webhook URL</div>
                 <div class="set-info-d">Leave empty to disable Discord. Server Settings &rarr; Integrations &rarr; Webhooks. The URL contains its own secret, so it is stored like a password.</div>
               </div>
-              <input class="set-input" id="f-discord-webhook" name="Notifications.DiscordWebhookUrl" type="password" autocomplete="off" placeholder="https://discord.com/api/webhooks/…" />
+              <input class="set-input" id="f-discord-webhook" name="Notifications.DiscordWebhookUrl" type="password" autocomplete="new-password" placeholder="https://discord.com/api/webhooks/…" />
             </div>
           </form>
         </div>
@@ -831,14 +758,14 @@
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t">Lossless fallback</div>
-                <div class="set-info-d">Soulseek came up empty and Octo settled for a YouTube MP3. The quality-loss alarm.</div>
+                <div class="set-info-d">Only for songs you play while Streams &amp; hearts waits for lossless: Soulseek came up empty and Octo played YouTube instead. Hearts report through Download completed or Download failed.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-notify-fallback" name="Notifications.NotifyLosslessFallback" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t">Download failed</div>
-                <div class="set-info-d">Both sources failed for a starred track.</div>
+                <div class="set-info-d">Every enabled heart source failed, so nothing was downloaded. The only place a failed heart is reported.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-notify-failed" name="Notifications.NotifyDownloadFailed" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -850,6 +777,122 @@
               <label class="switch"><input type="checkbox" id="f-notify-album" name="Notifications.NotifyAlbumCompleted" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
           </form>
+        </div>
+      </section>
+
+      <!-- ─── TAGS & GENRES ──────────────────────────────────── -->
+      <section data-pane="tags">
+        <header class="page-header">
+          <div>
+            <h1>Tags &amp; genres</h1>
+            <p>How Octo tags what it downloads, and a tool that applies the same genre rules to music already in your library.</p>
+          </div>
+        </header>
+
+        <div class="set-section">
+          <div class="set-head"><h3 class="set-title">Metadata</h3></div>
+          <form data-section="metadata" class="set-card">
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Tag language</div>
+                <div class="set-info-d">Language for genre and other text fetched from metadata providers (Deezer, Last.fm) and written into a download's tags. Without it, providers pick a language from the server's IP address. Two-letter code like <code>en</code>, <code>de</code>, <code>fr</code>; empty lets the provider decide. New lookups use it right away; results cached in the last 12 hours keep their old language until they expire. Cover art picks up a new language after a restart.</div>
+              </div>
+              <input class="set-input" id="f-metadata-language" name="Metadata.Language" placeholder="en" maxlength="16" />
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Genre normalization</h3>
+            <p class="set-desc">Downloads arrive with whatever genre the source had: YouTube categories like &ldquo;Music&rdquo; or &ldquo;People &amp; Blogs&rdquo;, hyper-specific tags, or seven genres at once. This collapses them into a list you can browse. Rules are tried <strong>top to bottom and the first match wins</strong>, so put the specific ones above the general ones. Applies to new downloads; files already in the library keep their tags.</p>
+          </div>
+          <form data-section="genre" class="set-card" id="genre-form">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Normalize genres</div><div class="set-info-d">Off by default, because this rewrites a tag you may have curated.</div></div>
+              <label class="switch"><input type="checkbox" name="Genre.Enabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Genres per track</div><div class="set-info-d">The default keeps what a file already has, so switching normalisation on does not throw away accurate tags. Set it to 1 for one broad genre per track, which is what makes browsing useful on a library whose tags are a mess.</div></div>
+              <input class="set-input" name="Genre.MaxGenres" type="number" min="1" max="10" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">When nothing is left</div><div class="set-info-d"><strong>Clear removes the genre</strong>, which is the point: without it, junk that maps to nothing survives forever. Leave keeps whatever was there, and Unknown writes a label instead.</div></div>
+              <select class="set-input" id="f-genre-on-empty" name="Genre.OnEmpty">
+                <option value="Clear">Clear the genre</option>
+                <option value="Leave">Leave it alone</option>
+                <option value="Unknown">Write a label</option>
+              </select>
+            </div>
+            <div class="set-row stack" id="genre-unknown-row" hidden>
+              <div class="set-info"><div class="set-info-t">Label for unknown genres</div></div>
+              <input class="set-input" name="Genre.UnknownLabel" placeholder="Unknown" maxlength="60" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Fallback source</div><div class="set-info-d">Where to look when a file has no usable genre left. Last.fm uses the top tags it already caches, and needs an API key but not radio.</div></div>
+              <select class="set-input" name="Genre.Fallback">
+                <option value="None">Leave it empty</option>
+                <option value="LastFm">Last.fm top tags</option>
+                <option value="MusicBrainz">MusicBrainz genres</option>
+              </select>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">Blocklist</div><div class="set-info-d">Extra values that are never a genre, comma separated. YouTube categories, format tags and years are already handled.</div></div>
+              <input class="set-input" id="f-genre-blocklist" placeholder="my rip, needs replacing" />
+              <input type="hidden" id="genre-blocklist-json" name="Genre.Blocklist" data-json="true" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Mapping rules</div>
+                <div class="set-info-d">Drag to reorder, or focus a handle and use the arrow keys. A rule with an empty genre drops the value instead of mapping it.</div>
+              </div>
+              <div class="genre-preset-actions">
+                <button class="btn btn-ghost" type="button" id="genre-preset-broad">Use broad preset</button>
+                <button class="btn btn-ghost" type="button" id="genre-add-custom">+ Custom rule</button>
+              </div>
+              <div id="genre-mapping-list" class="genre-mapping-list"></div>
+              <input type="hidden" id="genre-mappings-json" name="Genre.Mappings" data-json="true" />
+              <div id="genre-mapping-error" class="field-error" role="alert" hidden></div>
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Re-tag the existing library</h3>
+            <p class="set-desc">The settings above only apply to new downloads. This applies them to files that are already in your library. Start with a preview: nothing is written until you look at the list and say so.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Which files</div>
+                <div class="set-info-d">&ldquo;Downloads Octo made&rdquo; only touches files Octo created. &ldquo;The whole library&rdquo; also rewrites your own rips and purchases, and asks you to type the music path to confirm.</div>
+              </div>
+              <select class="set-input" id="genre-backfill-scope">
+                <option value="OctoDownloads">Downloads Octo made</option>
+                <option value="WholeLibrary">The whole library</option>
+              </select>
+              <div class="set-info-d scope-hint" id="genre-backfill-scope-hint" role="status" hidden>You changed which files. Preview again before applying.</div>
+            </div>
+            <div class="notice notice-warn">
+              <strong>There is no undo for anything but the genre.</strong> Writing a tag rewrites the whole tag block, so an unusual field the tag library does not understand is lost on the first save and cannot be restored. Undo is matched by file path, so a file you move afterwards stays changed. Your own backup of the music folder is the only complete safety net.
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Preview</div><div class="set-info-d">Walks every file and shows what would change. Writes nothing.</div></div>
+              <button class="btn btn-ghost" type="button" id="genre-backfill-preview">Preview changes</button>
+            </div>
+            <div id="genre-backfill-status" class="set-row stack"></div>
+            <div id="genre-backfill-results"></div>
+            <div class="set-row" id="genre-backfill-actions">
+              <div class="set-info"><div class="set-info-t">Apply</div><div class="set-info-d">Available once a preview has finished, for the same files and rules it previewed.</div></div>
+              <div class="genre-preset-actions">
+                <button class="btn" type="button" id="genre-backfill-apply" hidden>Apply these changes</button>
+                <button class="btn btn-ghost" type="button" id="genre-backfill-resume" hidden>Resume</button>
+                <button class="btn btn-ghost" type="button" id="genre-backfill-cancel" hidden>Cancel</button>
+                <button class="btn btn-ghost" type="button" id="genre-backfill-undo" hidden>Undo the last run</button>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -880,14 +923,15 @@
                 <div class="set-info-t">User token</div>
                 <div class="set-info-d">From <a href="https://listenbrainz.org/settings/" target="_blank" rel="noopener">listenbrainz.org/settings</a>. Applies to every Navidrome user without a token of their own. Leave empty to disable.</div>
               </div>
-              <input class="set-input" id="f-lb-token" name="ListenBrainz.Token" type="password" autocomplete="off" />
+              <input class="set-input" id="f-lb-token" name="ListenBrainz.Token" type="password" autocomplete="new-password" />
             </div>
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t">Per-user tokens <span class="set-opt">optional</span></div>
                 <div class="set-info-d">For installs with more than one listener: a Navidrome username and that person's own ListenBrainz token, as JSON, for example <code>{"alice": "token", "bob": "token"}</code>. Also settable as <code>LISTENBRAINZ__USERTOKENS__alice</code> in <code>.env</code>.</div>
               </div>
-              <textarea class="set-input" id="f-lb-user-tokens" name="ListenBrainz.UserTokens" data-json="true" rows="3" spellcheck="false"></textarea>
+              <textarea class="set-input secret-text" id="f-lb-user-tokens" name="ListenBrainz.UserTokens" data-json="true" data-json-empty="{}" data-error-for="lb-user-tokens-error" rows="3" spellcheck="false" autocomplete="off"></textarea>
+              <div id="lb-user-tokens-error" class="field-error" role="alert" data-json-error hidden></div>
             </div>
           </form>
         </div>
@@ -898,7 +942,7 @@
         <header class="page-header">
           <div>
             <h1>Soulseek</h1>
-            <p>Downloads FLACs when you star a song. slskd web UI: <a id="slskd-link" target="_blank" rel="noopener">port 5030</a>.</p>
+            <p>Downloads FLACs when you heart a song. slskd web UI: <a id="slskd-link" target="_blank" rel="noopener">port 5030</a>.</p>
           </div>
         </header>
 
@@ -918,8 +962,8 @@
                 <div class="set-info-d">These authenticate Octo against slskd's API. Not your Soulseek-network account — that's <code>SLSKD_SOULSEEK_USERNAME/PASSWORD</code> in <code>.env</code>.</div>
               </div>
               <div class="set-grid2">
-                <input class="set-input" id="f-slskd-user" name="Soulseek.Username" data-restart="true" placeholder="username" autocomplete="off" />
-                <input class="set-input" id="f-slskd-pass" name="Soulseek.Password" type="password" data-restart="true" placeholder="password" autocomplete="off" />
+                <input class="set-input" id="f-slskd-user" name="Soulseek.Username" data-restart="true" data-restart-label="Soulseek account" placeholder="username" autocomplete="off" aria-label="slskd web admin username" />
+                <input class="set-input" id="f-slskd-pass" name="Soulseek.Password" type="password" data-restart="true" data-restart-label="Soulseek account" placeholder="password" autocomplete="new-password" aria-label="slskd web admin password" />
               </div>
             </div>
           </form>
@@ -934,8 +978,8 @@
                 <div class="set-info-d">How long to wait for peer responses, and how long each of up to 5 peer downloads may take.</div>
               </div>
               <div class="set-grid2">
-                <input class="set-input" id="f-slskd-wait" name="Soulseek.SearchWaitSeconds" type="number" min="2" max="30" />
-                <input class="set-input" id="f-slskd-timeout" name="Soulseek.DownloadTimeoutSeconds" type="number" min="30" />
+                <input class="set-input" id="f-slskd-wait" name="Soulseek.SearchWaitSeconds" type="number" min="2" max="30" data-restart="true" data-restart-label="Soulseek search wait" aria-label="Search wait in seconds" />
+                <input class="set-input" id="f-slskd-timeout" name="Soulseek.DownloadTimeoutSeconds" type="number" min="30" data-restart="true" data-restart-label="Soulseek per-peer timeout" aria-label="Per-peer download timeout in seconds" />
               </div>
             </div>
             <div class="set-row stack">
@@ -944,8 +988,8 @@
                 <div class="set-info-d">Filter out clip-sized fakes and prefer a file type.</div>
               </div>
               <div class="set-grid2">
-                <input class="set-input" id="f-slskd-minsize" name="Soulseek.MinFileSizeBytes" type="number" min="0" />
-                <input class="set-input" id="f-slskd-ext" name="Soulseek.PreferredExtension" placeholder="flac" />
+                <input class="set-input" id="f-slskd-minsize" name="Soulseek.MinFileSizeBytes" type="number" min="0" data-restart="true" data-restart-label="Soulseek minimum file size" aria-label="Minimum file size in bytes" />
+                <input class="set-input" id="f-slskd-ext" name="Soulseek.PreferredExtension" placeholder="flac" data-restart="true" data-restart-label="Soulseek preferred extension" aria-label="Preferred file extension" />
               </div>
             </div>
           </form>
@@ -969,7 +1013,7 @@
                 <div class="set-info-t">AcoustID API key</div>
                 <div class="set-info-d">Free from <a href="https://acoustid.org/new-application" target="_blank" rel="noopener">acoustid.org/new-application</a>. Without a key the fingerprint lookup is skipped; the length check and its rejection memory still work.</div>
               </div>
-              <input class="set-input" type="password" name="Soulseek.AcoustIdApiKey" autocomplete="off" />
+              <input class="set-input" type="password" name="Soulseek.AcoustIdApiKey" autocomplete="new-password" />
             </div>
             <div class="set-row stack">
               <div class="set-info">
@@ -1013,7 +1057,7 @@
           <div class="set-head"><h3 class="set-title">Who and how</h3></div>
           <form data-section="library-actions" class="set-card" id="library-actions-form">
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Enable library actions</div><div class="set-info-d">Off by default. Needs a Navidrome admin credential under Subsonic, because finding the file behind a track is an admin-only lookup. <strong>Takes effect after a restart</strong>, so arming this is a deliberate act rather than a stray click.</div></div>
+              <div class="set-info"><div class="set-info-t">Enable library actions</div><div class="set-info-d">Off by default. Needs a Navidrome admin credential under Music server, because finding the file behind a track is an admin-only lookup. <strong>Star ratings act as soon as you save.</strong> Action playlists start being watched after a restart.</div></div>
               <label class="switch"><input type="checkbox" name="LibraryActions.Enabled" data-restart="true" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
@@ -1039,9 +1083,9 @@
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t">Star ratings as commands</div>
-                <div class="set-info-d"><strong>Worth leaving off.</strong> A star is a one-tap gesture with no confirmation in any client, and rating a track you dislike is an ordinary thing to do. Five stars is never mapped, so the top of the scale is always safe.</div>
+                <div class="set-info-d"><strong>Worth leaving off.</strong> A star is a one-tap gesture with no confirmation in any client, and rating a track you dislike is an ordinary thing to do. Five stars is never mapped, so the top of the scale is always safe. Applies as soon as you save.</div>
               </div>
-              <label class="switch"><input type="checkbox" name="LibraryActions.RatingsEnabled" data-restart="true" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+              <label class="switch"><input type="checkbox" name="LibraryActions.RatingsEnabled" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
           </form>
         </div>
@@ -1076,8 +1120,8 @@
             <div class="set-row stack">
               <div class="set-info"><div class="set-info-t">Check every <span class="set-opt">seconds</span> / at most <span class="set-opt">per check</span></div><div class="set-info-d">How quickly an action is noticed, and a ceiling on how many are applied at once so a client that dumps thousands of tracks cannot run away with your library.</div></div>
               <div class="set-grid2">
-                <input class="set-input" name="LibraryActions.PollIntervalSeconds" type="number" min="15" max="3600" data-number="true" />
-                <input class="set-input" name="LibraryActions.MaxActionsPerCycle" type="number" min="1" max="200" data-number="true" />
+                <input class="set-input" name="LibraryActions.PollIntervalSeconds" type="number" min="15" max="3600" data-number="true" data-restart="true" data-restart-label="Library actions check interval" aria-label="Check every this many seconds" />
+                <input class="set-input" name="LibraryActions.MaxActionsPerCycle" type="number" min="1" max="200" data-number="true" aria-label="At most this many actions per check" />
               </div>
             </div>
           </form>
@@ -1109,7 +1153,7 @@
 
         <div class="info-card">
           <h3 class="info-card-title">Album-level acquisition</h3>
-          <p>Lidarr cannot search for one track. Hearting a single external song resolves its release and imports the full album. Octo never deletes, renames, or retags Lidarr-managed files.</p>
+          <p>Lidarr cannot search for one track. Hearting a single external song resolves its release and imports the full album. Octo never deletes or retags Lidarr's files, but it does move each imported track into the folder layout chosen under Library folder, so Lidarr may later list those tracks as missing.</p>
         </div>
 
         <div class="set-section">
@@ -1127,7 +1171,7 @@
                 <label class="set-info-t" for="f-lidarr-key">API key</label>
                 <div class="set-info-d">Found in Lidarr under Settings → General → Security.</div>
               </div>
-              <input class="set-input" id="f-lidarr-key" name="Lidarr.ApiKey" type="password" autocomplete="off" />
+              <input class="set-input" id="f-lidarr-key" name="Lidarr.ApiKey" type="password" autocomplete="new-password" />
             </div>
           </form>
         </div>
@@ -1191,13 +1235,15 @@
           <p>The file lives at <code id="raw-config-path">/app/config/settings.json</code> inside the container. The host bind-mount is at <code>./octo-config/settings.json</code> next to your <code>docker-compose.yml</code> — you can <code>vim</code>/<code>nano</code> it there too. Changes hot-reload within ~500ms; settings flagged restart-required still need a restart.</p>
         </div>
 
+        <div class="notice notice-warn">Passwords and keys show here in plain text, except the Navidrome admin password. Don't screenshot or share this page.</div>
+
         <form id="raw-form" class="settings-card">
           <h3 class="settings-card-title">settings.json</h3>
           <div class="field">
             <label for="raw-editor">JSON content</label>
             <textarea id="raw-editor" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" placeholder="{}"></textarea>
             <div class="field-help">
-              Top-level keys: <code>Subsonic</code>, <code>Library</code>, <code>Soulseek</code>, <code>Lidarr</code>, <code>YouTube</code>, <code>LastFm</code>, <code>Metadata</code>.
+              Top-level keys: <code>Subsonic</code>, <code>Library</code>, <code>Server</code>, <code>Soulseek</code>, <code>Lidarr</code>, <code>YouTube</code>, <code>LastFm</code>, <code>Metadata</code>, <code>Genre</code>, <code>LibraryActions</code>, <code>Notifications</code>, <code>ListenBrainz</code>. Leave <code>"(saved, not shown)"</code> as it is to keep the stored admin password.
               Radio remains inside <code>LastFm</code>; pinned rows are the ordered <code>LastFm.DiscoveryStations</code> array and should be edited as complete objects with stable <code>Id</code>, <code>Name</code>, <code>Enabled</code>, and <code>Tags</code> fields.
               Anything you set here overrides the corresponding env var until removed.
             </div>
@@ -1216,7 +1262,7 @@
         <header class="page-header">
           <div>
             <h1>Config sources</h1>
-            <p>What value the app actually sees for each setting, after merging env vars and the settings file. Most settings now apply the moment you save. The few that cannot are marked <em>restart required</em> where you change them: the download path, the slskd connection, and the shim URL are all read once while the app starts.</p>
+            <p>What value the app actually sees for each setting, after merging env vars and the settings file. Settings marked <span class="restart-badge restart-badge-inline">Restart</span> take effect after Octo restarts; everything else applies within about a second of saving. Anything waiting on a restart is listed at the top of every page.</p>
           </div>
         </header>
 
@@ -1251,7 +1297,7 @@
         </header>
 
         <div class="info-card">
-          <p>Octo is a Subsonic API proxy that augments your existing Navidrome library with discovery and on-demand downloading. Search includes external recommendations alongside your local songs; "Radio" on any song fans out via Last.fm and previews via YouTube; star music you don't own and Octo acquires it through Soulseek or your existing Lidarr server.</p>
+          <p>Octo is a Subsonic API proxy that augments your existing Navidrome library with discovery and on-demand downloading. Search includes external recommendations alongside your local songs; "Radio" on any song fans out via Last.fm and previews via YouTube; heart music you don't own and Octo acquires it through Soulseek, YouTube or your existing Lidarr server.</p>
         </div>
 
         <div class="info-card">
@@ -1266,25 +1312,26 @@
 
         <div class="info-card">
           <h3 class="info-card-title">Hot-reload vs restart</h3>
-          <p>Most settings (storage mode, folder structure, filters) take effect immediately. Settings flagged <span class="restart-badge restart-badge-inline">restart required</span> bake into HTTP clients at startup; use the <strong>Restart</strong> button in the sidebar to apply them.</p>
+          <p>Settings marked <span class="restart-badge restart-badge-inline">Restart</span> take effect after Octo restarts; everything else applies within about a second of saving. Anything waiting on a restart is listed at the top of every page, and the <strong>Restart</strong> button in the sidebar applies it.</p>
         </div>
       </section>
     </main>
   </div>
 
   <div id="toast" role="status" aria-live="polite"></div>
+  <div id="sr-alert" class="visually-hidden" role="alert"></div>
 
   <!-- Sign-in modal for the folder browser. Hidden until needed; the browser
        endpoint refuses to list anything without a Navidrome admin. -->
   <div class="modal-backdrop" id="signin-modal" hidden>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="signin-title">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="signin-title" aria-describedby="signin-desc">
       <div class="modal-title" id="signin-title">Sign in to browse</div>
-      <div class="modal-desc">Browsing folders needs a Navidrome <strong>admin</strong> account. Octo checks it with your Navidrome server and never stores it.</div>
+      <div class="modal-desc" id="signin-desc">Browsing folders needs a Navidrome <strong>admin</strong> account. Octo checks it with your Navidrome server and never stores it.</div>
       <div class="modal-fields">
         <input class="set-input" id="signin-user" type="text" autocomplete="username" placeholder="Username" />
         <input class="set-input" id="signin-pass" type="password" autocomplete="current-password" placeholder="Password" />
       </div>
-      <div class="modal-error" id="signin-error"></div>
+      <div class="modal-error" id="signin-error" role="alert"></div>
       <div class="modal-actions">
         <button type="button" class="btn btn-ghost" id="signin-cancel">Cancel</button>
         <button type="button" class="btn btn-primary" id="signin-submit">Sign in</button>
