@@ -29,6 +29,7 @@ namespace Octo.Controllers;
 public class AdminController : ControllerBase
 {
     private readonly SettingsFileWriter _settings;
+    private readonly RestartTracker _restartTracker;
     private readonly IOptionsMonitor<SubsonicSettings> _subsonicOpts;
     private readonly IOptionsMonitor<SoulseekSettings> _soulseekOpts;
     private readonly IOptionsMonitor<LidarrSettings> _lidarrOpts;
@@ -65,6 +66,7 @@ public class AdminController : ControllerBase
 
     public AdminController(
         SettingsFileWriter settings,
+        RestartTracker restartTracker,
         IOptionsMonitor<SubsonicSettings> subsonicOpts,
         IOptionsMonitor<SoulseekSettings> soulseekOpts,
         IOptionsMonitor<LidarrSettings> lidarrOpts,
@@ -104,6 +106,7 @@ public class AdminController : ControllerBase
         _deezer = deezer;
         _coverArt = coverArt;
         _settings = settings;
+        _restartTracker = restartTracker;
         _subsonicOpts = subsonicOpts;
         _soulseekOpts = soulseekOpts;
         _lidarrOpts = lidarrOpts;
@@ -191,6 +194,14 @@ public class AdminController : ControllerBase
         var (valid, userName, detail) = await _listenBrainz.ValidateTokenAsync(candidate, HttpContext.RequestAborted);
         return Ok(new { configured = true, valid, userName, detail });
     }
+
+    public record ListenBrainzValidateRequest(string? User, string? Token);
+
+    /// <summary>The same check as the GET, with the token in the body so a typed token never
+    /// lands in a URL, a proxy log or the browser history. The GET stays for compatibility.</summary>
+    [HttpPost("listenbrainz/validate")]
+    public Task<IActionResult> ValidateListenBrainzPost([FromBody] ListenBrainzValidateRequest request) =>
+        ValidateListenBrainz(request.User, request.Token);
 
     [HttpPost("lastfm/radio/refresh")]
     public IActionResult RefreshLastFmRadio([FromBody] RadioUserRequest request)
@@ -431,6 +442,14 @@ public class AdminController : ControllerBase
             ["Subsonic"] = new Dictionary<string, object>
             {
                 ["Url"] = subsonic.Url ?? "",
+                // Both are fields on the Music server form. Missing here, they never pre-filled,
+                // so every save of that form wrote empty strings over them and quietly took away
+                // the admin identity library actions and authenticated rescans depend on. The
+                // password goes out as a placeholder the save swaps back, so it never reaches a
+                // browser.
+                ["AdminUsername"] = subsonic.AdminUsername ?? "",
+                ["AdminPassword"] = MaskSecret(subsonic.AdminPassword),
+                ["EnableSearchDiscovery"] = subsonic.EnableSearchDiscovery,
                 ["StorageMode"] = subsonic.StorageMode.ToString(),
                 ["DownloadMode"] = subsonic.DownloadMode.ToString(),
                 ["DownloadOnStar"] = subsonic.DownloadOnStar,
@@ -565,6 +584,8 @@ public class AdminController : ControllerBase
                 // the user what they typed rather than what survived.
                 ["Mappings"] = (_settings.Load()["Genre"] as JsonObject)?["Mappings"]?.DeepClone()
                     ?? JsonSerializer.SerializeToNode(genre.Mappings)!,
+                ["BackfillMaxConsecutiveFailures"] = genre.BackfillMaxConsecutiveFailures,
+                ["BackfillExtensions"] = genre.BackfillExtensions ?? [],
             },
             ["Notifications"] = new Dictionary<string, object>
             {
@@ -591,6 +612,12 @@ public class AdminController : ControllerBase
                 // visibly empty rather than a button that looks like it did nothing.
                 ["RejectedPeerCount"] = _rejectedPeers.Count,
                 ["ConfigFileExists"] = System.IO.File.Exists(_settings.FilePath),
+                // False when the file is there but unparseable, which is when saves are refused.
+                ["ConfigFileValid"] = _settings.IsReadable(),
+                // Restart-only settings whose saved value has not reached the running services.
+                ["RestartPending"] = _restartTracker.Pending(_config),
+                // What a saved-but-hidden secret reads as, so the dashboard can recognise it.
+                ["SecretPlaceholder"] = SecretPlaceholder,
                 // So a bug report can name a build. Comes from <InformationalVersion>
                 // in octo.csproj, which is bumped when a release is tagged.
                 ["Version"] = OctoVersion,
@@ -649,12 +676,44 @@ public class AdminController : ControllerBase
             if (validationError is not null) return BadRequest(new { error = validationError });
         }
 
+        // The form echoes the placeholder back when the admin password was left alone; that means
+        // "keep what is saved", so it must not be written. Anything typed after the placeholder
+        // would otherwise be saved as the password.
+        // Keys are matched without regard to case, as the configuration system matches them.
+        if (Child(patch, "Subsonic") is JsonObject subsonicPatch
+            && KeyOf(subsonicPatch, "AdminPassword") is { } passwordKey
+            && subsonicPatch[passwordKey] is JsonValue adminPassword
+            && adminPassword.TryGetValue<string>(out var adminPasswordText))
+        {
+            if (adminPasswordText.StartsWith(SecretPlaceholder, StringComparison.Ordinal)
+                && adminPasswordText != SecretPlaceholder)
+                return BadRequest(new { error = "Retype the whole admin password; it was added to the hidden placeholder." });
+
+            if (adminPasswordText == SecretPlaceholder)
+            {
+                // A different username with the old password kept is a pairing nobody asked for.
+                var newUser = KeyOf(subsonicPatch, "AdminUsername") is { } userKey
+                    && subsonicPatch[userKey] is JsonValue userValue
+                    && userValue.TryGetValue<string>(out var userText) ? userText : null;
+                if (newUser is not null
+                    && !string.Equals(newUser.Trim(), (_subsonicOpts.CurrentValue.AdminUsername ?? "").Trim(), StringComparison.Ordinal))
+                    return BadRequest(new { error = "Retype the admin password for the new username." });
+                subsonicPatch.Remove(passwordKey);
+            }
+        }
+
         try
         {
-            var merged = _settings.Merge(patch);
+            // UserTokens is a dictionary: merged, a user removed in the dashboard would stay.
+            var merged = _settings.Merge(patch, ["ListenBrainz.UserTokens"]);
             _logger.LogInformation("Admin settings updated: {Keys}",
                 string.Join(",", patch.Select(kv => kv.Key)));
-            return new JsonResult(new { ok = true, persisted = merged });
+            return new JsonResult(new { ok = true, persisted = RedactSecrets(merged) });
+        }
+        catch (SettingsFileCorruptException ex)
+        {
+            _logger.LogWarning("Refused to save settings: {Path} is not valid JSON", ex.Path);
+            return Conflict(new { error = $"{ex.Message} Fix it in Raw config, or on disk at {ex.Path}." });
         }
         catch (Exception ex)
         {
@@ -875,6 +934,10 @@ public class AdminController : ControllerBase
             run.Preview,
             canResume = run.CanResume,
             canUndo = _genreJournal.Exists,
+            // The genre rules changed after this run was planned. Apply re-plans from the current
+            // rules, so a preview in this state no longer describes what Apply would write.
+            settingsChanged = run.SettingsHash is not null
+                && run.SettingsHash != Octo.Services.Metadata.GenreBackfillWorker.HashSettings(_genreOpts.CurrentValue),
             musicPath = _config["Library:DownloadPath"] ?? "./downloads",
         });
     }
@@ -897,6 +960,11 @@ public class AdminController : ControllerBase
 
         var run = _genreBackfill.Current;
         if (!run.CanResume) return BadRequest(new { error = "There is nothing to resume." });
+        // A run's settings are snapshotted when it starts. Resuming under edited rules would
+        // finish the library under a different table from the one it started with.
+        if (run.SettingsHash is not null
+            && run.SettingsHash != Octo.Services.Metadata.GenreBackfillWorker.HashSettings(_genreOpts.CurrentValue))
+            return Conflict(new { error = "The genre rules changed since this run started. Preview again instead of resuming." });
         if (!_genreBackfill.TryEnqueue(new GenreBackfillRequest(run.Scope, run.DryRun)))
             return Conflict(new { error = "A genre backfill is already running." });
 
@@ -996,6 +1064,12 @@ public class AdminController : ControllerBase
             ["Subsonic"] = new JsonObject
             {
                 ["Url"] = subsonic.Url ?? "",
+                // Listed for the same reason as every other key here: PUT writes this document
+                // wholesale, so a key missing from it is a key a plain Save deletes. The password
+                // is the placeholder, which PUT swaps back for the stored value.
+                ["AdminUsername"] = subsonic.AdminUsername ?? "",
+                ["AdminPassword"] = MaskSecret(subsonic.AdminPassword),
+                ["EnableSearchDiscovery"] = subsonic.EnableSearchDiscovery,
                 ["StorageMode"] = subsonic.StorageMode.ToString(),
                 ["DownloadMode"] = subsonic.DownloadMode.ToString(),
                 ["DownloadOnStar"] = subsonic.DownloadOnStar,
@@ -1128,6 +1202,8 @@ public class AdminController : ControllerBase
                 ["Blocklist"] = JsonSerializer.SerializeToNode(genre.Blocklist ?? [])!,
                 ["Mappings"] = (_settings.Load()["Genre"] as JsonObject)?["Mappings"]?.DeepClone()
                     ?? JsonSerializer.SerializeToNode(genre.Mappings)!,
+                ["BackfillMaxConsecutiveFailures"] = genre.BackfillMaxConsecutiveFailures,
+                ["BackfillExtensions"] = JsonSerializer.SerializeToNode(genre.BackfillExtensions ?? [])!,
             },
             ["Notifications"] = new JsonObject
             {
@@ -1182,14 +1258,23 @@ public class AdminController : ControllerBase
 
         try
         {
-            // Atomic write via tmp + rename. Don't merge — this is the "I
-            // know exactly what I want" power-user endpoint.
-            var path = _settings.FilePath;
-            Directory.CreateDirectory(Path.GetDirectoryName(path) ?? ".");
-            var tmp = path + ".tmp";
+            // Don't merge: this is the "I know exactly what I want" power-user endpoint. It goes
+            // through the writer so it shares the lock and atomic write with form saves, and the
+            // hidden admin password comes back as a placeholder that must not be saved literally.
+            // When the file cannot be read, the running value is the only copy of the password
+            // left, and this save is the recovery path the 409 points people to.
+            var existing = _settings.IsReadable()
+                ? _settings.Load()
+                : new JsonObject { ["Subsonic"] = new JsonObject { ["AdminPassword"] = _subsonicOpts.CurrentValue.AdminPassword } };
+            RestoreSecretPlaceholders(parsed, existing);
+            if (Child(parsed, "Subsonic") is JsonObject savedSubsonic
+                && KeyOf(savedSubsonic, "AdminPassword") is { } savedKey
+                && savedSubsonic[savedKey] is JsonValue savedValue
+                && savedValue.TryGetValue<string>(out var savedText)
+                && savedText.StartsWith(SecretPlaceholder, StringComparison.Ordinal))
+                return BadRequest(new { error = "Retype the whole admin password; it was added to the hidden placeholder." });
             var pretty = parsed.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-            System.IO.File.WriteAllText(tmp, pretty);
-            System.IO.File.Move(tmp, path, overwrite: true);
+            _settings.Replace(parsed);
             _logger.LogInformation("Admin raw-config saved ({Bytes} bytes)", pretty.Length);
             return new JsonResult(new { ok = true, bytes = pretty.Length });
         }
@@ -1372,7 +1457,7 @@ public class AdminController : ControllerBase
         {
             var url = _subsonicOpts.CurrentValue.Url;
             if (string.IsNullOrWhiteSpace(url))
-                return new ServiceProbe(false, "Subsonic URL not configured");
+                return new ServiceProbe(false, "Not set up yet. Enter your server under Music server.");
             // Navidrome's /rest/ping requires auth, but it returns 200 with an
             // error body even on bad credentials — which proves connectivity.
             var http = _httpFactory.CreateClient();
@@ -1406,7 +1491,7 @@ public class AdminController : ControllerBase
         if (string.IsNullOrWhiteSpace(settings.BaseUrl) || string.IsNullOrWhiteSpace(settings.ApiKey))
             return lidarrEnabled
                 ? new ServiceProbe(true, "selected but not configured", Warning: true)
-                : new ServiceProbe(true, "not configured (optional)");
+                : new ServiceProbe(true, "Not set up. Optional.", Configured: false);
         if (lidarrEnabled
             && (string.IsNullOrWhiteSpace(settings.RootFolderPath)
                 || settings.QualityProfileId <= 0 || settings.MetadataProfileId <= 0))
@@ -1435,8 +1520,10 @@ public class AdminController : ControllerBase
     private async Task<ServiceProbe> ProbeLastFmAsync(CancellationToken ct)
     {
         var key = _lastFmOpts.CurrentValue.ApiKey;
+        // Optional: without a key search still shows your library and Deezer albums, and radio
+        // falls back to Navidrome. Red here read as a broken install.
         if (string.IsNullOrEmpty(key))
-            return new ServiceProbe(false, "API key not set");
+            return new ServiceProbe(true, "No API key, so song discovery and radio are off. Optional.", Configured: false);
         try
         {
             var http = _httpFactory.CreateClient();
@@ -1449,7 +1536,67 @@ public class AdminController : ControllerBase
         catch (Exception ex) { return new ServiceProbe(false, ex.Message); }
     }
 
-    private record ServiceProbe(bool Ok, string Detail, bool Warning = false);
+    /// <summary>
+    /// Health of one backing service. Configured is false for an optional service nobody set up,
+    /// which the dashboard shows as off rather than as a failure.
+    /// </summary>
+    private record ServiceProbe(bool Ok, string Detail, bool Warning = false, bool Configured = true);
+
+    /// <summary>
+    /// What a saved Navidrome admin password reads as through the admin API. Every other secret
+    /// still goes out in clear, as it always has; this one never did, and adding it to the GET
+    /// so the form could round-trip must not change that.
+    /// </summary>
+    internal const string SecretPlaceholder = "(saved, not shown)";
+
+    private static string MaskSecret(string? value) =>
+        string.IsNullOrEmpty(value) ? "" : SecretPlaceholder;
+
+    /// <summary>
+    /// Undo the placeholder in a Raw config document before it replaces the file: keep the stored
+    /// password when the file has one, otherwise drop the key so an environment value keeps
+    /// applying. A real value is left alone.
+    /// </summary>
+    internal static void RestoreSecretPlaceholders(JsonObject incoming, JsonObject existingFile)
+    {
+        if (Child(incoming, "Subsonic") is not JsonObject subsonic
+            || KeyOf(subsonic, "AdminPassword") is not { } key
+            || subsonic[key] is not JsonValue value
+            || !value.TryGetValue<string>(out var text)
+            || text != SecretPlaceholder)
+            return;
+
+        var stored = Child(existingFile, "Subsonic") is JsonObject storedSubsonic
+            && KeyOf(storedSubsonic, "AdminPassword") is { } storedKey
+                ? storedSubsonic[storedKey]
+                : null;
+        if (stored is JsonValue storedValue && storedValue.TryGetValue<string>(out var storedText)
+            && !string.IsNullOrEmpty(storedText))
+            subsonic[key] = storedText;
+        else
+            subsonic.Remove(key);
+    }
+
+    /// <summary>The key in <paramref name="obj"/> that matches <paramref name="name"/> ignoring
+    /// case, as configuration keys do, or null.</summary>
+    private static string? KeyOf(JsonObject obj, string name) =>
+        obj.Select(pair => pair.Key).FirstOrDefault(key => string.Equals(key, name, StringComparison.OrdinalIgnoreCase));
+
+    private static JsonObject? Child(JsonObject obj, string name) =>
+        KeyOf(obj, name) is { } key ? obj[key] as JsonObject : null;
+
+    /// <summary>The merged file echoed after a save, with the admin password masked the same way
+    /// the GET masks it.</summary>
+    internal static JsonObject RedactSecrets(JsonObject merged)
+    {
+        var copy = merged.DeepClone().AsObject();
+        if (Child(copy, "Subsonic") is JsonObject subsonic)
+            foreach (var key in subsonic.Select(pair => pair.Key)
+                         .Where(key => string.Equals(key, "AdminPassword", StringComparison.OrdinalIgnoreCase)).ToList())
+                if (subsonic[key] is JsonValue value && value.TryGetValue<string>(out var text))
+                    subsonic[key] = MaskSecret(text);
+        return copy;
+    }
 
     /// <summary>The release this build came from, e.g. "2026.07.29". Falls back to the
     /// assembly version if the informational version was not stamped.</summary>

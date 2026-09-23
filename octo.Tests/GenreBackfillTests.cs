@@ -233,6 +233,9 @@ public class GenreBackfillEndpointTests
         using var factory = new AdminWebFactory();
         using var client = factory.CreateClient();
         using var request = new HttpRequestMessage(new HttpMethod(method), url);
+        // Sent so the request gets past the admin write guard and reaches the session gate,
+        // which is what this test is about.
+        request.Headers.Add(Octo.Middleware.AdminRequestGuard.HeaderName, "1");
         if (method == "POST")
             request.Content = JsonContent.Create(new { scope = "OctoDownloads", dryRun = true });
 
@@ -288,6 +291,14 @@ internal sealed class AdminWebFactory : WebApplicationFactory<Program>
         builder.ConfigureHostConfiguration(config => config.AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["Library:DownloadPath"] = _directory,
+            // Every upstream points at a closed local port. With no Subsonic URL, Octo's first-run
+            // automation scans the LAN and adopts whatever Navidrome answers, writing it into
+            // /app/config/settings.json; a test run must never find a real server.
+            ["Subsonic:Url"] = "http://127.0.0.1:1",
+            ["Soulseek:BaseUrl"] = "http://127.0.0.1:1",
+            ["YouTube:ShimUrl"] = "http://127.0.0.1:1",
+            // Synthetic, and only here to prove the admin API never hands it back.
+            ["Subsonic:AdminPassword"] = "synthetic-admin-password",
         }));
         return base.CreateHost(builder);
     }

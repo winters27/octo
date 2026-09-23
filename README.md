@@ -37,7 +37,7 @@ Built for:
 - **Search finds music you don't own.** Tap a result to hear it instantly via YouTube preview.
 - **Radio works on every song.** Owned tracks play at full FLAC; missing ones preview from YouTube.
 - **Personal stations appear automatically.** Completed plays create Starter Radio, then Your Mix, discovery, artist, and genre stations in the client's playlist and Internet Radio lists. Admin-pinned tag categories stay fixed while their queues refresh.
-- **Heart to keep.** Star a previewed song and Octo grabs the FLAC from Soulseek, adds it to your library, and tells Navidrome to rescan. Within a minute, the song is yours forever.
+- **Heart to keep.** Heart (some apps say star) a previewed song and Octo grabs the FLAC from Soulseek, adds it to your library, and tells Navidrome to rescan. Usually within a few minutes, longer while Soulseek peers are tried, the song is yours for good.
 - **Search and heart whole albums.** Albums you don't own show up in search with real cover art and tracklists. Star one and Octo fetches every track. Downloads run one at a time, so a full album takes a while; album-heart sources can be disabled independently in the admin UI.
 - **Bring your own Lidarr.** Already running [Lidarr](https://github.com/Lidarr/Lidarr)? Add it as a heart source and order it against Soulseek and YouTube in the admin UI. Hearts hand off to Lidarr at album level, and finished imports land back in your library with a rescan.
 
@@ -139,7 +139,7 @@ Prebuilt multi-arch images are also published to `ghcr.io/winters27/octo`, tagge
 
 `http://<your-host>:5274/admin`
 
-Every setting has a form, every backing service has a live status indicator, and the **Raw Config** tab lets you edit the whole effective configuration as a JSON file if you'd rather work that way. Changes hot-reload — no rebuild, no restart for most settings.
+Every setting has a form, every backing service has a live status indicator, and the **Raw Config** tab lets you edit the whole effective configuration as a JSON file if you'd rather work that way. Changes hot-reload: no rebuild, and no restart for most settings. The few that only apply after a restart are marked **Restart** where you edit them, and anything saved but still waiting on a restart is listed at the top of every page until you restart Octo.
 
 > [!WARNING]
 > **The admin dashboard has no authentication, so run Octo on a trusted network only.**
@@ -154,6 +154,12 @@ Every setting has a form, every backing service has a live status indicator, and
 > requires authentication and blocks `/admin` outright. A proxy that only fronts the
 > Subsonic API and refuses `/admin` and `/api` is enough for music clients, since those
 > only need `/rest`.
+>
+> Octo does refuse admin changes from other websites and stops them reading the admin API:
+> a write has to carry an `X-Octo-Admin` header, which a page on another origin cannot add.
+> A script that changes settings must send that header too. **This is not a login.** Anyone
+> who can reach port 5274 directly, or a DNS-rebinding page, can still use the dashboard, so
+> the advice above stands.
 
 ## Notifications
 
@@ -192,17 +198,17 @@ Octo's per-user play ledger and station snapshots stay in `/app/config/lastfm-ra
 
 ### Do downloaded songs get tagged correctly?
 
-Yes. Soulseek peers share full FLAC files with their existing ID3 tags intact. Octo organizes them per your `FolderStructure` setting (`Flat` or `Organized`), then triggers a Navidrome rescan so they appear in your library exactly like everything else you own.
+Yes. Soulseek peers share full FLAC files with their existing ID3 tags intact. Octo organizes them per your `FolderStructure` setting (`Flat`, `ByArtist` or `Organized`), then triggers a Navidrome rescan so they appear in your library exactly like everything else you own.
 
 ### What if I don't want to use Soulseek?
 
 You can use YouTube or an existing Lidarr server, or disable automatic acquisition entirely.
 
-Use **Downloads → Heart download priority** in the admin UI to order Soulseek, YouTube, and Lidarr and independently choose whether each handles song hearts, album hearts, or both. Octo tries eligible sources from top to bottom and stops at the first success. `DOWNLOAD_SOURCE`, `DOWNLOAD_ON_STAR`, and `DOWNLOAD_ALBUM_ON_STAR` remain migration defaults for existing and env-only installations.
+Use **Streams & hearts → Heart download priority** in the admin UI to order Soulseek, YouTube, and Lidarr and independently choose whether each handles song hearts, album hearts, or both. Octo tries eligible sources from top to bottom and stops at the first success. `DOWNLOAD_SOURCE`, `DOWNLOAD_ON_STAR`, and `DOWNLOAD_ALBUM_ON_STAR` remain migration defaults for existing and env-only installations.
 
 Lidarr works at album level, so enabling it for song hearts still fetches the song's full album. It is last and disabled by default; configure its URL, API key, root folder, and profiles on the Lidarr page, then enable the heart types you want in the priority list.
 
-To stop downloading altogether, turn off both heart types for every source. On an env-only installation, set `Subsonic__DownloadOnStar=false` and `Subsonic__DownloadAlbumOnStar=false`. Hearts still register as favorites without acquiring files.
+To stop downloading altogether, turn off both heart types for every source. On an env-only installation, set `Subsonic__DownloadOnStar=false` and `Subsonic__DownloadAlbumOnStar=false`. A heart on a song Octo found for you then downloads nothing and is not kept, because Navidrome has no such song to favourite.
 
 `RECORD_REQUESTED_BY` (on by default) names the Subsonic user who asked for each download on
 its entry in **Fetched songs** and on the download notification, so on a shared library you can
@@ -295,9 +301,11 @@ ever written when non-empty and never cleared, so junk like "People & Blogs" sur
 forever; `Leave` keeps it and `Unknown` writes `GENRE_UNKNOWN_LABEL`. A file that had no
 genre and resolved to none is left untouched either way. `GENRE_FALLBACK=LastFm` fills a
 blank genre from Last.fm's top tags, which needs `LASTFM_API_KEY` but not radio. This
-applies to new downloads. To apply it to files already in the library, the Library tab has a
-re-tag tool: pick a scope, **Preview changes** walks every file and writes nothing, and only
-then can you apply. Every one of its endpoints requires signing in with a Navidrome admin
+applies to new downloads. To apply it to files already in the library, the **Tags & genres** page
+has a re-tag tool: pick a scope, **Preview changes** walks every file and writes nothing, and only
+then can you apply. Apply is withheld if you change the scope or the rules after previewing,
+because it would write something other than what the preview showed. An undo that is cancelled
+or cannot reach a file keeps that file's entry, so running Undo again finishes the job. Every one of its endpoints requires signing in with a Navidrome admin
 account, because `/api/admin` has no authentication of its own and this rewrites tags.
 
 Applying records each changed genre frame in `/app/config/genre-backfill-journal.jsonl`, which
@@ -385,8 +393,9 @@ Set `WAIT_FOR_LOSSLESS_ON_PLAY=true` if you would rather the first play wait for
 
 ### Folder layouts
 
-- `Flat` *(default)* — `Artist - Title.flac`.
-- `Organized` — `Artist/Album/01 - Title.flac`. A track with no known album falls back to its own title as the folder. Existing files are never moved; this only affects new downloads.
+- `Flat` *(default)*: `Artist - Title.flac`.
+- `ByArtist`: `Artist/Title.flac`.
+- `Organized`: `Artist/Album/01 - Title.flac`. A track with no known album falls back to its own title as the folder. Existing files are never moved; this only affects new downloads.
 
 ### Subsonic API surface
 
@@ -415,7 +424,7 @@ When a song is starred, Octo:
 1. Searches Soulseek for `<artist> <title>` (cleaned of `[brackets]` and redundant `Artist - ` prefixes).
 2. Falls back to title-only search if the first query returns nothing usable.
 3. Ranks candidates by queue depth, upload speed, file size.
-4. Tries the top 5 peers in sequence with a 60s per-peer timeout.
+4. Tries the top 5 peers in sequence with a per-peer timeout of 180 seconds by default (`SLSKD_DOWNLOAD_TIMEOUT_SECONDS`).
 5. Verifies the file landed on disk (slskd's polling endpoint sometimes drops successful transfers between polls).
 6. Renames per `FolderStructure` setting and triggers a Navidrome rescan.
 
@@ -441,7 +450,7 @@ Cached cross-source so a queue scroll doesn't trigger N external API calls per v
 Yes — slskd downloads are full FLACs from peer libraries that already have ID3 tags. Octo organizes them per `FolderStructure`, then triggers a Navidrome rescan.
 
 **What if all 5 Soulseek peers reject?**
-Octo throws an error and the star icon stays filled. Try again later or grab the file by hand. Real failures are rare.
+The next source in your heart order is tried. If every one fails and notifications are set up, you get a **Download failed** message; your music app itself hears nothing, because the heart was answered straight away. The heart may clear on the app's next sync, since Navidrome never stored a favourite for a song it doesn't have. Try again later or grab the file by hand.
 
 **Can it run without Soulseek?**
 Yes. Enable YouTube for MP3 downloads, Lidarr for album-level heart acquisition, or disable every song-heart source to keep discovery without automatic acquisition.

@@ -41,6 +41,8 @@ builder.Services.Configure<ForwardedHeadersOptions>(options =>
 });
 builder.Services.AddSingleton<Octo.Services.Admin.SettingsFileWriter>(
     sp => new Octo.Services.Admin.SettingsFileWriter(SettingsFilePath));
+// Which restart-only settings have changed since this process started; see RestartTracker.
+builder.Services.AddSingleton<Octo.Services.Admin.RestartTracker>();
 // Running log of fetched songs, stored next to the settings file (same
 // bind-mounted config dir, so it survives restarts).
 builder.Services.AddSingleton(sp => new Octo.Services.Local.DownloadHistoryService(
@@ -281,6 +283,10 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
+// Resolved here so it snapshots the values this process actually started with, before the
+// dashboard or first-run automation can change anything.
+app.Services.GetRequiredService<Octo.Services.Admin.RestartTracker>();
+
 // First-run automation (best-effort, background). Octo is an accessory to an
 // existing Navidrome, so it self-configures what it can: if no upstream URL is
 // set, scan the LAN and adopt the server when exactly one is found; then detect
@@ -328,6 +334,9 @@ _ = Task.Run(async () =>
 // This must run before any middleware or controller reads Request.Scheme.
 app.UseForwardedHeaders();
 app.UseExceptionHandler(_ => { });
+// Ahead of UseCors on purpose: it strips the CORS headers from /api/admin answers and refuses
+// admin writes that lack X-Octo-Admin. See AdminRequestGuard for what it does and does not stop.
+app.UseAdminRequestGuard();
 
 // Capture the raw request body for body-carrying methods so the proxy can
 // faithfully forward it after parameter extraction has consumed/closed the
