@@ -177,12 +177,13 @@ public sealed class NotificationService
             NotificationEventType.DownloadFailed => new NotificationMessage(
                 evt.Type,
                 $"Download failed: {track}",
-                evt.Detail ?? "Both sources failed.",
+                evt.Detail ?? "Every enabled source failed.",
                 evt.CoverArtUrl),
 
             NotificationEventType.AlbumCompleted => new NotificationMessage(
                 evt.Type,
-                $"Album complete: {track}",
+                // Sent after every album walk, so it has to say when nothing arrived at all.
+                evt.TrackCount is 0 && evt.FailedCount is > 0 ? $"Album failed: {track}" : $"Album complete: {track}",
                 $"{evt.TrackCount} tracks fetched, {evt.LosslessCount} lossless"
                     + (evt.FailedCount is int f and > 0 ? $", {f} failed" : ""),
                 evt.CoverArtUrl,

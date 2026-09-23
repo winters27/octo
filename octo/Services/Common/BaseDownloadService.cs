@@ -594,13 +594,25 @@ public abstract class BaseDownloadService : IDownloadService
             albumExternalId, excludeTrackExternalId);
 
         var album = await MetadataService.GetAlbumAsync(ProviderName, albumExternalId);
-        if (album == null)
+        if (AlbumWalkRefusal(album) is { } refusal)
         {
-            Logger.LogWarning("Album {AlbumId} not found, cannot download remaining tracks", albumExternalId);
+            Logger.LogWarning("Album {AlbumId}: {Refusal}", albumExternalId, refusal);
+            // Only a heart on the album itself reports this. A walk started by a track star has
+            // already reported that track's own outcome, and a mid-chain source stays quiet so
+            // the next source can try.
+            if (!suppressSummary && string.IsNullOrEmpty(excludeTrackExternalId))
+                Notifications.Notify(new Octo.Services.Notifications.NotificationEvent
+                {
+                    Type = Octo.Services.Notifications.NotificationEventType.DownloadFailed,
+                    Artist = album?.Artist,
+                    Title = album?.Title ?? "album",
+                    CoverArtUrl = album?.CoverArtUrl,
+                    Detail = refusal,
+                });
             return false;
         }
 
-        var tracksToDownload = album.Songs
+        var tracksToDownload = album!.Songs
             .Where(s => s.ExternalId != excludeTrackExternalId && !string.IsNullOrEmpty(s.ExternalId))
             .ToList();
 
@@ -669,6 +681,18 @@ public abstract class BaseDownloadService : IDownloadService
         if ((!suppressSummary || failed == 0) && summary is not null) Notifications.Notify(summary);
         return failed == 0;
     }
+
+    /// <summary>
+    /// Why an album walk cannot start, or null when it can. A walk with nothing to walk used to
+    /// return success, so a hearted album whose track list never loaded (the metadata provider
+    /// was down or rate-limited) did nothing, said nothing, and stopped the source chain there.
+    /// </summary>
+    internal static string? AlbumWalkRefusal(Album? album) =>
+        album is null
+            ? "Octo could no longer look this album up, so nothing was downloaded. Heart it again from a fresh search."
+            : !album.Songs.Any(song => !string.IsNullOrEmpty(song.ExternalId))
+                ? $"No track list came back for \"{album.Title}\", so nothing was downloaded. The metadata provider may be down; try again later."
+                : null;
 
     /// <summary>
     /// Null when the walk did no work — a re-star whose tracks are all already

@@ -182,6 +182,54 @@ public class NotificationServiceTests
         Assert.Contains("15 tracks fetched, 12 lossless, 1 failed", msg.Body);
     }
 
+    /// <summary>Every track failing used to arrive titled "Album complete".</summary>
+    [Fact]
+    public void AlbumSummaryWithNothingFetched_SaysFailed()
+    {
+        var msg = NotificationService.Render(new NotificationEvent
+        {
+            Type = NotificationEventType.AlbumCompleted,
+            Artist = "Tame Impala",
+            Title = "Currents",
+            TrackCount = 0,
+            LosslessCount = 0,
+            FailedCount = 12,
+        });
+
+        Assert.StartsWith("Album failed:", msg.Title);
+    }
+
+    /// <summary>The heart chain has one to three sources, so "Both" was wrong for most setups.</summary>
+    [Fact]
+    public void FailureWithoutDetail_DoesNotAssumeTwoSources()
+    {
+        var msg = NotificationService.Render(new NotificationEvent
+        {
+            Type = NotificationEventType.DownloadFailed,
+            Artist = "A",
+            Title = "B",
+        });
+
+        Assert.DoesNotContain("Both", msg.Body);
+    }
+
+    /// <summary>
+    /// A hearted album whose track list never loaded used to count as a successful walk of
+    /// nothing: no download, no notification, and the source chain stopped there.
+    /// </summary>
+    [Fact]
+    public void AlbumWalkRefusal_NamesWhyNothingCanBeDownloaded()
+    {
+        var empty = new Octo.Models.Domain.Album { Artist = "A", Title = "B" };
+        var unkeyed = new Octo.Models.Domain.Album { Artist = "A", Title = "B", Songs = [new() { Title = "t" }] };
+        var walkable = new Octo.Models.Domain.Album { Artist = "A", Title = "B", Songs = [new() { Title = "t", ExternalId = "x" }] };
+
+        Assert.NotNull(Octo.Services.Common.BaseDownloadService.AlbumWalkRefusal(null));
+        Assert.Contains("No track list", Octo.Services.Common.BaseDownloadService.AlbumWalkRefusal(empty));
+        Assert.NotNull(Octo.Services.Common.BaseDownloadService.AlbumWalkRefusal(unkeyed));
+        Assert.Null(Octo.Services.Common.BaseDownloadService.AlbumWalkRefusal(walkable));
+    }
+
     [Fact]
     public void AlbumSummaryIsSkippedWhenTheWalkDidNothing()
     {
