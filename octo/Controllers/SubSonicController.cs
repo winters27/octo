@@ -2626,6 +2626,14 @@ public class SubsonicController : ControllerBase
         var nativeAlbum = await TryServeNativeExternalAlbumAsync(endpoint);
         if (nativeAlbum != null) return nativeAlbum;
 
+        // Native ARTIST detail for an external id (patched 24sep2026).
+        // Sin esto, Feishin abre un artista externo -> GET /api/artist/{id} -> el
+        // relay va a Navidrome -> 401 (ese id no existe alli) -> Octo devuelve 500
+        // -> la UI se queda CARGANDO para siempre. Octo cubria song y album pero
+        // NO artist: era un hueco real de su codigo. Misma forma que el de album.
+        var nativeArtist = await TryServeNativeExternalArtistAsync(endpoint);
+        if (nativeArtist != null) return nativeArtist;
+
         // Native album search, the twin of the search3 album injection.
         var nativeAlbumSearch = await TryInjectNativeAlbumSearchAsync(endpoint, parameters);
         if (nativeAlbumSearch != null) return nativeAlbumSearch;
@@ -3141,6 +3149,67 @@ public class SubsonicController : ControllerBase
             ["updatedAt"] = "2020-01-01T00:00:00Z",
         };
         if (!string.IsNullOrEmpty(a.Genre)) o["genre"] = a.Genre;
+        return o;
+    }
+
+    /// <summary>
+    /// Native ARTIST detail for an external id: GET /api/artist/{id}.
+    ///
+    /// PATCH SESE (24sep2026). Octo cubria song, album y albumSongs, pero NO artist.
+    /// Sintoma observado: en Feishin, «ver album/artista» externo se quedaba
+    /// CARGANDO indefinidamente. Causa: la peticion nativa /api/artist/{id} caia al
+    /// relay final hacia Navidrome, que devuelve 401 (ese id es de Octo, no suyo), y
+    /// el relay propagaba un 500. La UI no recibe error claro y espera para siempre.
+    ///
+    /// Se sirve el objeto nativo sintetico en vez de relayar, igual que hacen los
+    /// handlers de album. El campo `id` es el id EXTERNO de Octo, que /rest/stream y
+    /// /rest/getCoverArt ya saben resolver.
+    /// </summary>
+    private async Task<IActionResult?> TryServeNativeExternalArtistAsync(string endpoint)
+    {
+        const string prefix = "api/artist/";
+        if (!endpoint.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return null;
+        var id = endpoint[prefix.Length..].Trim('/');
+        if (string.IsNullOrEmpty(id) || id.Contains('/')) return null;   // leaf id only
+
+        if (_idRegistry.Lookup(id)?.Kind != RoutingKind.Artist) return null;
+
+        var artist = await _metadataService.GetArtistAsync(SoulseekMetadataService.ProviderName, id);
+        if (artist == null) return null;
+
+        var bytes = Encoding.UTF8.GetBytes(BuildNativeArtistObject(artist).ToJsonString());
+        Response.StatusCode = 200;
+        Response.ContentType = "application/json";
+        await Response.Body.WriteAsync(bytes);
+        return new EmptyResult();
+    }
+
+    /// <summary>
+    /// Serializes one external Artist into Navidrome's native artist JSON shape.
+    /// Mismo criterio que BuildNativeAlbumObject: solo los campos que un cliente en
+    /// modo Navidrome lee para pintar la ficha, y un createdAt/updatedAt FIJO para
+    /// que las filas inyectadas no invadan la vista de «añadidos recientemente».
+    /// </summary>
+    private static JsonObject BuildNativeArtistObject(Artist a)
+    {
+        var o = new JsonObject
+        {
+            ["id"] = a.Id,
+            ["name"] = a.Name,
+            ["albumCount"] = a.AlbumCount ?? 0,
+            ["songCount"] = 0,
+            ["size"] = 0,
+            ["playCount"] = 0,
+            ["playDate"] = null,
+            ["rating"] = 0,
+            ["starred"] = false,
+            ["createdAt"] = "2020-01-01T00:00:00Z",
+            ["updatedAt"] = "2020-01-01T00:00:00Z",
+        };
+        // `hasCoverArt` + la URL de imagen: sin esto el cliente pide portada con un
+        // id que Navidrome no conoce y la ficha sale sin caratula.
+        o["hasCoverArt"] = !string.IsNullOrEmpty(a.ImageUrl);
+        if (!string.IsNullOrEmpty(a.ImageUrl)) o["imageUrl"] = a.ImageUrl;
         return o;
     }
 
