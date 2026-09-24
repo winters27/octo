@@ -63,6 +63,7 @@ public class SubsonicController : ControllerBase
     private readonly LastFmRadioRefreshQueue? _radioRefreshQueue;
     private readonly LastFmRadioStreamSessionStore _radioStreamSessions;
     private readonly LastFmRadioStreamService _radioStreams;
+    private readonly SyncCatalogService? _syncCatalog;
 
     public SubsonicController(
         IOptionsMonitor<SubsonicSettings> subsonicSettings,
@@ -93,9 +94,11 @@ public class SubsonicController : ControllerBase
         CoverArtAggregator? coverArtAggregator = null,
         LastFmRadioStateStore? radioStateStore = null,
         LastFmRadioRefreshQueue? radioRefreshQueue = null,
-        Octo.Services.ListenBrainz.ListenBrainzService? listenBrainz = null)
+        Octo.Services.ListenBrainz.ListenBrainzService? listenBrainz = null,
+        SyncCatalogService? syncCatalog = null)
     {
         _listenBrainz = listenBrainz;
+        _syncCatalog = syncCatalog;
         subsonicSettingsOptions = subsonicSettings;
         _metadataService = metadataService;
         _localLibraryService = localLibraryService;
@@ -368,6 +371,13 @@ public class SubsonicController : ControllerBase
             return _responseBuilder.CreateError(format, 40, "Wrong username or password");
 
         var songs = await MaterializeStationAsync(station, parameters);
+
+        // A song this user's sync catalog also holds goes out as the catalog describes it:
+        // same album, and filed under the library's own artist where there is one. A syncing
+        // client stores whichever description it read last, so the two must not disagree.
+        if (_syncCatalog is not null)
+            songs = songs.Select(song =>
+                !song.IsLocal && _syncCatalog.TryGetSong(username, song.Id, out var synced) ? synced : song).ToList();
         _radioQueueStore.Register(songs.Select(song => song.Id));
         _ = _metadataService.PrewarmYouTubeIdsAsync(songs, topN: 8);
         QueueRefreshIfStale(username);
@@ -862,6 +872,14 @@ public class SubsonicController : ControllerBase
         // let the library page normally underneath.
         var songOffset = int.TryParse(parameters.GetValueOrDefault("songOffset", "0"), out var so) ? so : 0;
 
+        // A client that copies the library to the device walks it with an empty query and
+        // never searches the server, so the walk is the only place discovery can reach it.
+        // Scoped to the whole library: a walk of one music folder is left exactly as it was.
+        if (string.IsNullOrWhiteSpace(cleanQuery) && _syncCatalog is not null
+            && !parameters.ContainsKey("musicFolderId")
+            && SyncCatalogService.IsSyncClient(_subsonicSettings, parameters.GetValueOrDefault("c")))
+            return await SyncWalkPageAsync(parameters, searchEndpoint, envelope, format);
+
         if (string.IsNullOrWhiteSpace(cleanQuery) || songOffset > 0)
         {
             try
@@ -1001,6 +1019,129 @@ public class SubsonicController : ControllerBase
         _radioQueueStore.Register(localSongIds.Concat(externalSongs.Select(s => s.Id)));
 
         return MergeSearchResults(localParsed, localResult.ContentType, externalResult, playlistTask, format, envelope);
+    }
+
+    /// <summary>
+    /// How long a sync page waits for the user's catalog to finish building before going
+    /// out without it. Kept short because a page the client gives up on fails its whole
+    /// sync, where a catalog that misses one sync is simply on the next.
+    /// </summary>
+    private static readonly TimeSpan SyncCatalogWait = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// One page of a sync walk: Navidrome's page, then, once the library has run out, the
+    /// user's catalog rows that fill the rest of it. See <see cref="SyncCatalogService"/>.
+    /// Each kind (artist, album, song) is paged on its own, since a client can walk them
+    /// separately or together.
+    /// </summary>
+    private async Task<IActionResult> SyncWalkPageAsync(Dictionary<string, string> parameters,
+        string searchEndpoint, string envelope, string format)
+    {
+        var relay = await _proxyService.RelaySafeAsync(searchEndpoint, parameters);
+        if (!relay.Success || relay.Body is not { Length: > 0 })
+            return _responseBuilder.CreateResponse(format, envelope, new { });
+        IActionResult Unchanged() => File(relay.Body, relay.ContentType ?? $"application/{format}");
+        if (IsFailedSubsonicBody(relay.Body, relay.ContentType)) return Unchanged();
+
+        var username = parameters.GetValueOrDefault("u", "");
+        var stations = VisibleStations(username);
+        var rows = SyncCatalogResponse.CountRows(relay.Body, relay.ContentType, envelope);
+        if (username.Length == 0 || rows is null) return Unchanged();
+
+        int Number(string name, int fallback) =>
+            int.TryParse(parameters.GetValueOrDefault(name, ""), out var value) ? Math.Max(0, value) : fallback;
+        var pages = new[]
+        {
+            (Kind: SyncCatalogKind.Artist, Name: "artist", Returned: rows.Value.Artists),
+            (Kind: SyncCatalogKind.Album, Name: "album", Returned: rows.Value.Albums),
+            (Kind: SyncCatalogKind.Song, Name: "song", Returned: rows.Value.Songs),
+        }.Select(page => (page.Kind, page.Name, page.Returned,
+            Offset: Number(page.Name + "Offset", 0), Count: Number(page.Name + "Count", 20))).ToList();
+
+        // The first page of a walk starts the build, so it has the whole library's worth of
+        // pages to finish in before the walk reaches the catalog.
+        if (pages.Any(page => page.Offset == 0 && page.Count > 0))
+        {
+            QueueRefreshIfStale(username);
+            _syncCatalog!.Warm(username, stations, parameters);
+        }
+        if (stations.Count == 0) return Unchanged();
+
+        async Task<bool?> Exists(SyncCatalogKind kind, int index)
+        {
+            // The client's own empty query, since servers disagree on which spelling of
+            // "everything" they accept.
+            var probe = new Dictionary<string, string>(parameters)
+            {
+                ["f"] = "json",
+                ["artistCount"] = "0", ["albumCount"] = "0", ["songCount"] = "0",
+                ["artistOffset"] = "0", ["albumOffset"] = "0", ["songOffset"] = "0",
+            };
+            var name = kind.ToString().ToLowerInvariant();
+            probe[name + "Count"] = "1"; probe[name + "Offset"] = index.ToString();
+            var result = await _proxyService.RelaySafeAsync(searchEndpoint, probe);
+            if (!result.Success || result.Body is not { Length: > 0 }
+                || IsFailedSubsonicBody(result.Body, result.ContentType)) return null;
+            var counted = SyncCatalogResponse.CountRows(result.Body, result.ContentType ?? "application/json", envelope);
+            if (counted is null) return null;
+            return (kind switch
+            {
+                SyncCatalogKind.Artist => counted.Value.Artists,
+                SyncCatalogKind.Album => counted.Value.Albums,
+                _ => counted.Value.Songs,
+            }) > 0;
+        }
+
+        IReadOnlyList<Artist> artists = [];
+        IReadOnlyList<Album> albums = [];
+        IReadOnlyList<Song> songs = [];
+        SyncCatalog? used = null;
+        foreach (var page in pages)
+        {
+            if (page.Count == 0 || page.Returned >= page.Count) continue;
+            var localTotal = SyncCatalogService.LocalTotalFromPage(page.Offset, page.Returned)
+                ?? await SyncCatalogService.ResolveLocalTotalAsync(page.Offset,
+                    _syncCatalog!.RememberedLocalTotal(username, page.Kind), index => Exists(page.Kind, index));
+            if (localTotal is null) continue;
+
+            // A short page is only the end of the library if nothing follows it. A server that
+            // caps the page size also answers short, and filling that page would make the
+            // client skip the library rows the cap held back.
+            if (page.Returned > 0 && await Exists(page.Kind, localTotal.Value) != false) continue;
+
+            var (start, take) = SyncCatalogService.Window(page.Offset, page.Count, page.Returned, localTotal.Value);
+            var catalog = start > 0 ? _syncCatalog!.PinnedCatalog(username, page.Kind) : null;
+            if (catalog is null)
+            {
+                try
+                {
+                    catalog = await _syncCatalog!.GetAsync(username, stations, parameters)
+                        .WaitAsync(SyncCatalogWait, HttpContext.RequestAborted);
+                }
+                catch (TimeoutException)
+                {
+                    _logger.LogInformation(
+                        "Sync catalog for {User} still building; this sync ends at the library and the next one gets it",
+                        username);
+                    continue;
+                }
+            }
+            _syncCatalog!.Remember(username, page.Kind, localTotal.Value, catalog);
+            used = catalog;
+
+            var slice = SyncCatalogService.Slice(catalog, page.Kind, start, take);
+            if (slice.Artists.Count > 0) artists = slice.Artists;
+            if (slice.Albums.Count > 0) albums = slice.Albums;
+            if (slice.Songs.Count > 0) songs = slice.Songs;
+        }
+
+        if (used is null || artists.Count + albums.Count + songs.Count == 0) return Unchanged();
+        _logger.LogInformation(
+            "Sync walk for {User} ({Client}): added {Songs} songs, {Albums} albums, {Artists} artists after the library",
+            username, parameters.GetValueOrDefault("c", ""), songs.Count, albums.Count, artists.Count);
+        var body = SyncCatalogResponse.Append(relay.Body, relay.ContentType, envelope, _responseBuilder, used,
+            artists, albums, songs);
+        return File(body, relay.ContentType ?? $"application/{format}");
     }
 
     /// <summary>

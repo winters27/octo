@@ -504,6 +504,27 @@
               </div>
               <label class="switch"><input type="checkbox" id="f-playlists" name="Subsonic.EnableExternalPlaylists" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Discovery for offline-search apps</div>
+                <div class="set-info-d">Apps like Symfonium copy your library to the phone and search only that copy, so a search never reaches Octo. With this on, the copy also gets your radio stations' tracks that you don't own yet. They show up in search, play as previews, and heart to download like any other song. Run a full sync in the app to pick up changes.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-sync-catalog" name="Subsonic.EnableSyncCatalog" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Offline-search apps</div>
+                <div class="set-info-d">The client names that get those tracks, separated by commas. Only list apps that search offline: any app listed here shows the tracks in its library views.</div>
+              </div>
+              <input class="set-input" id="f-sync-catalog-clients" name="Subsonic.SyncCatalogClients" placeholder="Symfonium" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Tracks per user <span class="set-opt">50–5000</span></div>
+                <div class="set-info-d">The most station tracks added to one user's copy.</div>
+              </div>
+              <input class="set-input" id="f-sync-catalog-max" name="Subsonic.SyncCatalogMaxSongs" type="number" min="50" max="5000" />
+            </div>
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t">Playlists directory</div>

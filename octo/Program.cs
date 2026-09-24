@@ -131,6 +131,7 @@ builder.Services.AddSingleton(sp => new ExternalIdRegistry(
 builder.Services.AddSingleton<RadioQueueStore>();
 builder.Services.AddSingleton<Octo.Services.Subsonic.NavidromeIdentityService>();
 builder.Services.AddSingleton<Octo.Services.Subsonic.SubsonicDiscoveryService>();
+builder.Services.AddSingleton<Octo.Services.Subsonic.SyncCatalogService>();
 builder.Services.AddSingleton<Octo.Services.Admin.DirectoryBrowser>();
 // Singleton so browse tokens survive between requests; they are in-memory only,
 // so a restart ends every browse session, which is the right trade for a token

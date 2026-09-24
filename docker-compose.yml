@@ -37,6 +37,11 @@ services:
       Subsonic__CacheDurationHours: ${CACHE_DURATION_HOURS:-1}
       Subsonic__EnableExternalPlaylists: ${ENABLE_EXTERNAL_PLAYLISTS:-false}
       Subsonic__EnableSearchDiscovery: ${ENABLE_SEARCH_DISCOVERY:-true}
+      # Clients that sync the library and search offline (Symfonium) get your radio
+      # stations' tracks appended to the sync, so discovery reaches them too.
+      Subsonic__EnableSyncCatalog: ${ENABLE_SYNC_CATALOG:-true}
+      Subsonic__SyncCatalogClients: ${SYNC_CATALOG_CLIENTS:-Symfonium}
+      Subsonic__SyncCatalogMaxSongs: ${SYNC_CATALOG_MAX_SONGS:-1000}
 
       # Where downloaded FLACs land (bind-mount below)
       Library__DownloadPath: /music

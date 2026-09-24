@@ -218,7 +218,39 @@ public class SubsonicSettings
     /// stations are unaffected either way.
     /// </summary>
     public bool EnableSearchDiscovery { get; set; } = true;
-    
+
+    /// <summary>
+    /// Give clients that sync the library to the device a discovery catalog (default: true).
+    /// Environment variable: ENABLE_SYNC_CATALOG
+    ///
+    /// Symfonium copies the whole library by paging search3 with an empty query and then
+    /// searches only that copy, so a typed search never reaches Octo. With this on, the
+    /// copy continues past the last library song with your radio stations' tracks that the
+    /// library does not own. On the device they search, browse and play like any other
+    /// song, the station playlists find their tracks, and a heart downloads one as usual.
+    /// Applies only to the clients named in SyncCatalogClients.
+    /// </summary>
+    public bool EnableSyncCatalog { get; set; } = true;
+
+    /// <summary>
+    /// Clients that get the sync catalog, comma-separated, matched against the client name
+    /// the app sends (the Subsonic <c>c</c> parameter), ignoring case (default: "Symfonium").
+    /// Environment variable: SYNC_CATALOG_CLIENTS
+    ///
+    /// A named client sees catalog songs in its library views, which is the point for an app
+    /// that only ever searches its own copy and noise for one that searches the server. So
+    /// name only the first kind.
+    /// </summary>
+    public string SyncCatalogClients { get; set; } = "Symfonium";
+
+    /// <summary>
+    /// The most songs one user's sync catalog holds (default: 1000, range 50-5000).
+    /// Environment variable: SYNC_CATALOG_MAX_SONGS
+    /// </summary>
+    public int SyncCatalogMaxSongs { get; set; } = 1000;
+
+    public int EffectiveSyncCatalogMaxSongs => Math.Clamp(SyncCatalogMaxSongs, 50, 5000);
+
     /// <summary>
     /// Directory name for storing playlist .m3u files (default: "playlists")
     /// Environment variable: PLAYLISTS_DIRECTORY

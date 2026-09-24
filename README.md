@@ -102,10 +102,24 @@ The installer asks for your Navidrome URL (and, optionally, Last.fm and Soulseek
 | ✅ | [SubTracks](https://github.com/austinried/subtracks) | Android / iOS |
 | ✅ | Tempus | Android |
 | ✅ | most other Subsonic apps | |
-| ❌ | Symfonium | searches its own offline copy, so it never asks the server |
+| 🟡 | [Symfonium](https://symfonium.app/) | your stations' tracks, not free-text search (see below) |
 
-Symfonium is the one that genuinely cannot work. It syncs your library to the device and
-searches locally, so a search never reaches Octo and there is nothing to add results to.
+**Symfonium** copies your library to the phone and searches only that copy, so a typed search
+never reaches Octo. What does reach Octo is the copy itself: Symfonium pages through the whole
+library with an empty `search3` query. Octo continues that walk past your last song with
+your radio stations' tracks that you don't own yet, so they land on the phone as ordinary
+songs. There they search, browse and play as previews like anything else, the station
+playlists find their tracks, and hearting one downloads it exactly as it does from any
+other app. What you can't do is search for any song at all: search on the phone only finds
+what the stations have suggested.
+
+- Run a full sync in Symfonium to pick up new suggestions. Stations refresh as you listen,
+  and Octo rebuilds the list when they change, or an hour after its last build.
+- A song you heart shows up twice for a while: the preview, and the downloaded copy once
+  Navidrome has scanned it. The next sync after the list is rebuilt drops the preview.
+- Controlled under **Behavior → Discovery for offline-search apps** in the admin dashboard
+  (`ENABLE_SYNC_CATALOG`, `SYNC_CATALOG_CLIENTS`, `SYNC_CATALOG_MAX_SONGS`). Only apps listed
+  there get the extra tracks, so apps that search the server keep a clean library view.
 
 **Both search generations are supported.** Subsonic has two search endpoints, `search2` and
 `search3`, and Octo answers either. This matters more than it sounds: DSub and Ultrasonic
