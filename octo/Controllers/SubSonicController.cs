@@ -1394,7 +1394,10 @@ public class SubsonicController : ControllerBase
             var deezerArtist = deezerArtists[0];
             if (deezerArtist.Name.Equals(artistName, StringComparison.OrdinalIgnoreCase))
             {
-                deezerAlbums = await _metadataService.GetArtistAlbumsAsync("deezer", deezerArtist.ExternalId!);
+                // The provider comes from the artist row itself. A hard-coded "deezer" is
+                // rejected by the metadata service, whose provider is "soulseek", so the
+                // missing albums never reached a local artist's page.
+                deezerAlbums = await _metadataService.GetArtistAlbumsAsync(deezerArtist.ExternalProvider!, deezerArtist.ExternalId!);
                 
                 // Fill artist info for each album (Deezer API doesn't include it in artist/albums endpoint)
                 // Use local artist ID and name so albums link back to the local artist

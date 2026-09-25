@@ -584,8 +584,76 @@ public class SoulseekMetadataService : IMusicMetadataService
         };
     }
 
-    public Task<List<Album>> GetArtistAlbumsAsync(string externalProvider, string externalId)
-        => Task.FromResult(new List<Album>());
+    /// <summary>How many artist hits to weigh when recovering a Deezer artist id from a name.
+    /// The top hit is not always the exact name, so an exact match is looked for among a few.</summary>
+    private const int ArtistMatchCandidates = 5;
+
+    /// <summary>
+    /// The artist's discography from Deezer, so getArtist can show releases the library
+    /// does not have. Serves both getArtist paths: an external artist's page, and the
+    /// missing albums merged into a local artist's page.
+    ///
+    /// Artist and ArtistId are left for the caller to decide on purpose: for a local
+    /// artist the controller points these rows back at the Navidrome artist, and setting
+    /// them here would send the user to a second, external copy of the same artist.
+    /// </summary>
+    public async Task<List<Album>> GetArtistAlbumsAsync(string externalProvider, string externalId)
+    {
+        if (!string.Equals(externalProvider, ProviderName, StringComparison.OrdinalIgnoreCase)) return new List<Album>();
+        var routing = _idRegistry.Lookup(externalId);
+        if (routing is null || string.IsNullOrWhiteSpace(routing.Artist)) return new List<Album>();
+
+        // The registry keeps only the artist's name, so the Deezer id is recovered by name.
+        // Exact (case-insensitive) match only: attaching a near-miss's discography would
+        // put another artist's records on this page.
+        var candidates = await _deezer.SearchArtistsAsync(routing.Artist, ArtistMatchCandidates);
+        var match = candidates.FirstOrDefault(c =>
+            string.Equals(c.Name, routing.Artist, StringComparison.OrdinalIgnoreCase));
+        if (match is null)
+        {
+            _logger.LogWarning("getArtist '{Artist}' ({Id}): no exact Deezer artist match; showing no external albums",
+                routing.Artist, externalId);
+            return new List<Album>();
+        }
+
+        var hits = await _deezer.GetArtistAlbumsAsync(match.DeezerId);
+        var albums = new List<Album>(hits.Count);
+
+        // Deezer lists explicit and clean editions as separate releases with the same
+        // title. The registry id is derived from artist + title, so both would mint the
+        // SAME id and the page would show one album twice. Keep the first of each.
+        var seenTitles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Newest first, like a streaming service's artist page. Undated rows go last.
+        foreach (var hit in hits.OrderByDescending(h => h.Year ?? int.MinValue))
+        {
+            if (!seenTitles.Add(hit.Title)) continue;
+
+            // Same routing shape SearchAlbumsAsync registers, so an album reached from the
+            // artist page and the same album found by search are one id, and getAlbum
+            // fetches the exact tracklist through ExternalAlbumId.
+            var albumId = _idRegistry.Register(new SoulseekRouting
+            {
+                Kind = RoutingKind.Album,
+                Artist = match.Name,
+                Album = hit.Title,
+                ExternalAlbumId = hit.DeezerId,
+            });
+
+            albums.Add(new Album
+            {
+                Id = albumId,
+                Title = hit.Title,
+                Year = hit.Year,
+                CoverArtUrl = hit.CoverUrl,
+                IsLocal = false,
+                ExternalProvider = ProviderName,
+                ExternalId = albumId,
+            });
+        }
+
+        return albums;
+    }
 
     public Task<List<ExternalPlaylist>> SearchPlaylistsAsync(string query, int limit = 20)
         => Task.FromResult(new List<ExternalPlaylist>());
