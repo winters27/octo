@@ -414,6 +414,74 @@ public class DeezerMetadataService : IDisposable
         return hits;
     }
 
+    /// <summary>Same ceiling the album tracklist call uses. A discography longer than this
+    /// is logged as truncated rather than silently presented as complete.</summary>
+    private const int ArtistAlbumsLimit = 300;
+
+    /// <summary>
+    /// An artist's releases (albums, EPs, singles and compilations), for the artist page.
+    /// This payload names neither the artist nor the track count, so Artist is empty and
+    /// TrackCount is 0; the caller already knows the artist, and the real track count
+    /// arrives with the album detail when the album is opened.
+    /// </summary>
+    public async Task<List<AlbumHit>> GetArtistAlbumsAsync(string deezerArtistId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(deezerArtistId)) return new List<AlbumHit>();
+        var key = $"aa|{deezerArtistId}";
+        if (TryGetCached<List<AlbumHit>>(key, out var cached)) return cached!;
+
+        var hits = new List<AlbumHit>();
+        try
+        {
+            using var r = await GetJsonAsync($"{Base}/artist/{deezerArtistId}/albums?limit={ArtistAlbumsLimit}", ct);
+            // Same rule as the searches: caching an empty list on a refusal would leave the
+            // artist page empty for the life of the entry.
+            if (r.Transient) return new List<AlbumHit>();
+            if (r.Doc is not null
+                && r.Doc.RootElement.TryGetProperty("data", out var data)
+                && data.ValueKind == JsonValueKind.Array)
+            {
+                // Materialize everything before the JsonDocument is disposed.
+                foreach (var a in data.EnumerateArray())
+                {
+                    var id = a.TryGetProperty("id", out var aid) && aid.ValueKind == JsonValueKind.Number
+                        ? aid.GetInt64().ToString() : null;
+                    var title = Str(a, "title");
+                    if (id is null || string.IsNullOrWhiteSpace(title)) continue;
+
+                    // Unlike the search payload, this one carries the release date.
+                    int? year = null;
+                    var rd = Str(a, "release_date");
+                    if (!string.IsNullOrEmpty(rd) && rd.Length >= 4 && int.TryParse(rd[..4], out var yr))
+                        year = yr;
+
+                    hits.Add(new AlbumHit(
+                        id, title, "",
+                        Str(a, "cover_xl") ?? Str(a, "cover_medium"),
+                        year, 0, Str(a, "record_type")));
+                }
+
+                // Compared against what Deezer sent, not what was kept, so a skipped row
+                // with no title is not mistaken for truncation.
+                var total = Int(r.Doc.RootElement, "total");
+                var returned = data.GetArrayLength();
+                if (total is int n && n > returned)
+                {
+                    _logger.LogWarning(
+                        "deezer artist {Id} has {Total} releases but {Got} were returned; discography is truncated",
+                        deezerArtistId, n, returned);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("deezer artist albums {Id} failed: {M}", deezerArtistId, ex.Message);
+        }
+
+        Put(key, hits, hits.Count == 0 ? NegativeTtl : PositiveTtl);
+        return hits;
+    }
+
     /// <summary>Resolve an artist + album name to a Deezer album id. Needed because album
     /// ids minted from a song row carry no Deezer id, so the name is all we have.</summary>
     public async Task<string?> FindAlbumIdAsync(string? artist, string? album, CancellationToken ct = default)
