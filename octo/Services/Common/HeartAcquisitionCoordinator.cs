@@ -1,10 +1,14 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Options;
 using Octo.Models.Settings;
 using Octo.Services.Lidarr;
 
 namespace Octo.Services.Common;
 
-/// <summary>Routes explicit heart gestures without changing playback acquisition.</summary>
+/// <summary>
+/// Routes explicit heart gestures, and plays when DownloadOnPlay or LidarrAlbumOnPlay ask
+/// for it.
+/// </summary>
 public sealed class HeartAcquisitionCoordinator
 {
     private readonly IOptionsMonitor<SubsonicSettings> _settings;
@@ -33,6 +37,21 @@ public sealed class HeartAcquisitionCoordinator
     public void QueueTrack(string provider, string externalId, string? requestedBy = null)
     {
         _ = AcquireTrackAsync(provider, externalId, requestedBy);
+    }
+
+    // Track ids already handed to Lidarr on play. Each hand-off is an AlbumSearch against
+    // every indexer, and clients request /rest/stream again on every seek.
+    private readonly ConcurrentDictionary<string, byte> _lidarrPlays = new();
+
+    public void QueuePlay(string provider, string externalId, string? requestedBy = null)
+    {
+        var settings = _settings.CurrentValue;
+        // WaitForLosslessOnPlay acquires the track itself, from its own source.
+        if (settings.DownloadOnPlay && !settings.WaitForLosslessOnPlay && PlaySource() is DownloadSource source)
+            _ = _directQueue.Enqueue(provider, externalId, isStar: false, triggerAlbumDownload: false,
+                forcePermanent: true, sourceOverride: source, notifyOnFailure: false, requestedBy: requestedBy);
+        if (settings.LidarrAlbumOnPlay && _lidarrPlays.TryAdd($"{provider}:{externalId}", 0))
+            _ = _lidarr.TryAcquireTrackAsync(provider, externalId, notifyFailure: false, requestedBy);
     }
 
     public void QueueAlbum(string provider, string albumExternalId, string? requestedBy = null)
@@ -131,6 +150,15 @@ public sealed class HeartAcquisitionCoordinator
             .Where(step => albumHeart ? step.AlbumEnabled == true : step.SongEnabled == true)
             .Select(step => step.Source)
             .ToList();
+
+    private DownloadSource? PlaySource()
+    {
+        var sources = EnabledSteps(albumHeart: false).Where(s => s != HeartDownloadSource.Lidarr).ToList();
+        if (sources.Count == 0) return null;
+        return sources[0] == HeartDownloadSource.YouTube ? DownloadSource.YouTube
+            : sources.Contains(HeartDownloadSource.YouTube) ? DownloadSource.SoulseekThenYouTube
+            : DownloadSource.Soulseek;
+    }
 
     private static string SourceName(HeartDownloadSource source) => source switch
     {

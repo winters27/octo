@@ -1471,9 +1471,11 @@ public class SubsonicController : ControllerBase
 
         try
         {
-            // Lossless-on-play remains an explicit opt-in. Normal playback never starts
-            // acquisition: owned ids already went to Navidrome above, and missing ids
-            // stream from YouTube below. Hearts are the normal permanent-copy gesture.
+            // Lossless-on-play remains an explicit opt-in. Normal playback starts no
+            // acquisition unless DownloadOnPlay or LidarrAlbumOnPlay are on: owned ids
+            // already went to Navidrome above, and missing ids stream from YouTube below.
+            // Hearts are the normal permanent-copy gesture.
+            _heartAcquisitions.QueuePlay(provider!, externalId!, RequesterFor(parameters));
             if (_subsonicSettings.WaitForLosslessOnPlay)
             {
                 var acquisition = _acquisitions.Enqueue(provider!, externalId!, isStar: false,

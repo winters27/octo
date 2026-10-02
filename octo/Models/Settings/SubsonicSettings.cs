@@ -315,6 +315,27 @@ public class SubsonicSettings
     public int LosslessWaitTimeoutSeconds { get; set; } = 0;
 
     /// <summary>
+    /// Keep a copy of every external track that is played, not only of hearted ones
+    /// (default: false).
+    /// Environment variable: DOWNLOAD_ON_PLAY
+    ///
+    /// The copy comes from the first source with song hearts enabled in the heart download
+    /// priority that Octo downloads from itself (Soulseek, YouTube; Lidarr is skipped, see
+    /// LidarrAlbumOnPlay). Playback still starts from the YouTube stream. Radio and other
+    /// continuous play keep every track they play.
+    /// </summary>
+    public bool DownloadOnPlay { get; set; } = false;
+
+    /// <summary>
+    /// Hand the album of every played external track to Lidarr (default: false).
+    /// Environment variable: LIDARR_ALBUM_ON_PLAY
+    ///
+    /// Works like a Lidarr song heart, once per track and run. Every hand-off makes Lidarr
+    /// search all its indexers, and radio pulls in an album per played track.
+    /// </summary>
+    public bool LidarrAlbumOnPlay { get; set; } = false;
+
+    /// <summary>
     /// Folder structure for downloaded tracks (default: Flat)
     /// Environment variable: FOLDER_STRUCTURE
     /// Values: "Organized" (Artist/Album/Track.flac), "Flat" (Artist - Title.flac)

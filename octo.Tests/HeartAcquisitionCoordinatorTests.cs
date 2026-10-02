@@ -272,4 +272,79 @@ public class HeartAcquisitionCoordinatorTests
             It.IsAny<string>(), It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<string?>()), Times.Never);
         lidarr.Verify(x => x.TryAcquireAlbumAsync("soulseek", "album-id", true, It.IsAny<string?>()), Times.Once);
     }
+
+    private static SubsonicSettings PlaySettings(bool downloadOnPlay, bool lidarrAlbumOnPlay) => new()
+    {
+        DownloadOnPlay = downloadOnPlay,
+        LidarrAlbumOnPlay = lidarrAlbumOnPlay,
+        HeartDownloadSources =
+        [
+            new HeartDownloadStep { Source = HeartDownloadSource.Lidarr, SongEnabled = true, AlbumEnabled = true },
+            new HeartDownloadStep { Source = HeartDownloadSource.YouTube, SongEnabled = true, AlbumEnabled = true },
+            new HeartDownloadStep { Source = HeartDownloadSource.Soulseek, SongEnabled = false, AlbumEnabled = false },
+        ],
+    };
+
+    private static async Task<AcquisitionRequest?> NextQueued(TrackAcquisitionQueue queue)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+        try
+        {
+            return await queue.DequeueAsync(timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    [Fact]
+    public async Task PlayStartsNothingByDefault()
+    {
+        var lidarr = new Mock<ILidarrHeartAcquisitionService>();
+        var queue = new TrackAcquisitionQueue(new Mock<ILogger<TrackAcquisitionQueue>>().Object);
+        var coordinator = new HeartAcquisitionCoordinator(TestOptions.Monitor(PlaySettings(false, false)),
+            queue, new Mock<IDownloadService>().Object, lidarr.Object, CoordinatorLogger);
+
+        coordinator.QueuePlay("soulseek", "track-id");
+
+        Assert.Null(await NextQueued(queue));
+        lidarr.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task DownloadOnPlayQueuesTheFirstDirectSongSourceAndSkipsLidarr()
+    {
+        var lidarr = new Mock<ILidarrHeartAcquisitionService>();
+        var queue = new TrackAcquisitionQueue(new Mock<ILogger<TrackAcquisitionQueue>>().Object);
+        var coordinator = new HeartAcquisitionCoordinator(TestOptions.Monitor(PlaySettings(true, false)),
+            queue, new Mock<IDownloadService>().Object, lidarr.Object, CoordinatorLogger);
+
+        coordinator.QueuePlay("soulseek", "track-id", "felix");
+
+        var request = await NextQueued(queue);
+        Assert.NotNull(request);
+        Assert.Equal("track-id", request.ExternalId);
+        Assert.False(request.IsStar);
+        Assert.True(request.ForcePermanent);
+        Assert.Equal(DownloadSource.YouTube, request.SourceOverride);
+        lidarr.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task LidarrAlbumOnPlayHandsEachTrackToLidarrOnce()
+    {
+        var lidarr = new Mock<ILidarrHeartAcquisitionService>();
+        lidarr.Setup(x => x.TryAcquireTrackAsync("soulseek", "track-id", false, It.IsAny<string?>()))
+            .ReturnsAsync(true);
+        var queue = new TrackAcquisitionQueue(new Mock<ILogger<TrackAcquisitionQueue>>().Object);
+        var coordinator = new HeartAcquisitionCoordinator(TestOptions.Monitor(PlaySettings(false, true)),
+            queue, new Mock<IDownloadService>().Object, lidarr.Object, CoordinatorLogger);
+
+        coordinator.QueuePlay("soulseek", "track-id");
+        coordinator.QueuePlay("soulseek", "track-id");
+
+        Assert.Null(await NextQueued(queue));
+        lidarr.Verify(x => x.TryAcquireTrackAsync("soulseek", "track-id", false, It.IsAny<string?>()), Times.Once);
+    }
 }
