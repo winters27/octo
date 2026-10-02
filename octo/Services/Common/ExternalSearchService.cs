@@ -1,4 +1,6 @@
+using Microsoft.Extensions.Options;
 using Octo.Models.Domain;
+using Octo.Models.Settings;
 using Octo.Services.LastFm;
 
 namespace Octo.Services.Common;
@@ -57,16 +59,19 @@ public sealed class ExternalSearchService
     private readonly SupersedableBuildCoordinator<List<Album>> _albumBuilds = new();
     private readonly IMusicMetadataService _metadata;
     private readonly LastFmService? _lastFm;
+    private readonly IOptionsMonitor<SubsonicSettings>? _subsonic;
     private readonly ILogger<ExternalSearchService> _logger;
 
     public ExternalSearchService(
         IMusicMetadataService metadata,
         ILogger<ExternalSearchService> logger,
-        LastFmService? lastFm = null)
+        LastFmService? lastFm = null,
+        IOptionsMonitor<SubsonicSettings>? subsonic = null)
     {
         _metadata = metadata;
         _logger = logger;
         _lastFm = lastFm;
+        _subsonic = subsonic;
     }
 
     /// <summary>
@@ -162,7 +167,8 @@ public sealed class ExternalSearchService
         // list from the real YouTube video (so the scrub bar matches the audio and the
         // client advances correctly). Bounded + cached.
         await _metadata.EnrichExternalSongsAsync(songs, ct);
-        await _metadata.ResolveTopDurationsAsync(songs, ct);
+        var waitForDurations = _subsonic?.CurrentValue.WaitForSearchDurations ?? true;
+        if (waitForDurations) await _metadata.ResolveTopDurationsAsync(songs, ct);
 
         // Fire-and-forget: pre-resolve YouTube videoIds for the top hits so the first
         // /rest/stream click doesn't pay the cold yt-dlp double-call cost (ytsearch1: + -g,
@@ -175,7 +181,13 @@ public sealed class ExternalSearchService
         // a different one using the Deezer duration — so for the top rows the two raced and
         // the loser could leave a song advertising the length of a video that would not be
         // the one played.
-        _ = _metadata.PrewarmYouTubeIdsAsync(songs, topN: 12);
+        _ = waitForDurations
+            ? _metadata.PrewarmYouTubeIdsAsync(songs, topN: 12)
+            : Task.Run(async () =>
+            {
+                await _metadata.ResolveTopDurationsAsync(songs, CancellationToken.None);
+                await _metadata.PrewarmYouTubeIdsAsync(songs, topN: 12);
+            });
 
         // Same reasoning, for cover art: a client renders the first screen of results a
         // moment after this returns, and without a prewarm each row's getCoverArt call

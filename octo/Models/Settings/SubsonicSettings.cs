@@ -220,6 +220,18 @@ public class SubsonicSettings
     public bool EnableSearchDiscovery { get; set; } = true;
 
     /// <summary>
+    /// Resolve the YouTube durations of the top discovery rows before search3/search2
+    /// answers (default: true).
+    /// Environment variable: WAIT_FOR_SEARCH_DURATIONS
+    ///
+    /// Off, search answers with Deezer's durations and resolves the YouTube ones in the
+    /// background, which saves a few seconds per new query. getSong resolves the exact
+    /// duration when a track starts, so clients that fetch it on play see the right length;
+    /// clients that only use the length from the search results may show Deezer's.
+    /// </summary>
+    public bool WaitForSearchDurations { get; set; } = true;
+
+    /// <summary>
     /// Give clients that sync the library to the device a discovery catalog (default: true).
     /// Environment variable: ENABLE_SYNC_CATALOG
     ///

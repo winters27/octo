@@ -37,6 +37,7 @@ services:
       Subsonic__CacheDurationHours: ${CACHE_DURATION_HOURS:-1}
       Subsonic__EnableExternalPlaylists: ${ENABLE_EXTERNAL_PLAYLISTS:-false}
       Subsonic__EnableSearchDiscovery: ${ENABLE_SEARCH_DISCOVERY:-true}
+      Subsonic__WaitForSearchDurations: ${WAIT_FOR_SEARCH_DURATIONS:-true}
       # Clients that sync the library and search offline (Symfonium) get your radio
       # stations' tracks appended to the sync, so discovery reaches them too.
       Subsonic__EnableSyncCatalog: ${ENABLE_SYNC_CATALOG:-true}
