@@ -12,6 +12,8 @@ Play songs you don't own yet, and keep the ones you like as FLAC.
 [![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED)](https://docs.docker.com/compose/)
 [![CI](https://github.com/winters27/octo/actions/workflows/ci.yml/badge.svg)](https://github.com/winters27/octo/actions/workflows/ci.yml)
 
+<a href="https://winters27.github.io/octo/fdroid/"><img src="https://f-droid.org/badge/get-it-on.png" alt="Get the Octo Android app on F-Droid" height="80"></a>
+
 </div>
 
 ---
@@ -37,7 +39,7 @@ Octo is a proxy, so it works with your Navidrome server and the Subsonic apps yo
 <tr><td width="33%"><img src="docs/images/players/phone-search.webp" alt="Search in the Octo Android app"></td><td width="33%"><img src="docs/images/players/phone-album.webp" alt="An album in the Octo Android app"></td><td width="33%"><img src="docs/images/players/phone-player.webp" alt="The player in the Octo Android app"></td></tr>
 </table>
 
-The desktop app runs on Windows and Linux, and the Android app on Android 10 and newer. They need Octo 2026.09.29 or newer, and they work as regular players with Navidrome too. Download them from [Octo for Windows and Linux](https://github.com/winters27/octo/releases/tag/desktop-v1.1.0) and [Octo for Android](https://github.com/winters27/octo/releases/tag/android-v1.1.0); the source is at [winters27/octo-player](https://github.com/winters27/octo-player).
+The desktop app runs on Windows and Linux, and the Android app on Android 10 and newer. They need Octo 2026.09.29 or newer, and they work as regular players with Navidrome too. Download them from [Octo for Windows and Linux](https://github.com/winters27/octo/releases/tag/desktop-v1.3.2) and [Octo for Android](https://github.com/winters27/octo/releases/tag/android-v1.2.4), or add [Octo's F-Droid repository](https://winters27.github.io/octo/fdroid/) so the Android app updates through F-Droid, Droid-ify or Neo Store. The source is at [winters27/octo-player](https://github.com/winters27/octo-player).
 
 ## What Octo does
 
