@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<fdroid>
+	<repo icon="octo.png" name="Octo" pubkey="30820505308202eda00302010202086279a9c757f321c6300d06092a864886f70d01010c0500303031123010060355040a130977696e746572733237311a3018060355040313114f63746f20462d44726f6964207265706f3020170d3236313030333039353232365a180f32313236303930393039353232365a303031123010060355040a130977696e746572733237311a3018060355040313114f63746f20462d44726f6964207265706f30820222300d06092a864886f70d01010105000382020f003082020a0282020100b0409862e98105f558482fc3c409e0c7e49ae2945813e1591bdf04318ca3ac9768151d0df5a6c603a26e61d83ce2a91c259dbbf8e1badeb0d38928b2ab9fb9de9e78858e6ff6b37f82ac78c16456c8283810cd0af14a23469dbb11bb24f507362c24ec076ed24ea6608560b9b654b179f0013736a0b3f57d833835ff1b646ff903c91c25e3d5b5208aeb72fcb6c73fac6a18db4dca8a193a111be56abe92dbcc79421f3f5061e14ac7f11d2d8f7d6d8ac9bc781c2caff5265276cb2823f95d7fc894e180f65f57833b729f9b38c6af2016843e29a1db5cebd856048a7a0e495a60d7cf9d17c8422084e7f51034642c13dffffc4b1c6c69312cb7d5826a9eafc3b60c81cadc8a9867c61f56eaac40884e20f7926afe34b7c4da164dd2b914f3931b3a8a21d034af1bdfd2afd7099c2ffa990656b71a06739e95b6a7e2dfa2aaba1bbcbe9611b7c2c284d15f07fa3eb2827379a22d1e237a586f35cd800f9005aae00d84fe6f5c5d9e547cb215e9e1dbb28f576efc45700f191cb67d448c1f8aeaac74b2e0b8d5409f4fe972354daab6d3cd8864b728a4cb3c8732338f04138c91f9c93ae6cbad1983537b582829aec638735a2290b74f9945d0dd5027166d088fd5f9412f95334fe4af8de9562058c9d76eef971a81f0eb5c919cbcfbd753f2b4833b6202e16a3530156a6b0cf9fa3e5eebf3b45201e3ab93b5b25130b6c14e950203010001a321301f301d0603551d0e0416041408bd29a9177a44be77a8dbd2624f2ceacbb7f8e4300d06092a864886f70d01010c0500038202010072098a09d60d9c3b74d35d08534781c8aaa2655c035c6afebc6796dccc3186f8618af7d6d8d826ac01c118fe7587f0e363714adf4846194798f538afde7f7b874bbdb54d8423aa858b620a67a8a3546376ed8dbbffa6c380910edecf0ef2e9b2f9acd717d0cab134ef221645f4ee8c0fb2de963a291c908311eeca168903b2188f47e0f5871da4db04a53de396e8a7998c6733bf548fcf603ef2ee755ebea8c02368325a23d5ae4820de77ee9beffa74f132a214f870dc5d16b678f36d50ae34200c0d600452ac1ea88254fc439a02393338e8698cdb7e619573817eb71ef3399881c0530fa9c1ae797ec444558bbb41c6b90f7c04fcca9c353479985a4b6f4a001a06b4ca174d199a1e2f852c0b75197e70ca703cbccdeea3088bf33efbdbabfc942f61e005e6a7c1a2c1a05f070e39807eaa4dde14e473a202376c90c5b05ffcaa3200996a64616e4b4b97b1fdb00de03c7b2cfdad276be3b8bc0306cc98020d4afea11ca1bfed9a7a2ab3c46c591167d14fa9848b81062db69a5c4530157d03052717d08df9e9fbe5b6d3f748e93304fdd13aeb0381659d09382184354ba2719827e6523b15bf676b3fad209787cfb211e354f5e9b7c06c3c2a012ba18d7053f1a109dd3e53daf022be49585f1b62aec8bd6f225cc4f5f5cca0386325e1a0a238b183d864d67db3a828d523da3eedf67635aee40e75647b34838ed57ca7d5" timestamp="1791026454" url="https://winters27.github.io/octo/fdroid/repo" version="20002">
+		<description>The Octo music player for Android, for your Octo or Navidrome server. Releases come from https://github.com/winters27/octo/releases.</description>
+	</repo>
+	<application id="app.winters.octo">
+		<id>app.winters.octo</id>
+		<added>2026-10-03</added>
+		<lastupdated>2026-10-03</lastupdated>
+		<name>Octo</name>
+		<summary>Music player for your Octo or Navidrome server</summary>
+		<desc>Octo plays the music on your own server. It is made for Octo, a proxy that adds discovery to a Navidrome server, and it works with any Subsonic server too.
+
+With Octo:
+
+* Add songs, albums and search results you find to your library with one press.
+* One search for everything: your music first, then what Octo found, all playable at once.
+* Whole albums, with the songs you have marked and the rest one press away.
+* Stations on Home, and radio that reaches past your library.
+
+With any Subsonic server, it is a full player for the music you have: browse by artist, album, song, genre or folder, with favourites, ratings and playlists; synced lyrics, gapless playback, an equalizer with presets, ReplayGain and a sleep timer; and a queue that follows you between your phone and computer.</desc>
+		<license>GPL-3.0-or-later</license>
+		<categories>Multimedia</categories>
+		<category>Multimedia</category>
+		<web>https://github.com/winters27/octo</web>
+		<source></source>
+		<tracker>https://github.com/winters27/octo/issues</tracker>
+		<changelog>https://github.com/winters27/octo/releases</changelog>
+		<author>winters27</author>
+		<marketversion></marketversion>
+		<marketvercode>655</marketvercode>
+		<package>
+			<version>1.3.0</version>
+			<versioncode>655</versioncode>
+			<apkname>Octo-1.3.0-android.apk</apkname>
+			<hash type="sha256">705b3d7eaf1f5be043a5cbf384e2b59244ac9e36aee9dfff500164ab1f08a532</hash>
+			<size>61205041</size>
+			<sdkver>29</sdkver>
+			<targetSdkVersion>36</targetSdkVersion>
+			<added>2026-10-03</added>
+			<sig>7a0c9172bfec2938a17026ff8f472c7b</sig>
+			<permissions>ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CHANGE_WIFI_MULTICAST_STATE,FOREGROUND_SERVICE,FOREGROUND_SERVICE_MEDIA_PLAYBACK,INTERNET,READ_EXTERNAL_STORAGE,READ_MEDIA_AUDIO,REQUEST_INSTALL_PACKAGES,UPDATE_PACKAGES_WITHOUT_USER_ACTION,WAKE_LOCK,WRITE_SETTINGS,app.winters.octo.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION</permissions>
+			<uses-permission maxSdkVersion="32" name="android.permission.READ_EXTERNAL_STORAGE"/>
+			<nativecode>arm64-v8a,armeabi-v7a,x86,x86_64</nativecode>
+		</package>
+		<package>
+			<version>1.2.4</version>
+			<versioncode>652</versioncode>
+			<apkname>Octo-1.2.4-android.apk</apkname>
+			<hash type="sha256">4a5a10cce62ac02d29fcbd767270aaf6df6fa6f4daa1389a1cff47fe74edd89c</hash>
+			<size>61114806</size>
+			<sdkver>29</sdkver>
+			<targetSdkVersion>36</targetSdkVersion>
+			<added>2026-10-03</added>
+			<sig>7a0c9172bfec2938a17026ff8f472c7b</sig>
+			<permissions>ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CHANGE_WIFI_MULTICAST_STATE,FOREGROUND_SERVICE,FOREGROUND_SERVICE_MEDIA_PLAYBACK,INTERNET,READ_EXTERNAL_STORAGE,READ_MEDIA_AUDIO,REQUEST_INSTALL_PACKAGES,UPDATE_PACKAGES_WITHOUT_USER_ACTION,WAKE_LOCK,WRITE_SETTINGS,app.winters.octo.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION</permissions>
+			<uses-permission maxSdkVersion="32" name="android.permission.READ_EXTERNAL_STORAGE"/>
+			<nativecode>arm64-v8a,armeabi-v7a,x86,x86_64</nativecode>
+		</package>
+		<package>
+			<version>1.2.3</version>
+			<versioncode>650</versioncode>
+			<apkname>Octo-1.2.3-android.apk</apkname>
+			<hash type="sha256">8db9698b7ea1aef814c6137aafe65d8c9616b531aa425c5b9435110026ece8ff</hash>
+			<size>61098422</size>
+			<sdkver>29</sdkver>
+			<targetSdkVersion>36</targetSdkVersion>
+			<added>2026-10-03</added>
+			<sig>7a0c9172bfec2938a17026ff8f472c7b</sig>
+			<permissions>ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CHANGE_WIFI_MULTICAST_STATE,FOREGROUND_SERVICE,FOREGROUND_SERVICE_MEDIA_PLAYBACK,INTERNET,READ_EXTERNAL_STORAGE,READ_MEDIA_AUDIO,REQUEST_INSTALL_PACKAGES,UPDATE_PACKAGES_WITHOUT_USER_ACTION,WAKE_LOCK,WRITE_SETTINGS,app.winters.octo.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION</permissions>
+			<uses-permission maxSdkVersion="32" name="android.permission.READ_EXTERNAL_STORAGE"/>
+			<nativecode>arm64-v8a,armeabi-v7a,x86,x86_64</nativecode>
+		</package>
+	</application>
+</fdroid>

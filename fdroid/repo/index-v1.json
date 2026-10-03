@@ -1,0 +1,259 @@
+{
+  "repo": {
+    "timestamp": 1791026454000,
+    "version": 20002,
+    "name": "Octo",
+    "icon": "octo.png",
+    "address": "https://winters27.github.io/octo/fdroid/repo",
+    "description": "The Octo music player for Android, for your Octo or Navidrome server. Releases come from https://github.com/winters27/octo/releases."
+  },
+  "requests": {
+    "install": [],
+    "uninstall": []
+  },
+  "apps": [
+    {
+      "authorName": "winters27",
+      "categories": [
+        "Multimedia"
+      ],
+      "changelog": "https://github.com/winters27/octo/releases",
+      "suggestedVersionCode": "655",
+      "description": "Octo plays the music on your own server. It is made for Octo, a proxy that adds discovery to a Navidrome server, and it works with any Subsonic server too.\n\nWith Octo:\n\n* Add songs, albums and search results you find to your library with one press.\n* One search for everything: your music first, then what Octo found, all playable at once.\n* Whole albums, with the songs you have marked and the rest one press away.\n* Stations on Home, and radio that reaches past your library.\n\nWith any Subsonic server, it is a full player for the music you have: browse by artist, album, song, genre or folder, with favourites, ratings and playlists; synced lyrics, gapless playback, an equalizer with presets, ReplayGain and a sleep timer; and a queue that follows you between your phone and computer.",
+      "issueTracker": "https://github.com/winters27/octo/issues",
+      "license": "GPL-3.0-or-later",
+      "name": "Octo",
+      "summary": "Music player for your Octo or Navidrome server",
+      "webSite": "https://github.com/winters27/octo",
+      "added": 1791026447000,
+      "packageName": "app.winters.octo",
+      "lastUpdated": 1791026449000
+    }
+  ],
+  "packages": {
+    "app.winters.octo": [
+      {
+        "added": 1791026447000,
+        "apkName": "Octo-1.3.0-android.apk",
+        "hash": "705b3d7eaf1f5be043a5cbf384e2b59244ac9e36aee9dfff500164ab1f08a532",
+        "hashType": "sha256",
+        "minSdkVersion": 29,
+        "nativecode": [
+          "arm64-v8a",
+          "armeabi-v7a",
+          "x86",
+          "x86_64"
+        ],
+        "packageName": "app.winters.octo",
+        "sig": "7a0c9172bfec2938a17026ff8f472c7b",
+        "signer": "93838bbbc34af54ff5b812d8bef10170570dccbb4ce7a849d46b33458b7cd3be",
+        "size": 61205041,
+        "targetSdkVersion": 36,
+        "uses-permission": [
+          [
+            "android.permission.INTERNET",
+            null
+          ],
+          [
+            "android.permission.ACCESS_NETWORK_STATE",
+            null
+          ],
+          [
+            "android.permission.READ_MEDIA_AUDIO",
+            null
+          ],
+          [
+            "android.permission.READ_EXTERNAL_STORAGE",
+            32
+          ],
+          [
+            "android.permission.FOREGROUND_SERVICE",
+            null
+          ],
+          [
+            "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+            null
+          ],
+          [
+            "android.permission.WAKE_LOCK",
+            null
+          ],
+          [
+            "android.permission.CHANGE_WIFI_MULTICAST_STATE",
+            null
+          ],
+          [
+            "android.permission.ACCESS_WIFI_STATE",
+            null
+          ],
+          [
+            "android.permission.WRITE_SETTINGS",
+            null
+          ],
+          [
+            "android.permission.REQUEST_INSTALL_PACKAGES",
+            null
+          ],
+          [
+            "android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION",
+            null
+          ],
+          [
+            "app.winters.octo.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+            null
+          ]
+        ],
+        "versionCode": 655,
+        "versionName": "1.3.0"
+      },
+      {
+        "added": 1791026448000,
+        "apkName": "Octo-1.2.4-android.apk",
+        "hash": "4a5a10cce62ac02d29fcbd767270aaf6df6fa6f4daa1389a1cff47fe74edd89c",
+        "hashType": "sha256",
+        "minSdkVersion": 29,
+        "nativecode": [
+          "arm64-v8a",
+          "armeabi-v7a",
+          "x86",
+          "x86_64"
+        ],
+        "packageName": "app.winters.octo",
+        "sig": "7a0c9172bfec2938a17026ff8f472c7b",
+        "signer": "93838bbbc34af54ff5b812d8bef10170570dccbb4ce7a849d46b33458b7cd3be",
+        "size": 61114806,
+        "targetSdkVersion": 36,
+        "uses-permission": [
+          [
+            "android.permission.INTERNET",
+            null
+          ],
+          [
+            "android.permission.ACCESS_NETWORK_STATE",
+            null
+          ],
+          [
+            "android.permission.READ_MEDIA_AUDIO",
+            null
+          ],
+          [
+            "android.permission.READ_EXTERNAL_STORAGE",
+            32
+          ],
+          [
+            "android.permission.FOREGROUND_SERVICE",
+            null
+          ],
+          [
+            "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+            null
+          ],
+          [
+            "android.permission.WAKE_LOCK",
+            null
+          ],
+          [
+            "android.permission.CHANGE_WIFI_MULTICAST_STATE",
+            null
+          ],
+          [
+            "android.permission.ACCESS_WIFI_STATE",
+            null
+          ],
+          [
+            "android.permission.WRITE_SETTINGS",
+            null
+          ],
+          [
+            "android.permission.REQUEST_INSTALL_PACKAGES",
+            null
+          ],
+          [
+            "android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION",
+            null
+          ],
+          [
+            "app.winters.octo.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+            null
+          ]
+        ],
+        "versionCode": 652,
+        "versionName": "1.2.4"
+      },
+      {
+        "added": 1791026449000,
+        "apkName": "Octo-1.2.3-android.apk",
+        "hash": "8db9698b7ea1aef814c6137aafe65d8c9616b531aa425c5b9435110026ece8ff",
+        "hashType": "sha256",
+        "minSdkVersion": 29,
+        "nativecode": [
+          "arm64-v8a",
+          "armeabi-v7a",
+          "x86",
+          "x86_64"
+        ],
+        "packageName": "app.winters.octo",
+        "sig": "7a0c9172bfec2938a17026ff8f472c7b",
+        "signer": "93838bbbc34af54ff5b812d8bef10170570dccbb4ce7a849d46b33458b7cd3be",
+        "size": 61098422,
+        "targetSdkVersion": 36,
+        "uses-permission": [
+          [
+            "android.permission.INTERNET",
+            null
+          ],
+          [
+            "android.permission.ACCESS_NETWORK_STATE",
+            null
+          ],
+          [
+            "android.permission.READ_MEDIA_AUDIO",
+            null
+          ],
+          [
+            "android.permission.READ_EXTERNAL_STORAGE",
+            32
+          ],
+          [
+            "android.permission.FOREGROUND_SERVICE",
+            null
+          ],
+          [
+            "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+            null
+          ],
+          [
+            "android.permission.WAKE_LOCK",
+            null
+          ],
+          [
+            "android.permission.CHANGE_WIFI_MULTICAST_STATE",
+            null
+          ],
+          [
+            "android.permission.ACCESS_WIFI_STATE",
+            null
+          ],
+          [
+            "android.permission.WRITE_SETTINGS",
+            null
+          ],
+          [
+            "android.permission.REQUEST_INSTALL_PACKAGES",
+            null
+          ],
+          [
+            "android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION",
+            null
+          ],
+          [
+            "app.winters.octo.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+            null
+          ]
+        ],
+        "versionCode": 650,
+        "versionName": "1.2.3"
+      }
+    ]
+  }
+}
