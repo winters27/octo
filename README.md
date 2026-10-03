@@ -12,8 +12,6 @@ Play songs you don't own yet, and keep the ones you like as FLAC.
 [![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED)](https://docs.docker.com/compose/)
 [![CI](https://github.com/winters27/octo/actions/workflows/ci.yml/badge.svg)](https://github.com/winters27/octo/actions/workflows/ci.yml)
 
-<a href="https://winters27.github.io/octo/fdroid/"><img src="https://f-droid.org/badge/get-it-on.png" alt="Get the Octo Android app on F-Droid" height="80"></a>
-
 </div>
 
 ---
