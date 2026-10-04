@@ -16,7 +16,8 @@ public sealed record AlbumFolderChoice(string Username, string Folder,
 /// batch instead of a search, a peer and a queue per song.
 ///
 /// Every check a song's own search makes applies to each file here too: the title as a phrase in
-/// the file name, a length within the window, no version the track did not ask for. On top of that
+/// the file name, a length within the window, no version the track did not ask for and none it
+/// asked for missing. On top of that
 /// a file's leading track number counts, and matching is global rather than in track order, so
 /// "Hold On" never takes "Hold On, We're Going Home" when both are on the record.
 /// </summary>
@@ -98,6 +99,7 @@ public static class AlbumFolderPicker
             if (!SoulseekDownloadService.FilenamePlausiblyMatchesTitle(file.Filename, track.Title, requirePhrase: true)) continue;
             if (!SoulseekDownloadService.DurationPlausible(file.Length, track.Duration)) continue;
             if (SoulseekDownloadService.AddsVersion(file.Filename, track.Title)) continue;
+            if (VersionVariant.LacksRequested(file.Filename, track.Title)) continue;
             var leaf = Path.GetFileNameWithoutExtension(file.Filename.Replace('\\', '/').Split('/')[^1]);
             var number = LeadingNumber.Match(leaf) is { Success: true } m && int.TryParse(m.Groups[1].Value, out var n) ? n : (int?)null;
             var score = (ExactTitle(leaf, track.Title) ? 0 : 3)
