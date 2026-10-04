@@ -571,8 +571,9 @@ public class SoulseekDownloadService : BaseDownloadService
                 CandidateAllowed(hit, _rejectedPeers, _verification.RemembersRejections)
                 && string.Equals(hit.Extension, wantedExt, StringComparison.OrdinalIgnoreCase)
                 && hit.Size >= _settings.MinFileSizeBytes
-                // A studio album is never taken from a live album's folder.
-                && !FromLiveFolder(hit.Filename, "", album.Title));
+                // A studio album is never taken from a live album's folder, nor from a remix or
+                // radio edit compilation's.
+                && !FromVersionFolder(hit.Filename, "", album.Title, album.Artist));
             if (choice is null)
             {
                 Logger.LogInformation("Album '{Album}': no one folder covers enough of it; searching song by song", album.Title);
@@ -684,6 +685,8 @@ public class SoulseekDownloadService : BaseDownloadService
             List<SoulseekFileHit> found = [];
             // Every query's answers, for the folder look below.
             List<SoulseekFileHit> everyHit = [];
+            // One wider search per song at most: each one waits seconds.
+            var widened = false;
             foreach (var (query, strict) in queries)
             {
                 if (ReferenceEquals(query, queries[0].Query))
@@ -692,11 +695,27 @@ public class SoulseekDownloadService : BaseDownloadService
                     Logger.LogInformation("Soulseek query returned no usable hits; retrying with '{Query}'", query.Text);
                 // Ranked once, on the whole search: slskd hands over a search's answers only when it
                 // ends, so there is nothing to stop early on.
-                hits = await _slskd.SearchAsync(query.Text, profile, cancellationToken);
+                var outcome = await _slskd.SearchWithEndAsync(query.Text, profile, cancellationToken);
+                hits = outcome.Hits;
                 everyHit.AddRange(hits);
-                found = RankCandidates(hits, routing.Title!, routing.Duration, strict, routing.Album)
+                found = RankCandidates(hits, routing.Title!, routing.Duration, strict, routing.Album, routing.Artist)
                     .Where(h => passOver is null || h.Username != passOver.Username || h.Filename != passOver.Filename)
                     .ToList();
+                if (found.Count == 0 && outcome.HitLimit && !widened)
+                {
+                    // The limit filled before the answers ran out, so the peers still on their way
+                    // were never heard. The same words once more, wider, before other words.
+                    widened = true;
+                    var wider = profile.Wider();
+                    Logger.LogInformation(
+                        "Soulseek search '{Query}' filled its limit with nothing usable; asking again for up to {Files} files",
+                        query.Text, wider.FileLimit);
+                    hits = (await _slskd.SearchWithEndAsync(query.Text, wider, cancellationToken)).Hits;
+                    everyHit.AddRange(hits);
+                    found = RankCandidates(hits, routing.Title!, routing.Duration, strict, routing.Album, routing.Artist)
+                        .Where(h => passOver is null || h.Username != passOver.Username || h.Filename != passOver.Filename)
+                        .ToList();
+                }
                 if (found.Count > 0) break;
             }
             if (found.Count == 0)
@@ -1201,10 +1220,12 @@ public class SoulseekDownloadService : BaseDownloadService
     ///
     /// The same reading TrackMatchComparer applies to the title AcoustID identified, so a peer
     /// is never chosen for a file the verification would then reject, delete and deny-list. A
-    /// remaster, an explicit tag or an "Original Mix" is the same recording and passes.
+    /// remaster, an explicit tag or an "Original Mix" is the same recording and passes. A name
+    /// that runs its version on with no brackets ("Too Close-radio edit") is read too.
     /// </summary>
-    internal static bool AddsVersion(string filename, string title) =>
-        SongIdentity.AddedVersions(title, LeafTitle(filename)).Count > 0;
+    internal static bool AddsVersion(string filename, string title, string? artist = null) =>
+        SongIdentity.AddedVersions(title, LeafTitle(filename)).Count > 0
+        || VersionVariant.UnrequestedInName(filename, title, artist).Count > 0;
 
     /// <summary>How many peers' folders are looked in when a search finds only lossy copies.</summary>
     internal const int PeerFoldersToBrowse = 3;
@@ -1229,8 +1250,8 @@ public class SoulseekDownloadService : BaseDownloadService
             .Where(h => FolderOfFile(h.Filename).Length > 0)
             .Where(h => FilenamePlausiblyMatchesTitle(h.Filename, title, requirePhrase: false))
             .Where(h => DurationPlausible(h.Length, routing.Duration, requireKnownLength: false))
-            .Where(h => !AddsVersion(h.Filename, title))
-            .Where(h => !FromLiveFolder(h.Filename, title, routing.Album))
+            .Where(h => !AddsVersion(h.Filename, title, routing.Artist))
+            .Where(h => !FromVersionFolder(h.Filename, title, routing.Album, routing.Artist))
             .GroupBy(h => (h.Username, Folder: FolderOfFile(h.Filename)))
             .Select(group => group.First())
             .OrderByDescending(h => h.HasFreeUploadSlot == true)
@@ -1244,7 +1265,7 @@ public class SoulseekDownloadService : BaseDownloadService
         // One at a time: slskd runs one peer operation at a time anyway.
         foreach (var hit in lossy)
             listed.AddRange(await _slskd.BrowseFolderAsync(hit, FolderOfFile(hit.Filename), BrowseTimeout, cancellationToken));
-        var found = RankCandidates(listed, title, routing.Duration, strict: false, routing.Album);
+        var found = RankCandidates(listed, title, routing.Duration, strict: false, routing.Album, routing.Artist);
         Logger.LogInformation(
             "Soulseek: no {Ext} of '{Artist} - {Title}' in the search; looked in {Peers} peers' folders beside their lossy copy and found {Count}",
             wanted.ToUpperInvariant(), routing.Artist, title, lossy.Count, found.Count);
@@ -1264,12 +1285,21 @@ public class SoulseekDownloadService : BaseDownloadService
     /// nothing. The album folder and the one above it are read (a disc folder sits between);
     /// not the share's top level. Never when the request itself asks for a live song or album.
     /// </summary>
-    internal static bool FromLiveFolder(string filename, string title, string? album)
+    internal static bool FromLiveFolder(string filename, string title, string? album, string? artist = null)
     {
         if (LiveVersion.Requested(title, album)) return false;
-        var parts = filename.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
-        return parts.Length > 1 && parts[..^1].TakeLast(2).Any(LiveVersion.Mentions);
+        return VersionVariant.AlbumFolders(filename).Any(folder => LiveVersion.Mentions(VersionVariant.WithoutArtist(folder, artist)));
     }
+
+    /// <summary>
+    /// Whether a file's album folder makes it a version nobody asked for, as a live folder does:
+    /// "Too Close (Radio Edit) - Single\01 - Too Close.flac" is the radio edit, and "Mezzanine
+    /// Remix Tapes '98\03 - Angel.flac" a remix, though neither file name says so. The artist's
+    /// own name is never read as a version (a band called Live).
+    /// </summary>
+    internal static bool FromVersionFolder(string filename, string title, string? album, string? artist = null) =>
+        FromLiveFolder(filename, title, album, artist)
+        || VersionVariant.UnrequestedFromFolder(filename, title, album, artist).Count > 0;
 
     private static string LeafTitle(string filename)
     {
@@ -1279,24 +1309,45 @@ public class SoulseekDownloadService : BaseDownloadService
     }
 
     private List<SoulseekFileHit> RankCandidates(List<SoulseekFileHit> hits, string title, int? expectedDuration,
-        bool strict = false, string? album = null)
+        bool strict = false, string? album = null, string? artist = null) =>
+        Rank(hits, new CandidateWant(title, expectedDuration, strict, album, artist),
+            _settings.PreferredExtension, _settings.MinFileSizeBytes,
+            h => CandidateAllowed(h, _rejectedPeers, _verification.RemembersRejections));
+
+    /// <summary>What a song's search is ranked against: its title, length, album and artist, and
+    /// whether the strict reading applies (see <see cref="PlannedQueries"/>).</summary>
+    internal sealed record CandidateWant(string Title, int? Duration, bool Strict = false, string? Album = null, string? Artist = null);
+
+    /// <summary>
+    /// The one ranking every Soulseek download uses: a star, a play, an album walk's song, Better
+    /// quality and the weekly upgrade. Only how wide the search behind it looks differs.
+    /// </summary>
+    internal static List<SoulseekFileHit> Rank(IEnumerable<SoulseekFileHit> hits, CandidateWant want,
+        string preferredExtension, long minFileSizeBytes, Func<SoulseekFileHit, bool> allowed)
     {
-        var wanted = SoulseekClient.NormalizeExtension(_settings.PreferredExtension, "");
+        var wanted = SoulseekClient.NormalizeExtension(preferredExtension, "");
+        var title = want.Title;
         return hits
             // First because it is the cheapest filter and the only one backed by evidence
             // from a completed transfer: these exact files were downloaded, inspected and
             // found to be the wrong recording. Offering them again spends a whole transfer
             // to reach the same verdict.
-            .Where(h => CandidateAllowed(h, _rejectedPeers, _verification.RemembersRejections))
+            .Where(allowed)
             .Where(h => string.Equals(h.Extension, wanted, StringComparison.OrdinalIgnoreCase))
-            .Where(h => h.Size >= _settings.MinFileSizeBytes)
-            .Where(h => FilenamePlausiblyMatchesTitle(h.Filename, title, requirePhrase: strict))
-            .Where(h => DurationPlausible(h.Length, expectedDuration, requireKnownLength: strict))
-            .Where(h => !AddsVersion(h.Filename, title))
-            .Where(h => !FromLiveFolder(h.Filename, title, album))
+            .Where(h => h.Size >= minFileSizeBytes)
+            .Where(h => FilenamePlausiblyMatchesTitle(h.Filename, title, requirePhrase: want.Strict))
+            .Where(h => DurationPlausible(h.Length, want.Duration, requireKnownLength: want.Strict))
+            .Where(h => !AddsVersion(h.Filename, title, want.Artist))
+            .Where(h => !FromVersionFolder(h.Filename, title, want.Album, want.Artist))
+            // "Song (Acoustic)" is never answered by the plain studio file. A radio edit may be
+            // named plainly, so that one is only ranked, below.
+            .Where(h => !VersionVariant.LacksRequested(h.Filename, title, want.Artist))
+            // The copy that says it is the version asked for goes first: "Too Close (Radio Edit)"
+            // takes "Too Close [Radio Edit].flac" before a plain "Too Close.flac".
+            .OrderBy(h => VersionVariant.Missing(h.Filename, title, want.Artist).Count)
             // An unnamed bracketed addition sorts last rather than being dropped: it may be a
             // different take ("Angel (Angel Dust)"), or only a peer's own label.
-            .OrderBy(h => VariantPenalty(h.Filename, title))
+            .ThenBy(h => VariantPenalty(h.Filename, title))
             .ThenBy(h => QualityPenalty(h))
             .ThenBy(h => h.QueueLength ?? int.MaxValue)
             .ThenByDescending(h => h.UploadSpeed ?? 0)
@@ -1419,6 +1470,7 @@ public class SoulseekDownloadService : BaseDownloadService
     internal static bool FilenamePlausiblyMatchesTitle(string filename, string title, bool requirePhrase = false)
     {
         if (string.IsNullOrEmpty(filename) || string.IsNullOrEmpty(title)) return true;
+        title = NameTitle(title);
         // Folded the way titles are, so "Huntin’ Wabbitz" finds "Huntin' Wabbitz" and
         // "Hoppípolla" finds "Hoppipolla".
         var leaf = SongIdentity.Plain(LeafOf(filename));
@@ -1448,6 +1500,33 @@ public class SoulseekDownloadService : BaseDownloadService
                 || LeafContainsTitlePhrase(Stylized(leaf), SongIdentity.FoldStylized(title));
         var looseLeaf = Stylized(leaf);
         return tokens.All(t => leaf.Contains(t) || looseLeaf.Contains(Stylized(t)));
+    }
+
+    private static readonly Regex TitleBracket = new(@"\s*[\(\[\{]([^\(\)\[\]\{\}]*)[\)\]\}]", RegexOptions.Compiled);
+
+    /// <summary>
+    /// The part of a title a file name has to carry: the title without its guest credit and its
+    /// version tags. "Take Care (feat. Rihanna)" used to demand the words "feat" and "Rihanna",
+    /// and "Too Close (Radio Edit)" the words "radio" and "edit", so a plainly named
+    /// "04 - Take Care.flac" never answered either and only files that spelled the tag out were
+    /// ever downloaded. Which version a file is gets decided by the version rules, not here. A
+    /// title with nothing left once they are off is kept whole.
+    /// </summary>
+    internal static string NameTitle(string title)
+    {
+        static bool IsVersion(string tag) => SongIdentity.ParseTitle($"x ({tag})").Versions.Count > 0;
+
+        var text = SongIdentity.StripFeatures(title);
+        text = TitleBracket.Replace(text, match => IsVersion(match.Groups[1].Value) ? " " : match.Value);
+        // " - Radio Edit", " - Remastered 2011": a dash tail that is only a version tag.
+        for (var guard = 0; guard < 3; guard++)
+        {
+            var dash = text.LastIndexOf(" - ", StringComparison.Ordinal);
+            if (dash <= 0 || !IsVersion(text[(dash + 3)..])) break;
+            text = text[..dash];
+        }
+        text = Regex.Replace(text, @"\s+", " ").Trim();
+        return SongIdentity.Key(text).Length == 0 ? title : text;
     }
 
     private static string Stylized(string value) => SongIdentity.Plain(SongIdentity.FoldStylized(value));
