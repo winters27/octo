@@ -357,6 +357,10 @@ builder.Services.AddHostedService<Octo.Services.Common.SoulseekHoldResumer>();
 // this each call re-runs the enrichment pipeline over them concurrently.
 builder.Services.AddSingleton<Octo.Services.Common.ExternalSearchService>();
 
+// An artist's most played songs and the chart of the moment, for the apps' search. Built once
+// per artist and kept, since every listener searching that artist asks for the same list.
+builder.Services.AddSingleton<Octo.Services.Common.TopSongsService>();
+
 // What page one of each search showed, so a later page carries on from it rather than
 // building its discovery rows again and repeating or skipping some.
 builder.Services.AddSingleton<Octo.Services.Subsonic.SearchSongOrderCache>();
