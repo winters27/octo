@@ -124,19 +124,21 @@ public sealed class DownloadTaggingTests : IDisposable
 
     private Harness Build(Dictionary<string, Song> songs, Dictionary<string, string> routes,
         MetadataSettings? metadata = null, SoulseekSettings? soulseek = null, Loudness? loudness = null,
-        FolderStructure layout = FolderStructure.Flat, Func<string, HttpResponseMessage?>? special = null)
+        FolderStructure layout = FolderStructure.Flat, Func<string, HttpResponseMessage?>? special = null,
+        AcquisitionTracker? tracker = null)
     {
         var http = Http(routes, special);
         var meter = new FakeMeter(loudness ?? new Loudness(-11.5, 6.3, -0.3));
         var metadataSettings = TestOptions.Monitor(metadata ?? new MetadataSettings());
-        var provider = new ServiceCollection()
+        var services = new ServiceCollection()
             .AddSingleton<IOptionsMonitor<SoulseekSettings>>(TestOptions.Monitor(soulseek ?? new SoulseekSettings()))
             .AddSingleton<IOptionsMonitor<MetadataSettings>>(metadataSettings)
             .AddSingleton(new DeezerMetadataService(http, metadataSettings, NullLogger<DeezerMetadataService>.Instance))
             .AddSingleton(new MusicBrainzClient(http, NullLogger<MusicBrainzClient>.Instance))
             .AddSingleton<ILoudnessMeter>(meter)
-            .AddSingleton(sp => new ReleaseIdentifier(sp, NullLogger<ReleaseIdentifier>.Instance))
-            .BuildServiceProvider();
+            .AddSingleton(sp => new ReleaseIdentifier(sp, NullLogger<ReleaseIdentifier>.Instance));
+        if (tracker is not null) services.AddSingleton(tracker);
+        var provider = services.BuildServiceProvider();
 
         var catalog = new Mock<IMusicMetadataService>();
         catalog.Setup(m => m.GetSongAsync("test", It.IsAny<string>()))
@@ -613,6 +615,30 @@ public sealed class DownloadTaggingTests : IDisposable
         File.Delete(explicitCopy.Path);
         var cleanCopy = await Landing("USUM71210787");
         Assert.Equal("2", Vorbis(cleanCopy.Path, "ITUNESADVISORY"));
+    }
+
+    [Fact]
+    public async Task TheDownloadsLogSaysWhatCameOffThePeersTagsAndWhetherTheSongIsExplicit()
+    {
+        var tracker = new AcquisitionTracker(NullLogger<AcquisitionTracker>.Instance);
+        var harness = Build(new() { ["1"] = new Song { Artist = "Kendrick Lamar", Title = "Money Trees", ExternalProvider = "test", ExternalId = "1" } },
+            MoneyTreesRoutes(), tracker: tracker);
+        harness.Service.Landing = _ => LandedFlac("peer share", file =>
+        {
+            file.Tag.Title = "Money Trees";
+            file.Tag.Performers = ["Kendrick Lamar"];
+            TagWriterExtras.SetText(file, TagFields.Isrc, "USUM71210782");
+            ((TagLib.Ogg.XiphComment)file.GetTag(TagLib.TagTypes.Xiph, true)).SetField("MUSICBRAINZ_ALBUMID", "0b1c2d3e-4f50-4617-8899-aabbccddeeff");
+        });
+        tracker.Begin("test", "1", null, "alice");
+
+        await harness.Service.Download("1");
+
+        var log = tracker.Detail("test:1", "alice")!.Events!;
+        Assert.Contains(log, e => e.Kind == AcquisitionEventKinds.Tags && e.Text == "Marked explicit"
+            && e.Detail == "The catalog's match for this exact version says so");
+        Assert.Contains(log, e => e.Kind == AcquisitionEventKinds.Tags && e.Text == "Took off the peer's own album tags"
+            && e.Detail!.Contains("MUSICBRAINZ_ALBUMID", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

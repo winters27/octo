@@ -18,13 +18,16 @@ public static class ExplicitAdvisory
 {
     public const int None = 0, Explicit = 1, Clean = 2;
 
+    /// <summary>The source a decision names when the file's own name said clean.</summary>
+    public const string FileNameSource = "the file name";
+
     /// <summary>The advisory for this download, or null when nothing that matched this exact
     /// version said. <paramref name="sourceFile"/> is the peer's file name, when there was a peer.</summary>
     public static AdvisoryDecision? Decide(Song song, TagPlan? plan, string? sourceFile = null)
     {
         // A name that says clean is the strongest evidence there is: it is what was shared.
         if (SaysClean(song.Title) || SaysClean(plan?.Evidence?.File.Title) || SaysClean(LeafName(sourceFile)))
-            return new AdvisoryDecision(Clean, "the file name");
+            return new AdvisoryDecision(Clean, FileNameSource);
         if (plan is null) return null;
 
         var catalog = plan.Ranked.Select(scored => scored.Candidate).Where(c => c.Source == TagSource.Catalog).ToList();

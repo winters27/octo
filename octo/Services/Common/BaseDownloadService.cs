@@ -1136,6 +1136,15 @@ public abstract class BaseDownloadService : IDownloadService
         var advisory = ExplicitAdvisory.Decide(song, plan, song.SourceFile);
         song.Advisory = advisory?.Value;
         if (plan is not null && advisory is not null) plan.Fields["advisory"] = ExplicitAdvisory.Field(advisory);
+        if (advisory is not null)
+            LogStep(song, AcquisitionEventKinds.Tags, advisory.Value switch
+                {
+                    ExplicitAdvisory.Explicit => "Marked explicit",
+                    ExplicitAdvisory.Clean => "Marked as the clean edit",
+                    _ => "Marked not explicit",
+                },
+                advisory.Source == ExplicitAdvisory.FileNameSource ? "The file's name says it is the clean edit"
+                    : "The catalog's match for this exact version says so");
 
         var sibling = SubsonicSettings.FolderStructure == FolderStructure.Organized ? AlbumSibling(song, requested, filePath) : null;
         if (sibling is not null) JoinAlbum(song, sibling);
@@ -1429,6 +1438,9 @@ public abstract class BaseDownloadService : IDownloadService
                 var why = filedElsewhere ? $"it arrived filed under '{arrivedAlbum}'" : "a new download keeps no album grouping values";
                 song.TagPlan?.Notes.Add($"took off the file's own {string.Join(", ", dropped)}: {why}");
                 Logger.LogInformation("Took off {Fields} from {Path}: {Why}", string.Join(", ", dropped), filePath, why);
+                LogStep(song, AcquisitionEventKinds.Tags, "Took off the peer's own album tags",
+                    (filedElsewhere ? $"The peer had it filed under \"{arrivedAlbum}\": " : "A new download starts its own album: ")
+                    + string.Join(", ", dropped));
             }
 
             // Basic metadata. Title/artist we always have; only overwrite album +
