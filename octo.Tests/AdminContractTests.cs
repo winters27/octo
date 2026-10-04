@@ -33,6 +33,7 @@ public class AdminContractTests
         ("Updates", typeof(UpdateSettings)),
         ("ListenBrainz", typeof(ListenBrainzSettings)),
         ("GeneratedPlaylists", typeof(GeneratedPlaylistSettings)),
+        ("Imports", typeof(ImportSettings)),
     ];
 
     /// <summary>Settings deliberately absent from the admin API, each with its reason.</summary>

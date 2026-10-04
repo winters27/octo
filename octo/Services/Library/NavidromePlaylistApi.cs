@@ -124,6 +124,96 @@ public sealed class NavidromePlaylistApi
         return false;
     }
 
+    /// <summary>A new private playlist, made as the admin, so its owner is the admin until
+    /// <see cref="GiveToAsync"/> hands it on. Its id, or null.</summary>
+    public async Task<string?> CreatePlaylistAsync(string name, string? comment, CancellationToken ct)
+    {
+        var body = JsonSerializer.Serialize(new { name, comment = comment ?? "", @public = false });
+        using var response = await SendAsync(jwt =>
+        {
+            var request = Request(HttpMethod.Post, $"{BaseUrl}/api/playlist", jwt);
+            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+            return request;
+        }, ct);
+        if (response is not { IsSuccessStatusCode: true })
+        {
+            _logger.LogWarning("Could not create playlist '{Name}': HTTP {Status}", name, (int?)response?.StatusCode);
+            return null;
+        }
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(ct));
+        return doc.RootElement.TryGetProperty("id", out var id) && id.ValueKind == JsonValueKind.String ? id.GetString() : null;
+    }
+
+    /// <summary>
+    /// Makes a Navidrome user the playlist's owner, the way the admin changes it in Navidrome's own
+    /// playlist editor. True when it is theirs afterwards, already or now.
+    /// </summary>
+    public async Task<bool> GiveToAsync(string playlistId, string username, CancellationToken ct)
+    {
+        try
+        {
+            using var users = await SendAsync(jwt => Request(HttpMethod.Get, $"{BaseUrl}/api/user?_start=0&_end=1000", jwt), ct);
+            if (users is not { IsSuccessStatusCode: true }) return false;
+            using var userDoc = JsonDocument.Parse(await users.Content.ReadAsByteArrayAsync(ct));
+            var ownerId = userDoc.RootElement.ValueKind != JsonValueKind.Array ? null : userDoc.RootElement.EnumerateArray()
+                .Where(user => string.Equals(Str(user, "userName"), username, StringComparison.OrdinalIgnoreCase))
+                .Select(user => Str(user, "id")).FirstOrDefault();
+            if (ownerId is null) return false;
+
+            using var current = await SendAsync(jwt => Request(HttpMethod.Get, $"{BaseUrl}/api/playlist/{Uri.EscapeDataString(playlistId)}", jwt), ct);
+            if (current is not { IsSuccessStatusCode: true }) return false;
+            var playlist = System.Text.Json.Nodes.JsonNode.Parse(await current.Content.ReadAsByteArrayAsync(ct))?.AsObject();
+            if (playlist is null) return false;
+            if ((string?)playlist["ownerId"] == ownerId) return true;
+            // The whole playlist goes back with only its owner changed, so nothing else is reset.
+            playlist["ownerId"] = ownerId;
+            var body = playlist.ToJsonString();
+            using var response = await SendAsync(jwt =>
+            {
+                var request = Request(HttpMethod.Put, $"{BaseUrl}/api/playlist/{Uri.EscapeDataString(playlistId)}", jwt);
+                request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+                return request;
+            }, ct);
+            return response is { IsSuccessStatusCode: true };
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning("Could not give playlist {Id} to {User}: {M}", playlistId, username, ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>Whether the playlist is still there: null when Navidrome could not say.</summary>
+    public async Task<bool?> PlaylistExistsAsync(string playlistId, CancellationToken ct)
+    {
+        using var response = await SendAsync(jwt => Request(HttpMethod.Get, $"{BaseUrl}/api/playlist/{Uri.EscapeDataString(playlistId)}", jwt), ct);
+        if (response is null) return null;
+        if (response.StatusCode == HttpStatusCode.NotFound) return false;
+        return response.IsSuccessStatusCode ? true : null;
+    }
+
+    /// <summary>Every track of a playlist in order, however long, or null when it could not be read
+    /// (never an empty list for a failure, which a caller would take for an empty playlist).</summary>
+    public async Task<IReadOnlyList<LibraryActionPlaylistWorker.PlaylistTrackRow>?> ReadAllTracksAsync(string playlistId,
+        CancellationToken ct)
+    {
+        const int page = 500;
+        var rows = new List<LibraryActionPlaylistWorker.PlaylistTrackRow>();
+        for (var start = 0; ; start += page)
+        {
+            using var response = await SendAsync(jwt => Request(HttpMethod.Get,
+                $"{BaseUrl}/api/playlist/{Uri.EscapeDataString(playlistId)}/tracks?_start={start}&_end={start + page}", jwt), ct);
+            if (response is not { IsSuccessStatusCode: true }) return null;
+            using var doc = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(ct));
+            var chunk = LibraryActionPlaylistWorker.ParseTracks(doc.RootElement);
+            rows.AddRange(chunk);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array || doc.RootElement.GetArrayLength() < page) return rows;
+        }
+    }
+
+    private static string? Str(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
     private static HttpRequestMessage Request(HttpMethod method, string url, string jwt)
     {
         var request = new HttpRequestMessage(method, url);

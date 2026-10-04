@@ -932,6 +932,13 @@ public class AdminController : ControllerBase
                 ["UserTokens"] = _listenBrainzOpts?.CurrentValue.UserTokens
                     ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
             },
+            ["Imports"] = new Dictionary<string, object>
+            {
+                ["SpotifyClientId"] = ImportOptions.SpotifyClientId ?? "",
+                ["SpotifyRedirectUri"] = ImportOptions.EffectiveRedirectUri,
+                ["SongsPerHour"] = ImportOptions.SongsPerHour,
+                ["RefreshHours"] = ImportOptions.RefreshHours,
+            },
             ["_meta"] = new Dictionary<string, object>
             {
                 ["ConfigFilePath"] = _settings.FilePath,
@@ -1923,6 +1930,13 @@ public class AdminController : ControllerBase
                     (_listenBrainzOpts?.CurrentValue.UserTokens ?? new Dictionary<string, string>())
                     .Select(pair => new KeyValuePair<string, JsonNode?>(pair.Key, pair.Value))),
             },
+            ["Imports"] = new JsonObject
+            {
+                ["SpotifyClientId"] = ImportOptions.SpotifyClientId ?? "",
+                ["SpotifyRedirectUri"] = ImportOptions.EffectiveRedirectUri,
+                ["SongsPerHour"] = ImportOptions.SongsPerHour,
+                ["RefreshHours"] = ImportOptions.RefreshHours,
+            },
         };
         var json = effective.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
         return Content(json, "application/json");
@@ -2091,6 +2105,7 @@ public class AdminController : ControllerBase
             "Notifications:NotifyLosslessFallback", "Notifications:NotifyDownloadFailed",
             "Notifications:NotifyAlbumCompleted",
             "ListenBrainz:Token", "ListenBrainz:SubmitExternalPlays",
+            "Imports:SpotifyClientId", "Imports:SpotifyRedirectUri", "Imports:SongsPerHour", "Imports:RefreshHours",
         };
         var rows = new List<object>();
         foreach (var k in keys)
@@ -2428,6 +2443,8 @@ public class AdminController : ControllerBase
 
     /// <summary>The Updates section as configured now; read when asked, so a save shows at once.</summary>
     private UpdateSettings UpdateOptions => _config.GetSection("Updates").Get<UpdateSettings>() ?? new UpdateSettings();
+
+    private ImportSettings ImportOptions => _config.GetSection("Imports").Get<ImportSettings>() ?? new ImportSettings();
 
     /// <summary>The release this build came from, e.g. "2026.07.29". Falls back to the
     /// assembly version if the informational version was not stamped.</summary>
