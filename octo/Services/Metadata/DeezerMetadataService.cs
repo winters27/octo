@@ -16,7 +16,7 @@ namespace Octo.Services.Metadata;
 /// returns null, and callers fall back to a synthetic entity. Nothing on this
 /// path ever blocks or fails playback.
 /// </summary>
-public class DeezerMetadataService : IDisposable
+public partial class DeezerMetadataService : IDisposable
 {
     public record TrackMeta(string? AlbumTitle, string? AlbumCoverUrl, int? Year, int? Duration,
         string? ArtistName, string? ArtistImageUrl);

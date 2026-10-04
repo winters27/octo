@@ -22,7 +22,7 @@ namespace Octo.Controllers;
 
 [ApiController]
 [Route("")]
-public class SubsonicController : ControllerBase
+public partial class SubsonicController : ControllerBase
 {
     // IOptionsMonitor, not IOptions: the admin UI writes settings.json and the
     // config provider reloads it, but IOptions.Value is resolved once and this is a
@@ -2559,8 +2559,8 @@ public class SubsonicController : ControllerBase
 
     /// <summary>
     /// Navidrome's extension list with octoAcquisitions added, so a client can tell this server
-    /// answers getAcquisitions before it asks, and octoLibraryActions while library actions are
-    /// on. Relayed, then merged; no credentials are needed, as the OpenSubsonic spec has it.
+    /// answers getAcquisitions before it asks, octoLibraryActions while library actions are
+    /// on, and octoTopSongs while search discovery is. Relayed, then merged; no credentials are needed, as the OpenSubsonic spec has it.
     /// </summary>
     [HttpGet, HttpPost]
     [Route("rest/getOpenSubsonicExtensions")]
@@ -2573,7 +2573,8 @@ public class SubsonicController : ControllerBase
         return _responseBuilder.MergeOpenSubsonicExtensions(format,
             relay.Success ? relay.Body : null, relay.ContentType,
             lyricsChoices: _lyricsChoices is not null && _metadataSettings?.CurrentValue.FetchLyrics == true,
-            libraryActions: _libraryActions is not null && _libraryActionSettings.CurrentValue.Enabled);
+            libraryActions: _libraryActions is not null && _libraryActionSettings.CurrentValue.Enabled,
+            topSongs: _subsonicSettings.EnableSearchDiscovery);
     }
 
     /// <summary>

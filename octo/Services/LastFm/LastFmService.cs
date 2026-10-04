@@ -7,7 +7,7 @@ using Octo.Services.Metadata;
 
 namespace Octo.Services.LastFm;
 
-public class LastFmService
+public partial class LastFmService
 {
     private readonly HttpClient _httpClient;
     private readonly IOptionsMonitor<LastFmSettings> _settingsOptions;
