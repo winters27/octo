@@ -25,6 +25,8 @@ Octo is a proxy, so it works with your Navidrome server and the Subsonic apps yo
 - **Add songs to your library.** Press **+** on a song, an album or a search result and it joins your library.
 - **One search for everything.** Your music comes first, then what Octo found, and all of it plays straight away.
 - **Whole albums.** Every track shows, the ones you have are marked, and one press adds the rest.
+- **Follow every download.** The downloads drawer lists what Octo is fetching for you and what it fetched lately. Each one opens to its log: what was searched, the copies found with their format, size and peer, the one chosen and why, every check, the tags, the cover and the lyrics.
+- **Find songs.** Run a song's search again on your download sources (Soulseek, and Lidarr's releases), see every copy with its details, and pick the one you want. For a song you have, only a lossless copy can take its place.
 - **Your stations on Home**, each with its own painted cover.
 
 ![An album in the Octo desktop app](docs/images/players/desktop-album.webp)
@@ -643,8 +645,10 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `getLyricsBySongId`, `getLyrics` | lyrics for outside songs and for library songs Navidrome has none for; chosen or hidden lyrics for every client; word cues with `enhanced=true` |
 | `getLyricsCandidates`, `setLyricsChoice` | the `octoLyrics` extension: every lyrics entry for a song, and pinning one, hiding lyrics, or going back to automatic |
 | `getLibraryActions`, `libraryAction` | the `octoLibraryActions` extension: what the caller may do to library files, and removing one song the way the Delete playlist does |
+| `getAcquisitions`, `getAcquisition`, `clearAcquisitions` | the `octoAcquisitions` extension: the caller's downloads; version 2 adds each one's log and clearing finished ones |
+| `findSongs`, `getFoundSongs`, `pickFoundSong` | `octoAcquisitions` 2: a song's search run again on the caller's download sources, every copy found, and fetching the one picked |
 | `/api/artist/{id}`, `/api/album?artist_id=` | Navidrome's own API, for clients that use it (Feishin): an outside artist's page and its albums |
-| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions`, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on) and `songLyrics` 1 and 2 |
+| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 and 2, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on) and `songLyrics` 1 and 2 |
 
 ### Soulseek download details
 
