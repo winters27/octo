@@ -414,6 +414,34 @@ public sealed class LibraryEditEndpointTests
         Assert.Null(Tags(stray)["year"]);
     }
 
+    [Fact]
+    public async Task JoinAlbum_TakesAwayAPeersStrayAlbumId_ReleaseDate_AndVersion_WhenTheAlbumHasNone()
+    {
+        await using var factory = new Factory();
+        factory.Song("lead", "Uzi/Eternal Atake/01 Baby Pluto.flac", "Baby Pluto", "Lil Uzi Vert", "Eternal Atake", "Lil Uzi Vert", 2020);
+        var stray = factory.Song("stray", "Uzi/Eternal Atake/02 Lo Mein.flac", "Lo Mein", "Lil Uzi Vert", "Eternal Atake", "Lil Uzi Vert", 2020);
+        // What a Soulseek peer's tagger left on one song, and its album-mates lack: Navidrome
+        // groups albums by these, so this song shows as an album of its own.
+        using (var file = TagLib.File.Create(stray))
+        {
+            Octo.Services.Common.TagWriterExtras.SetText(file, Octo.Services.Common.TagFields.AlbumId, "4c6d8f8a-77a5-4a3b-9b49-6ac41a2b3e2c");
+            Octo.Services.Common.TagWriterExtras.SetText(file, Octo.Services.Common.TagFields.ReleaseDate, "2020-03-06");
+            Octo.Services.Common.TagWriterExtras.SetExact(file, Octo.Services.Common.TagFields.AlbumVersion, ["Deluxe"]);
+            file.Save();
+        }
+        factory.Navidrome.Songs["stray"] = factory.Navidrome.Songs["stray"] with { Size = new FileInfo(stray).Length };
+        using var client = factory.CreateClient();
+
+        Assert.Equal("applied", State(await Call(client, "id=stray&action=joinAlbum&like=lead")));
+
+        var joined = KeptIdentityTags.Read(stray)!;
+        var lead = KeptIdentityTags.Read(Path.Combine(factory.Root, "Uzi/Eternal Atake/01 Baby Pluto.flac"))!;
+        Assert.Null(joined.AlbumId);
+        Assert.Null(joined.AlbumVersion);
+        Assert.Equal(lead.ReleaseDate, joined.ReleaseDate);
+        Assert.Equal(KeptIdentityTags.PidInputs(lead with { Title = "" }), KeptIdentityTags.PidInputs(joined with { Title = "" }));
+    }
+
     // Covers
 
     private static byte[] Jpeg(int side)
