@@ -240,6 +240,25 @@ public sealed class LibraryEditEndpointTests
     }
 
     [Fact]
+    public async Task RemovingASecondCopy_LeavesTheSongWanted_ButDeletingTheSongDoesNot()
+    {
+        await using var factory = new Factory();
+        var copy = factory.Song("copy", "Bon Iver/Holocene/Holocene.flac", "Holocene", "Bon Iver", "Holocene");
+        factory.Song("song", "Bon Iver/Bon Iver/Towers.flac", "Towers", "Bon Iver", "Bon Iver");
+        using var client = factory.CreateClient();
+
+        var removed = await Call(client, "id=copy&action=remove&copy=true");
+        Assert.Equal("applied", State(removed));
+        Assert.Contains("stays in the library", removed.GetProperty("detail").GetString());
+        Assert.False(File.Exists(copy));
+        // The kept copy can still be upgraded, or the song hearted, later.
+        Assert.False(factory.Journal.IsNeverRequested("Bon Iver", "Holocene"));
+
+        Assert.Equal("applied", State(await Call(client, "id=song&action=remove")));
+        Assert.True(factory.Journal.IsNeverRequested("Bon Iver", "Towers"));
+    }
+
+    [Fact]
     public async Task Restore_ASongNotInTheTrash_ChangesNothing()
     {
         await using var factory = new Factory();

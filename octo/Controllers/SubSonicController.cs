@@ -2683,8 +2683,10 @@ public class SubsonicController : ControllerBase
                 Octo.Services.Library.LibraryActionState.Skipped, "Only a server admin can remove songs from the library."));
 
         // Not tied to the request: a client that hangs up must not stop a move halfway.
+        // copy=true: Library health removing a second copy, so the song itself is still wanted.
+        var onlyACopy = parameters.GetValueOrDefault("copy", "") is "true" or "1";
         var outcome = await _libraryActions.ApplyAsync(
-            new Octo.Services.Library.LibraryActionRequest(LibraryAction.Delete, id, username),
+            new Octo.Services.Library.LibraryActionRequest(LibraryAction.Delete, id, username, OnlyACopy: onlyACopy),
             CancellationToken.None);
         _logger.LogInformation("Library action Delete for {Id} by {User} from the app: {State} - {Detail}",
             id, username, outcome.State, outcome.Detail);

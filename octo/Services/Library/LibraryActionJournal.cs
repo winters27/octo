@@ -41,6 +41,10 @@ public sealed record LibraryActionEntry(
     /// <summary>Where a replacement moved in, recorded the moment it did. A restart after that
     /// finds the swap done instead of putting the original back beside it.</summary>
     public string? RevealedPath { get; init; }
+
+    /// <summary>A Delete of one copy of a song the library keeps another of, so not a song the
+    /// person never wants again.</summary>
+    public bool Copy { get; init; }
 }
 
 /// <summary>
@@ -153,6 +157,7 @@ public sealed class LibraryActionJournal : IDisposable
             entry.Action == LibraryAction.Delete
             && entry.State == LibraryActionState.Applied
             && !entry.DryRun
+            && !entry.Copy
             && SongIdentity.MatchKey(entry.Artist, entry.Title) == wanted);
     }
 

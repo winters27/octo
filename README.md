@@ -426,7 +426,8 @@ and `action=remove` does exactly what the Delete playlist does, with the same al
 and quarantine, as the user whose credentials it carries, and answers with what happened. The
 Delete action has to be on for it to do anything, and the caller has to be a Navidrome admin.
 Octo asks Navidrome for a scan right after, so the song leaves the library in seconds rather
-than at the next scheduled scan. Both always answer in JSON.
+than at the next scheduled scan. With `copy=true` (Library health removing a second copy of a song the library
+keeps) the song is not refused when it is asked for again, since only that copy was unwanted. Both always answer in JSON.
 
 Version 3 of the extension is what the apps' Library health fixes with. Every one of these needs
 library actions on, the caller on the allowlist and a Navidrome admin, and only rehearses while
