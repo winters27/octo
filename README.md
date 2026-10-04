@@ -650,7 +650,7 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 
 When a song is starred, Octo:
 
-1. Searches Soulseek for `<artist> <title>` (cleaned of `[brackets]` and redundant `Artist - ` prefixes).
+1. Searches Soulseek for `<artist> <title>` (cleaned of `[brackets]` and redundant `Artist - ` prefixes), reading up to 2,000 files, as Better quality does. A popular song can fill that with its fastest peers' MP3s in a second; when nothing usable came back and the search stopped at its limit, the same search runs once more, four times as wide.
 2. Falls back to title-only search if the first query returns nothing usable, then to `<artist> <album>` for peers who name files by number and title only.
    When every query finds the song only lossy (an MP3 where FLAC is preferred), Octo asks the best three of those peers for the folder that MP3 sits in, and takes a FLAC of the same song from beside it: albums are often shared in both formats, and only one answered the search. Those files go through every check below, like any search hit.
 3. Ranks candidates by queue depth, upload speed, file size.

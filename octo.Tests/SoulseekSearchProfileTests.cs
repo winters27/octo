@@ -30,7 +30,7 @@ public class SoulseekSearchProfileTests
                 r.GetProperty("fileLimit").GetInt32(), r.GetProperty("filterResponses").GetBoolean());
         }
         var s = new SoulseekSettings();
-        Assert.Equal((15_000, 250, 500, true), Limits(SearchProfile.Interactive(s)));
+        Assert.Equal((15_000, 500, 2_000, true), Limits(SearchProfile.Interactive(s)));
         Assert.Equal((30_000, 500, 2_000, true), Limits(SearchProfile.Upgrade(s)));
         Assert.Equal((30, 90), (SearchProfile.Interactive(s).CeilingSeconds, SearchProfile.Upgrade(s).CeilingSeconds));
         Assert.Equal(300, SearchProfile.Upgrade(new SoulseekSettings { UpgradeSearchWaitSeconds = 9999 }).CeilingSeconds);

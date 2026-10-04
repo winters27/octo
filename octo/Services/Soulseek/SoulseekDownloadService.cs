@@ -684,6 +684,8 @@ public class SoulseekDownloadService : BaseDownloadService
             List<SoulseekFileHit> found = [];
             // Every query's answers, for the folder look below.
             List<SoulseekFileHit> everyHit = [];
+            // One wider search per song at most: each one waits seconds.
+            var widened = false;
             foreach (var (query, strict) in queries)
             {
                 if (ReferenceEquals(query, queries[0].Query))
@@ -692,11 +694,27 @@ public class SoulseekDownloadService : BaseDownloadService
                     Logger.LogInformation("Soulseek query returned no usable hits; retrying with '{Query}'", query.Text);
                 // Ranked once, on the whole search: slskd hands over a search's answers only when it
                 // ends, so there is nothing to stop early on.
-                hits = await _slskd.SearchAsync(query.Text, profile, cancellationToken);
+                var outcome = await _slskd.SearchWithEndAsync(query.Text, profile, cancellationToken);
+                hits = outcome.Hits;
                 everyHit.AddRange(hits);
                 found = RankCandidates(hits, routing.Title!, routing.Duration, strict, routing.Album)
                     .Where(h => passOver is null || h.Username != passOver.Username || h.Filename != passOver.Filename)
                     .ToList();
+                if (found.Count == 0 && outcome.HitLimit && !widened)
+                {
+                    // The limit filled before the answers ran out, so the peers still on their way
+                    // were never heard. The same words once more, wider, before other words.
+                    widened = true;
+                    var wider = profile.Wider();
+                    Logger.LogInformation(
+                        "Soulseek search '{Query}' filled its limit with nothing usable; asking again for up to {Files} files",
+                        query.Text, wider.FileLimit);
+                    hits = (await _slskd.SearchWithEndAsync(query.Text, wider, cancellationToken)).Hits;
+                    everyHit.AddRange(hits);
+                    found = RankCandidates(hits, routing.Title!, routing.Duration, strict, routing.Album)
+                        .Where(h => passOver is null || h.Username != passOver.Username || h.Filename != passOver.Filename)
+                        .ToList();
+                }
                 if (found.Count > 0) break;
             }
             if (found.Count == 0)

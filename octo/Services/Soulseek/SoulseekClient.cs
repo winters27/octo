@@ -257,7 +257,14 @@ public class SoulseekClient
     /// A caller who gives up still gets an OperationCanceledException, as before, so a cancelled
     /// acquisition is not mistaken for "not on Soulseek"; the slskd search is cancelled behind it.
     /// </summary>
-    public async Task<List<SoulseekFileHit>> SearchAsync(string query, SearchProfile profile, CancellationToken ct = default)
+    public async Task<List<SoulseekFileHit>> SearchAsync(string query, SearchProfile profile, CancellationToken ct = default) =>
+        (await SearchWithEndAsync(query, profile, ct)).Hits;
+
+    /// <summary>
+    /// <see cref="SearchAsync"/>, and whether slskd stopped it at the profile's response or file
+    /// limit rather than when the answers ran out: such a search saw only the fastest peers.
+    /// </summary>
+    public async Task<SoulseekSearchOutcome> SearchWithEndAsync(string query, SearchProfile profile, CancellationToken ct = default)
     {
         var searchId = Guid.NewGuid().ToString();
         var began = Clock();
@@ -270,7 +277,7 @@ public class SoulseekClient
             if (!await StartSearchAsync(searchId, query, profile, ct))
             {
                 started = false;
-                return [];
+                return new SoulseekSearchOutcome([], false);
             }
             var status = await WaitForEndAsync(searchId, began.AddSeconds(profile.CeilingSeconds), ct);
             string reason;
@@ -293,7 +300,7 @@ public class SoulseekClient
                 "Soulseek search '{Query}' ({Profile}): {Count} hits after {Elapsed:F1}s ({Reason}; slskd {State}, {Responses} responses)",
                 query, profile.Name, hits.Count, (Clock() - began).TotalSeconds, reason,
                 status?.State ?? "unknown", status?.ResponseCount ?? 0);
-            return hits;
+            return new SoulseekSearchOutcome(hits, HitLimit(status?.State));
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -389,6 +396,11 @@ public class SoulseekClient
     }
 
     internal sealed record SearchStatus(string State, bool Ended, int ResponseCount);
+
+    /// <summary>Whether slskd's state says a search ended at its limit: "Completed,
+    /// FileLimitReached" or "Completed, ResponseLimitReached".</summary>
+    internal static bool HitLimit(string? state) =>
+        state is not null && state.Contains("LimitReached", StringComparison.OrdinalIgnoreCase);
 
     private async Task<SearchStatus?> ReadSearchStatusAsync(string searchId, CancellationToken ct)
     {
@@ -978,6 +990,9 @@ public sealed record BatchEnqueue(bool Supported, IReadOnlyDictionary<string, st
 {
     public static readonly BatchEnqueue NotSupported = new(false, new Dictionary<string, string>(), []);
 }
+
+/// <summary>A search's files, and whether slskd stopped it at its response or file limit.</summary>
+public sealed record SoulseekSearchOutcome(List<SoulseekFileHit> Hits, bool HitLimit);
 
 public class SoulseekFileHit
 {
