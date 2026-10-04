@@ -352,6 +352,26 @@ public class DownloadLogTests
     }
 
     [Fact]
+    public void APickWaitingInTheUpgradeQueueOutlivesARestart()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"octo-upgrades-{Guid.NewGuid():N}.json");
+        try
+        {
+            var pick = new PickedCopy { Source = "Lidarr", ReleaseGuid = "g1", IndexerId = 7, ReleaseTitle = "Air - Moon Safari [FLAC]" };
+            new UpgradeQueue(path).Add([new UpgradeAsk("nd-1", Pick: pick)], "alice", "find");
+            Assert.DoesNotContain("IsSoulseek", File.ReadAllText(path));
+
+            var job = Assert.Single(new UpgradeQueue(path).Snapshot());
+            Assert.Equal(new LidarrReleasePick("g1", 7, "Air - Moon Safari [FLAC]"), job.Pick!.Release);
+            Assert.False(job.Pick.IsSoulseek);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task AnUpgradeWithAPickFetchesOnlyThatCopyAndLogsTheVerdict()
     {
         var queue = new UpgradeQueue();

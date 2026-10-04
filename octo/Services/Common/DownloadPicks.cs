@@ -27,6 +27,7 @@ public sealed class PickedCopy
     public int? IndexerId { get; set; }
     public string? ReleaseTitle { get; set; }
 
+    [System.Text.Json.Serialization.JsonIgnore]
     public bool IsSoulseek => string.Equals(Source, SongFinder.SoulseekSource, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>The file as the Soulseek pipeline takes it.</summary>
@@ -40,6 +41,7 @@ public sealed class PickedCopy
         : null;
 
     /// <summary>The release Lidarr is to grab, or null to let it choose.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
     public Octo.Services.Lidarr.LidarrReleasePick? Release =>
         !IsSoulseek && !string.IsNullOrEmpty(ReleaseGuid) && IndexerId is { } indexer
             ? new Octo.Services.Lidarr.LidarrReleasePick(ReleaseGuid, indexer, ReleaseTitle)
