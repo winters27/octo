@@ -56,6 +56,9 @@ public sealed class TagPreview
         plan.Notes.InsertRange(0, notes);
         plan.ApplyTo(song);
         BaseDownloadService.FillBlanksFromCatalog(song, plan.CatalogBest);
+        if (ExplicitAdvisory.Decide(song, plan, path) is { } advisory) plan.Fields["advisory"] = ExplicitAdvisory.Field(advisory);
+        if (path is not null && WouldTakeOff(path, song.Album) is { Count: > 0 } off)
+            plan.Notes.Add($"a download would take off the file's own {string.Join(", ", off)}");
 
         if (loudness is not null)
         {
@@ -73,5 +76,21 @@ public sealed class TagPreview
             }
         }
         return plan.ToReport();
+    }
+
+    /// <summary>What the writer would take off the file, worked out on the file in memory and
+    /// never saved: the preview writes nothing.</summary>
+    private IReadOnlyList<string> WouldTakeOff(string path, string? album)
+    {
+        try
+        {
+            using var file = TagLib.File.Create(path);
+            return ReleaseFactTags.Tidy(file, ReleaseFactTags.FiledElsewhere(file.Tag.Album, album), null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("preview could not read {Path}: {M}", path, ex.Message);
+            return [];
+        }
     }
 }

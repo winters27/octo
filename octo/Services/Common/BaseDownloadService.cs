@@ -1107,6 +1107,14 @@ public abstract class BaseDownloadService : IDownloadService
         FillAlbumFromFile(song, filePath);
         ApplySingleFallback(song, settings.AlbumFromTitle);
 
+        // Explicit or clean, from what landed; the library server shows it on every song.
+        var advisory = ExplicitAdvisory.Decide(song, plan, song.SourceFile);
+        song.Advisory = advisory?.Value;
+        if (plan is not null && advisory is not null) plan.Fields["advisory"] = ExplicitAdvisory.Field(advisory);
+
+        var sibling = SubsonicSettings.FolderStructure == FolderStructure.Organized ? AlbumSibling(song, requested, filePath) : null;
+        if (sibling is not null) JoinAlbum(song, sibling);
+
         if (plan is not null && !settings.TagRehearsal)
         {
             if (album is not null)
@@ -1114,8 +1122,8 @@ public abstract class BaseDownloadService : IDownloadService
                 album.Pin(song);
                 album.Capture(plan, song);
             }
-            else if (SubsonicSettings.FolderStructure == FolderStructure.Organized)
-                PinToSibling(song, requested, filePath);
+            else if (sibling is not null)
+                PinToSibling(song, sibling);
         }
     }
 
@@ -1175,43 +1183,67 @@ public abstract class BaseDownloadService : IDownloadService
         if (string.IsNullOrEmpty(song.Isrc)) song.Isrc = m.Isrc;
     }
 
-    /// <summary>
-    /// A single joining an album folder that is already there takes that album's release facts
-    /// from one of its files, when the two agree on the album and its artist, so the album the
-    /// library server shows keeps one label, one catalogue number and one year.
-    /// </summary>
-    private void PinToSibling(Song song, RequestedIdentity requested, string currentPath)
+    /// <summary>One file of the album folder this song will join, when the folder is already there
+    /// and the file agrees on the album and its artist; its facts as read, with its path.</summary>
+    private sealed record AlbumSiblingFile(string Path, FileFacts Facts);
+
+    private AlbumSiblingFile? AlbumSibling(Song song, RequestedIdentity requested, string currentPath)
     {
         try
         {
-            if (string.IsNullOrWhiteSpace(song.Album) || string.IsNullOrEmpty(DownloadPath)) return;
+            if (string.IsNullOrWhiteSpace(song.Album) || string.IsNullOrEmpty(DownloadPath)) return null;
             var choice = ChooseLayout(song, requested, SoulseekSettingsValue.NameFromMatch);
             var target = PathHelper.BuildLayoutPath(FolderStructure.Organized, DownloadPath,
                 string.IsNullOrWhiteSpace(choice.FolderArtist) ? "Unknown Artist" : choice.FolderArtist,
                 choice.Album, PathHelper.FileTitle(choice.Title, choice.FileArtist), choice.Track, Path.GetExtension(currentPath));
             var dir = Path.GetDirectoryName(target);
-            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return null;
             var sibling = Directory.EnumerateFiles(dir)
                 .FirstOrDefault(file => AudioExtensions.Contains(Path.GetExtension(file))
                     && !string.Equals(Path.GetFullPath(file), Path.GetFullPath(currentPath), StringComparison.OrdinalIgnoreCase));
-            if (sibling is null) return;
+            if (sibling is null) return null;
 
             var facts = TagWriterExtras.ReadFacts(sibling, tagsAreEvidence: true);
-            if (SongIdentity.Key(facts.Album) != SongIdentity.Key(song.Album)) return;
+            if (SongIdentity.Key(facts.Album) != SongIdentity.Key(song.Album)) return null;
             var albumArtist = song.AlbumArtist ?? song.PrimaryArtist ?? song.Artist;
             if (!string.IsNullOrEmpty(facts.AlbumArtist) && !string.IsNullOrEmpty(albumArtist)
-                && !SongIdentity.SameArtistName(facts.AlbumArtist, albumArtist)) return;
-
-            if (facts.Year is > 0) song.Year = facts.Year;
-            if (!string.IsNullOrEmpty(facts.Label)) song.Label = facts.Label;
-            if (!string.IsNullOrEmpty(facts.CatalogNumber)) song.CatalogNumber = facts.CatalogNumber;
-            if (!string.IsNullOrEmpty(facts.Barcode)) song.Barcode = facts.Barcode;
-            song.TagPlan?.Notes.Add($"album facts taken from the album folder's own '{Path.GetFileName(sibling)}'");
+                && !SongIdentity.SameArtistName(facts.AlbumArtist, albumArtist)) return null;
+            return new AlbumSiblingFile(sibling, facts);
         }
         catch (Exception ex)
         {
             Logger.LogDebug("could not read the album folder's sibling for {Path}: {M}", currentPath, ex.Message);
+            return null;
         }
+    }
+
+    /// <summary>
+    /// A single joining an album folder that is already there takes that album's release facts
+    /// from one of its files, so the album the library server shows keeps one label, one
+    /// catalog number and one year.
+    /// </summary>
+    private static void PinToSibling(Song song, AlbumSiblingFile sibling)
+    {
+        var facts = sibling.Facts;
+        if (facts.Year is > 0) song.Year = facts.Year;
+        if (!string.IsNullOrEmpty(facts.Label)) song.Label = facts.Label;
+        if (!string.IsNullOrEmpty(facts.CatalogNumber)) song.CatalogNumber = facts.CatalogNumber;
+        if (!string.IsNullOrEmpty(facts.Barcode)) song.Barcode = facts.Barcode;
+        song.TagPlan?.Notes.Add($"album facts taken from the album folder's own '{Path.GetFileName(sibling.Path)}'");
+    }
+
+    /// <summary>
+    /// The values the library server groups the folder's album by, read the way it reads them, so
+    /// the new track carries exactly the same ones and lands in that album rather than one of its
+    /// own. Not a matching decision, so a rehearsal keeps it too.
+    /// </summary>
+    private void JoinAlbum(Song song, AlbumSiblingFile sibling)
+    {
+        if (Octo.Services.Library.KeptIdentityTags.Read(sibling.Path) is not { } kept) return;
+        if (kept.AlbumId is null && kept.ReleaseDate is null && kept.AlbumVersion is null) return;
+        song.JoinsAlbum = new AlbumGrouping(kept.AlbumId, kept.ReleaseDate, kept.AlbumVersion);
+        song.TagPlan?.Notes.Add($"album grouping copied from the album folder's own '{Path.GetFileName(sibling.Path)}'");
+        Logger.LogDebug("{Title} joins the album of {Sibling}", song.Title, sibling.Path);
     }
 
     /// <summary>Start measuring a landed file, beside identification, when ReplayGain is on.</summary>
@@ -1360,7 +1392,20 @@ public abstract class BaseDownloadService : IDownloadService
             Logger.LogInformation("Writing metadata to: {Path}", filePath);
             
             using var tagFile = TagLib.File.Create(filePath);
-            
+
+            // A peer tags a file for the release it ripped. What it wrote about that release goes
+            // before Octo writes its own, so the file never names two albums at once (a barcode,
+            // a release id or a track number of the album it was filed away from).
+            var arrivedAlbum = tagFile.Tag.Album;
+            var filedElsewhere = ReleaseFactTags.FiledElsewhere(arrivedAlbum, song.Album);
+            var dropped = ReleaseFactTags.Tidy(tagFile, filedElsewhere, song.JoinsAlbum);
+            if (dropped.Count > 0)
+            {
+                var why = filedElsewhere ? $"it arrived filed under '{arrivedAlbum}'" : "a new download keeps no album grouping values";
+                song.TagPlan?.Notes.Add($"took off the file's own {string.Join(", ", dropped)}: {why}");
+                Logger.LogInformation("Took off {Fields} from {Path}: {Why}", string.Join(", ", dropped), filePath, why);
+            }
+
             // Basic metadata. Title/artist we always have; only overwrite album +
             // album-artist when we actually resolved them, so a well-tagged Soulseek
             // FLAC keeps its own album if Deezer had no match.
@@ -1388,8 +1433,13 @@ public abstract class BaseDownloadService : IDownloadService
             }
             
             if (song.DiscNumber.HasValue)
+            {
                 tagFile.Tag.Disc = (uint)song.DiscNumber.Value;
-            
+                if (song.TotalDiscs is > 0 && song.TotalDiscs >= song.DiscNumber)
+                    tagFile.Tag.DiscCount = (uint)song.TotalDiscs.Value;
+            }
+            ReleaseFactTags.DropOtherTotals(tagFile);
+
             if (song.Year.HasValue)
                 tagFile.Tag.Year = (uint)song.Year.Value;
             
@@ -1466,7 +1516,7 @@ public abstract class BaseDownloadService : IDownloadService
             // The flag is album-level: when the chooser set the album, a peer's stale flag from
             // the compilation the file was ripped from would file the studio album as one.
             if (song.IsCompilation) TagWriterExtras.SetCompilation(tagFile, true);
-            else if (song.TagPlan is { AlbumFromCandidate: true, Rehearsed: false }) TagWriterExtras.SetCompilation(tagFile, false);
+            else if (filedElsewhere || song.TagPlan is { AlbumFromCandidate: true, Rehearsed: false }) TagWriterExtras.SetCompilation(tagFile, false);
 
             // The rest of what a release is: its code, its label and catalogue number, its barcode,
             // its kind and status, where and when it came out, and the ids that name it. The code
@@ -1486,7 +1536,16 @@ public abstract class BaseDownloadService : IDownloadService
             TagWriterExtras.SetText(tagFile, TagFields.FingerprintId, song.AcoustId);
             TagWriterExtras.SetReplayGain(tagFile, song.ReplayGainTrackGainDb, song.ReplayGainTrackPeak,
                 song.ReplayGainAlbumGainDb, song.ReplayGainAlbumPeak);
-            
+            // A value Octo wrote under one name is the only one: a peer's copy under another name
+            // the library server also reads would be a second label or a second barcode.
+            foreach (var (field, value) in new (TagField, string?)[]
+                     {
+                         (TagFields.Barcode, song.Barcode), (TagFields.Label, song.Label), (TagFields.ReleaseType, song.ReleaseType),
+                         (TagFields.ReleaseStatus, song.ReleaseStatus), (TagFields.ReleaseCountry, song.ReleaseCountry),
+                     })
+                if (!string.IsNullOrWhiteSpace(value)) ReleaseFactTags.DropOtherNames(tagFile, field);
+            TagWriterExtras.SetAdvisory(tagFile, song.Advisory);
+
             // One chain (#51) instead of one Deezer URL: Apple's master of the album, the Cover
             // Art Archive when a fingerprint named the release, the catalog's own cover, then
             // Deezer, iTunes and Last.fm by name, then the file's own art; the largest wins. A
@@ -1495,8 +1554,11 @@ public abstract class BaseDownloadService : IDownloadService
             // gets it whole.
             try
             {
-                var embedded = tagFile.Tag.Pictures.FirstOrDefault(picture => picture.Type == TagLib.PictureType.FrontCover)
-                    ?? tagFile.Tag.Pictures.FirstOrDefault();
+                // The art of the album the file was filed away from is not this album's, so it never
+                // outranks the chain; it stays on the file only when the chain finds nothing.
+                var embedded = filedElsewhere ? null
+                    : tagFile.Tag.Pictures.FirstOrDefault(picture => picture.Type == TagLib.PictureType.FrontCover)
+                        ?? tagFile.Tag.Pictures.FirstOrDefault();
                 var resolver = _serviceProvider.GetService<Octo.Services.CoverArt.DownloadCoverResolver>();
                 var cover = resolver is null ? null
                     : await resolver.ResolveAsync(song, embedded?.Data?.Data, cancellationToken);

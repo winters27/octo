@@ -188,6 +188,21 @@ public class Song
     /// <summary>The ids of the release's album artists, one per credit.</summary>
     public List<string> MusicBrainzAlbumArtistIds { get; set; } = new();
 
+    /// <summary>How many discs the release has, when the chosen release said.</summary>
+    public int? TotalDiscs { get; set; }
+
+    /// <summary>What the downloaded version's words are, as the advisory tag holds it: 1 explicit,
+    /// 2 the clean edit, 0 neither. Null when nothing that matched this exact version said.</summary>
+    public int? Advisory { get; set; }
+
+    /// <summary>
+    /// The album grouping values the album this track joins already carries in the library (its
+    /// release id, release date and version), copied exactly so the library server keeps the two
+    /// as one album. Null when there is no such album to join. Never serialised.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public Octo.Services.Tagging.AlbumGrouping? JoinsAlbum { get; set; }
+
     /// <summary>The fingerprint service's id for the audio, once it confirmed the recording.</summary>
     public string? AcoustId { get; set; }
 

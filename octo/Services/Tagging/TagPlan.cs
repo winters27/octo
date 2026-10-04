@@ -151,6 +151,7 @@ public sealed class TagPlan
                 if (c.KindText is { Length: > 0 }) Set(song, "releaseType", song.ReleaseType = c.KindText, from);
                 if (c.Status is { Length: > 0 }) Set(song, "releaseStatus", song.ReleaseStatus = c.Status.ToLowerInvariant(), from);
                 if (c.Country is { Length: > 0 }) Set(song, "releaseCountry", song.ReleaseCountry = c.Country, from);
+                if (c.DiscCount is > 0) Set(song, "discCount", (song.TotalDiscs = c.DiscCount).ToString(), from);
                 if (c.Source is TagSource.Fingerprint or TagSource.Database)
                 {
                     song.MusicBrainzReleaseId = c.ReleaseId;

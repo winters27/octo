@@ -119,6 +119,7 @@ public sealed class DownloadTaggingTests : IDisposable
         public required TaggingService Service { get; init; }
         public required DownloadHistoryService History { get; init; }
         public required FakeMeter Meter { get; init; }
+        public required IServiceProvider Provider { get; init; }
     }
 
     private Harness Build(Dictionary<string, Song> songs, Dictionary<string, string> routes,
@@ -152,6 +153,7 @@ public sealed class DownloadTaggingTests : IDisposable
             Service = new TaggingService(_root, layout, provider, catalog.Object, library.Object, history),
             History = history,
             Meter = meter,
+            Provider = provider,
         };
     }
 
@@ -431,7 +433,7 @@ public sealed class DownloadTaggingTests : IDisposable
       ]}]}]}
     """;
 
-    private Harness CompilationRip(bool preferOriginalAlbum)
+    private Harness CompilationRip(bool preferOriginalAlbum, Action<TagLib.Ogg.XiphComment>? peer = null)
     {
         var harness = Build(new() { ["1"] = new Song { Artist = "Massive Attack", Title = "Teardrop" } },
             new() { ["release/r-mezz?"] = MezzanineDetails, ["/search?q="] = """{"data":[]}""" },
@@ -453,10 +455,204 @@ public sealed class DownloadTaggingTests : IDisposable
                 file.Tag.Album = "Now That's What I Call Music! 42";
                 file.Tag.AlbumArtists = ["Various Artists"];
                 TagWriterExtras.SetCompilation(file, true);
+                peer?.Invoke((TagLib.Ogg.XiphComment)file.GetTag(TagLib.TagTypes.Xiph, true));
             });
         };
         return harness;
     }
+
+    /// <summary>What a peer who tagged the compilation wrote about it: every one of these names
+    /// the compilation, not the studio album the song is filed under.</summary>
+    private static void TaggedForTheCompilation(TagLib.Ogg.XiphComment xiph)
+    {
+        xiph.SetField("MUSICBRAINZ_ALBUMID", "0b1c2d3e-4f50-4617-8899-aabbccddeeff");
+        xiph.SetField("MUSICBRAINZ_RELEASETRACKID", "t-now");
+        xiph.SetField("MUSICBRAINZ_RELEASEGROUPID", "g-now42");
+        xiph.SetField("RELEASEDATE", "1999-04-12");
+        xiph.SetField("UPC", "0724352168227");
+        xiph.SetField("ORGANIZATION", "EMI");
+        xiph.SetField("TRACKNUMBER", "9");
+        xiph.SetField("TRACKTOTAL", "21");
+        xiph.SetField("DISCNUMBER", "2");
+        xiph.SetField("TOTALDISCS", "2");
+        xiph.SetField("REPLAYGAIN_ALBUM_GAIN", "-9.40 dB");
+    }
+
+    [Fact]
+    public async Task CompilationRip_FiledUnderTheStudioAlbum_KeepsNoneOfTheCompilationsFacts()
+    {
+        var harness = CompilationRip(preferOriginalAlbum: true, TaggedForTheCompilation);
+
+        var path = await harness.Service.Download("1");
+
+        Assert.Equal("Mezzanine", Vorbis(path, "ALBUM"));
+        Assert.Equal((3, 11, 1, 1), (int.Parse(Vorbis(path, "TRACKNUMBER")!), int.Parse(Vorbis(path, "TRACKTOTAL")!),
+            int.Parse(Vorbis(path, "DISCNUMBER")!), int.Parse(Vorbis(path, "DISCTOTAL")!)));
+        Assert.Equal("724384559922", Vorbis(path, "BARCODE"));
+        Assert.Equal(["Virgin"], VorbisAll(path, "LABEL"));
+        foreach (var field in new[] { "MUSICBRAINZ_ALBUMID", "RELEASEDATE", "UPC", "ORGANIZATION", "TOTALDISCS", "REPLAYGAIN_ALBUM_GAIN", "COMPILATION" })
+            Assert.True(Vorbis(path, field) is null, $"{field} should have gone");
+        Assert.NotEqual("t-now", Vorbis(path, "MUSICBRAINZ_RELEASETRACKID"));
+        Assert.NotEqual("g-now42", Vorbis(path, "MUSICBRAINZ_RELEASEGROUPID"));
+        var report = harness.History.GetRecent(1).Single().Tagging!;
+        Assert.Contains(report.Notes, n => n.Contains("Now That's What I Call Music! 42") && n.Contains("UPC"));
+    }
+
+    [Fact]
+    public async Task CompilationKept_LosesOnlyTheGroupingValues()
+    {
+        var harness = CompilationRip(preferOriginalAlbum: false, TaggedForTheCompilation);
+
+        var path = await harness.Service.Download("1");
+
+        Assert.Equal("Now That's What I Call Music! 42", Vorbis(path, "ALBUM"));
+        Assert.Null(Vorbis(path, "MUSICBRAINZ_ALBUMID"));
+        Assert.Null(Vorbis(path, "RELEASEDATE"));
+        // Still the compilation, so what the peer wrote about it stays.
+        Assert.Equal("EMI", Vorbis(path, "ORGANIZATION"));
+        Assert.Equal("1", Vorbis(path, "COMPILATION"));
+        Assert.Equal("-9.40 dB", Vorbis(path, "REPLAYGAIN_ALBUM_GAIN"));
+    }
+
+    [Fact]
+    public async Task SameAlbumFromAPeer_EndsWithOneLabelOneBarcodeAndNoGroupingValues()
+    {
+        var harness = Build(new() { ["1"] = new Song { Artist = "Massive Attack", Title = "Teardrop" } }, MezzanineRoutes());
+        harness.Service.Landing = song =>
+        {
+            var verdict = ConfirmedTeardrop();
+            verdict.ApplyTagsTo(song);
+            song.Verification = verdict;
+            return LandedFlac("peer share", file =>
+            {
+                file.Tag.Album = "Mezzanine";
+                var xiph = (TagLib.Ogg.XiphComment)file.GetTag(TagLib.TagTypes.Xiph, true);
+                xiph.SetField("MUSICBRAINZ_ALBUMID", "0b1c2d3e-4f50-4617-8899-aabbccddeeff");
+                xiph.SetField("RELEASEDATE", "2019-08-23");
+                xiph.SetField("ORGANIZATION", "Circa");
+                xiph.SetField("UPC", "724384559922");
+                xiph.SetField("MUSICBRAINZ_ALBUMTYPE", "album");
+            });
+        };
+
+        var path = await harness.Service.Download("1");
+
+        using var file = TagLib.File.Create(path);
+        var view = Octo.Services.Library.KeptIdentityTags.NavidromeView(file);
+        Assert.Equal(["Virgin"], view["label"]);
+        Assert.False(view.ContainsKey("organization"));
+        Assert.Equal(["724384559922"], view["barcode"]);
+        Assert.False(view.ContainsKey("upc"));
+        Assert.False(view.ContainsKey("musicbrainz_albumtype"));
+        var identity = Octo.Services.Library.KeptIdentityTags.Read(path)!;
+        Assert.Null(identity.AlbumId);
+        Assert.Null(identity.ReleaseDate);
+    }
+
+    [Fact]
+    public async Task JoiningAnAlbumFolder_CarriesTheAlbumsOwnGroupingValues()
+    {
+        const string theirs = "99999999-8888-4777-8666-555555555555";
+        var harness = Build(new() { ["1"] = new Song { Artist = "Massive Attack", Title = "Teardrop" } }, MezzanineRoutes(catalogAlbum: "Collected"),
+            layout: FolderStructure.Organized, metadata: new MetadataSettings { TagRehearsal = true });
+        var folder = Path.GetDirectoryName(PathHelper.BuildLayoutPath(FolderStructure.Organized, _root,
+            "Massive Attack", "Collected", "Teardrop", 4, ".flac"))!;
+        Directory.CreateDirectory(folder);
+        var sibling = Path.Combine(folder, "01 - Unfinished Sympathy.flac");
+        File.WriteAllBytes(sibling, AudioFixtures.Flac());
+        using (var file = TagLib.File.Create(sibling))
+        {
+            file.Tag.Title = "Unfinished Sympathy";
+            file.Tag.Album = "Collected";
+            file.Tag.AlbumArtists = ["Massive Attack"];
+            var xiph = (TagLib.Ogg.XiphComment)file.GetTag(TagLib.TagTypes.Xiph, true);
+            xiph.SetField("MUSICBRAINZ_ALBUMID", theirs);
+            xiph.SetField("RELEASEDATE", "2006-03-27");
+            file.Save();
+        }
+        harness.Service.Landing = song =>
+        {
+            var verdict = ConfirmedTeardrop();
+            verdict.ApplyTagsTo(song);
+            song.Verification = verdict;
+            // A peer's own release id for another pressing of the same compilation.
+            return LandedFlac("peer share", file =>
+                ((TagLib.Ogg.XiphComment)file.GetTag(TagLib.TagTypes.Xiph, true)).SetField("MUSICBRAINZ_ALBUMID", "0b1c2d3e-4f50-4617-8899-aabbccddeeff"));
+        };
+
+        // A rehearsal files it under the catalog's album, the one the folder holds.
+        var path = await harness.Service.Download("1");
+
+        Assert.Equal(folder, Path.GetDirectoryName(path));
+        var identity = Octo.Services.Library.KeptIdentityTags.Read(path)!;
+        Assert.Equal((theirs, "2006-03-27"), (identity.AlbumId, identity.ReleaseDate));
+    }
+
+    [Fact]
+    public async Task TheExplicitCopyThatLanded_IsTaggedExplicit_AndTheCleanOneClean()
+    {
+        var routes = MoneyTreesRoutes();
+        async Task<(string Path, TagReport Report)> Landing(string isrc)
+        {
+            var harness = Build(new() { ["1"] = new Song { Artist = "Kendrick Lamar", Title = "Money Trees" } }, routes);
+            harness.Service.Landing = _ => LandedFlac("peer share", file =>
+            {
+                file.Tag.Title = "Money Trees";
+                file.Tag.Performers = ["Kendrick Lamar"];
+                TagWriterExtras.SetText(file, TagFields.Isrc, isrc);
+            });
+            var path = await harness.Service.Download("1");
+            return (path, harness.History.GetRecent(1).Single().Tagging!);
+        }
+
+        var explicitCopy = await Landing("USUM71210782");
+        Assert.Equal("1", Vorbis(explicitCopy.Path, "ITUNESADVISORY"));
+        Assert.Equal(new FieldDecision("explicit", "Catalog"), explicitCopy.Report.Fields["advisory"]);
+
+        // The catalog's first hit is the explicit one; the file's own code says it is the edit.
+        File.Delete(explicitCopy.Path);
+        var cleanCopy = await Landing("USUM71210787");
+        Assert.Equal("2", Vorbis(cleanCopy.Path, "ITUNESADVISORY"));
+    }
+
+    [Fact]
+    public async Task TryItOnASong_ShowsTheAdvisoryAndWhatADownloadWouldTakeOff_AndWritesNothing()
+    {
+        var harness = Build(new(), MoneyTreesRoutes());
+        var path = LandedFlac("library", file =>
+        {
+            file.Tag.Title = "Money Trees";
+            file.Tag.Performers = ["Kendrick Lamar"];
+            file.Tag.Album = "Kendrick Lamar Mixtape Vol. 2";
+            var xiph = (TagLib.Ogg.XiphComment)file.GetTag(TagLib.TagTypes.Xiph, true);
+            xiph.SetField("ISRC", "USUM71210787");
+            xiph.SetField("MUSICBRAINZ_ALBUMID", "0b1c2d3e-4f50-4617-8899-aabbccddeeff");
+            xiph.SetField("CATALOGNUMBER", "MIX-2");
+        });
+        var before = File.ReadAllBytes(path);
+        var preview = new TagPreview(harness.Provider, harness.Provider.GetRequiredService<ReleaseIdentifier>(), NullLogger<TagPreview>.Instance);
+
+        var report = await preview.PreviewAsync(path, null, null, null, CancellationToken.None);
+
+        Assert.Equal(new FieldDecision("clean edit", "Catalog"), report.Fields["advisory"]);
+        Assert.Contains(report.Notes, n => n.StartsWith("a download would take off") && n.Contains("MUSICBRAINZ_ALBUMID") && n.Contains("CATALOGNUMBER"));
+        Assert.Equal(before, File.ReadAllBytes(path));
+    }
+
+    /// <summary>"Money Trees" twice in the catalog: the explicit copy first, then the clean edit,
+    /// each with its own code.</summary>
+    private static Dictionary<string, string> MoneyTreesRoutes() => new()
+    {
+        ["/album/7"] = """{"id":7,"record_type":"album","release_date":"2012-10-22","nb_tracks":12,"artist":{"name":"Kendrick Lamar"}}""",
+        ["/album/8"] = """{"id":8,"record_type":"album","release_date":"2012-10-22","nb_tracks":12,"artist":{"name":"Kendrick Lamar"}}""",
+        ["/track/71"] = """{"id":71,"track_position":5,"disk_number":1,"isrc":"USUM71210782","explicit_lyrics":true,"explicit_content_lyrics":1}""",
+        ["/track/81"] = """{"id":81,"track_position":5,"disk_number":1,"isrc":"USUM71210787","explicit_lyrics":false,"explicit_content_lyrics":3}""",
+        ["/search?q="] = """
+            {"data":[
+              {"id":71,"title":"Money Trees","duration":386,"explicit_lyrics":true,"album":{"id":7,"title":"good kid, m.A.A.d city"},"artist":{"name":"Kendrick Lamar"}},
+              {"id":81,"title":"Money Trees","duration":386,"explicit_lyrics":false,"album":{"id":8,"title":"good kid, m.A.A.d city"},"artist":{"name":"Kendrick Lamar"}}]}
+            """,
+    };
 
     [Fact]
     public async Task CompilationRip_PreferOriginalAlbumOn_IsFiledUnderTheStudioAlbum()

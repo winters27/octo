@@ -101,6 +101,7 @@ public static class CandidateSources
             CoverUrl = meta.AlbumCoverUrl,
             Genre = meta.Genre,
             Explicit = meta.ExplicitLyrics,
+            ExplicitContent = meta.ExplicitContent,
             CatalogAlbumId = meta.AlbumId,
             CatalogTrackId = meta.TrackId,
         };
