@@ -142,6 +142,12 @@ services:
       # first closing brace would end the variable.
       GeneratedPlaylists__NameFormat: ${MIX_NAME_FORMAT:-}
 
+      # ----- Spotify import: lists from Spotify, a link or a file, and the trickle -----
+      Imports__SpotifyClientId: ${IMPORTS_SPOTIFY_CLIENT_ID:-}
+      Imports__SpotifyRedirectUri: ${IMPORTS_SPOTIFY_REDIRECT_URI:-http://127.0.0.1/callback}
+      Imports__SongsPerHour: ${IMPORTS_SONGS_PER_HOUR:-20}
+      Imports__RefreshHours: ${IMPORTS_REFRESH_HOURS:-6}
+
       # ----- Genre normalization -----
       # Collapses the genres downloads arrive with into a browsable list. Off by
       # default. The mapping table itself lives in the dashboard / settings.json,

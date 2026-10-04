@@ -1180,6 +1180,41 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: inset 0 1px 
   .lossy-row > span:nth-child(3), .lossy-row > span:nth-child(5) { grid-column: 2 / -1; }
 }
 
+/* ── Spotify import: lists, one list's songs, the trickle ── */
+.imp-actions { display: flex; flex-wrap: wrap; gap: var(--s-m); justify-content: flex-end; }
+.imp-card { padding: var(--s-xl); display: flex; flex-direction: column; gap: var(--s-l); }
+.set-card.imp-card > :not([hidden]):not([type="hidden"]) ~ :not([type="hidden"]) { border-top: 0; }
+.imp-card > .set-row { padding: 0; }
+.imp-reading { margin: 0; }
+.imp-reading.imp-error { color: #ff7b72; }
+.imp-row { grid-template-columns: minmax(0, 2.2fr) minmax(0, 1.6fr) 92px 104px 136px; gap: var(--s-l); align-items: center; }
+.imp-row.picked, .imp-track.picked { background: var(--accent-selected); }
+.imp-row .key, .imp-track .key, .imp-trickle-row .key { font-family: inherit; color: var(--ink); overflow-wrap: anywhere; }
+.imp-name { color: var(--ink); font-weight: 500; text-align: left; }
+.imp-name:hover { color: var(--accent-hover); text-decoration: underline; text-decoration-color: var(--accent-line); }
+.imp-row-actions { display: flex; gap: var(--s-s, 6px); justify-content: flex-end; }
+.imp-track { grid-template-columns: 28px 2fr 1.4fr 56px 1.6fr; gap: var(--s-l); align-items: center; cursor: default; }
+.imp-track .value { font-family: inherit; word-break: normal; overflow-wrap: anywhere; }
+.imp-tracks { max-height: 62vh; overflow-y: auto; }
+.imp-trickle-row { grid-template-columns: minmax(0, 2fr) minmax(0, 2fr) 96px; gap: var(--s-l); align-items: center; }
+.imp-detail-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s-l); }
+.imp-detail-head h4 { margin: 0; font-size: var(--t-body, 14px); color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+.imp-detail-head .btn { margin-left: auto; }
+.imp-subhead { margin: 0 0 6px; font-size: var(--t-meta); color: var(--ink-1); font-weight: 600; }
+.imp-num { width: 96px; flex: none; }
+.imp-switch-cell { display: flex; align-items: center; gap: var(--s-m); }
+.imp-cell-label { display: none; color: var(--ink-2); font-size: 12px; }
+@container (max-width: 640px) {
+  .imp-row { grid-template-columns: 1fr 1fr; }
+  .imp-row > span:nth-child(1), .imp-row > span:nth-child(2), .imp-row > span:nth-child(5) { grid-column: 1 / -1; }
+  .imp-row.config-row-head { display: none; }
+  .imp-cell-label { display: inline; }
+  .imp-track { grid-template-columns: 28px 1fr; }
+  .imp-track > span:nth-child(n+3) { grid-column: 2 / -1; }
+  .imp-trickle-row { grid-template-columns: 1fr auto; }
+  .imp-trickle-row > span:nth-child(2) { grid-column: 1 / -1; grid-row: 2; }
+}
+
 /* ── Cover art: the soft covers wall ── */
 .cover-tool { padding: var(--s-xl); display: flex; flex-direction: column; gap: var(--s-l); }
 /* The card's row dividers are for settings rows; the wall is one surface. */

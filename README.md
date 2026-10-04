@@ -557,6 +557,39 @@ DejaVu or Symbola from the image. No cover carries an Octo mark. A picture in
 `/app/config/covers` named after a mix or station (`Rock Mix.jpg`), or after its genre or
 decade (`Rock.png`), replaces its cover, and replacing the picture shows without a restart.
 
+### Spotify import
+
+The dashboard's **Spotify import** page, and the same view in the Octo apps, shows what your
+library has of your Spotify liked songs and playlists. A list can be kept as a Navidrome
+playlist of the songs you have, in Spotify's order, and filled in as the rest arrive; its
+missing songs can go to the trickle, which fetches them a few an hour through the same chain
+a heart uses (your library first, then each heart download source in order, Soulseek's outage
+hold, Lidarr). It never starts a song while anyone's own download runs, and waits out a Soulseek
+outage instead of taking a YouTube copy. Lists, sign-ins and the trickle live in
+`/app/config/imports.json`, `spotify-accounts.json` and `imports-trickle.json`, so a restart
+carries on.
+
+Spotify's Web API only works through an app you register yourself, and in 2026 such an app
+in development mode reads for at most five Spotify accounts, needs its owner to have Premium,
+gets no ISRCs, and is shown the songs only of playlists the account made or works on. Octo
+reads the first 100 songs of any other playlist from its public page, and says so.
+
+1. At [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard), **Create app**,
+   tick **Web API**, and add the redirect URI `http://127.0.0.1/callback` exactly. Spotify takes
+   https or a loopback address, never `localhost`; a loopback one with no port lets the Octo apps
+   sign in on any port.
+2. Under **User Management**, add every Spotify account that will connect.
+3. Put the app's **Client ID** in `IMPORTS_SPOTIFY_CLIENT_ID` or on the page. Octo signs in
+   with PKCE, so there is no secret. After you allow Octo, the dashboard asks for the address
+   the browser ended on; an Octo behind https can register
+   `https://<octo>/imports/spotify/callback` instead and finish by itself.
+
+No sign-in is needed for a public playlist or album link (the first 100 songs), a CSV from
+Exportify, TuneMyMusic or Soundiiz (any CSV with a title and an artist column), or the zip
+from Spotify's own **Download your data**, which holds every playlist whole.
+`IMPORTS_SONGS_PER_HOUR` (20) paces the trickle and `IMPORTS_REFRESH_HOURS` (6) reads lists
+that are kept or fetching again, so new songs on Spotify reach them.
+
 ### Download path on Windows and manual installs
 
 `DOWNLOAD_PATH` in `.env` is a HOST path: it is bind-mounted as `/music` into the octo, yt-dlp-shim, and slskd containers, and it is the only path you change to move the library. Container-side settings (Octo's `Library__DownloadPath`, slskd's downloads dir) stay `/music`.
@@ -643,8 +676,9 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `getLyricsBySongId`, `getLyrics` | lyrics for outside songs and for library songs Navidrome has none for; chosen or hidden lyrics for every client; word cues with `enhanced=true` |
 | `getLyricsCandidates`, `setLyricsChoice` | the `octoLyrics` extension: every lyrics entry for a song, and pinning one, hiding lyrics, or going back to automatic |
 | `getLibraryActions`, `libraryAction` | the `octoLibraryActions` extension: what the caller may do to library files, and removing one song the way the Delete playlist does |
+| `getImports`, `getImport`, `importAction` | the `octoImports` extension: the caller's Spotify sign-in, imported lists with what the library has of each, and the trickle |
 | `/api/artist/{id}`, `/api/album?artist_id=` | Navidrome's own API, for clients that use it (Feishin): an outside artist's page and its albums |
-| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions`, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on) and `songLyrics` 1 and 2 |
+| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions`, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoImports` and `songLyrics` 1 and 2 |
 
 ### Soulseek download details
 

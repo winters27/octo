@@ -58,6 +58,10 @@
             <svg class="icon" aria-hidden="true"><use href="#i-heart"/></svg>
             <span>Streams &amp; hearts</span>
           </button>
+          <button class="sidebar-nav-item" data-tab="imports">
+            <svg class="icon" aria-hidden="true"><use href="#i-spotify-logo"/></svg>
+            <span>Spotify import</span>
+          </button>
           <button class="sidebar-nav-item" data-tab="soulseek">
             <svg class="icon brand" aria-hidden="true"><use href="#b-slskd"/></svg>
             <span>Soulseek</span>
@@ -1762,6 +1766,156 @@
           </div>
         </div>
 
+      </section>
+
+      <section data-pane="imports">
+        <header class="page-header">
+          <div>
+            <h1>Spotify import</h1>
+            <p>See which of your Spotify songs are missing here, keep your playlists as Navidrome playlists, and let Octo fetch the rest a few songs an hour.</p>
+          </div>
+        </header>
+
+        <div class="notice notice-warn" id="imp-library-problem" hidden></div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Spotify account</h3>
+            <p class="set-desc">Octo reads your liked songs and playlists through a Spotify app of your own. It only reads; nothing on Spotify changes.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t" id="imp-account-title">Not connected</div>
+                <div class="set-info-d" id="imp-account-line">Loading…</div>
+              </div>
+              <div class="imp-actions">
+                <button class="btn" type="button" id="imp-read" hidden>Read again</button>
+                <button class="btn" type="button" id="imp-disconnect" hidden>Disconnect</button>
+                <button class="btn btn-primary" type="button" id="imp-connect">Connect Spotify</button>
+              </div>
+            </div>
+            <div class="set-row stack" id="imp-paste-row" hidden>
+              <div class="set-info">
+                <div class="set-info-t">Paste where Spotify sent you</div>
+                <div class="set-info-d">Once you allow Octo, Spotify sends your browser to an address that will not open. That is expected. Copy the whole address from the address bar and paste it here.</div>
+              </div>
+              <div class="lfm-connect-row">
+                <input class="set-input" id="imp-paste" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1/callback?code=…" aria-label="The address Spotify sent you to" />
+                <button class="btn btn-primary" id="imp-finish" type="button">Finish</button>
+              </div>
+            </div>
+          </div>
+          <form data-section="imports" class="set-card" id="imports-form">
+            <details class="set-more" id="imp-guide">
+              <summary>Set up your Spotify app</summary>
+              <div class="set-row stack">
+                <div class="set-info">
+                  <ol class="lfm-steps">
+                    <li>Signed in to Spotify, open the <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">developer dashboard</a> and choose <strong>Create app</strong>. Spotify asks that the account that owns the app has Premium.</li>
+                    <li>Any name will do, such as Octo. Tick <strong>Web API</strong>.</li>
+                    <li>Under <strong>Redirect URIs</strong>, add exactly <code id="imp-redirect-shown">http://127.0.0.1/callback</code> and save.</li>
+                    <li>Under <strong>User Management</strong>, add the email of every Spotify account that will connect, up to five. Your own account is there already.</li>
+                    <li>Copy the <strong>Client ID</strong> into the field below and save. There is no secret to copy.</li>
+                  </ol>
+                </div>
+              </div>
+            </details>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Client ID</div>
+                <div class="set-info-d">From your Spotify app's settings. Not a secret: Octo signs in with PKCE, which needs none.</div>
+              </div>
+              <input class="set-input" name="Imports.SpotifyClientId" type="text" autocomplete="off" spellcheck="false" placeholder="32 letters and numbers" />
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Redirect URI</div>
+                <div class="set-info-d">Exactly as it is on your Spotify app. Spotify takes https, or http on 127.0.0.1, never localhost.</div>
+                <div class="set-info-more">The default, with no port, also lets the Octo apps sign in. If Octo has an https address of its own, use that address followed by <code>/imports/spotify/callback</code>, and Octo finishes the sign-in by itself with nothing to paste.</div>
+              </div>
+              <input class="set-input" name="Imports.SpotifyRedirectUri" type="text" autocomplete="off" spellcheck="false" placeholder="http://127.0.0.1/callback" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Songs an hour</div>
+                <div class="set-info-d">How many missing songs Octo starts fetching in an hour, at most. 0 stops it.</div>
+                <div class="set-info-more">It waits while anyone's own downloads run, and while Soulseek is out, so a heart never waits behind it.</div>
+              </div>
+              <input class="set-input imp-num" name="Imports.SongsPerHour" type="number" min="0" max="600" step="1" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Read lists again every</div>
+                <div class="set-info-d">Hours. Only lists kept as a playlist or getting their missing songs, so new songs on Spotify reach them. 0 reads them only when you ask.</div>
+              </div>
+              <input class="set-input imp-num" name="Imports.RefreshHours" type="number" min="0" max="168" step="1" />
+            </div>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Without signing in</h3>
+            <p class="set-desc">A public playlist or album by its link, or a file another tool exported.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">Public link</div>
+                <div class="set-info-d">Share, then Copy link, on a Spotify playlist or album. A link shows Octo only the first 100 songs.</div>
+              </div>
+              <div class="lfm-connect-row">
+                <input class="set-input" id="imp-link" type="url" autocomplete="off" spellcheck="false" placeholder="https://open.spotify.com/playlist/…" aria-label="Spotify playlist or album link" />
+                <button class="btn" id="imp-link-add" type="button">Add</button>
+              </div>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">A file</div>
+                <div class="set-info-d">A CSV from <a href="https://exportify.app" target="_blank" rel="noopener">Exportify</a>, TuneMyMusic or Soundiiz, or the zip from Spotify's own <a href="https://www.spotify.com/account/privacy/" target="_blank" rel="noopener">Download your data</a>, which holds every playlist whole.</div>
+                <div class="set-info-more">Any CSV with a title column and an artist column works. Importing a newer file updates the list of the same name.</div>
+              </div>
+              <div class="lfm-connect-row">
+                <input class="set-input" id="imp-file" type="file" accept=".csv,.json,.zip,text/csv,application/json,application/zip" aria-label="File to import" />
+                <button class="btn" id="imp-file-add" type="button">Import</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Your lists</h3>
+            <p class="set-desc"><strong>Keep as playlist</strong> makes a Navidrome playlist of the songs you have, in Spotify's order, and adds the rest as they arrive. <strong>Get missing songs</strong> hands the rest to the trickle below, and every song added to the list later too.</p>
+          </div>
+          <div class="set-card imp-card">
+            <p class="set-info-d imp-reading" id="imp-reading" hidden></p>
+            <div id="imp-lists" aria-live="polite"></div>
+          </div>
+          <div class="set-card imp-card" id="imp-detail" hidden></div>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Trickle</h3>
+            <p class="set-desc">Fetches missing songs one at a time, the way a heart does: your library is checked first, then each download source in its order.</p>
+          </div>
+          <div class="set-card imp-card">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t" id="imp-trickle-title">Nothing to fetch</div>
+                <div class="set-info-d" id="imp-trickle-line"></div>
+              </div>
+              <div class="imp-actions">
+                <button class="btn" type="button" id="imp-retry" hidden>Try not found again</button>
+                <button class="btn" type="button" id="imp-clear" hidden>Clear finished</button>
+                <button class="btn" type="button" id="imp-pause" hidden>Pause</button>
+              </div>
+            </div>
+            <div id="imp-trickle-rows"></div>
+          </div>
+        </div>
       </section>
 
       <section data-pane="lossy">

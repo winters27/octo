@@ -49,6 +49,7 @@ function activateTab(name, { focus = false } = {}) {
   // Panes that show live data reload whenever they are opened, so they are never stale.
   if (name === 'fetched' && typeof loadFetched === 'function') loadFetched();
   if (name === 'lossy' && typeof loadLossy === 'function') loadLossy();
+  if (name === 'imports' && typeof loadImports === 'function') loadImports();
   if (name === 'raw' && typeof loadRawConfig === 'function') loadRawConfig();
   if (name === 'sources' && typeof loadConfigSources === 'function') loadConfigSources();
   if (name === 'lastfm' && typeof loadRadioStatus === 'function') loadRadioStatus();
@@ -4765,6 +4766,422 @@ document.getElementById('update-copy')?.addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(text); toast('Command copied.', 'ok'); }
   catch { await askDialog({ title: 'Copy the command', confirm: 'Done', cancel: null, input: { value: text, readOnly: true } }); }
 });
+
+// ────────────────────────────────────────────────────────────────
+// Spotify import: lists from a Spotify account, a link or a file, what the library has of each,
+// playlists kept in Navidrome, and the trickle that fetches the rest
+// ────────────────────────────────────────────────────────────────
+const imp = { view: null, user: null, open: null, detail: null, picked: new Set(), timer: null, waitingForPaste: false };
+const impEl = id => document.getElementById(id);
+const impStateWords = {
+  have: 'In your library', missing: 'Missing', queued: 'Queued', downloading: 'Fetching',
+  done: 'Fetched', notFound: 'Not found', skipped: 'Skipped',
+};
+const impStateTone = { have: 'good', done: 'good', missing: 'state', queued: 'state', downloading: 'state', notFound: 'warn', skipped: 'warn' };
+const impSourceWords = { spotifyLiked: 'Spotify', spotifyPlaylist: 'Spotify', link: 'Link', file: 'File' };
+
+// The page acts for the Navidrome account signed in on it, like Better quality.
+async function impFetch(path, options = {}) {
+  let response = await api(path, { credentials: 'same-origin', ...options });
+  if (response.status === 401 && await browseAuthenticate(impEl('imp-lists'))) {
+    response = await api(path, { credentials: 'same-origin', ...options });
+  }
+  return response;
+}
+
+async function impPost(path, body, anchor) {
+  const response = await impFetch(path, {
+    method: 'POST',
+    headers: body instanceof FormData ? {} : { 'Content-Type': 'application/json' },
+    body: body instanceof FormData ? body : JSON.stringify(body ?? {}),
+  });
+  const answer = await response.json().catch(() => ({}));
+  const message = answer.message || answer.error || `HTTP ${response.status}`;
+  if (anchor) note(anchor, message, response.ok ? 'ok' : 'error');
+  return { ok: response.ok, answer };
+}
+
+async function loadImports() {
+  clearTimeout(imp.timer);
+  if (!imp.view) impEl('imp-lists').innerHTML = stateBlock('loading', 'Reading your lists…');
+  try {
+    const response = await impFetch('/api/admin/imports');
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    imp.view = body.overview;
+    imp.user = body.user;
+    renderImports();
+    if (imp.open) await loadImportDetail(imp.open, false);
+  } catch (error) {
+    impEl('imp-lists').innerHTML = stateBlock('error', error.message);
+  }
+  // Live while something is moving and the page is open.
+  const moving = imp.view && (imp.view.reading?.busy || imp.view.trickle?.queued > 0 || imp.view.trickle?.downloading > 0);
+  if (moving && document.querySelector('section[data-pane="imports"].active')) imp.timer = setTimeout(loadImports, 3000);
+}
+
+function impWhen(utc) {
+  if (!utc) return '';
+  const date = new Date(utc);
+  return date.toDateString() === new Date().toDateString()
+    ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : date.toLocaleDateString();
+}
+
+function renderImports() {
+  const view = imp.view;
+  if (!view) return;
+  const spotify = view.spotify;
+
+  const problem = impEl('imp-library-problem');
+  problem.hidden = !view.libraryProblem;
+  if (view.libraryProblem) problem.textContent = view.libraryProblem;
+
+  // The account.
+  impEl('imp-redirect-shown').textContent = spotify.redirectUri;
+  impEl('imp-account-title').textContent = spotify.connected ? `Connected as ${spotify.account}`
+    : spotify.problem ? 'Sign in again' : 'Not connected';
+  let line;
+  if (!spotify.configured) line = 'Add your Spotify app\'s Client ID below first. The steps are under "Set up your Spotify app".';
+  else if (spotify.redirectProblem) line = `The redirect URI will not work: ${spotify.redirectProblem}`;
+  else if (spotify.problem) line = spotify.problem;
+  else if (spotify.connected) line = `Spotify ends this sign-in on ${new Date(spotify.endsUtc).toLocaleDateString()}, six months after it was made; connect again then.`;
+  else line = 'Connect opens Spotify in a new tab to allow Octo to read your library.';
+  impEl('imp-account-line').textContent = line;
+  impEl('imp-connect').textContent = spotify.connected ? 'Connect again' : 'Connect Spotify';
+  impEl('imp-connect').disabled = !spotify.configured || !!spotify.redirectProblem;
+  impEl('imp-connect').classList.toggle('btn-primary', !spotify.connected);
+  impEl('imp-read').hidden = !spotify.connected;
+  impEl('imp-read').disabled = !!view.reading?.busy;
+  impEl('imp-disconnect').hidden = !spotify.connected && !spotify.problem;
+  impEl('imp-paste-row').hidden = !imp.waitingForPaste || spotify.octoFinishes;
+  impEl('imp-guide').open = !spotify.configured;
+
+  const reading = impEl('imp-reading');
+  const read = view.reading;
+  reading.hidden = !read?.busy && !read?.error;
+  reading.classList.toggle('imp-error', !!read?.error);
+  reading.textContent = read?.busy ? `${read.step}…` : read?.error ?? '';
+
+  renderImportLists();
+  renderTrickle();
+}
+
+function renderImportLists() {
+  const lists = imp.view.lists || [];
+  const holder = impEl('imp-lists');
+  if (!lists.length) {
+    holder.innerHTML = stateBlock('empty', imp.view.spotify.connected
+      ? 'No lists yet. Read again to look at your Spotify once more.'
+      : 'No lists yet. Connect Spotify, or add a link or a file.');
+    return;
+  }
+  holder.innerHTML = `
+    <div class="config-table">
+      <div class="config-row config-row-head imp-row">
+        <span>List</span><span>In your library</span><span>Keep as playlist</span><span>Get missing songs</span><span></span>
+      </div>
+      ${lists.map(list => {
+        const total = list.total || list.have + list.missing + list.queued + list.downloading + list.done + list.notFound + list.skipped;
+        const pct = total ? Math.round(list.have / total * 100) : 0;
+        const coming = list.queued + list.downloading;
+        const sub = [
+          impSourceWords[list.source] ?? list.source,
+          list.by ? `by ${list.by}` : null,
+          list.gone ? 'no longer on your Spotify' : null,
+          `read ${impWhen(list.readUtc)}`,
+        ].filter(Boolean).join(' · ');
+        const counts = [`${list.have} of ${total}`, list.missing ? `${list.missing} missing` : null,
+          coming ? `${coming} coming` : null, list.notFound ? `${list.notFound} not found` : null].filter(Boolean).join(' · ');
+        return `
+          <div class="config-row imp-row${imp.open === list.id ? ' picked' : ''}">
+            <span class="key"><button type="button" class="link-btn imp-name" data-imp-open="${esc(list.id)}">${esc(list.name)}</button>
+              <span class="lossy-sub">${esc(sub)}</span>
+              ${list.partial ? `<span class="lossy-detail">${esc(list.partial)}</span>` : ''}
+              ${list.playlistNote ? `<span class="lossy-detail">${esc(list.playlistNote)}</span>` : ''}</span>
+            <span><span class="lossy-sub">${esc(counts)}</span><span class="lossy-meter"><span style="width:${pct}%"></span></span></span>
+            <span class="imp-switch-cell"><span class="imp-cell-label">Keep as playlist</span><label class="switch" title="Keep as playlist"><input type="checkbox" data-imp-playlist="${esc(list.id)}" ${list.keepPlaylist ? 'checked' : ''}
+              aria-label="Keep ${esc(list.name)} as a Navidrome playlist" /><span class="sw-track"></span><span class="sw-thumb"></span></label></span>
+            <span class="imp-switch-cell"><span class="imp-cell-label">Get missing songs</span><label class="switch" title="Get missing songs"><input type="checkbox" data-imp-fetch="${esc(list.id)}" ${list.getMissing ? 'checked' : ''}
+              aria-label="Get the songs ${esc(list.name)} is missing" /><span class="sw-track"></span><span class="sw-thumb"></span></label></span>
+            <span class="imp-row-actions">
+              ${list.canRefresh ? `<button type="button" class="btn btn-ghost" data-imp-refresh="${esc(list.id)}">Read again</button>` : ''}
+              <button type="button" class="btn btn-ghost" data-imp-remove="${esc(list.id)}" aria-label="Remove ${esc(list.name)}">${icon('i-trash')}</button>
+            </span>
+          </div>`;
+      }).join('')}
+    </div>`;
+}
+
+async function loadImportDetail(id, scroll = true) {
+  imp.open = id;
+  const box = impEl('imp-detail');
+  box.hidden = false;
+  if (!imp.detail || imp.detail.list.id !== id) {
+    imp.picked.clear();
+    box.innerHTML = stateBlock('loading', 'Reading the list…');
+  }
+  const response = await impFetch(`/api/admin/imports/lists/${encodeURIComponent(id)}`);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) { box.innerHTML = stateBlock('error', body.error || `HTTP ${response.status}`); return; }
+  imp.detail = body;
+  renderImportDetail();
+  renderImportLists();
+  if (scroll) box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+function renderImportDetail() {
+  const { list, tracks } = imp.detail;
+  const box = impEl('imp-detail');
+  const pickable = tracks.filter(t => ['missing', 'notFound', 'skipped'].includes(t.state));
+  for (const key of [...imp.picked]) if (!pickable.some(t => t.key === key)) imp.picked.delete(key);
+  const n = imp.picked.size;
+  const length = s => (s ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` : '');
+  box.innerHTML = `
+    <div class="imp-detail-head">
+      <h4>${esc(list.name)}</h4>
+      <span class="lossy-sub">${list.have} in your library, ${tracks.length - list.have} not</span>
+      <button type="button" class="btn btn-ghost" id="imp-detail-close">Close</button>
+    </div>
+    <div class="config-table imp-tracks">
+      <div class="config-row config-row-head imp-track">
+        <span></span><span>Song</span><span>Album</span><span>Length</span><span>Status</span>
+      </div>
+      ${tracks.map(track => {
+        const can = ['missing', 'notFound', 'skipped'].includes(track.state);
+        const pct = typeof track.progress === 'number' ? Math.round(track.progress * 100) : null;
+        return `
+          <label class="config-row imp-track${imp.picked.has(track.key) ? ' picked' : ''}">
+            <span>${can ? `<input type="checkbox" class="pick" data-imp-pick="${esc(track.key)}" ${imp.picked.has(track.key) ? 'checked' : ''} aria-label="Pick ${esc(track.title)}" />` : ''}</span>
+            <span class="key">${esc(track.title)}<span class="lossy-sub">${esc(track.artist)}</span></span>
+            <span class="value">${esc(track.album ?? '')}</span>
+            <span class="value">${esc(length(track.seconds))}</span>
+            <span><span class="dl-badge ${impStateTone[track.state] ?? 'state'}">${esc(impStateWords[track.state] ?? track.state)}</span>
+              ${track.detail ? `<span class="lossy-detail">${esc(track.detail)}${pct !== null ? ` ${pct}%` : ''}</span>` : ''}
+              ${pct !== null ? `<span class="lossy-meter"><span style="width:${pct}%"></span></span>` : ''}</span>
+          </label>`;
+      }).join('')}
+    </div>
+    <div class="cover-bar">
+      <span class="cover-count">${n ? `${n} ${n === 1 ? 'song' : 'songs'} picked` : 'Pick missing songs to get only those'}</span>
+      <span class="cover-hint"></span>
+      ${pickable.length ? `<button type="button" class="btn btn-ghost" id="imp-pick-all">Select all ${pickable.length}</button>` : ''}
+      <button type="button" class="btn btn-primary" id="imp-get" ${n ? '' : 'disabled'}>Get ${n || ''} ${n === 1 ? 'song' : 'songs'}</button>
+    </div>`;
+}
+
+function renderTrickle() {
+  const t = imp.view.trickle;
+  const words = {
+    idle: 'Nothing to fetch',
+    running: t.downloading ? 'Fetching' : 'Waiting for the next turn',
+    paused: 'Paused',
+    off: 'Off',
+    yielding: 'Waiting for other downloads',
+    waitingForSoulseek: 'Waiting for Soulseek',
+  };
+  impEl('imp-trickle-title').textContent = words[t.state] ?? t.state;
+  const parts = [];
+  if (t.state === 'off') parts.push('Songs an hour is 0, so nothing starts. Change it above.');
+  else parts.push(`Up to ${t.perHour} ${t.perHour === 1 ? 'song' : 'songs'} an hour.`);
+  if (t.state === 'running' && t.nextUtc && !t.downloading) parts.push(`Next song at ${impWhen(t.nextUtc)}.`);
+  if (t.state === 'yielding') parts.push('Someone\'s own downloads come first; it goes on once they finish.');
+  if (t.state === 'waitingForSoulseek') parts.push('slskd is not logged in to Soulseek; it goes on once it is back.');
+  const tally = [[t.queued, 'waiting'], [t.downloading, 'fetching'], [t.done, 'fetched'], [t.notFound, 'not found'], [t.skipped, 'skipped']]
+    .filter(([count]) => count > 0).map(([count, label]) => `${count} ${label}`);
+  if (tally.length) parts.push(`${tally.join(', ')}.`);
+  impEl('imp-trickle-line').textContent = parts.join(' ');
+
+  const pause = impEl('imp-pause');
+  pause.hidden = t.state === 'idle' && t.queued === 0;
+  pause.textContent = t.state === 'paused' ? 'Go on' : 'Pause';
+  impEl('imp-retry').hidden = !t.notFound;
+  impEl('imp-clear').hidden = !(t.done + t.notFound + t.skipped);
+
+  const row = (track, action = '') => {
+    const pct = typeof track.progress === 'number' ? Math.round(track.progress * 100) : null;
+    return `
+      <div class="config-row imp-trickle-row">
+        <span class="key">${esc(track.title)}<span class="lossy-sub">${esc(track.artist)}</span></span>
+        <span><span class="dl-badge ${impStateTone[track.state] ?? 'state'}">${esc(impStateWords[track.state] ?? track.state)}</span>
+          ${track.detail ? `<span class="lossy-detail">${esc(track.detail)}${pct !== null ? ` ${pct}%` : ''}</span>` : ''}
+          ${pct !== null ? `<span class="lossy-meter"><span style="width:${pct}%"></span></span>` : ''}</span>
+        <span class="imp-row-actions">${action}</span>
+      </div>`;
+  };
+  const sections = [];
+  if (t.current) sections.push(`<h4 class="imp-subhead">Now</h4><div class="config-table">${row(t.current)}</div>`);
+  if (t.next?.length) {
+    sections.push(`<h4 class="imp-subhead">Next</h4><div class="config-table">${t.next.map(track =>
+      row(track, `<button type="button" class="btn btn-ghost" data-imp-skip="${esc(track.key)}">Skip</button>`)).join('')}</div>`);
+  }
+  if (t.recent?.length) {
+    sections.push(`<h4 class="imp-subhead">Lately</h4><div class="config-table">${t.recent.map(track =>
+      row(track, ['notFound', 'skipped'].includes(track.state)
+        ? `<button type="button" class="btn btn-ghost" data-imp-retry="${esc(track.key)}">Try again</button>` : '')).join('')}</div>`);
+  }
+  impEl('imp-trickle-rows').innerHTML = sections.join('');
+}
+
+impEl('imp-connect')?.addEventListener('click', async event => {
+  // Opened before the answer, inside the click, so the browser does not block the new tab.
+  const tab = window.open('', '_blank');
+  const { ok, answer } = await impPost('/api/admin/imports/spotify/connect', {}, null);
+  if (!ok || !answer.url) {
+    tab?.close();
+    note(event.currentTarget, answer.message || 'Spotify could not be opened.', 'error');
+    return;
+  }
+  if (tab) tab.location.href = answer.url; else location.href = answer.url;
+  imp.waitingForPaste = !imp.view?.spotify?.octoFinishes;
+  renderImports();
+  if (imp.waitingForPaste) impEl('imp-paste').focus();
+  else imp.timer = setTimeout(loadImports, 4000);
+});
+
+impEl('imp-finish')?.addEventListener('click', async event => {
+  const address = impEl('imp-paste').value.trim();
+  if (!address) { note(event.currentTarget, 'Paste the address first.', 'error'); return; }
+  event.currentTarget.disabled = true;
+  const { ok } = await impPost('/api/admin/imports/spotify/finish', { address }, event.currentTarget);
+  event.currentTarget.disabled = false;
+  if (ok) {
+    imp.waitingForPaste = false;
+    impEl('imp-paste').value = '';
+    await loadImports();
+  }
+});
+
+impEl('imp-paste')?.addEventListener('keydown', event => {
+  if (event.key === 'Enter') { event.preventDefault(); impEl('imp-finish').click(); }
+});
+
+impEl('imp-read')?.addEventListener('click', async event => {
+  await impPost('/api/admin/imports/spotify/read', {}, event.currentTarget);
+  await loadImports();
+});
+
+impEl('imp-disconnect')?.addEventListener('click', async event => {
+  if (!(await askConfirm('Disconnect Spotify?', 'Your lists, playlists and fetched songs stay. Octo stops reading your Spotify.', 'Disconnect'))) return;
+  await impPost('/api/admin/imports/spotify/disconnect', {}, event.currentTarget);
+  await loadImports();
+});
+
+impEl('imp-link-add')?.addEventListener('click', async event => {
+  const url = impEl('imp-link').value.trim();
+  if (!url) { note(event.currentTarget, 'Paste a link first.', 'error'); return; }
+  event.currentTarget.disabled = true;
+  note(event.currentTarget, 'Reading the link…', 'busy');
+  const { ok, answer } = await impPost('/api/admin/imports/link', { url }, event.currentTarget);
+  event.currentTarget.disabled = false;
+  if (ok) {
+    impEl('imp-link').value = '';
+    await loadImports();
+    if (answer.listId) await loadImportDetail(answer.listId);
+  }
+});
+
+impEl('imp-file-add')?.addEventListener('click', async event => {
+  const file = impEl('imp-file').files?.[0];
+  if (!file) { note(event.currentTarget, 'Choose a file first.', 'error'); return; }
+  const form = new FormData();
+  form.append('file', file, file.name);
+  event.currentTarget.disabled = true;
+  note(event.currentTarget, 'Reading the file…', 'busy');
+  const { ok, answer } = await impPost('/api/admin/imports/file', form, event.currentTarget);
+  event.currentTarget.disabled = false;
+  if (ok) {
+    impEl('imp-file').value = '';
+    await loadImports();
+    if (answer.listId) await loadImportDetail(answer.listId);
+  }
+});
+
+impEl('imp-lists')?.addEventListener('click', async event => {
+  const open = event.target.closest('[data-imp-open]');
+  if (open) { await loadImportDetail(open.dataset.impOpen); return; }
+  const refresh = event.target.closest('[data-imp-refresh]');
+  if (refresh) {
+    refresh.disabled = true;
+    await impPost(`/api/admin/imports/lists/${encodeURIComponent(refresh.dataset.impRefresh)}/refresh`, {}, null);
+    await loadImports();
+    return;
+  }
+  const remove = event.target.closest('[data-imp-remove]');
+  if (remove) {
+    const list = imp.view.lists.find(l => l.id === remove.dataset.impRemove);
+    if (!(await askConfirm(`Remove ${list?.name ?? 'this list'}?`,
+      'Octo forgets the list and stops getting its missing songs. A playlist it made stays in Navidrome, and fetched songs stay in your library.', 'Remove', true))) return;
+    const response = await impFetch(`/api/admin/imports/lists/${encodeURIComponent(remove.dataset.impRemove)}`, { method: 'DELETE' });
+    const answer = await response.json().catch(() => ({}));
+    toast(answer.message || `HTTP ${response.status}`, response.ok ? 'ok' : 'error');
+    if (imp.open === remove.dataset.impRemove) { imp.open = null; imp.detail = null; impEl('imp-detail').hidden = true; }
+    await loadImports();
+  }
+});
+
+impEl('imp-lists')?.addEventListener('change', async event => {
+  const playlist = event.target.closest('[data-imp-playlist]');
+  const fetchSwitch = event.target.closest('[data-imp-fetch]');
+  const input = playlist ?? fetchSwitch;
+  if (!input) return;
+  const id = input.dataset.impPlaylist ?? input.dataset.impFetch;
+  input.disabled = true;
+  const { ok, answer } = await impPost(`/api/admin/imports/lists/${encodeURIComponent(id)}/${playlist ? 'playlist' : 'fetch'}`,
+    { on: input.checked }, null);
+  toast(answer.message || 'Done.', ok ? 'ok' : 'error');
+  await loadImports();
+});
+
+impEl('imp-detail')?.addEventListener('change', event => {
+  const pick = event.target.closest('[data-imp-pick]');
+  if (!pick) return;
+  if (pick.checked) imp.picked.add(pick.dataset.impPick); else imp.picked.delete(pick.dataset.impPick);
+  renderImportDetail();
+});
+
+impEl('imp-detail')?.addEventListener('click', async event => {
+  if (event.target.closest('#imp-detail-close')) {
+    imp.open = null; imp.detail = null; impEl('imp-detail').hidden = true; renderImportLists();
+    return;
+  }
+  if (event.target.closest('#imp-pick-all')) {
+    for (const track of imp.detail.tracks) if (['missing', 'notFound', 'skipped'].includes(track.state)) imp.picked.add(track.key);
+    renderImportDetail();
+    return;
+  }
+  const get = event.target.closest('#imp-get');
+  if (get && imp.picked.size) {
+    const { ok, answer } = await impPost(`/api/admin/imports/lists/${encodeURIComponent(imp.open)}/songs`, { keys: [...imp.picked] }, null);
+    toast(answer.message || 'Done.', ok ? 'ok' : 'error');
+    imp.picked.clear();
+    await loadImports();
+  }
+});
+
+impEl('imp-pause')?.addEventListener('click', async event => {
+  await impPost('/api/admin/imports/trickle/pause', { paused: imp.view?.trickle?.state !== 'paused' }, event.currentTarget);
+  await loadImports();
+});
+impEl('imp-retry')?.addEventListener('click', async event => {
+  await impPost('/api/admin/imports/trickle/retry', {}, event.currentTarget);
+  await loadImports();
+});
+impEl('imp-clear')?.addEventListener('click', async event => {
+  await impPost('/api/admin/imports/trickle/clear', {}, event.currentTarget);
+  await loadImports();
+});
+impEl('imp-trickle-rows')?.addEventListener('click', async event => {
+  const skip = event.target.closest('[data-imp-skip]');
+  const retry = event.target.closest('[data-imp-retry]');
+  if (!skip && !retry) return;
+  const key = (skip ?? retry).dataset[skip ? 'impSkip' : 'impRetry'];
+  await impPost(`/api/admin/imports/trickle/${skip ? 'skip' : 'retry'}`, { keys: [key] }, null);
+  await loadImports();
+});
+
+// A saved Client ID or redirect URI changes what Connect can do, so the page reads itself again.
+impEl('imports-form')?.addEventListener('submit', () => setTimeout(loadImports, 800));
 
 // ────────────────────────────────────────────────────────────────
 // Boot
