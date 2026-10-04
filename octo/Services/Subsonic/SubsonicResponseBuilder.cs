@@ -555,6 +555,7 @@ public partial class SubsonicResponseBuilder
         (LyricsExtension, [LyricsExtensionVersion]),
         (LibraryActionsExtension, [1, LibraryActionsExtensionVersion]),
         ("songLyrics", [1, 2]),
+        (ImportsExtension, [ImportsExtensionVersion]),
     ];
 
     /// <summary>

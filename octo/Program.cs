@@ -281,6 +281,33 @@ builder.Services.AddSingleton<Octo.Services.Library.LibraryOwnership>();
 builder.Services.AddSingleton<Octo.Services.Library.HeartOwnership>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<Octo.Services.Library.UpgradeWorker>());
 builder.Services.AddHostedService(sp => sp.GetRequiredService<Octo.Services.Library.QualityUpgradeWorker>());
+// Importing from Spotify, a public link or a file: the lists, the sign-ins, and the trickle that
+// fetches what the library is missing a few songs an hour, through the heart chain.
+builder.Services.Configure<ImportSettings>(builder.Configuration.GetSection("Imports"));
+builder.Services.AddHttpClient(Octo.Services.Imports.SpotifyWebApi.ClientName, c => c.Timeout = TimeSpan.FromSeconds(20));
+builder.Services.AddHttpClient(Octo.Services.Imports.SpotifyLinkReader.ClientName, c =>
+{
+    c.Timeout = TimeSpan.FromSeconds(20);
+    c.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (compatible; Octo)");
+});
+builder.Services.AddSingleton(sp => new Octo.Services.Imports.ImportStore(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "imports.json"),
+    sp.GetRequiredService<ILogger<Octo.Services.Imports.ImportStore>>()));
+builder.Services.AddSingleton(sp => new Octo.Services.Imports.TrickleQueue(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "imports-trickle.json"),
+    sp.GetRequiredService<ILogger<Octo.Services.Imports.TrickleQueue>>()));
+builder.Services.AddSingleton(sp => new Octo.Services.Imports.SpotifyAccountStore(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "spotify-accounts.json"),
+    sp.GetRequiredService<ILogger<Octo.Services.Imports.SpotifyAccountStore>>()));
+builder.Services.AddSingleton<Octo.Services.Imports.SpotifyAuth>();
+builder.Services.AddSingleton<Octo.Services.Imports.SpotifyWebApi>();
+builder.Services.AddSingleton<Octo.Services.Imports.SpotifyLinkReader>();
+builder.Services.AddSingleton<Octo.Services.Imports.ImportMatcher>();
+builder.Services.AddSingleton<Octo.Services.Imports.ImportPlaylists>();
+builder.Services.AddSingleton<Octo.Services.Imports.TrickleWorker>();
+builder.Services.AddSingleton<Octo.Services.Imports.ImportService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<Octo.Services.Imports.TrickleWorker>());
+builder.Services.AddHostedService(sp => sp.GetRequiredService<Octo.Services.Imports.ImportService>());
 // The library Review sweep (#72): asks about music that was already there, a few songs an hour,
 // only while nothing downloads. Off until LibraryActions:ReviewSweepPerHour is set.
 builder.Services.AddSingleton(sp => new Octo.Services.Library.ReviewSweepStore(
