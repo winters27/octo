@@ -427,7 +427,26 @@ An app can also remove a song directly, without a playlist or a rating, through 
 whether it is a dry run, and how many days a removed file is kept. `libraryAction` with an `id`
 and `action=remove` does exactly what the Delete playlist does, with the same allowlist, dry run
 and quarantine, as the user whose credentials it carries, and answers with what happened. The
-Delete action has to be on for it to do anything. Both always answer in JSON.
+Delete action has to be on for it to do anything, and the caller has to be a Navidrome admin.
+Octo asks Navidrome for a scan right after, so the song leaves the library in seconds rather
+than at the next scheduled scan. With `copy=true` (Library health removing a second copy of a song the library
+keeps) the song is not refused when it is asked for again, since only that copy was unwanted. Both always answer in JSON.
+
+Version 3 of the extension is what the apps' Library health fixes with. Every one of these needs
+library actions on, the caller on the allowlist and a Navidrome admin, and only rehearses while
+dry run is on. `libraryAction` takes `action=` one of:
+
+| Action | What it does |
+| --- | --- |
+| `restore` | puts a removed song back where it was, from the trash; `getLibraryTrash` lists the songs there and when each goes for good |
+| `retag` | writes the tags sent (`title`, `artist`, `album`, `albumArtist`, `year`, `genre`, `track`, `disc`, `isrc`; an empty one clears it, except title, artist and album) into the file, in place, so Navidrome keeps the song's id, plays and playlist places |
+| `joinAlbum` | with `like=` another song's id, gives the song that song's album tags (title, album artists, release date, MusicBrainz album id, compilation, year), which mends an album Navidrome shows as two |
+| `cover` | finds the album's cover the way the Cover art page does and puts it inside a file that has no picture; `preview=true` only says what it found |
+| `lookup` | the tags a download of the song would get, beside what the file says now; writes nothing |
+| `undo` | puts back the last `retag`, `joinAlbum` or `cover` of the song, unless the file has changed since |
+
+Each edit is kept in `tag-edits.json` beside the settings, with the tags before and after, and is
+followed by one Navidrome scan a few seconds later (a normal scan, never a full one).
 
 `LIBRARY_ACTIONS_REVIEW` gives each allowed user a Review playlist, where Octo asks about the
 downloads a person can settle by listening: AcoustID had never heard the recording, was not
@@ -647,7 +666,7 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `getTranscodeDecision` | OpenSubsonic: return direct-play for Octo IDs |
 | `getLyricsBySongId`, `getLyrics` | lyrics for outside songs and for library songs Navidrome has none for; chosen or hidden lyrics for every client; word cues with `enhanced=true` |
 | `getLyricsCandidates`, `setLyricsChoice` | the `octoLyrics` extension: every lyrics entry for a song, and pinning one, hiding lyrics, or going back to automatic |
-| `getLibraryActions`, `libraryAction` | the `octoLibraryActions` extension: what the caller may do to library files, and removing one song the way the Delete playlist does |
+| `getLibraryActions`, `libraryAction`, `getLibraryTrash` | the `octoLibraryActions` extension: what the caller may do to library files, removing one song the way the Delete playlist does, putting it back, and the tag, album and cover fixes of Library health |
 | `getAcquisitions`, `getAcquisition`, `clearAcquisitions` | the `octoAcquisitions` extension: the caller's downloads; version 2 adds each one's log and clearing finished ones |
 | `findSongs`, `getFoundSongs`, `pickFoundSong` | `octoAcquisitions` 2: a song's search run again on the caller's download sources, every copy found, and fetching the one picked |
 | `/api/artist/{id}`, `/api/album?artist_id=` | Navidrome's own API, for clients that use it (Feishin): an outside artist's page and its albums |

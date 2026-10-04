@@ -237,6 +237,13 @@ builder.Services.AddHostedService(sp =>
 builder.Services.AddSingleton(sp => new Octo.Services.Library.LibraryActionJournal(
     System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "library-actions.json"),
     sp.GetRequiredService<ILogger<Octo.Services.Library.LibraryActionJournal>>()));
+// The apps' Library health fixes: tags written in place, albums joined, covers added, removed
+// songs put back. Every edit is kept beside the settings so it can be undone.
+builder.Services.AddSingleton(sp => new Octo.Services.Library.TagEditJournal(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "tag-edits.json"),
+    sp.GetRequiredService<ILogger<Octo.Services.Library.TagEditJournal>>()));
+builder.Services.AddSingleton<Octo.Services.Library.LibraryRescan>();
+builder.Services.AddSingleton<Octo.Services.Library.LibraryEditService>();
 
 // The playlists Octo fills to ask a person something (#47): what was asked and answered lives
 // beside the journal, and the admin-side playlist calls are shared with the action sweep so both

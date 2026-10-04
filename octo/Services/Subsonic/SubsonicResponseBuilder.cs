@@ -609,7 +609,7 @@ public partial class SubsonicResponseBuilder
     [
         (AcquisitionsExtension, [1, AcquisitionsExtensionVersion]),
         (LyricsExtension, [LyricsExtensionVersion]),
-        (LibraryActionsExtension, [1, LibraryActionsExtensionVersion]),
+        (LibraryActionsExtension, [1, 2, LibraryActionsExtensionVersion]),
         ("songLyrics", [1, 2]),
         (TopSongsExtension, [TopSongsExtensionVersion]),
     ];

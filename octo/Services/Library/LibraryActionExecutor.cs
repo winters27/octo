@@ -11,10 +11,12 @@ namespace Octo.Services.Library;
 /// the moment it is queued, so the upgrade queue can follow that download's progress.</param>
 /// <param name="OnlySource">The one source to fetch the replacement from, for a copy someone picked
 /// in Find songs; no other source is tried after it.</param>
+/// <param name="OnlyACopy">A Delete of one copy of a song the library keeps another of (Library
+/// health's duplicates). The song is still wanted, so it is not refused when asked for again.</param>
 public sealed record LibraryActionRequest(LibraryAction Action, string NavidromeId, string Username,
     Octo.Services.Subsonic.SubsonicCredential? Credential = null,
     Action<string, string>? OnReplacementQueued = null,
-    DownloadSource? OnlySource = null);
+    DownloadSource? OnlySource = null, bool OnlyACopy = false);
 
 /// <summary>
 /// Code says WHY, for callers that act on the reason: the upgrade queue waits for Soulseek on one
@@ -260,7 +262,9 @@ public sealed class LibraryActionExecutor
             _journal.Complete(key, LibraryActionState.Pending, "Moved to quarantine; finishing.", quarantinePath);
             _journal.Flush();
             await _library.ForgetMappingAsync(resolved.AbsolutePath);
-            outcome = new(LibraryActionState.Applied, "Removed. It will not be downloaded again.");
+            outcome = new(LibraryActionState.Applied, request.OnlyACopy
+                ? "Removed this copy. The song stays in the library."
+                : "Removed. It will not be downloaded again.");
         }
         else
         {
@@ -592,7 +596,7 @@ public sealed class LibraryActionExecutor
             State: state,
             Detail: detail,
             DryRun: dryRun,
-            AtUtc: DateTime.UtcNow);
+            AtUtc: DateTime.UtcNow) { Copy = request.OnlyACopy };
 
     private static string Describe(LibraryAction action) => action switch
     {
