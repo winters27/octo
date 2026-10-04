@@ -55,6 +55,7 @@ function activateTab(name, { focus = false } = {}) {
   if (name === 'lastfm' && typeof loadLastFmScrobbling === 'function') loadLastFmScrobbling();
   if (name === 'lastfm' && typeof loadLastFmAccount === 'function') loadLastFmAccount();
   if (name === 'about' && typeof loadUpdate === 'function') loadUpdate();
+  if (name === 'soulseek' && typeof loadSharing === 'function') loadSharing();
   if (focus) {
     window.scrollTo({ top: 0 });
     const heading = document.querySelector(`section[data-pane="${name}"] h1`);
@@ -289,12 +290,7 @@ async function loadSettings() {
   if (version && currentSettings?._meta?.Version) {
     version.textContent = currentSettings._meta.Version;
   }
-  const slskdLink = document.getElementById('slskd-link');
-  if (slskdLink) {
-    const here = new URL(location.href);
-    slskdLink.href = `${here.protocol}//${here.hostname}:5030`;
-    slskdLink.textContent = `${here.hostname}:5030`;
-  }
+  renderSlskdOpen();
 
   renderOctoAddresses();
   updateDiscoveryBanner();
@@ -4767,9 +4763,154 @@ document.getElementById('update-copy')?.addEventListener('click', async () => {
 });
 
 // ────────────────────────────────────────────────────────────────
+// Soulseek: Open slskd, and the Sharing card
+// ────────────────────────────────────────────────────────────────
+// The browser only ever gets slskd's address. slskd asks for its own sign-in, so the login Octo
+// uses for slskd stays on the server.
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value ?? '').trim());
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+  } catch { return null; }
+}
+
+function slskdWebUrl() {
+  const own = safeHttpUrl(currentSettings?.Soulseek?.WebUrl);
+  if (own) return own;
+  const base = safeHttpUrl(currentSettings?.Soulseek?.BaseUrl);
+  const port = base ? (new URL(base).port || '5030') : '5030';
+  if (base) {
+    // An address or a dotted name is somewhere this browser can go too. "slskd" is a name only
+    // Docker's network knows, and localhost would be this browser's own machine.
+    const host = new URL(base).hostname;
+    const local = host === 'localhost' || host.startsWith('127.') || host === '[::1]';
+    if (!local && (host.includes('.') || host.startsWith('['))) return base;
+  }
+  return `http://${location.hostname}:${port}/`;
+}
+
+function renderSlskdOpen() {
+  const open = document.getElementById('slskd-open');
+  if (open) open.href = slskdWebUrl();
+}
+
+const shareSize = bytes => {
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes, unit = 0;
+  while (value >= 1000 && unit < units.length - 1) { value /= 1000; unit++; }
+  return `${unit === 0 ? value : value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
+};
+const sharePlural = (n, one, many = `${one}s`) => `${n.toLocaleString()} ${n === 1 ? one : many}`;
+// "day", "3 hours", "90 minutes": the plainest whole unit.
+const shareEvery = minutes => {
+  const [n, unit] = minutes % 1440 === 0 ? [minutes / 1440, 'day']
+    : minutes % 60 === 0 ? [minutes / 60, 'hour'] : [minutes, 'minute'];
+  return n === 1 ? unit : sharePlural(n, unit);
+};
+
+function sharePortText(port) {
+  const when = port?.checkedAt ? `, tested ${new Date(port.checkedAt).toLocaleString()}` : '';
+  const number = port?.port ?? 'unknown';
+  switch (port?.state) {
+    case 'Open': return `${number}, open: other people can connect${when}`;
+    case 'Closed': return `${number}, closed: other people cannot connect${when}`;
+    case 'Off': return `${number}, not tested (the test is off below)`;
+    default: return `${number}, ${port?.error ? `not known. ${port.error}` : 'not tested yet'}`;
+  }
+}
+
+function renderSharing(report) {
+  const line = document.getElementById('share-line');
+  const facts = document.getElementById('share-facts');
+  const warnings = document.getElementById('share-warnings');
+  if (!line || !facts || !warnings) return;
+
+  const shared = (report.folders || []).filter(folder => !folder.excluded);
+  if (!report.reachable) line.textContent = 'Octo cannot reach slskd right now.';
+  else if (shared.length === 0) line.textContent = 'You share nothing yet.';
+  else {
+    let text = report.files == null ? 'Sharing.'
+      : `Sharing ${sharePlural(report.files, 'file')} in ${sharePlural(report.directories ?? 0, 'folder')}.`;
+    if (report.scanning) text += ` slskd is looking through your folders now${report.scanProgress != null ? ` (${Math.round(report.scanProgress * 100)}%)` : ''}.`;
+    if (report.networkFiles != null && report.files != null && report.networkFiles !== report.files && !report.scanning)
+      text += ` Soulseek has ${sharePlural(report.networkFiles, 'file')} on record for you.`;
+    line.textContent = text;
+  }
+
+  const rows = [];
+  if (report.reachable) {
+    const folderText = folder => `${folder.alias || folder.path}${folder.alias && folder.path ? ` (${folder.path})` : ''}${folder.files != null ? `, ${sharePlural(folder.files, 'file')}` : ''}`;
+    rows.push(['Shared', shared.length ? shared.map(folderText).join('; ') : 'nothing']);
+    const kept = (report.folders || []).filter(folder => folder.excluded);
+    if (kept.length) rows.push(['Kept out', kept.map(folder => folder.path).join('; ')]);
+    const up = report.uploads;
+    rows.push(['Uploading now', `${up.sending.toLocaleString()} sending, ${up.waiting.toLocaleString()} waiting`]);
+    rows.push(['Last 7 days', up.files
+      ? `${sharePlural(up.files, 'file')}, ${shareSize(up.bytes)}, to ${sharePlural(up.people, 'person', 'people')}${up.failed ? `; ${up.failed.toLocaleString()} failed` : ''}`
+      : `nothing downloaded from you${up.failed ? `; ${up.failed.toLocaleString()} failed` : ''}`]);
+    if (up.lastUploadAt) rows.push(['Last upload', new Date(up.lastUploadAt).toLocaleString()]);
+    const slots = report.uploadSlots != null ? `${report.uploadSlots.toLocaleString()} at a time` : 'slskd did not say';
+    const speed = report.uploadSpeedLimitKiB != null ? `${report.uploadSpeedLimitKiB.toLocaleString()} KiB/s in all` : 'no speed limit';
+    rows.push(['Upload limits', `${slots}, ${speed}`]);
+    rows.push(['Rescans', report.rescanMinutes
+      ? `every ${shareEvery(report.rescanMinutes)}`
+      : 'when slskd starts, or when you press Rescan']);
+    rows.push(['Listening port', sharePortText(report.port)]);
+  }
+  facts.innerHTML = rows.map(([term, value]) => `<div><dt>${esc(term)}</dt><dd>${esc(value)}</dd></div>`).join('');
+  facts.hidden = rows.length === 0;
+
+  const list = report.warnings || [];
+  warnings.innerHTML = list.map(warning => `<div class="notice notice-warn" role="status">${esc(warning.text)}</div>`).join('');
+  warnings.hidden = list.length === 0;
+
+  document.getElementById('share-rescan').disabled = !report.reachable || shared.length === 0 || report.scanning;
+  document.getElementById('share-test-port').disabled = !report.reachable || report.port?.state === 'Off' || report.listenPort == null;
+}
+
+async function loadSharing({ testPort = false } = {}) {
+  const line = document.getElementById('share-line');
+  if (!line) return null;
+  try {
+    const r = testPort
+      ? await api('/api/admin/soulseek/sharing/test-port', { method: 'POST' })
+      : await api('/api/admin/soulseek/sharing', { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const report = await r.json();
+    renderSharing(report);
+    return report;
+  } catch (e) {
+    line.textContent = `Octo did not answer: ${e.message}`;
+    return null;
+  }
+}
+
+document.getElementById('share-refresh')?.addEventListener('click', () => loadSharing());
+document.getElementById('share-test-port')?.addEventListener('click', async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  note(button, 'Asking Soulseek\'s port test…', 'busy');
+  const report = await loadSharing({ testPort: true });
+  const state = report?.port?.state;
+  if (state === 'Open') note(button, 'Open. Other people can connect to slskd.', 'ok');
+  else if (state === 'Closed') note(button, 'Closed. See the note below.', 'error');
+  else note(button, report?.port?.error || 'No answer from the port test.', 'info');
+});
+document.getElementById('share-rescan')?.addEventListener('click', async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  const r = await api('/api/admin/soulseek/sharing/rescan', { method: 'POST' }).catch(() => null);
+  const body = await r?.json().catch(() => ({}));
+  if (r?.ok) note(button, 'slskd is looking through your shared folders. A big library takes a while.', 'ok');
+  else note(button, body?.error || 'Octo did not answer.', 'error');
+  setTimeout(() => loadSharing(), 2000);
+});
+
+// ────────────────────────────────────────────────────────────────
 // Boot
 // ────────────────────────────────────────────────────────────────
 if (location.hash) followHash();
 loadSettings();
 loadSignedIn();
 loadUpdate();
+renderSlskdOpen();

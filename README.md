@@ -201,9 +201,10 @@ Every setting has a form, every backing service has a live status indicator, and
 > [!WARNING]
 > **The admin dashboard has no authentication, so run Octo on a trusted network only.**
 >
-> Anyone who can reach port 5274 can read and change every setting, including your
-> Last.fm API key and shared secret, your Navidrome admin login, and your Soulseek and slskd
-> passwords, and connect or disconnect each listener's Last.fm.
+> Anyone who can reach port 5274 can change every setting, including your Last.fm API key
+> and shared secret, your Navidrome admin login, and the slskd sign-in Octo uses, and
+> connect or disconnect each listener's Last.fm. The passwords and the shared secret show
+> only as a placeholder, but most other settings, API keys included, can be read.
 > Nothing on that page asks who you are.
 >
 > Do not port-forward 5274 or put it on a public hostname. If you need Octo from
@@ -332,7 +333,7 @@ Three Docker containers in one `docker compose` stack:
 
 - **`octo`** (port 5274): the proxy + admin UI. Personalized Radio, its state store, recommendation queue, and refresh worker all run in this process. Octo hijacks the Subsonic endpoints that need enrichment and passes everything else through to Navidrome.
 - **`yt-dlp-shim`** (internal): wraps `yt-dlp` behind two HTTP endpoints. Process-isolation keeps yt-dlp's frequent extractor breakage from affecting the rest of the stack.
-- **`slskd`** (port 5030): Soulseek client with REST API. Octo authenticates and queues downloads.
+- **`slskd`** (port 5030 for its web page, 50300 for other Soulseek users): Soulseek client with REST API. Octo authenticates and queues downloads, and slskd shares your library back, read-only (see [Sharing back on Soulseek](#sharing-back-on-soulseek)).
 
 Navidrome is **not** part of the stack. Octo just talks to whatever Navidrome you already have.
 
@@ -675,6 +676,23 @@ The dashboard's **Better quality** page lists every song in your library that is
 Copies come from Soulseek, from Lidarr, or from both: **Library actions → Where to look for a higher quality copy** (`LIBRARY_ACTIONS_UPGRADE_SOURCE`). Automatic, the default, asks Soulseek first and Lidarr for what Soulseek cannot find, using whichever is set up, and asks Lidarr alone while Soulseek is offline. Lidarr only fetches whole albums, so Octo borrows the album: it copies out the one song, which then goes through the same checks and the same in-place swap as a Soulseek copy, deletes the other files that search brought in, and puts the album's monitoring back as it was. A song whose file Lidarr itself manages is left to Lidarr, which upgrades it in place when its quality profile asks for lossless.
 
 > **A heart is "fetch" for a song you do not have, and "favorite" for one you do.** Octo checks your library first. A song you already have, even the copy Octo found outside your library, becomes your favorite in Navidrome straight away and downloads nothing (an MP3 is queued for Better quality). A song you do not have is downloaded and nothing more: once it is in your library, heart it there to make it a favorite. `STAR_DOWNLOADS_FOR_REQUESTER` makes Octo favorite downloads when they land instead. Octo's own apps are left out of both, since their heart means Add.
+
+### Sharing back on Soulseek
+
+Soulseek only works because people share. Many users will not send files to someone who shares nothing. So the bundled compose file has slskd share your music library back:
+
+- **Read-only.** `DOWNLOAD_PATH` is mounted into slskd a second time, at `/share`, read-only, and that is the folder slskd shares. An upload only ever reads a file. Other people see it as a folder named `Music`, never your own path.
+- **Nothing private.** Octo's working folders (`.octo-incoming`, `.octo-trash`) are hidden folders, which slskd skips, and a share filter keeps out Octo's temporary and partial files. slskd's own unfinished downloads live in `slskd-state/incomplete`, which is not shared. To keep a folder of your own out, add it to `SLSKD_SHARED_DIR` with a `!` in front, for example `[Music]/share;!/share/Voice Memos`.
+- **Polite limits.** 4 uploads at a time and 2048 KiB/s (about 16 Mbit/s) in all, so sharing never crowds out streaming from your server (`SLSKD_UPLOAD_SLOTS`, `SLSKD_UPLOAD_SPEED_LIMIT`). Raise them if you have upload to spare.
+- **New songs are shared too.** slskd looks through the shared folders once a day (`SLSKD_SHARE_RESCAN_MINUTES`, 60 or more). Every look reads each file's header, so a library on a cloud drive is better at 10080, once a week. The dashboard's **Rescan shared folders** button looks straight away.
+
+**Forward TCP port 50300** on your router to the machine running Octo. That is the port other people connect to, to download from you; without it only people whose own port is open can reach you, and some of your own downloads fail too. Never forward 5030: that is slskd's own web page. If you change slskd's listening port, forward that port instead, and publish the same number in the compose file.
+
+The dashboard's **Soulseek** page has a **Sharing** card: the folders and files shared, uploads now and over the last 7 days, the upload limits, and whether the port is open. It warns when you share nothing, when a shared folder turns out empty, when the port is closed, and when slskd still has its default sign-in. The port test is Soulseek's own (`tools.slsknet.org`): Octo sends it the port number and nothing else, at most every 6 hours unless you press **Test the port**, and `SLSKD_CHECK_PORT=false` stops it. The test checks the address Octo's request comes from, so it is only right when slskd reaches the internet the same way, not through a VPN of its own.
+
+**Open slskd** at the top of that page opens slskd's own web page in a new tab, at this server's name on port 5030, or at `SLSKD_WEB_URL` when you reach slskd some other way. slskd asks for its own sign-in (`SLSKD_USERNAME` and `SLSKD_PASSWORD` in `.env`). Octo never hands its slskd login to the browser: the dashboard shows the slskd password as a placeholder, like the Navidrome admin password.
+
+A share list in `slskd-state/slskd.yml` outranks `SLSKD_SHARED_DIR` (slskd reads its file after its environment), so if you set shares up there yourself, those stay.
 
 ### Cover art aggregator
 

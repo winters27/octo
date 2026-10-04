@@ -301,8 +301,9 @@ internal sealed class AdminWebFactory : WebApplicationFactory<Program>
             ["Subsonic:Url"] = "http://127.0.0.1:1",
             ["Soulseek:BaseUrl"] = "http://127.0.0.1:1",
             ["YouTube:ShimUrl"] = "http://127.0.0.1:1",
-            // Synthetic, and only here to prove the admin API never hands it back.
+            // Synthetic, and only here to prove the admin API never hands them back.
             ["Subsonic:AdminPassword"] = "synthetic-admin-password",
+            ["Soulseek:Password"] = "synthetic-slskd-password",
         }));
         // In memory, so a test that signs in never writes beside the real settings file.
         builder.ConfigureServices(services =>

@@ -1880,3 +1880,21 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: inset 0 1px 
 /* ── Restart waiting ── */
 #restart-btn.needs-restart { color: var(--warn); box-shadow: var(--glaze-rest), inset 0 0 0 1px var(--warn-line); }
 #restart-btn.needs-restart .icon { color: var(--warn); }
+
+/* ── Soulseek: the Sharing card ── */
+.share-card { overflow: hidden; }
+.share-line { margin: 0; color: var(--ink-1); font-size: var(--t-body); line-height: 1.5; }
+.share-facts { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: var(--s-s) var(--s-xl); font-size: var(--t-meta); }
+.share-facts > div { display: contents; }
+.share-facts dt { color: var(--text-muted); }
+.share-facts dd { margin: 0; color: var(--ink-1); overflow-wrap: anywhere; }
+@container (max-width: 480px) {
+  .share-facts { grid-template-columns: 1fr; gap: 0; }
+  .share-facts dd { margin-bottom: var(--s-m); }
+}
+.share-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-m); }
+.share-actions .btn-icon { margin-left: auto; }
+#share-warnings .notice { margin: 0; border-radius: 0; border-width: 1px 0 0; }
+/* A link styled as a button in a page header keeps the button's colors, not the header's link color. */
+.page-header a.btn-ghost { color: var(--ink-1); }
+.page-header a.btn-ghost:hover { color: var(--ink); text-decoration: none; }

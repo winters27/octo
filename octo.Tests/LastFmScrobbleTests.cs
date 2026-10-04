@@ -929,6 +929,32 @@ public sealed class LastFmScrobbleAdminTests
         Assert.Equal("stored-secret", (string?)JsonNode.Parse(File.ReadAllText(factory.SettingsPath))!["LastFm"]!["ApiSecret"]);
     }
 
+    /// <summary>The Soulseek page's Connection form sends the slskd sign-in back as it was shown.
+    /// The placeholder keeps the stored password; with a new username it is refused, because the
+    /// old password under a new name is a pairing nobody typed.</summary>
+    [Fact]
+    public async Task FormSave_WithTheSlskdPlaceholder_KeepsTheStoredPassword()
+    {
+        const string stored = """{ "Soulseek": { "Username": "octo", "Password": "slskd-secret" } }""";
+        await using var factory = new ScrobbleAdminFactory(stored);
+        using var client = factory.AdminClient();
+
+        using var save = await client.PostAsync("/api/admin/settings",
+            Json(new { Soulseek = new { Username = "octo", Password = AdminController.SecretPlaceholder } }));
+        save.EnsureSuccessStatusCode();
+        Assert.DoesNotContain("slskd-secret", await save.Content.ReadAsStringAsync());
+        Assert.Equal("slskd-secret", (string?)JsonNode.Parse(File.ReadAllText(factory.SettingsPath))!["Soulseek"]!["Password"]);
+
+        using var renamed = await client.PostAsync("/api/admin/settings",
+            Json(new { Soulseek = new { Username = "someone", Password = AdminController.SecretPlaceholder } }));
+        Assert.Equal(HttpStatusCode.BadRequest, renamed.StatusCode);
+
+        using var appended = await client.PostAsync("/api/admin/settings",
+            Json(new { Soulseek = new { Password = AdminController.SecretPlaceholder + "x" } }));
+        Assert.Equal(HttpStatusCode.BadRequest, appended.StatusCode);
+        Assert.Equal("slskd-secret", (string?)JsonNode.Parse(File.ReadAllText(factory.SettingsPath))!["Soulseek"]!["Password"]);
+    }
+
     /// <summary>A session key typed onto the end of the placeholder is refused, like the secret is:
     /// saved, it would be a key Last.fm rejects, and the listener would be cut off for it.</summary>
     [Fact]
