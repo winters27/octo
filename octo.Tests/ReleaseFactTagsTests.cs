@@ -435,7 +435,7 @@ public sealed class ReleaseFactTagsTests : IDisposable
     public void ANameThatSaysClean_IsTheCleanEdit(string title, string? sourceFile)
     {
         var plan = Plan([], TagConfidence.Strong, Hit("USUM71210782", 1));
-        Assert.Equal(new AdvisoryDecision(ExplicitAdvisory.Clean, "the name"),
+        Assert.Equal(new AdvisoryDecision(ExplicitAdvisory.Clean, "the file name"),
             ExplicitAdvisory.Decide(new Song { Title = title }, plan, sourceFile));
     }
 }

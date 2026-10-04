@@ -24,7 +24,7 @@ public static class ExplicitAdvisory
     {
         // A name that says clean is the strongest evidence there is: it is what was shared.
         if (SaysClean(song.Title) || SaysClean(plan?.Evidence?.File.Title) || SaysClean(LeafName(sourceFile)))
-            return new AdvisoryDecision(Clean, "the name");
+            return new AdvisoryDecision(Clean, "the file name");
         if (plan is null) return null;
 
         var catalog = plan.Ranked.Select(scored => scored.Candidate).Where(c => c.Source == TagSource.Catalog).ToList();
@@ -44,6 +44,14 @@ public static class ExplicitAdvisory
             return new AdvisoryDecision(byMatch, TagSource.Catalog.ToString());
         return null;
     }
+
+    /// <summary>The advisory as the tag report shows it.</summary>
+    public static FieldDecision Field(AdvisoryDecision decision) => new(decision.Value switch
+    {
+        Explicit => "explicit",
+        Clean => "clean edit",
+        _ => "not explicit",
+    }, decision.Source);
 
     /// <summary>The catalog's numbers as the advisory tag holds them: its 1 is explicit and its 3
     /// the clean edit; 0 is neither. Its other values say it does not know, so only the plain

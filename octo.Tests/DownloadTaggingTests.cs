@@ -119,6 +119,7 @@ public sealed class DownloadTaggingTests : IDisposable
         public required TaggingService Service { get; init; }
         public required DownloadHistoryService History { get; init; }
         public required FakeMeter Meter { get; init; }
+        public required IServiceProvider Provider { get; init; }
     }
 
     private Harness Build(Dictionary<string, Song> songs, Dictionary<string, string> routes,
@@ -152,6 +153,7 @@ public sealed class DownloadTaggingTests : IDisposable
             Service = new TaggingService(_root, layout, provider, catalog.Object, library.Object, history),
             History = history,
             Meter = meter,
+            Provider = provider,
         };
     }
 
@@ -589,18 +591,7 @@ public sealed class DownloadTaggingTests : IDisposable
     [Fact]
     public async Task TheExplicitCopyThatLanded_IsTaggedExplicit_AndTheCleanOneClean()
     {
-        var routes = new Dictionary<string, string>
-        {
-            ["/album/7"] = """{"id":7,"record_type":"album","release_date":"2012-10-22","nb_tracks":12,"artist":{"name":"Kendrick Lamar"}}""",
-            ["/album/8"] = """{"id":8,"record_type":"album","release_date":"2012-10-22","nb_tracks":12,"artist":{"name":"Kendrick Lamar"}}""",
-            ["/track/71"] = """{"id":71,"track_position":5,"disk_number":1,"isrc":"USUM71210782","explicit_lyrics":true,"explicit_content_lyrics":1}""",
-            ["/track/81"] = """{"id":81,"track_position":5,"disk_number":1,"isrc":"USUM71210787","explicit_lyrics":false,"explicit_content_lyrics":3}""",
-            ["/search?q="] = """
-                {"data":[
-                  {"id":71,"title":"Money Trees","duration":386,"explicit_lyrics":true,"album":{"id":7,"title":"good kid, m.A.A.d city"},"artist":{"name":"Kendrick Lamar"}},
-                  {"id":81,"title":"Money Trees","duration":386,"explicit_lyrics":false,"album":{"id":8,"title":"good kid, m.A.A.d city"},"artist":{"name":"Kendrick Lamar"}}]}
-                """,
-        };
+        var routes = MoneyTreesRoutes();
         async Task<(string Path, TagReport Report)> Landing(string isrc)
         {
             var harness = Build(new() { ["1"] = new Song { Artist = "Kendrick Lamar", Title = "Money Trees" } }, routes);
@@ -616,13 +607,52 @@ public sealed class DownloadTaggingTests : IDisposable
 
         var explicitCopy = await Landing("USUM71210782");
         Assert.Equal("1", Vorbis(explicitCopy.Path, "ITUNESADVISORY"));
-        Assert.Equal(new FieldDecision("1", "Catalog"), explicitCopy.Report.Fields["advisory"]);
+        Assert.Equal(new FieldDecision("explicit", "Catalog"), explicitCopy.Report.Fields["advisory"]);
 
         // The catalog's first hit is the explicit one; the file's own code says it is the edit.
         File.Delete(explicitCopy.Path);
         var cleanCopy = await Landing("USUM71210787");
         Assert.Equal("2", Vorbis(cleanCopy.Path, "ITUNESADVISORY"));
     }
+
+    [Fact]
+    public async Task TryItOnASong_ShowsTheAdvisoryAndWhatADownloadWouldTakeOff_AndWritesNothing()
+    {
+        var harness = Build(new(), MoneyTreesRoutes());
+        var path = LandedFlac("library", file =>
+        {
+            file.Tag.Title = "Money Trees";
+            file.Tag.Performers = ["Kendrick Lamar"];
+            file.Tag.Album = "Kendrick Lamar Mixtape Vol. 2";
+            var xiph = (TagLib.Ogg.XiphComment)file.GetTag(TagLib.TagTypes.Xiph, true);
+            xiph.SetField("ISRC", "USUM71210787");
+            xiph.SetField("MUSICBRAINZ_ALBUMID", "0b1c2d3e-4f50-4617-8899-aabbccddeeff");
+            xiph.SetField("CATALOGNUMBER", "MIX-2");
+        });
+        var before = File.ReadAllBytes(path);
+        var preview = new TagPreview(harness.Provider, harness.Provider.GetRequiredService<ReleaseIdentifier>(), NullLogger<TagPreview>.Instance);
+
+        var report = await preview.PreviewAsync(path, null, null, null, CancellationToken.None);
+
+        Assert.Equal(new FieldDecision("clean edit", "Catalog"), report.Fields["advisory"]);
+        Assert.Contains(report.Notes, n => n.StartsWith("a download would take off") && n.Contains("MUSICBRAINZ_ALBUMID") && n.Contains("CATALOGNUMBER"));
+        Assert.Equal(before, File.ReadAllBytes(path));
+    }
+
+    /// <summary>"Money Trees" twice in the catalog: the explicit copy first, then the clean edit,
+    /// each with its own code.</summary>
+    private static Dictionary<string, string> MoneyTreesRoutes() => new()
+    {
+        ["/album/7"] = """{"id":7,"record_type":"album","release_date":"2012-10-22","nb_tracks":12,"artist":{"name":"Kendrick Lamar"}}""",
+        ["/album/8"] = """{"id":8,"record_type":"album","release_date":"2012-10-22","nb_tracks":12,"artist":{"name":"Kendrick Lamar"}}""",
+        ["/track/71"] = """{"id":71,"track_position":5,"disk_number":1,"isrc":"USUM71210782","explicit_lyrics":true,"explicit_content_lyrics":1}""",
+        ["/track/81"] = """{"id":81,"track_position":5,"disk_number":1,"isrc":"USUM71210787","explicit_lyrics":false,"explicit_content_lyrics":3}""",
+        ["/search?q="] = """
+            {"data":[
+              {"id":71,"title":"Money Trees","duration":386,"explicit_lyrics":true,"album":{"id":7,"title":"good kid, m.A.A.d city"},"artist":{"name":"Kendrick Lamar"}},
+              {"id":81,"title":"Money Trees","duration":386,"explicit_lyrics":false,"album":{"id":8,"title":"good kid, m.A.A.d city"},"artist":{"name":"Kendrick Lamar"}}]}
+            """,
+    };
 
     [Fact]
     public async Task CompilationRip_PreferOriginalAlbumOn_IsFiledUnderTheStudioAlbum()

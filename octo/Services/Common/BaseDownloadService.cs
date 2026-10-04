@@ -1110,8 +1110,7 @@ public abstract class BaseDownloadService : IDownloadService
         // Explicit or clean, from what landed; the library server shows it on every song.
         var advisory = ExplicitAdvisory.Decide(song, plan, song.SourceFile);
         song.Advisory = advisory?.Value;
-        if (plan is not null && advisory is not null)
-            plan.Fields["advisory"] = new FieldDecision(advisory.Value.ToString(System.Globalization.CultureInfo.InvariantCulture), advisory.Source);
+        if (plan is not null && advisory is not null) plan.Fields["advisory"] = ExplicitAdvisory.Field(advisory);
 
         var sibling = SubsonicSettings.FolderStructure == FolderStructure.Organized ? AlbumSibling(song, requested, filePath) : null;
         if (sibling is not null) JoinAlbum(song, sibling);
