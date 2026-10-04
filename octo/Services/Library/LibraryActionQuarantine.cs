@@ -52,9 +52,8 @@ public sealed class LibraryActionQuarantine
     {
         try
         {
+            if (Outside(file.AbsolutePath, musicRoot) is { } refused) return new QuarantineResult(false, null, refused);
             var relative = Path.GetRelativePath(musicRoot, file.AbsolutePath);
-            if (relative.StartsWith("..", StringComparison.Ordinal))
-                return new QuarantineResult(false, null, "the file is not under the music root");
 
             var destination = Path.Combine(RootFor(musicRoot),
                 DateTime.UtcNow.ToString("yyyy-MM-dd"), relative);
@@ -92,8 +91,28 @@ public sealed class LibraryActionQuarantine
         }
     }
 
-    /// <summary>Put a quarantined file back where it came from.</summary>
-    public QuarantineResult Restore(string quarantinePath)
+    /// <summary>
+    /// Why a file may not be moved out of the library, or null when it may. The resolver proved
+    /// it already; this is the last word before a move, so it does not trust that: the full path
+    /// must sit inside the music root (a "..", another drive or a lookalike folder name such as
+    /// "/music-old" all fail), must not already be in the trash, and must be a real file rather
+    /// than a link that could point anywhere.
+    /// </summary>
+    internal string? Outside(string path, string musicRoot)
+    {
+        string full;
+        try { full = Path.GetFullPath(path); }
+        catch (Exception) { return "the file's path cannot be read"; }
+        if (!NavidromeSongPathResolver.IsInside(full, musicRoot)) return "the file is not under the music root";
+        if (NavidromeSongPathResolver.IsInside(full, RootFor(musicRoot))) return "the file is in the trash already";
+        var info = new FileInfo(full);
+        if (info.Exists && info.Attributes.HasFlag(FileAttributes.ReparsePoint)) return "the file is a link, not a song file";
+        return null;
+    }
+
+    /// <summary>Put a quarantined file back where it came from. With <paramref name="musicRoot"/>,
+    /// only into it, whatever the manifest beside the file says.</summary>
+    public QuarantineResult Restore(string quarantinePath, string? musicRoot = null)
     {
         try
         {
@@ -103,6 +122,8 @@ public sealed class LibraryActionQuarantine
             var manifest = ReadManifest(quarantinePath);
             if (manifest is null)
                 return new QuarantineResult(false, null, "no manifest, so the original path is unknown");
+            if (musicRoot is not null && !NavidromeSongPathResolver.IsInside(Path.GetFullPath(manifest.OriginalPath), musicRoot))
+                return new QuarantineResult(false, null, "its old place is not under the music root");
 
             Directory.CreateDirectory(Path.GetDirectoryName(manifest.OriginalPath)!);
             if (File.Exists(manifest.OriginalPath))

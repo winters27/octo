@@ -32,6 +32,10 @@ public sealed class LibraryActionEndpointTests
     {
         public int Pings;
         public int SongLookups;
+        public int UserLookups;
+
+        /// <summary>Whether getUser says the caller is an admin. Removing needs it.</summary>
+        public bool Admin = true;
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
@@ -43,6 +47,14 @@ public sealed class LibraryActionEndpointTests
                 return Task.FromResult(Json(query["t"] == "good" || query["apiKey"] == "goodkey"
                     ? """{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome"}}"""
                     : """{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":40,"message":"Wrong username or password"}}}"""));
+            }
+            if (uri.AbsolutePath.EndsWith("/rest/getUser", StringComparison.Ordinal))
+            {
+                Interlocked.Increment(ref UserLookups);
+                return Task.FromResult(Json(JsonSerializer.Serialize(new Dictionary<string, object>
+                {
+                    ["subsonic-response"] = new { status = "ok", version = "1.16.1", user = new { username = query["username"], adminRole = Admin } },
+                })));
             }
             if (uri.AbsolutePath == "/auth/login")
                 return Task.FromResult(Json(
@@ -142,6 +154,9 @@ public sealed class LibraryActionEndpointTests
         }
     }
 
+    /// <summary>Version 3's edits, listed after remove and upgrade whenever library actions are on.</summary>
+    private static readonly string[] Edits = ["retag", "joinAlbum", "lookup", "undo", "restore", "cover"];
+
     private static string Auth(string user, string token = "good") =>
         $"u={user}&t={token}&s=salt&v=1.16.1&c=octo-android";
 
@@ -201,7 +216,7 @@ public sealed class LibraryActionEndpointTests
                 e => e.GetProperty("versions").EnumerateArray().Select(v => v.GetInt32()).ToList());
         Assert.Contains("formPost", extensions.Keys);
         Assert.Contains("octoAcquisitions", extensions.Keys);
-        if (listed) Assert.Equal([1, 2], extensions["octoLibraryActions"]);
+        if (listed) Assert.Equal([1, 2, 3], extensions["octoLibraryActions"]);
         else Assert.DoesNotContain("octoLibraryActions", extensions.Keys);
     }
 
@@ -240,12 +255,13 @@ public sealed class LibraryActionEndpointTests
         Assert.Equal("octo", envelope.GetProperty("type").GetString());
         Assert.True(envelope.GetProperty("openSubsonic").GetBoolean());
         var actions = envelope.GetProperty("libraryActions");
-        Assert.Equal(["actions", "allowed", "dryRun", "enabled", "keepDays", "parallel", "upgradeSource"],
+        Assert.Equal(["actions", "admin", "allowed", "dryRun", "enabled", "keepDays", "parallel", "upgradeSource"],
             actions.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal));
         Assert.True(actions.GetProperty("enabled").GetBoolean());
         Assert.True(actions.GetProperty("allowed").GetBoolean());
         Assert.False(actions.GetProperty("dryRun").GetBoolean());
-        Assert.Equal(["remove"], actions.GetProperty("actions").EnumerateArray().Select(a => a.GetString()));
+        Assert.Equal(["remove", .. Edits], actions.GetProperty("actions").EnumerateArray().Select(a => a.GetString()));
+        Assert.True(actions.GetProperty("admin").GetBoolean());
         Assert.Equal(14, actions.GetProperty("keepDays").GetInt32());
     }
 
@@ -277,7 +293,8 @@ public sealed class LibraryActionEndpointTests
 
         var actions = Envelope(doc).GetProperty("libraryActions");
         Assert.True(actions.GetProperty("dryRun").GetBoolean());
-        Assert.Empty(actions.GetProperty("actions").EnumerateArray());
+        // Remove is off; the edits are listed, and the app reads dryRun before offering them.
+        Assert.Equal(Edits, actions.GetProperty("actions").EnumerateArray().Select(a => a.GetString()));
         Assert.Equal(0, actions.GetProperty("keepDays").GetInt32());
     }
 
@@ -489,14 +506,14 @@ public sealed class LibraryActionEndpointTests
             using var client = off.CreateClient();
             using var doc = await GetJson(client, $"/rest/getLibraryActions.view?{Auth("alice")}");
             var actions = Envelope(doc).GetProperty("libraryActions");
-            Assert.Equal(["remove"], actions.GetProperty("actions").EnumerateArray().Select(a => a.GetString()));
+            Assert.Equal(["remove", .. Edits], actions.GetProperty("actions").EnumerateArray().Select(a => a.GetString()));
             Assert.Equal(1, actions.GetProperty("parallel").GetInt32());
         }
         await using (var on = new LibraryActionWebFactory(BetterQualityOn()))
         {
             using var client = on.CreateClient();
             using var doc = await GetJson(client, $"/rest/getLibraryActions.view?{Auth("alice")}");
-            Assert.Equal(["remove", "upgrade"],
+            Assert.Equal(["remove", "upgrade", .. Edits],
                 Envelope(doc).GetProperty("libraryActions").GetProperty("actions").EnumerateArray().Select(a => a.GetString()));
         }
     }

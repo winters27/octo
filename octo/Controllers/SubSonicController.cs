@@ -2588,8 +2588,30 @@ public class SubsonicController : ControllerBase
     {
         var parameters = await ExtractAllParameters();
         if (await CheckCallerAsync(parameters) is { } refused) return refused;
+        var edits = HttpContext.RequestServices.GetService<Octo.Services.Library.LibraryEditService>();
         return _responseBuilder.CreateLibraryActionsResponse(_libraryActionSettings.CurrentValue,
-            parameters.GetValueOrDefault("u"), _downloadConcurrency?.Current ?? 1, UpgradeReady, UpgradeSourceName);
+            parameters.GetValueOrDefault("u"), _downloadConcurrency?.Current ?? 1, UpgradeReady, UpgradeSourceName,
+            admin: await IsCallerAdminAsync(parameters), edits: edits is not null,
+            covers: HttpContext.RequestServices.GetService<Octo.Services.CoverArt.IAlbumCoverFinder>() is not null);
+    }
+
+    /// <summary>
+    /// octoLibraryActions v3: the songs the server holds in its trash, newest first, for an app to
+    /// offer putting one back. Always JSON; credentials checked like getLibraryActions, and listed
+    /// only to someone who could put them back.
+    /// </summary>
+    [HttpGet, HttpPost]
+    [Route("rest/getLibraryTrash")]
+    [Route("rest/getLibraryTrash.view")]
+    public async Task<IActionResult> GetLibraryTrash()
+    {
+        var parameters = await ExtractAllParameters();
+        if (await CheckCallerAsync(parameters) is { } refused) return refused;
+        var edits = HttpContext.RequestServices.GetService<Octo.Services.Library.LibraryEditService>();
+        var allowed = edits is not null
+            && edits.Refusal(parameters.GetValueOrDefault("u"), await IsCallerAdminAsync(parameters)) is null;
+        return _responseBuilder.CreateLibraryTrashResponse(allowed ? edits!.Trash() : [],
+            _libraryActionSettings.CurrentValue.EffectiveQuarantineRetentionDays);
     }
 
     /// <summary>
@@ -2638,8 +2660,11 @@ public class SubsonicController : ControllerBase
             return _responseBuilder.CreateError(format, 10, "Required parameter is missing: id and action");
         if (action.Equals(SubsonicResponseBuilder.UpgradeAction, StringComparison.OrdinalIgnoreCase))
             return QueueUpgrade(id, parameters.GetValueOrDefault("u"));
+        if (SubsonicResponseBuilder.EditActions.FirstOrDefault(a => a.Equals(action, StringComparison.OrdinalIgnoreCase)) is { } edit)
+            return await ApplyLibraryEdit(id, edit, parameters);
         if (!action.Equals(SubsonicResponseBuilder.RemoveAction, StringComparison.OrdinalIgnoreCase))
-            return _responseBuilder.CreateError(format, 0, $"Unknown action \"{action}\"; this server knows remove and upgrade");
+            return _responseBuilder.CreateError(format, 0,
+                $"Unknown action \"{action}\"; this server knows remove, upgrade, {string.Join(", ", SubsonicResponseBuilder.EditActions)}");
 
         // The name the ping just checked. An API key alone names nobody here, so it cannot be on
         // the allowlist, and the executor is not asked at all.
@@ -2652,13 +2677,102 @@ public class SubsonicController : ControllerBase
             return _responseBuilder.CreateLibraryActionResponse(id, new Octo.Services.Library.LibraryActionOutcome(
                 Octo.Services.Library.LibraryActionState.Skipped, "Library actions are off."));
 
+        // Taking a file off the disk is for the server's admins, whatever the allowed list says.
+        if (!await IsCallerAdminAsync(parameters))
+            return _responseBuilder.CreateLibraryActionResponse(id, new Octo.Services.Library.LibraryActionOutcome(
+                Octo.Services.Library.LibraryActionState.Skipped, "Only a server admin can remove songs from the library."));
+
         // Not tied to the request: a client that hangs up must not stop a move halfway.
         var outcome = await _libraryActions.ApplyAsync(
             new Octo.Services.Library.LibraryActionRequest(LibraryAction.Delete, id, username),
             CancellationToken.None);
         _logger.LogInformation("Library action Delete for {Id} by {User} from the app: {State} - {Detail}",
             id, username, outcome.State, outcome.Detail);
+        // Navidrome drops the song on its next scan; one is asked for now rather than whenever.
+        if (outcome.State == Octo.Services.Library.LibraryActionState.Applied)
+            HttpContext.RequestServices.GetService<Octo.Services.Library.LibraryRescan>()?.Soon();
         return _responseBuilder.CreateLibraryActionResponse(id, outcome);
+    }
+
+    /// <summary>
+    /// octoLibraryActions v3: change a song's file without removing it, or put a removed one back.
+    /// retag writes the tags sent (title, artist, album, albumArtist, year, genre, track, disc,
+    /// isrc; an empty one clears it), joinAlbum puts the song on the album of the song named by
+    /// <c>like</c>, cover puts a found cover inside a file that has none (<c>preview=true</c> only
+    /// says what was found), lookup finds the tags a download would get and writes nothing, undo
+    /// puts back the song's last change, and restore takes a removed song out of the trash. All of
+    /// them only for an admin on the allowed list; a dry run rehearses.
+    /// </summary>
+    private async Task<IActionResult> ApplyLibraryEdit(string id, string action, IReadOnlyDictionary<string, string> parameters)
+    {
+        var username = parameters.GetValueOrDefault("u");
+        var edits = HttpContext.RequestServices.GetService<Octo.Services.Library.LibraryEditService>();
+        var refusal = edits is null ? "This server cannot change library files." : edits.Refusal(username, await IsCallerAdminAsync(parameters));
+        if (refusal is not null)
+            return action == SubsonicResponseBuilder.LookupAction
+                ? _responseBuilder.CreateLookupResponse(id, new("skipped", refusal, new Dictionary<string, string?>(),
+                    new Dictionary<string, string?>(), null, null, null))
+                : _responseBuilder.CreateLibraryEditResponse(id, action, new("skipped", refusal));
+
+        // Not tied to the request either: a write that has started finishes.
+        var none = CancellationToken.None;
+        Octo.Services.Library.LibraryEditOutcome outcome;
+        switch (action)
+        {
+            case SubsonicResponseBuilder.LookupAction:
+                return _responseBuilder.CreateLookupResponse(id, await edits!.LookupAsync(id, HttpContext.RequestAborted));
+            case SubsonicResponseBuilder.RetagAction:
+                var changes = Octo.Services.Library.SongTagFields.All
+                    .Where(parameters.ContainsKey)
+                    .ToDictionary(field => field, field => (string?)parameters[field]);
+                outcome = await edits!.RetagAsync(id, username!, changes, none);
+                break;
+            case SubsonicResponseBuilder.JoinAlbumAction:
+                var like = parameters.GetValueOrDefault("like", "").Trim();
+                if (like.Length == 0) return _responseBuilder.CreateError("json", 10, "Required parameter is missing: like");
+                outcome = await edits!.JoinAlbumAsync(id, like, username!, none);
+                break;
+            case SubsonicResponseBuilder.CoverAction:
+                var preview = parameters.GetValueOrDefault("preview", "") is "true" or "1";
+                outcome = await edits!.AddCoverAsync(id, username!, preview, none);
+                break;
+            case SubsonicResponseBuilder.UndoAction:
+                outcome = await edits!.UndoAsync(id, username!, none);
+                break;
+            default:
+                outcome = edits!.Restore(id, username!);
+                break;
+        }
+        _logger.LogInformation("Library {Action} for {Id} by {User} from the app: {State} - {Detail}",
+            action, id, username, outcome.State, outcome.Detail);
+        return _responseBuilder.CreateLibraryEditResponse(id, action, outcome);
+    }
+
+    /// <summary>
+    /// Whether the caller is one of Navidrome's admins, asked with their own sign-in. False when
+    /// Navidrome cannot say, so a change to the library's files is never allowed by an outage.
+    /// Asked every time: a role taken away counts at once, and it is one call to Navidrome.
+    /// </summary>
+    private async Task<bool> IsCallerAdminAsync(IReadOnlyDictionary<string, string> parameters)
+    {
+        var username = parameters.GetValueOrDefault("u");
+        if (string.IsNullOrWhiteSpace(username)) return false;
+        var auth = parameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+        auth["f"] = "json";
+        auth["username"] = username;
+        var relay = await _proxyService.RelaySafeAsync("rest/getUser", auth);
+        if (!relay.Success || relay.Body is not { } body) return false;
+        var admin = false;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(body);
+            admin = doc.RootElement.TryGetProperty("subsonic-response", out var root)
+                    && root.TryGetProperty("user", out var user)
+                    && user.TryGetProperty("adminRole", out var role)
+                    && role.ValueKind == System.Text.Json.JsonValueKind.True;
+        }
+        catch (System.Text.Json.JsonException) { return false; }
+        return admin;
     }
 
     /// <summary>

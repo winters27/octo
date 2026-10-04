@@ -23,6 +23,10 @@ public enum LibraryActionState
     /// kind of thing that makes someone turn rehearsal mode off to "fix" it.
     /// </summary>
     Rehearsed,
+
+    /// <summary>A removed song put back from the trash. Appended: the journal stores states as
+    /// numbers. Neither applied nor skipped, so the same file can be removed again.</summary>
+    Restored,
 }
 
 public sealed record LibraryActionEntry(
