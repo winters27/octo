@@ -642,6 +642,36 @@ public sealed class DownloadTaggingTests : IDisposable
     }
 
     [Fact]
+    public async Task AFlacNamedMp3_IsRenamedBeforeTagging_AndTheLogAndReportSaySo()
+    {
+        var tracker = new AcquisitionTracker(NullLogger<AcquisitionTracker>.Instance);
+        var harness = Build(new() { ["1"] = new Song { Artist = "Massive Attack", Title = "Teardrop", ExternalProvider = "test", ExternalId = "1" } },
+            MezzanineRoutes(), tracker: tracker);
+        harness.Service.Landing = song =>
+        {
+            var verdict = ConfirmedTeardrop();
+            verdict.ApplyTagsTo(song);
+            song.Verification = verdict;
+            var flac = LandedFlac("peer share");
+            var misnamed = Path.ChangeExtension(flac, ".mp3");
+            File.Move(flac, misnamed);
+            return misnamed;
+        };
+        tracker.Begin("test", "1", null, "alice");
+
+        var path = await harness.Service.Download("1");
+
+        Assert.Equal(".flac", Path.GetExtension(path));
+        // Written as a FLAC: the tagger read it by its new name.
+        Assert.Equal("Mezzanine", Vorbis(path, "ALBUM"));
+        Assert.Empty(Directory.EnumerateFiles(_root, "*.mp3", SearchOption.AllDirectories));
+        var report = harness.History.GetRecent(1).Single().Tagging!;
+        Assert.Contains("renamed from .mp3 to .flac: the file is a FLAC", report.Notes);
+        Assert.Contains(tracker.Detail("test:1", "alice")!.Events!, e => e.Kind == AcquisitionEventKinds.Check
+            && e.Text == "Renamed to .flac: the file is a FLAC" && e.Detail == "It arrived named .mp3");
+    }
+
+    [Fact]
     public async Task TryItOnASong_ShowsTheAdvisoryAndWhatADownloadWouldTakeOff_AndWritesNothing()
     {
         var harness = Build(new(), MoneyTreesRoutes());

@@ -629,6 +629,10 @@ public abstract class BaseDownloadService : IDownloadService
                 await DownloadLock.WaitAsync(CancellationToken.None);
                 lockHeld = true;
             }
+            // A file named for another format than it holds is renamed before anything reads it
+            // by its name: the tagger chooses how to write by the extension.
+            var extensionFix = FixLandedExtension(landedPath, externalProvider, externalId);
+            if (extensionFix is not null) landedPath = extensionFix.Path;
             song.LocalPath = landedPath;
             Track(t => t.Stage(externalProvider, externalId, AcquisitionState.Importing));
             var finalize = System.Diagnostics.Stopwatch.StartNew();
@@ -642,6 +646,8 @@ public abstract class BaseDownloadService : IDownloadService
             // folder (#50) and its main artist names the artist folder (#49). Reads only; nothing
             // is written to the file until it sits where it will stay.
             await IdentifyAsync(song, requested, landedPath, albumContext, CancellationToken.None);
+            if (extensionFix is not null)
+                song.TagPlan?.Notes.Add($"renamed from {extensionFix.From} to {extensionFix.To}: the file is {extensionFix.Format}");
             await ApplyLoudnessAsync(song, loudness, landedPath);
             Track(t => t.Log(externalProvider, externalId, AcquisitionEventKinds.Tags,
                 $"Identified as {song.Artist} - {song.Title}",
@@ -1278,6 +1284,29 @@ public abstract class BaseDownloadService : IDownloadService
         song.JoinsAlbum = new AlbumGrouping(kept.AlbumId, kept.ReleaseDate, kept.AlbumVersion);
         song.TagPlan?.Notes.Add($"album grouping copied from the album folder's own '{Path.GetFileName(sibling.Path)}'");
         Logger.LogDebug("{Title} joins the album of {Sibling}", song.Title, sibling.Path);
+    }
+
+    /// <summary>
+    /// Renames a landed file whose extension names another format than its bytes (a FLAC named
+    /// .mp3, an M4A named .flac) and logs it. Null when the name was right or the file could not
+    /// be renamed; the file is then tagged as it is, as before.
+    /// </summary>
+    private ExtensionFix? FixLandedExtension(string path, string provider, string externalId)
+    {
+        try
+        {
+            if (AudioContainer.FixExtension(path) is not { } fix) return null;
+            Logger.LogInformation("{Path} is {Format}; renamed from {From} to {To} before tagging",
+                path, fix.Format, fix.From, fix.To);
+            Track(t => t.Log(provider, externalId, AcquisitionEventKinds.Check,
+                $"Renamed to {fix.To}: the file is {fix.Format}", $"It arrived named {fix.From}"));
+            return fix;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning("Could not check or fix the extension of {Path}: {Message}", path, ex.Message);
+            return null;
+        }
     }
 
     /// <summary>Start measuring a landed file, beside identification, when ReplayGain is on.</summary>
