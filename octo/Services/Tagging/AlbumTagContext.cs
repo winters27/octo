@@ -39,6 +39,7 @@ public sealed class AlbumTagContext
     public string? OriginalDate { get; private set; }
     public string? ReleaseDate { get; private set; }
     public int? TotalTracks { get; private set; }
+    public int? TotalDiscs { get; private set; }
     public IReadOnlyList<string> AlbumArtistIds { get; private set; } = [];
     public bool Captured { get; private set; }
 
@@ -64,6 +65,7 @@ public sealed class AlbumTagContext
         OriginalDate = song.OriginalDate;
         ReleaseDate = song.ReleaseDate;
         TotalTracks = song.TotalTracks;
+        TotalDiscs = song.TotalDiscs;
         AlbumArtistIds = song.MusicBrainzAlbumArtistIds.ToList();
     }
 
@@ -100,6 +102,7 @@ public sealed class AlbumTagContext
         song.OriginalDate = OriginalDate;
         song.ReleaseDate = ReleaseDate;
         if (TotalTracks is not null) song.TotalTracks = TotalTracks;
+        if (TotalDiscs is not null) song.TotalDiscs = TotalDiscs;
         song.MusicBrainzAlbumArtistIds = AlbumArtistIds.ToList();
     }
 }

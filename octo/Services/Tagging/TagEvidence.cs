@@ -59,6 +59,7 @@ public sealed record ReleaseCandidate(TagSource Source, string RecordingTitle, s
     public string? CoverUrl { get; init; }
     public string? Genre { get; init; }
     public bool? Explicit { get; init; }
+    public int? ExplicitContent { get; init; }
     public string? CatalogAlbumId { get; init; }
     public string? CatalogTrackId { get; init; }
 

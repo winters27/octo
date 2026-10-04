@@ -42,6 +42,9 @@ public class DeezerMetadataService : IDisposable
         public string? AlbumId { get; init; }
         public string? Barcode { get; init; }
         public bool? ExplicitLyrics { get; init; }
+        /// <summary>The catalog's word for this version's lyrics: 0 not explicit, 1 explicit,
+        /// 3 the clean edit; any other value says it does not know.</summary>
+        public int? ExplicitContent { get; init; }
         public double? CatalogGain { get; init; }
     }
 
@@ -402,6 +405,7 @@ public class DeezerMetadataService : IDisposable
         List<string>? contributors = null;
         bool? explicitLyrics = t.TryGetProperty("explicit_lyrics", out var ex0) && ex0.ValueKind is JsonValueKind.True or JsonValueKind.False
             ? ex0.GetBoolean() : null;
+        var explicitContent = Int(t, "explicit_content_lyrics");
         double? gain = null;
         string? trackId = null;
         if (t.TryGetProperty("id", out var tid) && tid.ValueKind == JsonValueKind.Number)
@@ -417,6 +421,7 @@ public class DeezerMetadataService : IDisposable
                 isrc ??= Str(track, "isrc");
                 if (track.TryGetProperty("explicit_lyrics", out var ex1) && ex1.ValueKind is JsonValueKind.True or JsonValueKind.False)
                     explicitLyrics = ex1.GetBoolean();
+                explicitContent = Int(track, "explicit_content_lyrics") ?? explicitContent;
                 if (track.TryGetProperty("gain", out var gn) && gn.ValueKind == JsonValueKind.Number) gain = gn.GetDouble();
                 if (track.TryGetProperty("contributors", out var people) && people.ValueKind == JsonValueKind.Array)
                     contributors = people.EnumerateArray()
@@ -438,6 +443,7 @@ public class DeezerMetadataService : IDisposable
             AlbumId = albId > 0 ? albId.ToString(System.Globalization.CultureInfo.InvariantCulture) : null,
             Barcode = string.IsNullOrWhiteSpace(barcode) ? null : barcode,
             ExplicitLyrics = explicitLyrics,
+            ExplicitContent = explicitContent,
             CatalogGain = gain,
         };
         return (meta, detailUnresolved);

@@ -30,6 +30,7 @@ internal static class TagFields
     public static readonly TagField AlbumArtists = new(null, "ALBUMARTISTS", "ALBUMARTISTS", "ALBUMARTISTS");
     public static readonly TagField AlbumVersion = new(null, "ALBUMVERSION", "ALBUMVERSION", "ALBUMVERSION");
     public static readonly TagField ReleaseDate = new(null, "RELEASEDATE", "RELEASEDATE", "RELEASEDATE");
+    public static readonly TagField Advisory = new(null, "ITUNESADVISORY", "ITUNESADVISORY", "ITUNESADVISORY");
 }
 
 /// <summary>
@@ -175,6 +176,39 @@ internal static class TagWriterExtras
         if (trackPeak is { } tp) SetText(file, TagFields.TrackPeak, PeakText(tp));
         if (albumGainDb is { } ag) SetText(file, TagFields.AlbumGain, GainText(ag));
         if (albumPeak is { } ap) SetText(file, TagFields.AlbumPeak, PeakText(ap));
+    }
+
+    /// <summary>The MP4 rating atom, which holds the advisory there.</summary>
+    private static readonly TagLib.ByteVector Rating = TagLib.ByteVector.FromString("rtng", TagLib.StringType.Latin1);
+
+    /// <summary>
+    /// Whether the words are explicit (1), the clean edit (2) or neither (0), where the library
+    /// server reads a song's explicit status from: ITUNESADVISORY on ID3 and Vorbis, the rtng atom
+    /// on MP4, which holds it as a one-byte number. Anything else leaves the file as it is.
+    /// </summary>
+    public static void SetAdvisory(TagLib.File file, int? value)
+    {
+        if (value is not (0 or 1 or 2)) return;
+        var text = value.Value.ToString(CultureInfo.InvariantCulture);
+        var (id3, xiph, apple) = NativeTags(file);
+        if (id3 is not null) TagLib.Id3v2.UserTextInformationFrame.Get(id3, TagFields.Advisory.Id3Description!, true).Text = [text];
+        xiph?.SetField(TagFields.Advisory.Vorbis, text);
+        if (apple is not null)
+        {
+            apple.SetData(Rating, new TagLib.ByteVector(new[] { (byte)value.Value }), (uint)TagLib.Mpeg4.AppleDataBox.FlagType.ForTempo);
+            // A freeform copy beside the atom would be a second value.
+            if (apple.GetDashBox(AppleMean, TagFields.Advisory.Mp4) is not null) apple.SetDashBox(AppleMean, TagFields.Advisory.Mp4, null);
+        }
+    }
+
+    /// <summary>The advisory a file carries, from whichever frame holds it; null when none does.</summary>
+    public static int? ReadAdvisory(TagLib.File file)
+    {
+        if (file.GetTag(TagLib.TagTypes.Apple, false) is TagLib.Mpeg4.AppleTag apple
+            && apple.DataBoxes(Rating).FirstOrDefault()?.Data is { Count: > 0 } data)
+            return data[data.Count - 1];
+        return int.TryParse(ReadText(file, TagFields.Advisory), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+            ? value : null;
     }
 
     internal static string GainText(double gainDb) => gainDb.ToString("+0.00;-0.00", CultureInfo.InvariantCulture) + " dB";
