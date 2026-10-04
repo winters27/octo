@@ -63,6 +63,12 @@ services:
       Soulseek__BaseUrl: http://slskd:5030
       Soulseek__Username: ${SLSKD_USERNAME:-slskd}
       Soulseek__Password: ${SLSKD_PASSWORD:-slskd}
+      # Where the dashboard's Open slskd button goes. Blank: this server's name
+      # on port 5030.
+      Soulseek__WebUrl: ${SLSKD_WEB_URL:-}
+      # Ask Soulseek's port test whether other people can reach slskd (sends the
+      # port number only, at most every 6 hours).
+      Soulseek__CheckListenPort: ${SLSKD_CHECK_PORT:-true}
       Soulseek__SearchWaitSeconds: ${SLSKD_SEARCH_WAIT_SECONDS:-30}
       Soulseek__UpgradeSearchWaitSeconds: ${SLSKD_UPGRADE_SEARCH_WAIT_SECONDS:-90}
       Soulseek__MinFileSizeBytes: ${SLSKD_MIN_FILE_SIZE_BYTES:-5242880}
@@ -293,6 +299,10 @@ services:
   # State (config, db, downloads-in-progress) persisted to ./slskd-state so the
   # account survives recreate. SLSKD_DOWNLOADS_DIR below sends finished files
   # to the same /music mount Octo watches.
+  #
+  # Peer port 50300 is the one other Soulseek users connect to, to download what
+  # you share. Forward TCP 50300 on your router to this machine. Port 5030 is
+  # slskd's own web page: keep it on your network, never forward it.
   slskd:
     image: slskd/slskd:latest
     container_name: slskd
@@ -315,9 +325,31 @@ services:
       SLSKD_SLSK_PASSWORD: ${SLSKD_SOULSEEK_PASSWORD:-}
       SLSKD_USERNAME: ${SLSKD_USERNAME:-slskd}
       SLSKD_PASSWORD: ${SLSKD_PASSWORD:-slskd}
+      # ----- Sharing: give back to the people you download from -----
+      # Soulseek runs on sharing, and many users will not send files to someone
+      # who shares nothing. slskd shares your music library from the read-only
+      # /share mount below, so an upload can never change a file. Other people
+      # see it as a folder named Music. Several folders: separate them with ";".
+      # A shares list in ./slskd-state/slskd.yml outranks this.
+      SLSKD_SHARED_DIR: ${SLSKD_SHARED_DIR:-[Music]/share}
+      # Octo's own working files are never shared: partial and temporary
+      # copies, and its hidden folders (.octo-incoming, .octo-trash), which
+      # slskd skips anyway because their names start with a dot.
+      SLSKD_SHARE_FILTER: '/\.octo-;\.octo-tmp$$;\.part$$;\.tmp$$'
+      # Look through the shared folders again this often, in minutes (60 or
+      # more), so songs added since are shared too. A library on a cloud drive
+      # may want 10080, once a week: every look reads each file's header.
+      SLSKD_SHARE_CACHE_RETENTION: ${SLSKD_SHARE_RESCAN_MINUTES:-1440}
+      # Uploads at once, and their total speed in KiB/s, so sharing never
+      # crowds out streaming from this server. Raise both if you have upload
+      # to spare.
+      SLSKD_UPLOAD_SLOTS: ${SLSKD_UPLOAD_SLOTS:-4}
+      SLSKD_UPLOAD_SPEED_LIMIT: ${SLSKD_UPLOAD_SPEED_LIMIT:-2048}
     volumes:
       - ${SLSKD_STATE_DIR:-./slskd-state}:/app
       - ${DOWNLOAD_PATH:-./downloads}:/music
+      # The same library again, read-only, for sharing.
+      - ${DOWNLOAD_PATH:-./downloads}:/share:ro
 
 volumes:
   ytdlp-cache:

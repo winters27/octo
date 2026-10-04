@@ -226,6 +226,9 @@ echo "  Sign up free at https://www.slsknet.org/news/node/1"
 echo "  These are your Soulseek-network credentials — slskd uses them to log in."
 SLSKD_SOULSEEK_USERNAME=$(ask "Your Soulseek username" "$(existing SLSKD_SOULSEEK_USERNAME)")
 SLSKD_SOULSEEK_PASSWORD=$(ask_secret "Your Soulseek password" "$(existing SLSKD_SOULSEEK_PASSWORD)")
+echo "  slskd shares your music folder back, read-only: many Soulseek users will"
+echo "  not send files to someone who shares nothing. Forward TCP port 50300 on"
+echo "  your router to this machine so people can connect. Never forward 5030."
 echo
 
 # ─────────────────────────────────────────────────────────────────
@@ -339,7 +342,9 @@ YTDLP_URL_CACHE_MAX=512
 YTDLP_URL_CACHE_TTL=3600
 EOF
 # Kept from the old .env when they were set there: settings this installer never asks about.
-for key in OCTO_CONFIG_DIR SLSKD_STATE_DIR UPDATES_CHECK UPDATES_REPO; do
+for key in OCTO_CONFIG_DIR SLSKD_STATE_DIR UPDATES_CHECK UPDATES_REPO \
+           SLSKD_SHARED_DIR SLSKD_SHARE_RESCAN_MINUTES SLSKD_UPLOAD_SLOTS SLSKD_UPLOAD_SPEED_LIMIT \
+           SLSKD_CHECK_PORT SLSKD_WEB_URL; do
   if [ -n "$(existing "$key")" ]; then
     printf '%s=%s
 ' "$key" "$(existing "$key")" >> .env
@@ -444,7 +449,8 @@ else
   echo "     the YouTube preview. Heart it to download via Soulseek."
 fi
 echo
-dim "  slskd web UI:    http://<this-host>:5030    (admin / shown above)"
+dim "  slskd web UI:    http://<this-host>:5030    (SLSKD_USERNAME and SLSKD_PASSWORD in .env; or Open slskd on the dashboard)"
+dim "  Sharing:         forward TCP 50300 to this machine; the dashboard's Soulseek page tests it"
 dim "  Stop:            docker compose down"
 dim "  Update later:    admin dashboard, About (or see Updating in the README)"
 bold "═══════════════════════════════════════════════════════════"
