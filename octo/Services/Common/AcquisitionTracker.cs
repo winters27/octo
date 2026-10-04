@@ -38,7 +38,86 @@ public sealed record AcquisitionSnapshot(
     string? Error,
     string? LibraryId,
     int? Ahead = null,
-    string? Note = null);
+    string? Note = null,
+    string? Key = null,
+    string Kind = AcquisitionKinds.Download,
+    string? Quality = null,
+    string? Peer = null,
+    int LogLines = 0,
+    IReadOnlyList<AcquisitionEvent>? Events = null);
+
+/// <summary>What a row is for. Sent to clients as is.</summary>
+public static class AcquisitionKinds
+{
+    /// <summary>A heart, a play or an album walk.</summary>
+    public const string Download = "download";
+    /// <summary>A higher quality copy of a song already in the library.</summary>
+    public const string Upgrade = "upgrade";
+    /// <summary>The one copy someone picked from Find songs.</summary>
+    public const string Pick = "pick";
+}
+
+/// <summary>What one line of a download's log is about, so an app can draw it. Sent as is; an app
+/// that meets a kind it does not know draws a plain line.</summary>
+public static class AcquisitionEventKinds
+{
+    public const string Queued = "queued";
+    public const string Search = "search";
+    public const string Found = "found";
+    public const string Try = "try";
+    public const string Transfer = "transfer";
+    public const string Check = "check";
+    public const string Tags = "tags";
+    public const string Cover = "cover";
+    public const string Lyrics = "lyrics";
+    public const string Library = "library";
+    public const string Done = "done";
+    public const string Failed = "failed";
+    public const string Note = "note";
+}
+
+/// <summary>One line of a download's log: when, what kind of step, the words, an optional second
+/// line, and the copies a search offered when the step is about them.</summary>
+public sealed record AcquisitionEvent(DateTime At, string Kind, string Text, string? Detail = null,
+    IReadOnlyList<AcquisitionCandidate>? Candidates = null);
+
+/// <summary>
+/// One copy a source offered, as the log and Find songs show it. Every figure the source gave is
+/// kept; any of them may be missing. Rank is Octo's order of preference among the copies it would
+/// try (1 is first), null for a copy it would pass over, and Note says why it would.
+/// </summary>
+public sealed record AcquisitionCandidate(
+    string Source,
+    string? Peer = null,
+    string? File = null,
+    string? Folder = null,
+    string? Format = null,
+    int? BitRate = null,
+    int? BitDepth = null,
+    int? SampleRate = null,
+    long? Size = null,
+    int? Length = null,
+    int? QueueLength = null,
+    bool? FreeSlot = null,
+    int? Speed = null,
+    int? Rank = null,
+    string? Note = null,
+    string? Title = null,
+    string? Album = null)
+{
+    /// <summary>"FLAC 16-bit 44.1 kHz", "MP3 320 kbps", or just the format.</summary>
+    public string? Quality => QualityText(Format, BitRate, BitDepth, SampleRate);
+
+    public static string? QualityText(string? format, int? bitRate, int? bitDepth, int? sampleRate)
+    {
+        var kind = format?.Trim().TrimStart('.').ToUpperInvariant();
+        if (string.IsNullOrEmpty(kind)) return null;
+        if (bitDepth is > 0 && sampleRate is > 0)
+            return $"{kind} {bitDepth}-bit {(sampleRate.Value / 1000.0).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture)} kHz";
+        if (bitRate is > 0) return $"{kind} {bitRate} kbps";
+        return kind;
+    }
+}
 
 /// <summary>How a row ended. LibraryId is set only for a song Navidrome showed; AlbumKeys are
 /// the hearted albums the song was fetched for.</summary>
@@ -47,7 +126,9 @@ public sealed record AcquisitionEnd(string Key, string? Artist, string? Title, b
 
 /// <summary>
 /// Live progress of every hearted download, from the moment the star is accepted until a while
-/// after it ends, so a client can draw a ring on the button it was tapped on.
+/// after it ends, so a client can draw a ring on the button it was tapped on. Each row keeps a
+/// log of what happened on the way (the searches, the copies found, the one chosen and why, the
+/// checks, the tags, the cover and the lyrics), which the apps' downloads drawer shows.
 ///
 /// Observation only. Nothing in the download path reads it back, and no method here throws: a
 /// bookkeeping mistake must never cost anyone a song. Held in memory and gone on a restart,
@@ -59,7 +140,7 @@ public sealed record AcquisitionEnd(string Key, string? Artist, string? Title, b
 public sealed class AcquisitionTracker
 {
     /// <summary>How long a finished or failed entry stays visible.</summary>
-    internal static readonly TimeSpan FinishedRetention = TimeSpan.FromMinutes(30);
+    internal static readonly TimeSpan FinishedRetention = TimeSpan.FromHours(3);
 
     /// <summary>
     /// How long an entry that is still running may go without any news before it is dropped.
@@ -71,6 +152,13 @@ public sealed class AcquisitionTracker
     internal const int Capacity = 500;
 
     private const int MaxErrorLength = 160;
+
+    /// <summary>Lines kept per run of a download. A walk of five peers with every check logs
+    /// about thirty; past this the oldest lines after the first go.</summary>
+    internal const int MaxEvents = 150;
+
+    /// <summary>Copies kept on one line of the log.</summary>
+    internal const int MaxCandidatesPerEvent = 30;
 
     private sealed class Entry
     {
@@ -101,6 +189,18 @@ public sealed class AcquisitionTracker
         /// <summary>Bumped on every restart, so a watcher left over from an earlier run of the
         /// same song can never finish the new one.</summary>
         public int Run { get; set; }
+
+        public string Kind { get; set; } = AcquisitionKinds.Download;
+
+        /// <summary>The copy being fetched, once one is chosen: its quality and its peer.</summary>
+        public string? Quality { get; set; }
+        public string? Peer { get; set; }
+
+        /// <summary>The log of this run, oldest first.</summary>
+        public List<AcquisitionEvent> Events { get; } = [];
+
+        /// <summary>The source the log last said it was looking on, so it says so once.</summary>
+        public string? LoggedSource { get; set; }
 
         public bool Finished => State is AcquisitionState.Done or AcquisitionState.Failed;
     }
@@ -174,17 +274,26 @@ public sealed class AcquisitionTracker
     /// or adds this user to one that is still running (a second heart joins the same download).
     /// </summary>
     public void Begin(string provider, string externalId, string? clientId, string? requestedBy,
-        string? artist = null, string? title = null, string? album = null)
+        string? artist = null, string? title = null, string? album = null, string kind = AcquisitionKinds.Download)
     {
         Guard(nameof(Begin), () =>
         {
             if (string.IsNullOrWhiteSpace(provider) || string.IsNullOrWhiteSpace(externalId)) return;
             lock (_lock)
             {
+                var fresh = !_entries.TryGetValue(KeyOf(provider, externalId), out var was) || was.Finished;
                 var entry = Open(provider, externalId, restartFinished: true);
                 if (!string.IsNullOrWhiteSpace(clientId)) entry.ClientId = clientId;
+                // A heart joining a pick or an upgrade does not make it a plain download.
+                if (fresh || kind != AcquisitionKinds.Download) entry.Kind = kind;
                 AddOwner(entry.Owners, requestedBy);
                 Name(entry, artist, title, album);
+                if (fresh) Add(entry, AcquisitionEventKinds.Queued, kind switch
+                {
+                    AcquisitionKinds.Upgrade => "Asked for a higher quality copy",
+                    AcquisitionKinds.Pick => "Asked for the copy you picked",
+                    _ => "Asked for",
+                }, string.IsNullOrWhiteSpace(requestedBy) ? null : $"By {requestedBy.Trim()}");
                 Prune();
             }
         });
@@ -243,6 +352,8 @@ public sealed class AcquisitionTracker
                         : existing!;
                     entry.Owners.UnionWith(owners);
                     Name(entry, track.Artist, track.Title, track.Album);
+                    if (restart) Add(entry, AcquisitionEventKinds.Queued, "Asked for with its album",
+                        track.Album is { Length: > 0 } albumName ? $"From {albumName}" : null);
                 }
                 if (claim is not null) claim.UpdatedAt = Now;
                 Prune();
@@ -272,6 +383,7 @@ public sealed class AcquisitionTracker
             }
             Update(provider, externalId, entry =>
             {
+                var was = entry.State;
                 // Back to looking means the last transfer is gone, whatever it had reached.
                 if (state is AcquisitionState.Queued or AcquisitionState.Searching)
                 {
@@ -281,7 +393,21 @@ public sealed class AcquisitionTracker
                 entry.State = state;
                 entry.Progress = null;
                 if (!string.IsNullOrWhiteSpace(source)) entry.Source = source;
-                if (!string.IsNullOrWhiteSpace(note)) entry.Note = note.Trim();
+                if (!string.IsNullOrWhiteSpace(note) && note.Trim() != entry.Note)
+                {
+                    entry.Note = note.Trim();
+                    Add(entry, AcquisitionEventKinds.Note, entry.Note);
+                }
+                if (state == AcquisitionState.Searching && !string.IsNullOrWhiteSpace(source)
+                    && !string.Equals(source, entry.LoggedSource, StringComparison.OrdinalIgnoreCase))
+                {
+                    entry.LoggedSource = source;
+                    Add(entry, AcquisitionEventKinds.Search, $"Looking on {source}");
+                }
+                if (state == AcquisitionState.Verifying && was != AcquisitionState.Verifying)
+                    Add(entry, AcquisitionEventKinds.Check, "Checking the file");
+                if (state == AcquisitionState.Importing && was != AcquisitionState.Importing)
+                    Add(entry, AcquisitionEventKinds.Tags, "Naming, tagging and filing it");
             });
         });
     }
@@ -304,6 +430,13 @@ public sealed class AcquisitionTracker
     {
         Guard(nameof(Transfer), () => Update(provider, externalId, entry =>
         {
+            if (entry.State != AcquisitionState.Downloading)
+            {
+                var from = !string.IsNullOrWhiteSpace(source) ? source : entry.Source;
+                var peer = entry.Peer is { } who && from == "Soulseek" ? $" ({who})" : "";
+                Add(entry, AcquisitionEventKinds.Transfer, from is null ? "Downloading" : $"Downloading from {from}{peer}",
+                    bytesTotal is > 0 ? SizeText(bytesTotal.Value) : null);
+            }
             entry.State = AcquisitionState.Downloading;
             if (!string.IsNullOrWhiteSpace(source)) entry.Source = source;
             entry.BytesDone = bytesDone is >= 0 ? bytesDone : null;
@@ -330,6 +463,7 @@ public sealed class AcquisitionTracker
                 entry.Progress = null;
                 entry.UpdatedAt = Now;
                 run = entry.Run;
+                Add(entry, AcquisitionEventKinds.Library, "In the library folder", "Waiting for Navidrome to show it");
                 // A song found already in the library arrives here before anything named it.
                 if (string.IsNullOrWhiteSpace(artist)) artist = entry.Artist;
                 if (string.IsNullOrWhiteSpace(title)) title = entry.Title;
@@ -375,6 +509,7 @@ public sealed class AcquisitionTracker
                 entry.State = AcquisitionState.Failed;
                 entry.Progress = null;
                 entry.Error = UserSafe(error) ?? "The download failed.";
+                Add(entry, AcquisitionEventKinds.Failed, "Could not get it", entry.Error);
                 ended = EndOf(KeyOf(provider, externalId), entry);
             });
             Raise(ended);
@@ -399,6 +534,141 @@ public sealed class AcquisitionTracker
             }
         });
     }
+
+    // ---------------------------------------------------------------------------------------
+    // The log. Unlike the stages, a line may be added to a row that has finished: lyrics are
+    // looked for after the song is in, and an upgrade's verdict comes after its download.
+    // ---------------------------------------------------------------------------------------
+
+    /// <summary>One line in a row's log, for this run of it.</summary>
+    public void Log(string provider, string externalId, string kind, string text, string? detail = null)
+    {
+        Guard(nameof(Log), () =>
+        {
+            if (string.IsNullOrWhiteSpace(provider) || string.IsNullOrWhiteSpace(externalId) || string.IsNullOrWhiteSpace(text)) return;
+            lock (_lock)
+            {
+                if (!_entries.TryGetValue(KeyOf(provider, externalId), out var entry)) return;
+                Add(entry, kind, text, detail);
+            }
+        });
+    }
+
+    /// <summary>What a search found: a line with the copies on it, best first.</summary>
+    public void Found(string provider, string externalId, string text, IReadOnlyList<AcquisitionCandidate> candidates,
+        string? detail = null)
+    {
+        Guard(nameof(Found), () =>
+        {
+            if (string.IsNullOrWhiteSpace(provider) || string.IsNullOrWhiteSpace(externalId)) return;
+            lock (_lock)
+            {
+                if (!_entries.TryGetValue(KeyOf(provider, externalId), out var entry) || entry.Finished) return;
+                Add(entry, AcquisitionEventKinds.Found, text, detail, candidates.Take(MaxCandidatesPerEvent).ToList());
+            }
+        });
+    }
+
+    /// <summary>The copy being tried now, and why it was chosen. The row shows its quality and peer
+    /// from here on.</summary>
+    public void Trying(string provider, string externalId, AcquisitionCandidate candidate, string text, string? why = null)
+    {
+        Guard(nameof(Trying), () =>
+        {
+            if (string.IsNullOrWhiteSpace(provider) || string.IsNullOrWhiteSpace(externalId)) return;
+            lock (_lock)
+            {
+                if (!_entries.TryGetValue(KeyOf(provider, externalId), out var entry) || entry.Finished) return;
+                entry.Quality = candidate.Quality;
+                entry.Peer = candidate.Peer;
+                entry.UpdatedAt = Now;
+                Add(entry, AcquisitionEventKinds.Try, text, why, [candidate]);
+            }
+        });
+    }
+
+    /// <summary>Whether the row with this key is still running.</summary>
+    public bool IsRunning(string key)
+    {
+        lock (_lock) return _entries.TryGetValue(key, out var entry) && !entry.Finished;
+    }
+
+    /// <summary>One row with its whole log, when this user may see it (or anyone, for null).</summary>
+    public AcquisitionSnapshot? Detail(string key, string? username)
+    {
+        try
+        {
+            lock (_lock)
+            {
+                if (!_entries.TryGetValue(key, out var entry)) return null;
+                if (username is not null && !entry.Owners.Contains(username.Trim())) return null;
+                var running = _entries.Values.Where(other => !other.Finished).ToList();
+                return Snapshot(entry, AheadOf(entry, running), withEvents: true);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Acquisition tracker detail failed: {Message}", ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Takes finished rows off this user's list, or the one row named. A row someone else still
+    /// sees stays for them; one nobody sees goes. A row still running is never cleared. Answers
+    /// how many left this user's list.
+    /// </summary>
+    public int Clear(string username, string? key = null)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(username)) return 0;
+            var who = username.Trim();
+            lock (_lock)
+            {
+                var cleared = 0;
+                foreach (var (entryKey, entry) in _entries.ToList())
+                {
+                    if (!entry.Finished || !entry.Owners.Contains(who)) continue;
+                    if (key is not null && !string.Equals(key, entryKey, StringComparison.Ordinal)) continue;
+                    entry.Owners.Remove(who);
+                    cleared++;
+                    if (entry.Owners.Count == 0) _entries.Remove(entryKey);
+                }
+                return cleared;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("Acquisition tracker clear failed: {Message}", ex.Message);
+            return 0;
+        }
+    }
+
+    /// <summary>Adds a line. Caller holds the lock. Past the cap the oldest lines after the
+    /// first go, so the log still says how it began.</summary>
+    private void Add(Entry entry, string kind, string text, string? detail = null,
+        IReadOnlyList<AcquisitionCandidate>? candidates = null)
+    {
+        entry.Events.Add(new AcquisitionEvent(Now, kind, text.Trim(), string.IsNullOrWhiteSpace(detail) ? null : detail.Trim(),
+            candidates is { Count: > 0 } ? candidates : null));
+        if (entry.Events.Count > MaxEvents) entry.Events.RemoveAt(1);
+    }
+
+    /// <summary>A line for one run only, from a watcher that may outlive it.</summary>
+    private void LogRun(string key, int run, string kind, string text)
+    {
+        lock (_lock)
+        {
+            if (_entries.TryGetValue(key, out var entry) && entry.Run == run && !entry.Finished) Add(entry, kind, text);
+        }
+    }
+
+    /// <summary>"31.4 MB".</summary>
+    internal static string SizeText(long bytes) =>
+        bytes >= 1024 * 1024
+            ? $"{(bytes / 1048576.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture)} MB"
+            : $"{Math.Max(1, bytes / 1024)} KB";
 
     // ---------------------------------------------------------------------------------------
     // Reading
@@ -433,12 +703,14 @@ public sealed class AcquisitionTracker
         }
     }
 
-    private static AcquisitionSnapshot Snapshot(Entry entry, int? ahead) => new(
+    private static AcquisitionSnapshot Snapshot(Entry entry, int? ahead, bool withEvents = false) => new(
         entry.ClientId ?? entry.ExternalId, entry.Provider, entry.ExternalId,
         entry.Artist, entry.Title, entry.Album,
         entry.Owners.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToList(),
         entry.Source, entry.State, entry.Progress, entry.BytesDone, entry.BytesTotal,
-        entry.StartedAt, entry.UpdatedAt, entry.Error, entry.LibraryId, ahead, entry.Note);
+        entry.StartedAt, entry.UpdatedAt, entry.Error, entry.LibraryId, ahead, entry.Note,
+        KeyOf(entry.Provider, entry.ExternalId), entry.Kind, entry.Quality, entry.Peer, entry.Events.Count,
+        withEvents ? entry.Events.ToList() : null);
 
     /// <summary>
     /// How many downloads, anyone's, are ahead of a queued one. Octo fetches one song at a
@@ -511,6 +783,11 @@ public sealed class AcquisitionTracker
             entry.Error = null;
             entry.LibraryId = null;
             entry.Note = null;
+            entry.Kind = AcquisitionKinds.Download;
+            entry.Quality = null;
+            entry.Peer = null;
+            entry.LoggedSource = null;
+            entry.Events.Clear();
         }
         else
         {
@@ -547,6 +824,8 @@ public sealed class AcquisitionTracker
             entry.Note = null;
             if (!string.IsNullOrWhiteSpace(libraryId)) entry.LibraryId = libraryId;
             entry.UpdatedAt = Now;
+            Add(entry, AcquisitionEventKinds.Done, "In your library",
+                entry.LibraryId is null ? "Navidrome has not shown it yet; it appears after its next scan" : null);
             ended = EndOf(key, entry);
         }
         Raise(ended);
@@ -578,7 +857,11 @@ public sealed class AcquisitionTracker
             for (var attempt = 0; attempt < total; attempt++)
             {
                 if (attempt > 0) await Task.Delay(attempt < fast ? VisibilityPoll : SlowVisibilityPoll);
-                if (attempt > 0 && attempt == RescanAfterAttempts) await RescanOnceAsync(path);
+                if (attempt > 0 && attempt == RescanAfterAttempts)
+                {
+                    LogRun(key, run, AcquisitionEventKinds.Library, "Navidrome had not shown it yet, so Octo asked it to scan again");
+                    await RescanOnceAsync(path);
+                }
                 lock (_lock)
                 {
                     // Restarted or finished by something else while this waited: not ours now.

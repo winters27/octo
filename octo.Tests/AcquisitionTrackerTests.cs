@@ -13,7 +13,7 @@ namespace Octo.Tests;
 /// <summary>
 /// The live progress list behind the app's download ring. It watches the pipeline and must
 /// tell the truth about it: one row per hearted song however many sources it falls through,
-/// failed only when the last one gives up, and gone half an hour after it ends.
+/// failed only when the last one gives up, and gone three hours after it ends.
 /// </summary>
 public class AcquisitionTrackerTests
 {
@@ -304,14 +304,14 @@ public class AcquisitionTrackerTests
     // --- Expiry and the cap --------------------------------------------------------------
 
     [Fact]
-    public void AFinishedRowStaysThirtyMinutesThenGoes()
+    public void AFinishedRowStaysThreeHoursThenGoes()
     {
         var clock = new ManualClock();
         var tracker = NewTracker(clock);
         tracker.Begin("soulseek", "abc", "abc", "alice");
         tracker.Complete("soulseek", "abc");
 
-        clock.Now += TimeSpan.FromMinutes(29);
+        clock.Now += TimeSpan.FromHours(3) - TimeSpan.FromMinutes(1);
         Assert.Single(tracker.ForUser("alice"));
 
         clock.Now += TimeSpan.FromMinutes(1);

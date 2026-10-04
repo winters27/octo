@@ -538,7 +538,7 @@ public sealed class LyricsChoiceTests : IDisposable
         Assert.Equal([1, 2], extensions["songLyrics"]);
         Assert.Equal(fetch, extensions.ContainsKey("octoLyrics"));
         if (fetch) Assert.Equal([1], extensions["octoLyrics"]);
-        Assert.Equal([1], extensions["octoAcquisitions"]);
+        Assert.Equal([1, 2], extensions["octoAcquisitions"]);
     }
 
     // ---- The pins on disk ------------------------------------------------------------------

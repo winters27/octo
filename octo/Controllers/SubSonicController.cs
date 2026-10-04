@@ -2671,15 +2671,8 @@ public partial class SubsonicController : ControllerBase
     private IActionResult QueueUpgrade(string id, string? username)
     {
         const string action = SubsonicResponseBuilder.UpgradeAction;
-        var settings = _libraryActionSettings.CurrentValue;
-        string? refusal =
-            string.IsNullOrWhiteSpace(username) ? "Sign in with a username to upgrade songs; an API key alone does not say who is asking."
-            : _libraryActions is null || _upgradeQueue is null || !settings.Enabled ? "Library actions are off."
-            : !settings.IsAllowed(username) ? $"{username} is not on the library actions allowed list."
-            : !settings.EffectiveActions().Any(a => a.Action == LibraryAction.BetterQuality && a.Enabled) ? "Better quality is not switched on."
-            : settings.DryRun ? "Library actions only rehearse while dry run is on, so nothing would change."
-            : !UpgradeReady ? $"Better quality looks for copies on {UpgradeSourceName}, which is not set up on this server."
-            : null;
+        var refusal = UpgradeGate.Refusal(_libraryActionSettings.CurrentValue, username,
+            _libraryActions is not null && _upgradeQueue is not null, UpgradeReady, UpgradeSourceName);
         if (refusal is not null) return _responseBuilder.CreateLibraryActionResponse(id, "skipped", refusal, action);
 
         var (jobs, full) = _upgradeQueue!.Add([new Octo.Services.Library.UpgradeAsk(id)], username!, "app");

@@ -285,9 +285,16 @@ public class SoulseekDownloadService : BaseDownloadService
             Track(t => t.Stage(provider, id, AcquisitionState.Searching, "Lidarr", "Lidarr is searching the album"));
         var jobDir = Path.Combine(DownloadPath, IncomingFolderName, "lidarr", Guid.NewGuid().ToString("N"));
         FetchedFrom.AddOrUpdate(song, "Lidarr");
-        return await fetcher.FetchAsync(new Octo.Services.Lidarr.LidarrTrackRequest(
-            routing.Artist!, routing.Title!, routing.Album, routing.Duration ?? song.Duration, losslessOnly, ReplacingPath),
-            jobDir, cancellationToken);
+        // A release picked in Find songs is grabbed as it is, instead of Lidarr's own search.
+        var picked = song.ExternalId is { Length: > 0 } pickedId
+            ? OptionalService<DownloadPicks>()?.Take(pickedId, SongFinder.LidarrSource)?.Release : null;
+        if (picked is not null) LogStep(song.ExternalId!, AcquisitionEventKinds.Try, "Grabbing the release you picked", picked.Title);
+        var path = await fetcher.FetchAsync(new Octo.Services.Lidarr.LidarrTrackRequest(
+            routing.Artist!, routing.Title!, routing.Album, routing.Duration ?? song.Duration, losslessOnly, ReplacingPath,
+            picked), jobDir, cancellationToken);
+        LogStep(song.ExternalId ?? "", AcquisitionEventKinds.Found, "Lidarr brought a copy",
+            Octo.Services.Library.AudioSummary.Describe(path).Text);
+        return path;
     }
 
     // Lossy MP3 via the yt-dlp shim's /download. The shim writes <dest>.mp3 into the staging
@@ -309,6 +316,7 @@ public class SoulseekDownloadService : BaseDownloadService
         }
         if (string.IsNullOrEmpty(videoId))
             throw new FileNotFoundException($"No YouTube match for '{routing.Artist} - {routing.Title}'");
+        LogStep(trackKey, AcquisitionEventKinds.Found, "Found it on YouTube", $"Video {videoId}, saved as an MP3");
 
         if (!suppressNotify && announceStart)
         {
@@ -356,6 +364,8 @@ public class SoulseekDownloadService : BaseDownloadService
             Logger.LogWarning(
                 "AcoustID says the YouTube file for '{Artist} - {Title}' is {Actual}; keeping it and asking about it",
                 routing.Artist, routing.Title, verdict.Describe());
+            LogStep(trackKey, AcquisitionEventKinds.Check, $"AcoustID says this is {verdict.Describe()}",
+                "YouTube has no other copy, so it is kept and goes to your Review playlist");
             verdict = verdict with
             {
                 Verdict = Octo.Services.Fingerprint.VerificationVerdict.Inconclusive,
@@ -671,13 +681,16 @@ public class SoulseekDownloadService : BaseDownloadService
         Track(t => t.Stage(ProviderName, trackKey, AcquisitionState.Searching, "Soulseek"));
         SweepJobFolders();
 
+        // A copy picked in Find songs is the only one tried: no search, and no other peer after it.
+        var picked = OptionalService<DownloadPicks>()?.Take(trackKey, SongFinder.SoulseekSource)?.ToHit();
         // An album walk may have queued this song's file already, from one peer's folder of the
         // album. That file is tried first, without a search; the search runs only if it fails.
-        _prepared.TryRemove(trackKey, out var prepared);
+        PreparedTransfer? prepared = null;
+        if (picked is null) _prepared.TryRemove(trackKey, out prepared);
         var searched = prepared is null;
         // Whether the album folder's file for this song arrived at all, whatever the checks said.
         var preparedArrived = false;
-        var ranked = prepared is null ? await SearchRankedAsync(null) : [prepared.Hit];
+        var ranked = picked is not null ? [picked] : prepared is null ? await SearchRankedAsync(null) : [prepared.Hit];
 
         async Task<List<SoulseekFileHit>> SearchRankedAsync(SoulseekFileHit? passOver)
         {
@@ -695,6 +708,7 @@ public class SoulseekDownloadService : BaseDownloadService
                     Logger.LogInformation("Soulseek query returned no usable hits; retrying with '{Query}'", query.Text);
                 // Ranked once, on the whole search: slskd hands over a search's answers only when it
                 // ends, so there is nothing to stop early on.
+                LogStep(trackKey, AcquisitionEventKinds.Search, $"Searching Soulseek for \"{query.Text}\"");
                 var outcome = await _slskd.SearchWithEndAsync(query.Text, profile, cancellationToken);
                 hits = outcome.Hits;
                 everyHit.AddRange(hits);
@@ -710,6 +724,9 @@ public class SoulseekDownloadService : BaseDownloadService
                     Logger.LogInformation(
                         "Soulseek search '{Query}' filled its limit with nothing usable; asking again for up to {Files} files",
                         query.Text, wider.FileLimit);
+                    LogStep(trackKey, AcquisitionEventKinds.Search,
+                        $"Searching again, wider: {hits.Count} files filled the limit and none fit",
+                        $"Up to {wider.FileLimit} files this time");
                     hits = (await _slskd.SearchWithEndAsync(query.Text, wider, cancellationToken)).Hits;
                     everyHit.AddRange(hits);
                     found = RankCandidates(hits, routing.Title!, routing.Duration, strict, routing.Album, routing.Artist)
@@ -718,10 +735,18 @@ public class SoulseekDownloadService : BaseDownloadService
                 }
                 if (found.Count > 0) break;
             }
+            if (found.Count == 0 && everyHit.Count > 0)
+                LogStep(trackKey, AcquisitionEventKinds.Search,
+                    $"No {_settings.PreferredExtension.ToUpperInvariant()} that fits; looking in the folders beside the other copies");
             if (found.Count == 0)
                 found = (await BesideLossyCopiesAsync(everyHit, routing, cancellationToken))
                     .Where(h => passOver is null || h.Username != passOver.Username || h.Filename != passOver.Filename)
                     .ToList();
+            var peers = everyHit.Select(h => h.Username).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+            Track(t => t.Found(ProviderName, trackKey,
+                found.Count == 0 ? $"Nothing that fits among {everyHit.Count} files" : $"{found.Count} {(found.Count == 1 ? "copy fits" : "copies fit")}, best first",
+                found.Select((h, i) => SoulseekCandidates.Of(h, i + 1)).ToList(),
+                $"{everyHit.Count} files from {peers} {(peers == 1 ? "peer" : "peers")}"));
 
             // Logged here, once per song, rather than inside RankCandidates. This is the line that
             // explains a track that used to download and now does not.
@@ -786,6 +811,9 @@ public class SoulseekDownloadService : BaseDownloadService
                 tried++;
                 Logger.LogInformation("Soulseek attempt {N}/{Total}: {User} -> {File} (queue={Q}, speed={S})",
                     attemptIdx, ranked.Count, hit.Username, hit.Filename, hit.QueueLength, hit.UploadSpeed);
+                Track(t => t.Trying(ProviderName, trackKey, SoulseekCandidates.Of(hit, attemptIdx),
+                    SoulseekCandidates.TryingText(attemptIdx, ranked.Count, prepared is not null && ReferenceEquals(hit, prepared.Hit), picked is not null),
+                    SoulseekCandidates.WhyChosen(hit)));
 
                 // Each attempt lands in a folder of its own, so finding its file never rests on the
                 // file's name, and a download beside it can never claim it. A file an album walk queued
@@ -818,6 +846,8 @@ public class SoulseekDownloadService : BaseDownloadService
                     catch (Exception ex)
                     {
                         Logger.LogWarning("Soulseek enqueue failed for {User} ({Msg}); trying next peer", hit.Username, ex.Message);
+                        LogStep(trackKey, AcquisitionEventKinds.Note, $"{hit.Username} would not take the request",
+                            AcquisitionTracker.UserSafe(ex.Message));
                         lastError = ex;
                         continue;
                     }
@@ -941,6 +971,9 @@ public class SoulseekDownloadService : BaseDownloadService
                             attemptIdx, routing.Artist, routing.Title, actualSecs, routing.Duration);
                         DiscardRejectedDownload(localPath, attemptStartedUtc);
                         DenyCandidate(hit, routing, $"delivered {actualSecs}s for a {routing.Duration}s track");
+                        LogStep(trackKey, AcquisitionEventKinds.Check,
+                            $"Wrong length: {SoulseekCandidates.LengthText(actualSecs)} for a {SoulseekCandidates.LengthText(routing.Duration ?? 0)} song",
+                            "Thrown away; the peer will not be asked for it again");
                         lastError = new Exception(
                             $"peer delivered a {actualSecs}s file for a {routing.Duration}s track");
                         continue;
@@ -989,6 +1022,8 @@ public class SoulseekDownloadService : BaseDownloadService
                             attemptIdx, verdict.Describe(), routing.Artist, routing.Title, verdict.Score);
                         DiscardRejectedDownload(localPath, attemptStartedUtc);
                         DenyCandidate(hit, routing, verdict.DenyReason);
+                        LogStep(trackKey, AcquisitionEventKinds.Check, $"AcoustID says this is {verdict.Describe()}",
+                            "Not the song asked for; thrown away");
                         lastError = new Exception($"AcoustID identified the file as {verdict.Describe()}");
                         continue;
                     }
@@ -1019,6 +1054,8 @@ public class SoulseekDownloadService : BaseDownloadService
                             callerGaveUp ? "the caller has left, so no other copy is tried"
                                 : "holding it back and trying the next lossless copy");
                         lastError = new Exception($"the file is {spectrum.Describe()}");
+                        LogStep(trackKey, AcquisitionEventKinds.Check, "Looks made from a lossy file",
+                            $"{spectrum.Describe()}; held back while another copy is tried");
                         if (callerGaveUp) break;
                         continue;
                     }
@@ -1052,6 +1089,7 @@ public class SoulseekDownloadService : BaseDownloadService
                     // the album and the credit it will be filed under.
                     Logger.LogInformation("Soulseek download complete (attempt {N}, slskd state={State}{Aborted}): {Path}",
                         attemptIdx, state?.ToString() ?? "interrupted", callerGaveUp ? ", caller had already left" : "", localPath);
+                    LogStep(trackKey, AcquisitionEventKinds.Check, "Passed the checks", ChecksPassed(verdict, spectrum));
                     return Accept(localPath, hit, verdict, transcodedFrom: null);
                 }
 
@@ -1066,11 +1104,14 @@ public class SoulseekDownloadService : BaseDownloadService
                         throw waitError;
                     }
                     Logger.LogWarning("Soulseek attempt {N} wait failed ({Msg}); advancing", attemptIdx, waitError.Message);
+                    LogStep(trackKey, AcquisitionEventKinds.Note, $"{hit.Username} did not send it", AcquisitionTracker.UserSafe(waitError.Message));
                     lastError = waitError;
                     continue;
                 }
 
                 Logger.LogInformation("Soulseek attempt {N} failed (state={State}, no file on disk), advancing", attemptIdx, state);
+                LogStep(trackKey, AcquisitionEventKinds.Note, $"{hit.Username} did not send it",
+                    state is null ? null : $"The transfer ended as {state.ToString()!.ToLowerInvariant()}");
                 lastError = new Exception($"transfer ended in state {state} with no resulting file");
             }
 
@@ -1096,6 +1137,8 @@ public class SoulseekDownloadService : BaseDownloadService
                     "Soulseek: no genuine lossless copy of '{Artist} - {Title}' among {Count} candidates; keeping attempt {N} "
                     + "from {User}, which is {Spectrum}: {Path}",
                     routing.Artist, routing.Title, ranked.Count, kept.Attempt, kept.Hit.Username, kept.Spectrum.Describe(), kept.Path);
+                LogStep(trackKey, AcquisitionEventKinds.Check, $"Keeping the copy from {kept.Hit.Username}",
+                    $"No genuine lossless copy was found; this one is {kept.Spectrum.Describe()}");
                 return Accept(kept.Path, kept.Hit, kept.Verdict, kept.Spectrum.Estimate);
             }
             Logger.LogWarning("Soulseek: the copy held back from attempt {N} is no longer at {Path}", kept.Attempt, kept.Path);
@@ -1107,6 +1150,54 @@ public class SoulseekDownloadService : BaseDownloadService
             + $"If slskd shows these transfers as Completed, slskd's downloads directory is not the directory Octo watches ({DownloadPath}); "
             + "set SLSKD_DOWNLOADS_DIR=/music on the slskd container (see issue #17).");
     }
+
+    /// <summary>The checks a kept file passed, in words, for the log.</summary>
+    private string ChecksPassed(Octo.Services.Fingerprint.VerificationResult verdict, Octo.Services.Fingerprint.SpectrumReport spectrum)
+    {
+        var parts = new List<string> { "the right length" };
+        parts.Add(verdict.Verdict == Octo.Services.Fingerprint.VerificationVerdict.Confirmed
+            ? "AcoustID: the same recording" : "AcoustID could not say, so the name and length decide");
+        if (!spectrum.IsLikelyLossy && _settings.DetectTranscodes) parts.Add("the spectrum: really lossless");
+        return string.Join("; ", parts);
+    }
+
+    /// <summary>
+    /// Find songs: every file the song's searches turn up, and the ones the download would try, in
+    /// its order. The same searches a download runs, stopping at the first that finds a copy that
+    /// fits; nothing is downloaded.
+    /// </summary>
+    internal async Task<SoulseekFind> FindCopiesAsync(string artist, string title, string? album, int? duration,
+        CancellationToken ct)
+    {
+        var all = new List<SoulseekFileHit>();
+        var asked = new List<string>();
+        List<SoulseekFileHit> ranked = [];
+        var profile = SearchProfile.Interactive(_settings);
+        var widened = false;
+        foreach (var (query, strict) in PlannedQueries(title, artist, album, duration))
+        {
+            asked.Add(query.Text);
+            var outcome = await _slskd.SearchWithEndAsync(query.Text, profile, ct);
+            all.AddRange(outcome.Hits);
+            ranked = RankCandidates(outcome.Hits, title, duration, strict, album, artist);
+            if (ranked.Count == 0 && outcome.HitLimit && !widened)
+            {
+                // As a download does: once, wider, when the limit filled with nothing usable.
+                widened = true;
+                var hits = (await _slskd.SearchWithEndAsync(query.Text, profile.Wider(), ct)).Hits;
+                all.AddRange(hits);
+                ranked = RankCandidates(hits, title, duration, strict, album, artist);
+            }
+            if (ranked.Count > 0) break;
+        }
+        var distinct = all.GroupBy(h => (h.Username, h.Filename)).Select(g => g.First()).ToList();
+        return new SoulseekFind(distinct, ranked, asked);
+    }
+
+    /// <summary>What Find songs got from Soulseek: every file, the ones the download would try in
+    /// order, and the searches run.</summary>
+    internal sealed record SoulseekFind(IReadOnlyList<SoulseekFileHit> Hits, IReadOnlyList<SoulseekFileHit> Ranked,
+        IReadOnlyList<string> Queries);
 
     /// <summary>A song's file an album walk has queued already: the hit, the walk's job folder, the
     /// transfer slskd gave it, and when it was queued, which says whether a rejected file is ours.</summary>

@@ -137,6 +137,18 @@ public abstract class BaseDownloadService : IDownloadService
         }
     }
 
+    /// <summary>One line in the downloads log of this source's row for a song. Watching only, like
+    /// <see cref="Track"/>.</summary>
+    protected void LogStep(string externalId, string kind, string text, string? detail = null) =>
+        Track(t => t.Log(ProviderName, externalId, kind, text, detail));
+
+    /// <summary>The same for a song that carries its own outside id.</summary>
+    private void LogStep(Song song, string kind, string text, string? detail = null)
+    {
+        if (song is { ExternalProvider: { Length: > 0 } provider, ExternalId: { Length: > 0 } id })
+            Track(t => t.Log(provider, id, kind, text, detail));
+    }
+
     /// <summary>The name a download was asked for under, captured before anything corrects it.</summary>
     protected internal sealed record RequestedIdentity(string Artist, string Title, string Album, int? Track);
 
@@ -544,6 +556,9 @@ public abstract class BaseDownloadService : IDownloadService
                 Logger.LogInformation("'{Artist} - {Title}' is already in your library ({Suffix}) at {Path}; not downloading another copy{Upgrade}",
                     song.Artist, song.Title, owned.Suffix, owned.AbsolutePath,
                     decision == Octo.Services.Library.OwnedDecision.KeepAndUpgrade ? ", looking for a higher quality one instead" : "");
+                Track(t => t.Log(externalProvider, externalId, AcquisitionEventKinds.Library,
+                    $"Already in your library as {owned.Suffix?.ToUpperInvariant() ?? "a file"}, so no second copy",
+                    decision == Octo.Services.Library.OwnedDecision.KeepAndUpgrade ? "A higher quality copy is being looked for instead" : null));
                 Track(t => t.Imported(externalProvider, externalId, song.Artist, song.Title, owned.AbsolutePath));
                 return owned.AbsolutePath;
             }
@@ -628,6 +643,14 @@ public abstract class BaseDownloadService : IDownloadService
             // is written to the file until it sits where it will stay.
             await IdentifyAsync(song, requested, landedPath, albumContext, CancellationToken.None);
             await ApplyLoudnessAsync(song, loudness, landedPath);
+            Track(t => t.Log(externalProvider, externalId, AcquisitionEventKinds.Tags,
+                $"Identified as {song.Artist} - {song.Title}",
+                string.Join("; ", new[]
+                {
+                    string.IsNullOrWhiteSpace(song.Album) ? null : $"on {song.Album}{(song.Year is > 0 ? $" ({song.Year})" : "")}",
+                    song.TagPlan is { } identified ? $"{identified.Confidence.ToString().ToLowerInvariant()} match" : null,
+                    song.Verification?.Verdict == Octo.Services.Fingerprint.VerificationVerdict.Confirmed ? "AcoustID agrees" : null,
+                }.Where(part => part is not null))));
 
             // Placed from the Song, so the path and the tags come from one decision (#48). The
             // file used to be moved inside DownloadTrackAsync, before any of this was known.
@@ -656,6 +679,8 @@ public abstract class BaseDownloadService : IDownloadService
                 placement = await RevealReplacementAsync(song, requested, localPath, replacement);
                 localPath = placement.Path;
                 song.LocalPath = localPath;
+                Track(t => t.Log(externalProvider, externalId, AcquisitionEventKinds.Library,
+                    "Swapped in where your old copy was", "It keeps the old copy's place in Navidrome, so plays and favorites stay"));
             }
             if (!isCache) await WriteSidecarsAsync(song, placement, cover, CancellationToken.None);
             if (song.TagPlan is { } tagPlan)
@@ -1580,6 +1605,9 @@ public abstract class BaseDownloadService : IDownloadService
                             },
                         };
                         Logger.LogInformation("Cover art embedded from {Source}: {Size} bytes", cover.Source, embed.Length);
+                        LogStep(song, AcquisitionEventKinds.Cover, $"Cover from {cover.Source}",
+                            Octo.Services.CoverArt.CoverImage.Measure(embed) is { } side
+                                ? $"{side.Width} x {side.Height} px, embedded in the song" : "Embedded in the song");
                     }
                 }
             }
@@ -1590,6 +1618,7 @@ public abstract class BaseDownloadService : IDownloadService
             
             tagFile.Save();
             Logger.LogInformation("Metadata written successfully to: {Path}", filePath);
+            LogStep(song, AcquisitionEventKinds.Tags, "Tags written", Path.GetFileName(filePath));
             return chosenCover;
         }
         catch (Exception ex)
@@ -1645,6 +1674,7 @@ public abstract class BaseDownloadService : IDownloadService
             {
                 Octo.Services.CoverArt.CoverFiles.Write(dir, cover);
                 Logger.LogInformation("Wrote cover.jpg beside {Path}", placement.Path);
+                LogStep(song, AcquisitionEventKinds.Cover, "Saved cover.jpg in the album folder");
             }
         }
         catch (Exception ex)
@@ -1656,10 +1686,16 @@ public abstract class BaseDownloadService : IDownloadService
         // service that is slow or shedding load must not hold up the next download (#52).
         if (MetadataSettingsValue.FetchLyrics
             && _serviceProvider.GetService<Octo.Services.Lyrics.LyricsSidecarWriter>() is { } lyrics)
-            lyrics.TryEnqueue(new Octo.Services.Lyrics.LyricsJob(placement.Path,
-                song.PrimaryArtist ?? song.Artist,
-                Octo.Services.Lyrics.LyricsText.QueryTitle(song.Title, song.Artist),
-                song.Album, song.Duration));
+        {
+            // The log's row hears how the look went, after the song is in.
+            var row = song is { ExternalProvider: { Length: > 0 } provider, ExternalId: { Length: > 0 } id }
+                ? AcquisitionTracker.KeyOf(provider, id) : null;
+            if (lyrics.TryEnqueue(new Octo.Services.Lyrics.LyricsJob(placement.Path,
+                    song.PrimaryArtist ?? song.Artist,
+                    Octo.Services.Lyrics.LyricsText.QueryTitle(song.Title, song.Artist),
+                    song.Album, song.Duration, Acquisition: row)))
+                LogStep(song, AcquisitionEventKinds.Lyrics, "Looking for lyrics", "In the background, so the next download need not wait");
+        }
         return Task.CompletedTask;
     }
 

@@ -11,8 +11,9 @@ namespace Octo.Services.Lidarr;
 /// <param name="LosslessOnly">Wait for a lossless file; any file will do otherwise.</param>
 /// <param name="OriginalPath">The library file this replaces, when there is one: its tags can name
 /// the album exactly, and Lidarr may already be the one managing it.</param>
+/// <param name="Release">A release picked in Find songs, grabbed instead of Lidarr's own search.</param>
 public sealed record LidarrTrackRequest(string Artist, string Title, string? Album, int? DurationSeconds,
-    bool LosslessOnly, string? OriginalPath = null);
+    bool LosslessOnly, string? OriginalPath = null, LidarrReleasePick? Release = null);
 
 public interface ILidarrTrackFetcher
 {
@@ -116,7 +117,7 @@ public sealed class LidarrTrackFetcher(
         }
 
         Task<LidarrSearchStarted> search;
-        lock (_gate) search = session.Search ??= client.StartAlbumSearchAsync(session.Candidate, CancellationToken.None);
+        lock (_gate) search = session.Search ??= client.StartAlbumSearchAsync(session.Candidate, CancellationToken.None, request.Release);
         var started = await search;
         logger.LogInformation("Lidarr is searching '{Artist} - {Album}' for a copy of '{Title}'",
             session.Candidate.Artist, session.Candidate.Title, request.Title);
@@ -185,7 +186,7 @@ public sealed class LidarrTrackFetcher(
 
     /// <summary>The album: from the original's own release group tag, then by its album name, then
     /// the studio album MusicBrainz files the song under.</summary>
-    private async Task<LidarrAlbumCandidate?> FindAlbumAsync(LidarrTrackRequest request, CancellationToken ct)
+    internal async Task<LidarrAlbumCandidate?> FindAlbumAsync(LidarrTrackRequest request, CancellationToken ct)
     {
         if (ReleaseGroupOf(request.OriginalPath) is { } tagged
             && await client.ResolveAlbumByForeignIdAsync(tagged, ct) is { } byTag)

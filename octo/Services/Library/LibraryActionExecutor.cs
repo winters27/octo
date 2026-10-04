@@ -9,9 +9,12 @@ namespace Octo.Services.Library;
 
 /// <param name="OnReplacementQueued">Told the provider and external id of the replacement download
 /// the moment it is queued, so the upgrade queue can follow that download's progress.</param>
+/// <param name="OnlySource">The one source to fetch the replacement from, for a copy someone picked
+/// in Find songs; no other source is tried after it.</param>
 public sealed record LibraryActionRequest(LibraryAction Action, string NavidromeId, string Username,
     Octo.Services.Subsonic.SubsonicCredential? Credential = null,
-    Action<string, string>? OnReplacementQueued = null);
+    Action<string, string>? OnReplacementQueued = null,
+    DownloadSource? OnlySource = null);
 
 /// <summary>
 /// Code says WHY, for callers that act on the reason: the upgrade queue waits for Soulseek on one
@@ -193,7 +196,7 @@ public sealed class LibraryActionExecutor
         // outage just means Lidarr alone is asked.
         if (request.Action == LibraryAction.BetterQuality)
         {
-            var sources = await SourcesForAsync(request.Action, ct);
+            var sources = await SourcesForAsync(request.Action, ct, request.OnlySource);
             if (sources.Count == 0 && await WaitingForSoulseekAsync(ct))
                 return new(LibraryActionState.Failed, SoulseekLink.OfflineText, LibraryActionCodes.SoulseekOffline);
             if (sources.Count == 0)
@@ -345,7 +348,7 @@ public sealed class LibraryActionExecutor
 
             // In order, and on to the next when one finds nothing or its copy fails the checks:
             // Soulseek first, then Lidarr, for Better quality with both set up.
-            var sources = await SourcesForAsync(request.Action, ct);
+            var sources = await SourcesForAsync(request.Action, ct, request.OnlySource);
             var upgradeSearch = request.Action == LibraryAction.BetterQuality;
             string? replacement = null;
             for (var attempt = 0; ; attempt++)
@@ -473,8 +476,11 @@ public sealed class LibraryActionExecutor
     /// wrong version use the download source, except that Lidarr there means Lidarr too: before,
     /// those replacements went to Soulseek whatever was configured. A null entry is the default.
     /// </summary>
-    internal async Task<IReadOnlyList<DownloadSource?>> SourcesForAsync(LibraryAction action, CancellationToken ct)
+    internal async Task<IReadOnlyList<DownloadSource?>> SourcesForAsync(LibraryAction action, CancellationToken ct,
+        DownloadSource? only = null)
     {
+        if (action == LibraryAction.BetterQuality && only is { } picked)
+            return picked == DownloadSource.Soulseek && await SoulseekOutAsync(ct) ? [] : [picked];
         if (action == LibraryAction.BetterQuality)
         {
             // Without the plan (hosts that build the executor by hand): Soulseek, as it always was.

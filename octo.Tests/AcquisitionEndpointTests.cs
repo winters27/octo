@@ -132,9 +132,13 @@ public sealed class AcquisitionEndpointTests
         var row = Assert.Single(rows);
 
         Assert.Equal(
-            ["ahead", "album", "artist", "bytesDone", "bytesTotal", "error", "id", "libraryId", "note",
-             "progress", "source", "startedAt", "state", "title", "updatedAt"],
+            ["ahead", "album", "artist", "bytesDone", "bytesTotal", "coverArt", "error", "id", "key", "kind", "libraryId",
+             "logLines", "note", "peer", "progress", "quality", "source", "startedAt", "state", "title", "updatedAt"],
             row.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal));
+        Assert.Equal("soulseek:3kX9Qm", row.GetProperty("key").GetString());
+        Assert.Equal("download", row.GetProperty("kind").GetString());
+        Assert.Equal("3kX9Qm", row.GetProperty("coverArt").GetString());
+        Assert.Equal(2, row.GetProperty("logLines").GetInt32());
         Assert.Equal("3kX9Qm", row.GetProperty("id").GetString());
         Assert.Equal("Daft Punk", row.GetProperty("artist").GetString());
         Assert.Equal("Da Funk", row.GetProperty("title").GetString());
@@ -304,7 +308,7 @@ public sealed class AcquisitionEndpointTests
         var extensions = envelope.GetProperty("openSubsonicExtensions").EnumerateArray()
             .ToDictionary(e => e.GetProperty("name").GetString()!,
                 e => e.GetProperty("versions").EnumerateArray().Select(v => v.GetInt32()).ToList());
-        Assert.Equal([1], extensions["octoAcquisitions"]);
+        Assert.Equal([1, 2], extensions["octoAcquisitions"]);
         Assert.Contains("formPost", extensions.Keys);
         Assert.Contains("songLyrics", extensions.Keys);
     }
@@ -323,7 +327,7 @@ public sealed class AcquisitionEndpointTests
         Assert.Contains("formPost", names);
         var ours = xml.Root.Elements(ns + "openSubsonicExtensions")
             .Single(e => (string?)e.Attribute("name") == "octoAcquisitions");
-        Assert.Equal("1", ours.Element(ns + "versions")?.Value);
+        Assert.Equal(["1", "2"], ours.Elements(ns + "versions").Select(v => v.Value));
     }
 
     [Fact]
@@ -341,5 +345,123 @@ public sealed class AcquisitionEndpointTests
         Assert.Equal(["alice"], alice.GetProperty("requestedBy").EnumerateArray().Select(v => v.GetString()));
         Assert.Equal("soulseek", alice.GetProperty("provider").GetString());
         Assert.Equal("downloading", alice.GetProperty("state").GetString());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Version 2: the downloads drawer
+    // ---------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task GetAcquisition_ReturnsTheRowWithItsLogInOrder()
+    {
+        await using var factory = new AcquisitionWebFactory();
+        using var client = factory.CreateClient();
+        Seed(factory.Tracker);
+        factory.Tracker.Found("soulseek", "3kX9Qm", "2 copies fit, best first",
+            [new AcquisitionCandidate("Soulseek", "peer1", "01 - Da Funk.flac", "Homework", "flac", BitDepth: 16, SampleRate: 44100, Size: 31_000_000, Rank: 1)]);
+
+        using var doc = JsonDocument.Parse(await client.GetStringAsync($"/rest/getAcquisition.view?{Auth("alice")}&key=soulseek:3kX9Qm"));
+
+        var row = doc.RootElement.GetProperty("subsonic-response").GetProperty("acquisition");
+        Assert.Equal("soulseek:3kX9Qm", row.GetProperty("key").GetString());
+        var lines = row.GetProperty("event").EnumerateArray().ToList();
+        Assert.Equal(["queued", "transfer", "found"], lines.Select(l => l.GetProperty("kind").GetString()));
+        Assert.Equal("Downloading from Soulseek", lines[1].GetProperty("text").GetString());
+        Assert.Equal("27.7 MB", lines[1].GetProperty("detail").GetString());
+        var copy = Assert.Single(lines[2].GetProperty("candidate").EnumerateArray());
+        Assert.Equal("FLAC 16-bit 44.1 kHz", copy.GetProperty("quality").GetString());
+        Assert.Equal("peer1", copy.GetProperty("peer").GetString());
+        Assert.Equal(1, copy.GetProperty("rank").GetInt32());
+    }
+
+    [Fact]
+    public async Task GetAcquisition_SomeoneElsesRowIsNotFound()
+    {
+        await using var factory = new AcquisitionWebFactory();
+        using var client = factory.CreateClient();
+        Seed(factory.Tracker);
+
+        using var doc = JsonDocument.Parse(await client.GetStringAsync($"/rest/getAcquisition.view?{Auth("bob")}&key=soulseek:3kX9Qm"));
+
+        var envelope = doc.RootElement.GetProperty("subsonic-response");
+        Assert.Equal("failed", envelope.GetProperty("status").GetString());
+        Assert.Equal(70, envelope.GetProperty("error").GetProperty("code").GetInt32());
+    }
+
+    [Fact]
+    public async Task ClearAcquisitions_TakesOnlyTheCallersFinishedRows()
+    {
+        await using var factory = new AcquisitionWebFactory();
+        using var client = factory.CreateClient();
+        Seed(factory.Tracker);
+        factory.Tracker.Begin("soulseek", "9zz", "9zz", "alice", "Air", "La Femme d'Argent", "Moon Safari");
+        factory.Tracker.Fail("soulseek", "9zz", "No Soulseek FLAC found");
+
+        using var doc = JsonDocument.Parse(await client.GetStringAsync($"/rest/clearAcquisitions.view?{Auth("alice")}"));
+
+        Assert.Equal(1, doc.RootElement.GetProperty("subsonic-response").GetProperty("cleared").GetProperty("count").GetInt32());
+        // The one still downloading stays, and bob's is not hers to clear.
+        Assert.Equal(["3kX9Qm"], factory.Tracker.ForUser("alice").Select(r => r.Id));
+        Assert.Single(factory.Tracker.ForUser("bob"));
+    }
+
+    [Fact]
+    public async Task FindSongs_StartsALookThatGetFoundSongsFollowsAndPickFoundSongFetches()
+    {
+        await using var factory = new AcquisitionWebFactory();
+        using var client = factory.CreateClient();
+        var id = RegisterTeardrop(factory);
+        var finder = factory.Services.GetRequiredService<SongFinder>();
+        finder.SourcesFor = _ => new Dictionary<string, string?> { ["Soulseek"] = null, ["Lidarr"] = "Lidarr is not set up on this server" };
+        finder.SearchSoulseek = (_, _) => Task.FromResult<(IReadOnlyList<FoundCopy>, IReadOnlyList<string>, string?)>((
+            [
+                new FoundCopy(new AcquisitionCandidate("Soulseek", "peer1", "03 Teardrop.flac", "Mezzanine", "flac", BitDepth: 16,
+                    SampleRate: 44100, Size: 40_000_000, Length: 331, Rank: 1, Title: "Teardrop", Album: "Mezzanine"),
+                    new PickedCopy { Source = "Soulseek", Peer = "peer1", File = @"Music\Mezzanine\03 Teardrop.flac", Size = 40_000_000, Format = "flac" }),
+            ], ["Massive Attack Teardrop"], "1 file from 1 peer; 1 fits the song"));
+
+        using var started = JsonDocument.Parse(await client.GetStringAsync($"/rest/findSongs.view?{Auth("alice")}&id={id}"));
+        var look = started.RootElement.GetProperty("subsonic-response").GetProperty("foundSongs");
+        var search = look.GetProperty("id").GetString()!;
+        Assert.Equal("Teardrop", look.GetProperty("song").GetProperty("title").GetString());
+        Assert.Equal(id, look.GetProperty("song").GetProperty("coverArt").GetString());
+        await finder.WaitAsync(search, TimeSpan.FromSeconds(10));
+
+        using var done = JsonDocument.Parse(await client.GetStringAsync($"/rest/getFoundSongs.view?{Auth("alice")}&search={search}"));
+        var found = done.RootElement.GetProperty("subsonic-response").GetProperty("foundSongs");
+        Assert.Equal("done", found.GetProperty("state").GetString());
+        var sources = found.GetProperty("source").EnumerateArray().ToDictionary(x => x.GetProperty("name").GetString()!, x => x.GetProperty("state").GetString());
+        Assert.Equal("done", sources["Soulseek"]);
+        Assert.Equal("off", sources["Lidarr"]);
+        var copy = Assert.Single(found.GetProperty("candidate").EnumerateArray());
+        Assert.Equal(0, copy.GetProperty("index").GetInt32());
+        Assert.Equal("Mezzanine", copy.GetProperty("album").GetString());
+
+        // Bob cannot read or pick alice's look.
+        using var bobs = JsonDocument.Parse(await client.GetStringAsync($"/rest/getFoundSongs.view?{Auth("bob")}&search={search}"));
+        Assert.Equal("failed", bobs.RootElement.GetProperty("subsonic-response").GetProperty("status").GetString());
+
+        using var picked = JsonDocument.Parse(await client.GetStringAsync($"/rest/pickFoundSong.view?{Auth("alice")}&search={search}&candidate=0"));
+        var pick = picked.RootElement.GetProperty("subsonic-response").GetProperty("pick");
+        Assert.Equal("queued", pick.GetProperty("state").GetString());
+        Assert.Equal($"soulseek:{id}", pick.GetProperty("key").GetString());
+
+        // The download waits in the queue (no worker runs here) with the pick pinned to it.
+        Assert.True(factory.Services.GetRequiredService<DownloadPicks>().Has(id));
+        var row = Assert.Single(factory.Tracker.ForUser("alice"));
+        Assert.Equal(AcquisitionKinds.Pick, row.Kind);
+        Assert.Equal("Getting FLAC from peer1", row.Note);
+    }
+
+    [Fact]
+    public async Task FindSongs_AnUnknownIdIsNotFound()
+    {
+        await using var factory = new AcquisitionWebFactory();
+        using var client = factory.CreateClient();
+        factory.Services.GetRequiredService<SongFinder>().Resolve = (_, _) => Task.FromResult<FindTarget?>(null);
+
+        using var doc = JsonDocument.Parse(await client.GetStringAsync($"/rest/findSongs.view?{Auth("alice")}&id=nope"));
+
+        Assert.Equal(70, doc.RootElement.GetProperty("subsonic-response").GetProperty("error").GetProperty("code").GetInt32());
     }
 }
