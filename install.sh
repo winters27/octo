@@ -344,7 +344,8 @@ EOF
 # Kept from the old .env when they were set there: settings this installer never asks about.
 for key in OCTO_CONFIG_DIR SLSKD_STATE_DIR UPDATES_CHECK UPDATES_REPO \
            SLSKD_SHARED_DIR SLSKD_SHARE_RESCAN_MINUTES SLSKD_UPLOAD_SLOTS SLSKD_UPLOAD_SPEED_LIMIT \
-           SLSKD_CHECK_PORT SLSKD_WEB_URL; do
+           SLSKD_CHECK_PORT SLSKD_WEB_URL \
+           IMPORTS_SPOTIFY_CLIENT_ID IMPORTS_SPOTIFY_REDIRECT_URI IMPORTS_SONGS_PER_HOUR IMPORTS_REFRESH_HOURS; do
   if [ -n "$(existing "$key")" ]; then
     printf '%s=%s
 ' "$key" "$(existing "$key")" >> .env
