@@ -22,6 +22,36 @@ public class SoulseekSettings
     public string? Password { get; set; }
 
     /// <summary>
+    /// The address the dashboard's Open slskd button opens in your browser. Blank works it out:
+    /// BaseUrl when that is an address a browser can reach, otherwise this server's own name on
+    /// BaseUrl's port (5030). Only http and https addresses are used. The browser gets the address
+    /// and nothing else: slskd asks for its own sign-in, and Octo's slskd login never leaves Octo.
+    /// Environment variable: SLSKD_WEB_URL
+    /// </summary>
+    public string WebUrl { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Ask Soulseek's own port test (tools.slsknet.org) whether other people can connect to slskd's
+    /// listening port, for the Sharing card. It tests the address the request comes from, so it
+    /// only means something when Octo and slskd reach the internet the same way. Sends the port
+    /// number and nothing else, at most every 6 hours unless you press Test. Off never asks.
+    /// Environment variable: SLSKD_CHECK_PORT
+    /// </summary>
+    public bool CheckListenPort { get; set; } = true;
+
+    /// <summary>WebUrl when it is an absolute http or https address, otherwise null.</summary>
+    public string? EffectiveWebUrl => SafeWebUrl(WebUrl);
+
+    /// <summary>An absolute http or https address, trimmed, or null. Anything else (a script: or
+    /// file: address, a bare host) is never handed to the browser as a link.</summary>
+    public static string? SafeWebUrl(string? value) =>
+        Uri.TryCreate(value?.Trim(), UriKind.Absolute, out var uri)
+        && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+        && !string.IsNullOrEmpty(uri.Host)
+            ? uri.ToString()
+            : null;
+
+    /// <summary>
     /// How long to wait (seconds) for a Soulseek search to gather peer responses
     /// before returning results. Soulseek searches stream in over time, so this is
     /// the difference between finding a lossless file and silently settling for a

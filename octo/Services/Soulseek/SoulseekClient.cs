@@ -186,6 +186,45 @@ public class SoulseekClient
         }
     }
 
+    /// <summary>
+    /// One of slskd's read-only answers as text, for the Sharing card: application, options,
+    /// shares or uploads. Null when slskd did not answer it. Nothing read here changes slskd.
+    /// </summary>
+    public async Task<string?> ReadAsync(string path, CancellationToken ct = default)
+    {
+        try
+        {
+            using var resp = await SendAsync(HttpMethod.Get, $"{Base}/api/v0/{path.TrimStart('/')}", null, ct);
+            return resp.IsSuccessStatusCode ? await resp.Content.ReadAsStringAsync(ct) : null;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogDebug("slskd {Path} not readable at {Base}: {Msg}", path, Base, ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Asks slskd to look through its shared folders again, so songs added since its last look are
+    /// shared. Null when it started; otherwise why not, in words for the dashboard.
+    /// </summary>
+    public async Task<string?> RescanSharesAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var resp = await SendAsync(HttpMethod.Put, $"{Base}/api/v0/shares", null, ct);
+            if (resp.IsSuccessStatusCode) return null;
+            return resp.StatusCode == System.Net.HttpStatusCode.Conflict
+                ? "slskd is already looking through your shared folders."
+                : $"slskd refused the rescan (HTTP {(int)resp.StatusCode}).";
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogWarning("slskd share rescan failed at {Base}: {Msg}", Base, ex.Message);
+            return "Octo cannot reach slskd.";
+        }
+    }
+
     private static bool? Flag(JsonElement element, string name) =>
         TryGetPropertyIgnoreCase(element, name, out var v) && v.ValueKind is JsonValueKind.True or JsonValueKind.False
             ? v.GetBoolean() : null;

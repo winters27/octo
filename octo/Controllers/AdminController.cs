@@ -757,6 +757,8 @@ public class AdminController : ControllerBase
                 ["Username"] = soulseek.Username ?? "",
                 // slskd's web login opens slskd entirely, so it goes out as the placeholder too.
                 ["Password"] = MaskSecret(soulseek.Password),
+                ["WebUrl"] = soulseek.WebUrl ?? "",
+                ["CheckListenPort"] = soulseek.CheckListenPort,
                 ["SearchWaitSeconds"] = soulseek.SearchWaitSeconds,
                 ["UpgradeSearchWaitSeconds"] = soulseek.UpgradeSearchWaitSeconds,
                 ["MinFileSizeBytes"] = soulseek.MinFileSizeBytes,
@@ -1044,6 +1046,15 @@ public class AdminController : ControllerBase
                 return BadRequest(new { error = "Retype the slskd password for the new username." });
             soulseekPatch.Remove(slskdPasswordKey);
         }
+
+        // Open slskd puts this address in a link, so only a web address is kept.
+        if (Child(patch, "Soulseek") is JsonObject webPatch
+            && KeyOf(webPatch, "WebUrl") is { } webKey
+            && webPatch[webKey] is JsonValue webValue
+            && webValue.TryGetValue<string>(out var webText)
+            && !string.IsNullOrWhiteSpace(webText)
+            && SoulseekSettings.SafeWebUrl(webText) is null)
+            return BadRequest(new { error = "slskd's page must be a whole http:// or https:// address, such as http://192.168.1.5:5030." });
 
         if (Child(patch, "LastFm") is JsonObject lastFmSecrets)
         {
@@ -1737,6 +1748,8 @@ public class AdminController : ControllerBase
                 ["BaseUrl"] = soulseek.BaseUrl ?? "",
                 ["Username"] = soulseek.Username ?? "",
                 ["Password"] = MaskSecret(soulseek.Password),
+                ["WebUrl"] = soulseek.WebUrl ?? "",
+                ["CheckListenPort"] = soulseek.CheckListenPort,
                 ["SearchWaitSeconds"] = soulseek.SearchWaitSeconds,
                 ["UpgradeSearchWaitSeconds"] = soulseek.UpgradeSearchWaitSeconds,
                 ["MinFileSizeBytes"] = soulseek.MinFileSizeBytes,
@@ -2022,7 +2035,7 @@ public class AdminController : ControllerBase
             "Library:DownloadPath",
             "Server:PublicUrl",
             "Updates:Check", "Updates:Repo",
-            "Soulseek:BaseUrl", "Soulseek:Username", "Soulseek:Password",
+            "Soulseek:BaseUrl", "Soulseek:Username", "Soulseek:Password", "Soulseek:WebUrl", "Soulseek:CheckListenPort",
             "Soulseek:SearchWaitSeconds", "Soulseek:UpgradeSearchWaitSeconds", "Soulseek:MinFileSizeBytes",
             "Soulseek:PreferredExtension", "Soulseek:DownloadTimeoutSeconds",
             "Soulseek:RejectedPeerTtlDays", "Soulseek:FingerprintSeconds",

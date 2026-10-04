@@ -1307,9 +1307,42 @@
         <header class="page-header">
           <div>
             <h1>Soulseek</h1>
-            <p>Downloads lossless copies through slskd when you heart a song. slskd's own page: <a id="slskd-link" target="_blank" rel="noopener">port 5030</a>.</p>
+            <p>Downloads lossless copies through slskd when you heart a song, and shares your music back with the people you download from.</p>
           </div>
+          <a class="btn btn-ghost" id="slskd-open" target="_blank" rel="noopener noreferrer" title="slskd's own page, in a new tab. slskd asks for its own sign-in."><svg class="icon" aria-hidden="true"><use href="#i-arrow-square-out"/></svg><span>Open slskd</span></a>
         </header>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Sharing</h3>
+            <p class="set-desc">Soulseek works because people share. slskd shares your music folder, read-only, so the people you download from can download from you too.</p>
+          </div>
+          <div class="set-card share-card" id="share-card">
+            <div class="set-row stack">
+              <p class="share-line" id="share-line" aria-live="polite">Asking slskd…</p>
+              <dl class="share-facts" id="share-facts" hidden></dl>
+              <div class="share-actions">
+                <button type="button" class="btn btn-ghost" id="share-rescan"><svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg><span>Rescan shared folders</span></button>
+                <button type="button" class="btn btn-ghost" id="share-test-port"><svg class="icon" aria-hidden="true"><use href="#i-plugs-connected"/></svg><span>Test the port</span></button>
+                <button type="button" class="btn btn-ghost btn-icon" id="share-refresh" aria-label="Check sharing again" title="Check again"><svg class="icon" aria-hidden="true"><use href="#i-arrow-clockwise"/></svg></button>
+              </div>
+            </div>
+            <div id="share-warnings" hidden></div>
+          </div>
+        </div>
+
+        <div class="set-section">
+          <form data-section="soulseek-sharing" class="set-card">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Test the listening port</div>
+                <div class="set-info-d">Asks Soulseek's own port test whether other people can connect to slskd. On by default.</div>
+                <div class="set-info-more">Octo sends the port number to tools.slsknet.org and nothing else, at most every 6 hours unless you press Test the port. The test checks this server's internet address, so it is only right when slskd reaches the internet the same way as Octo, not through a VPN of its own.</div>
+              </div>
+              <label class="switch"><input type="checkbox" name="Soulseek.CheckListenPort" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+          </form>
+        </div>
 
         <div class="set-section">
           <div class="set-head">
@@ -1334,6 +1367,14 @@
                 <input class="set-input" id="f-slskd-user" name="Soulseek.Username" data-restart="true" data-restart-label="Soulseek account" placeholder="Username" autocomplete="off" aria-label="slskd web admin username" />
                 <input class="set-input" id="f-slskd-pass" name="Soulseek.Password" type="password" data-restart="true" data-restart-label="Soulseek account" placeholder="Password" autocomplete="new-password" aria-label="slskd web admin password" />
               </div>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info">
+                <div class="set-info-t">slskd's page <span class="set-opt">optional</span></div>
+                <div class="set-info-d">The address Open slskd goes to in your browser. Blank uses this server's name on port 5030.</div>
+                <div class="set-info-more">Set it when you reach slskd some other way, such as through a reverse proxy. Only the address goes to your browser; slskd asks for its own sign-in.</div>
+              </div>
+              <input class="set-input" id="f-slskd-web" name="Soulseek.WebUrl" type="url" placeholder="http://this-server:5030" autocomplete="off" />
             </div>
           </form>
         </div>
