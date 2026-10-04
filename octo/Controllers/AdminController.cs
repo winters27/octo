@@ -755,7 +755,8 @@ public class AdminController : ControllerBase
             {
                 ["BaseUrl"] = soulseek.BaseUrl ?? "",
                 ["Username"] = soulseek.Username ?? "",
-                ["Password"] = soulseek.Password ?? "",
+                // slskd's web login opens slskd entirely, so it goes out as the placeholder too.
+                ["Password"] = MaskSecret(soulseek.Password),
                 ["SearchWaitSeconds"] = soulseek.SearchWaitSeconds,
                 ["UpgradeSearchWaitSeconds"] = soulseek.UpgradeSearchWaitSeconds,
                 ["MinFileSizeBytes"] = soulseek.MinFileSizeBytes,
@@ -1024,6 +1025,24 @@ public class AdminController : ControllerBase
                     return BadRequest(new { error = "Retype the admin password for the new username." });
                 subsonicPatch.Remove(passwordKey);
             }
+        }
+
+        // The slskd sign-in the same way.
+        if (Child(patch, "Soulseek") is JsonObject soulseekPatch
+            && KeyOf(soulseekPatch, "Password") is { } slskdPasswordKey
+            && soulseekPatch[slskdPasswordKey] is JsonValue slskdPassword
+            && slskdPassword.TryGetValue<string>(out var slskdPasswordText)
+            && slskdPasswordText.StartsWith(SecretPlaceholder, StringComparison.Ordinal))
+        {
+            if (slskdPasswordText != SecretPlaceholder)
+                return BadRequest(new { error = "Retype the whole slskd password; it was added to the hidden placeholder." });
+            var newUser = KeyOf(soulseekPatch, "Username") is { } slskdUserKey
+                && soulseekPatch[slskdUserKey] is JsonValue slskdUserValue
+                && slskdUserValue.TryGetValue<string>(out var slskdUserText) ? slskdUserText : null;
+            if (newUser is not null
+                && !string.Equals(newUser.Trim(), (_soulseekOpts.CurrentValue.Username ?? "").Trim(), StringComparison.Ordinal))
+                return BadRequest(new { error = "Retype the slskd password for the new username." });
+            soulseekPatch.Remove(slskdPasswordKey);
         }
 
         if (Child(patch, "LastFm") is JsonObject lastFmSecrets)
@@ -1717,7 +1736,7 @@ public class AdminController : ControllerBase
             {
                 ["BaseUrl"] = soulseek.BaseUrl ?? "",
                 ["Username"] = soulseek.Username ?? "",
-                ["Password"] = soulseek.Password ?? "",
+                ["Password"] = MaskSecret(soulseek.Password),
                 ["SearchWaitSeconds"] = soulseek.SearchWaitSeconds,
                 ["UpgradeSearchWaitSeconds"] = soulseek.UpgradeSearchWaitSeconds,
                 ["MinFileSizeBytes"] = soulseek.MinFileSizeBytes,
@@ -1933,6 +1952,7 @@ public class AdminController : ControllerBase
                 : new JsonObject
                 {
                     ["Subsonic"] = new JsonObject { ["AdminPassword"] = _subsonicOpts.CurrentValue.AdminPassword },
+                    ["Soulseek"] = new JsonObject { ["Password"] = _soulseekOpts.CurrentValue.Password },
                     ["LastFm"] = new JsonObject
                     {
                         ["ApiSecret"] = _lastFmOpts.CurrentValue.ApiSecret,
@@ -1946,6 +1966,12 @@ public class AdminController : ControllerBase
                 && savedValue.TryGetValue<string>(out var savedText)
                 && savedText.StartsWith(SecretPlaceholder, StringComparison.Ordinal))
                 return BadRequest(new { error = "Retype the whole admin password; it was added to the hidden placeholder." });
+            if (Child(parsed, "Soulseek") is JsonObject savedSoulseek
+                && KeyOf(savedSoulseek, "Password") is { } savedSlskdKey
+                && savedSoulseek[savedSlskdKey] is JsonValue savedSlskd
+                && savedSlskd.TryGetValue<string>(out var savedSlskdText)
+                && savedSlskdText.StartsWith(SecretPlaceholder, StringComparison.Ordinal))
+                return BadRequest(new { error = "Retype the whole slskd password; it was added to the hidden placeholder." });
             if (Child(parsed, "LastFm") is JsonObject savedLastFm
                 && KeyOf(savedLastFm, "ApiSecret") is { } savedSecretKey
                 && savedLastFm[savedSecretKey] is JsonValue savedSecret
@@ -2258,8 +2284,8 @@ public class AdminController : ControllerBase
     /// <summary>
     /// What a saved Navidrome admin password reads as through the admin API. The Last.fm shared
     /// secret and each listener's Last.fm session key read the same way: they were added after
-    /// this was, and neither has ever gone out in clear. Every other secret still does, as it
-    /// always has.
+    /// this was, and neither has ever gone out in clear. So does the slskd web password, which
+    /// signs in to slskd as its owner. Every other secret still goes out in clear, as it always has.
     /// </summary>
     internal const string SecretPlaceholder = "(saved, not shown)";
 
@@ -2274,6 +2300,7 @@ public class AdminController : ControllerBase
     internal static void RestoreSecretPlaceholders(JsonObject incoming, JsonObject existingFile)
     {
         RestorePlaceholder(Child(incoming, "Subsonic"), Child(existingFile, "Subsonic"), "AdminPassword");
+        RestorePlaceholder(Child(incoming, "Soulseek"), Child(existingFile, "Soulseek"), "Password");
         RestorePlaceholder(Child(incoming, "LastFm"), Child(existingFile, "LastFm"), "ApiSecret");
 
         // Each listener's session the same way, matched by username. An entry whose key is only
@@ -2346,6 +2373,7 @@ public class AdminController : ControllerBase
     {
         var copy = merged.DeepClone().AsObject();
         MaskIn(Child(copy, "Subsonic"), "AdminPassword");
+        MaskIn(Child(copy, "Soulseek"), "Password");
         if (Child(copy, "LastFm") is JsonObject lastFm)
         {
             MaskIn(lastFm, "ApiSecret");

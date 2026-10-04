@@ -92,6 +92,34 @@ public class AdminContractTests
         Assert.Equal(AdminController.SecretPlaceholder, password);
     }
 
+    /// <summary>slskd's web password signs in to slskd as its owner, so it never goes to a browser
+    /// either.</summary>
+    [Theory]
+    [InlineData("/api/admin/settings")]
+    [InlineData("/api/admin/raw-config")]
+    public async Task SlskdPassword_IsNeverReturned(string url)
+    {
+        using var factory = new AdminWebFactory();
+        using var client = factory.CreateClient();
+
+        var body = await client.GetStringAsync(url);
+
+        Assert.DoesNotContain("synthetic-slskd-password", body);
+        var password = JsonDocument.Parse(body).RootElement.GetProperty("Soulseek").GetProperty("Password").GetString();
+        Assert.Equal(AdminController.SecretPlaceholder, password);
+    }
+
+    [Fact]
+    public void SlskdPassword_PlaceholderIsRestoredAndMasked()
+    {
+        var incoming = JsonNodeObject($$"""{ "Soulseek": { "Password": "{{AdminController.SecretPlaceholder}}" } }""");
+        AdminController.RestoreSecretPlaceholders(incoming, JsonNodeObject("""{ "Soulseek": { "Password": "stored" } }"""));
+        Assert.Equal("stored", (string?)incoming["Soulseek"]!["Password"]);
+
+        var echoed = AdminController.RedactSecrets(JsonNodeObject("""{ "Soulseek": { "Password": "stored" } }"""));
+        Assert.Equal(AdminController.SecretPlaceholder, (string?)echoed["Soulseek"]!["Password"]);
+    }
+
     /// <summary>If the factory's upstream override ever stops applying, the first-run automation
     /// would scan the LAN from a test run. Fail loudly instead.</summary>
     [Fact]
