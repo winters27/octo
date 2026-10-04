@@ -380,6 +380,11 @@ builder.Services.AddSingleton(sp => new Octo.Services.Common.AcquisitionTracker(
     sp.GetRequiredService<ILogger<Octo.Services.Common.AcquisitionTracker>>(), sp));
 // Favorites a starred outside song for whoever starred it once Navidrome shows it (#71).
 builder.Services.AddSingleton<Octo.Services.Common.StarOnArrival>();
+// Find songs in the apps' downloads drawer: a search run again by hand, and the copy picked from
+// it, which the Soulseek and Lidarr pipelines take instead of searching.
+builder.Services.AddSingleton<Octo.Services.Common.DownloadPicks>();
+builder.Services.AddSingleton(sp => new Octo.Services.Common.SongFinder(
+    sp, sp.GetRequiredService<ILogger<Octo.Services.Common.SongFinder>>()));
 
 // Long enough for an already-downloaded file to finish being tagged and registered, and
 // no longer: sizing this for the transfer itself would tax every restart for a benefit

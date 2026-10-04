@@ -525,7 +525,7 @@ public sealed class LibraryActionEndpointTests
         var row = Assert.Single(Envelope(listed).GetProperty("upgrades").EnumerateArray());
         Assert.Equal("nd-1", row.GetProperty("id").GetString());
         Assert.Equal("queued", row.GetProperty("state").GetString());
-        Assert.Equal(["album", "artist", "detail", "id", "progress", "state", "title", "updatedAt"],
+        Assert.Equal(["acquisition", "album", "artist", "detail", "id", "picked", "progress", "state", "title", "updatedAt"],
             row.EnumerateObject().Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal));
 
         using var someoneElse = await GetJson(client, $"/rest/getUpgrades.view?{Auth("bob")}");

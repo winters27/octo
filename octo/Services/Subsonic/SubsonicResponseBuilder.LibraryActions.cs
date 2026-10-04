@@ -105,6 +105,10 @@ public partial class SubsonicResponseBuilder
                 ["detail"] = pair.Job.Detail,
                 ["progress"] = pair.Progress,
                 ["updatedAt"] = pair.Job.UpdatedUtc.ToString("O"),
+                // The downloads row that fetches the replacement, once there is one, for its log.
+                ["acquisition"] = pair.Job.AcquisitionKey is { } key && key.IndexOf(':') is > 0 and var split
+                    ? Octo.Services.Common.AcquisitionTracker.KeyOf(key[..split], key[(split + 1)..]) : null,
+                ["picked"] = pair.Job.Pick?.Describe(),
             }).ToList(),
         });
 }

@@ -494,9 +494,11 @@ public partial class SubsonicResponseBuilder
         return new JsonResult(response);
     }
 
-    /// <summary>The OpenSubsonic extension a client checks for before it asks for getAcquisitions.</summary>
+    /// <summary>The OpenSubsonic extension a client checks for before it asks for getAcquisitions.
+    /// Version 2 adds each row's log (getAcquisition), clearing finished rows (clearAcquisitions)
+    /// and Find songs (findSongs, getFoundSongs, pickFoundSong).</summary>
     public const string AcquisitionsExtension = "octoAcquisitions";
-    public const int AcquisitionsExtensionVersion = 1;
+    public const int AcquisitionsExtensionVersion = 2;
 
     /// <summary>
     /// getAcquisitions: the caller's own downloads in flight or recently ended. Always JSON,
@@ -537,6 +539,60 @@ public partial class SubsonicResponseBuilder
         // Added for the app's words beside the ring. Older apps ignore them.
         ["ahead"] = row.Ahead,
         ["note"] = row.Note,
+        // Added for the downloads drawer: the row's own key for getAcquisition, what it is for,
+        // the copy being fetched, the picture to draw, and how long its log is.
+        ["key"] = row.Key,
+        ["kind"] = row.Kind,
+        ["quality"] = row.Quality,
+        ["peer"] = row.Peer,
+        ["coverArt"] = row.LibraryId ?? row.Id,
+        ["logLines"] = row.LogLines,
+    };
+
+    /// <summary>getAcquisition: one row with its whole log.</summary>
+    public IActionResult CreateAcquisitionResponse(Octo.Services.Common.AcquisitionSnapshot row)
+    {
+        var json = AcquisitionJson(row);
+        json["event"] = (row.Events ?? []).Select(EventJson).ToList();
+        return CreateJsonResponse(new Dictionary<string, object?>
+        {
+            ["status"] = "ok",
+            ["version"] = SubsonicVersion,
+            ["type"] = "octo",
+            ["acquisition"] = json,
+        });
+    }
+
+    private static Dictionary<string, object?> EventJson(Octo.Services.Common.AcquisitionEvent line) => new()
+    {
+        ["at"] = Utc(line.At),
+        ["kind"] = line.Kind,
+        ["text"] = line.Text,
+        ["detail"] = line.Detail,
+        ["candidate"] = line.Candidates?.Select(CandidateJson).ToList(),
+    };
+
+    /// <summary>One copy a source offered, in the log and in Find songs alike.</summary>
+    public static Dictionary<string, object?> CandidateJson(Octo.Services.Common.AcquisitionCandidate copy) => new()
+    {
+        ["source"] = copy.Source,
+        ["peer"] = copy.Peer,
+        ["file"] = copy.File,
+        ["folder"] = copy.Folder,
+        ["title"] = copy.Title,
+        ["album"] = copy.Album,
+        ["format"] = copy.Format,
+        ["quality"] = copy.Quality,
+        ["bitRate"] = copy.BitRate,
+        ["bitDepth"] = copy.BitDepth,
+        ["sampleRate"] = copy.SampleRate,
+        ["size"] = copy.Size,
+        ["length"] = copy.Length,
+        ["queueLength"] = copy.QueueLength,
+        ["freeSlot"] = copy.FreeSlot,
+        ["speed"] = copy.Speed,
+        ["rank"] = copy.Rank,
+        ["note"] = copy.Note,
     };
 
     private static string Utc(DateTime value) =>
@@ -551,7 +607,7 @@ public partial class SubsonicResponseBuilder
     /// </summary>
     internal static readonly (string Name, int[] Versions)[] OwnExtensions =
     [
-        (AcquisitionsExtension, [AcquisitionsExtensionVersion]),
+        (AcquisitionsExtension, [1, AcquisitionsExtensionVersion]),
         (LyricsExtension, [LyricsExtensionVersion]),
         (LibraryActionsExtension, [1, LibraryActionsExtensionVersion]),
         ("songLyrics", [1, 2]),

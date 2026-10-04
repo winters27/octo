@@ -5,8 +5,10 @@ using Octo.Models.Settings;
 
 namespace Octo.Services.Lyrics;
 
+/// <param name="Acquisition">The downloads log row ("provider:id") that hears how the look went,
+/// when a download asked for it.</param>
 public sealed record LyricsJob(string AudioPath, string Artist, string Title, string? Album, int? DurationSeconds,
-    int Attempt = 1);
+    int Attempt = 1, string? Acquisition = null);
 
 public enum LyricsWriteOutcome { Written, Instrumental, NotFound, AlreadyThere, Gone, Retrying, GaveUp, Upgraded }
 
@@ -56,9 +58,13 @@ public sealed class LyricsSidecarWriter : BackgroundService
     private readonly IServiceScopeFactory? _scopes;
     private int _scanPending;
 
+    private readonly Octo.Services.Common.AcquisitionTracker? _tracker;
+
     public LyricsSidecarWriter(LyricsService lyrics, ILogger<LyricsSidecarWriter> logger,
-        IOptionsMonitor<MetadataSettings>? settings = null, IServiceScopeFactory? scopes = null)
+        IOptionsMonitor<MetadataSettings>? settings = null, IServiceScopeFactory? scopes = null,
+        Octo.Services.Common.AcquisitionTracker? tracker = null)
     {
+        _tracker = tracker;
         _lyrics = lyrics;
         _logger = logger;
         _settings = settings;
@@ -77,8 +83,9 @@ public sealed class LyricsSidecarWriter : BackgroundService
             // StopHost, so one unhandled exception here would take Octo down.
             try
             {
-                var outcome = await WriteAsync(job, stoppingToken);
-                if (outcome == LyricsWriteOutcome.Retrying) _ = RetryLaterAsync(job with { Attempt = job.Attempt + 1 }, stoppingToken);
+                var write = await WriteAsync(job, upgrade: false, stoppingToken);
+                Report(job, write);
+                if (write.Outcome == LyricsWriteOutcome.Retrying) _ = RetryLaterAsync(job with { Attempt = job.Attempt + 1 }, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception ex)
@@ -90,6 +97,46 @@ public sealed class LyricsSidecarWriter : BackgroundService
 
     internal async Task<LyricsWriteOutcome> WriteAsync(LyricsJob job, CancellationToken ct) =>
         (await WriteAsync(job, upgrade: false, ct)).Outcome;
+
+    /// <summary>Tells the download's log what the look found, in words, and where the lyrics went.</summary>
+    internal void Report(LyricsJob job, LyricsWrite write)
+    {
+        if (_tracker is null || job.Acquisition is not { } row) return;
+        var split = row.IndexOf(':');
+        if (split <= 0) return;
+        var (text, detail) = ReportText(job, write, File.Exists(job.AudioPath) ? SongLyrics.Of(job.AudioPath).Where : SongLyricsPlace.None);
+        if (text is null) return;
+        _tracker.Log(row[..split], row[(split + 1)..], Octo.Services.Common.AcquisitionEventKinds.Lyrics, text, detail);
+    }
+
+    /// <summary>The log's words for one look, or null when there is nothing to say yet.</summary>
+    internal static (string? Text, string? Detail) ReportText(LyricsJob job, LyricsWrite write, SongLyricsPlace place) =>
+        write.Outcome switch
+        {
+            LyricsWriteOutcome.Written or LyricsWriteOutcome.Upgraded when write.Result is { } found => (
+                $"{TimingWords(found.Timing)} from {found.Source}",
+                place switch
+                {
+                    SongLyricsPlace.Inside => "Embedded in the song",
+                    SongLyricsPlace.Beside => $"Saved beside the song as a {(found.HasSynced ? ".lrc" : ".txt")} file",
+                    _ => "Saved",
+                }),
+            LyricsWriteOutcome.Instrumental => ("No lyrics: an instrumental",
+                write.Result is { } said ? $"{said.Source} says it has no words" : null),
+            LyricsWriteOutcome.NotFound => ("No lyrics found", "None of the lyrics sources has this song"),
+            LyricsWriteOutcome.AlreadyThere => ("The song already has lyrics", "Left as they are"),
+            LyricsWriteOutcome.Retrying => ("No lyrics service answered",
+                $"Trying again in {(int)RetryDelay.TotalMinutes} minutes (try {job.Attempt} of {MaxAttempts})"),
+            LyricsWriteOutcome.GaveUp => ("No lyrics service answered", $"Gave up after {MaxAttempts} tries"),
+            _ => (null, null),
+        };
+
+    private static string TimingWords(LyricsTiming timing) => timing switch
+    {
+        LyricsTiming.Word => "Word by word lyrics",
+        LyricsTiming.Line => "Synced lyrics",
+        _ => "Plain lyrics",
+    };
 
     /// <summary>
     /// Look the song up and save what was found. A song that already has lyrics is left alone,

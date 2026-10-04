@@ -52,6 +52,9 @@ public sealed class UpgradeJob
     /// <summary>What a finished job found and did, for a person to read.</summary>
     public UpgradeResult? Result { get; set; }
 
+    /// <summary>The copy someone picked in Find songs, fetched instead of searching; null to search.</summary>
+    public PickedCopy? Pick { get; set; }
+
     public UpgradeJob Copy() => (UpgradeJob)MemberwiseClone();
 }
 
@@ -73,7 +76,7 @@ public sealed class UpgradeResult
 
 /// <summary>A song to look for, with what the asker already knows about it.</summary>
 public sealed record UpgradeAsk(string NavidromeId, string? Title = null, string? Artist = null, string? Album = null,
-    string? Suffix = null, string? AttemptKey = null);
+    string? Suffix = null, string? AttemptKey = null, PickedCopy? Pick = null);
 
 /// <summary>
 /// The songs waiting to be found in higher quality, from the apps and the Better quality page, on disk so a
@@ -135,7 +138,7 @@ public sealed class UpgradeQueue
                 {
                     NavidromeId = ask.NavidromeId, Title = ask.Title, Artist = ask.Artist, Album = ask.Album,
                     Suffix = ask.Suffix, AttemptKey = ask.AttemptKey, RequestedBy = requester, Origin = origin,
-                    State = UpgradeStates.Queued, QueuedUtc = now, UpdatedUtc = now,
+                    State = UpgradeStates.Queued, QueuedUtc = now, UpdatedUtc = now, Pick = ask.Pick,
                 };
                 _jobs[job.NavidromeId] = job;
                 open++;
@@ -273,13 +276,16 @@ public sealed class UpgradeWorker : BackgroundService
     private readonly AcquisitionTracker? _tracker;
     private readonly QualityUpgradeStore? _attempts;
     private readonly IOptionsMonitor<SoulseekSettings>? _soulseekSettings;
+    private readonly DownloadPicks? _picks;
     private readonly List<Task> _running = [];
 
     public UpgradeWorker(UpgradeQueue queue, LibraryActionExecutor executor, NavidromeSongPathResolver resolver,
         ILogger<UpgradeWorker> logger, DownloadConcurrency? concurrency = null, ISoulseekLink? soulseek = null,
         AcquisitionTracker? tracker = null, QualityUpgradeStore? attempts = null,
-        IOptionsMonitor<SoulseekSettings>? soulseekSettings = null, UpgradeSources? sources = null)
+        IOptionsMonitor<SoulseekSettings>? soulseekSettings = null, UpgradeSources? sources = null,
+        DownloadPicks? picks = null)
     {
+        _picks = picks;
         _soulseekSettings = soulseekSettings;
         SourceName = () => sources?.Name ?? "Soulseek";
         _queue = queue;
@@ -344,13 +350,23 @@ public sealed class UpgradeWorker : BackgroundService
                 (job.Title, job.Artist, job.Album) = (song.Title, song.Artist, song.Album);
             }
 
+            string? acquired = null;
             var outcome = await Apply(new LibraryActionRequest(LibraryAction.BetterQuality, job.NavidromeId, job.RequestedBy,
                 OnReplacementQueued: (provider, externalId) =>
                 {
+                    acquired = externalId;
                     _queue.Update(job.NavidromeId, j => j.AcquisitionKey = $"{provider}:{externalId}");
-                    // The tracker follows only rows that were opened, so the replacement gets one.
-                    _tracker?.Begin(provider, externalId, null, job.RequestedBy, job.Artist, job.Title, job.Album);
-                }), ct);
+                    // A copy picked in Find songs is fetched as it is, with no search.
+                    if (job.Pick is { } pick) _picks?.Pin(externalId, pick);
+                    // The tracker follows only rows that were opened, so the replacement gets one. It
+                    // carries the library song's id, so the apps draw that song's cover on it.
+                    _tracker?.Begin(provider, externalId, job.NavidromeId, job.RequestedBy, job.Artist, job.Title, job.Album,
+                        AcquisitionKinds.Upgrade);
+                    _tracker?.Log(provider, externalId, AcquisitionEventKinds.Note,
+                        job.Pick is { } chosen ? $"Getting {chosen.Describe()}" : $"Your copy is {job.Suffix?.ToUpperInvariant() ?? "lossy"}; looking for a lossless one",
+                        "Your copy stays until the new one passes every check");
+                },
+                OnlySource: job.Pick is { } only ? (only.IsSoulseek ? DownloadSource.Soulseek : DownloadSource.Lidarr) : null), ct);
 
             var state = StateFor(outcome);
             var result = state == UpgradeStates.Upgraded ? Report(outcome, job) : null;
@@ -367,6 +383,21 @@ public sealed class UpgradeWorker : BackgroundService
                     _ => outcome.Detail,
                 };
             });
+            // The verdict comes after the download's own row has ended, so it is a line of its own.
+            if (acquired is not null)
+                _tracker?.Log(SoulseekMetadataService.ProviderName, acquired,
+                    state == UpgradeStates.Upgraded ? AcquisitionEventKinds.Done : AcquisitionEventKinds.Note,
+                    state switch
+                    {
+                        UpgradeStates.Upgraded => "Took the place of your old copy",
+                        UpgradeStates.NotFound => "No lossless copy found; your copy is unchanged",
+                        UpgradeStates.Waiting => "Waiting for Soulseek",
+                        UpgradeStates.Rehearsed => "Only rehearsed; nothing changed",
+                        _ => "Your copy is unchanged",
+                    },
+                    state == UpgradeStates.Upgraded && result?.After is { } now
+                        ? $"Now {now}{Size(result.AfterBytes)}, was {result.Before ?? job.Suffix?.ToUpperInvariant()}{Size(result.BeforeBytes)}"
+                        : AcquisitionTracker.UserSafe(outcome.Detail));
             if (state == UpgradeStates.NotFound && job.AttemptKey is { } key)
                 _attempts?.Update(s => s.Attempts[key] = new QualityUpgradeAttempt(DateTime.UtcNow, outcome.State.ToString(), outcome.Detail));
             _logger.LogInformation("Higher quality for {Id} ('{Artist} - {Title}') by {User}: {State} - {Detail}",

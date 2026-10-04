@@ -27,6 +27,14 @@ public sealed record LidarrAlbumState(int Id, bool Monitored);
 /// <summary>A search Lidarr accepted, and whether Octo added or monitored the album to get it.</summary>
 public sealed record LidarrSearchStarted(int AlbumId, bool Existed, bool WasMonitored);
 
+/// <summary>One release an indexer offered for an album, as Lidarr's interactive search lists it.
+/// Rejected says Lidarr would not take it on its own, and Rejections says why.</summary>
+public sealed record LidarrRelease(string Guid, int IndexerId, string Title, string? Indexer, string? Quality,
+    long? Size, int? Seeders, int? Leechers, string? Protocol, int? AgeDays, bool Rejected, IReadOnlyList<string> Rejections);
+
+/// <summary>A release someone picked in Find songs, grabbed instead of Lidarr's own search.</summary>
+public sealed record LidarrReleasePick(string Guid, int IndexerId, string? Title);
+
 public sealed record LidarrAlbumImportState(
     IReadOnlyList<LidarrImportedTrack> Tracks, int TrackCount, int TrackFileCount)
 {
@@ -163,11 +171,57 @@ public sealed class LidarrClient
         using var _ = await SendAsync(request, ct);
     }
 
+    /// <summary>How long an interactive search may take: Lidarr asks every indexer before it answers.</summary>
+    internal static readonly TimeSpan ReleaseSearchTimeout = TimeSpan.FromSeconds(120);
+
     /// <summary>
-    /// Adds the album when Lidarr lacks it, monitors it, and starts an AlbumSearch. Says whether the
-    /// album was there before and monitored, so a caller that only borrowed it can put it back.
+    /// Every release the indexers offer for an album Lidarr has, as its interactive search lists
+    /// them, best first by Lidarr's own order. Nothing is grabbed.
     /// </summary>
-    public async Task<LidarrSearchStarted> StartAlbumSearchAsync(LidarrAlbumCandidate candidate, CancellationToken ct = default)
+    public async Task<IReadOnlyList<LidarrRelease>> ListReleasesAsync(int albumId, CancellationToken ct = default)
+    {
+        using var request = CreateRequest(HttpMethod.Get, $"/api/v1/release?albumId={albumId}");
+        using var response = await SendAsync(request, ct, ReleaseSearchTimeout);
+        await using var stream = await response.Content.ReadAsStreamAsync(ct);
+        var rows = (await JsonNode.ParseAsync(stream, cancellationToken: ct) as JsonArray)?.OfType<JsonObject>().ToList() ?? [];
+        return rows.Select(ParseRelease).Where(r => r.Guid.Length > 0).ToList();
+    }
+
+    internal static LidarrRelease ParseRelease(JsonObject row)
+    {
+        var quality = (row["quality"] as JsonObject)?["quality"] as JsonObject;
+        var age = row["ageHours"] is JsonValue hours && hours.TryGetValue<double>(out var h) ? (int?)(int)Math.Round(h / 24)
+            : NullableNumber(row, "age");
+        return new LidarrRelease(
+            NullableStr(row, "guid") ?? "",
+            NullableNumber(row, "indexerId") ?? 0,
+            NullableStr(row, "title") ?? "",
+            NullableStr(row, "indexer"),
+            quality is null ? null : NullableStr(quality, "name"),
+            row["size"] is JsonValue size && size.TryGetValue<double>(out var bytes) ? (long)bytes : null,
+            NullableNumber(row, "seeders"),
+            NullableNumber(row, "leechers"),
+            NullableStr(row, "protocol"),
+            age,
+            row["rejected"] is JsonValue rejected && rejected.TryGetValue<bool>(out var no) && no,
+            (row["rejections"] as JsonArray)?.Select(r => r?.GetValue<string>() ?? "").Where(r => r.Length > 0).ToList() ?? []);
+    }
+
+    /// <summary>Asks Lidarr to download one release an interactive search listed.</summary>
+    public async Task GrabReleaseAsync(LidarrReleasePick release, CancellationToken ct = default) =>
+        await SendJsonAsync(HttpMethod.Post, "/api/v1/release", new JsonObject
+        {
+            ["guid"] = release.Guid,
+            ["indexerId"] = release.IndexerId,
+        }, ct);
+
+    /// <summary>
+    /// Adds the album when Lidarr lacks it, monitors it, and starts an AlbumSearch, or grabs the
+    /// release someone picked. Says whether the album was there before and monitored, so a caller
+    /// that only borrowed it can put it back.
+    /// </summary>
+    public async Task<LidarrSearchStarted> StartAlbumSearchAsync(LidarrAlbumCandidate candidate, CancellationToken ct = default,
+        LidarrReleasePick? grab = null)
     {
         var settings = RequireSettings(requireProfiles: true);
         var existing = await GetArrayAsync(
@@ -230,11 +284,13 @@ public sealed class LidarrClient
             await EnsureArtistMonitoredAsync(existingArtist, ct);
         }
 
-        await SendJsonAsync(HttpMethod.Post, "/api/v1/command", new JsonObject
-        {
-            ["name"] = "AlbumSearch",
-            ["albumIds"] = new JsonArray(albumId),
-        }, ct);
+        if (grab is not null) await GrabReleaseAsync(grab, ct);
+        else
+            await SendJsonAsync(HttpMethod.Post, "/api/v1/command", new JsonObject
+            {
+                ["name"] = "AlbumSearch",
+                ["albumIds"] = new JsonArray(albumId),
+            }, ct);
         return new LidarrSearchStarted(albumId, existing.Count > 0, wasMonitored);
     }
 
@@ -312,10 +368,10 @@ public sealed class LidarrClient
         return request;
     }
 
-    private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct, TimeSpan? timeout = null)
     {
         var client = _httpFactory.CreateClient();
-        client.Timeout = TimeSpan.FromSeconds(20);
+        client.Timeout = timeout ?? TimeSpan.FromSeconds(20);
         var response = await client.SendAsync(request, ct);
         if (!response.IsSuccessStatusCode)
         {
@@ -394,4 +450,8 @@ public sealed class LidarrClient
     private static string? NullableStr(JsonObject o, string key) => o[key]?.GetValue<string>();
     private static int? NullableInt(JsonObject o, string key) => o[key]?.GetValue<int>();
     private static long? NullableLong(JsonObject o, string key) => o[key]?.GetValue<long>();
+
+    // A whole number however Lidarr wrote it.
+    private static int? NullableNumber(JsonObject o, string key) =>
+        o[key] is JsonValue value && value.TryGetValue<double>(out var number) ? (int)Math.Round(number) : null;
 }
