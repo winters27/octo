@@ -216,7 +216,7 @@ public class AdminController : ControllerBase
     {
         if (_listenBrainz is null || _listenBrainzOpts is null)
             return Ok(new { configured = false, valid = false, detail = "ListenBrainz is not available." });
-        var candidate = string.IsNullOrWhiteSpace(token)
+        var candidate = string.IsNullOrWhiteSpace(token) || token == SecretPlaceholder
             ? _listenBrainzOpts.CurrentValue.TokenFor(user ?? "") ?? ""
             : token;
         if (candidate.Length == 0)
@@ -765,7 +765,7 @@ public class AdminController : ControllerBase
                 ["PreferredExtension"] = soulseek.PreferredExtension,
                 ["DownloadTimeoutSeconds"] = soulseek.DownloadTimeoutSeconds,
                 ["VerifyDownloads"] = soulseek.VerifyDownloads,
-                ["AcoustIdApiKey"] = soulseek.AcoustIdApiKey ?? "",
+                ["AcoustIdApiKey"] = MaskSecret(soulseek.AcoustIdApiKey),
                 ["MinMatchScore"] = soulseek.MinMatchScore,
                 ["TagFromMusicBrainz"] = soulseek.TagFromMusicBrainz,
                 ["NameFromMatch"] = soulseek.NameFromMatch,
@@ -779,12 +779,12 @@ public class AdminController : ControllerBase
                 ["ParallelDownloads"] = soulseek.ParallelDownloads,
                 ["AlbumFolders"] = soulseek.AlbumFolders,
                 ["SubmitConfirmedFingerprints"] = soulseek.SubmitConfirmedFingerprints,
-                ["AcoustIdUserApiKey"] = soulseek.AcoustIdUserApiKey ?? "",
+                ["AcoustIdUserApiKey"] = MaskSecret(soulseek.AcoustIdUserApiKey),
             },
             ["Lidarr"] = new Dictionary<string, object>
             {
                 ["BaseUrl"] = lidarr.BaseUrl ?? "",
-                ["ApiKey"] = lidarr.ApiKey ?? "",
+                ["ApiKey"] = MaskSecret(lidarr.ApiKey),
                 ["RootFolderPath"] = lidarr.RootFolderPath ?? "",
                 ["QualityProfileId"] = lidarr.QualityProfileId,
                 ["MetadataProfileId"] = lidarr.MetadataProfileId,
@@ -797,7 +797,7 @@ public class AdminController : ControllerBase
             },
             ["LastFm"] = new Dictionary<string, object>
             {
-                ["ApiKey"] = lastfm.ApiKey ?? "",
+                ["ApiKey"] = MaskSecret(lastfm.ApiKey),
                 ["ApiSecret"] = MaskSecret(lastfm.ApiSecret),
                 ["ScrobbleExternalPlays"] = lastfm.ScrobbleExternalPlays,
                 ["ScrobbleLibraryPlays"] = lastfm.ScrobbleLibraryPlays,
@@ -917,8 +917,9 @@ public class AdminController : ControllerBase
             ["Notifications"] = new Dictionary<string, object>
             {
                 ["NtfyUrl"] = notif.NtfyUrl ?? "",
-                ["NtfyToken"] = notif.NtfyToken ?? "",
-                ["DiscordWebhookUrl"] = notif.DiscordWebhookUrl ?? "",
+                ["NtfyToken"] = MaskSecret(notif.NtfyToken),
+                // The address carries the webhook's own token, so the whole address is the secret.
+                ["DiscordWebhookUrl"] = MaskSecret(notif.DiscordWebhookUrl),
                 ["NotifyDownloadStarted"] = notif.NotifyDownloadStarted,
                 ["NotifyDownloadCompleted"] = notif.NotifyDownloadCompleted,
                 ["NotifyLosslessFallback"] = notif.NotifyLosslessFallback,
@@ -927,10 +928,9 @@ public class AdminController : ControllerBase
             },
             ["ListenBrainz"] = new Dictionary<string, object>
             {
-                ["Token"] = _listenBrainzOpts?.CurrentValue.Token ?? "",
+                ["Token"] = MaskSecret(_listenBrainzOpts?.CurrentValue.Token),
                 ["SubmitExternalPlays"] = _listenBrainzOpts?.CurrentValue.SubmitExternalPlays ?? true,
-                ["UserTokens"] = _listenBrainzOpts?.CurrentValue.UserTokens
-                    ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                ["UserTokens"] = MaskTokens(_listenBrainzOpts?.CurrentValue.UserTokens),
             },
             ["Imports"] = new Dictionary<string, object>
             {
@@ -1063,21 +1063,13 @@ public class AdminController : ControllerBase
             && SoulseekSettings.SafeWebUrl(webText) is null)
             return BadRequest(new { error = "slskd's page must be a whole http:// or https:// address, such as http://192.168.1.5:5030." });
 
-        if (Child(patch, "LastFm") is JsonObject lastFmSecrets)
-        {
-            // Sessions are made by Connect and removed by Disconnect. No form sends them, and an
-            // echoed placeholder must never overwrite a real key.
-            if (KeyOf(lastFmSecrets, "UserSessions") is { } sessionsKey) lastFmSecrets.Remove(sessionsKey);
-            if (KeyOf(lastFmSecrets, "ApiSecret") is { } secretKey
-                && lastFmSecrets[secretKey] is JsonValue secretValue
-                && secretValue.TryGetValue<string>(out var secretText)
-                && secretText.StartsWith(SecretPlaceholder, StringComparison.Ordinal))
-            {
-                if (secretText != SecretPlaceholder)
-                    return BadRequest(new { error = "Retype the whole Last.fm shared secret; it was added to the hidden placeholder." });
-                lastFmSecrets.Remove(secretKey);
-            }
-        }
+        // Sessions are made by Connect and removed by Disconnect. No form sends them, and an
+        // echoed placeholder must never overwrite a real key.
+        if (Child(patch, "LastFm") is JsonObject lastFmSecrets && KeyOf(lastFmSecrets, "UserSessions") is { } sessionsKey)
+            lastFmSecrets.Remove(sessionsKey);
+        // Every other credential the same way: the placeholder sent back keeps what is saved.
+        if (KeepSavedSecrets(patch, _listenBrainzOpts?.CurrentValue.UserTokens) is { } secretError)
+            return BadRequest(new { error = secretError });
 
         try
         {
@@ -1784,7 +1776,7 @@ public class AdminController : ControllerBase
                 ["PreferredExtension"] = soulseek.PreferredExtension,
                 ["DownloadTimeoutSeconds"] = soulseek.DownloadTimeoutSeconds,
                 ["VerifyDownloads"] = soulseek.VerifyDownloads,
-                ["AcoustIdApiKey"] = soulseek.AcoustIdApiKey ?? "",
+                ["AcoustIdApiKey"] = MaskSecret(soulseek.AcoustIdApiKey),
                 ["MinMatchScore"] = soulseek.MinMatchScore,
                 ["TagFromMusicBrainz"] = soulseek.TagFromMusicBrainz,
                 ["NameFromMatch"] = soulseek.NameFromMatch,
@@ -1798,12 +1790,12 @@ public class AdminController : ControllerBase
                 ["ParallelDownloads"] = soulseek.ParallelDownloads,
                 ["AlbumFolders"] = soulseek.AlbumFolders,
                 ["SubmitConfirmedFingerprints"] = soulseek.SubmitConfirmedFingerprints,
-                ["AcoustIdUserApiKey"] = soulseek.AcoustIdUserApiKey ?? "",
+                ["AcoustIdUserApiKey"] = MaskSecret(soulseek.AcoustIdUserApiKey),
             },
             ["Lidarr"] = new JsonObject
             {
                 ["BaseUrl"] = lidarr.BaseUrl ?? "",
-                ["ApiKey"] = lidarr.ApiKey ?? "",
+                ["ApiKey"] = MaskSecret(lidarr.ApiKey),
                 ["RootFolderPath"] = lidarr.RootFolderPath ?? "",
                 ["QualityProfileId"] = lidarr.QualityProfileId,
                 ["MetadataProfileId"] = lidarr.MetadataProfileId,
@@ -1816,7 +1808,7 @@ public class AdminController : ControllerBase
             },
             ["LastFm"] = new JsonObject
             {
-                ["ApiKey"] = lastfm.ApiKey ?? "",
+                ["ApiKey"] = MaskSecret(lastfm.ApiKey),
                 // Placeholders, which PUT swaps back for what is stored.
                 ["ApiSecret"] = MaskSecret(lastfm.ApiSecret),
                 ["ScrobbleExternalPlays"] = lastfm.ScrobbleExternalPlays,
@@ -1933,8 +1925,9 @@ public class AdminController : ControllerBase
             ["Notifications"] = new JsonObject
             {
                 ["NtfyUrl"] = notif.NtfyUrl ?? "",
-                ["NtfyToken"] = notif.NtfyToken ?? "",
-                ["DiscordWebhookUrl"] = notif.DiscordWebhookUrl ?? "",
+                ["NtfyToken"] = MaskSecret(notif.NtfyToken),
+                // The address carries the webhook's own token, so the whole address is the secret.
+                ["DiscordWebhookUrl"] = MaskSecret(notif.DiscordWebhookUrl),
                 ["NotifyDownloadStarted"] = notif.NotifyDownloadStarted,
                 ["NotifyDownloadCompleted"] = notif.NotifyDownloadCompleted,
                 ["NotifyLosslessFallback"] = notif.NotifyLosslessFallback,
@@ -1945,10 +1938,9 @@ public class AdminController : ControllerBase
             // section the next Raw Config save silently deletes.
             ["ListenBrainz"] = new JsonObject
             {
-                ["Token"] = _listenBrainzOpts?.CurrentValue.Token ?? "",
+                ["Token"] = MaskSecret(_listenBrainzOpts?.CurrentValue.Token),
                 ["SubmitExternalPlays"] = _listenBrainzOpts?.CurrentValue.SubmitExternalPlays ?? true,
-                ["UserTokens"] = new JsonObject(
-                    (_listenBrainzOpts?.CurrentValue.UserTokens ?? new Dictionary<string, string>())
+                ["UserTokens"] = new JsonObject(MaskTokens(_listenBrainzOpts?.CurrentValue.UserTokens)
                     .Select(pair => new KeyValuePair<string, JsonNode?>(pair.Key, pair.Value))),
             },
             ["Imports"] = new JsonObject
@@ -1997,35 +1989,10 @@ public class AdminController : ControllerBase
             // left, and this save is the recovery path the 409 points people to.
             var existing = _settings.IsReadable()
                 ? _settings.Load()
-                : new JsonObject
-                {
-                    ["Subsonic"] = new JsonObject { ["AdminPassword"] = _subsonicOpts.CurrentValue.AdminPassword },
-                    ["Soulseek"] = new JsonObject { ["Password"] = _soulseekOpts.CurrentValue.Password },
-                    ["LastFm"] = new JsonObject
-                    {
-                        ["ApiSecret"] = _lastFmOpts.CurrentValue.ApiSecret,
-                        ["UserSessions"] = JsonSerializer.SerializeToNode(_lastFmOpts.CurrentValue.UserSessions),
-                    },
-                };
+                : RunningSecrets();
             RestoreSecretPlaceholders(parsed, existing);
-            if (Child(parsed, "Subsonic") is JsonObject savedSubsonic
-                && KeyOf(savedSubsonic, "AdminPassword") is { } savedKey
-                && savedSubsonic[savedKey] is JsonValue savedValue
-                && savedValue.TryGetValue<string>(out var savedText)
-                && savedText.StartsWith(SecretPlaceholder, StringComparison.Ordinal))
-                return BadRequest(new { error = "Retype the whole admin password; it was added to the hidden placeholder." });
-            if (Child(parsed, "Soulseek") is JsonObject savedSoulseek
-                && KeyOf(savedSoulseek, "Password") is { } savedSlskdKey
-                && savedSoulseek[savedSlskdKey] is JsonValue savedSlskd
-                && savedSlskd.TryGetValue<string>(out var savedSlskdText)
-                && savedSlskdText.StartsWith(SecretPlaceholder, StringComparison.Ordinal))
-                return BadRequest(new { error = "Retype the whole slskd password; it was added to the hidden placeholder." });
-            if (Child(parsed, "LastFm") is JsonObject savedLastFm
-                && KeyOf(savedLastFm, "ApiSecret") is { } savedSecretKey
-                && savedLastFm[savedSecretKey] is JsonValue savedSecret
-                && savedSecret.TryGetValue<string>(out var savedSecretText)
-                && savedSecretText.StartsWith(SecretPlaceholder, StringComparison.Ordinal))
-                return BadRequest(new { error = "Retype the whole Last.fm shared secret; it was added to the hidden placeholder." });
+            if (SecretTypedIntoPlaceholder(parsed) is { } typedSecret)
+                return BadRequest(new { error = $"Retype the whole {typedSecret}; it was added to the hidden placeholder." });
             if (SessionKeyTypedIntoPlaceholder(parsed) is { } typedInto)
                 return BadRequest(new { error = $"Connect {typedInto} to Last.fm again, or paste their whole session key; it was added to the hidden placeholder." });
             var pretty = parsed.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
@@ -2202,8 +2169,9 @@ public class AdminController : ControllerBase
     {
         try
         {
-            var options = await _lidarr.TestConnectionAsync(
-                request.BaseUrl ?? "", request.ApiKey ?? "", ct);
+            // The page only ever holds the placeholder for a saved key; testing it means the saved one.
+            var key = request.ApiKey == SecretPlaceholder ? _lidarrOpts.CurrentValue.ApiKey : request.ApiKey;
+            var options = await _lidarr.TestConnectionAsync(request.BaseUrl ?? "", key ?? "", ct);
             return Ok(new { ok = true, message = "Connected to Lidarr. Choices loaded.", options });
         }
         catch (Exception ex) { return BadRequest(new { ok = false, error = ex.Message }); }
@@ -2331,15 +2299,128 @@ public class AdminController : ControllerBase
     private record ServiceProbe(bool Ok, string Detail, bool Warning = false, bool Configured = true);
 
     /// <summary>
-    /// What a saved Navidrome admin password reads as through the admin API. The Last.fm shared
-    /// secret and each listener's Last.fm session key read the same way: they were added after
-    /// this was, and neither has ever gone out in clear. So does the slskd web password, which
-    /// signs in to slskd as its owner. Every other secret still goes out in clear, as it always has.
+    /// What a saved credential reads as through the admin API: every password, key, token and
+    /// webhook address in <see cref="SecretFields"/> and <see cref="SecretMaps"/>. None goes out
+    /// in clear, and a save that sends this back keeps what is saved.
     /// </summary>
     internal const string SecretPlaceholder = "(saved, not shown)";
 
+    /// <summary>Every credential among the settings, by section and key, with its name in words
+    /// for "Retype the whole ...". AdminSecretTests walks the settings types, so a new one cannot
+    /// go out in clear without failing it.</summary>
+    internal static readonly (string Section, string Key, string Words)[] SecretFields =
+    [
+        ("Subsonic", "AdminPassword", "admin password"),
+        ("Soulseek", "Password", "slskd password"),
+        ("Soulseek", "AcoustIdApiKey", "AcoustID application key"),
+        ("Soulseek", "AcoustIdUserApiKey", "AcoustID user key"),
+        ("Lidarr", "ApiKey", "Lidarr API key"),
+        ("LastFm", "ApiKey", "Last.fm API key"),
+        ("LastFm", "ApiSecret", "Last.fm shared secret"),
+        ("Notifications", "NtfyToken", "ntfy token"),
+        ("Notifications", "DiscordWebhookUrl", "Discord webhook address"),
+        ("ListenBrainz", "Token", "ListenBrainz token"),
+    ];
+
+    /// <summary>Credentials kept one per listener: section, map, and the field inside each entry,
+    /// or null when the entry itself is the credential.</summary>
+    internal static readonly (string Section, string Map, string? Field)[] SecretMaps =
+    [
+        ("LastFm", "UserSessions", "SessionKey"),
+        ("ListenBrainz", "UserTokens", null),
+    ];
+
     private static string MaskSecret(string? value) =>
         string.IsNullOrEmpty(value) ? "" : SecretPlaceholder;
+
+    /// <summary>Each listener's ListenBrainz token as the placeholder, names kept.</summary>
+    private static Dictionary<string, string> MaskTokens(IReadOnlyDictionary<string, string>? tokens) =>
+        (tokens ?? new Dictionary<string, string>())
+            .Where(pair => !string.IsNullOrEmpty(pair.Value))
+            .ToDictionary(pair => pair.Key, pair => SecretPlaceholder, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A settings patch with every echoed placeholder taken out, so what is saved stays: a
+    /// credential, or a listener's ListenBrainz token (kept from <paramref name="storedTokens"/>,
+    /// since that map is saved whole). The words to refuse it with when someone typed onto the end
+    /// of a placeholder, or null.
+    /// </summary>
+    internal static string? KeepSavedSecrets(JsonObject patch, IReadOnlyDictionary<string, string>? storedTokens)
+    {
+        foreach (var (section, name, words) in SecretFields)
+        {
+            if (Child(patch, section) is not JsonObject part || KeyOf(part, name) is not { } key
+                || part[key] is not JsonValue value || !value.TryGetValue<string>(out var text)
+                || !text.StartsWith(SecretPlaceholder, StringComparison.Ordinal))
+                continue;
+            if (text != SecretPlaceholder) return $"Retype the whole {words}; it was added to the hidden placeholder.";
+            part.Remove(key);
+        }
+        if (Child(patch, "ListenBrainz") is JsonObject listenBrainz && Child(listenBrainz, "UserTokens") is JsonObject tokens)
+            foreach (var user in tokens.Select(pair => pair.Key).ToList())
+            {
+                if (tokens[user] is not JsonValue value || !value.TryGetValue<string>(out var text)
+                    || !text.StartsWith(SecretPlaceholder, StringComparison.Ordinal))
+                    continue;
+                if (text != SecretPlaceholder) return $"Retype {user}'s whole ListenBrainz token; it was added to the hidden placeholder.";
+                var stored = storedTokens?.FirstOrDefault(pair => string.Equals(pair.Key, user, StringComparison.OrdinalIgnoreCase)).Value;
+                if (string.IsNullOrEmpty(stored)) tokens.Remove(user);
+                else tokens[user] = stored;
+            }
+        return null;
+    }
+
+    /// <summary>The words for the first credential in a Raw config document that still starts
+    /// with the placeholder once the placeholders are restored: someone typed onto its end.</summary>
+    internal static string? SecretTypedIntoPlaceholder(JsonObject incoming)
+    {
+        static bool Typed(JsonNode? node) =>
+            node is JsonValue value && value.TryGetValue<string>(out var text) && text.StartsWith(SecretPlaceholder, StringComparison.Ordinal);
+        foreach (var (section, name, words) in SecretFields)
+            if (Child(incoming, section) is JsonObject part && KeyOf(part, name) is { } key && Typed(part[key]))
+                return words;
+        if (Child(incoming, "ListenBrainz") is JsonObject listenBrainz && Child(listenBrainz, "UserTokens") is JsonObject tokens
+            && tokens.FirstOrDefault(pair => Typed(pair.Value)) is { Key: { } user })
+            return $"ListenBrainz token of {user}";
+        return null;
+    }
+
+    /// <summary>The credentials Octo runs with, shaped like the settings file: what Raw config
+    /// keeps when the file itself cannot be read.</summary>
+    private JsonObject RunningSecrets()
+    {
+        var soulseek = _soulseekOpts.CurrentValue;
+        var lastFm = _lastFmOpts.CurrentValue;
+        var notifications = _notificationOpts.CurrentValue;
+        var listenBrainz = _listenBrainzOpts?.CurrentValue;
+        return new JsonObject
+        {
+            ["Subsonic"] = new JsonObject { ["AdminPassword"] = _subsonicOpts.CurrentValue.AdminPassword },
+            ["Soulseek"] = new JsonObject
+            {
+                ["Password"] = soulseek.Password,
+                ["AcoustIdApiKey"] = soulseek.AcoustIdApiKey,
+                ["AcoustIdUserApiKey"] = soulseek.AcoustIdUserApiKey,
+            },
+            ["Lidarr"] = new JsonObject { ["ApiKey"] = _lidarrOpts.CurrentValue.ApiKey },
+            ["LastFm"] = new JsonObject
+            {
+                ["ApiKey"] = lastFm.ApiKey,
+                ["ApiSecret"] = lastFm.ApiSecret,
+                ["UserSessions"] = JsonSerializer.SerializeToNode(lastFm.UserSessions),
+            },
+            ["Notifications"] = new JsonObject
+            {
+                ["NtfyToken"] = notifications.NtfyToken,
+                ["DiscordWebhookUrl"] = notifications.DiscordWebhookUrl,
+            },
+            ["ListenBrainz"] = new JsonObject
+            {
+                ["Token"] = listenBrainz?.Token,
+                ["UserTokens"] = JsonSerializer.SerializeToNode(listenBrainz?.UserTokens ?? new Dictionary<string, string>()),
+            },
+        };
+    }
 
     /// <summary>
     /// Undo the placeholder in a Raw config document before it replaces the file: keep the stored
@@ -2348,9 +2429,20 @@ public class AdminController : ControllerBase
     /// </summary>
     internal static void RestoreSecretPlaceholders(JsonObject incoming, JsonObject existingFile)
     {
-        RestorePlaceholder(Child(incoming, "Subsonic"), Child(existingFile, "Subsonic"), "AdminPassword");
-        RestorePlaceholder(Child(incoming, "Soulseek"), Child(existingFile, "Soulseek"), "Password");
-        RestorePlaceholder(Child(incoming, "LastFm"), Child(existingFile, "LastFm"), "ApiSecret");
+        foreach (var (section, name, _) in SecretFields)
+            RestorePlaceholder(Child(incoming, section), Child(existingFile, section), name);
+
+        // Each listener's ListenBrainz token, by name; one only the environment has is dropped.
+        if (Child(incoming, "ListenBrainz") is JsonObject listenBrainz && Child(listenBrainz, "UserTokens") is JsonObject tokens)
+        {
+            var storedTokens = Child(existingFile, "ListenBrainz") is JsonObject storedListenBrainz
+                ? Child(storedListenBrainz, "UserTokens") : null;
+            foreach (var user in tokens.Select(pair => pair.Key).ToList())
+            {
+                RestorePlaceholder(tokens, storedTokens, user);
+                if (KeyOf(tokens, user) is null) tokens.Remove(user);
+            }
+        }
 
         // Each listener's session the same way, matched by username. An entry whose key is only
         // in the environment is dropped whole, so the environment keeps applying.
@@ -2421,14 +2513,13 @@ public class AdminController : ControllerBase
     internal static JsonObject RedactSecrets(JsonObject merged)
     {
         var copy = merged.DeepClone().AsObject();
-        MaskIn(Child(copy, "Subsonic"), "AdminPassword");
-        MaskIn(Child(copy, "Soulseek"), "Password");
-        if (Child(copy, "LastFm") is JsonObject lastFm)
+        foreach (var (section, name, _) in SecretFields) MaskIn(Child(copy, section), name);
+        foreach (var (section, map, field) in SecretMaps)
         {
-            MaskIn(lastFm, "ApiSecret");
-            if (Child(lastFm, "UserSessions") is JsonObject sessions)
-                foreach (var (_, session) in sessions)
-                    MaskIn(session as JsonObject, "SessionKey");
+            if (Child(copy, section) is not JsonObject part || Child(part, map) is not JsonObject entries) continue;
+            foreach (var key in entries.Select(pair => pair.Key).ToList())
+                if (field is null) MaskIn(entries, key);
+                else MaskIn(entries[key] as JsonObject, field);
         }
         return copy;
     }
