@@ -454,7 +454,9 @@ bold "─── Service health ────────────────�
 status_json=$(curl -sS -m 5 "http://localhost:5274/api/admin/status" 2>/dev/null || echo "{}")
 check_svc() {
   local name="$1" key="$2"
-  if echo "$status_json" | grep -q "\"$key\":{\"ok\":true"; then
+  if echo "$status_json" | grep -q "\"$key\":{\"ok\":true,\"configured\":false"; then
+    printf "  %-14s " "$name"; dim "- off (optional)"
+  elif echo "$status_json" | grep -q "\"$key\":{\"ok\":true"; then
     printf "  %-14s " "$name"; green "✓ ok"
   else
     local detail

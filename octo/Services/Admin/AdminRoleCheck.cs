@@ -10,9 +10,12 @@ namespace Octo.Services.Admin;
 /// <summary>
 /// A dashboard sign-in lasts 90 days, so once an hour per person Octo reads Navidrome's user list,
 /// as its own admin identity, and checks that person is still there and still an admin. Gone or no
-/// longer an admin ends every session of theirs. Navidrome unreachable, no admin identity, or a
-/// list that does not look like an admin's view never locks anyone out: Octo asks again in five
-/// minutes.
+/// longer an admin ends every session of theirs. Navidrome unreachable, or no admin login that can
+/// read the whole list, never locks anyone out: Octo asks again in five minutes.
+///
+/// Octo's token is whichever admin login it saw last, so it may be the demoted person's own. Then
+/// Navidrome shows it only that person, marked not an admin, which is answer enough; for anyone
+/// else Octo drops the token and asks again with the admin login in its settings.
 ///
 /// The list, not Subsonic getUser: Navidrome answers getUser only for the caller's own name, and an
 /// admin asking about anyone else gets error 50, so getUser can never say someone was demoted.
@@ -60,26 +63,42 @@ public sealed class AdminRoleCheck(
         {
             using var wait = CancellationTokenSource.CreateLinkedTokenSource(ct);
             wait.CancelAfter(AskFor);
-            var jwt = await identity.EnsureAdminJwtAsync(wait.Token);
-            if (string.IsNullOrEmpty(jwt)) return Role.Unknown;
+            // Twice at most: Octo's token is whichever admin login it saw last, so it can expire
+            // (a 401) or belong to someone Navidrome has since demoted (a non-admin's view). Either
+            // way it is dropped, and the second try logs in with the admin login in the settings.
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                var jwt = await identity.EnsureAdminJwtAsync(wait.Token);
+                if (string.IsNullOrEmpty(jwt)) return Role.Unknown;
 
-            var first = await ListAsync(url, jwt, wait.Token);
-            using var response = first.StatusCode == HttpStatusCode.Unauthorized
-                ? await RetryWithFreshTokenAsync(first, url, jwt, wait.Token)
-                : first;
-            if (response is not { IsSuccessStatusCode: true }) return Role.Unknown;
+                using var response = await ListAsync(url, jwt, wait.Token);
+                if (response.StatusCode == HttpStatusCode.Unauthorized)
+                {
+                    identity.InvalidateAdminJwt(jwt);
+                    continue;
+                }
+                if (!response.IsSuccessStatusCode) return Role.Unknown;
 
-            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(wait.Token));
-            if (doc.RootElement.ValueKind != JsonValueKind.Array) return Role.Unknown;
-            var users = doc.RootElement.EnumerateArray().ToList();
-            // A non-admin's view of the list is just themselves. Only an admin's view, which always
-            // holds at least one admin, can say that someone is missing.
-            if (!users.Any(IsAdmin)) return Role.Unknown;
-            var found = users.FirstOrDefault(entry =>
-                entry.TryGetProperty("userName", out var name)
-                && string.Equals(name.GetString(), user, StringComparison.OrdinalIgnoreCase));
-            if (found.ValueKind == JsonValueKind.Undefined) return Role.Gone;
-            return IsAdmin(found) ? Role.Admin : Role.NotAdmin;
+                using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(wait.Token));
+                if (doc.RootElement.ValueKind != JsonValueKind.Array) return Role.Unknown;
+                var users = doc.RootElement.EnumerateArray().ToList();
+                var found = users.FirstOrDefault(entry =>
+                    entry.TryGetProperty("userName", out var name)
+                    && string.Equals(name.GetString(), user, StringComparison.OrdinalIgnoreCase));
+
+                if (users.Any(IsAdmin))
+                {
+                    if (found.ValueKind == JsonValueKind.Undefined) return Role.Gone;
+                    return IsAdmin(found) ? Role.Admin : Role.NotAdmin;
+                }
+
+                // A non-admin's view: Navidrome shows a non-admin only themselves, so the token is
+                // no longer an admin's. If it is this person's own, it already says they are not
+                // an admin. Otherwise it cannot say anything about anyone else.
+                identity.InvalidateAdminJwt(jwt);
+                if (found.ValueKind != JsonValueKind.Undefined && !IsAdmin(found)) return Role.NotAdmin;
+            }
+            return Role.Unknown;
         }
         catch (Exception ex) when (ex is JsonException or HttpRequestException or OperationCanceledException)
         {
@@ -95,15 +114,5 @@ public sealed class AdminRoleCheck(
         using var request = new HttpRequestMessage(HttpMethod.Get, $"{url}/api/user");
         request.Headers.TryAddWithoutValidation("X-Nd-Authorization", $"Bearer {jwt}");
         return await httpFactory.CreateClient().SendAsync(request, ct);
-    }
-
-    // Octo's captured token expires; log in again once, as the playlist calls do.
-    private async Task<HttpResponseMessage?> RetryWithFreshTokenAsync(HttpResponseMessage refused, string url, string jwt, CancellationToken ct)
-    {
-        refused.Dispose();
-        identity.InvalidateAdminJwt(jwt);
-        var fresh = await identity.EnsureAdminJwtAsync(ct);
-        if (string.IsNullOrEmpty(fresh) || fresh == jwt) return null;
-        return await ListAsync(url, fresh, ct);
     }
 }

@@ -2270,7 +2270,8 @@ public class AdminController : ControllerBase
             object answer = new
             {
                 octo = new { ok = true },
-                services = probes.ToDictionary(kv => kv.Key, kv => (object)new { ok = kv.Value.Ok }),
+                // configured too, so an optional service nobody set up reads as off, not as working.
+                services = probes.ToDictionary(kv => kv.Key, kv => (object)new { ok = kv.Value.Ok, configured = kv.Value.Configured }),
                 time = DateTimeOffset.UtcNow.ToString("O"),
                 signedIn = false,
             };

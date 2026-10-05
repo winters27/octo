@@ -94,7 +94,7 @@ public class AdminSignInTests
         using var doc = JsonDocument.Parse(text);
         Assert.True(doc.RootElement.TryGetProperty("octo", out _));
         foreach (var service in doc.RootElement.GetProperty("services").EnumerateObject())
-            Assert.Equal(["ok"], service.Value.EnumerateObject().Select(p => p.Name));
+            Assert.Equal(["configured", "ok"], service.Value.EnumerateObject().Select(p => p.Name).Order());
     }
 
     [Fact]
@@ -272,6 +272,37 @@ public class AdminSignInTests
     }
 
     [Fact]
+    public async Task ADemotedAdminIsSignedOutEvenWhenOctosTokenIsTheirOwn()
+    {
+        // Found on a real starter stack: signing in made admin2's own login Octo's admin token, so
+        // after the demotion Octo checked admin2 with admin2's token, saw a non-admin's view, and
+        // let the session stand. That view is answer enough about admin2 themselves.
+        await using var factory = new SignInWebFactory();
+        using var admin2 = factory.CreateClient();
+        Assert.Equal(HttpStatusCode.OK, (await SignInAsync(admin2, "admin2", "pw")).StatusCode);
+
+        factory.Navidrome.Admin2Demoted = true;
+
+        Assert.Equal(HttpStatusCode.Unauthorized, (await admin2.GetAsync("/api/admin/settings")).StatusCode);
+    }
+
+    [Fact]
+    public async Task AStaleTokenIsDroppedAndTheSettingsLoginAsksAgain()
+    {
+        // Octo's token came from admin2, since demoted; checking someone else needs a real admin's
+        // view, so Octo logs in again with the admin login in its settings, as a starter stack has.
+        await using var factory = new SignInWebFactory(adminLoginInSettings: true);
+        using var admin2 = factory.CreateClient();
+        Assert.Equal(HttpStatusCode.OK, (await SignInAsync(admin2, "admin2", "pw")).StatusCode);
+        var demoted = factory.Sessions.Create("demoted");
+
+        factory.Navidrome.Admin2Demoted = true;
+
+        Assert.Equal(HttpStatusCode.Unauthorized, (await GetWithToken(factory, "/api/admin/settings", demoted)).StatusCode);
+        Assert.Null(factory.Sessions.UserOf(demoted));
+    }
+
+    [Fact]
     public async Task NobodyIsLockedOutWhenNavidromeCannotSay()
     {
         await using var factory = new SignInWebFactory();
@@ -421,7 +452,7 @@ public class AdminSignInTests
         JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement.Clone();
 
     /// <summary>Octo with the sign-in on (or the value given), a fake Navidrome, and its state in a temp folder.</summary>
-    private sealed class SignInWebFactory(string signIn = "required") : WebApplicationFactory<Program>
+    private sealed class SignInWebFactory(string signIn = "required", bool adminLoginInSettings = false) : WebApplicationFactory<Program>
     {
         private readonly string _directory = Path.Combine(Path.GetTempPath(), "octo-signin-" + Guid.NewGuid());
 
@@ -438,6 +469,9 @@ public class AdminSignInTests
             builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(new Dictionary<string, string?>
             {
                 ["Admin:SignIn"] = signIn,
+                // The admin login a starter stack writes, which Octo can always log in again with.
+                ["Subsonic:AdminUsername"] = adminLoginInSettings ? "admin" : null,
+                ["Subsonic:AdminPassword"] = adminLoginInSettings ? "pw" : null,
                 ["Subsonic:Url"] = "http://navidrome.test",
                 ["Subsonic:AutoDetectDownloadPath"] = "false",
                 ["Library:DownloadPath"] = _directory,
@@ -482,6 +516,7 @@ public class AdminSignInTests
         public int UserListCalls => Volatile.Read(ref _userListCalls);
         public bool UserListFails { get; set; }
         public bool UserListAsListener { get; set; }
+        public bool Admin2Demoted { get; set; }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
@@ -494,10 +529,10 @@ public class AdminSignInTests
                 using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellationToken));
                 var user = body.RootElement.GetProperty("username").GetString();
                 var password = body.RootElement.GetProperty("password").GetString();
-                if (password != "pw" || user is not ("admin" or "listener")) return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+                if (password != "pw" || user is not ("admin" or "admin2" or "listener")) return new HttpResponseMessage(HttpStatusCode.Unauthorized);
                 return Answer(JsonSerializer.Serialize(new
                 {
-                    id = user, name = user, username = user, isAdmin = user == "admin",
+                    id = user, name = user, username = user, isAdmin = user == "admin" || (user == "admin2" && !Admin2Demoted),
                     token = "jwt-" + user, subsonicSalt = "salt", subsonicToken = "token-" + user,
                 }));
             }
@@ -524,7 +559,10 @@ public class AdminSignInTests
                 Interlocked.Increment(ref _userListCalls);
                 if (UserListFails) return new HttpResponseMessage(HttpStatusCode.InternalServerError);
                 var auth = request.Headers.TryGetValues("X-Nd-Authorization", out var values) ? values.Single() : "";
-                if (auth != "Bearer jwt-admin") return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+                // admin2's own token after Navidrome demoted admin2: a non-admin sees only themselves.
+                if (auth == "Bearer jwt-admin2" && Admin2Demoted)
+                    return Answer(JsonSerializer.Serialize(new object[] { new { userName = "admin2", isAdmin = false } }));
+                if (auth is not ("Bearer jwt-admin" or "Bearer jwt-admin2")) return new HttpResponseMessage(HttpStatusCode.Unauthorized);
                 object[] users = UserListAsListener
                     ? [new { userName = "listener", isAdmin = false }]
                     :
@@ -533,6 +571,7 @@ public class AdminSignInTests
                         new { userName = "other-admin", isAdmin = true },
                         new { userName = "listener", isAdmin = false },
                         new { userName = "demoted", isAdmin = false },
+                        new { userName = "admin2", isAdmin = !Admin2Demoted },
                     ];
                 return Answer(JsonSerializer.Serialize(users));
             }
