@@ -148,6 +148,31 @@ public sealed class AdminSecretTests
     }
 
     [Fact]
+    public void ASavedCredentialNeverFollowsANewAddressItWasNotTypedFor()
+    {
+        var placeholder = AdminController.SecretPlaceholder;
+        var running = new Dictionary<string, string>
+        {
+            ["Lidarr:BaseUrl"] = "http://lidarr:8686", ["Lidarr:ApiKey"] = "stored-key",
+            ["Notifications:NtfyUrl"] = "https://ntfy.sh/octo", ["Notifications:NtfyToken"] = "tk_stored",
+        };
+        string? Current(string section, string name) => running.GetValueOrDefault($"{section}:{name}");
+        JsonObject Patch(string json) => JsonNode.Parse(json)!.AsObject();
+
+        Assert.Equal("Retype the Lidarr API key for the new address.", AdminController.SecretSentElsewhere(
+            Patch($$"""{ "Lidarr": { "BaseUrl": "http://elsewhere:8686", "ApiKey": "{{placeholder}}" } }"""), Current));
+        Assert.Equal("Retype the ntfy token for the new address.", AdminController.SecretSentElsewhere(
+            Patch("""{ "Notifications": { "NtfyUrl": "https://elsewhere.example/octo" } }"""), Current));
+        // The same address, a retyped key, or nothing saved yet: nothing to keep from anyone.
+        Assert.Null(AdminController.SecretSentElsewhere(
+            Patch($$"""{ "Lidarr": { "BaseUrl": "http://lidarr:8686/", "ApiKey": "{{placeholder}}" } }"""), Current));
+        Assert.Null(AdminController.SecretSentElsewhere(
+            Patch("""{ "Lidarr": { "BaseUrl": "http://elsewhere:8686", "ApiKey": "typed-key" } }"""), Current));
+        Assert.Null(AdminController.SecretSentElsewhere(
+            Patch($$"""{ "Soulseek": { "BaseUrl": "http://slskd:5030", "Password": "{{placeholder}}" } }"""), Current));
+    }
+
+    [Fact]
     public void RawConfigPutsBackEveryCredentialItHidAndEchoesNone()
     {
         var placeholder = AdminController.SecretPlaceholder;

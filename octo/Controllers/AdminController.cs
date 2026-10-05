@@ -1010,6 +1010,11 @@ public class AdminController : ControllerBase
             if (validationError is not null) return BadRequest(new { error = validationError });
         }
 
+        // A saved credential never follows a new address it was not typed again for: with the
+        // admin API open to the LAN, that would hand it to whatever server the address names.
+        if (SecretSentElsewhere(patch, (section, name) => _config[$"{section}:{name}"]) is { } elsewhere)
+            return BadRequest(new { error = elsewhere });
+
         // The form echoes the placeholder back when the admin password was left alone; that means
         // "keep what is saved", so it must not be written. Anything typed after the placeholder
         // would otherwise be saved as the password.
@@ -1990,6 +1995,8 @@ public class AdminController : ControllerBase
             var existing = _settings.IsReadable()
                 ? _settings.Load()
                 : RunningSecrets();
+            if (SecretSentElsewhere(parsed, (section, name) => _config[$"{section}:{name}"]) is { } elsewhere)
+                return BadRequest(new { error = elsewhere });
             RestoreSecretPlaceholders(parsed, existing);
             if (SecretTypedIntoPlaceholder(parsed) is { } typedSecret)
                 return BadRequest(new { error = $"Retype the whole {typedSecret}; it was added to the hidden placeholder." });
@@ -2321,6 +2328,37 @@ public class AdminController : ControllerBase
         ("Notifications", "DiscordWebhookUrl", "Discord webhook address"),
         ("ListenBrainz", "Token", "ListenBrainz token"),
     ];
+
+    /// <summary>Credentials that are sent to an address the settings also hold.</summary>
+    internal static readonly (string Section, string Address, string Key, string Words)[] SecretAddresses =
+    [
+        ("Subsonic", "Url", "AdminPassword", "admin password"),
+        ("Soulseek", "BaseUrl", "Password", "slskd password"),
+        ("Lidarr", "BaseUrl", "ApiKey", "Lidarr API key"),
+        ("Notifications", "NtfyUrl", "NtfyToken", "ntfy token"),
+    ];
+
+    /// <summary>
+    /// The words to refuse a save with when it moves a server's address while keeping the saved
+    /// credential that goes to it (the placeholder sent back, or the field left out), or null.
+    /// <paramref name="current"/> reads a running value by section and key.
+    /// </summary>
+    internal static string? SecretSentElsewhere(JsonObject patch, Func<string, string, string?> current)
+    {
+        static string Address(string? value) => (value ?? "").Trim().TrimEnd('/');
+        foreach (var (section, address, name, words) in SecretAddresses)
+        {
+            if (Child(patch, section) is not JsonObject part || KeyOf(part, address) is not { } addressKey
+                || part[addressKey] is not JsonValue addressValue || !addressValue.TryGetValue<string>(out var newAddress))
+                continue;
+            if (string.Equals(Address(newAddress), Address(current(section, address)), StringComparison.OrdinalIgnoreCase)) continue;
+            if (string.IsNullOrEmpty(current(section, name))) continue;
+            var typed = KeyOf(part, name) is { } key && part[key] is JsonValue value && value.TryGetValue<string>(out var text)
+                && !text.StartsWith(SecretPlaceholder, StringComparison.Ordinal);
+            if (!typed) return $"Retype the {words} for the new address.";
+        }
+        return null;
+    }
 
     /// <summary>Credentials kept one per listener: section, map, and the field inside each entry,
     /// or null when the entry itself is the credential.</summary>
