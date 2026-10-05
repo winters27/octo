@@ -179,6 +179,14 @@ public sealed class SongFinder
         return _jobs.TryGetValue(id, out var job) && SameUser(job, user) ? Snapshot(job) : null;
     }
 
+    /// <summary>This person's looks, newest first, for the dashboard's progress cards.</summary>
+    public IReadOnlyList<FindSnapshot> ForUser(string user)
+    {
+        Prune();
+        return _jobs.Values.Where(job => SameUser(job, user)).Select(Snapshot)
+            .OrderByDescending(found => found.StartedAt).ToList();
+    }
+
     /// <summary>Waits for a look to end. Only tests need it.</summary>
     internal async Task<FindSnapshot?> WaitAsync(string id, TimeSpan limit)
     {

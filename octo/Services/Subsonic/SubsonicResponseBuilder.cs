@@ -572,7 +572,8 @@ public partial class SubsonicResponseBuilder
         });
     }
 
-    private static Dictionary<string, object?> EventJson(Octo.Services.Common.AcquisitionEvent line) => new()
+    /// <summary>One line of a download's log, for the apps and the dashboard alike.</summary>
+    public static Dictionary<string, object?> EventJson(Octo.Services.Common.AcquisitionEvent line) => new()
     {
         ["at"] = Utc(line.At),
         ["kind"] = line.Kind,

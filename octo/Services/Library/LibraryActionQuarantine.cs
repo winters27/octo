@@ -290,6 +290,14 @@ public sealed class LibraryActionQuarantine
         WriteManifest(quarantinePath, manifest with { Mappings = mappings });
     }
 
+    /// <summary>The names of the song's own files (its lyrics) waiting in the trash with it, which
+    /// a restore puts back too. Empty when there are none, or the manifest cannot be read.</summary>
+    public IReadOnlyList<string> SidecarNames(string quarantinePath) =>
+        (ReadManifest(quarantinePath)?.Sidecars ?? [])
+            .Where(sidecar => File.Exists(sidecar.QuarantinePath))
+            .Select(sidecar => Path.GetFileName(sidecar.OriginalPath))
+            .ToList();
+
     private void WriteManifest(string quarantinePath, QuarantineManifest manifest)
     {
         try

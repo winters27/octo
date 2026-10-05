@@ -653,12 +653,25 @@ public class AdminController : ControllerBase
         return Ok(new { ok = true, ended });
     }
 
-    /// <summary>The running log of songs Octo has fetched, newest first.</summary>
+    /// <summary>
+    /// The running log of songs Octo has fetched, newest first. Each entry's saved download log
+    /// stays out of the list (it can run to hundreds of lines); hasLog says one was kept, and
+    /// downloads/log reads it.
+    /// </summary>
     [HttpGet("downloads")]
     [AdminAppCall(adminOnly: true)]
     public IActionResult Downloads()
     {
-        return Ok(new { downloads = _history.GetRecent(200) });
+        var web = HttpContext.RequestServices.GetService<IOptions<Microsoft.AspNetCore.Mvc.JsonOptions>>()?.Value.JsonSerializerOptions
+                  ?? new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        var downloads = _history.GetRecent(200).Select(entry =>
+        {
+            var json = JsonSerializer.SerializeToNode(entry, web)!.AsObject();
+            json.Remove("log");
+            json["hasLog"] = entry.Log is { Count: > 0 };
+            return json;
+        }).ToList();
+        return Ok(new { downloads });
     }
 
     /// <summary>A file inside the music folder, or an artist and a title, to try the matching on.</summary>
@@ -1249,11 +1262,13 @@ public class AdminController : ControllerBase
     /// <summary>
     /// Every file library actions have moved, who asked, and where it went.
     ///
-    /// Session-gated, because it lists filenames and usernames. Read-only: there is deliberately
-    /// no endpoint here that deletes a quarantined file or applies an action on demand, since
-    /// /api/admin has no authentication of its own and those would be the wrong things to leave
-    /// reachable. The one exception is the Better quality page's upgrade queue, which needs a
-    /// Navidrome admin sign-in and acts as that person, who must be on the allowed list.
+    /// Session-gated, because it lists filenames and usernames. Read-only. Every /api/admin
+    /// endpoint now sits behind the dashboard sign-in, and the rule for anything that changes
+    /// library files on demand is: a Navidrome admin's own sign-in (never the recovery code),
+    /// acting as that person, who must pass the same gates as in the apps (library actions on,
+    /// on the allowed list, dry run only rehearses). That covers the Better quality page's upgrade
+    /// queue, Find songs picks, and Put back from Recently removed (AdminDownloadsController).
+    /// Nothing here ever deletes a quarantined file; the retention sweep alone does.
     /// </summary>
     [HttpGet("library-actions")]
     public IActionResult GetLibraryActions([FromHeader(Name = "X-Octo-Browse-Token")] string? token)

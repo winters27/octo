@@ -24,7 +24,17 @@ public sealed record SongLookup(string State, string? Detail,
 
 /// <summary>A song taken out of the library that is still in the server's trash.</summary>
 public sealed record TrashedSong(string Id, string Title, string Artist, string Album, string Username,
-    DateTime RemovedUtc, DateTime? GoneUtc);
+    DateTime RemovedUtc, DateTime? GoneUtc)
+{
+    /// <summary>The removal's entry in the library actions history, which Allow downloading again takes.</summary>
+    public string? Key { get; init; }
+
+    /// <summary>Whether this removal keeps the song from being downloaded again.</summary>
+    public bool BlocksDownloads { get; init; }
+
+    /// <summary>The song's own files (its lyrics) in the trash with it, by name.</summary>
+    public IReadOnlyList<string> Sidecars { get; init; } = [];
+}
 
 /// <summary>
 /// What the apps' Library health changes in a song's file, other than removing it: tags written
@@ -210,7 +220,12 @@ public sealed class LibraryEditService
             .GroupBy(e => e.NavidromeId).Select(group => group.First())
             .Select(e => new TrashedSong(e.NavidromeId, e.Title, e.Artist, e.Album, e.Username, e.AtUtc,
                 // The sweep goes by the day folder, so the file goes at the start of that day plus the days kept.
-                days > 0 ? e.AtUtc.Date.AddDays(days + 1) : null))
+                days > 0 ? e.AtUtc.Date.AddDays(days + 1) : null)
+            {
+                Key = e.Key,
+                BlocksDownloads = e.BlocksDownloads,
+                Sidecars = _quarantine.SidecarNames(e.QuarantinePath!),
+            })
             .Take(500)
             .ToList();
     }
