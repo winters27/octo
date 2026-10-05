@@ -59,6 +59,10 @@ public sealed class GenreBackfillWorker : BackgroundService
 
     public bool IsRunning => _store.Current.Status == GenreBackfillStatus.Running;
 
+    /// <summary>A run accepted and still reading the library before it turns Running. Without
+    /// it the dashboard reads the last run's answer right after Start and thinks nothing began.</summary>
+    public bool IsPending => Volatile.Read(ref _pending) == 1;
+
     /// <summary>The run the dashboard polls. Exposed here so the controller has one thing to
     /// talk to rather than needing the store as well.</summary>
     public GenreBackfillRun Current => _store.Current;

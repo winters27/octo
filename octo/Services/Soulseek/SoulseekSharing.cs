@@ -108,7 +108,15 @@ public sealed class SoulseekSharing
     }
 
     /// <summary>Starts a share rescan in slskd. Null when it started, otherwise why not.</summary>
-    public Task<string?> RescanAsync(CancellationToken ct) => _client.RescanSharesAsync(ct);
+    public async Task<string?> RescanAsync(CancellationToken ct)
+    {
+        var refused = await _client.RescanSharesAsync(ct);
+        if (refused is null) LastRescanUtc = DateTime.UtcNow;
+        return refused;
+    }
+
+    /// <summary>When a rescan last started from the dashboard, so the activity view watches it.</summary>
+    public DateTime? LastRescanUtc { get; private set; }
 
     /// <summary>
     /// Puts slskd's answers together. Any of them may be null, which reads as "slskd did not

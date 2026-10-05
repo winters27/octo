@@ -349,9 +349,13 @@ public class LocalLibraryService : ILocalLibraryService
     {
         try
         {
-            // Note: This endpoint works without authentication on most Subsonic/Navidrome servers
-            // when called from localhost.
-            var url = $"{_subsonicSettings.Url}/rest/getScanStatus?f=json";
+            // Navidrome answers getScanStatus only with a sign-in, so it gets the same admin
+            // identity startScan uses.
+            var auth = _navIdentity.GetScanAuth();
+            var url = auth is { } a
+                ? $"{_subsonicSettings.Url}/rest/getScanStatus?f=json&c=octo&v=1.16.1" +
+                  $"&u={Uri.EscapeDataString(a.user)}&t={a.token}&s={a.salt}"
+                : $"{_subsonicSettings.Url}/rest/getScanStatus?f=json";
             
             var response = await _httpClient.GetAsync(url);
             
@@ -366,14 +370,14 @@ public class LocalLibraryService : ILocalLibraryService
                     return new ScanStatus
                     {
                         Scanning = scanStatus.TryGetProperty("scanning", out var scanning) && scanning.GetBoolean(),
-                        Count = scanStatus.TryGetProperty("count", out var count) ? count.GetInt32() : null
+                        Count = scanStatus.TryGetProperty("count", out var count) && count.TryGetInt32(out var n) ? n : null
                     };
                 }
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error getting Subsonic scan status");
+            _logger.LogDebug(ex, "Error getting Subsonic scan status");
         }
         
         return null;
