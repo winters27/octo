@@ -1781,13 +1781,39 @@ async function showSessionTable(holder, path, head, row, summary = () => '') {
   }
 }
 
-document.getElementById('library-actions-refresh')?.addEventListener('click', () =>
-  showSessionTable(document.getElementById('library-actions-history'), '/api/admin/library-actions',
+function showLibraryActionsHistory() {
+  return showSessionTable(document.getElementById('library-actions-history'), '/api/admin/library-actions',
     ['Track', 'Action', 'Who', 'Result'], entry => `
             <span class="key">${esc(entry.artist)} - ${esc(entry.title)}</span>
             <span class="value">${esc(entry.action)}${entry.dryRun ? ' (rehearsal)' : ''}</span>
             <span class="value">${esc(entry.username)}</span>
-            <span class="value">${esc(entry.state)}${entry.detail ? `: ${esc(entry.detail)}` : ''}</span>`));
+            <span class="value">${esc(entry.state)}${entry.detail ? `: ${esc(entry.detail)}` : ''}${entry.blocksDownloads
+              ? ` <button type="button" class="btn btn-ghost btn-sm" data-allow-download="${esc(entry.key)}">Allow downloading again</button>`
+              : ''}</span>`);
+}
+
+document.getElementById('library-actions-refresh')?.addEventListener('click', showLibraryActionsHistory);
+
+// A song removed with Delete from disk is not downloaded again until it is put back, or allowed here.
+document.getElementById('library-actions-history')?.addEventListener('click', async event => {
+  const button = event.target.closest('[data-allow-download]');
+  if (!button) return;
+  button.disabled = true;
+  try {
+    const response = await api('/api/admin/library-actions/allow-download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: button.dataset.allowDownload }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    toast('It can be downloaded again.');
+    await showLibraryActionsHistory();
+  } catch (error) {
+    button.disabled = false;
+    toast(error.message, 'err');
+  }
+});
 
 const noticeStates = {
   Waiting: 'Waiting its turn',

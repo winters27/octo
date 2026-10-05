@@ -45,6 +45,14 @@ public sealed record LibraryActionEntry(
     /// <summary>A Delete of one copy of a song the library keeps another of, so not a song the
     /// person never wants again.</summary>
     public bool Copy { get; init; }
+
+    /// <summary>The admin chose Allow downloading again: a song removed from disk that may be
+    /// downloaded once more, while its file stays in the trash.</summary>
+    public bool DownloadAllowed { get; init; }
+
+    /// <summary>Whether this entry keeps the song from being downloaded again.</summary>
+    public bool BlocksDownloads =>
+        Action == LibraryAction.Delete && State == LibraryActionState.Applied && !DryRun && !Copy && !DownloadAllowed;
 }
 
 /// <summary>
@@ -154,11 +162,26 @@ public sealed class LibraryActionJournal : IDisposable
         // feat. Rihanna - Too Good"), but a live take of a deleted song is still its own song.
         var wanted = SongIdentity.MatchKey(artist, title);
         return _byKey.Values.Any(entry =>
-            entry.Action == LibraryAction.Delete
-            && entry.State == LibraryActionState.Applied
-            && !entry.DryRun
-            && !entry.Copy
-            && SongIdentity.MatchKey(entry.Artist, entry.Title) == wanted);
+            entry.BlocksDownloads && SongIdentity.MatchKey(entry.Artist, entry.Title) == wanted);
+    }
+
+    /// <summary>
+    /// The dashboard's Allow downloading again: the song this entry removed may be downloaded
+    /// once more. Every removal of the same song is lifted, since any one of them would still
+    /// refuse it. Answers how many were; 0 when the entry blocks nothing.
+    /// </summary>
+    public int AllowDownloads(string key)
+    {
+        if (!_byKey.TryGetValue(key, out var chosen) || !chosen.BlocksDownloads) return 0;
+        var song = SongIdentity.MatchKey(chosen.Artist, chosen.Title);
+        var lifted = 0;
+        foreach (var entry in _byKey.Values.Where(entry => entry.BlocksDownloads
+                     && SongIdentity.MatchKey(entry.Artist, entry.Title) == song).ToList())
+        {
+            Record(entry with { DownloadAllowed = true });
+            lifted++;
+        }
+        return lifted;
     }
 
     public IReadOnlyList<LibraryActionEntry> Pending() =>

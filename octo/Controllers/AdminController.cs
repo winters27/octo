@@ -1200,8 +1200,29 @@ public class AdminController : ControllerBase
                 entry.QuarantinePath,
                 resolution = entry.Resolution?.ToString(),
                 entry.AtUtc,
+                entry.Key,
+                // A song removed from disk that a download would refuse; Allow downloading again lifts it.
+                blocksDownloads = entry.BlocksDownloads,
             }),
         });
+    }
+
+    public sealed record AllowDownloadRequest(string? Key);
+
+    /// <summary>
+    /// The history's Allow downloading again: a song removed with Delete from disk may be
+    /// downloaded once more. Its file stays in the trash. Gated like the history it sits in.
+    /// </summary>
+    [HttpPost("library-actions/allow-download")]
+    public IActionResult AllowDownload([FromBody] AllowDownloadRequest request,
+        [FromHeader(Name = "X-Octo-Browse-Token")] string? token)
+    {
+        if (!HasBrowseSession(token))
+            return Unauthorized(new { error = "Sign in with your Navidrome admin account first." });
+        if (string.IsNullOrWhiteSpace(request.Key) || _libraryActionJournal.AllowDownloads(request.Key) == 0)
+            return BadRequest(new { error = "That song is not kept from downloading." });
+        _libraryActionJournal.Flush();
+        return Ok(new { ok = true });
     }
 
     /// <summary>

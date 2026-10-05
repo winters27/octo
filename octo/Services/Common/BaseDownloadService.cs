@@ -587,11 +587,13 @@ public abstract class BaseDownloadService : IDownloadService
             if (actionJournal?.IsNeverRequested(song.Artist, song.Title) == true)
             {
                 Logger.LogInformation(
-                    "Skipping '{Artist} - {Title}': it was removed with a library action, so it is "
-                    + "not requested again. Clear that entry from the dashboard to allow it.",
+                    "Skipping '{Artist} - {Title}': it was removed with Delete from disk, so it is not "
+                    + "downloaded again. Put it back from the trash, or choose Allow downloading again "
+                    + "beside it in the Library actions history on the dashboard.",
                     song.Artist, song.Title);
                 throw new InvalidOperationException(
-                    $"'{song.Artist} - {song.Title}' was deleted with a library action");
+                    $"'{song.Artist} - {song.Title}' was removed with Delete from disk, so it is not downloaded again; "
+                    + "put it back from the trash, or allow downloading it again in the dashboard's Library actions history");
             }
 
             // Snapshot before anything can correct it: with NameFromMatch off this is still what
