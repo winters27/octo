@@ -267,6 +267,7 @@ services:
     depends_on:
       - yt-dlp-shim
       - slskd
+      - octo-sonic
 
   # Wraps yt-dlp behind /search and /stream HTTP endpoints. Isolating the binary
   # in its own container prevents .NET process-management quirks from wedging
@@ -314,6 +315,23 @@ services:
       # self-updates when a 403 outlives a cache purge; this is what makes that
       # update outlive the next `docker compose up -d`.
       - ytdlp-bin:/opt/ytdlp
+
+  # Reads each song once and says how it sounds, for Sounds alike radio. Read-only on the
+  # music; each file is read by a child process, so a damaged one costs only itself.
+  octo-sonic:
+    build: ./sonic
+    container_name: octo-sonic
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      MUSIC_ROOT: /music
+      ANALYSE_CONCURRENCY: "1"
+    # Docker refuses a cap above the machine's CPUs, and compose up then fails, so the
+    # default is one. bliss uses about six threads a song.
+    cpus: ${SONIC_CPUS:-1}
+    volumes:
+      - ${DOWNLOAD_PATH:-./downloads}:/music:ro
 
   # Soulseek client (slskd). Web UI on 5030, peer port 50300.
   # State (config, db, downloads-in-progress) persisted to ./slskd-state so the
