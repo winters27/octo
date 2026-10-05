@@ -581,6 +581,8 @@ app.Services.GetRequiredService<Octo.Services.Admin.RestartTracker>();
         else
             startLog.LogInformation("Locked out of the dashboard? The recovery code is in {Path}.", recovery.FilePath);
     }
+    if (adminPort > 0)
+        startLog.LogInformation("The dashboard answers only on port {Port} now; Octo's own port refuses it.", adminPort);
 }
 
 // Built now rather than on the first Subsonic request, so it is already listening when the

@@ -471,6 +471,10 @@ public class AdminController : ControllerBase
             var payload = JsonSerializer.Serialize(new { username = req.Username, password = req.Password });
             using var content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
             using var resp = await http.PostAsync($"{url}/auth/login", content, ct);
+            // Navidrome's own limit (5 sign-ins per 20 seconds per address) counts every sign-in
+            // through Octo as Octo's, so say so rather than calling the password wrong.
+            if (resp.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                return StatusCode(429, new { error = "Navidrome is limiting sign-ins right now. Wait half a minute and try again." });
             if (!resp.IsSuccessStatusCode)
             {
                 throttle?.Failed(tryKey);

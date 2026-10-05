@@ -206,7 +206,9 @@ The dashboard asks for a **Navidrome admin** account. Octo checks it with your N
 never keeps the password. A browser stays signed in for 90 days after its last visit, across
 restarts. **Sign out** at the bottom of the sidebar ends it now, and **Sign out everywhere**
 ends every browser and script signed in as you. Octo also ends them within an hour of
-Navidrome removing your admin role or your account.
+Navidrome removing your admin role or your account, as long as Octo has its own Navidrome admin
+sign-in: the admin login on the **Music server** page, or a dashboard sign-in in the last day or
+so.
 
 - **Locked out?** If Navidrome is down or its address is wrong, choose **Use the recovery
   code** and type the code from `admin-recovery-code` in Octo's config folder

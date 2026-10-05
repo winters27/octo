@@ -1989,7 +1989,8 @@ document.getElementById('review-sweep-reset')?.addEventListener('click', async (
   reviewSweepPost(button, '/api/admin/review-sweep/reset', 'Starting over.');
 });
 ready.then(loadReviewSweep);
-setInterval(() => { if (document.visibilityState === 'visible') loadReviewSweep(); }, 30000);
+// Not while the sign-in screen is up: every refused poll would wait behind it and fire at once after.
+setInterval(() => { if (document.visibilityState === 'visible' && !gatePromise) loadReviewSweep(); }, 30000);
 
 const upgradeOutcomes = { Applied: 'upgraded', Failed: 'no better copy found', Rehearsed: 'dry run',
   Skipped: 'skipped', Unresolved: 'file not found', Nothing: 'nothing left to try' };

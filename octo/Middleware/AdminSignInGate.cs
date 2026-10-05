@@ -45,7 +45,7 @@ public static class AdminSignInGate
             {
                 var recovery = user == BrowseSessionStore.RecoveryUser;
                 if (!recovery && !await services.GetRequiredService<AdminRoleCheck>()
-                        .StillAdminAsync(user, services.GetRequiredService<SubsonicProxyService>(), context.RequestAborted))
+                        .StillAdminAsync(user, context.RequestAborted))
                 {
                     if (open)
                     {

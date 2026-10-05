@@ -253,25 +253,55 @@ public class AdminSignInTests
 
         var demoted = factory.Sessions.Create("demoted");
         var gone = factory.Sessions.Create("gone");
-        var flaky = factory.Sessions.Create("flaky");
 
         Assert.Equal(HttpStatusCode.Unauthorized, (await GetWithToken(factory, "/api/admin/settings", demoted)).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized, (await GetWithToken(factory, "/api/admin/settings", gone)).StatusCode);
         Assert.Null(factory.Sessions.UserOf(demoted));
         Assert.Null(factory.Sessions.UserOf(gone));
-        // Navidrome could not say, so nobody is locked out.
-        Assert.Equal(HttpStatusCode.OK, (await GetWithToken(factory, "/api/admin/settings", flaky)).StatusCode);
 
         // Asked once an hour, not on every call.
-        var asked = factory.Navidrome.GetUserCalls;
+        var asked = factory.Navidrome.UserListCalls;
         Assert.Equal(HttpStatusCode.OK, (await admin.GetAsync("/api/admin/settings")).StatusCode);
         Assert.Equal(HttpStatusCode.OK, (await admin.GetAsync("/api/admin/settings")).StatusCode);
-        Assert.Equal(asked + 1, factory.Navidrome.GetUserCalls);
+        Assert.Equal(asked + 1, factory.Navidrome.UserListCalls);
         var check = factory.Services.GetRequiredService<AdminRoleCheck>();
         var later = DateTime.UtcNow.AddMinutes(61);
         check.Clock = () => later;
         Assert.Equal(HttpStatusCode.OK, (await admin.GetAsync("/api/admin/settings")).StatusCode);
-        Assert.Equal(asked + 2, factory.Navidrome.GetUserCalls);
+        Assert.Equal(asked + 2, factory.Navidrome.UserListCalls);
+    }
+
+    [Fact]
+    public async Task NobodyIsLockedOutWhenNavidromeCannotSay()
+    {
+        await using var factory = new SignInWebFactory();
+        using var admin = factory.CreateClient();
+        Assert.Equal(HttpStatusCode.OK, (await SignInAsync(admin, "admin", "pw")).StatusCode);
+
+        // The list fails outright.
+        factory.Navidrome.UserListFails = true;
+        var first = factory.Sessions.Create("stranger");
+        Assert.Equal(HttpStatusCode.OK, (await GetWithToken(factory, "/api/admin/settings", first)).StatusCode);
+
+        // The list comes back as a non-admin's view (just one listener): it cannot say anyone is missing.
+        factory.Navidrome.UserListFails = false;
+        factory.Navidrome.UserListAsListener = true;
+        var second = factory.Sessions.Create("someone-else");
+        Assert.Equal(HttpStatusCode.OK, (await GetWithToken(factory, "/api/admin/settings", second)).StatusCode);
+        Assert.Equal("someone-else", factory.Sessions.UserOf(second));
+    }
+
+    [Fact]
+    public async Task ABrowserThatNeverSignedInIsToldSoWithoutAPrompt()
+    {
+        await using var factory = new SignInWebFactory();
+        using var client = factory.CreateClient();
+
+        using var response = await client.GetAsync("/api/admin/browse/session");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var session = await Json(response);
+        Assert.False(session.GetProperty("signedIn").GetBoolean());
+        Assert.False(session.GetProperty("signInOff").GetBoolean());
     }
 
     [Fact]
@@ -448,8 +478,10 @@ public class AdminSignInTests
     /// <summary>The few Navidrome answers the sign-in needs; anything else is a 404.</summary>
     internal sealed class FakeNavidrome : HttpMessageHandler
     {
-        private int _getUserCalls;
-        public int GetUserCalls => Volatile.Read(ref _getUserCalls);
+        private int _userListCalls;
+        public int UserListCalls => Volatile.Read(ref _userListCalls);
+        public bool UserListFails { get; set; }
+        public bool UserListAsListener { get; set; }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
@@ -473,16 +505,36 @@ public class AdminSignInTests
             if (path.StartsWith("/rest/ping", StringComparison.Ordinal))
                 return Q("p") == "pw" && Q("u") is "admin" or "listener" ? Subsonic("\"status\":\"ok\"") : Failed(40);
 
+            // As real Navidrome does: getUser answers only for the caller's own name, and anyone else,
+            // even asked by an admin, is error 50. (server/subsonic/users.go)
             if (path.StartsWith("/rest/getUser", StringComparison.Ordinal))
             {
-                Interlocked.Increment(ref _getUserCalls);
-                return Q("username") switch
+                if (!string.Equals(Q("username"), Q("u"), StringComparison.OrdinalIgnoreCase)) return Failed(50);
+                return Q("u") switch
                 {
-                    "admin" or "other-admin" => Subsonic("\"status\":\"ok\",\"user\":{\"adminRole\":true}"),
-                    "listener" or "demoted" => Subsonic("\"status\":\"ok\",\"user\":{\"adminRole\":false}"),
-                    "gone" => Failed(70),
-                    _ => new HttpResponseMessage(HttpStatusCode.InternalServerError),
+                    "admin" => Subsonic("\"status\":\"ok\",\"user\":{\"adminRole\":true}"),
+                    "listener" => Subsonic("\"status\":\"ok\",\"user\":{\"adminRole\":false}"),
+                    _ => Failed(40),
                 };
+            }
+
+            // The native user list, an admin's token sees everyone. (server/nativeapi, model/user.go)
+            if (path == "/api/user")
+            {
+                Interlocked.Increment(ref _userListCalls);
+                if (UserListFails) return new HttpResponseMessage(HttpStatusCode.InternalServerError);
+                var auth = request.Headers.TryGetValues("X-Nd-Authorization", out var values) ? values.Single() : "";
+                if (auth != "Bearer jwt-admin") return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+                object[] users = UserListAsListener
+                    ? [new { userName = "listener", isAdmin = false }]
+                    :
+                    [
+                        new { userName = "admin", isAdmin = true },
+                        new { userName = "other-admin", isAdmin = true },
+                        new { userName = "listener", isAdmin = false },
+                        new { userName = "demoted", isAdmin = false },
+                    ];
+                return Answer(JsonSerializer.Serialize(users));
             }
 
             return new HttpResponseMessage(HttpStatusCode.NotFound);
