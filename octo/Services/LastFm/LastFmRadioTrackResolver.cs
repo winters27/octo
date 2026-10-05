@@ -87,23 +87,7 @@ public sealed class LastFmRadioTrackResolver
                 if (string.IsNullOrEmpty(id) || !IsSameRecording(artist, title, hitArtist, hitTitle))
                     continue;
 
-                return new Song
-                {
-                    Id = id,
-                    Title = hitTitle,
-                    Artist = hitArtist,
-                    ArtistId = NullableString(song, "artistId"),
-                    Album = String(song, "album"),
-                    AlbumId = NullableString(song, "albumId"),
-                    Duration = Integer(song, "duration"),
-                    Year = Integer(song, "year"),
-                    Track = Integer(song, "track"),
-                    Genre = NullableString(song, "genre"),
-                    Suffix = NullableString(song, "suffix"),
-                    BitRate = Integer(song, "bitRate"),
-                    Isrcs = Texts(song, "isrc"),
-                    IsLocal = true,
-                };
+                return LibrarySong(song);
             }
         }
         catch (Exception ex)
@@ -112,6 +96,116 @@ public sealed class LastFmRadioTrackResolver
         }
         return null;
     }
+
+    /// <summary>
+    /// What a radio was started from in the library. Subsonic's getSimilarSongs takes a song, an
+    /// album or an artist id; an album is read as its first song, an artist as the name alone.
+    /// Null when Navidrome knows none of them for this listener.
+    /// </summary>
+    public async Task<LibrarySeed?> ReadSeedAsync(string id,
+        IReadOnlyDictionary<string, string> authenticatedParameters)
+    {
+        if (await ReadAsync("rest/getSong", id, authenticatedParameters, "song") is { } song)
+            return new LibrarySeed(LibrarySong(song), String(song, "artist"));
+        if (await ReadAsync("rest/getAlbum", id, authenticatedParameters, "album") is { } album)
+        {
+            var first = Songs(album).FirstOrDefault();
+            return first is null ? null : new LibrarySeed(first, String(album, "artist") is { Length: > 0 } name ? name : first.Artist);
+        }
+        if (await ReadAsync("rest/getArtist", id, authenticatedParameters, "artist") is { } artist
+            && String(artist, "name") is { Length: > 0 } artistName)
+            return new LibrarySeed(null, artistName);
+        return null;
+    }
+
+    /// <summary>
+    /// Library songs near a seed by its own tags: the rest of its album, which for a library
+    /// downloaded from playlists is the playlist, and songs sharing its genre. They lead a radio
+    /// Last.fm cannot place, so the radio keeps the seed's style (#78). Never the seed itself.
+    /// </summary>
+    public async Task<List<Song>> LibraryNeighboursAsync(Song seed, int count,
+        IReadOnlyDictionary<string, string> authenticatedParameters)
+    {
+        var sameAlbum = new List<Song>();
+        if (!string.IsNullOrEmpty(seed.AlbumId)
+            && await ReadAsync("rest/getAlbum", seed.AlbumId, authenticatedParameters, "album") is { } album)
+        {
+            sameAlbum = Songs(album).Where(song => song.Id != seed.Id).ToList();
+            Random.Shared.Shuffle(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(sameAlbum));
+        }
+
+        var sameGenre = new List<Song>();
+        if (!string.IsNullOrWhiteSpace(seed.Genre))
+        {
+            var parameters = authenticatedParameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+            parameters.Remove("id");
+            parameters["genre"] = seed.Genre;
+            parameters["size"] = Math.Clamp(count, 1, 500).ToString();
+            parameters["f"] = "json";
+            try
+            {
+                var result = await _proxy.RelaySafeAsync("rest/getRandomSongs", parameters);
+                if (result.Success && result.Body is { Length: > 0 })
+                {
+                    using var document = JsonDocument.Parse(result.Body);
+                    if (document.RootElement.TryGetProperty("subsonic-response", out var response)
+                        && response.TryGetProperty("randomSongs", out var random))
+                        sameGenre = Songs(random).Where(song => song.Id != seed.Id).ToList();
+                }
+            }
+            catch (Exception ex) { _logger.LogDebug(ex, "radio genre neighbours failed for {Genre}", seed.Genre); }
+        }
+
+        return Interleave([sameAlbum, sameGenre]).DistinctBy(song => song.Id).Take(count).ToList();
+    }
+
+    /// <summary>One from each list in turn, keeping each list's order, until all are spent.</summary>
+    public static IEnumerable<T> Interleave<T>(IReadOnlyList<IReadOnlyList<T>> lists)
+    {
+        for (var index = 0; lists.Any(list => index < list.Count); index++)
+            foreach (var list in lists)
+                if (index < list.Count) yield return list[index];
+    }
+
+    private async Task<JsonElement?> ReadAsync(string endpoint, string id,
+        IReadOnlyDictionary<string, string> authenticatedParameters, string element)
+    {
+        try
+        {
+            var parameters = authenticatedParameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+            parameters["id"] = id; parameters["f"] = "json";
+            var result = await _proxy.RelaySafeAsync(endpoint, parameters);
+            if (!result.Success || result.Body is not { Length: > 0 }) return null;
+            using var document = JsonDocument.Parse(result.Body);
+            return document.RootElement.TryGetProperty("subsonic-response", out var response)
+                && response.TryGetProperty(element, out var found) && found.ValueKind == JsonValueKind.Object
+                ? found.Clone() : null;
+        }
+        catch (Exception ex) { _logger.LogDebug(ex, "{Endpoint} failed for radio seed {Id}", endpoint, id); return null; }
+    }
+
+    private static List<Song> Songs(JsonElement parent) =>
+        parent.TryGetProperty("song", out var songs) && songs.ValueKind == JsonValueKind.Array
+            ? songs.EnumerateArray().Where(song => String(song, "id").Length > 0).Select(LibrarySong).ToList()
+            : [];
+
+    private static Song LibrarySong(JsonElement song) => new()
+    {
+        Id = String(song, "id"),
+        Title = String(song, "title"),
+        Artist = String(song, "artist"),
+        ArtistId = NullableString(song, "artistId"),
+        Album = String(song, "album"),
+        AlbumId = NullableString(song, "albumId"),
+        Duration = Integer(song, "duration"),
+        Year = Integer(song, "year"),
+        Track = Integer(song, "track"),
+        Genre = NullableString(song, "genre"),
+        Suffix = NullableString(song, "suffix"),
+        BitRate = Integer(song, "bitRate"),
+        Isrcs = Texts(song, "isrc"),
+        IsLocal = true,
+    };
 
     /// <summary>
     /// Whether a library hit is the recording Last.fm recommended.
@@ -151,3 +245,8 @@ public sealed class LastFmRadioTrackResolver
                 .Select(item => item.GetString()!).ToList()
             : [];
 }
+
+/// <summary>A radio's starting point in the library.</summary>
+/// <param name="Song">The song, or an album's first song; null for an artist.</param>
+/// <param name="Artist">Whose radio it is, as the library credits them.</param>
+public sealed record LibrarySeed(Song? Song, string Artist);

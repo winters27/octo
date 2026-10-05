@@ -2914,6 +2914,7 @@ public partial class SubsonicController : ControllerBase
         // Get the seed song metadata
         string artistName = "";
         string trackTitle = "";
+        Song? librarySeed = null;
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(id);
 
@@ -2929,35 +2930,20 @@ public partial class SubsonicController : ControllerBase
         }
         else
         {
-            // Local song - get metadata from Navidrome
-            try
+            // A library song, or an album or artist, which Subsonic's getSimilarSongs also takes.
+            // Read with the caller's own credentials, so it is their library being asked.
+            var seed = await _radioTrackResolver.ReadSeedAsync(id, parameters);
+            if (seed is null)
             {
-                // Build parameters with auth from original request
-                var getSongParams = new Dictionary<string, string>(parameters)
-                {
-                    ["id"] = id,
-                    ["f"] = "json"
-                };
-                var result = await _proxyService.RelayAsync("rest/getSong", getSongParams);
-
-                var json = System.Text.Encoding.UTF8.GetString(result.Body);
-                var doc = JsonDocument.Parse(json);
-
-                if (doc.RootElement.TryGetProperty("subsonic-response", out var response) &&
-                    response.TryGetProperty("song", out var songElement))
-                {
-                    artistName = songElement.TryGetProperty("artist", out var artist) ? artist.GetString() ?? "" : "";
-                    trackTitle = songElement.TryGetProperty("title", out var title) ? title.GetString() ?? "" : "";
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to get song metadata for {Id}", id);
+                _logger.LogWarning("Could not read radio seed {Id} from Navidrome", id);
                 return _responseBuilder.CreateResponse(format, responseKey, new { });
             }
+            librarySeed = seed.Song;
+            artistName = seed.Artist;
+            trackTitle = seed.Song?.Title ?? "";
         }
 
-        if (string.IsNullOrEmpty(artistName) || string.IsNullOrEmpty(trackTitle))
+        if (string.IsNullOrEmpty(artistName) || (string.IsNullOrEmpty(trackTitle) && isExternal))
         {
             _logger.LogWarning("Could not get artist/title for song {Id}", id);
             return _responseBuilder.CreateResponse(format, responseKey, new { });
@@ -2969,16 +2955,43 @@ public partial class SubsonicController : ControllerBase
         _logger.LogInformation("Getting similar songs for {Artist} - {Title} (lookup: {LookA} - {LookT})",
             artistName, trackTitle, lookupArtist, lookupTitle);
 
-        var similarTracks = await _lastFmService.GetSimilarTracksAsync(lookupArtist, lookupTitle, count);
+        // An artist's radio is the songs of artists like them; a song's is songs like it.
+        var answer = trackTitle.Length == 0
+            ? new LastFmService.SimilarAnswer(
+                await _lastFmService.GetSimilarArtistTracksAsync(lookupArtist, count),
+                LastFmService.SimilarSource.SimilarArtists, ArtistTrusted: true)
+            : await _lastFmService.FindSimilarTracksAsync(lookupArtist, lookupTitle, count);
 
-        if (similarTracks.Count == 0)
+        // When Last.fm has nothing for this very song, the seed's own tags know its style better
+        // than a guess from its artist's name, which for a YouTube upload is only the channel's
+        // (#78). The rest of its album and its genre lead, Last.fm's songs for that genre come
+        // next, and the similar artists play only when Last.fm knows that artist for who they are.
+        var libraryLed = librarySeed is not null && answer.Source != LastFmService.SimilarSource.Song;
+        var neighbours = libraryLed
+            ? await _radioTrackResolver.LibraryNeighboursAsync(librarySeed!, count, parameters)
+            : [];
+        var genre = libraryLed ? PrimaryGenre(librarySeed!.Genre) : null;
+        var genreTracks = genre is not null
+            ? await _lastFmService.GetTagTopTracksAsync(genre, count)
+            : [];
+        var trusted = answer.Source == LastFmService.SimilarSource.Original
+            || (answer.Source == LastFmService.SimilarSource.SimilarArtists && answer.ArtistTrusted);
+        var lastFmTracks = !libraryLed || trusted || (neighbours.Count == 0 && genreTracks.Count == 0)
+            ? answer.Tracks
+            : [];
+        var candidateLists = new[] { genreTracks, lastFmTracks }.Where(list => list.Count > 0).ToList();
+        var share = candidateLists.Count == 0 ? 0 : (int)Math.Ceiling(count / (double)candidateLists.Count);
+        // Each Last.fm list is resolved only as far as it can still play.
+        var similarTracks = candidateLists.Select(list => list.Take(libraryLed ? share : count).ToList()).ToList();
+
+        if (neighbours.Count == 0 && similarTracks.All(list => list.Count == 0))
         {
             _logger.LogInformation("No similar tracks found from Last.fm");
             return _responseBuilder.CreateResponse(format, responseKey, new { });
         }
 
-        _logger.LogInformation("Found {Count} similar tracks from Last.fm; building radio queue",
-            similarTracks.Count);
+        _logger.LogInformation("Found {Count} similar tracks from Last.fm ({Source}, artist trusted: {Trusted}) and {Library} library neighbours; building radio queue",
+            similarTracks.Sum(list => list.Count), answer.Source, answer.ArtistTrusted, neighbours.Count);
 
         // For each Last.fm recommendation, prefer the local copy if we own it.
         // Tracks the user already has play at full FLAC quality from Navidrome
@@ -2987,24 +3000,30 @@ public partial class SubsonicController : ControllerBase
         // semaphore=10 cap, which fits comfortably inside Arpeggi's HTTP
         // budget.
         var sem = new SemaphoreSlim(10);
-        var resolveTasks = similarTracks.Take(count).Select(async track =>
-        {
-            await sem.WaitAsync();
-            try
+        async Task<List<Song>> ResolveAll(List<LastFmService.SimilarTrack> tracks) =>
+            (await Task.WhenAll(tracks.Select(async track =>
             {
-                return await _radioTrackResolver.ResolveAsync(
-                    track.Artist, track.Title, track.Duration, parameters);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "radio resolve failed for {Artist} - {Title}", track.Artist, track.Title);
-                return null;
-            }
-            finally { sem.Release(); }
-        }).ToList();
-        var resolvedSongs = LastFmRadioSpacing.Spread(
-            (await Task.WhenAll(resolveTasks)).Where(s => s != null).Cast<Song>().ToList(),
-            s => s.Artist, artistName);
+                await sem.WaitAsync();
+                try
+                {
+                    return await _radioTrackResolver.ResolveAsync(
+                        track.Artist, track.Title, track.Duration, parameters);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "radio resolve failed for {Artist} - {Title}", track.Artist, track.Title);
+                    return null;
+                }
+                finally { sem.Release(); }
+            }))).Where(s => s != null).Cast<Song>().ToList();
+        var resolvedLists = (await Task.WhenAll(similarTracks.Select(ResolveAll))).ToList();
+
+        // A library-led radio keeps its order: its neighbours often share the seed's artist (one
+        // uploader for a whole playlist), and spacing by artist would push every one of them back.
+        var resolvedSongs = libraryLed
+            ? LastFmRadioTrackResolver.Interleave([neighbours, .. resolvedLists])
+                .Where(song => song.Id != id).DistinctBy(song => song.Id).Take(count).ToList()
+            : LastFmRadioSpacing.Spread(resolvedLists.SelectMany(list => list).ToList(), s => s.Artist, artistName);
 
         var localCount = resolvedSongs.Count(s => s.IsLocal);
         var externalCount = resolvedSongs.Count - localCount;
@@ -3024,6 +3043,16 @@ public partial class SubsonicController : ControllerBase
         _ = _metadataService.PrewarmYouTubeIdsAsync(resolvedSongs, topN: 8);
 
         return BuildSimilarSongsResponse(format, resolvedSongs, responseKey);
+    }
+
+    /// <summary>The first of a song's genres, the one a tag lookup can use; null for none or a
+    /// placeholder.</summary>
+    internal static string? PrimaryGenre(string? genre)
+    {
+        var first = (genre ?? "").Split([';', '/', '|', ','], StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault();
+        return first is null || first.Equals("Unknown", StringComparison.OrdinalIgnoreCase)
+            || first.Equals("Other", StringComparison.OrdinalIgnoreCase) ? null : first;
     }
 
     private IActionResult BuildSimilarSongsResponse(string format, List<Song> songs, string responseKey)

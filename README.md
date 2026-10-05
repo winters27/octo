@@ -363,6 +363,16 @@ bounded 24-hour/512 MiB temporary cache. Unplayable tracks are rejected for 24 h
 and replaced through the normal refresh path; no prepared track is added to the music
 library. **Start radio from this song** remains a one-time `getSimilarSongs[2]` queue.
 
+That queue is Last.fm's songs like the seed, found by its artist and title. When Last.fm
+has nothing for that very song, as with a YouTube upload tagged with its uploader for the
+artist, the radio leads with the seed's own tags instead: the rest of its album (for a
+library downloaded from playlists, the playlist), library songs with its genre, then
+Last.fm's top songs for that genre. Artists like the seed's artist join only when Last.fm
+knows the artist, so an uploader's name never picks the music. A nightcore, sped up or
+remixed seed whose original Last.fm knows gets songs like the original too, behind its
+album and genre. A title written "Artist - Title" is also looked up under the artist it
+names. An album id starts from its first song, an artist id from artists like them.
+
 `GENRE_NORMALIZE` collapses the genres downloads arrive with into a list you can browse.
 Rules are a pattern-to-genre table applied **in order, first match wins**, edited in the
 dashboard (or as `Genre.Mappings` in settings JSON) because encoding structured rows in
@@ -690,7 +700,7 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | Endpoint | Why |
 |---|---|
 | `search3` | merge local + Last.fm-driven external songs and Deezer-driven external albums; later pages carry on through the outside songs page one started |
-| `getSimilarSongs2` | radio queue with local-first preference |
+| `getSimilarSongs2` | radio queue with local-first preference; a song Last.fm cannot place is led by its album and genre |
 | `getPlaylists`, `getPlaylist` | append authenticated per-user read-only Radio snapshots and materialize tracks local-first |
 | `createPlaylist`, `updatePlaylist`, `deletePlaylist` | protect reserved Radio IDs while relaying ordinary mutations |
 | `getInternetRadioStations` | append startup-warmed authenticated Octo stations immediately, with a one-starter same-request fallback, while preserving ordinary internet radio |
