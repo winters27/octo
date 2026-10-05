@@ -4819,6 +4819,8 @@ function sharePortText(port) {
   }
 }
 
+let shareScanTimer = null;
+
 function renderSharing(report) {
   const line = document.getElementById('share-line');
   const facts = document.getElementById('share-facts');
@@ -4826,15 +4828,24 @@ function renderSharing(report) {
   if (!line || !facts || !warnings) return;
 
   const shared = (report.folders || []).filter(folder => !folder.excluded);
+  const choice = report.switch || {};
+  const toggle = document.getElementById('share-switch');
+  if (toggle && !toggle.dataset.busy) {
+    toggle.checked = !!choice.on;
+    toggle.disabled = !report.reachable;
+  }
+  const outside = choice.control === 'Outside' ? ' slskd\'s shares are set outside Octo, so the switch above stands aside.' : '';
   if (!report.reachable) line.textContent = 'Octo cannot reach slskd right now.';
-  else if (shared.length === 0) line.textContent = 'You share nothing yet.';
+  else if (shared.length === 0 && !choice.on && choice.control !== 'Outside')
+    line.textContent = 'Sharing is off, so nothing in your library is shared. Many people on Soulseek send files more readily to someone who shares, so turning it on can help your own downloads.';
+  else if (shared.length === 0) line.textContent = `You share nothing yet.${outside}`;
   else {
     let text = report.files == null ? 'Sharing.'
       : `Sharing ${sharePlural(report.files, 'file')} in ${sharePlural(report.directories ?? 0, 'folder')}.`;
     if (report.scanning) text += ` slskd is looking through your folders now${report.scanProgress != null ? ` (${Math.round(report.scanProgress * 100)}%)` : ''}.`;
     if (report.networkFiles != null && report.files != null && report.networkFiles !== report.files && !report.scanning)
       text += ` Soulseek has ${sharePlural(report.networkFiles, 'file')} on record for you.`;
-    line.textContent = text;
+    line.textContent = text + outside;
   }
 
   const rows = [];
@@ -4865,6 +4876,11 @@ function renderSharing(report) {
   warnings.hidden = list.length === 0;
 
   document.getElementById('share-rescan').disabled = !report.reachable || shared.length === 0 || report.scanning;
+
+  // While slskd looks through the folders, look again every few seconds until the count settles.
+  clearTimeout(shareScanTimer);
+  if (report.scanning && document.querySelector('[data-pane="soulseek"].active'))
+    shareScanTimer = setTimeout(() => loadSharing(), 4000);
   document.getElementById('share-test-port').disabled = !report.reachable || report.port?.state === 'Off' || report.listenPort == null;
 }
 
@@ -4886,6 +4902,32 @@ async function loadSharing({ testPort = false } = {}) {
 }
 
 document.getElementById('share-refresh')?.addEventListener('click', () => loadSharing());
+document.getElementById('share-switch')?.addEventListener('change', async event => {
+  const toggle = event.currentTarget;
+  const on = toggle.checked;
+  toggle.dataset.busy = '1';
+  toggle.disabled = true;
+  note(document.getElementById('share-line'), on ? 'Turning sharing on…' : 'Turning sharing off…', 'busy');
+  try {
+    const r = await api('/api/admin/soulseek/sharing/share', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+    delete toggle.dataset.busy;
+    renderSharing(body);
+    const problem = body.switch?.problem;
+    if (problem) note(document.getElementById('share-line'), 'Saved, but slskd did not take it. See the note below.', 'error');
+    else note(document.getElementById('share-line'), on ? 'Sharing is on. slskd is looking through your library.' : 'Sharing is off. Nothing is shared.', 'ok');
+  } catch (e) {
+    delete toggle.dataset.busy;
+    toggle.checked = !on;
+    toggle.disabled = false;
+    note(document.getElementById('share-line'), e.message || 'Octo did not answer.', 'error');
+  }
+});
 document.getElementById('share-test-port')?.addEventListener('click', async event => {
   const button = event.currentTarget;
   button.disabled = true;

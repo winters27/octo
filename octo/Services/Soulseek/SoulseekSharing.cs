@@ -48,13 +48,19 @@ public sealed record SharingReport(
     UploadActivity Uploads,
     int? ListenPort,
     PortCheckResult Port,
+    ShareSwitchState Switch,
     IReadOnlyList<SharingWarning> Warnings);
+
+/// <summary>The Share my library switch: what it is set to, who decides slskd's shares, and why the
+/// switch could not do its job the last time it tried, if it could not.</summary>
+public sealed record ShareSwitchState(bool On, ShareControl Control, string? Problem);
 
 /// <summary>
 /// Reads how slskd shares with the Soulseek network and says plainly what is wrong with it.
 /// Soulseek works because people share: many users refuse to send files to someone who shares
 /// nothing, and a closed listening port stops most people reaching you at all. Everything here
-/// reads; the only thing it can ask slskd to do is look through its shared folders again.
+/// reads, apart from asking slskd to look through its shared folders again; turning sharing on and
+/// off is SoulseekShareSwitch.
 /// </summary>
 public sealed class SoulseekSharing
 {
@@ -62,10 +68,14 @@ public sealed class SoulseekSharing
     private readonly SoulseekPortCheck _port;
     private readonly IOptionsMonitor<SoulseekSettings> _settings;
 
-    public SoulseekSharing(SoulseekClient client, SoulseekPortCheck port, IOptionsMonitor<SoulseekSettings> settings)
+    private readonly SoulseekShareSwitch _switch;
+
+    public SoulseekSharing(SoulseekClient client, SoulseekPortCheck port, SoulseekShareSwitch shareSwitch,
+        IOptionsMonitor<SoulseekSettings> settings)
     {
         _client = client;
         _port = port;
+        _switch = shareSwitch;
         _settings = settings;
         Read = (path, ct) => _client.ReadAsync(path, ct);
     }
@@ -75,8 +85,9 @@ public sealed class SoulseekSharing
     internal Func<DateTime> Clock { get; set; } = () => DateTime.UtcNow;
 
     /// <summary>The report as it stands. TestPort asks Soulseek's port test now rather than using
-    /// its last answer.</summary>
-    public async Task<SharingReport> ReportAsync(bool testPort, CancellationToken ct)
+    /// its last answer. ShareOn stands in for the saved switch just after it was flipped, before
+    /// the settings file has been read back.</summary>
+    public async Task<SharingReport> ReportAsync(bool testPort, CancellationToken ct, bool? shareOn = null)
     {
         var app = Read("application", ct);
         var options = Read("options", ct);
@@ -92,7 +103,8 @@ public sealed class SoulseekSharing
         var settings = _settings.CurrentValue;
         var defaultLogin = string.Equals(settings.Username?.Trim(), "slskd", StringComparison.Ordinal)
                            && string.Equals(settings.Password, "slskd", StringComparison.Ordinal);
-        return Build(app.Result, options.Result, shares.Result, uploads.Result, port, defaultLogin, Clock());
+        var shareSwitch = new ShareSwitchState(shareOn ?? settings.ShareLibrary, _switch.Control, _switch.Problem);
+        return Build(app.Result, options.Result, shares.Result, uploads.Result, port, shareSwitch, defaultLogin, Clock());
     }
 
     /// <summary>Starts a share rescan in slskd. Null when it started, otherwise why not.</summary>
@@ -103,12 +115,12 @@ public sealed class SoulseekSharing
     /// say", never as zero. No application answer at all means slskd is out of reach.
     /// </summary>
     internal static SharingReport Build(string? appJson, string? optionsJson, string? sharesJson,
-        string? uploadsJson, PortCheckResult port, bool defaultLogin, DateTime now)
+        string? uploadsJson, PortCheckResult port, ShareSwitchState shareSwitch, bool defaultLogin, DateTime now)
     {
         var none = new UploadActivity(0, 0, 0, 0, 0, 0, null);
         if (appJson is null)
             return new SharingReport(false, "Unknown", [], null, null, false, null, false, null, null, null, null, null,
-                none, null, port, [new SharingWarning("unreachable",
+                none, null, port, shareSwitch, [new SharingWarning("unreachable",
                     "Octo cannot reach slskd, so it cannot tell what you share.")]);
 
         var login = SoulseekClient.ParseServerReading(appJson).Link;
@@ -145,9 +157,13 @@ public sealed class SoulseekSharing
             warnings.Add(new("signedOut",
                 "slskd is not signed in to Soulseek right now, so nobody can download from you until it is."));
         var shared = folders.Where(folder => !folder.Excluded).ToList();
-        if (shared.Count == 0 && optionsJson is not null)
+        if (shareSwitch.Problem is { } problem)
+            warnings.Add(new("switch", problem));
+        // Sharing off by choice is a choice: the card says so plainly, and it is not a warning.
+        var offByChoice = !shareSwitch.On && shareSwitch.Control is ShareControl.Octo or ShareControl.Unknown;
+        if (shared.Count == 0 && optionsJson is not null && !offByChoice && shareSwitch.Problem is null)
             warnings.Add(new("nothingShared",
-                "You share nothing. Many people on Soulseek will not send files to someone who shares nothing, so your downloads fail more often. Share your music folder: see Sharing back on Soulseek in Octo's README."));
+                "You share nothing. Many people on Soulseek will not send files to someone who shares nothing, so your downloads fail more often."));
         else if (shared.Count > 0 && files == 0 && !scanning && !faulted)
             warnings.Add(new("emptyShares",
                 $"slskd shares {string.Join(", ", shared.Select(folder => folder.Path))} but found no files there. Check that the folder is mounted into the slskd container, then rescan."));
@@ -155,11 +171,12 @@ public sealed class SoulseekSharing
             warnings.Add(new("scanFailed",
                 "slskd's last look through your shared folders failed. Rescan, and read slskd's log if it fails again."));
         if (port.State == PortState.Closed)
-            warnings.Add(new("portClosed",
-                $"Other people cannot connect to slskd on port {port.Port}. Forward TCP port {port.Port} on your router to this server. Until then, only people whose own port is open can download from you, and some of your downloads fail too."));
+            warnings.Add(new("portClosed", shared.Count > 0
+                ? $"Other people cannot connect to slskd on port {port.Port}. Forward TCP port {port.Port} on your router to this server. Until then, only people whose own port is open can download from you, and some of your downloads fail too."
+                : $"Other people cannot connect to slskd on port {port.Port}, so some of your downloads fail. Forward TCP port {port.Port} on your router to this server."));
 
         return new SharingReport(true, login.ToString(), folders, directories, files, scanning, progress, faulted,
-            networkFiles, networkDirectories, slots, speed, rescan, uploads, listenPort, port, warnings);
+            networkFiles, networkDirectories, slots, speed, rescan, uploads, listenPort, port, shareSwitch, warnings);
     }
 
     /// <summary>

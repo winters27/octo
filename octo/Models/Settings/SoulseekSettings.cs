@@ -39,6 +39,28 @@ public class SoulseekSettings
     /// </summary>
     public bool CheckListenPort { get; set; } = true;
 
+    /// <summary>
+    /// Share the music library with the Soulseek network, through slskd. On, Octo writes
+    /// SharedFolders into slskd's own settings file and has slskd look through them; off, it writes
+    /// an empty list, has slskd forget what it shared and cancels uploads still waiting or under
+    /// way. Applied within seconds, without a restart. Off here so an existing install never starts
+    /// sharing on an update by itself; the installer and .env.example turn it on for new ones.
+    /// Environment variable: SLSKD_SHARE_LIBRARY
+    /// </summary>
+    public bool ShareLibrary { get; set; } = false;
+
+    /// <summary>
+    /// What slskd shares while ShareLibrary is on, as slskd sees the folders, separated by ";".
+    /// "[Music]/share" is the library's read-only mount in the bundled compose file, shown to other
+    /// people as a folder named Music. A "!" in front keeps a folder out.
+    /// Environment variable: SLSKD_SHARED_DIR
+    /// </summary>
+    public string SharedFolders { get; set; } = "[Music]/share";
+
+    /// <summary>SharedFolders as a list, blanks dropped.</summary>
+    public IReadOnlyList<string> SharedFolderList =>
+        (SharedFolders ?? "").Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+
     /// <summary>WebUrl when it is an absolute http or https address, otherwise null.</summary>
     public string? EffectiveWebUrl => SafeWebUrl(WebUrl);
 
