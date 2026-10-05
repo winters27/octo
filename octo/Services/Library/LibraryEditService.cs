@@ -177,7 +177,7 @@ public sealed class LibraryEditService
     }
 
     /// <summary>Puts a removed song back where it was, from the server's trash.</summary>
-    public LibraryEditOutcome Restore(string id, string username)
+    public async Task<LibraryEditOutcome> RestoreAsync(string id, string username)
     {
         var entry = _actions.Recent(int.MaxValue).FirstOrDefault(e =>
             e.NavidromeId == id && e.Action == LibraryAction.Delete && !e.DryRun
@@ -187,6 +187,10 @@ public sealed class LibraryEditService
         if (DryRun) return new("rehearsed", $"Dry run: would put back {entry.SourcePath}");
         var restored = _quarantine.Restore(entry.QuarantinePath!, _resolver.MusicRoot());
         if (!restored.Moved) return new("failed", $"Could not put it back: {restored.Error}.");
+        // The outside songs Octo knew this file as point at it again, as before it was removed.
+        if (restored.Mappings is { Count: > 0 } mappings
+            && _services.GetService<Octo.Services.Local.ILocalLibraryService>() is { } library)
+            await library.RestoreMappingsAsync(mappings, restored.QuarantinePath!);
         _actions.Complete(entry.Key, LibraryActionState.Restored, $"Put back by {username}.");
         _actions.Flush();
         _rescan.Soon();

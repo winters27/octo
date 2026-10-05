@@ -262,7 +262,8 @@ public sealed class LibraryActionExecutor
             quarantinePath = moved.QuarantinePath;
             _journal.Complete(key, LibraryActionState.Pending, "Moved to quarantine; finishing.", quarantinePath);
             _journal.Flush();
-            await _library.ForgetMappingAsync(resolved.AbsolutePath);
+            // Kept in the trash note, so Put back links the outside song to the file again.
+            _quarantine.RecordMappings(quarantinePath!, await _library.ForgetMappingAsync(resolved.AbsolutePath));
             outcome = new(LibraryActionState.Applied, request.OnlyACopy
                 ? "Removed this copy. The song stays in the library."
                 : "Removed. It will not be downloaded again.");

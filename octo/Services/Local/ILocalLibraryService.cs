@@ -61,8 +61,13 @@ public interface ILocalLibraryService
     Task<LocalSongMapping?> FindMappingByTagsAsync(string? artist, string? title, string? album);
 
     /// <summary>Drop the mapping for a path Octo no longer owns, so a re-acquire is not
-    /// short-circuited by a file that has just been moved out of the library.</summary>
-    Task<bool> ForgetMappingAsync(string localPath);
+    /// short-circuited by a file that has just been moved out of the library. Answers the
+    /// mappings it dropped, so a song put back can have them again.</summary>
+    Task<IReadOnlyList<LocalSongMapping>> ForgetMappingAsync(string localPath);
+
+    /// <summary>Puts back mappings a removal dropped, pointing at the song's path again. A song
+    /// mapped anew since keeps its newer mapping.</summary>
+    Task RestoreMappingsAsync(IReadOnlyList<LocalSongMapping> mappings, string localPath);
 
     Task<bool> TriggerLibraryScanAsync(bool force = false);
     

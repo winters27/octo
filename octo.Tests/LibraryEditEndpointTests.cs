@@ -270,6 +270,28 @@ public sealed class LibraryEditEndpointTests
     }
 
     [Fact]
+    public async Task PutBack_LinksTheOutsideSongToTheFileAgain()
+    {
+        await using var factory = new Factory();
+        var path = factory.Song("s1", "Daft Punk/Discovery/03 - Digital Love.flac", "Digital Love", "Daft Punk", "Discovery");
+        using var client = factory.CreateClient();
+        var library = factory.Services.GetRequiredService<Octo.Services.Local.ILocalLibraryService>();
+        await library.RegisterDownloadedSongAsync(new Octo.Models.Domain.Song
+        {
+            ExternalProvider = "soulseek", ExternalId = "4H0vAhIr2YJ67Riz3Uv6wG", Title = "Digital Love", Artist = "Daft Punk",
+            Album = "Discovery", SourcePeer = "peer1",
+        }, path);
+
+        Assert.Equal("applied", State(await Call(client, "id=s1&action=remove")));
+        Assert.Null(await library.GetLocalPathForExternalSongAsync("soulseek", "4H0vAhIr2YJ67Riz3Uv6wG"));
+
+        Assert.Equal("applied", State(await Call(client, "id=s1&action=restore")));
+
+        Assert.Equal(path, await library.GetLocalPathForExternalSongAsync("soulseek", "4H0vAhIr2YJ67Riz3Uv6wG"));
+        Assert.Equal("peer1", (await library.GetMappingsAsync()).Single().SourcePeer);
+    }
+
+    [Fact]
     public async Task RemovingOneFormatOfASong_LeavesTheLyricsTheOtherCopyShares()
     {
         await using var factory = new Factory();

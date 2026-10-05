@@ -2743,7 +2743,7 @@ public partial class SubsonicController : ControllerBase
                 outcome = await edits!.UndoAsync(id, username!, none);
                 break;
             default:
-                outcome = edits!.Restore(id, username!);
+                outcome = await edits!.RestoreAsync(id, username!);
                 break;
         }
         _logger.LogInformation("Library {Action} for {Id} by {User} from the app: {State} - {Detail}",

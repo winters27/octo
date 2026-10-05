@@ -4,16 +4,20 @@ using Octo.Models.Settings;
 
 namespace Octo.Services.Library;
 
-public sealed record QuarantineResult(bool Moved, string? QuarantinePath, string? Error);
+/// <summary>A move into or out of the trash. A restore answers the outside-song mappings the
+/// removal dropped, for the library to have again.</summary>
+public sealed record QuarantineResult(bool Moved, string? QuarantinePath, string? Error,
+    IReadOnlyList<Octo.Services.Local.LocalSongMapping>? Mappings = null);
 
 /// <summary>A file of the song's own that went to the trash with it: where it was, and where it waits.</summary>
 public sealed record QuarantinedSidecar(string OriginalPath, string QuarantinePath);
 
 /// <summary>What is written next to a quarantined file so a restore works without the journal.
-/// Sidecars are the song's own files that went with it (its lyrics), put back with it.</summary>
+/// Sidecars are the song's own files that went with it (its lyrics), put back with it; Mappings
+/// the outside songs Octo knew the file as, which a removal forgets and a restore puts back.</summary>
 public sealed record QuarantineManifest(
     string OriginalPath, string NavidromeId, string Action, string Username, DateTime AtUtc,
-    IReadOnlyList<QuarantinedSidecar>? Sidecars = null);
+    IReadOnlyList<QuarantinedSidecar>? Sidecars = null, IReadOnlyList<Octo.Services.Local.LocalSongMapping>? Mappings = null);
 
 /// <summary>
 /// Moves a verified file out of the library instead of deleting it.
@@ -195,7 +199,7 @@ public sealed class LibraryActionQuarantine
             TryDelete(quarantinePath + ManifestSuffix);
 
             _logger.LogInformation("Library action restored {Path}", manifest.OriginalPath);
-            return new QuarantineResult(true, manifest.OriginalPath, null);
+            return new QuarantineResult(true, manifest.OriginalPath, null, manifest.Mappings);
         }
         catch (Exception ex)
         {
@@ -276,6 +280,14 @@ public sealed class LibraryActionQuarantine
             _logger.LogWarning("Library action could not move {Path} with its song: {M}", from, ex.Message);
             return false;
         }
+    }
+
+    /// <summary>Writes into a trashed song's note which outside songs Octo knew it as, so Put back
+    /// can tell the library again.</summary>
+    public void RecordMappings(string quarantinePath, IReadOnlyList<Octo.Services.Local.LocalSongMapping> mappings)
+    {
+        if (mappings.Count == 0 || ReadManifest(quarantinePath) is not { } manifest) return;
+        WriteManifest(quarantinePath, manifest with { Mappings = mappings });
     }
 
     private void WriteManifest(string quarantinePath, QuarantineManifest manifest)

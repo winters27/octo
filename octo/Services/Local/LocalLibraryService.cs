@@ -213,9 +213,9 @@ public class LocalLibraryService : ILocalLibraryService
     /// Without this, DownloadSongInternalAsync's existing-file short-circuit keeps pointing a
     /// re-acquire at the file that was just quarantined, and the replacement never happens.
     /// </summary>
-    public async Task<bool> ForgetMappingAsync(string localPath)
+    public async Task<IReadOnlyList<LocalSongMapping>> ForgetMappingAsync(string localPath)
     {
-        if (string.IsNullOrWhiteSpace(localPath)) return false;
+        if (string.IsNullOrWhiteSpace(localPath)) return [];
 
         var mappings = await LoadMappingsAsync();
         await _lock.WaitAsync();
@@ -223,12 +223,36 @@ public class LocalLibraryService : ILocalLibraryService
         {
             var stale = mappings
                 .Where(pair => string.Equals(pair.Value.LocalPath, localPath, StringComparison.OrdinalIgnoreCase))
-                .Select(pair => pair.Key).ToList();
-            if (stale.Count == 0) return false;
+                .ToList();
+            if (stale.Count == 0) return [];
 
-            foreach (var key in stale) mappings.Remove(key);
+            foreach (var (key, _) in stale) mappings.Remove(key);
             await SaveMappingsAsync(mappings);
-            return true;
+            return stale.Select(pair => pair.Value).ToList();
+        }
+        finally { _lock.Release(); }
+    }
+
+    public async Task RestoreMappingsAsync(IReadOnlyList<LocalSongMapping> mappings, string localPath)
+    {
+        if (mappings.Count == 0 || string.IsNullOrWhiteSpace(localPath)) return;
+
+        var current = await LoadMappingsAsync();
+        await _lock.WaitAsync();
+        try
+        {
+            var added = 0;
+            foreach (var mapping in mappings)
+            {
+                if (string.IsNullOrEmpty(mapping.ExternalProvider) || string.IsNullOrEmpty(mapping.ExternalId)) continue;
+                var key = $"{mapping.ExternalProvider}:{mapping.ExternalId}";
+                // Downloaded again while this one was in the trash: that copy is the song's now.
+                if (current.TryGetValue(key, out var newer) && File.Exists(newer.LocalPath)) continue;
+                mapping.LocalPath = localPath;
+                current[key] = mapping;
+                added++;
+            }
+            if (added > 0) await SaveMappingsAsync(current);
         }
         finally { _lock.Release(); }
     }
