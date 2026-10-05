@@ -140,6 +140,7 @@ services:
       # Radio's other sources (multi-source radio). Weights live on the dashboard's Radio page.
       RadioSources__YouTubeMusic: ${RADIO_YOUTUBE_MUSIC:-true}
       RadioSources__ListenBrainz: ${RADIO_LISTENBRAINZ:-true}
+      RadioSources__ListenBrainzAlgorithm: ${RADIO_LISTENBRAINZ_ALGORITHM:-session_based_days_9000_session_300_contribution_5_threshold_15_limit_50_skip_30}
       RadioSources__SoundsAlike: ${RADIO_SOUNDS_ALIKE:-true}
       RadioSources__SonicUrl: ${RADIO_SONIC_URL:-http://octo-sonic:8080}
       RadioSources__SonicPauseSeconds: ${RADIO_SONIC_PAUSE_SECONDS:-2}
@@ -264,10 +265,10 @@ services:
       # change. Bind-mounted to host so values survive `docker compose up`. The
       # update helper watches its update/ folder.
       - ${OCTO_CONFIG_DIR:-./octo-config}:/app/config
+    # Not octo-sonic: it is optional (the "sonic" profile), and Octo waits for it on its own.
     depends_on:
       - yt-dlp-shim
       - slskd
-      - octo-sonic
 
   # Wraps yt-dlp behind /search and /stream HTTP endpoints. Isolating the binary
   # in its own container prevents .NET process-management quirks from wedging
@@ -318,10 +319,15 @@ services:
 
   # Reads each song once and says how it sounds, for Sounds alike radio. Read-only on the
   # music; each file is read by a child process, so a damaged one costs only itself.
+  # Sounds alike. Started only with the "sonic" profile (COMPOSE_PROFILES=sonic in .env, as
+  # .env.example and install.sh set it), so a machine that cannot build or run it still runs Octo.
   octo-sonic:
     build: ./sonic
     container_name: octo-sonic
     restart: unless-stopped
+    profiles: ["sonic"]
+    # Passes docker stop's SIGTERM on and reaps the reader processes.
+    init: true
     expose:
       - "8080"
     environment:
@@ -330,6 +336,17 @@ services:
     # Docker refuses a cap above the machine's CPUs, and compose up then fails, so the
     # default is one. bliss uses about six threads a song.
     cpus: ${SONIC_CPUS:-1}
+    # A long file is decoded whole in memory; a limit keeps one from crowding out the rest.
+    mem_limit: 2g
+    # It only reads the music, as nobody unless SONIC_USER says otherwise (a folder only its
+    # owner can read: SONIC_USER=1000:1000).
+    user: ${SONIC_USER:-65534:65534}
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - ${DOWNLOAD_PATH:-./downloads}:/music:ro
 

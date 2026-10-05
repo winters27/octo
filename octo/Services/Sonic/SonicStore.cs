@@ -44,6 +44,8 @@ public sealed class SonicStore
     private readonly string _path;
     private readonly ILogger<SonicStore> _logger;
     private readonly object _lock = new();
+    /// <summary>Held from the snapshot to the file move, so an older snapshot never lands last.</summary>
+    private readonly object _fileLock = new();
     private SonicState _state;
     private bool _dirty;
     private DateTime _lastFlush = DateTime.MinValue;
@@ -64,22 +66,25 @@ public sealed class SonicStore
 
     public void Flush()
     {
-        string json;
-        lock (_lock)
+        lock (_fileLock)
         {
-            if (!_dirty) return;
-            json = JsonSerializer.Serialize(_state);
-            _dirty = false;
-            _lastFlush = DateTime.UtcNow;
+            string json;
+            lock (_lock)
+            {
+                if (!_dirty) return;
+                json = JsonSerializer.Serialize(_state);
+                _dirty = false;
+                _lastFlush = DateTime.UtcNow;
+            }
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+                var temp = _path + ".tmp";
+                File.WriteAllText(temp, json);
+                File.Move(temp, _path, overwrite: true);
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "Could not save {Path}", _path); lock (_lock) _dirty = true; }
         }
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-            var temp = _path + ".tmp";
-            File.WriteAllText(temp, json);
-            File.Move(temp, _path, overwrite: true);
-        }
-        catch (Exception ex) { _logger.LogWarning(ex, "Could not save {Path}", _path); lock (_lock) _dirty = true; }
     }
 
     /// <summary>Library songs that sound most like the seed, nearest first. Nothing for a song not analysed yet.</summary>
@@ -158,7 +163,15 @@ public sealed class SonicStore
         try
         {
             if (File.Exists(_path))
-                return JsonSerializer.Deserialize<SonicState>(File.ReadAllText(_path)) ?? new SonicState();
+            {
+                var state = JsonSerializer.Deserialize<SonicState>(File.ReadAllText(_path)) ?? new SonicState();
+                // A hand-edited or half-written file can hold nulls; they are dropped, not crashed on.
+                state.Songs = (state.Songs ?? []).Where(pair => pair.Value is { F: not null, Stamp: not null })
+                    .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+                state.Failed = (state.Failed ?? []).Where(pair => pair.Value is { Stamp: not null })
+                    .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+                return state;
+            }
         }
         catch (Exception ex) { _logger.LogWarning(ex, "{Path} could not be read; starting over", _path); }
         return new SonicState();

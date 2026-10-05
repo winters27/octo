@@ -101,4 +101,16 @@ public sealed class SonicStoreTests : IDisposable
         File.WriteAllText(StatePath, "{ not json");
         Assert.Empty(Store().Read(s => s.Songs));
     }
+
+    [Fact]
+    public void AFileWithNulls_IsReadWithoutThem()
+    {
+        File.WriteAllText(StatePath, """
+            {"Pass":3,"Songs":{"a":{"Stamp":"1:1","Version":2,"F":[0.1]},"b":null,"c":{"Stamp":"1:1","F":null}},"Failed":{"x":null},"Paused":false}
+            """);
+        var store = Store();
+        Assert.Equal(["a"], store.Read(s => s.Songs.Keys.ToList()));
+        Assert.Empty(store.Read(s => s.Failed));
+        Assert.Empty(store.Nearest("a", 5));
+    }
 }

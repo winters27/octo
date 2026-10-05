@@ -4,7 +4,7 @@
 //! <path>`): FFmpeg can crash on a damaged file, and a crash there must cost that file,
 //! not the server.
 
-use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{path::{Component, Path, PathBuf}, sync::Arc, time::Duration};
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::{get, post}, Json, Router};
 use bliss_audio::decoder::Decoder as _;
@@ -47,9 +47,25 @@ async fn main() {
     let app = router(App { root, slots: Arc::new(Semaphore::new(slots)), program });
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.expect("port 8080");
     axum::serve(listener, app)
-        .with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; })
+        .with_graceful_shutdown(stopped())
         .await
         .expect("server");
+}
+
+/// Ctrl-C, or the SIGTERM `docker stop` sends: without it the container waits out the
+/// stop timeout and is killed, a file half read.
+async fn stopped() {
+    let interrupt = async { let _ = tokio::signal::ctrl_c().await; };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! { _ = interrupt => {}, _ = term.recv() => {} },
+            Err(_) => interrupt.await,
+        }
+    }
+    #[cfg(not(unix))]
+    interrupt.await;
 }
 
 /// The child: print the features as JSON on stdout, or the error on stderr. Exit 0 or 2.
@@ -70,13 +86,30 @@ fn router(app: App) -> Router {
     Router::new().route("/health", get(health)).route("/analyse", post(analyse)).with_state(app)
 }
 
-async fn health() -> impl IntoResponse {
-    Json(json!({ "ok": true, "featuresVersion": version() }))
+/// Healthy only when the music folder is there and has something in it: a mount that failed
+/// leaves an empty folder, and every song would then look missing.
+async fn health(State(app): State<App>) -> impl IntoResponse {
+    let root = app.root.clone();
+    let sees = tokio::task::spawn_blocking(move || {
+        std::fs::read_dir(root).map(|mut entries| entries.next().is_some()).unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    if sees {
+        (StatusCode::OK, Json(json!({ "ok": true, "featuresVersion": version() })))
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "ok": false, "featuresVersion": version(),
+            "error": "cannot see the music folder",
+        })))
+    }
 }
 
 async fn analyse(State(app): State<App>, Json(body): Json<Analyse>) -> impl IntoResponse {
-    let Some(path) = inside(&app.root, Path::new(&body.path)) else {
-        return (StatusCode::FORBIDDEN, Json(json!({ "error": "outside the music folder" })));
+    let path = match inside(&app.root, Path::new(&body.path)) {
+        Ok(path) => path,
+        Err(Refused::Missing) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "no such file" }))),
+        Err(Refused::Outside) => return (StatusCode::FORBIDDEN, Json(json!({ "error": "outside the music folder" }))),
     };
     if !path.is_file() {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "not a file" })));
@@ -106,10 +139,24 @@ async fn analyse(State(app): State<App>, Json(body): Json<Analyse>) -> impl Into
     }
 }
 
-/// The file, resolved, when it really is under the music folder (no "..", no symlink out).
-fn inside(root: &Path, path: &Path) -> Option<PathBuf> {
-    let full = std::fs::canonicalize(path).ok()?;
-    full.starts_with(root).then_some(full)
+enum Refused {
+    /// Under the music folder by its name, but not there.
+    Missing,
+    /// Outside it, by "..", a symlink or another folder.
+    Outside,
+}
+
+/// The file, resolved, when it really is under the music folder (no "..", no symlink out). A
+/// path that names a place under it but is not there is missing, not refused, so Octo can tell
+/// a song it should look for again from a request it should never have made.
+fn inside(root: &Path, path: &Path) -> Result<PathBuf, Refused> {
+    match std::fs::canonicalize(path) {
+        Ok(full) if full.starts_with(root) => Ok(full),
+        Ok(_) => Err(Refused::Outside),
+        Err(_) if path.is_absolute() && path.starts_with(root)
+            && !path.components().any(|part| matches!(part, Component::ParentDir)) => Err(Refused::Missing),
+        Err(_) => Err(Refused::Outside),
+    }
 }
 
 #[cfg(test)]
@@ -136,13 +183,31 @@ mod tests {
             .body(Body::from(body)).unwrap()).await.unwrap().status()
     }
 
+    async fn health(app: Router) -> (StatusCode, serde_json::Value) {
+        let res = app.oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
     #[tokio::test]
     async fn health_says_the_feature_version() {
-        let res = app(&std::env::temp_dir()).oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let root = std::env::temp_dir().join("octo-sonic-health");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("song.flac"), b"x").unwrap();
+        let (status, value) = health(app(&root)).await;
+        assert_eq!(status, StatusCode::OK);
         assert_eq!(value["featuresVersion"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn an_empty_music_folder_is_not_healthy() {
+        let root = std::env::temp_dir().join("octo-sonic-empty");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (status, value) = health(app(&root)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(value["ok"], json!(false));
     }
 
     #[tokio::test]
@@ -155,10 +220,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_file_is_refused() {
-        let root = std::env::temp_dir().join("octo-sonic-root3");
-        std::fs::create_dir_all(&root).unwrap();
-        assert_eq!(post(app(&root), &root.join("gone.flac")).await, StatusCode::FORBIDDEN);
+    async fn a_missing_file_is_missing_not_refused() {
+        let root = std::fs::canonicalize({
+            let root = std::env::temp_dir().join("octo-sonic-root3");
+            std::fs::create_dir_all(&root).unwrap();
+            root
+        }).unwrap();
+        assert_eq!(post(app(&root), &root.join("gone.flac")).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_missing_path_that_climbs_out_is_refused() {
+        let root = std::fs::canonicalize({
+            let root = std::env::temp_dir().join("octo-sonic-root4");
+            std::fs::create_dir_all(&root).unwrap();
+            root
+        }).unwrap();
+        assert_eq!(post(app(&root), &root.join("../nowhere/gone.flac")).await, StatusCode::FORBIDDEN);
     }
 
     #[test]

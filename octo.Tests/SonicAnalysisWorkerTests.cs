@@ -33,18 +33,28 @@ public sealed class SonicAnalysisWorkerTests : IDisposable
     private sealed class Sidecar : HttpMessageHandler
     {
         public int? Version { get; set; } = 2;
+        /// <summary>Its music folder is empty or unreadable: health answers 503.</summary>
+        public bool Blind { get; set; }
         public List<string> Analysed { get; } = [];
         public Dictionary<string, string> Errors { get; } = new();
         public HashSet<string> Drops { get; } = [];
+        /// <summary>Files it cannot find (404), as when it mounts another folder than Octo.</summary>
+        public HashSet<string> Missing { get; } = [];
+        /// <summary>Files it answers with something that is not its JSON.</summary>
+        public HashSet<string> Garbled { get; } = [];
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             if (request.RequestUri!.AbsolutePath == "/health")
-                return Version is { } v ? Json(HttpStatusCode.OK, $$"""{"ok":true,"featuresVersion":{{v}}}""") : new HttpResponseMessage(HttpStatusCode.BadGateway);
+                return Version is not { } v ? new HttpResponseMessage(HttpStatusCode.BadGateway)
+                    : Blind ? Json(HttpStatusCode.ServiceUnavailable, $$"""{"ok":false,"featuresVersion":{{v}},"error":"cannot see the music folder"}""")
+                    : Json(HttpStatusCode.OK, $$"""{"ok":true,"featuresVersion":{{v}}}""");
             using var doc = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
             var name = Path.GetFileName(doc.RootElement.GetProperty("path").GetString()!);
             Analysed.Add(name);
             if (Drops.Contains(name)) throw new HttpRequestException("connection reset");
+            if (Missing.Contains(name)) return Json(HttpStatusCode.NotFound, """{"error":"no such file"}""");
+            if (Garbled.Contains(name)) return Json(HttpStatusCode.OK, """{"features":"lots"}""");
             if (Errors.TryGetValue(name, out var error)) return Json(HttpStatusCode.UnprocessableEntity, $$"""{"error":"{{error}}"}""");
             var features = string.Join(",", Enumerable.Range(0, 23).Select(i => (i / 100.0).ToString(System.Globalization.CultureInfo.InvariantCulture)));
             return Json(HttpStatusCode.OK, $$"""{"features":[{{features}}],"version":{{Version ?? 2}}}""");
@@ -60,6 +70,14 @@ public sealed class SonicAnalysisWorkerTests : IDisposable
         public Dictionary<string, LibrarySongRow> Arrivals { get; } = new();
         public int FileLookups;
         public bool Listable { get; set; } = true;
+        /// <summary>A page that fails, by its start.</summary>
+        public int? FailingPage { get; set; }
+        /// <summary>Songs Navidrome lists as missing: counted in the page, left out of its rows.</summary>
+        public HashSet<string> MissingIds { get; } = [];
+
+        /// <summary>A row with no file behind it, for listing tests.</summary>
+        public void AddListed(string id) =>
+            Rows.Add(new LibrarySongRow(id, Path.Combine(directory, "none", id + ".flac"), null, 1000, "flac", 900, id, "Artist", 200, "Album"));
 
         public LibrarySongRow Add(string id, string name, int? seconds = 200, List<LibrarySongRow>? into = null)
         {
@@ -70,9 +88,15 @@ public sealed class SonicAnalysisWorkerTests : IDisposable
             return row;
         }
 
-        public Task<(IReadOnlyList<LibrarySongRow> Rows, int Count)?> ListAsync(int start, int count, CancellationToken ct) =>
-            Task.FromResult<(IReadOnlyList<LibrarySongRow> Rows, int Count)?>(
-                Listable ? (Rows.Skip(start).Take(count).ToList(), Rows.Count) : null);
+        /// <summary>As Navidrome's native API answers: the count is the page's rows before missing
+        /// songs were left out, not the library's.</summary>
+        public Task<(IReadOnlyList<LibrarySongRow> Rows, int Count)?> ListAsync(int start, int count, CancellationToken ct)
+        {
+            if (!Listable || FailingPage == start) return Task.FromResult<(IReadOnlyList<LibrarySongRow> Rows, int Count)?>(null);
+            var page = Rows.Skip(start).Take(count).ToList();
+            return Task.FromResult<(IReadOnlyList<LibrarySongRow> Rows, int Count)?>(
+                (page.Where(row => !MissingIds.Contains(row.Id)).ToList(), page.Count));
+        }
 
         public Task<LibrarySongRow?> ArrivedAsync(string id, CancellationToken ct) => Task.FromResult(Arrivals.GetValueOrDefault(id));
 
@@ -129,7 +153,7 @@ public sealed class SonicAnalysisWorkerTests : IDisposable
         var t = Make();
         t.Library.Listable = false;
         await t.Worker.TickAsync(default);
-        Assert.Equal("Octo has no Navidrome sign-in of its own yet.", t.Worker.Status().Reason);
+        Assert.Contains("Octo needs its own Navidrome sign-in", t.Worker.Status().Reason);
     }
 
     [Fact]
@@ -248,5 +272,130 @@ public sealed class SonicAnalysisWorkerTests : IDisposable
         t.Worker.Reset();
         Assert.Empty(t.Store.Read(s => s.Songs));
         Assert.Equal(0, t.Store.Read(s => s.Pass));
+    }
+
+    private async Task<int> TicksUntilDone((SonicAnalysisWorker Worker, SonicStore Store, Sidecar Sidecar, Library Library, Activity Activity, Clock Clock) t)
+    {
+        for (var tick = 1; tick <= 20; tick++)
+        {
+            await t.Worker.TickAsync(default);
+            if (t.Worker.Status().State == "Done") return tick;
+        }
+        throw new Xunit.Sdk.XunitException("the pass never finished");
+    }
+
+    [Fact]
+    public async Task APageThatFails_ForgetsNothing()
+    {
+        var t = Make();
+        for (var i = 0; i < SonicAnalysisWorker.PageSize + 5; i++) t.Library.AddListed($"s{i}");
+        t.Store.Write(s => s.Songs[$"s{SonicAnalysisWorker.PageSize + 2}"] = new SonicSong { Stamp = "1:1", Version = 2, F = new float[23] });
+        t.Library.FailingPage = SonicAnalysisWorker.PageSize;
+
+        await t.Worker.TickAsync(default);
+        Assert.Equal("Waiting", t.Worker.Status().State);
+        Assert.Single(t.Store.Read(s => s.Songs));
+        Assert.Equal(0, t.Store.Read(s => s.Pass));
+    }
+
+    [Fact]
+    public async Task APageWithAMissingSong_IsNotTheEndOfTheList()
+    {
+        var t = Make();
+        for (var i = 0; i < SonicAnalysisWorker.PageSize + 5; i++) t.Library.AddListed($"s{i}");
+        t.Library.MissingIds.Add("s3");
+        var later = $"s{SonicAnalysisWorker.PageSize + 2}";
+        t.Store.Write(s => s.Songs[later] = new SonicSong { Stamp = "1:1", Version = 2, F = new float[23] });
+
+        await TicksUntilDone(t);
+        Assert.True(t.Store.Read(s => s.Songs.ContainsKey(later)), "a song on the second page is still known");
+        // Every listed row has no file: left out, and counted.
+        Assert.Equal(SonicAnalysisWorker.PageSize + 4, t.Worker.Status().Skipped);
+    }
+
+    [Fact]
+    public async Task ASongThatArrivedDuringAPass_IsKeptAtItsEnd()
+    {
+        var t = Make();
+        t.Library.Add("a", "a.flac");
+        await t.Worker.TickAsync(default);
+        var arrival = t.Library.Add("new", "new.flac", into: []);
+        t.Library.Arrivals["new"] = arrival;
+        t.Worker.ArrivedFirst("new");
+
+        await TicksUntilDone(t);
+        Assert.True(t.Store.Read(s => s.Songs.ContainsKey("new")));
+    }
+
+    [Fact]
+    public async Task ASongThatArrivesBetweenPasses_IsReadWithoutANewPass()
+    {
+        var t = Make();
+        t.Library.Add("a", "a.flac");
+        await TicksUntilDone(t);
+        var arrival = t.Library.Add("new", "new.flac", into: []);
+        t.Library.Arrivals["new"] = arrival;
+        t.Worker.ArrivedFirst("new");
+
+        await t.Worker.TickAsync(default);
+        await t.Worker.TickAsync(default);
+        Assert.Equal(["a.flac", "new.flac"], t.Sidecar.Analysed);
+        Assert.Equal(1, t.Store.Read(s => s.Pass));
+        Assert.Equal("Done", t.Worker.Status().State);
+    }
+
+    [Fact]
+    public async Task WhenOctoSonicCannotSeeTheMusic_ItWaits_AndBlamesNoSong()
+    {
+        var t = Make();
+        t.Library.Add("a", "a.flac");
+        t.Sidecar.Blind = true;
+        await t.Worker.TickAsync(default);
+        Assert.Equal(SonicAnalysisWorker.CannotSeeMusic, t.Worker.Status().Reason);
+        Assert.Empty(t.Sidecar.Analysed);
+
+        // It sees a folder, but not Octo's: every file is missing to it.
+        t.Sidecar.Blind = false;
+        t.Sidecar.Missing.Add("a.flac");
+        await t.Worker.TickAsync(default);
+        Assert.Equal(SonicAnalysisWorker.CannotSeeMusic, t.Worker.Status().Reason);
+        Assert.Empty(t.Store.Read(s => s.Failed));
+
+        t.Sidecar.Missing.Clear();
+        await t.Worker.TickAsync(default);
+        Assert.True(t.Store.Read(s => s.Songs.ContainsKey("a")));
+    }
+
+    [Fact]
+    public async Task AnAnswerOctoCannotRead_IsThatSongsFailure()
+    {
+        var t = Make();
+        t.Library.Add("odd", "odd.flac");
+        t.Library.Add("fine", "fine.flac");
+        t.Sidecar.Garbled.Add("odd.flac");
+        await TicksUntilDone(t);
+        Assert.Contains("could not read", t.Store.Read(s => s.Failed["odd"].Error));
+        Assert.True(t.Store.Read(s => s.Songs.ContainsKey("fine")));
+    }
+
+    [Fact]
+    public async Task ASongWithNoLength_IsLeftOut_AndCounted()
+    {
+        var t = Make();
+        t.Library.Add("zero", "zero.flac", seconds: 0);
+        t.Library.Add("none", "none.flac", seconds: null);
+        t.Library.Add("fine", "fine.flac");
+        await TicksUntilDone(t);
+        Assert.Equal(["fine.flac"], t.Sidecar.Analysed);
+    }
+
+    [Fact]
+    public async Task PauseAndStartOver_AreSavedAtOnce()
+    {
+        var t = Make();
+        t.Worker.SetPaused(true);
+        Assert.Contains("\"Paused\":true", File.ReadAllText(Path.Combine(_directory, "state.json")));
+        t.Worker.Reset();
+        Assert.Contains("\"Pass\":0", File.ReadAllText(Path.Combine(_directory, "state.json")));
     }
 }

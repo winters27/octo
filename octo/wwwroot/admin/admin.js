@@ -1926,6 +1926,7 @@ async function loadSonic() {
     const parts = [`${sonicStates[s.state] || s.state}.`];
     if (s.total > 0) parts.push(`${s.analysed} of ${s.total} songs analysed (pass ${s.pass}).`);
     if (s.failed > 0) parts.push(`${s.failed} could not be read.`);
+    if (s.skipped > 0) parts.push(`${s.skipped} left out: Octo cannot find the file, or the song has no length or runs over 45 minutes.`);
     if (s.reason) parts.push(s.reason);
     status.textContent = parts.join(' ');
     const toggle = document.getElementById('sonic-toggle');

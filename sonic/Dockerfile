@@ -16,4 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certi
 COPY --from=build /src/target/release/octo-sonic /usr/local/bin/octo-sonic
 ENV MUSIC_ROOT=/music
 EXPOSE 8080
+# It only reads: nobody, unless compose says otherwise (SONIC_USER, for a music folder only
+# its owner can read).
+USER 65534:65534
 CMD ["octo-sonic"]
