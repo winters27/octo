@@ -215,7 +215,7 @@ public static class CoverLayout
 
     private static readonly HashSet<string> KindWords = new(StringComparer.OrdinalIgnoreCase)
     {
-        "Mix", "Mixes", "Radio", "Radios", "Station", "Stations", "Playlist", "Playlists",
+        "Mix", "Mixes", "Radio", "Radios", "Station", "Stations", "Playlist", "Playlists", "Chart", "Charts",
     };
 
     /// <summary>Whether the name's last word already says what kind of list it is, so no light line repeats it.</summary>

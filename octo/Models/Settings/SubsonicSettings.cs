@@ -213,9 +213,9 @@ public class SubsonicSettings
     ///
     /// Off, search returns only local library matches: every result plays straight from
     /// Navidrome instead of resolving through the YouTube shim on first tap, and a search
-    /// no longer waits on Deezer/Last.fm at all. This only changes what search3/search2
-    /// hands back; radio (getSimilarSongs2) and the Last.fm personalized/discovery
-    /// stations are unaffected either way.
+    /// no longer waits on Deezer/Last.fm at all. getTopSongs and "Popular right now" follow
+    /// it too: off, they list only the library's songs. Radio (getSimilarSongs2) and the
+    /// Last.fm personalized/discovery stations are unaffected either way.
     /// </summary>
     public bool EnableSearchDiscovery { get; set; } = true;
 

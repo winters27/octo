@@ -282,14 +282,19 @@ public class CoverArtService
 
     /// <summary>
     /// What goes on a list's cover. The name is the list's own, less a trailing "Radio" on a
-    /// station or "Mix" on a mix, since the light line under it says which it is; "Your Mix"
-    /// stays whole. A name that still ends in a word saying what it is ("Your Mix", "Discovery
-    /// Mix") has no light line, as the name already says it. The foot line is its song count
-    /// when known. The design is picked by the list's full name, the same on every request.
+    /// station, "Chart" on a chart or "Mix" on a mix, since the light line under it says which
+    /// it is; "Your Mix" stays whole. A name that still ends in a word saying what it is ("Your
+    /// Mix", "Discovery Mix") has no light line, as the name already says it. The foot line is
+    /// its song count when known. The design is picked by the list's full name, the same on every request.
     /// </summary>
     internal static CoverSpec Spec(string display, string? kind, int? songCount, CoverMusic? music)
     {
-        var (line, suffix) = kind == ListKinds.Radio ? ("Station", " Radio") : ("Mix", " Mix");
+        var (line, suffix) = kind switch
+        {
+            ListKinds.Radio => ("Station", " Radio"),
+            ListKinds.Chart => ("Chart", " Chart"),
+            _ => ("Mix", " Mix"),
+        };
         var title = display;
         if (display.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
         {
@@ -444,6 +449,7 @@ public static class ListKinds
 {
     public const string Radio = "radio";
     public const string Mix = "mix";
+    public const string Chart = "chart";
 }
 
 /// <summary>A list whose cover Octo draws: its name, its genre or decade, its kind, its song
