@@ -105,4 +105,73 @@ public sealed class FindSongsPickTests
         // The same copy again is the pick already waiting, not another one.
         Assert.Equal(LibraryActionStates.Queued, (await server.Finder.PickAsync(look.Id, look.Copies[0].Id, "alice")).State);
     }
+
+    // ---- Picks no download used ---------------------------------------------------------------
+
+    [Fact]
+    public async Task APickIsLetGoWhenItsDownloadEndsWithoutUsingIt()
+    {
+        var target = new FindTarget("Air", "Sexy Boy", "Moon Safari", 298, "ext1", ExternalId: "ext1");
+        var server = Build(target);
+        var queue = new TrackAcquisitionQueue(NullLogger<TrackAcquisitionQueue>.Instance);
+        var services = new ServiceCollection()
+            .AddSingleton(queue)
+            .AddSingleton(server.Services.GetRequiredService<DownloadPicks>())
+            .BuildServiceProvider();
+        var finder = new SongFinder(services, NullLogger<SongFinder>.Instance)
+        {
+            Resolve = server.Finder.Resolve, SourcesFor = server.Finder.SourcesFor, SearchSoulseek = server.Finder.SearchSoulseek,
+        };
+        var picks = services.GetRequiredService<DownloadPicks>();
+        var look = await LookAsync(finder);
+
+        Assert.Equal(LibraryActionStates.Queued, (await finder.PickAsync(look.Id, look.Copies[0].Id, "alice")).State);
+        Assert.True(picks.Has("ext1"));
+
+        // The download ends at once, "already in your library", and never takes the pick.
+        var request = (await queue.DequeueAsync(CancellationToken.None))!;
+        queue.Release(request);
+        request.Completion.SetResult("/music/Air/Moon Safari/02 - Sexy Boy.flac");
+        for (var i = 0; i < 200 && picks.Has("ext1"); i++) await Task.Delay(10);
+
+        Assert.False(picks.Has("ext1"));
+    }
+
+    [Fact]
+    public void ForgettingAPickLeavesANewerOneForTheSameSong()
+    {
+        var picks = new DownloadPicks();
+        var first = new PickedCopy { Source = "Soulseek", Peer = "p1", File = "a.flac" };
+        var second = new PickedCopy { Source = "Soulseek", Peer = "p2", File = "a.flac" };
+        picks.Pin("ext1", first);
+        picks.Pin("ext1", second);
+
+        Assert.False(picks.Forget("ext1", first));
+        Assert.Equal("p2", picks.Take("ext1", "Soulseek")!.Peer);
+    }
+
+    [Fact]
+    public async Task AnUpgradeLetsGoOfAPickItNeverUsed()
+    {
+        var queue = new UpgradeQueue();
+        var picks = new DownloadPicks();
+        queue.Add([new UpgradeAsk("nd-1", "Sexy Boy", "Air", "Moon Safari", "mp3", Pick: Flac("peer1", 1).Pick)], "alice", "find");
+        var worker = new UpgradeWorker(queue, null!, null!, NullLogger<UpgradeWorker>.Instance, picks: picks)
+        {
+            Apply = (request, _) =>
+            {
+                request.OnReplacementQueued!("soulseek", "ext1");
+                // Joined a download already running, so this pick was never taken.
+                return Task.FromResult(new LibraryActionOutcome(LibraryActionState.Failed, "joined", null));
+            },
+            Describe = (_, _) => Task.FromResult<ResolvedSongFile?>(null),
+            Width = () => 1,
+            SoulseekOffline = _ => Task.FromResult(false),
+        };
+
+        await worker.TickAsync(CancellationToken.None);
+        await worker.DrainAsync();
+
+        Assert.False(picks.Has("ext1"));
+    }
 }

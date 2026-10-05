@@ -370,22 +370,32 @@ public sealed class UpgradeWorker : BackgroundService
             }
 
             string? acquired = null;
-            var outcome = await Apply(new LibraryActionRequest(LibraryAction.BetterQuality, job.NavidromeId, job.RequestedBy,
-                OnReplacementQueued: (provider, externalId) =>
-                {
-                    acquired = externalId;
-                    _queue.Update(job.NavidromeId, j => j.AcquisitionKey = $"{provider}:{externalId}");
-                    // A copy picked in Find songs is fetched as it is, with no search.
-                    if (job.Pick is { } pick) _picks?.Pin(externalId, pick);
-                    // The tracker follows only rows that were opened, so the replacement gets one. It
-                    // carries the library song's id, so the apps draw that song's cover on it.
-                    _tracker?.Begin(provider, externalId, job.NavidromeId, job.RequestedBy, job.Artist, job.Title, job.Album,
-                        AcquisitionKinds.Upgrade);
-                    _tracker?.Log(provider, externalId, AcquisitionEventKinds.Note,
-                        job.Pick is { } chosen ? $"Getting {chosen.Describe()}" : $"Your copy is {job.Suffix?.ToUpperInvariant() ?? "lossy"}; looking for a lossless one",
-                        "Your copy stays until the new one passes every check");
-                },
-                OnlySource: job.Pick is { } only ? (only.IsSoulseek ? DownloadSource.Soulseek : DownloadSource.Lidarr) : null), ct);
+            LibraryActionOutcome outcome;
+            try
+            {
+                outcome = await Apply(new LibraryActionRequest(LibraryAction.BetterQuality, job.NavidromeId, job.RequestedBy,
+                    OnReplacementQueued: (provider, externalId) =>
+                    {
+                        acquired = externalId;
+                        _queue.Update(job.NavidromeId, j => j.AcquisitionKey = $"{provider}:{externalId}");
+                        // A copy picked in Find songs is fetched as it is, with no search.
+                        if (job.Pick is { } pick) _picks?.Pin(externalId, pick);
+                        // The tracker follows only rows that were opened, so the replacement gets one. It
+                        // carries the library song's id, so the apps draw that song's cover on it.
+                        _tracker?.Begin(provider, externalId, job.NavidromeId, job.RequestedBy, job.Artist, job.Title, job.Album,
+                            AcquisitionKinds.Upgrade);
+                        _tracker?.Log(provider, externalId, AcquisitionEventKinds.Note,
+                            job.Pick is { } chosen ? $"Getting {chosen.Describe()}" : $"Your copy is {job.Suffix?.ToUpperInvariant() ?? "lossy"}; looking for a lossless one",
+                            "Your copy stays until the new one passes every check");
+                    },
+                    OnlySource: job.Pick is { } only ? (only.IsSoulseek ? DownloadSource.Soulseek : DownloadSource.Lidarr) : null), ct);
+            }
+            finally
+            {
+                // A pick the replacement never used (it joined another download, or found the
+                // song needed nothing) is let go with the job, not left for a later download.
+                if (acquired is not null && job.Pick is { } unused) _picks?.Forget(acquired, unused);
+            }
 
             var state = StateFor(outcome);
             var result = state == UpgradeStates.Upgraded ? Report(outcome, job) : null;

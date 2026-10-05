@@ -331,7 +331,8 @@ public sealed class SongFinder
         if (tracker?.IsRunning(key) == true)
             return new(LibraryActionStates.Skipped, "This song is downloading right now. Pick again once it ends.");
         var acquisitions = _services.GetRequiredService<TrackAcquisitionQueue>();
-        _services.GetRequiredService<DownloadPicks>().Pin(externalId, copy.Pick);
+        var picks = _services.GetRequiredService<DownloadPicks>();
+        picks.Pin(externalId, copy.Pick);
         tracker?.Begin(provider, externalId, externalId, user, target.Artist, target.Title, target.Album, AcquisitionKinds.Pick);
         tracker?.Stage(provider, externalId, AcquisitionState.Queued, copy.Pick.Source, $"Getting {copy.Pick.Describe()}");
         _logger.LogInformation("Find songs: {User} picked {Copy} for '{Artist} - {Title}'", user, copy.Pick.Describe(), target.Artist, target.Title);
@@ -340,6 +341,9 @@ public sealed class SongFinder
             notifyOnFailure: true, requestedBy: user);
         _ = download.ContinueWith(task => tracker?.Fail(provider, externalId, task.Exception?.GetBaseException().Message),
             CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+        // However it ended, the pick was for this download and no later one.
+        _ = download.ContinueWith(_ => picks.Forget(externalId, copy.Pick),
+            CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
         return new(LibraryActionStates.Queued, $"Getting {copy.Pick.Describe()}.", key);
     }
 

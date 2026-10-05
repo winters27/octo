@@ -104,6 +104,18 @@ public sealed class DownloadPicks
         return _picks.TryRemove(new KeyValuePair<string, (PickedCopy, DateTime)>(externalId, pick)) ? pick.Copy : null;
     }
 
+    /// <summary>
+    /// Lets go of this pick once the download it was made for has ended, whether or not it used
+    /// it ("already in your library" ends a download without a search). A newer pick for the same
+    /// song stays, so a later download never takes a copy from a run long over.
+    /// </summary>
+    public bool Forget(string externalId, PickedCopy copy)
+    {
+        if (string.IsNullOrWhiteSpace(externalId) || !_picks.TryGetValue(externalId, out var pick)
+            || !ReferenceEquals(pick.Copy, copy)) return false;
+        return _picks.TryRemove(new KeyValuePair<string, (PickedCopy, DateTime)>(externalId, pick));
+    }
+
     /// <summary>Whether a pick is still waiting for this song.</summary>
     public bool Has(string externalId) => _picks.ContainsKey(externalId);
 }

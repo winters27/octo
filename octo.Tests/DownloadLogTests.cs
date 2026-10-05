@@ -439,12 +439,14 @@ public class DownloadLogTests
         var pick = new PickedCopy { Source = "Soulseek", Peer = "peer9", File = "x.flac", Format = "flac", BitDepth = 16, SampleRate = 44100 };
         queue.Add([new UpgradeAsk("nd-1", "Sexy Boy", "Air", "Moon Safari", "mp3", Pick: pick)], "alice", "find");
         LibraryActionRequest? asked = null;
+        PickedCopy? taken = null;
         var worker = new UpgradeWorker(queue, null!, null!, NullLogger<UpgradeWorker>.Instance, tracker: tracker, picks: picks)
         {
             Apply = (request, _) =>
             {
                 asked = request;
                 request.OnReplacementQueued!("soulseek", "ext1");
+                taken = picks.Take("ext1", "Soulseek");
                 tracker.Complete("soulseek", "ext1");
                 return Task.FromResult(new LibraryActionOutcome(LibraryActionState.Failed, "nothing", LibraryActionCodes.NoReplacement));
             },
@@ -457,7 +459,7 @@ public class DownloadLogTests
         await worker.DrainAsync();
 
         Assert.Equal(DownloadSource.Soulseek, asked!.OnlySource);
-        Assert.Equal("peer9", picks.Take("ext1", "Soulseek")!.Peer);
+        Assert.Equal("peer9", taken!.Peer);
         var row = tracker.Detail("soulseek:ext1", "alice")!;
         Assert.Equal(AcquisitionKinds.Upgrade, row.Kind);
         Assert.Equal("nd-1", row.Id);
