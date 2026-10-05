@@ -108,6 +108,24 @@ public class AdminSignInTests
         Assert.True(services.GetProperty("navidrome").TryGetProperty("detail", out _));
     }
 
+    /// <summary>octo-sonic turned off in .env reads as off on the status page, like the switch, not
+    /// as a service that is down.</summary>
+    [Theory]
+    [InlineData(true, true, false, "Sounds alike is off in .env")]
+    [InlineData(false, true, true, "reachable")]
+    public async Task OctoSonicTurnedOffInEnv_IsOff_NotDown(bool off, bool ok, bool configured, string detail)
+    {
+        await using var factory = new SignInWebFactory();
+        factory.Navidrome.SonicOff = off;
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Octo-Browse-Token", factory.Sessions.Create("admin"));
+
+        var sonic = (await Json(await client.GetAsync("/api/admin/status"))).GetProperty("services").GetProperty("sonic");
+        Assert.Equal(ok, sonic.GetProperty("ok").GetBoolean());
+        Assert.Equal(configured, sonic.GetProperty("configured").GetBoolean());
+        Assert.Equal(detail, sonic.GetProperty("detail").GetString());
+    }
+
     // ---- signing in with Navidrome ----------------------------------------------------------------
 
     [Fact]
@@ -559,10 +577,20 @@ public class AdminSignInTests
         public bool UserListAsListener { get; set; }
         public bool Admin2Demoted { get; set; }
         public bool NonAdminSeesSelf { get; set; }
+        /// <summary>octo-sonic with Sounds alike turned off in .env (RADIO_SOUNDS_ALIKE=false).</summary>
+        public bool SonicOff { get; set; }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var path = request.RequestUri!.AbsolutePath;
+            if (request.RequestUri.Host == "octo-sonic" && path == "/health")
+                return SonicOff
+                    ? new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                    {
+                        Content = new StringContent("""{"error":"Sounds alike is off (RADIO_SOUNDS_ALIKE=false)","featuresVersion":2,"off":true,"ok":false}""",
+                            System.Text.Encoding.UTF8, "application/json"),
+                    }
+                    : Answer("""{"featuresVersion":2,"ok":true}""");
             var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(request.RequestUri.Query);
             string Q(string key) => query.TryGetValue(key, out var value) ? value.ToString() : "";
 

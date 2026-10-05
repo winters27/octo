@@ -35,6 +35,8 @@ public sealed class SonicAnalysisWorkerTests : IDisposable
         public int? Version { get; set; } = 2;
         /// <summary>Its music folder is empty or unreadable: health answers 503.</summary>
         public bool Blind { get; set; }
+        /// <summary>Sounds alike is off in .env: health answers 503 with off.</summary>
+        public bool Off { get; set; }
         public List<string> Analysed { get; } = [];
         public Dictionary<string, string> Errors { get; } = new();
         public HashSet<string> Drops { get; } = [];
@@ -47,6 +49,7 @@ public sealed class SonicAnalysisWorkerTests : IDisposable
         {
             if (request.RequestUri!.AbsolutePath == "/health")
                 return Version is not { } v ? new HttpResponseMessage(HttpStatusCode.BadGateway)
+                    : Off ? Json(HttpStatusCode.ServiceUnavailable, $$"""{"ok":false,"off":true,"featuresVersion":{{v}},"error":"Sounds alike is off"}""")
                     : Blind ? Json(HttpStatusCode.ServiceUnavailable, $$"""{"ok":false,"featuresVersion":{{v}},"error":"cannot see the music folder"}""")
                     : Json(HttpStatusCode.OK, $$"""{"ok":true,"featuresVersion":{{v}}}""");
             using var doc = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(ct));
@@ -342,6 +345,18 @@ public sealed class SonicAnalysisWorkerTests : IDisposable
         Assert.Equal(["a.flac", "new.flac"], t.Sidecar.Analysed);
         Assert.Equal(1, t.Store.Read(s => s.Pass));
         Assert.Equal("Done", t.Worker.Status().State);
+    }
+
+    [Fact]
+    public async Task TurnedOffInEnv_ItIsOff_NotWaitingOrFailing()
+    {
+        var t = Make();
+        t.Library.Add("a", "a.flac");
+        t.Sidecar.Off = true;
+        await t.Worker.TickAsync(default);
+        Assert.Equal(("Off", SonicAnalysisWorker.TurnedOffInEnv), (t.Worker.Status().State, t.Worker.Status().Reason));
+        Assert.Empty(t.Sidecar.Analysed);
+        Assert.Empty(t.Store.Read(s => s.Failed));
     }
 
     [Fact]

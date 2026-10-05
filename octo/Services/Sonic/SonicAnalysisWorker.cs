@@ -117,6 +117,7 @@ public sealed class SonicAnalysisWorker : BackgroundService
         if (_store.Read(s => s.Paused)) return Hold("Paused", "Paused from the dashboard.", IdleCheck);
         var health = await _sonic.HealthAsync(ct);
         if (health is null) return Hold("Waiting", "octo-sonic is not answering.", DownCheck);
+        if (health.Off) return Hold("Off", TurnedOffInEnv, IdleCheck);
         if (health.Problem is not null) return Hold("Waiting", CannotSeeMusic, DownCheck);
         if (_activity.IsBusy) return Hold("Waiting", "Waiting for a download to finish.", BusyCheck);
 
@@ -198,6 +199,9 @@ public sealed class SonicAnalysisWorker : BackgroundService
         });
         return Hold("Running", null, TimeSpan.FromSeconds(settings.EffectiveSonicPauseSeconds));
     }
+
+    internal const string TurnedOffInEnv =
+        "Sounds alike is off in .env (RADIO_SOUNDS_ALIKE=false), so octo-sonic reads nothing.";
 
     internal const string CannotSeeMusic =
         "octo-sonic cannot see the music folder. Check that it mounts the same folder as Octo (DOWNLOAD_PATH) and can read it (SONIC_USER).";

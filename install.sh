@@ -186,11 +186,6 @@ if [ -n "$(existing SUBSONIC_URL)" ] && [ "$(existing SUBSONIC_URL)" != "http://
   HAVE_NAVIDROME_DEFAULT="y"
 fi
 STARTER=false
-# octo-sonic (Sounds alike radio) starts unless an earlier .env left "sonic" out.
-WANT_SONIC=true
-if [ -n "${EXISTING[COMPOSE_PROFILES]+set}" ] && [[ ",${EXISTING[COMPOSE_PROFILES]// /}," != *",sonic,"* ]]; then
-  WANT_SONIC=false
-fi
 COMPOSE_PROFILES=""
 NAVIDROME_ADMIN_PASSWORD=""
 SUBSONIC_ADMIN_USERNAME="$(existing SUBSONIC_ADMIN_USERNAME)"
@@ -330,11 +325,6 @@ if [ -z "$SLSKD_PASSWORD" ]; then
   green "  ✓ generated random slskd web admin password (saved in .env)"
 fi
 
-# The optional services compose starts: octo-sonic first, then the starter Navidrome.
-if [ "$WANT_SONIC" = true ]; then
-  COMPOSE_PROFILES="sonic${COMPOSE_PROFILES:+,$COMPOSE_PROFILES}"
-fi
-
 # ─────────────────────────────────────────────────────────────────
 # Write .env
 # ─────────────────────────────────────────────────────────────────
@@ -351,7 +341,7 @@ DOWNLOAD_PATH=$DOWNLOAD_PATH
 SUBSONIC_ADMIN_USERNAME=$SUBSONIC_ADMIN_USERNAME
 SUBSONIC_ADMIN_PASSWORD="$SUBSONIC_ADMIN_PASSWORD"
 
-# === Optional services: sonic (Sounds alike), navidrome (the starter stack) ===
+# === Starter stack (Navidrome started beside Octo) ===
 COMPOSE_PROFILES=$COMPOSE_PROFILES
 NAVIDROME_ADMIN_PASSWORD="$NAVIDROME_ADMIN_PASSWORD"
 
