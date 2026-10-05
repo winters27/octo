@@ -132,6 +132,29 @@ public class AdminSignInTests
         Assert.False(session.GetProperty("signInOff").GetBoolean());
     }
 
+    /// <summary>Library health answers a signed-in Navidrome admin, and its fixes still go through
+    /// the library actions gates: off here, so nothing is changed.</summary>
+    [Fact]
+    public async Task LibraryHealthAnswersASignedInAdmin_AndItsFixesKeepTheLibraryActionsGates()
+    {
+        await using var factory = new SignInWebFactory();
+        using var client = factory.CreateClient();
+        Assert.Equal(HttpStatusCode.OK, (await SignInAsync(client, "admin", "pw")).StatusCode);
+
+        using var report = await client.GetAsync("/api/admin/health");
+        // The fake Navidrome has no native song list, so the report says it could not read one.
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, report.StatusCode);
+        Assert.Contains("could not read your library", (await Json(report)).GetProperty("error").GetString());
+
+        using var apply = await PostJsonAsync(client, "/api/admin/health/apply",
+            new { label = "Fixing copies", check = "duplicates", steps = new[] { new { action = "remove", id = "a", title = "A" } } });
+        Assert.Equal(HttpStatusCode.Forbidden, apply.StatusCode);
+        Assert.Equal("Library actions are off.", (await Json(apply)).GetProperty("error").GetString());
+
+        using var noHeader = await client.PostAsync("/api/admin/health/undo", null);
+        Assert.Equal(HttpStatusCode.Forbidden, noHeader.StatusCode);
+    }
+
     [Fact]
     public async Task AListenerCannotSignInToTheDashboard()
     {
@@ -171,6 +194,8 @@ public class AdminSignInTests
 
         Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/admin/settings")).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/admin/lyrics/library")).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/admin/health")).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await PostJsonAsync(client, "/api/admin/health/undo", new { })).StatusCode);
         Assert.True((await Json(await client.GetAsync("/api/admin/browse/session"))).GetProperty("recovery").GetBoolean());
 
         using var other = factory.CreateClient();
@@ -393,6 +418,7 @@ public class AdminSignInTests
         Assert.Equal(HttpStatusCode.OK, (await client.GetAsync("/api/admin/settings")).StatusCode);
         Assert.True((await Json(await client.GetAsync("/api/admin/browse/session"))).GetProperty("signInOff").GetBoolean());
         Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/admin/lyrics/library")).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized, (await client.GetAsync("/api/admin/health")).StatusCode);
     }
 
     [Fact]

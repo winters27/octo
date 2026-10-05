@@ -62,6 +62,27 @@ public sealed class LibrarySnapshot
         return reading.WaitAsync(ct);
     }
 
+    /// <summary>When the copy answered with now was read, or null before the first read.</summary>
+    public DateTime? ReadAtUtc
+    {
+        get { lock (_gate) return _current?.At; }
+    }
+
+    /// <summary>
+    /// A copy read from now on, for a caller that knows the library changed (Library health's
+    /// "Check again", after its own fixes). A read already running is joined rather than doubled.
+    /// </summary>
+    public Task<LibraryAlbumIndex?> RefreshAsync(CancellationToken ct = default)
+    {
+        Task<LibraryAlbumIndex?> reading;
+        lock (_gate)
+        {
+            _failedAt = null;
+            reading = _reading ??= ReadAsync();
+        }
+        return reading.WaitAsync(ct);
+    }
+
     private async Task<LibraryAlbumIndex?> ReadAsync()
     {
         // Off the caller's thread and without its token: one caller giving up does not stop a

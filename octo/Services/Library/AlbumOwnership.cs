@@ -29,8 +29,9 @@ public sealed class LibraryAlbumIndex
 
     public LibraryAlbumIndex(IEnumerable<LibrarySongRow> rows)
     {
+        Rows = rows as IReadOnlyList<LibrarySongRow> ?? rows.ToList();
         var byAlbum = new Dictionary<string, List<LibrarySongRow>>(StringComparer.Ordinal);
-        foreach (var row in rows)
+        foreach (var row in Rows)
         {
             if (string.IsNullOrWhiteSpace(row.Title)) continue;
             Add(_byKey, SongIdentity.MatchKey(row.Artist, row.Title), row);
@@ -51,6 +52,9 @@ public sealed class LibraryAlbumIndex
 
     /// <summary>How many songs the library has.</summary>
     public int SongCount { get; }
+
+    /// <summary>Every row as it was read, for the checks that look at the whole library (Library health).</summary>
+    public IReadOnlyList<LibrarySongRow> Rows { get; }
 
     public LibraryAlbum? Album(string id) => _albums.GetValueOrDefault(id);
 

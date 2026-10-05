@@ -14,6 +14,35 @@ public sealed record LibraryTrack(string Id, string Title, string Artist, string
     /// <summary>For a lossless file whose spectrum says it was made from a lossy one, what it was
     /// likely made from ("about 128 kbps MP3"). Only ever set on a copy inside a duplicate group.</summary>
     public string? TranscodedFrom { get; init; }
+
+    /// <summary>The ISRCs its tags carry, which name the recording as a MusicBrainz id does.</summary>
+    public IReadOnlyList<string> Isrcs { get; init; } = [];
+}
+
+/// <summary>What the shared duplicate finder reads of a track: who, what, how long, and its codes.</summary>
+internal sealed class LibraryTrackFields : Octo.Services.Health.IHealthFields<LibraryTrack>
+{
+    public static readonly LibraryTrackFields Instance = new();
+
+    public string Id(LibraryTrack song) => song.Id;
+    public string Title(LibraryTrack song) => song.Title;
+    public string? Artist(LibraryTrack song) => song.Artist.Length == 0 ? null : song.Artist;
+    public string? Album(LibraryTrack song) => song.Album;
+    public string? AlbumId(LibraryTrack song) => null;
+    public string? AlbumArtist(LibraryTrack song) => null;
+    public IReadOnlyList<string> Genres(LibraryTrack song) => [];
+    public int? Year(LibraryTrack song) => null;
+    public int? Disc(LibraryTrack song) => null;
+    public int? Track(LibraryTrack song) => null;
+    public int Seconds(LibraryTrack song) => song.Duration;
+    public string? Format(LibraryTrack song) => song.Suffix;
+    public bool Lossless(LibraryTrack song) => DuplicateScanWorker.IsLossless(song);
+    public int? BitRate(LibraryTrack song) => song.BitRate;
+    public int? BitDepth(LibraryTrack song) => null;
+    public int? SampleRate(LibraryTrack song) => null;
+    public IReadOnlyList<string> Isrcs(LibraryTrack song) => song.Isrcs;
+    public string? RecordingId(LibraryTrack song) => song.RecordingId;
+    public string? Cover(LibraryTrack song) => null;
 }
 
 /// <summary>Copies of one recording, the one worth keeping first.</summary>
@@ -26,11 +55,13 @@ public sealed record DuplicateScanResult(DateTime AtUtc, int Tracks, int Groups,
 /// Walks the library for recordings it holds more than once (#53) and hands them to the
 /// Duplicates playlists. It only points them out: nothing here touches a file.
 ///
-/// A duplicate is two files with the same MusicBrainz recording id AND the same version: a live
-/// take, a remix, a radio edit or a second part shares a recording id surprisingly often, and
-/// someone who keeps the album cut and the radio edit keeps both on purpose. Files without a
-/// recording id are never grouped, because a guess about which files are the same song is a
-/// guess someone would act on.
+/// A duplicate is what Library health calls one, in the Octo app and on the dashboard alike
+/// (<see cref="Octo.Services.Health.LibraryHealth.FindDuplicates{T}"/>): files whose tags name one
+/// recording (an ISRC or a MusicBrainz recording id, lengths within 10 seconds), or files by the
+/// same artist whose titles read the same, version and all (a live take, a remix or a radio edit
+/// is never a copy), with lengths within 3 seconds. Until 2026-10-05 only files sharing a recording
+/// id were grouped here, which found almost nothing in a library where few files carry one, and
+/// disagreed with what Library health showed for the same library.
 /// </summary>
 public sealed class DuplicateScanWorker : BackgroundService
 {
@@ -152,12 +183,12 @@ public sealed class DuplicateScanWorker : BackgroundService
         _queue.Flush();
 
         LastResult = new DuplicateScanResult(DateTime.UtcNow, tracks.Count, groups.Count, added, complete);
-        _logger.LogInformation("Duplicate scan: {Tracks} tracks with a recording id, {Groups} groups, {Added} new question(s){Partial}",
+        _logger.LogInformation("Duplicate scan: {Tracks} tracks, {Groups} groups, {Added} new question(s){Partial}",
             tracks.Count, groups.Count, added, complete ? "" : " (the walk did not finish, so nothing was settled)");
     }
 
     /// <summary>
-    /// Every track with a recording id, by paging search3 with the empty query, the same walk
+    /// Every track, by paging search3 with the empty query, the same walk
     /// Symfonium makes to copy a library. Complete only when a short page ends it.
     /// </summary>
     internal async Task<(IReadOnlyList<LibraryTrack> Tracks, bool Complete)> WalkAsync(CancellationToken ct)
@@ -187,8 +218,8 @@ public sealed class DuplicateScanWorker : BackgroundService
     }
 
     /// <summary>
-    /// Adds the page's tracks that carry a recording id, and returns how many rows the page held,
-    /// or null when it is not a successful answer at all (a refusal must not read as the end).
+    /// Adds the page's tracks, and returns how many rows the page held, or null when it is not a
+    /// successful answer at all (a refusal must not read as the end).
     /// </summary>
     internal static int? ParsePage(JsonElement root, List<LibraryTrack> into)
     {
@@ -204,43 +235,39 @@ public sealed class DuplicateScanWorker : BackgroundService
         {
             rows++;
             var id = Str(song, "id");
-            var recording = Str(song, "musicBrainzId");
-            if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(recording)) continue;
+            if (string.IsNullOrEmpty(id)) continue;
+            // An outside song a server lists beside the library's is not a file to keep or remove.
+            if (song.TryGetProperty("isExternal", out var external) && external.ValueKind == JsonValueKind.True) continue;
             into.Add(new LibraryTrack(id, Str(song, "title") ?? "", Str(song, "artist") ?? "", Str(song, "album") ?? "",
-                recording, Str(song, "suffix") ?? "", Int(song, "bitRate"), Int(song, "duration")));
+                Str(song, "musicBrainzId") ?? "", Str(song, "suffix") ?? "", Int(song, "bitRate"), Int(song, "duration"))
+            {
+                Isrcs = IsrcsOf(song),
+            });
         }
         return rows;
     }
 
-    /// <summary>
-    /// Copies of one recording in one version. Grouped by recording id first, then clustered by
-    /// title and artist, because a recording id alone groups a remix or a live take with the
-    /// original more often than it should.
-    /// </summary>
-    internal static IReadOnlyList<DuplicateGroup> FindGroups(IEnumerable<LibraryTrack> tracks)
+    /// <summary>OpenSubsonic's isrc list; one written as a single string is a list of one.</summary>
+    private static IReadOnlyList<string> IsrcsOf(JsonElement song)
     {
-        var groups = new List<DuplicateGroup>();
-        foreach (var recording in tracks.Where(track => track.RecordingId.Length > 0)
-                     .GroupBy(track => track.RecordingId, StringComparer.OrdinalIgnoreCase))
-        {
-            var clusters = new List<List<LibraryTrack>>();
-            foreach (var track in recording.OrderBy(track => track.Id, StringComparer.Ordinal))
-            {
-                var home = clusters.FirstOrDefault(cluster =>
-                    SongIdentity.SameTitle(track.Title, cluster[0].Title, SongIdentity.StrictTitles).IsSame
-                    && TrackMatchComparer.ArtistMatches(track.Artist, cluster[0].Artist, [cluster[0].Artist])
-                    && TrackMatchComparer.ArtistMatches(cluster[0].Artist, track.Artist, [track.Artist]));
-                if (home is null) clusters.Add([track]);
-                else home.Add(track);
-            }
-
-            foreach (var cluster in clusters.Where(cluster => cluster.Count > 1))
-                groups.Add(new DuplicateGroup(
-                    "dup|" + string.Join(",", cluster.Select(track => track.Id).Order(StringComparer.Ordinal)),
-                    RankForKeeping(cluster)));
-        }
-        return groups;
+        if (!song.TryGetProperty("isrc", out var isrc)) return [];
+        if (isrc.ValueKind == JsonValueKind.String) return isrc.GetString() is { Length: > 0 } one ? [one] : [];
+        if (isrc.ValueKind != JsonValueKind.Array) return [];
+        return isrc.EnumerateArray().Where(value => value.ValueKind == JsonValueKind.String)
+            .Select(value => value.GetString()!).Where(value => value.Length > 0).ToList();
     }
+
+    /// <summary>
+    /// Copies of one recording, by Library health's own rule, so the Duplicates playlist asks about
+    /// exactly the sets Library health shows. Each set is ranked here for keeping, which can also
+    /// weigh a fake lossless copy (<see cref="CheckTranscodesAsync"/>).
+    /// </summary>
+    internal static IReadOnlyList<DuplicateGroup> FindGroups(IEnumerable<LibraryTrack> tracks) =>
+        Octo.Services.Health.LibraryHealth.FindDuplicates(tracks.ToList(), LibraryTrackFields.Instance)
+            .Select(set => new DuplicateGroup(
+                "dup|" + string.Join(",", set.Copies.Select(track => track.Id).Order(StringComparer.Ordinal)),
+                RankForKeeping(set.Copies)))
+            .ToList();
 
     /// <summary>
     /// The groups again, with every lossless copy in a group that has two or more of them
