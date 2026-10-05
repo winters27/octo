@@ -554,6 +554,24 @@ last good version. State is bounded and versioned in
 `/app/config/lastfm-radio-state.json`; do not share that file across Octo instances
 because cross-process locking is not supported.
 
+### Made for you
+
+Every listener gets three lists, made again every day from their own plays, on the Octo apps'
+Home under **Made for you** and as read-only playlists in every other app:
+
+- **New Releases:** albums, EPs and singles from the `NEW_RELEASE_ARTISTS` artists they play
+  most (default 50), released in the last `NEW_RELEASE_WEEKS` (default 8), newest first, a few
+  songs from each. Songs they already have are their own copies; the rest play right away and
+  can be added with **+**. Release dates come from Deezer, which needs no key.
+- **Rediscover:** songs they loved (played three times or more, hearted, or rated 4 or more)
+  and have not played for `REDISCOVER_MONTHS` (default 6).
+- **Deep Cuts:** songs played once or never, from the 15 artists they play most.
+
+They are on by default; `FOR_YOU_NEW_RELEASES`, `FOR_YOU_REDISCOVER` and `FOR_YOU_DEEP_CUTS`
+switch each off, as does the dashboard's Mixes page. Plays, hearts and ratings are Navidrome's,
+read as that listener, so a list is made the next time their app lists playlists. A library
+bigger than 40,000 songs is read as far as its first 40,000.
+
 ### Mixes
 
 `MIXES_ENABLED` adds genre and decade mixes drawn from each listener's own library, listed

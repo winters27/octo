@@ -58,6 +58,39 @@ public class GeneratedPlaylistSettings
     /// </summary>
     public string NameFormat { get; set; } = "{0} Mix";
 
+    // ---- Made for you: three lists per listener, on whether or not the genre and decade mixes
+    // are. Each is rebuilt once a RefreshHours period from that listener's own plays.
+
+    /// <summary>New releases from the listener's most-played artists, from Deezer.
+    /// Environment variable: FOR_YOU_NEW_RELEASES</summary>
+    public bool NewReleases { get; set; } = true;
+
+    /// <summary>Songs the listener loved and has not played for RediscoverMonths.
+    /// Environment variable: FOR_YOU_REDISCOVER</summary>
+    public bool Rediscover { get; set; } = true;
+
+    /// <summary>Songs played at most once, from the listener's most-played artists.
+    /// Environment variable: FOR_YOU_DEEP_CUTS</summary>
+    public bool DeepCuts { get; set; } = true;
+
+    /// <summary>How far back New Releases looks. Environment variable: NEW_RELEASE_WEEKS</summary>
+    public int NewReleaseWeeks { get; set; } = 8;
+
+    /// <summary>How many of the listener's most-played artists New Releases follows.
+    /// Environment variable: NEW_RELEASE_ARTISTS</summary>
+    public int NewReleaseArtists { get; set; } = 50;
+
+    /// <summary>How long since a loved song was last played before Rediscover brings it back.
+    /// Environment variable: REDISCOVER_MONTHS</summary>
+    public int RediscoverMonths { get; set; } = 6;
+
+    public int EffectiveNewReleaseWeeks => Math.Clamp(NewReleaseWeeks, 1, 26);
+    public int EffectiveNewReleaseArtists => Math.Clamp(NewReleaseArtists, 10, 200);
+    public int EffectiveRediscoverMonths => Math.Clamp(RediscoverMonths, 3, 24);
+
+    /// <summary>Whether any of the three Made for you lists is on.</summary>
+    public bool AnyForYou => NewReleases || Rediscover || DeepCuts;
+
     public int EffectiveTrackCount => Math.Clamp(TrackCount, 10, 500);
     public int EffectiveMaxPerArtist => Math.Clamp(MaxPerArtist, 1, 50);
     public int EffectiveCreateAt => Math.Clamp(CreateAt, 1, 10_000);

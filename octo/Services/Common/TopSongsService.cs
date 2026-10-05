@@ -254,9 +254,13 @@ public sealed class TopSongsService : IDisposable
         return songs;
     }
 
-    private Song CatalogSong(DeezerMetadataService.ChartTrack track)
+    private Song CatalogSong(DeezerMetadataService.ChartTrack track) => CatalogSong(_registry, track);
+
+    /// <summary>A catalog track as an outside song: its artist, album and song registered so it plays,
+    /// opens its album and is added like any other. Shared with New Releases.</summary>
+    internal static Song CatalogSong(ExternalIdRegistry registry, DeezerMetadataService.ChartTrack track)
     {
-        var artistId = _registry.Register(new SoulseekRouting
+        var artistId = registry.Register(new SoulseekRouting
         {
             Kind = RoutingKind.Artist,
             Artist = track.Artist,
@@ -265,7 +269,7 @@ public sealed class TopSongsService : IDisposable
         string? albumId = null;
         if (!string.IsNullOrWhiteSpace(track.Album))
         {
-            albumId = _registry.Register(new SoulseekRouting
+            albumId = registry.Register(new SoulseekRouting
             {
                 Kind = RoutingKind.Album,
                 Artist = track.Artist,
@@ -275,7 +279,7 @@ public sealed class TopSongsService : IDisposable
         }
         // The album rides on the song's routing too, so a download tags it with this album
         // rather than one found again from the artist and title.
-        var id = _registry.Register(new SoulseekRouting
+        var id = registry.Register(new SoulseekRouting
         {
             Kind = RoutingKind.Song,
             Artist = track.Artist,
@@ -283,7 +287,7 @@ public sealed class TopSongsService : IDisposable
             Album = track.Album,
             Duration = track.Duration,
         });
-        _registry.RememberLength(id, track.Duration, LengthSource.Deezer);
+        registry.RememberLength(id, track.Duration, LengthSource.Deezer);
         return new Song
         {
             Id = id,

@@ -377,7 +377,8 @@ public partial class SubsonicController : ControllerBase
         var stations = PlaylistStations(username);
         QueueRefreshIfStale(username);
         var mixSettings = _generatedSettings?.CurrentValue;
-        var generated = _generatedPlaylists is not null && mixSettings is { Enabled: true }
+        // The mixes, and Made for you, which is on by default whatever the mixes switch says.
+        var generated = _generatedPlaylists is not null && mixSettings is not null && (mixSettings.Enabled || mixSettings.AnyForYou)
             ? await _generatedPlaylists.ListAsync(username, parameters)
             : [];
         if (stations.Count == 0 && generated.Count == 0)
@@ -2236,6 +2237,21 @@ public partial class SubsonicController : ControllerBase
         Octo.Services.Library.GeneratedPlaylist mix, Dictionary<string, string> parameters, CancellationToken ct)
     {
         if (_generatedPlaylists is null) return [];
+        // New Releases is mostly albums Navidrome has never heard of: its covers come from the
+        // catalog's own image host, as the album pages of outside albums do.
+        if (mix.Kind == Octo.Services.Library.ForYouLists.NewReleasesKind)
+        {
+            var http = HttpContext.RequestServices.GetService<IHttpClientFactory>();
+            if (http is null) return [];
+            return _generatedPlaylists.ForYouCovers(username)
+                .Where(url => Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps)
+                .Select(url => new CoverSeed("catalog|" + url, async token =>
+                {
+                    try { return await http.CreateClient().GetByteArrayAsync(url, token); }
+                    catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException) { return null; }
+                }))
+                .ToList();
+        }
         var auth = parameters.Where(pair => pair.Key is not ("id" or "size")).ToDictionary(pair => pair.Key, pair => pair.Value);
         var songs = _generatedPlaylists.Drawn(username, mix);
         if (songs is null)

@@ -899,6 +899,12 @@ public class AdminController : ControllerBase
                 ["NewShare"] = mixes.NewShare,
                 ["NewDays"] = mixes.NewDays,
                 ["NameFormat"] = mixes.NameFormat ?? "",
+                ["NewReleases"] = mixes.NewReleases,
+                ["Rediscover"] = mixes.Rediscover,
+                ["DeepCuts"] = mixes.DeepCuts,
+                ["NewReleaseWeeks"] = mixes.NewReleaseWeeks,
+                ["NewReleaseArtists"] = mixes.NewReleaseArtists,
+                ["RediscoverMonths"] = mixes.RediscoverMonths,
             },
             ["Genre"] = new Dictionary<string, object>
             {
@@ -1917,6 +1923,12 @@ public class AdminController : ControllerBase
                 ["NewShare"] = mixes.NewShare,
                 ["NewDays"] = mixes.NewDays,
                 ["NameFormat"] = mixes.NameFormat ?? "",
+                ["NewReleases"] = mixes.NewReleases,
+                ["Rediscover"] = mixes.Rediscover,
+                ["DeepCuts"] = mixes.DeepCuts,
+                ["NewReleaseWeeks"] = mixes.NewReleaseWeeks,
+                ["NewReleaseArtists"] = mixes.NewReleaseArtists,
+                ["RediscoverMonths"] = mixes.RediscoverMonths,
             },
             ["Genre"] = new JsonObject
             {
@@ -2098,6 +2110,8 @@ public class AdminController : ControllerBase
             "GeneratedPlaylists:TrackCount", "GeneratedPlaylists:MaxPerArtist", "GeneratedPlaylists:CreateAt",
             "GeneratedPlaylists:RemoveBelow", "GeneratedPlaylists:MaxPlaylists", "GeneratedPlaylists:RefreshHours",
             "GeneratedPlaylists:NewShare", "GeneratedPlaylists:NewDays", "GeneratedPlaylists:NameFormat",
+            "GeneratedPlaylists:NewReleases", "GeneratedPlaylists:Rediscover", "GeneratedPlaylists:DeepCuts",
+            "GeneratedPlaylists:NewReleaseWeeks", "GeneratedPlaylists:NewReleaseArtists", "GeneratedPlaylists:RediscoverMonths",
             "Notifications:NtfyUrl", "Notifications:NtfyToken",
             "Notifications:DiscordWebhookUrl",
             "Notifications:NotifyDownloadStarted", "Notifications:NotifyDownloadCompleted",
