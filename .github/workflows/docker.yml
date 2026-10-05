@@ -53,6 +53,19 @@ jobs:
             exit 1
           fi
 
+      # docker-compose.yml pulls the sidecar images at Octo's own version unless
+      # OCTO_IMAGE_TAG says otherwise, so a release bump that missed it would leave
+      # installs pulling the last release's sidecars. Checked on main too, so a
+      # missed bump shows up before anyone tags it.
+      - name: Compose pulls this version's images
+        run: |
+          version="$(sed -n 's:.*<InformationalVersion>\(.*\)</InformationalVersion>.*:\1:p' octo/octo.csproj | head -n 1)"
+          stale="$(grep -o 'OCTO_IMAGE_TAG:-[^}]*' docker-compose.yml | sed 's/^OCTO_IMAGE_TAG:-//' | grep -Fvx "$version" | paste -sd ' ' || true)"
+          if [ -n "$stale" ]; then
+            echo "::error::docker-compose.yml pulls images tagged $stale, but octo/octo.csproj says $version. Bump the OCTO_IMAGE_TAG defaults with it."
+            exit 1
+          fi
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v6
         with:
@@ -79,6 +92,33 @@ jobs:
     # which should publish. The old condition also allowed merged pull_request events,
     # which no longer reach this workflow.
 
+    # One job per image Octo publishes, all with the same tags and platforms, so a
+    # release's sidecars carry the release's number and docker-compose.yml can pull
+    # them. Each image is ghcr.io/<owner>/<repo> plus its suffix.
+    strategy:
+      # One image failing must not cancel another halfway through its push.
+      fail-fast: false
+      matrix:
+        include:
+          - name: octo
+            context: .
+            suffix: ""
+            # The scope this image has always cached under (build-push-action's
+            # default), so splitting into a matrix keeps its cache.
+            cache: buildkit
+          - name: yt-dlp-shim
+            context: ./yt-dlp-shim
+            suffix: -yt-dlp-shim
+            cache: yt-dlp-shim
+          # The Sounds alike reader (Rust). Skipped by the first step below until
+          # sonic/ is in the repo, so it needs no edit here when it lands; its
+          # service in docker-compose.yml then wants the same image: line the shim
+          # has. A Rust build for arm64 runs under QEMU and is slow.
+          - name: octo-sonic
+            context: ./sonic
+            suffix: -octo-sonic
+            cache: octo-sonic
+
     permissions:
       contents: read
       packages: write
@@ -87,13 +127,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # An image whose folder is not in this commit is skipped, and the job passes.
+      - name: Is ${{ matrix.name }} in this commit
+        id: present
+        env:
+          CONTEXT: ${{ matrix.context }}
+        run: |
+          if [ -f "$CONTEXT/Dockerfile" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$CONTEXT/Dockerfile is not in this commit, so ${{ matrix.name }} is not built."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up QEMU
+        if: steps.present.outputs.build == 'true'
         uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
+        if: steps.present.outputs.build == 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Login to GitHub Container Registry
+        if: steps.present.outputs.build == 'true'
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -101,10 +157,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
+        if: steps.present.outputs.build == 'true'
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.suffix }}
           tags: |
             type=ref,event=branch
             # Tags the image with the release name verbatim, e.g. 2026.07.29. The semver
@@ -118,14 +175,20 @@ jobs:
             # Was gated on refs/heads/dev, a branch this repo does not have, so `latest`
             # was never published at all and `docker pull ...:latest` failed for everyone.
             type=raw,value=latest,enable={{is_default_branch}}
+          # Every image would otherwise be titled after the repo.
+          labels: |
+            org.opencontainers.image.title=octo${{ matrix.suffix }}
 
       - name: Build and push
+        if: steps.present.outputs.build == 'true'
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: ${{ matrix.context }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # A scope per image, so the images building side by side never fight
+          # over the same cache entries.
+          cache-from: type=gha,scope=${{ matrix.cache }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache }}

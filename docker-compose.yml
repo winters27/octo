@@ -245,7 +245,14 @@ services:
   # Wraps yt-dlp behind /search and /stream HTTP endpoints. Isolating the binary
   # in its own container prevents .NET process-management quirks from wedging
   # the parent (see Brain/projects/Flaccy.md, 2026-04-29 LXC wedge note).
+  #
+  # Published with every Octo release, so it can be pulled as well as built. A build
+  # tags itself with this name, so the update helper's build still works as before.
+  # The default tag is this release's own number (bumped with octo/octo.csproj; CI
+  # checks it); OCTO_IMAGE_TAG picks another, such as latest on an install that pulls
+  # Octo's images instead of building them.
   yt-dlp-shim:
+    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.04}
     build: ./yt-dlp-shim
     container_name: yt-dlp-shim
     restart: unless-stopped

@@ -339,7 +339,7 @@ YTDLP_URL_CACHE_MAX=512
 YTDLP_URL_CACHE_TTL=3600
 EOF
 # Kept from the old .env when they were set there: settings this installer never asks about.
-for key in OCTO_CONFIG_DIR SLSKD_STATE_DIR UPDATES_CHECK UPDATES_REPO; do
+for key in OCTO_CONFIG_DIR SLSKD_STATE_DIR UPDATES_CHECK UPDATES_REPO OCTO_IMAGE_TAG; do
   if [ -n "$(existing "$key")" ]; then
     printf '%s=%s
 ' "$key" "$(existing "$key")" >> .env

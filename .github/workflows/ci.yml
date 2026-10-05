@@ -52,9 +52,10 @@ jobs:
           # only widens the CI cliff; a genuine hang still fails the job.
           DOTNET_HOST_FACTORY_RESOLVER_DEFAULT_TIMEOUT_IN_SECONDS: "600"
 
-  # The shim is Python and its image is only ever built on the deploy host, so
-  # before this job a syntax error in app.py passed CI and was discovered when
-  # the container failed to restart in production. compileall alone justifies
+  # The shim is Python and its image is built only after a merge (docker.yml
+  # publishes it) or on the deploy host, so before this job a syntax error in
+  # app.py passed CI and was discovered when the container failed to restart in
+  # production. compileall alone justifies
   # the two minutes; the gate tests cover the concurrency logic that decides
   # whether a play queues behind background prewarm.
   shim:
