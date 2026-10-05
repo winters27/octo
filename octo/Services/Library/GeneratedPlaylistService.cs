@@ -11,13 +11,14 @@ using Octo.Models.Settings;
 using Octo.Services.Common;
 using Octo.Services.LastFm;
 using Octo.Services.Metadata;
+using Octo.Services.Soulseek;
 using Octo.Services.Subsonic;
 
 namespace Octo.Services.Library;
 
-/// <summary>One genre or decade mix, as one listener sees it for the current draw.</summary>
-/// <param name="Kind">"genre" or "decade".</param>
-/// <param name="Key">"genre:Rock" or "decade:1990".</param>
+/// <summary>One mix or Made for you list, as one listener sees it for the current draw.</summary>
+/// <param name="Kind">"genre", "decade", or a Made for you kind ("newReleases", "rediscover", "deepCuts").</param>
+/// <param name="Key">"genre:Rock", "decade:1990" or "for:newReleases".</param>
 public sealed record GeneratedPlaylist(string Id, string Key, string Kind, string Label, string Name,
     string Owner, int PoolSize, DateTime PeriodStartUtc, DateTime PeriodEndUtc);
 
@@ -30,6 +31,10 @@ public sealed record GeneratedPlaylist(string Id, string Key, string Kind, strin
 /// genre sitting at the threshold does not appear and vanish on alternate days. What is in a mix
 /// is a seeded draw per listener and period, so it holds still for the period and every client
 /// sees the same tracks, then changes.
+///
+/// The Made for you lists (New Releases, Rediscover, Deep Cuts) live here too, on by default and
+/// switched apart from the mixes: built in the same refresh, from one walk of the listener's
+/// library as they see it, and kept on disk, so opening one never waits on a build.
 /// </summary>
 public sealed class GeneratedPlaylistService
 {
@@ -39,6 +44,13 @@ public sealed class GeneratedPlaylistService
     private const int BlendCandidates = 200;
     private static readonly TimeSpan FirstListWait = TimeSpan.FromSeconds(1.5);
     private static readonly TimeSpan RefreshDeadline = TimeSpan.FromMinutes(2);
+    // New Releases asks the catalog for up to NewReleaseArtists artists on its background lane.
+    private static readonly TimeSpan ForYouRefreshDeadline = TimeSpan.FromMinutes(6);
+    // A library bigger than this is walked this far: 40,000 songs.
+    internal const int MaxWalkPages = 80;
+    private const string ForYouPrefix = "for:";
+    // Where a stored outside song of New Releases keeps what it is made from; never sent out.
+    private const string SeedField = "octoCatalog";
     private static readonly TimeSpan RetryAfterFailure = TimeSpan.FromMinutes(5);
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = false };
 
@@ -52,6 +64,7 @@ public sealed class GeneratedPlaylistService
     private readonly object _lock = new();
     private readonly Dictionary<string, UserMixes> _users = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTime> _lastAttempt = new(StringComparer.Ordinal);
+    private IOptionsMonitor<SubsonicSettings>? _subsonic;
 
     public GeneratedPlaylistService(string? statePath, IServiceScopeFactory scopes,
         IOptionsMonitor<GeneratedPlaylistSettings> settings, IOptionsMonitor<GenreSettings> genre,
@@ -72,6 +85,13 @@ public sealed class GeneratedPlaylistService
         public Dictionary<string, int> Counts { get; set; } = new(StringComparer.Ordinal);
         public DateTime CountsUtc { get; set; }
         public string Kinds { get; set; } = "";
+
+        /// <summary>Each Made for you list's songs as Subsonic song JSON, by kind.</summary>
+        public Dictionary<string, List<string>> ForYou { get; set; } = new(StringComparer.Ordinal);
+
+        /// <summary>Album covers New Releases' cover is coloured from: outside albums Navidrome
+        /// does not know, so they are fetched from the catalog's own image host.</summary>
+        public List<string> ForYouCovers { get; set; } = [];
     }
 
     private sealed class StateDocument
@@ -87,16 +107,17 @@ public sealed class GeneratedPlaylistService
     public async Task<IReadOnlyList<GeneratedPlaylist>> ListAsync(string username, IReadOnlyDictionary<string, string> auth)
     {
         var settings = _settings.CurrentValue;
-        if (!settings.Enabled || string.IsNullOrWhiteSpace(username) || !(settings.Genres || settings.Decades)) return [];
+        if (string.IsNullOrWhiteSpace(username) || !(MixesOn(settings) || settings.AnyForYou)) return [];
 
         var user = UserKey(username);
         var now = DateTime.UtcNow;
+        var explicitFilter = ExplicitFilterNow();
         UserMixes? state;
         bool due;
         lock (_lock)
         {
             _users.TryGetValue(user, out state);
-            due = (state is null || IsStale(state, settings, now))
+            due = (state is null || IsStale(state, settings, explicitFilter, now))
                   && (!_lastAttempt.TryGetValue(user, out var attempted) || now - attempted >= RetryAfterFailure);
             if (due) _lastAttempt[user] = now;
         }
@@ -104,7 +125,8 @@ public sealed class GeneratedPlaylistService
         if (due)
         {
             var copy = auth.ToDictionary(pair => pair.Key, pair => pair.Value);
-            var refresh = _refreshes.RunAsync(user, ct => RefreshAsync(username, copy, ct), RefreshDeadline);
+            var refresh = _refreshes.RunAsync(user, ct => RefreshAsync(username, copy, ct),
+                settings.NewReleases ? ForYouRefreshDeadline : RefreshDeadline);
             _ = refresh.ContinueWith(task => _logger.LogDebug(task.Exception, "Mix refresh failed for {User}", username),
                 CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
             if (state is null) await Task.WhenAny(refresh, Task.Delay(FirstListWait));
@@ -116,7 +138,7 @@ public sealed class GeneratedPlaylistService
     public GeneratedPlaylist? Find(string username, string id)
     {
         var settings = _settings.CurrentValue;
-        if (!settings.Enabled || string.IsNullOrEmpty(id) || !id.StartsWith("og", StringComparison.Ordinal)) return null;
+        if (string.IsNullOrEmpty(id) || !id.StartsWith("og", StringComparison.Ordinal)) return null;
         return Current(username, settings, DateTime.UtcNow).FirstOrDefault(mix => mix.Id == id);
     }
 
@@ -131,7 +153,12 @@ public sealed class GeneratedPlaylistService
         lock (_lock)
         {
             if (!_users.TryGetValue(user, out var state)) return [];
-            return state.Active
+            // Made for you first, newest to oldest, and only a list with something in it.
+            var forYou = ForYouLists.Kinds
+                .Where(kind => ForYouOn(settings, kind) && state.ForYou.TryGetValue(kind, out var songs) && songs.Count > 0)
+                .Select(kind => new GeneratedPlaylist(PlaylistId(username, ForYouPrefix + kind), ForYouPrefix + kind, kind,
+                    ForYouLists.Name(kind), ForYouLists.Name(kind), username.Trim(), state.ForYou[kind].Count, start, end));
+            IEnumerable<GeneratedPlaylist> mixes = !MixesOn(settings) ? [] : state.Active
                 .Where(key => (settings.Genres && key.StartsWith("genre:", StringComparison.Ordinal))
                     || (settings.Decades && key.StartsWith("decade:", StringComparison.Ordinal)))
                 .Select(key =>
@@ -139,9 +166,27 @@ public sealed class GeneratedPlaylistService
                     var (kind, label) = Describe(key);
                     return new GeneratedPlaylist(PlaylistId(username, key), key, kind, label, settings.Name(label),
                         username.Trim(), state.Counts.GetValueOrDefault(key), start, end);
-                })
-                .ToList();
+                });
+            return forYou.Concat(mixes).ToList();
         }
+    }
+
+    private static bool MixesOn(GeneratedPlaylistSettings settings) =>
+        settings.Enabled && (settings.Genres || settings.Decades);
+
+    private static bool ForYouOn(GeneratedPlaylistSettings settings, string kind) => kind switch
+    {
+        ForYouLists.NewReleasesKind => settings.NewReleases,
+        ForYouLists.RediscoverKind => settings.Rediscover,
+        ForYouLists.DeepCutsKind => settings.DeepCuts,
+        _ => false,
+    };
+
+    /// <summary>The album covers New Releases' own cover is coloured from, up to four.</summary>
+    public IReadOnlyList<string> ForYouCovers(string username)
+    {
+        lock (_lock)
+            return _users.TryGetValue(UserKey(username), out var state) ? state.ForYouCovers.Take(4).ToList() : [];
     }
 
     private static (string Kind, string Label) Describe(string key) =>
@@ -149,12 +194,32 @@ public sealed class GeneratedPlaylistService
             ? ("decade", key["decade:".Length..] + "s")
             : ("genre", key["genre:".Length..]);
 
-    private static string KindsOf(GeneratedPlaylistSettings settings) =>
-        (settings.Genres ? "genre" : "") + "," + (settings.Decades ? "decade" : "");
+    private static string KindsOf(GeneratedPlaylistSettings settings, ExplicitFilter explicitFilter) =>
+        (MixesOn(settings) && settings.Genres ? "genre" : "") + "," + (MixesOn(settings) && settings.Decades ? "decade" : "")
+        + "," + string.Join("+", ForYouLists.Kinds.Where(kind => ForYouOn(settings, kind)))
+        + (settings.NewReleases
+            ? $",w{settings.EffectiveNewReleaseWeeks}a{settings.EffectiveNewReleaseArtists}x{(int)explicitFilter}"
+            : "")
+        + (settings.Rediscover ? $",m{settings.EffectiveRediscoverMonths}" : "");
 
-    private static bool IsStale(UserMixes state, GeneratedPlaylistSettings settings, DateTime nowUtc) =>
+    private static bool IsStale(UserMixes state, GeneratedPlaylistSettings settings, ExplicitFilter explicitFilter, DateTime nowUtc) =>
         nowUtc - state.CountsUtc >= TimeSpan.FromHours(settings.EffectiveRefreshHours)
-        || state.Kinds != KindsOf(settings);
+        || state.Kinds != KindsOf(settings, explicitFilter);
+
+    /// <summary>
+    /// The server's explicit filter, which New Releases' outside songs obey as search and radio's
+    /// do. It is part of what decides the lists, so changing it makes them anew.
+    /// </summary>
+    private ExplicitFilter ExplicitFilterNow()
+    {
+        if (_subsonic is null)
+        {
+            // A singleton, so it outlives the scope it is found through.
+            using var scope = _scopes.CreateScope();
+            _subsonic = scope.ServiceProvider.GetService<IOptionsMonitor<SubsonicSettings>>();
+        }
+        return _subsonic?.CurrentValue.ExplicitFilter ?? ExplicitFilter.All;
+    }
 
     /// <summary>
     /// Count what the listener's library holds per genre and decade, and decide which mixes they
@@ -168,12 +233,12 @@ public sealed class GeneratedPlaylistService
         var proxy = scope.ServiceProvider.GetRequiredService<SubsonicProxyService>();
         var counts = new Dictionary<string, int>(StringComparer.Ordinal);
 
-        if (settings.Genres)
+        if (MixesOn(settings) && settings.Genres)
         {
             if (await CountGenresAsync(proxy, auth) is not { } genres) return false;
             foreach (var (key, count) in genres) counts[key] = count;
         }
-        if (settings.Decades)
+        if (MixesOn(settings) && settings.Decades)
         {
             for (var decade = FirstDecade; decade <= DateTime.UtcNow.Year / 10 * 10; decade += 10)
             {
@@ -189,6 +254,13 @@ public sealed class GeneratedPlaylistService
             }
         }
 
+        var explicitFilter = ExplicitFilterNow();
+        UserMixes? before;
+        lock (_lock) _users.TryGetValue(UserKey(username), out before);
+        var (forYou, covers) = settings.AnyForYou
+            ? await BuildForYouAsync(scope.ServiceProvider, proxy, username, auth, settings, explicitFilter, before, ct)
+            : (new Dictionary<string, List<string>>(StringComparer.Ordinal), new List<string>());
+
         lock (_lock)
         {
             var previous = _users.TryGetValue(UserKey(username), out var old) ? old.Active : [];
@@ -196,7 +268,8 @@ public sealed class GeneratedPlaylistService
                 settings.EffectiveMaxPlaylists);
             _users[UserKey(username)] = new UserMixes
             {
-                Active = active.ToList(), Counts = counts, CountsUtc = DateTime.UtcNow, Kinds = KindsOf(settings),
+                Active = active.ToList(), Counts = counts, CountsUtc = DateTime.UtcNow, Kinds = KindsOf(settings, explicitFilter),
+                ForYou = forYou, ForYouCovers = covers,
             };
             SaveLocked();
         }
@@ -260,10 +333,142 @@ public sealed class GeneratedPlaylistService
             .ToList();
     }
 
+    /// <summary>
+    /// Made for you, from one walk of the listener's library as they see it. A list that could not
+    /// be made this time (Navidrome or the catalog not answering) keeps what it had, so a bad day
+    /// never empties it.
+    /// </summary>
+    private async Task<(Dictionary<string, List<string>> Lists, List<string> Covers)> BuildForYouAsync(
+        IServiceProvider services, SubsonicProxyService proxy, string username, IReadOnlyDictionary<string, string> auth,
+        GeneratedPlaylistSettings settings, ExplicitFilter explicitFilter, UserMixes? before, CancellationToken ct)
+    {
+        var lists = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var covers = before?.ForYouCovers.ToList() ?? [];
+        void KeepOld(string kind)
+        {
+            if (before?.ForYou.TryGetValue(kind, out var old) == true) lists[kind] = old;
+        }
+
+        var library = await WalkLibraryAsync(proxy, auth, ct);
+        if (library is null)
+        {
+            foreach (var kind in ForYouLists.Kinds.Where(kind => ForYouOn(settings, kind))) KeepOld(kind);
+            return (lists, covers);
+        }
+
+        var now = DateTime.UtcNow;
+        var period = PeriodIndex(now, settings.EffectiveRefreshHours);
+        var rediscover = ForYouLists.Rediscover(library, now, settings.EffectiveRediscoverMonths,
+            Seed(username, ForYouPrefix + ForYouLists.RediscoverKind, period));
+        if (settings.Rediscover) lists[ForYouLists.RediscoverKind] = rediscover.Select(song => song.ToJsonString()).ToList();
+        if (settings.DeepCuts)
+        {
+            var artists = ForYouLists.TopArtists(library, ForYouLists.DeepCutArtists).Select(artist => artist.Key).ToList();
+            var excluded = rediscover.Select(song => ForYouLists.Str(song, "id")).OfType<string>().ToHashSet(StringComparer.Ordinal);
+            lists[ForYouLists.DeepCutsKind] = ForYouLists.DeepCuts(library, artists, excluded,
+                Seed(username, ForYouPrefix + ForYouLists.DeepCutsKind, period)).Select(song => song.ToJsonString()).ToList();
+        }
+        // Rediscover and Deep Cuts are ready in moments; New Releases waits on the catalog, a
+        // minute or more the first time. Shown at once, a new listener's first lists never wait on it.
+        if (settings.NewReleases) PublishEarly(username, lists);
+        if (settings.NewReleases)
+        {
+            var builder = services.GetService<NewReleasesBuilder>();
+            var responses = services.GetService<SubsonicResponseBuilder>();
+            if (builder is null || responses is null)
+            {
+                KeepOld(ForYouLists.NewReleasesKind);
+            }
+            else
+            {
+                var built = await builder.BuildAsync(ForYouLists.TopArtists(library, settings.EffectiveNewReleaseArtists),
+                    library, DateOnly.FromDateTime(now), settings.EffectiveNewReleaseWeeks, ct, explicitFilter);
+                if (built.Entries.Count == 0 && !built.Whole)
+                {
+                    KeepOld(ForYouLists.NewReleasesKind);
+                }
+                else
+                {
+                    lists[ForYouLists.NewReleasesKind] = built.Entries.Select(entry => StoredEntry(entry, responses)).ToList();
+                    covers = built.Entries.Select(entry => entry.CoverUrl).OfType<string>()
+                        .Distinct(StringComparer.Ordinal).Take(4).ToList();
+                }
+            }
+        }
+        _logger.LogInformation("Made for you for {User}: {Lists} from {Songs} library songs", username,
+            string.Join(", ", lists.Select(pair => $"{ForYouLists.Name(pair.Key)} {pair.Value.Count}")), library.Count);
+        return (lists, covers);
+    }
+
+    /// <summary>
+    /// Lists shown before the whole build is done, without touching the lists the build is still
+    /// reading. A listener with none yet gets a state that is still due, so the build finishes it.
+    /// </summary>
+    private void PublishEarly(string username, Dictionary<string, List<string>> lists)
+    {
+        if (lists.Count == 0) return;
+        lock (_lock)
+        {
+            var user = UserKey(username);
+            if (_users.TryGetValue(user, out var state))
+            {
+                var forYou = new Dictionary<string, List<string>>(state.ForYou, StringComparer.Ordinal);
+                foreach (var (kind, songs) in lists) forYou[kind] = songs;
+                state.ForYou = forYou;
+            }
+            else
+            {
+                _users[user] = new UserMixes { ForYou = new Dictionary<string, List<string>>(lists, StringComparer.Ordinal) };
+            }
+        }
+    }
+
+    /// <summary>One entry of New Releases as stored: a library song as Navidrome sent it, or an
+    /// outside song with what it is made from.</summary>
+    private static string StoredEntry(NewReleasesBuilder.Entry entry, SubsonicResponseBuilder responses)
+    {
+        if (entry.Library is { } library) return library.ToJsonString();
+        var song = JsonSerializer.SerializeToNode(responses.ConvertSongToJson(entry.Outside!))!.AsObject();
+        if (entry.Seed is { } seed) song[SeedField] = JsonSerializer.SerializeToNode(seed);
+        return song.ToJsonString();
+    }
+
+    /// <summary>
+    /// Every song of the listener's library as they see it, 500 at a time, up to
+    /// <see cref="MaxWalkPages"/> pages; null when Navidrome did not answer, even part way: lists
+    /// made from part of a library would show songs the listener owns as outside ones and miss
+    /// their plays, so the lists they have stay instead.
+    /// </summary>
+    private async Task<List<JsonObject>?> WalkLibraryAsync(SubsonicProxyService proxy, IReadOnlyDictionary<string, string> auth,
+        CancellationToken ct)
+    {
+        var all = new List<JsonObject>();
+        for (var page = 0; page < MaxWalkPages; page++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var songs = await FetchSongsAsync(proxy, auth, "rest/search3", "searchResult3", new()
+            {
+                // Navidrome's whole library: an empty phrase, as the duplicate scan walks it.
+                ["query"] = "\"\"",
+                ["songCount"] = PoolPage.ToString(CultureInfo.InvariantCulture),
+                ["songOffset"] = (page * PoolPage).ToString(CultureInfo.InvariantCulture),
+                ["albumCount"] = "0",
+                ["artistCount"] = "0",
+            });
+            if (songs is null) return null;
+            all.AddRange(songs);
+            if (songs.Count < PoolPage) return all;
+        }
+        _logger.LogInformation("Made for you read the first {Count} songs of a bigger library", all.Count);
+        return all;
+    }
+
     /// <summary>The songs of one mix for this period: the same for every request in the period.</summary>
     public async Task<IReadOnlyList<JsonObject>> MaterializeAsync(string username, GeneratedPlaylist playlist,
         IReadOnlyDictionary<string, string> auth, CancellationToken ct)
     {
+        if (ForYouLists.IsForYou(playlist.Kind)) return StoredForYou(username, playlist.Kind);
+
         // Cached as text: a JsonObject is not safe to share between requests, and each request
         // needs objects of its own to hand to the response anyway.
         var cacheKey = $"{UserKey(username)}|{playlist.Id}|{playlist.PeriodStartUtc.Ticks}";
@@ -310,8 +515,43 @@ public sealed class GeneratedPlaylistService
         return Parse(drawn);
     }
 
+    /// <summary>
+    /// A Made for you list as stored. Each outside song is made again from its seed, with the
+    /// same id, so it plays even after a busy day has pushed it out of the outside songs Octo
+    /// remembers; the seed itself is never sent out.
+    /// </summary>
+    private IReadOnlyList<JsonObject> StoredForYou(string username, string kind)
+    {
+        List<string>? stored;
+        lock (_lock)
+            stored = _users.TryGetValue(UserKey(username), out var state) && state.ForYou.TryGetValue(kind, out var songs)
+                ? songs
+                : null;
+        if (stored is null) return [];
+        var parsed = Parse(stored);
+        ExternalIdRegistry? registry = null;
+        foreach (var song in parsed)
+        {
+            if (song[SeedField] is not JsonObject node) continue;
+            NewReleasesBuilder.CatalogSeed? seed = null;
+            try { seed = node.Deserialize<NewReleasesBuilder.CatalogSeed>(); }
+            catch (JsonException) { }
+            song.Remove(SeedField);
+            if (seed is null) continue;
+            if (registry is null)
+            {
+                using var scope = _scopes.CreateScope();
+                registry = scope.ServiceProvider.GetService<ExternalIdRegistry>();
+                if (registry is null) continue;
+            }
+            NewReleasesBuilder.Mint(registry, seed);
+        }
+        return parsed;
+    }
+
     /// <summary>The songs of one mix for this period if they have been drawn already, else null. Never fetches.</summary>
     public IReadOnlyList<JsonObject>? Drawn(string username, GeneratedPlaylist playlist) =>
+        ForYouLists.IsForYou(playlist.Kind) ? StoredForYou(username, playlist.Kind) :
         _drawn.TryGetValue($"{UserKey(username)}|{playlist.Id}|{playlist.PeriodStartUtc.Ticks}", out string[]? cached) && cached is not null
             ? Parse(cached)
             : null;
