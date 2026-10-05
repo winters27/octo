@@ -329,6 +329,14 @@ public class LastFmRadioCoreTests
         Assert.Null(settings.TokenFor("bob"));
     }
 
+    [Theory]
+    [InlineData("favourites")]
+    [InlineData("Favourite Songs")]
+    [InlineData("favorites")]
+    [InlineData("favorite song")]
+    public void BookkeepingTags_AreNotGenres_InEitherSpelling(string tag) =>
+        Assert.Equal("", LastFmRadioRecommendationService.CanonicalTag(tag));
+
     [Fact]
     public void KinshipTags_DropYearsTheArtistAndBookkeeping()
     {

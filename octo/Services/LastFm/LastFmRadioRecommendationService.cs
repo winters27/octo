@@ -77,10 +77,11 @@ public sealed class LastFmRadioRecommendationService
 
     private static readonly HashSet<string> DeniedTags = new(StringComparer.OrdinalIgnoreCase)
     {
-        "seen live", "favorites", "favorites", "owned", "spotify", "albums i own",
+        // Last.fm's tags as listeners write them, in both spellings: these are data, not Octo's words.
+        "seen live", "favorites", "favourites", "owned", "spotify", "albums i own",
         "under 2000 listeners", "awesome", "love", "best",
         // Sentiment and superlatives say how a listener felt, not what the music is.
-        "favorite song", "favorite song", "favorite songs", "favorite songs", "my love",
+        "favorite song", "favourite song", "favorite songs", "favourite songs", "my love",
         "love at first listen", "beautiful", "epic", "legendary", "classic", "amazing",
         "perfect", "masterpiece", "good", "great", "catchy", "fun", "chill", "cool"
     };
