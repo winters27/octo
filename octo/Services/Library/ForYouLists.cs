@@ -68,10 +68,13 @@ public static class ForYouLists
                 group.Count()))
             .Where(artist => artist.Name.Length > 0 && SongIdentity.Key(artist.Name) != various)
             .ToList();
-        var anyPlays = artists.Any(artist => artist.Plays > 0);
-        return (anyPlays
-                ? artists.OrderByDescending(a => a.Plays).ThenByDescending(a => a.Songs)
-                : artists.OrderByDescending(a => a.Hearts).ThenByDescending(a => a.Songs))
+        // Only artists the listener played or hearted are theirs; an artist they never touched is
+        // never one of "your artists", however few they have. Someone with no plays or hearts at
+        // all gets the library's biggest artists, so a new listener still has lists.
+        var theirs = artists.Where(artist => artist.Plays > 0 || artist.Hearts > 0).ToList();
+        return (theirs.Count > 0
+                ? theirs.OrderByDescending(a => a.Plays).ThenByDescending(a => a.Hearts).ThenByDescending(a => a.Songs)
+                : artists.OrderByDescending(a => a.Songs))
             .ThenBy(a => a.Name, StringComparer.Ordinal)
             .Take(count)
             .ToList();
@@ -243,7 +246,7 @@ public sealed class NewReleasesBuilder(DeezerMetadataService deezer, ExternalIdR
             owned.TryAdd(SongIdentity.MatchKey(ForYouLists.Str(song, "artist"), ForYouLists.Str(song, "title")), song);
 
         var whole = true;
-        var releases = new List<(DeezerMetadataService.AlbumHit Release, DateOnly Date, string ArtistId)>();
+        var releases = new List<(DeezerMetadataService.AlbumHit Release, DateOnly Date, string ArtistName)>();
         // The catalog answers a throttled or failed call with nothing, just as it answers a name it
         // does not know. Nothing at all, for every artist asked, is read as no answer, so a bad
         // moment never replaces yesterday's list with an empty one.
@@ -259,11 +262,11 @@ public sealed class NewReleasesBuilder(DeezerMetadataService deezer, ExternalIdR
             if (albums.Count > 0) listedAny = true;
             foreach (var release in ForYouLists.RecentReleases(albums, today, weeks))
                 if (releases.All(known => known.Release.DeezerId != release.DeezerId))
-                    releases.Add((release, ForYouLists.ReleaseDate(release)!.Value, id));
+                    releases.Add((release, ForYouLists.ReleaseDate(release)!.Value, artist.Name));
         }
         if (artists.Count > 0 && (resolved == 0 || !listedAny)) whole = false;
 
-        var picked = new (DeezerMetadataService.AlbumHit Release, IReadOnlyList<DeezerMetadataService.AlbumTrack> Tracks)?[releases.Count];
+        var picked = new (DeezerMetadataService.AlbumHit Release, IReadOnlyList<DeezerMetadataService.AlbumTrack> Tracks, string ArtistName)?[releases.Count];
         using var gate = new SemaphoreSlim(ReleasesAtOnce);
         await Task.WhenAll(releases.Select(async (item, index) =>
         {
@@ -272,7 +275,7 @@ public sealed class NewReleasesBuilder(DeezerMetadataService deezer, ExternalIdR
             {
                 var lookup = await deezer.LookUpAlbumDetailAsync(item.Release.DeezerId, ct, background: true);
                 if (lookup.Detail is { } detail)
-                    picked[index] = (item.Release, ForYouLists.PickTracks(detail.RecordType ?? item.Release.RecordType, detail.Tracks));
+                    picked[index] = (item.Release, ForYouLists.PickTracks(detail.RecordType ?? item.Release.RecordType, detail.Tracks), item.ArtistName);
                 else if (lookup.Answer == DeezerMetadataService.AlbumAnswer.Unavailable)
                     whole = false;
             }
@@ -284,15 +287,19 @@ public sealed class NewReleasesBuilder(DeezerMetadataService deezer, ExternalIdR
 
         var entries = new List<Entry>();
         var listed = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var (release, tracks) in picked.OfType<(DeezerMetadataService.AlbumHit, IReadOnlyList<DeezerMetadataService.AlbumTrack>)>()
+        foreach (var (release, tracks, artistName) in picked.OfType<(DeezerMetadataService.AlbumHit, IReadOnlyList<DeezerMetadataService.AlbumTrack>, string)>()
                      .OrderByDescending(item => ForYouLists.ReleaseDate(item.Item1)))
         {
             foreach (var track in tracks)
             {
                 if (entries.Count >= ForYouLists.TrackCount) break;
                 var key = SongIdentity.MatchKey(track.Artist, track.Title);
-                if (!listed.Add(key)) continue;
-                if (owned.TryGetValue(key, out var mine))
+                // The catalog may credit a shared song to the other artist (a release on Ella
+                // Langley's page credited to Miranda Lambert), while the library files it under the
+                // listener's artist who led here: the same title under that artist is theirs too.
+                var byTheirArtist = SongIdentity.MatchKey(artistName, track.Title);
+                if (!listed.Add(key) || !listed.Add(byTheirArtist) && byTheirArtist != key) continue;
+                if (owned.TryGetValue(key, out var mine) || owned.TryGetValue(byTheirArtist, out mine))
                 {
                     entries.Add(new Entry(mine.DeepClone().AsObject(), null, release.CoverUrl));
                     continue;

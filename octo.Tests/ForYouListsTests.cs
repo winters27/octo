@@ -32,30 +32,35 @@ public class ForYouListsTests
     // ---- top artists ------------------------------------------------------------------------
 
     [Fact]
-    public void TopArtists_ArePlaysSummed_AndVariousArtistsIsNobody()
+    public void TopArtists_ArePlaysSummed_OnlyOnesPlayedOrHearted_AndVariousArtistsIsNobody()
     {
+        // Found live: with room for 50, a listener who played two artists got every artist in
+        // the library as "theirs". An artist never played nor hearted is never one.
         var songs = new[]
         {
             Song("1", "Big", plays: 10), Song("2", "Big", plays: 10), Song("3", "Small", plays: 5),
-            Song("4", "Various Artists", plays: 100), Song("5", "Quiet"),
+            Song("4", "Various Artists", plays: 100), Song("5", "Quiet"), Song("6", "Hearted", starred: true),
         };
 
-        var top = ForYouLists.TopArtists(songs, 10);
+        var top = ForYouLists.TopArtists(songs, 50);
 
-        Assert.Equal(["Big", "Small", "Quiet"], top.Select(artist => artist.Name));
+        Assert.Equal(["Big", "Small", "Hearted"], top.Select(artist => artist.Name));
         Assert.Equal(20, top[0].Plays);
     }
 
     [Fact]
-    public void TopArtists_WithNoPlaysAtAll_AreReadByHeartsThenBySongs()
+    public void TopArtists_WithNoPlays_AreTheHearted_AndWithNothingAtAll_TheBiggest()
     {
-        var songs = new[]
+        var hearted = new[]
         {
             Song("1", "Kept"), Song("2", "Kept"), Song("3", "Kept"),
             Song("4", "Loved", starred: true), Song("5", "Neither"),
         };
+        Assert.Equal(["Loved"], ForYouLists.TopArtists(hearted, 10).Select(artist => artist.Name));
 
-        Assert.Equal(["Loved", "Kept", "Neither"], ForYouLists.TopArtists(songs, 10).Select(artist => artist.Name));
+        // A new listener, with no plays or hearts yet, still gets lists from the library's biggest.
+        var fresh = new[] { Song("1", "Kept"), Song("2", "Kept"), Song("3", "Neither") };
+        Assert.Equal(["Kept", "Neither"], ForYouLists.TopArtists(fresh, 10).Select(artist => artist.Name));
     }
 
     // ---- Rediscover -------------------------------------------------------------------------
@@ -185,7 +190,8 @@ internal sealed class ForYouUpstream : HttpMessageHandler
                 + AlbumTrack("Opener", 180, 1, 100) + "," + AlbumTrack("Hit", 200, 2, 900) + ","
                 + AlbumTrack("Owned Song", 210, 3, 800) + "," + AlbumTrack("Closer", 240, 4, 700) + "],\"total\":4}",
             (_, "album/101") => """{"id":101,"title":"New Single","record_type":"single","nb_tracks":1,"artist":{"name":"Big Artist"}}""",
-            (_, "album/101/tracks") => "{\"data\":[" + AlbumTrack("Single Song", 190, 1, 500) + "],\"total\":1}",
+            // The single is credited to a guest, as the catalog does with shared songs.
+            (_, "album/101/tracks") => "{\"data\":[" + AlbumTrack("Single Song", 190, 1, 500, "Guest Star") + "],\"total\":1}",
             _ => """{"data":[]}""",
         };
         return Task.FromResult(ReviewFixtures.Json(body));
@@ -205,9 +211,9 @@ internal sealed class ForYouUpstream : HttpMessageHandler
     private static string Album(int id, string title, string type, string date, int tracks, string? cover) =>
         $$"""{"id":{{id}},"title":"{{title}}","record_type":"{{type}}","release_date":"{{date}}","nb_tracks":{{tracks}}{{(cover is null ? "" : $",\"cover_xl\":\"{cover}\"")}}}""";
 
-    private static string AlbumTrack(string title, int duration, int position, int rank) =>
+    private static string AlbumTrack(string title, int duration, int position, int rank, string artist = "Big Artist") =>
         "{\"title\":\"" + title + "\",\"duration\":" + duration + ",\"track_position\":" + position
-        + ",\"disk_number\":1,\"rank\":" + rank + ",\"artist\":{\"name\":\"Big Artist\"}}";
+        + ",\"disk_number\":1,\"rank\":" + rank + ",\"artist\":{\"name\":\"" + artist + "\"}}";
 
     private static string Navidrome(string query)
     {
@@ -219,6 +225,7 @@ internal sealed class ForYouUpstream : HttpMessageHandler
             songs.Add($$"""{"id":"big{{i}}","title":"Big {{i}}","artist":"Big Artist","artistId":"arBig","duration":200,"playCount":{{(i < 6 ? 8 : 0)}},"played":"{{old}}"}""");
         songs.Add("""{"id":"owned","title":"Owned Song","artist":"Big Artist","artistId":"arBig","duration":210,"playCount":0}""");
         songs.Add("""{"id":"small","title":"Small","artist":"Small Artist","artistId":"arSmall","duration":200,"playCount":1}""");
+        songs.Add("""{"id":"never","title":"Never","artist":"Never Played","artistId":"arNever","duration":200,"playCount":0}""");
         return "{\"subsonic-response\":{\"status\":\"ok\",\"version\":\"1.16.1\",\"searchResult3\":{\"song\":[" + string.Join(",", songs) + "]}}}";
     }
 }
@@ -236,6 +243,8 @@ public class NewReleasesBuilderTests
         var library = new List<JsonObject>
         {
             JsonNode.Parse("""{"id":"owned","title":"Owned Song","artist":"Big Artist","playCount":0}""")!.AsObject(),
+            // Credited to a guest in the catalog, filed under the listener's own artist here.
+            JsonNode.Parse("""{"id":"single","title":"Single Song","artist":"Big Artist","playCount":0}""")!.AsObject(),
         };
 
         var result = await builder.BuildAsync([new ForYouLists.TopArtist("arBig", "Big Artist", 50, 0, 13)], library,
@@ -246,6 +255,7 @@ public class NewReleasesBuilderTests
         Assert.Equal(["Single Song", "Hit", "Owned Song", "Closer"], result.Entries.Select(entry =>
             entry.Outside?.Title ?? entry.Library!["title"]!.GetValue<string>()));
         Assert.Equal("owned", result.Entries[2].Library!["id"]!.GetValue<string>());
+        Assert.Equal("single", result.Entries[0].Library!["id"]!.GetValue<string>());
         Assert.All(result.Entries.Where(entry => entry.Outside is not null), entry =>
         {
             Assert.False(entry.Outside!.IsLocal);
@@ -317,6 +327,7 @@ public class ForYouServiceTests : IDisposable
         Assert.Equal(3, rediscover.Count); // the six played songs, three per artist at most
         var deepCuts = await service.MaterializeAsync("alice", lists[2], Auth, CancellationToken.None);
         Assert.All(deepCuts, song => Assert.True(song["playCount"]!.GetValue<int>() <= 1));
+        Assert.DoesNotContain(deepCuts, song => song["id"]!.GetValue<string>() == "never");
         var newReleases = await service.MaterializeAsync("alice", lists[0], Auth, CancellationToken.None);
         Assert.Contains(newReleases, song => song["id"]!.GetValue<string>() == "owned");
         Assert.Contains(newReleases, song => song["title"]!.GetValue<string>() == "Single Song"
