@@ -355,6 +355,8 @@ public class DeezerMetadataServiceTests
         {
             ("/album/711108/tracks", new[] { QuotaEnvelope, @"{""data"":[]}", TracksJson(10) }),
             ("/album/711108", new[] { AlbumDetailJson }),
+            // The tracklist is asked beside the album, and dropped when there is no album.
+            ("/album/999/tracks", new[] { @"{""data"":[]}" }),
             ("/album/999", new[] { NoDataEnvelope }),
         }, out var calls);
 
@@ -367,6 +369,7 @@ public class DeezerMetadataServiceTests
         Assert.Equal(DeezerMetadataService.AlbumAnswer.NoSuchAlbum, (await svc.LookUpAlbumDetailAsync("999")).Answer);
         Assert.Equal(DeezerMetadataService.AlbumAnswer.NoSuchAlbum, (await svc.LookUpAlbumDetailAsync("999")).Answer);
         Assert.Equal(1, calls("/album/999"));
+        Assert.Equal(1, calls("/album/999/tracks"));
     }
 
     /// <summary>

@@ -8,7 +8,8 @@ using Octo.Services.Subsonic;
 namespace Octo.Services.Library;
 
 public sealed record LibrarySongRow(string Id, string Path, string? LibraryPath, long Size, string Suffix,
-    int BitRate, string Title, string Artist, int? Duration, string? Album = null);
+    int BitRate, string Title, string Artist, int? Duration, string? Album = null, string? AlbumId = null,
+    string? AlbumArtist = null, IReadOnlyList<string>? Isrcs = null);
 
 public sealed record QualityUpgradeAttempt(DateTime AtUtc, string Outcome, string? Detail);
 
@@ -277,11 +278,28 @@ public sealed class QualityUpgradeWorker : BackgroundService
                 // A float in Navidrome's native API, unlike Subsonic's whole seconds.
                 song.TryGetProperty("duration", out var d) && d.ValueKind == JsonValueKind.Number
                     ? (int)Math.Round(d.GetDouble()) : null,
-                Str(song, "album")));
+                Str(song, "album"), Str(song, "albumId"), Str(song, "albumArtist"), IsrcsOf(song)));
         }
         return (rows, count);
     }
 
     private static string? Str(JsonElement e, string name) =>
         e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+    /// <summary>A song's ISRCs: Navidrome files them among its tags, as a list; one written as
+    /// a single string is read as a list of one.</summary>
+    private static IReadOnlyList<string> IsrcsOf(JsonElement song)
+    {
+        var found = new List<string>();
+        void Read(JsonElement value)
+        {
+            if (value.ValueKind == JsonValueKind.String && value.GetString() is { Length: > 0 } one) found.Add(one);
+            else if (value.ValueKind == JsonValueKind.Array)
+                foreach (var item in value.EnumerateArray()) Read(item);
+        }
+        if (song.TryGetProperty("tags", out var tags) && tags.ValueKind == JsonValueKind.Object
+            && tags.TryGetProperty("isrc", out var tagged)) Read(tagged);
+        if (song.TryGetProperty("isrc", out var direct)) Read(direct);
+        return found;
+    }
 }

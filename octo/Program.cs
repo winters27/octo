@@ -320,6 +320,8 @@ builder.Services.AddSingleton<Octo.Services.Imports.SpotifyAuth>();
 builder.Services.AddSingleton<Octo.Services.Imports.SpotifyWebApi>();
 builder.Services.AddSingleton<Octo.Services.Imports.SpotifyLinkReader>();
 builder.Services.AddSingleton<Octo.Services.Imports.ImportMatcher>();
+builder.Services.AddSingleton<Octo.Services.Library.LibrarySnapshot>();
+builder.Services.AddSingleton<Octo.Services.Library.AlbumOwnership>();
 builder.Services.AddSingleton<Octo.Services.Imports.ImportPlaylists>();
 builder.Services.AddSingleton<Octo.Services.Imports.TrickleWorker>();
 builder.Services.AddSingleton<Octo.Services.Imports.ImportService>();

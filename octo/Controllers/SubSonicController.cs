@@ -1041,6 +1041,10 @@ public partial class SubsonicController : ControllerBase
         // fold external artists in and dedupe them against local ones, but nothing ever
         // gave it any, so the artist column of every search showed only what the library
         // already had. Keyless like albums, so it works without a Last.fm key.
+        // What the library already holds of those albums, from their songs, started as soon as
+        // they are found so it runs alongside the song build rather than after it.
+        var ownershipTask = JudgeAlbumsAsync(albumTask);
+
         var artistTask = requestedArtists > 0 && artistOffset <= 0 && !isTypeAheadProbe && _subsonicSettings.EnableSearchDiscovery
             ? _metadataService.SearchArtistsAsync(cleanQuery, Math.Min(requestedArtists, 20))
             : Task.FromResult(new List<Artist>());
@@ -1127,10 +1131,17 @@ public partial class SubsonicController : ControllerBase
             externalArtists = new List<Artist>();
         }
 
+        // An album the library holds whole, or by its very name, is listed as the library's
+        // album; one it holds in part says how much. search2 lists folders, not albums, so
+        // nothing is added there and its outside albums stay, counted.
+        var (settledAlbums, addedAlbums) = await SettleSearchAlbumsAsync(externalAlbums, await ownershipTask,
+            localParsed.Albums, localResult.ContentType, parameters, canAdd: !isSearch2);
+        localParsed.Albums.AddRange(addedAlbums);
+
         var externalResult = new SearchResult
         {
             Songs = externalSongs,
-            Albums = externalAlbums.ToList(),
+            Albums = settledAlbums,
             Artists = externalArtists,
         };
 
@@ -1723,6 +1734,10 @@ public partial class SubsonicController : ControllerBase
                     album.ArtistId = artist.Id;
                 }
             }
+
+            // Each says how much of it the library holds. None is left out: the page lists no
+            // library album to stand in for one.
+            albums = await SettleArtistAlbumsAsync(albums, []);
             
             return _responseBuilder.CreateArtistResponse(format, artist, albums);
         }
@@ -1809,6 +1824,10 @@ public partial class SubsonicController : ControllerBase
         // An owned album is one the library has by the matcher's key, so "Discovery" in the
         // library hides the catalog's "Discovery" however either is spelled or punctuated.
         var localAlbumNames = localAlbumTitles.Select(SongIdentity.Key).ToHashSet(StringComparer.Ordinal);
+
+        // Each outside album says how much of it the library holds; one the page's own albums
+        // hold whole, or by name, is left out.
+        deezerAlbums = await SettleArtistAlbumsAsync(deezerAlbums, localAlbums);
 
         var mergedAlbums = localAlbums.ToList();
         foreach (var deezerAlbum in deezerAlbums)
@@ -1897,6 +1916,9 @@ public partial class SubsonicController : ControllerBase
             {
                 return _responseBuilder.CreateError(format, 70, "Album not found");
             }
+
+            // The songs the library already holds go out as the library's own copies.
+            if (await OutsideAlbumWithOwnedSongsAsync(album, parameters, format) is { } owned) return owned;
 
             return _responseBuilder.CreateAlbumResponse(format, album);
         }
