@@ -25,9 +25,10 @@ public class LibraryHealthServerTests
           "mbzRecordingID":"f14b5405-2d38-4693-adaf-38d27821943f","mbzReleaseGroupId":"786a089a-9266-4fd3-984a-1df9e0ca34b4",
           "tags":{"barcode":["808391285880"],"isrc":["USLD91772032"],"recordlabel":["OVO Sound"]},
           "participants":{"albumartist":[{"id":"a","name":"PARTYNEXTDOOR"}],"artist":[{"id":"b","name":"Drake"}]},
-          "path":"PARTYNEXTDOOR/$ome $exy $ongs 4 U/14 - NOKIA.flac","missing":false},
+          "path":"PARTYNEXTDOOR/$ome $exy $ongs 4 U/14 - NOKIA.flac","missing":false,"createdAt":"2026-10-05T02:16:27.952323177Z"},
          {"id":"gone","title":"Gone","artist":"X","path":"x.flac","missing":true},
          {"id":"bare","title":"Nightcall","artist":"Kavinsky","albumId":"u","hasCoverArt":false,"year":0,"trackNumber":0,
+          "createdAt":"2026-08-14T19:43:35.76268Z",
           "suffix":"m4a","bitDepth":0,"duration":257.4,"path":"Kavinsky/Nightcall.m4a"}]
         """;
 
@@ -53,6 +54,16 @@ public class LibraryHealthServerTests
         Assert.Equal(["PARTYNEXTDOOR"], nokia.AlbumArtists);
         Assert.Equal(["USLD91772032"], nokia.Isrcs);
         Assert.False(rows[1].HasCover);
+    }
+
+    /// <summary>Navidrome's search3, which the apps read, lists songs as they were added; the
+    /// checks take them in that order, so a reason names the same song the app's does.</summary>
+    [Fact]
+    public void TheSongsAreCheckedInTheOrderTheAppsReadThem()
+    {
+        var rows = Rows();
+        Assert.Equal(new DateTime(2026, 10, 5, 2, 16, 27, 952, DateTimeKind.Utc).AddTicks(3232), rows[0].AddedUtc);
+        Assert.Equal(["bare", "6KpragWkvfYGesMZAXBmAm"], LibraryHealthService.InSearchOrder(rows).Select(row => row.Id));
     }
 
     [Fact]

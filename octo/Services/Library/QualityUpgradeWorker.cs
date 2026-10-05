@@ -32,6 +32,8 @@ public sealed record LibrarySongRow(string Id, string Path, string? LibraryPath,
     /// <summary>Every artist the song credits, and every album artist, as Navidrome lists them.</summary>
     public IReadOnlyList<string> Artists { get; init; } = [];
     public IReadOnlyList<string> AlbumArtists { get; init; } = [];
+    /// <summary>When Navidrome first saw the file: the order its Subsonic song list (search3) gives.</summary>
+    public DateTime? AddedUtc { get; init; }
 }
 
 public sealed record QualityUpgradeAttempt(DateTime AtUtc, string Outcome, string? Detail);
@@ -320,6 +322,9 @@ public sealed class QualityUpgradeWorker : BackgroundService
                 Labels = TagValues(song, "recordlabel"),
                 Artists = Participants(song, "artist"),
                 AlbumArtists = Participants(song, "albumartist"),
+                AddedUtc = Str(song, "createdAt") is { } created && DateTime.TryParse(created, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out var added)
+                    ? added : null,
             });
         }
         return (rows, count);

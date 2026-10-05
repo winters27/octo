@@ -147,16 +147,17 @@ public sealed class LibraryHealthService
                 if (_checked is { } known && ReferenceEquals(known.Index, index))
                     return new HealthSnapshot(known.Report, index.Rows, known.Fields, known.ReadUtc);
             var started = DateTime.UtcNow;
+            var rows = InSearchOrder(index.Rows);
             var (report, fields) = await Task.Run(() =>
             {
-                var fields = new ServerSongFields(index.Rows);
-                return (LibraryHealth.Check(index.Rows, fields), fields);
+                var fields = new ServerSongFields(rows);
+                return (LibraryHealth.Check(rows, fields), fields);
             });
             _logger.LogInformation("Library health checked {Songs} songs in {Ms} ms: {Findings}", report.Checked,
                 (int)(DateTime.UtcNow - started).TotalMilliseconds,
                 string.Join(", ", report.Findings.Select(check => $"{check} {report.Count(check)}")));
             lock (_gate) _checked = (index, report, fields, readUtc);
-            return new HealthSnapshot(report, index.Rows, fields, readUtc);
+            return new HealthSnapshot(report, rows, fields, readUtc);
         }
         catch (Exception ex)
         {
@@ -172,6 +173,14 @@ public sealed class LibraryHealthService
             }
         }
     }
+
+    /// <summary>
+    /// The songs in the order the apps read them (Navidrome's search3 lists them as they were
+    /// added), so where a finding names one song of several, like the song that ties a split
+    /// album's parts together, it names the same one the apps do.
+    /// </summary>
+    public static IReadOnlyList<LibrarySongRow> InSearchOrder(IReadOnlyList<LibrarySongRow> rows) =>
+        rows.OrderBy(row => row.AddedUtc ?? DateTime.MaxValue).ToList();
 
     /// <summary>The report with what was fixed here left out, while the library read is older than the fix.</summary>
     private HealthSnapshot Settled(HealthSnapshot found)
