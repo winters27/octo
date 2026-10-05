@@ -284,10 +284,15 @@ public sealed class LibraryEditEndpointTests
 
         Assert.Equal("applied", State(await Call(client, "id=s1&action=remove")));
         Assert.Null(await library.GetLocalPathForExternalSongAsync("soulseek", "4H0vAhIr2YJ67Riz3Uv6wG"));
+        Assert.Empty(await library.GetMappingsAsync());
+        // The link waits in the trash note beside the file, which is all Put back reads.
+        var note = JsonSerializer.Deserialize<QuarantineManifest>(
+            await File.ReadAllTextAsync(factory.Journal.Recent().Single().QuarantinePath + ".octo-action.json"))!;
+        Assert.Equal("4H0vAhIr2YJ67Riz3Uv6wG", Assert.Single(note.Mappings!).ExternalId);
 
         Assert.Equal("applied", State(await Call(client, "id=s1&action=restore")));
 
-        Assert.Equal(path, await library.GetLocalPathForExternalSongAsync("soulseek", "4H0vAhIr2YJ67Riz3Uv6wG"));
+        Assert.Equal(Path.GetFullPath(path), await library.GetLocalPathForExternalSongAsync("soulseek", "4H0vAhIr2YJ67Riz3Uv6wG"));
         Assert.Equal("peer1", (await library.GetMappingsAsync()).Single().SourcePeer);
     }
 

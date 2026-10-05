@@ -221,8 +221,10 @@ public class LocalLibraryService : ILocalLibraryService
         await _lock.WaitAsync();
         try
         {
+            // By the whole path, so "Artist/Album/Song.flac" and "Artist\Album\Song.flac" are one file.
+            var wanted = FullPathOrSelf(localPath);
             var stale = mappings
-                .Where(pair => string.Equals(pair.Value.LocalPath, localPath, StringComparison.OrdinalIgnoreCase))
+                .Where(pair => string.Equals(FullPathOrSelf(pair.Value.LocalPath), wanted, StringComparison.OrdinalIgnoreCase))
                 .ToList();
             if (stale.Count == 0) return [];
 
@@ -231,6 +233,12 @@ public class LocalLibraryService : ILocalLibraryService
             return stale.Select(pair => pair.Value).ToList();
         }
         finally { _lock.Release(); }
+    }
+
+    private static string FullPathOrSelf(string path)
+    {
+        try { return Path.GetFullPath(path); }
+        catch (Exception) { return path; }
     }
 
     public async Task RestoreMappingsAsync(IReadOnlyList<LocalSongMapping> mappings, string localPath)
