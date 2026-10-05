@@ -295,7 +295,7 @@ public sealed class LastFmRadioRecommendationService
                 var found = new List<Candidate>();
                 foreach (var answer in await _sources.AskAllAsync(radioSeed, each, EmptyAuth, ct))
                 {
-                    var factor = RadioBlend.StationFactor(answer.Match) * RadioBlend.Thin(answer)
+                    var factor = RadioBlend.StationFactor(answer.Match) * RadioBlend.Thin(answer, each)
                         * weights.GetValueOrDefault(answer.Provider, 1.0);
                     if (factor <= 0) continue;
                     // Sources score on different scales (Last.fm's match, a flat 1 from YouTube Music),
@@ -343,22 +343,29 @@ public sealed class LastFmRadioRecommendationService
     private async Task<List<Candidate>> TracksFromArtist(string? username, string artist,
         int candidateTarget, CancellationToken ct)
     {
-        var result = Ranked(await _lastFm.GetArtistTopTracksAsync(artist,
-            Math.Min(50, candidateTarget), ct), "artist:" + artist);
-        foreach (var similar in (await _lastFm.GetSimilarArtistsAsync(artist, 6, ct)).Take(5))
-            result.AddRange(Ranked(await _lastFm.GetArtistTopTracksAsync(similar.Name,
-                Math.Min(20, Math.Max(6, candidateTarget / 5)), ct), "artist:" + similar.Name,
-                NeighbourArtistAffinity));
-        // The other sources' radio for the artist (YouTube Music's, LB Radio's), beside the
-        // similar artists' songs.
-        if (_sources is not null)
+        var result = new List<Candidate>();
+        // The build's budget running out keeps what was found so far: the artist's own top
+        // tracks alone still make a station.
+        try
         {
-            var weights = _sources.Weights(username);
-            foreach (var answer in await _sources.AskAllAsync(new RadioSeed(artist, "", null, null), candidateTarget, EmptyAuth, ct))
-                if (answer.Provider != RadioProvider.LastFm)
+            result.AddRange(Ranked(await _lastFm.GetArtistTopTracksAsync(artist,
+                Math.Min(50, candidateTarget), ct), "artist:" + artist));
+            foreach (var similar in (await _lastFm.GetSimilarArtistsAsync(artist, 6, ct)).Take(5))
+                result.AddRange(Ranked(await _lastFm.GetArtistTopTracksAsync(similar.Name,
+                    Math.Min(20, Math.Max(6, candidateTarget / 5)), ct), "artist:" + similar.Name,
+                    NeighbourArtistAffinity));
+            // The other sources' radio for the artist (YouTube Music's, LB Radio's), beside the
+            // similar artists' songs. Last.fm is not asked again: its answer is the lines above.
+            if (_sources is not null)
+            {
+                var weights = _sources.Weights(username);
+                foreach (var answer in await _sources.AskAllAsync(new RadioSeed(artist, "", null, null),
+                             candidateTarget, EmptyAuth, ct, only: source => source.Provider != RadioProvider.LastFm))
                     result.AddRange(Ranked(answer.Tracks, answer.Provider + ":artist:" + artist,
                         NeighbourArtistAffinity * weights.GetValueOrDefault(answer.Provider, 1.0)));
+            }
         }
+        catch (OperationCanceledException) { }
         return result;
     }
 
@@ -404,8 +411,11 @@ public sealed class LastFmRadioRecommendationService
             .GroupBy(item => LastFmRadioSeedNormalizer.TrackKey(item.Track.Artist, item.Track.Title))
             .Select(group => group.OrderByDescending(item => item.Weight).First())
             .ToList();
-        var sourceCap = SourceCap(target, distinct.Select(item => item.Source)
-            .Distinct(StringComparer.OrdinalIgnoreCase).Count());
+        // The cap is per seed, not per source list: three sources answering one seed are one
+        // seed's songs, so a mix of six seeds keeps six shares however many sources answer. The
+        // familiar plays have their own quota and sit outside it.
+        var sourceCap = SourceCap(target, distinct.Where(item => item.Source != FamiliarSource)
+            .Select(item => SeedGroup(item.Source)).Distinct(StringComparer.OrdinalIgnoreCase).Count());
         var artistGap = Math.Clamp(distinct.Select(item => ArtistKey(item.Track.Artist))
             .Distinct(StringComparer.OrdinalIgnoreCase).Count() - 1, 1, ArtistGap);
         var held = new List<Candidate>();
@@ -429,8 +439,9 @@ public sealed class LastFmRadioRecommendationService
             if (unavailable.Contains(key)) return Verdict.Skip;
             if (excludeRecent && recent.Contains(key)) return Verdict.Skip;
             if (perArtist.GetValueOrDefault(artist) >= artistCap) return Verdict.Skip;
-            if (perSource.GetValueOrDefault(candidate.Source) >= sourceCap) return Verdict.Skip;
             var isFamiliar = candidate.Source == FamiliarSource;
+            var group = SeedGroup(candidate.Source);
+            if (!isFamiliar && perSource.GetValueOrDefault(group) >= sourceCap) return Verdict.Skip;
             if (familiarQuota is { } quota)
             {
                 if (isFamiliar && familiarTaken >= quota) return Verdict.Skip;
@@ -460,7 +471,7 @@ public sealed class LastFmRadioRecommendationService
             outputArtists.Add(artist);
             outputTitles.Add(title);
             perArtist[artist] = perArtist.GetValueOrDefault(artist) + 1;
-            perSource[candidate.Source] = perSource.GetValueOrDefault(candidate.Source) + 1;
+            perSource[group] = perSource.GetValueOrDefault(group) + 1;
             if (isFamiliar) familiarTaken++;
             return Verdict.Taken;
         }
@@ -480,6 +491,14 @@ public sealed class LastFmRadioRecommendationService
     /// </summary>
     internal static int SourceCap(int target, int sources) =>
         Math.Max(3, (int)Math.Ceiling(1.5 * target / Math.Max(1, sources)));
+
+    /// <summary>The seed a source list answers: "youtube-music:tag:trip hop" and "tag:trip hop"
+    /// are one seed's lists. Only a provider's own prefix is taken off.</summary>
+    internal static string SeedGroup(string source)
+    {
+        var colon = source.IndexOf(':');
+        return colon > 0 && RadioProvider.IsKnown(source[..colon]) ? source[(colon + 1)..] : source;
+    }
 
     /// <summary>The seed ranking: provenance, hearts, and a 45-day recency decay.</summary>
     private static double SeedScore(LastFmRadioPlay play) =>

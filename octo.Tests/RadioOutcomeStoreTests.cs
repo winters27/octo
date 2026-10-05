@@ -59,6 +59,9 @@ public sealed class RadioOutcomeStoreTests : IDisposable
         // A song the listener played themselves.
         store.Served("alice", [("mine", RadioProvider.History)], T0);
         Play(store, "alice", "mine", T0.AddMinutes(5), T0.AddMinutes(9));
+        // A song from Navidrome's own picks: no source suggested it.
+        store.Served("alice", [("owned", RadioProvider.Library)], T0);
+        Play(store, "alice", "owned", T0.AddMinutes(10), T0.AddMinutes(14));
 
         Assert.Empty(store.Stats(T0.AddDays(2)));
         Assert.Empty(store.Multipliers("alice", T0.AddDays(2)));
@@ -108,8 +111,8 @@ public sealed class RadioOutcomeStoreTests : IDisposable
         for (var i = 0; i < 40; i++)
         {
             store.Served("alice", [($"y{i}", RadioProvider.YouTubeMusic), ($"l{i}", RadioProvider.LastFm)], at);
-            Play(store, "alice", $"y{i}", at.AddSeconds(1), at.AddSeconds(2));
-            Play(store, "alice", $"l{i}", at.AddSeconds(3), null);
+            Play(store, "alice", $"y{i}", at.AddMinutes(1), at.AddMinutes(4));
+            Play(store, "alice", $"l{i}", at.AddMinutes(5), null);
             at = at.AddMinutes(10);
         }
         var multipliers = store.Multipliers("alice", at.AddDays(2));
@@ -202,5 +205,64 @@ public sealed class RadioOutcomeStoreTests : IDisposable
         Assert.Equal(1, Row(again, RadioProvider.LastFm, T0.AddMinutes(3)).Plays);
         again.Forget();
         Assert.Empty(Store().Stats(T0.AddMinutes(3)));
+    }
+
+    [Fact]
+    public void OneServing_TeachesOnce()
+    {
+        var store = Store();
+        store.Served("alice", [("a", RadioProvider.LastFm)], T0);
+        Play(store, "alice", "a", T0.AddMinutes(1), T0.AddMinutes(4));
+        // Played again from the queue an hour later: the listener's choice, not the source's.
+        Play(store, "alice", "a", T0.AddHours(1), T0.AddHours(1.1));
+        Assert.Equal(1, Row(store, RadioProvider.LastFm, T0.AddHours(2)).Plays);
+    }
+
+    [Fact]
+    public void AStationRefetch_NeverRenewsAServingStillRemembered()
+    {
+        var store = Store();
+        store.Served("alice", [("a", RadioProvider.LastFm)], T0, refresh: false);
+        // Past the start window, but the first serving is still remembered.
+        store.Served("alice", [("a", RadioProvider.LastFm)], T0.AddHours(7), refresh: false);
+        Play(store, "alice", "a", T0.AddHours(8), T0.AddHours(8.1));
+        Assert.Empty(store.Stats(T0.AddHours(9)));
+    }
+
+    [Fact]
+    public void AFinishWithinThirtySecondsOfItsStart_IsASkip()
+    {
+        var store = Store();
+        store.Served("alice", [("a", RadioProvider.YouTubeMusic)], T0);
+        Play(store, "alice", "a", T0.AddMinutes(1), T0.AddMinutes(1).AddSeconds(10));
+        var row = Row(store, RadioProvider.YouTubeMusic, T0.AddMinutes(2));
+        Assert.Equal(1, row.Plays);
+        Assert.Equal(0, row.KeepRate);
+    }
+
+    [Fact]
+    public void AFinishArrivingDaysLate_TurnsItsSkipBackIntoAKeep()
+    {
+        var store = Store();
+        store.Served("alice", [("a", RadioProvider.ListenBrainz)], T0);
+        Play(store, "alice", "a", T0.AddMinutes(1), null);
+        Assert.Equal(0, Row(store, RadioProvider.ListenBrainz, T0.AddHours(25)).KeepRate);
+
+        // The phone was offline for three days; its queue sends the finish now.
+        store.Observe("alice", ["a"], ["true"], T0.AddDays(3));
+        var row = Row(store, RadioProvider.ListenBrainz, T0.AddDays(3));
+        Assert.Equal(1, row.Plays);
+        Assert.Equal(1.0, row.KeepRate, 2);
+    }
+
+    [Fact]
+    public void AFileWithNulls_IsReadWithoutThem()
+    {
+        File.WriteAllText(StatePath, """
+            {"Listeners":{"alice":{"lastfm":{"Kept":2,"Skipped":1,"UpdatedUtc":"2026-10-04T12:00:00Z"},"youtube-music":null},"bob":null}}
+            """);
+        var store = Store();
+        Assert.Equal(3, Row(store, RadioProvider.LastFm, T0).Plays);
+        Assert.Single(store.Stats(T0));
     }
 }

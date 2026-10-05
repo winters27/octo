@@ -27,7 +27,9 @@ public sealed record ProviderOutcome(string Provider, string Name, int Plays, do
 /// What radio learns from listening. A song a source suggested, started within
 /// <see cref="StartWindow"/> of being served, is kept when a finished scrobble follows within
 /// <see cref="FinishWindow"/> (the Octo apps can send that late, from an offline queue), and
-/// skipped otherwise; a one-star rating is <see cref="DislikeWeight"/> skips. Each listener's
+/// skipped otherwise; a finish later still, within <see cref="LateFinishWindow"/>, turns that skip
+/// back into a keep. A finish within <see cref="ShortestKeep"/> of its start is a skip, and a
+/// one-star rating is <see cref="DislikeWeight"/> skips. One serving teaches once. Each listener's
 /// counts per source fade by half every <see cref="HalfLifeDays"/> days and give that source a
 /// multiplier around 1: above it when the listener keeps its songs more than their own average,
 /// below when less. <see cref="PriorPlays"/> pretend plays at the average keep a source with few
@@ -37,6 +39,7 @@ public sealed class RadioOutcomeStore
 {
     internal static readonly TimeSpan StartWindow = TimeSpan.FromHours(6);
     internal static readonly TimeSpan FinishWindow = TimeSpan.FromHours(24);
+    internal static readonly TimeSpan LateFinishWindow = TimeSpan.FromDays(7);
     internal const double HalfLifeDays = 60;
     internal const double PriorPlays = 30;
     internal const double LowestMultiplier = 0.5;
@@ -52,8 +55,12 @@ public sealed class RadioOutcomeStore
     private readonly IOptionsMonitor<RadioSourceSettings> _settings;
     private readonly ILogger<RadioOutcomeStore> _logger;
     private readonly object _lock = new();
-    private readonly Dictionary<(string User, string Song), (string Provider, DateTime ServedUtc)> _served = new();
+    /// <summary>Held from the snapshot to the file move, so an older snapshot never lands last.</summary>
+    private readonly object _fileLock = new();
+    private readonly Dictionary<(string User, string Song), (string Provider, DateTime ServedUtc, bool Used)> _served = new();
     private readonly Dictionary<(string User, string Song), (string Provider, DateTime StartedUtc)> _open = new();
+    /// <summary>Outcomes counted as skips when the finish window closed, kept a week in case the finish arrives late.</summary>
+    private readonly Dictionary<(string User, string Song), (string Provider, DateTime SweptUtc)> _swept = new();
     private OutcomeState _state;
     private bool _dirty;
     private DateTime _lastFlush = DateTime.MinValue;
@@ -66,12 +73,16 @@ public sealed class RadioOutcomeStore
 
     private bool On => _settings.CurrentValue.LearnFromListening;
 
+    /// <summary>A finish this soon after its start is a skip; per store, so a test can play a song through at once.</summary>
+    internal TimeSpan ShortestKeep { get; set; } = TimeSpan.FromSeconds(30);
+
     /// <summary>Usernames as Navidrome compares them, without case.</summary>
     private static string Who(string listener) => listener.Trim().ToLowerInvariant();
 
     /// <summary>These songs went out on a radio for this listener, each from its source.</summary>
     /// <param name="refresh">False for a station: clients that sync playlists fetch them again and
-    /// again, and a refetch is not the listener choosing the radio, so it does not renew the window.</param>
+    /// again, and a refetch is not the listener choosing the radio, so it never renews a serving
+    /// still remembered. True for song radio: asking again is a new serving.</param>
     public void Served(string? listener, IEnumerable<(string SongId, string? Provider)> songs,
         DateTime? now = null, bool refresh = true)
     {
@@ -83,9 +94,11 @@ public sealed class RadioOutcomeStore
             Sweep(at);
             foreach (var (song, provider) in songs)
             {
-                if (song.Length == 0 || provider is null || provider == RadioProvider.History) continue;
-                if (!refresh && _served.TryGetValue((who, song), out var earlier) && at - earlier.ServedUtc <= StartWindow) continue;
-                _served[(who, song)] = (provider, at);
+                // Only a source's suggestions teach: a song from the listener's own plays or
+                // Navidrome's library picks says nothing about any source.
+                if (song.Length == 0 || provider is null || provider is RadioProvider.History or RadioProvider.Library) continue;
+                if (!refresh && _served.ContainsKey((who, song))) continue;
+                _served[(who, song)] = (provider, at, false);
             }
             if (_served.Count > MaxServed)
                 foreach (var old in _served.OrderBy(pair => pair.Value.ServedUtc).Take(_served.Count - MaxServed)
@@ -116,11 +129,22 @@ public sealed class RadioOutcomeStore
                 var key = (listener, ids[index]);
                 if (!completed)
                 {
-                    if (_served.TryGetValue(key, out var served) && now - served.ServedUtc <= StartWindow)
+                    // One serving opens one outcome: playing the song again later, from the queue
+                    // or the library, is the listener's choice, not the source's suggestion.
+                    if (_served.TryGetValue(key, out var served) && !served.Used && now - served.ServedUtc <= StartWindow)
+                    {
+                        _served[key] = served with { Used = true };
                         _open[key] = (served.Provider, now);
+                    }
                 }
                 else if (_open.Remove(key, out var open))
-                    Count(listener, open.Provider, kept: 1, skipped: 0, now);
+                {
+                    // A finish this soon after its start is a client scrobbling the skip.
+                    if (now - open.StartedUtc < ShortestKeep) Count(listener, open.Provider, kept: 0, skipped: 1, now);
+                    else Count(listener, open.Provider, kept: 1, skipped: 0, now);
+                }
+                else if (_swept.Remove(key, out var swept))
+                    Count(listener, swept.Provider, kept: 1, skipped: -1, now);
             }
         }
         FlushIfDue();
@@ -134,10 +158,18 @@ public sealed class RadioOutcomeStore
         lock (_lock)
         {
             var key = (listener, songId);
+            if (_swept.Remove(key, out var swept))
+            {
+                // Already counted as one skip when its window closed.
+                Count(listener, swept.Provider, kept: 0, skipped: DislikeWeight - 1, now);
+                return;
+            }
             var provider = _open.Remove(key, out var open) ? open.Provider
                 : _served.TryGetValue(key, out var served) && now - served.ServedUtc <= FinishWindow ? served.Provider
                 : null;
             if (provider is not null) Count(listener, provider, kept: 0, skipped: DislikeWeight, now);
+            // One serving is disliked once.
+            _served.Remove(key);
         }
         FlushIfDue();
     }
@@ -193,20 +225,28 @@ public sealed class RadioOutcomeStore
     /// <summary>Forget everything learned, from the dashboard.</summary>
     public void Forget()
     {
-        lock (_lock) { _state = new OutcomeState(); _served.Clear(); _open.Clear(); _dirty = true; }
+        lock (_lock) { _state = new OutcomeState(); _served.Clear(); _open.Clear(); _swept.Clear(); _dirty = true; }
         Flush();
     }
 
-    /// <summary>An outcome still open past the finish window was skipped; a song served a day ago is forgotten.</summary>
+    /// <summary>An outcome still open past the finish window was skipped (and is remembered a
+    /// week, in case its finish comes late); a song served a day ago is forgotten.</summary>
     private void Sweep(DateTime now)
     {
         foreach (var (key, open) in _open.Where(pair => now - pair.Value.StartedUtc > FinishWindow).ToList())
         {
             _open.Remove(key);
             Count(key.User, open.Provider, kept: 0, skipped: 1, now);
+            _swept[key] = (open.Provider, now);
         }
         foreach (var key in _served.Where(pair => now - pair.Value.ServedUtc > FinishWindow).Select(pair => pair.Key).ToList())
             _served.Remove(key);
+        foreach (var key in _swept.Where(pair => now - pair.Value.SweptUtc > LateFinishWindow).Select(pair => pair.Key).ToList())
+            _swept.Remove(key);
+        if (_swept.Count > MaxServed)
+            foreach (var old in _swept.OrderBy(pair => pair.Value.SweptUtc).Take(_swept.Count - MaxServed)
+                         .Select(pair => pair.Key).ToList())
+                _swept.Remove(old);
     }
 
     private void Count(string listener, string provider, double kept, double skipped, DateTime now)
@@ -221,8 +261,9 @@ public sealed class RadioOutcomeStore
         if (!byProvider.TryGetValue(provider, out var counts))
             byProvider[provider] = counts = new OutcomeCounts { UpdatedUtc = now };
         var (fadedKept, fadedSkipped) = Faded(counts, now);
-        counts.Kept = fadedKept + kept;
-        counts.Skipped = fadedSkipped + skipped;
+        // A late finish takes back a skip that has faded since: never below none.
+        counts.Kept = Math.Max(0, fadedKept + kept);
+        counts.Skipped = Math.Max(0, fadedSkipped + skipped);
         counts.UpdatedUtc = now;
         _dirty = true;
     }
@@ -244,22 +285,25 @@ public sealed class RadioOutcomeStore
 
     public void Flush()
     {
-        string json;
-        lock (_lock)
+        lock (_fileLock)
         {
-            if (!_dirty) return;
-            json = JsonSerializer.Serialize(_state);
-            _dirty = false;
-            _lastFlush = DateTime.UtcNow;
+            string json;
+            lock (_lock)
+            {
+                if (!_dirty) return;
+                json = JsonSerializer.Serialize(_state);
+                _dirty = false;
+                _lastFlush = DateTime.UtcNow;
+            }
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
+                var temp = _path + ".tmp";
+                File.WriteAllText(temp, json);
+                File.Move(temp, _path, overwrite: true);
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "Could not save {Path}", _path); lock (_lock) _dirty = true; }
         }
-        try
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-            var temp = _path + ".tmp";
-            File.WriteAllText(temp, json);
-            File.Move(temp, _path, overwrite: true);
-        }
-        catch (Exception ex) { _logger.LogWarning(ex, "Could not save {Path}", _path); lock (_lock) _dirty = true; }
     }
 
     private OutcomeState Load()
@@ -267,7 +311,20 @@ public sealed class RadioOutcomeStore
         try
         {
             if (File.Exists(_path))
-                return JsonSerializer.Deserialize<OutcomeState>(File.ReadAllText(_path)) ?? new OutcomeState();
+            {
+                var state = JsonSerializer.Deserialize<OutcomeState>(File.ReadAllText(_path)) ?? new OutcomeState();
+                // A hand-edited or half-written file can hold nulls; they are dropped, not crashed on.
+                var listeners = new Dictionary<string, Dictionary<string, OutcomeCounts>>(StringComparer.Ordinal);
+                foreach (var (listener, byProvider) in state.Listeners ?? [])
+                {
+                    if (string.IsNullOrWhiteSpace(listener) || byProvider is null) continue;
+                    var kept = byProvider.Where(pair => pair.Value is not null)
+                        .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal);
+                    if (kept.Count > 0) listeners[listener] = kept;
+                }
+                state.Listeners = listeners;
+                return state;
+            }
         }
         catch (Exception ex) { _logger.LogWarning(ex, "{Path} could not be read; radio starts learning again", _path); }
         return new OutcomeState();

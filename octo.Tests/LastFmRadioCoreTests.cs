@@ -1202,10 +1202,12 @@ public class LastFmRadioRecommendationTests
     {
         public string Provider => provider;
         public bool Available => true;
+        public System.Collections.Concurrent.ConcurrentQueue<RadioSeed> Asked { get; } = new();
 
         public async Task<RadioAnswer> SongsLikeAsync(RadioSeed seed, int requested,
             IReadOnlyDictionary<string, string> auth, CancellationToken ct)
         {
+            Asked.Enqueue(seed);
             if (hangs) await Task.Delay(Timeout.Infinite, ct);
             return new RadioAnswer(provider, match, Enumerable.Range(0, count)
                 .Select(i => new LastFmService.SimilarTrack($"{provider} artist {i}", $"{provider} song {i} for {seed.Title}",
@@ -1270,6 +1272,32 @@ public class LastFmRadioRecommendationTests
         }
         finally { try { Directory.Delete(directory, true); } catch { } }
     }
+
+    [Fact]
+    public async Task AnArtistStation_AsksTheOtherSources_NotLastFmAgain()
+    {
+        var lastFm = new StationSource(RadioProvider.LastFm, RadioMatch.Song, 5);
+        var ytm = new StationSource(RadioProvider.YouTubeMusic, RadioMatch.Song, 10);
+        var (service, _, directory) = WithSources(lastFm, ytm);
+        try
+        {
+            await service.BuildAsync("alice");
+            // An artist station's seed has no title; Last.fm answered it with its own top tracks.
+            Assert.Contains(ytm.Asked, seed => seed.Title.Length == 0);
+            Assert.DoesNotContain(lastFm.Asked, seed => seed.Title.Length == 0);
+        }
+        finally { try { Directory.Delete(directory, true); } catch { } }
+    }
+
+    [Theory]
+    [InlineData("youtube-music:tag:trip hop", "tag:trip hop")]
+    [InlineData("tag:trip hop", "tag:trip hop")]
+    [InlineData("lastfm:massive attack - teardrop", "massive attack - teardrop")]
+    [InlineData("listenbrainz:artist:Portishead", "artist:Portishead")]
+    [InlineData("history", "history")]
+    [InlineData("artist:Sunn O))): live", "artist:Sunn O))): live")]
+    public void ASeedsListsFromEverySource_AreOneSeed(string source, string group) =>
+        Assert.Equal(group, LastFmRadioRecommendationService.SeedGroup(source));
 
     /// <summary>Enough plays that BuildAsync takes the learned branch and builds all four kinds.
     /// The key has to be set: without one LastFmService short-circuits every tag lookup, so

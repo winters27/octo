@@ -204,6 +204,8 @@ public sealed class SimilarSongsSeedTests
         using var client = fixture.CreateClient();
         var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=spooky&u=alice&t=token&s=salt&f=json&count=20"));
         var ytm = songs.First(song => song.By == "YouTube Music").Id;
+        // The test plays the song through at once; a real one is heard for more than 30 s.
+        fixture.Services.GetRequiredService<Octo.Services.Radio.RadioOutcomeStore>().ShortestKeep = TimeSpan.Zero;
 
         await Scrobble(client, "alice", ytm, finished: false);
         await Scrobble(client, "alice", ytm, finished: true);
@@ -365,6 +367,14 @@ public sealed class SimilarSongsSeedTests
     public void Interleave_TakesOneFromEachInTurn() =>
         Assert.Equal([1, 10, 2, 20, 3], LastFmRadioTrackResolver.Interleave<int>([[1, 2, 3], [10, 20]]));
 
+    [Fact]
+    public async Task NothingFromOctosSources_LetsNavidromeAnswer()
+    {
+        await using var fixture = new Factory(new Dictionary<string, string?> { ["LastFm:ApiKey"] = "" });
+        using var client = fixture.CreateClient();
+        Assert.Equal(["nd-1"], await RadioIds(client, "teardrop"));
+    }
+
     private static async Task<List<string>> RadioIds(HttpClient client, string id)
     {
         var body = await client.GetStringAsync($"/rest/getSimilarSongs2?id={id}&u=alice&t=token&s=salt&f=json&count=20");
@@ -427,6 +437,8 @@ public sealed class SimilarSongsSeedTests
                     ? """{"randomSongs":{"song":[""" + Song("genre-1", "GHOST", "Kaito", "Phonk Mix", "al-mix", "Phonk") + "," + LibrarySongs["spooky"] + "]}}"
                     : """{"randomSongs":{"song":[]}}""",
                 _ when path.EndsWith("/rest/search3") => """{"searchResult3":{}}""",
+                // Navidrome's own agents, for when Octo's sources have nothing.
+                _ when path.EndsWith("/rest/getSimilarSongs2") => """{"similarSongs2":{"song":[""" + Song("nd-1", "Unfinished Sympathy", "Massive Attack", "Blue Lines", "al-blue", "Trip-Hop") + "]}}",
                 _ when path.EndsWith("/rest/ping") => "",
                 _ when path.EndsWith("/rest/scrobble") => "",
                 _ when path.EndsWith("/rest/getOpenSubsonicExtensions") => """{"openSubsonic":true,"openSubsonicExtensions":[]}""",

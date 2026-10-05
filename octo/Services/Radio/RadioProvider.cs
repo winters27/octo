@@ -18,6 +18,10 @@ public static class RadioProvider
     public static bool IsCatalog(string provider) =>
         provider is LastFm or YouTubeMusic or ListenBrainz;
 
+    /// <summary>A provider's own key, as a station's source lists are prefixed with.</summary>
+    public static bool IsKnown(string key) =>
+        key is LastFm or YouTubeMusic or ListenBrainz or SoundsAlike or Library or History;
+
     /// <summary>What the apps show; null for a song the listener played themselves.</summary>
     public static string? DisplayName(string? provider) => provider switch
     {
