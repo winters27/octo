@@ -92,6 +92,49 @@ public sealed class DownloadMatchingTests : IDisposable
         Assert.Same(single, Assert.Single(ranked));
     }
 
+    // ---- An edition that changes what is played is a version ---------------------------------
+
+    [Theory]
+    [InlineData(@"Daft Punk\Random Access Memories (Drumless Edition)\08 - Get Lucky (Drumless Edition).flac")]
+    [InlineData(@"Daft Punk\Singles\Daft Punk - Get Lucky Drumless.flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (Piano Version).flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (8D Audio).flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (Orchestral Version).flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (Lo-Fi).flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (Bass Boosted).flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (Instrumental Edition).flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (A Cappella).flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (Karaoke Edition).flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (Slowed + Reverb).flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (Nightcore).flac")]
+    [InlineData(@"Daft Punk\Singles\Get Lucky (Unplugged).flac")]
+    public void AnEditionThatChangesThePerformanceIsAnotherVersion(string file) =>
+        Assert.True(SoulseekDownloadService.AddsVersion(file, "Get Lucky")
+            || SoulseekDownloadService.FromVersionFolder(file, "Get Lucky", "Random Access Memories", "Daft Punk"));
+
+    [Fact]
+    public void ADrumlessAlbumsPlainFileIsTheDrumlessOne() =>
+        Assert.True(SoulseekDownloadService.FromVersionFolder(
+            @"Daft Punk\Random Access Memories (Drumless Edition) (2023)\08 - Get Lucky.flac", "Get Lucky", "Random Access Memories", "Daft Punk"));
+
+    [Theory]
+    [InlineData(@"Daft Punk\Random Access Memories (10th Anniversary Edition)\08 - Get Lucky.flac")]
+    [InlineData(@"Daft Punk\Random Access Memories (Deluxe Edition)\08 - Get Lucky.flac")]
+    [InlineData(@"Daft Punk\Random Access Memories (Super Deluxe Edition)\08 - Get Lucky.flac")]
+    [InlineData(@"Daft Punk\Random Access Memories (Collector's Edition)\08 - Get Lucky.flac")]
+    [InlineData(@"Daft Punk\Random Access Memories (Bonus Track Version)\08 - Get Lucky.flac")]
+    [InlineData(@"Daft Punk\Random Access Memories (Limited Edition)\08 - Get Lucky (Remastered Edition).flac")]
+    public void AReleaseEditionIsTheSameRecording(string file)
+    {
+        Assert.False(SoulseekDownloadService.AddsVersion(file, "Get Lucky"));
+        Assert.False(SoulseekDownloadService.FromVersionFolder(file, "Get Lucky", "Random Access Memories", "Daft Punk"));
+    }
+
+    [Fact]
+    public void ADrumlessRequestStillTakesTheDrumlessCopy() =>
+        Assert.False(SoulseekDownloadService.AddsVersion(
+            @"Daft Punk\Random Access Memories (Drumless Edition)\08 - Get Lucky (Drumless Edition).flac", "Get Lucky (Drumless Edition)"));
+
     [Fact]
     public void ARadioEditRequestHearsAPlainlyNamedSingle() =>
         Assert.True(SoulseekDownloadService.FilenamePlausiblyMatchesTitle(

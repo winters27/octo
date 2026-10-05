@@ -31,6 +31,8 @@ internal static class VersionVariant
         (Rx(@"\binstrumentals?\b"), "instrumental"),
         (Rx(@"\b(?:a\s*cappellas?|acapellas?)\b"), "acapella"),
         (Rx(@"\bkaraoke\b"), "karaoke"),
+        (Rx(@"\bdrumless\b"), "drumless"),
+        (Rx(@"\b8d\s+audio\b"), "8d"),
         (Rx(@"\b(?:dj|continuous|non-?stop)\s+mix(?:es)?\b|\bmixed\s+by\b"), "dj mix"),
     ];
 

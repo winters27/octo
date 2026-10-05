@@ -316,7 +316,7 @@ public static class SongIdentity
     /// <summary>Version words that mean a version even without brackets at the end of a title,
     /// "Mask Off Remix", "Heat Waves Sped Up". Not "live" or "edit": too many titles end in them.</summary>
     private static readonly Regex TrailingVersion = new(
-        @"\s+(re-?mix|rmx|sped\s*up|speed\s*up|slowed(?:\s*(?:\+|&|and|n)\s*reverb(?:ed)?)?|slowed\s+down|nightcore|instrumental|acapella|a\s*cappella|karaoke(?:\s+version)?)$",
+        @"\s+(re-?mix|rmx|sped\s*up|speed\s*up|slowed(?:\s*(?:\+|&|and|n)\s*reverb(?:ed)?)?|slowed\s+down|nightcore|instrumental|acapella|a\s*cappella|karaoke(?:\s+version)?|drumless|8d\s+audio)$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly Regex FeatureLead = new(
@@ -356,7 +356,9 @@ public static class SongIdentity
     private static readonly Regex NeutralPhrase = new(
         @"^(?:from|taken from|as heard (?:in|on)|as featured in|as seen (?:in|on)|theme from|music from)\b"
         + @"|\b(?:soundtrack|ost|motion picture|original score)\b"
-        + @"|^bonus(?:\s+track)?$|^(?:prod|produced)\b|^(?:deluxe|expanded|anniversary|special)(?:\s+(?:edition|version))?$"
+        + @"|^bonus(?:\s+tracks?)?(?:\s+(?:edition|version))?$|^(?:prod|produced)\b"
+        // A release edition is the same recordings packaged again; "Drumless Edition" is a marker below.
+        + @"|^(?:(?:super\s+)?deluxe|expanded|(?:\d+(?:st|nd|rd|th)\s+)?anniversary|special|collector'?s|limited|tour|platinum)(?:\s+(?:edition|version))?$"
         + @"|^(?:copyright free|free download|out now|audio only|single|ep)$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
@@ -382,6 +384,13 @@ public static class SongIdentity
         new(Rx(@"\bslowed(?:\s+down)?\b"), "slowed"),
         new(Rx(@"\breverb(?:ed)?\b"), "reverb"),
         new(Rx(@"\bnightcore\b"), "nightcore"),
+        // Editions that change what is played, unlike a deluxe or anniversary one (NeutralPhrase).
+        new(Rx(@"\bdrumless\b"), "drumless"),
+        new(Rx(@"\b8d(?:\s+audio)?\b"), "8d"),
+        new(Rx(@"\bpiano(?:\s+(?:version|edition|arrangement))?\b"), "piano"),
+        new(Rx(@"\b(?:orchestral|symphonic)(?:\s+(?:version|edition|mix))?\b"), "orchestral"),
+        new(Rx(@"\blo-?fi(?:\s+(?:version|edit|mix))?\b"), "lofi"),
+        new(Rx(@"\bbass\s*boost(?:ed)?\b"), "bass boosted"),
         new(Rx(@"^(.*?)\s*\b(?:re-?mix(?:ed)?|rmx)\b"), "remix", Credited: true),
         new(Rx(@"\bvip(?:\s+mix)?\b"), "vip"),
         new(Rx(@"\bbootleg\b"), "bootleg"),
