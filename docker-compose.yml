@@ -162,6 +162,15 @@ services:
       # Empty means "{0} Mix". A default with braces cannot be written here, because the
       # first closing brace would end the variable.
       GeneratedPlaylists__NameFormat: ${MIX_NAME_FORMAT:-}
+      # ----- Made for you: New Releases, Rediscover, Deep Cuts -----
+      # Three lists per listener, on whether or not the mixes are, made again
+      # every day from their own plays. New Releases asks Deezer (no key).
+      GeneratedPlaylists__NewReleases: ${FOR_YOU_NEW_RELEASES:-true}
+      GeneratedPlaylists__Rediscover: ${FOR_YOU_REDISCOVER:-true}
+      GeneratedPlaylists__DeepCuts: ${FOR_YOU_DEEP_CUTS:-true}
+      GeneratedPlaylists__NewReleaseWeeks: ${NEW_RELEASE_WEEKS:-8}
+      GeneratedPlaylists__NewReleaseArtists: ${NEW_RELEASE_ARTISTS:-50}
+      GeneratedPlaylists__RediscoverMonths: ${REDISCOVER_MONTHS:-6}
 
       # ----- Spotify import: lists from Spotify, a link or a file, and the trickle -----
       Imports__SpotifyClientId: ${IMPORTS_SPOTIFY_CLIENT_ID:-}

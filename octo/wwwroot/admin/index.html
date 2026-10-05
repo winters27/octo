@@ -1306,9 +1306,44 @@
         <header class="page-header">
           <div>
             <h1>Mixes</h1>
-            <p>Genre and decade playlists drawn from each listener's own library, next to the radio stations.</p>
+            <p>Made for you, and genre and decade playlists, drawn from each listener's own library, next to the radio stations.</p>
           </div>
         </header>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Made for you</h3>
+            <p class="set-desc">Three lists for each listener, made again every day from their own plays. They show on the Octo apps' Home, and as playlists in every other app.</p>
+          </div>
+          <form data-section="generated-playlists-foryou" class="set-card">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">New Releases</div><div class="set-info-d">Albums, EPs and singles from the artists each listener plays most, newest first, a few songs from each. Songs they do not have play right away and can be added.</div><div class="set-info-more">Release dates come from Deezer, with no key needed.</div></div>
+              <label class="switch"><input type="checkbox" name="GeneratedPlaylists.NewReleases" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Rediscover</div><div class="set-info-d">Songs each listener loved (played often, hearted or rated 4 or more) and has not played for a while.</div></div>
+              <label class="switch"><input type="checkbox" name="GeneratedPlaylists.Rediscover" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Deep Cuts</div><div class="set-info-d">Songs played once or never, from the artists each listener plays most.</div></div>
+              <label class="switch"><input type="checkbox" name="GeneratedPlaylists.DeepCuts" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <details class="set-more">
+              <summary>How far back</summary>
+              <div class="set-row stack">
+                <div class="set-info"><div class="set-info-t">New Releases looks back <span class="set-opt">weeks</span> / follows <span class="set-opt">artists</span></div><div class="set-info-d">Releases out in the last weeks given, from that many of each listener's most-played artists.</div></div>
+                <div class="set-grid2">
+                  <input class="set-input" name="GeneratedPlaylists.NewReleaseWeeks" type="number" min="1" max="26" data-number="true" aria-label="New Releases looks back this many weeks" />
+                  <input class="set-input" name="GeneratedPlaylists.NewReleaseArtists" type="number" min="10" max="200" data-number="true" aria-label="New Releases follows this many artists" />
+                </div>
+              </div>
+              <div class="set-row">
+                <div class="set-info"><div class="set-info-t">Rediscover after <span class="set-opt">months</span></div><div class="set-info-d">How long since a loved song was last played.</div></div>
+                <input class="set-input" name="GeneratedPlaylists.RediscoverMonths" type="number" min="3" max="24" data-number="true" />
+              </div>
+            </details>
+          </form>
+        </div>
 
         <div class="set-section">
           <div class="set-head">

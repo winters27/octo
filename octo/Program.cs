@@ -275,6 +275,8 @@ builder.Services.AddHostedService<Octo.Services.Library.NoticePlaylistWorker>();
 // Singleton AND hosted, like the rating worker, so the dashboard's "Scan now" reaches the
 // instance the host is running.
 builder.Services.AddSingleton<Octo.Services.Library.DuplicateScanWorker>();
+// Made for you's New Releases: the listener's artists found in the catalog, and their latest.
+builder.Services.AddSingleton<Octo.Services.Library.NewReleasesBuilder>();
 // Genre and decade mixes (#54): served by Octo like radio stations, never written to Navidrome.
 builder.Services.AddSingleton(sp => new Octo.Services.Library.GeneratedPlaylistService(
     System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "generated-playlists.json"),

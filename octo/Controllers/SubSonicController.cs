@@ -377,7 +377,8 @@ public partial class SubsonicController : ControllerBase
         var stations = PlaylistStations(username);
         QueueRefreshIfStale(username);
         var mixSettings = _generatedSettings?.CurrentValue;
-        var generated = _generatedPlaylists is not null && mixSettings is { Enabled: true }
+        // The mixes, and Made for you, which is on by default whatever the mixes switch says.
+        var generated = _generatedPlaylists is not null && mixSettings is not null && (mixSettings.Enabled || mixSettings.AnyForYou)
             ? await _generatedPlaylists.ListAsync(username, parameters)
             : [];
         var popular = Popular() is { } popularLists ? await popularLists.ListAsync(username, parameters) : null;
@@ -2255,6 +2256,39 @@ public partial class SubsonicController : ControllerBase
             .ToList();
     }
 
+    private const int CatalogImageMaxBytes = 8 * 1024 * 1024;
+
+    /// <summary>A cover the catalog's own image host serves over https (cdn-images.dzcdn.net and its kin).</summary>
+    internal static bool IsCatalogImage(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        && uri.Scheme == Uri.UriSchemeHttps
+        && (uri.Host.Equals("dzcdn.net", StringComparison.OrdinalIgnoreCase)
+            || uri.Host.EndsWith(".dzcdn.net", StringComparison.OrdinalIgnoreCase));
+
+    private static async Task<byte[]?> CatalogImageAsync(IHttpClientFactory http, string url, CancellationToken ct)
+    {
+        try
+        {
+            using var response = await http.CreateClient(Octo.Services.Metadata.DeezerRateLimiter.ClientName)
+                .GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+            if (!response.IsSuccessStatusCode || response.Content.Headers.ContentLength > CatalogImageMaxBytes) return null;
+            await using var body = await response.Content.ReadAsStreamAsync(ct);
+            using var copy = new MemoryStream();
+            var buffer = new byte[81920];
+            int read;
+            while ((read = await body.ReadAsync(buffer, ct)) > 0)
+            {
+                if (copy.Length + read > CatalogImageMaxBytes) return null;
+                copy.Write(buffer, 0, read);
+            }
+            return copy.ToArray();
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>
     /// The songs whose covers colour a mix's cover: the first of this period's draw, one per
     /// album cover, four at most, read from Navidrome as the listener. A period's first draw is
@@ -2264,6 +2298,18 @@ public partial class SubsonicController : ControllerBase
         Octo.Services.Library.GeneratedPlaylist mix, Dictionary<string, string> parameters, CancellationToken ct)
     {
         if (_generatedPlaylists is null) return [];
+        // New Releases is mostly albums Navidrome has never heard of: its covers come from the
+        // catalog's own image host, as the album pages of outside albums do. Only that host, over
+        // https, through the catalog's client (8 second limit), and no picture bigger than 8 MB.
+        if (mix.Kind == Octo.Services.Library.ForYouLists.NewReleasesKind)
+        {
+            var http = HttpContext.RequestServices.GetService<IHttpClientFactory>();
+            if (http is null) return [];
+            return _generatedPlaylists.ForYouCovers(username)
+                .Where(IsCatalogImage)
+                .Select(url => new CoverSeed("catalog|" + url, token => CatalogImageAsync(http, url, token)))
+                .ToList();
+        }
         var auth = parameters.Where(pair => pair.Key is not ("id" or "size")).ToDictionary(pair => pair.Key, pair => pair.Value);
         var songs = _generatedPlaylists.Drawn(username, mix);
         if (songs is null)

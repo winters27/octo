@@ -57,18 +57,21 @@ public partial class DeezerMetadataService : IDisposable
     public sealed record CatalogCandidates(IReadOnlyList<FullTrackMeta> Hits, bool DidNotAnswer);
 
     /// <summary>One album from a catalog search. Year is not on the search payload;
-    /// the detail call fills it.</summary>
+    /// the detail call fills it. ReleaseDate (yyyy-MM-dd) is filled by an artist's album list,
+    /// which New Releases sorts and filters by.</summary>
     public record AlbumHit(string DeezerId, string Title, string Artist,
-        string? CoverUrl, int? Year, int TrackCount, string? RecordType)
+        string? CoverUrl, int? Year, int TrackCount, string? RecordType, string? ReleaseDate = null)
     {
         /// <summary>The listing's explicit flag. False is not "clean": a listing does not tell a
         /// clean edit from an album that never had explicit words.</summary>
         public bool? ExplicitLyrics { get; init; }
     }
 
-    /// <summary>One track of an album, with the real length and position.</summary>
+    /// <summary>One track of an album, with the real length and position. Rank is the catalog's
+    /// popularity score, which picks an album's best songs for New Releases.
+    /// ExplicitContentLyrics is the catalog's own: 1 explicit, 0 clean, 3 a clean edit.</summary>
     public record AlbumTrack(string Title, string Artist, int? Duration,
-        int? TrackPosition, int? DiscNumber, string? Isrc)
+        int? TrackPosition, int? DiscNumber, string? Isrc, int? Rank = null)
     {
         /// <summary>1 explicit, 3 the clean edit, 0 neither, null not said.</summary>
         public int? ExplicitContent { get; init; }
@@ -503,23 +506,24 @@ public partial class DeezerMetadataService : IDisposable
     /// Search the catalog for artists. Plain query: the artist endpoint takes a bare name
     /// and the qualified form is dead everywhere now.
     /// </summary>
-    public Task<List<ArtistHit>> SearchArtistsAsync(string query, int limit, CancellationToken ct = default)
+    public Task<List<ArtistHit>> SearchArtistsAsync(string query, int limit, CancellationToken ct = default,
+        bool background = false)
     {
         if (string.IsNullOrWhiteSpace(query) || limit <= 0) return Task.FromResult(new List<ArtistHit>());
         var key = $"ars|{query}|{limit}".ToLowerInvariant();
         if (TryGetCached<List<ArtistHit>>(key, out var cached)) return Task.FromResult(cached!);
         // An artist page names its artist and lists its albums in two requests at once, and
         // both search for the name. They share one search.
-        return SharedAsync(key, () => FetchArtistSearchAsync(query, limit, key), ct);
+        return SharedAsync(key, () => FetchArtistSearchAsync(query, limit, key, background), ct);
     }
 
-    private async Task<List<ArtistHit>> FetchArtistSearchAsync(string query, int limit, string key)
+    private async Task<List<ArtistHit>> FetchArtistSearchAsync(string query, int limit, string key, bool background = false)
     {
         var hits = new List<ArtistHit>();
         try
         {
             var q = Uri.EscapeDataString(query);
-            using var r = await GetJsonAsync($"{Base}/search/artist?q={q}&limit={limit}", CancellationToken.None);
+            using var r = await GetJsonAsync($"{Base}/search/artist?q={q}&limit={limit}", CancellationToken.None, background);
             // Caching an empty list on a refusal is what would make external artists
             // silently vanish from search3 for the rest of the process.
             if (r.Transient) return new List<ArtistHit>();
@@ -614,10 +618,15 @@ public partial class DeezerMetadataService : IDisposable
     /// singles; grouped after the records, they no longer bury them. The artist's name is not
     /// on this listing, so every hit carries the one given.
     /// </summary>
-    public async Task<List<AlbumHit>> GetArtistAlbumsAsync(string deezerArtistId, string artistName, CancellationToken ct = default)
+    /// <param name="pages">How many of the catalog's pages of 100 to read for a long career. The
+    /// catalog lists albums before singles, so a new single of an artist with more than a page of
+    /// releases is on a later page; New Releases reads up to three.</param>
+    public async Task<List<AlbumHit>> GetArtistAlbumsAsync(string deezerArtistId, string artistName, CancellationToken ct = default,
+        bool background = false, int pages = 1)
     {
         if (string.IsNullOrWhiteSpace(deezerArtistId)) return new List<AlbumHit>();
-        var key = $"ara|{deezerArtistId}".ToLowerInvariant();
+        pages = Math.Clamp(pages, 1, 5);
+        var key = (pages > 1 ? $"ara|{deezerArtistId}|p{pages}" : $"ara|{deezerArtistId}").ToLowerInvariant();
         if (TryGetCached<List<AlbumHit>>(key, out var cached)) return cached!;
 
         var releases = new List<AlbumHit>();
@@ -625,18 +634,29 @@ public partial class DeezerMetadataService : IDisposable
         var byTitle = new Dictionary<string, int>(StringComparer.Ordinal);
         int? total = null;
         var listed = 0;
+        var partial = false;
         try
         {
             var id = Uri.EscapeDataString(deezerArtistId);
-            using var r = await GetJsonAsync($"{Base}/artist/{id}/albums?limit={ArtistAlbumsLimit}", ct);
-            // Caching an empty list on a refusal would leave the artist's page empty for hours.
-            if (r.Transient) return new List<AlbumHit>();
-            if (r.Doc is not null
-                && r.Doc.RootElement.TryGetProperty("data", out var data)
-                && data.ValueKind == JsonValueKind.Array)
+            for (var page = 0; page < pages; page++)
             {
-                total = Int(r.Doc.RootElement, "total");
-                listed = data.GetArrayLength();
+                using var r = await GetJsonAsync($"{Base}/artist/{id}/albums?limit={ArtistAlbumsLimit}"
+                    + (page > 0 ? $"&index={page * ArtistAlbumsLimit}" : ""), ct, background);
+                // Caching an empty list on a refusal would leave the artist's page empty for hours.
+                // A later page refused keeps the first pages, briefly.
+                if (r.Transient)
+                {
+                    if (page == 0) return new List<AlbumHit>();
+                    partial = true;
+                    break;
+                }
+                if (r.Doc is null
+                    || !r.Doc.RootElement.TryGetProperty("data", out var data)
+                    || data.ValueKind != JsonValueKind.Array)
+                    break;
+                total ??= Int(r.Doc.RootElement, "total");
+                var count = data.GetArrayLength();
+                listed += count;
                 // Materialize everything before the JsonDocument is disposed.
                 foreach (var a in data.EnumerateArray())
                 {
@@ -649,7 +669,8 @@ public partial class DeezerMetadataService : IDisposable
                     var released = Str(a, "release_date");
                     int? year = released is { Length: >= 4 } && int.TryParse(released[..4], out var y) && y > 0 ? y : null;
                     var hit = new AlbumHit(albumId, title, artistName,
-                        Str(a, "cover_xl") ?? Str(a, "cover_medium"), year, Int(a, "nb_tracks") ?? 0, recordType)
+                        Str(a, "cover_xl") ?? Str(a, "cover_medium"), year, Int(a, "nb_tracks") ?? 0, recordType,
+                        released is { Length: >= 10 } ? released[..10] : null)
                     { ExplicitLyrics = Bool(a, "explicit_lyrics") };
 
                     var titleKey = Octo.Services.Common.SongIdentity.Key(title);
@@ -667,6 +688,7 @@ public partial class DeezerMetadataService : IDisposable
                         releases[at] = hit;
                     }
                 }
+                if (count == 0 || total is not int knownTotal || listed >= knownTotal) break;
             }
         }
         catch (Exception ex)
@@ -684,7 +706,7 @@ public partial class DeezerMetadataService : IDisposable
             .OrderBy(h => ReleaseRank(h.RecordType))
             .ThenByDescending(h => h.Year ?? 0)
             .ToList();
-        Put(key, hits, hits.Count == 0 ? NegativeTtl : PositiveTtl);
+        Put(key, hits, partial ? PartialTtl : hits.Count == 0 ? NegativeTtl : PositiveTtl);
         return hits;
     }
 
@@ -723,6 +745,8 @@ public partial class DeezerMetadataService : IDisposable
         _ => 4,
     };
 
+    /// <summary>A track's explicit state as the catalog's number, from its yes or no when the
+    /// number is missing.</summary>
     /// <summary>A track count already known for an album, without asking the catalog.</summary>
     public bool TryKnownTrackCount(string deezerId, out int? count) => TryGetCached($"tc|{deezerId}", out count);
 
@@ -888,7 +912,7 @@ public partial class DeezerMetadataService : IDisposable
                         var tArtist = t.TryGetProperty("artist", out var ta) ? Str(ta, "name") : null;
                         tracks.Add(new AlbumTrack(
                             tTitle, tArtist ?? artist, Int(t, "duration"),
-                            Int(t, "track_position"), Int(t, "disk_number"), Str(t, "isrc"))
+                            Int(t, "track_position"), Int(t, "disk_number"), Str(t, "isrc"), Int(t, "rank"))
                         {
                             ExplicitContent = Octo.Models.Domain.ExplicitStatus.FromCatalog(
                                 Int(t, "explicit_content_lyrics"), Bool(t, "explicit_lyrics")),
