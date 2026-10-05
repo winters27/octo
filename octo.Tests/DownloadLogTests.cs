@@ -387,7 +387,7 @@ public class DownloadLogTests
         Assert.Equal("torrent, 12 seeders, 3 days old", copies[0].Shown.Note);
         Assert.Null(copies[1].Shown.Rank);
         Assert.Equal("Not wanted in profile", copies[1].Shown.Note);
-        Assert.Equal(new LidarrReleasePick("a", 1, "Air - Moon Safari [FLAC]"), copies[0].Pick.Release);
+        Assert.Equal(new LidarrReleasePick("a", 1, "Air - Moon Safari [FLAC]", 300_000_000), copies[0].Pick.Release);
     }
 
     // ---------------------------------------------------------------------------------------

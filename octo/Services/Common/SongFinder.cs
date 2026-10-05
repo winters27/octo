@@ -554,7 +554,11 @@ public sealed class SongFinder
                         release.AgeDays is { } days ? $"{days} {(days == 1 ? "day" : "days")} old" : null,
                     }.Where(part => !string.IsNullOrEmpty(part))),
                 Title: target.Title, Album: albumTitle),
-            new PickedCopy { Source = LidarrSource, ReleaseGuid = release.Guid, IndexerId = release.IndexerId, ReleaseTitle = release.Title }))
+            new PickedCopy
+            {
+                Source = LidarrSource, ReleaseGuid = release.Guid, IndexerId = release.IndexerId, ReleaseTitle = release.Title,
+                Size = release.Size ?? 0,
+            }))
             .ToList();
     }
 

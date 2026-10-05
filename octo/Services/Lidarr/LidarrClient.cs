@@ -32,8 +32,9 @@ public sealed record LidarrSearchStarted(int AlbumId, bool Existed, bool WasMoni
 public sealed record LidarrRelease(string Guid, int IndexerId, string Title, string? Indexer, string? Quality,
     long? Size, int? Seeders, int? Leechers, string? Protocol, int? AgeDays, bool Rejected, IReadOnlyList<string> Rejections);
 
-/// <summary>A release someone picked in Find songs, grabbed instead of Lidarr's own search.</summary>
-public sealed record LidarrReleasePick(string Guid, int IndexerId, string? Title);
+/// <summary>A release someone picked in Find songs, grabbed instead of Lidarr's own search. Its
+/// title and size find it again when Lidarr has forgotten the search that listed it.</summary>
+public sealed record LidarrReleasePick(string Guid, int IndexerId, string? Title, long? Size = null);
 
 public sealed record LidarrAlbumImportState(
     IReadOnlyList<LidarrImportedTrack> Tracks, int TrackCount, int TrackFileCount)
@@ -215,6 +216,43 @@ public sealed class LidarrClient
             ["indexerId"] = release.IndexerId,
         }, ct);
 
+    internal const string PickGoneText = "The release you picked is no longer offered by the indexers. Search again and pick another.";
+
+    /// <summary>
+    /// Grabs a picked release. Lidarr keeps an interactive search's releases only for a while, and
+    /// a pick made before that ran out is refused by its guid; the album's releases are then listed
+    /// once more and the same release, by its indexer, title and size, is grabbed under its new guid.
+    /// </summary>
+    internal async Task GrabPickedAsync(int albumId, LidarrReleasePick pick, CancellationToken ct)
+    {
+        try
+        {
+            await GrabReleaseAsync(pick, ct);
+            return;
+        }
+        catch (HttpRequestException)
+        {
+            // Most likely forgotten; found again below, or refused in plain words.
+        }
+        var again = (await ListReleasesAsync(albumId, ct)).FirstOrDefault(release => SameRelease(release, pick))
+            ?? throw new InvalidOperationException(PickGoneText);
+        try
+        {
+            await GrabReleaseAsync(new LidarrReleasePick(again.Guid, again.IndexerId, again.Title, again.Size), ct);
+        }
+        catch (HttpRequestException)
+        {
+            throw new InvalidOperationException("Lidarr would not take the release you picked. Search again and pick another.");
+        }
+    }
+
+    /// <summary>The same release in a newer listing: the same indexer and title, and the same size when both say.</summary>
+    internal static bool SameRelease(LidarrRelease release, LidarrReleasePick pick) =>
+        release.IndexerId == pick.IndexerId
+        && !string.IsNullOrWhiteSpace(pick.Title)
+        && string.Equals(release.Title.Trim(), pick.Title.Trim(), StringComparison.OrdinalIgnoreCase)
+        && (release.Size is null || pick.Size is null || release.Size == pick.Size);
+
     /// <summary>
     /// Adds the album when Lidarr lacks it, monitors it, and starts an AlbumSearch, or grabs the
     /// release someone picked. Says whether the album was there before and monitored, so a caller
@@ -284,7 +322,7 @@ public sealed class LidarrClient
             await EnsureArtistMonitoredAsync(existingArtist, ct);
         }
 
-        if (grab is not null) await GrabReleaseAsync(grab, ct);
+        if (grab is not null) await GrabPickedAsync(albumId, grab, ct);
         else
             await SendJsonAsync(HttpMethod.Post, "/api/v1/command", new JsonObject
             {

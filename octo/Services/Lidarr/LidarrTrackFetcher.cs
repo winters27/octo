@@ -12,8 +12,9 @@ namespace Octo.Services.Lidarr;
 /// <param name="OriginalPath">The library file this replaces, when there is one: its tags can name
 /// the album exactly, and Lidarr may already be the one managing it.</param>
 /// <param name="Release">A release picked in Find songs, grabbed instead of Lidarr's own search.</param>
+/// <param name="Step">Told, in words for the download's log, what became of the picked release.</param>
 public sealed record LidarrTrackRequest(string Artist, string Title, string? Album, int? DurationSeconds,
-    bool LosslessOnly, string? OriginalPath = null, LidarrReleasePick? Release = null);
+    bool LosslessOnly, string? OriginalPath = null, LidarrReleasePick? Release = null, Action<string, string?>? Step = null);
 
 public interface ILidarrTrackFetcher
 {
@@ -60,6 +61,8 @@ public sealed class LidarrTrackFetcher(
         public int Users;
         public Task<IReadOnlyList<LidarrImportedTrack>>? Before;
         public Task<LidarrSearchStarted>? Search;
+        /// <summary>The release the album's search grabbed, when it was a pick.</summary>
+        public LidarrReleasePick? Grabbed;
     }
 
     public async Task<string> FetchAsync(LidarrTrackRequest request, string destinationDirectory, CancellationToken ct = default)
@@ -117,7 +120,26 @@ public sealed class LidarrTrackFetcher(
         }
 
         Task<LidarrSearchStarted> search;
-        lock (_gate) search = session.Search ??= client.StartAlbumSearchAsync(session.Candidate, CancellationToken.None, request.Release);
+        bool joined;
+        lock (_gate)
+        {
+            joined = session.Search is not null;
+            if (!joined) session.Grabbed = request.Release;
+            search = session.Search ??= client.StartAlbumSearchAsync(session.Candidate, CancellationToken.None, request.Release);
+        }
+        if (request.Release is { } pick)
+        {
+            if (!joined || session.Grabbed?.Guid == pick.Guid)
+                request.Step?.Invoke("Grabbing the release you picked", pick.Title);
+            else
+            {
+                // One album, one search: the song comes from the one already running, not the pick.
+                logger.LogInformation("Lidarr is already fetching '{Artist} - {Album}', so the release picked for '{Title}' ({Release}) is not grabbed",
+                    session.Candidate.Artist, session.Candidate.Title, request.Title, pick.Title);
+                request.Step?.Invoke("Lidarr is already fetching this album, so the release you picked was not grabbed",
+                    "The song comes from the album's search already running");
+            }
+        }
         var started = await search;
         logger.LogInformation("Lidarr is searching '{Artist} - {Album}' for a copy of '{Title}'",
             session.Candidate.Artist, session.Candidate.Title, request.Title);

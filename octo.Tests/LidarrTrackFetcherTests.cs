@@ -184,6 +184,67 @@ public sealed class LidarrTrackFetcherTests : IDisposable
         Assert.Equal(0, _lidarr.Searches);
     }
 
+    // ---- Picked releases ----------------------------------------------------------------------
+
+    private const string Release = "Massive Attack - Mezzanine (1998) [FLAC]";
+
+    [Fact]
+    public async Task APickLidarrHasForgottenIsFoundAgainByItsTitleIndexerAndSize()
+    {
+        _lidarr.Offered.Add(("fresh-guid", 3, Release, 400_000_000));
+        _lidarr.Offered.Add(("other-guid", 3, "Massive Attack - Mezzanine (1998) [MP3]", 90_000_000));
+        _lidarr.OnSearch = () => _lidarr.Import(3, "Teardrop", "FLAC");
+        var steps = new List<string>();
+
+        var copy = await Fetcher().FetchAsync(Teardrop() with
+        {
+            Release = new LidarrReleasePick("stale-guid", 3, Release, 400_000_000), Step = (text, _) => steps.Add(text),
+        }, Destination);
+
+        Assert.Equal("Teardrop", File.ReadAllText(copy));
+        Assert.Equal(["fresh-guid"], _lidarr.Grabs);
+        Assert.Equal(["Grabbing the release you picked"], steps);
+    }
+
+    [Fact]
+    public async Task APickNoLongerOfferedIsRefusedInPlainWords()
+    {
+        _lidarr.Offered.Add(("other-guid", 3, "Massive Attack - Mezzanine (1998) [MP3]", 90_000_000));
+
+        var refused = await Assert.ThrowsAsync<InvalidOperationException>(() => Fetcher().FetchAsync(Teardrop() with
+        {
+            Release = new LidarrReleasePick("stale-guid", 3, Release, 400_000_000),
+        }, Destination));
+
+        Assert.Equal(LidarrClient.PickGoneText, refused.Message);
+        Assert.Empty(_lidarr.Grabs);
+    }
+
+    [Fact]
+    public async Task APickForAnAlbumAlreadyBeingFetchedSaysItWasNotGrabbed()
+    {
+        var release = new TaskCompletionSource();
+        _lidarr.Offered.Add(("guid", 3, Release, 400_000_000));
+        _lidarr.OnSearch = () => _ = release.Task.ContinueWith(_ =>
+        {
+            _lidarr.Import(1, "Angel", "FLAC");
+            _lidarr.Import(3, "Teardrop", "FLAC");
+        });
+        var fetcher = Fetcher();
+        var steps = new List<string>();
+
+        var teardrop = fetcher.FetchAsync(Teardrop(), Destination);
+        await LastFmScrobbleServiceTests.Until(() => _lidarr.Searches == 1);
+        var angel = fetcher.FetchAsync(new LidarrTrackRequest("Massive Attack", "Angel", "Mezzanine", 380, true,
+            Release: new LidarrReleasePick("guid", 3, Release, 400_000_000), Step: (text, _) => steps.Add(text)), Destination);
+        await LastFmScrobbleServiceTests.Until(() => steps.Count == 1);
+        release.SetResult();
+        await Task.WhenAll(teardrop, angel).WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(["Lidarr is already fetching this album, so the release you picked was not grabbed"], steps);
+        Assert.Empty(_lidarr.Grabs);
+    }
+
     [Fact]
     public void TheSongIsMatchedByTitleNeverByNumber()
     {
@@ -222,6 +283,11 @@ public sealed class LidarrTrackFetcherTests : IDisposable
 
         public void AddAlbum(bool monitored) { _added = true; _monitored = monitored; }
 
+        /// <summary>The releases an interactive search lists now. A grab by any other guid is
+        /// refused the way Lidarr refuses a release it has forgotten.</summary>
+        public List<(string Guid, int IndexerId, string Title, long Size)> Offered { get; } = [];
+        public List<string> Grabs { get; } = [];
+
         /// <summary>A file for a track, at Lidarr's path, written where Octo sees it. Returns Octo's path.</summary>
         public string Import(int trackId, string title, string quality)
         {
@@ -251,6 +317,11 @@ public sealed class LidarrTrackFetcherTests : IDisposable
                     ("PUT", "/api/v1/album/7") => Monitor(true),
                     ("PUT", "/api/v1/album/monitor") => Monitor(JsonNode.Parse(body!)!["monitored"]!.GetValue<bool>()),
                     ("POST", "/api/v1/command") => Search(),
+                    ("GET", "/api/v1/release") => Json(new JsonArray(Offered.Select(r => (JsonNode)new JsonObject
+                    {
+                        ["guid"] = r.Guid, ["indexerId"] = r.IndexerId, ["title"] = r.Title, ["size"] = r.Size,
+                    }).ToArray()).ToJsonString()),
+                    ("POST", "/api/v1/release") => Grab(JsonNode.Parse(body!)!["guid"]!.GetValue<string>()),
                     ("GET", "/api/v1/track") => Json(Tracks()),
                     ("GET", "/api/v1/trackFile") => Json(Files()),
                     ("DELETE", _) when path.StartsWith("/api/v1/trackfile/", StringComparison.Ordinal) => Delete(int.Parse(path[18..])),
@@ -294,6 +365,17 @@ public sealed class LidarrTrackFetcherTests : IDisposable
             // The lock is the same thread's, and C#'s lock lets it in again.
             OnSearch?.Invoke();
             return Json("""{"id":1,"name":"AlbumSearch"}""");
+        }
+
+        private HttpResponseMessage Grab(string guid)
+        {
+            if (Offered.All(r => r.Guid != guid))
+                return new HttpResponseMessage(HttpStatusCode.NotFound)
+                {
+                    Content = new StringContent("""{"message":"Couldn't find requested release in cache, cache timeout probably expired."}"""),
+                };
+            Grabs.Add(guid);
+            return Search();
         }
 
         private string Tracks() => new JsonArray(_tracks.Select(t =>

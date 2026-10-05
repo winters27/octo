@@ -22,7 +22,7 @@ public sealed class PickedCopy
     public int? SampleRate { get; set; }
     public int? Length { get; set; }
 
-    // A Lidarr release. Without one, Lidarr chooses by its quality profile.
+    // A Lidarr release, and its size in Size. Without one, Lidarr chooses by its quality profile.
     public string? ReleaseGuid { get; set; }
     public int? IndexerId { get; set; }
     public string? ReleaseTitle { get; set; }
@@ -44,7 +44,7 @@ public sealed class PickedCopy
     [System.Text.Json.Serialization.JsonIgnore]
     public Octo.Services.Lidarr.LidarrReleasePick? Release =>
         !IsSoulseek && !string.IsNullOrEmpty(ReleaseGuid) && IndexerId is { } indexer
-            ? new Octo.Services.Lidarr.LidarrReleasePick(ReleaseGuid, indexer, ReleaseTitle)
+            ? new Octo.Services.Lidarr.LidarrReleasePick(ReleaseGuid, indexer, ReleaseTitle, Size > 0 ? Size : null)
             : null;
 
     /// <summary>Whether this is the same copy: the same peer's same file, or the same release.</summary>

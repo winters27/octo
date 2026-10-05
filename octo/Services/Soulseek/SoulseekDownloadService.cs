@@ -288,10 +288,9 @@ public class SoulseekDownloadService : BaseDownloadService
         // A release picked in Find songs is grabbed as it is, instead of Lidarr's own search.
         var picked = song.ExternalId is { Length: > 0 } pickedId
             ? OptionalService<DownloadPicks>()?.Take(pickedId, SongFinder.LidarrSource)?.Release : null;
-        if (picked is not null) LogStep(song.ExternalId!, AcquisitionEventKinds.Try, "Grabbing the release you picked", picked.Title);
         var path = await fetcher.FetchAsync(new Octo.Services.Lidarr.LidarrTrackRequest(
             routing.Artist!, routing.Title!, routing.Album, routing.Duration ?? song.Duration, losslessOnly, ReplacingPath,
-            picked), jobDir, cancellationToken);
+            picked, Step: (text, detail) => LogStep(song.ExternalId ?? "", AcquisitionEventKinds.Try, text, detail)), jobDir, cancellationToken);
         LogStep(song.ExternalId ?? "", AcquisitionEventKinds.Found, "Lidarr brought a copy",
             Octo.Services.Library.AudioSummary.Describe(path).Text);
         return path;
