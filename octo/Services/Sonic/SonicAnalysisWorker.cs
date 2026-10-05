@@ -65,8 +65,9 @@ public sealed class SonicAnalysisWorker : BackgroundService
     internal const int LongestSeconds = 45 * 60;
     private List<LibrarySongRow>? _rows;
     private int _generation;
-    private volatile string _state = "Off";
-    private volatile string? _reason;
+    // Until the first tick, which waits for start-up to finish: not "Off", which would mislead.
+    private volatile string _state = "Waiting";
+    private volatile string? _reason = "Starts a couple of minutes after Octo does.";
 
     public SonicAnalysisWorker(SonicStore store, SonicClient sonic, ISonicLibrary library,
         IAcquisitionActivity activity, IOptionsMonitor<RadioSourceSettings> settings,
