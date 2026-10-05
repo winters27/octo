@@ -25,40 +25,43 @@ public partial class SubsonicResponseBuilder
         ["status"] = "ok",
         ["version"] = SubsonicVersion,
         ["type"] = "octo",
-        ["foundSongs"] = new Dictionary<string, object?>
-        {
-            ["id"] = found.Id,
-            ["state"] = found.State,
-            ["error"] = found.Error,
-            ["startedAt"] = Utc(found.StartedAt),
-            ["song"] = new Dictionary<string, object?>
-            {
-                ["artist"] = found.Target.Artist,
-                ["title"] = found.Target.Title,
-                ["album"] = found.Target.Album,
-                ["duration"] = found.Target.Duration,
-                ["coverArt"] = found.Target.CoverArt,
-                ["libraryId"] = found.Target.LibraryId,
-                ["format"] = found.Target.OwnedFormat,
-                ["quality"] = found.Target.OwnedQuality,
-                ["size"] = found.Target.OwnedSize,
-            },
-            ["source"] = found.Sources.Select(source => new Dictionary<string, object?>
-            {
-                ["name"] = source.Name,
-                ["state"] = source.State,
-                ["text"] = source.Text,
-                ["query"] = source.Queries,
-            }).ToList(),
-            ["candidate"] = found.Copies.Select((copy, index) =>
-            {
-                var json = CandidateJson(copy.Shown);
-                json["id"] = copy.Id;
-                json["index"] = index;
-                return json;
-            }).ToList(),
-        },
+        ["foundSongs"] = FoundSongsJson(found),
     });
+
+    /// <summary>A Find songs search as the apps and the dashboard read it.</summary>
+    public static Dictionary<string, object?> FoundSongsJson(FindSnapshot found) => new()
+    {
+        ["id"] = found.Id,
+        ["state"] = found.State,
+        ["error"] = found.Error,
+        ["startedAt"] = Utc(found.StartedAt),
+        ["song"] = new Dictionary<string, object?>
+        {
+            ["artist"] = found.Target.Artist,
+            ["title"] = found.Target.Title,
+            ["album"] = found.Target.Album,
+            ["duration"] = found.Target.Duration,
+            ["coverArt"] = found.Target.CoverArt,
+            ["libraryId"] = found.Target.LibraryId,
+            ["format"] = found.Target.OwnedFormat,
+            ["quality"] = found.Target.OwnedQuality,
+            ["size"] = found.Target.OwnedSize,
+        },
+        ["source"] = found.Sources.Select(source => new Dictionary<string, object?>
+        {
+            ["name"] = source.Name,
+            ["state"] = source.State,
+            ["text"] = source.Text,
+            ["query"] = source.Queries,
+        }).ToList(),
+        ["candidate"] = found.Copies.Select((copy, index) =>
+        {
+            var json = CandidateJson(copy.Shown);
+            json["id"] = copy.Id;
+            json["index"] = index;
+            return json;
+        }).ToList(),
+    };
 
     public IActionResult CreatePickResponse(PickOutcome outcome) => CreateJsonResponse(new Dictionary<string, object?>
     {

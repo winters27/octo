@@ -1727,6 +1727,92 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   .acq-list { grid-template-columns: minmax(0, 1fr); }
 }
 
+/* ── Download logs, Find songs and Recently removed (what the apps show, for every admin) ── */
+/* An In progress card's actions sit under its words; an open log takes the panel's whole width. */
+.acq-actions { display: flex; flex-wrap: wrap; gap: var(--s-s); margin-top: 10px; }
+.acq-actions .btn { padding: 0 10px; }
+.acq-card.has-log { grid-column: 1 / -1; flex-wrap: wrap; align-items: flex-start; }
+.acq-log { flex: 1 1 100%; min-width: 0; padding-top: var(--s-s); border-top: 1px solid var(--hairline); }
+.dl-log > summary { list-style-position: inside; }
+.dl-find { width: var(--h-s); height: var(--h-s); }
+.dl-find .icon { width: 15px; height: 15px; }
+
+/* The log: one line per step, its glyph on a thread, the copies a step weighed nested under it. */
+.dlog { list-style: none; margin: 0; padding: var(--s-s) 0 0; display: flex; flex-direction: column; }
+.dlog-line { position: relative; display: flex; gap: var(--s-l); padding-bottom: var(--s-l); min-width: 0; }
+.dlog-line:not(:last-child)::before {
+  content: ""; position: absolute; left: 11px; top: 26px; bottom: 2px; width: 1px; background: var(--hairline);
+}
+.dlog-dot {
+  width: 24px; height: 24px; flex-shrink: 0; display: grid; place-items: center;
+  border-radius: var(--r-pill); color: var(--text-secondary); background: var(--nest); box-shadow: var(--nest-rim);
+}
+.dlog-dot .icon { width: 14px; height: 14px; }
+.dlog-line.k-done .dlog-dot { color: var(--good); background: var(--good-wash); }
+.dlog-line.k-failed .dlog-dot { color: #ff7b72; background: var(--bad-wash); }
+.dlog-line.k-try .dlog-dot, .dlog-line.k-transfer .dlog-dot { color: var(--accent); background: rgb(var(--accent-rgb) / 0.14); }
+.dlog-body { min-width: 0; flex: 1; padding-top: 2px; }
+.dlog-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-l); }
+.dlog-text { font-size: var(--t-meta); color: var(--ink); line-height: 1.45; overflow-wrap: anywhere; }
+.dlog-time { flex-shrink: 0; font-size: var(--t-label); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.dlog-detail { margin-top: 2px; font-size: var(--t-label); color: var(--text-secondary); line-height: 1.45; overflow-wrap: anywhere; }
+.dlog-copies { display: flex; flex-direction: column; gap: var(--s-s); margin-top: var(--s-s); }
+.dlog-copy { padding: var(--s-m) var(--s-l); border-radius: var(--r-row); background: var(--nest); box-shadow: var(--nest-rim); min-width: 0; }
+.dlog-copy-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-m); }
+.dlog-copy-facts { font-size: var(--t-label); color: var(--ink-1); font-variant-numeric: tabular-nums; }
+.dlog-copy .dl-path { margin-top: 4px; }
+.dlog-copy-note { margin-top: 4px; font-size: var(--t-label); color: var(--text-muted); line-height: 1.4; }
+.dlog-more > summary { margin-top: var(--s-s); font-size: var(--t-label); color: var(--text-muted); cursor: pointer; }
+.dlog-more > summary:hover { color: var(--ink-1); }
+
+/* Find songs: the search box's answers, then the song being looked for and every copy found. */
+.find-results { display: flex; flex-direction: column; gap: var(--s-l); }
+.find-results[hidden], .find-look[hidden] { display: none; }
+.find-group { display: flex; flex-direction: column; }
+.find-group-title {
+  margin: 0 0 var(--s-xs); padding: 0 var(--s-l);
+  font-size: var(--t-label); font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em;
+}
+.find-hit .dl-sub, .trash-item .dl-sub { margin-top: 3px; }
+.find-target { display: flex; align-items: center; gap: var(--s-xl); }
+.find-target-title { font-size: var(--t-section); font-weight: 650; color: var(--ink); line-height: 1.3; overflow-wrap: anywhere; }
+.find-sources { display: flex; flex-direction: column; gap: var(--s-s); }
+.find-source { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-m); font-size: var(--t-meta); color: var(--ink-1); }
+.find-source strong { font-weight: 600; color: var(--ink); }
+.find-source-text { color: var(--text-secondary); font-size: var(--t-label); overflow-wrap: anywhere; }
+.find-copies { display: flex; flex-direction: column; margin: 0 calc(-1 * var(--s-l)); }
+.find-copy.best { background: rgb(var(--accent-rgb) / 0.08); }
+.find-copy .dl-side { max-width: 46%; }
+.find-copy .dl-sub { text-align: right; line-height: 1.4; }
+.find-why { margin-top: 4px; font-size: var(--t-label); color: var(--text-muted); line-height: 1.4; overflow-wrap: anywhere; }
+.find-why.good { color: var(--good); font-weight: 600; }
+.find-why-more { color: var(--text-muted); font-weight: 400; }
+.lossy-find { margin-top: var(--s-s); }
+.lossy-result-head .lossy-find { margin-top: 0; }
+
+/* Recently removed: a song row with its days left, and Put back beside it. */
+.trash-list { padding: var(--s-m); }
+.trash-list > .notice { margin: var(--s-m); }
+.trash-item .acq-art { color: var(--text-secondary); background: var(--nest); }
+.trash-item .dl-side { max-width: 50%; }
+.trash-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--s-s); }
+/* What a button did goes on its own line under the buttons, so the song's words keep their room. */
+.trash-actions > .inline-note { flex: 1 1 100%; justify-content: flex-end; text-align: right; margin: 0; }
+.find-copy .dl-side > .inline-note { margin: 0; text-align: right; }
+
+@media (max-width: 760px) {
+  /* A row's side moves under its words on a phone; it wraps there instead of running off the page. */
+  .dl-item .dl-main { min-width: calc(100% - 56px - var(--s-xl)); }
+  .dl-item .dl-side { flex-wrap: wrap; min-width: 0; max-width: calc(100% - 56px - var(--s-xl)); }
+  .find-copy .dl-side { max-width: calc(100% - 56px - var(--s-xl)); }
+  .find-copy .dl-sub { text-align: left; }
+  .find-copies { margin: 0; }
+  .trash-actions { justify-content: flex-start; }
+  .trash-item .dl-side { max-width: calc(100% - 56px - var(--s-xl)); }
+  .trash-actions > .inline-note, .find-copy .dl-side > .inline-note { justify-content: flex-start; text-align: left; }
+  .find-target { gap: var(--s-l); }
+}
+
 /* ── Server detection and the folder browser ── */
 .field-inline { display: flex; gap: var(--s-m); align-items: stretch; }
 .field-inline input { flex: 1 1 auto; min-width: 0; }

@@ -260,6 +260,11 @@ public sealed class AcquisitionTracker
     /// skipped, so it can never cost anyone a song.</summary>
     public event Action<AcquisitionEnd>? Ended;
 
+    /// <summary>Told, with the row's key, when a line arrives for a row that has already ended
+    /// (lyrics, an upgrade's verdict), outside the lock, so a saved copy of the log can catch up.
+    /// A listener that throws is logged and skipped.</summary>
+    public event Action<string>? LoggedAfterEnd;
+
     private DateTime Now => _time.GetUtcNow().UtcDateTime;
 
     internal static string KeyOf(string provider, string externalId) =>
@@ -548,11 +553,20 @@ public sealed class AcquisitionTracker
         Guard(nameof(Log), () =>
         {
             if (string.IsNullOrWhiteSpace(provider) || string.IsNullOrWhiteSpace(externalId) || string.IsNullOrWhiteSpace(text)) return;
+            var key = KeyOf(provider, externalId);
+            bool afterEnd;
             lock (_lock)
             {
-                if (!_entries.TryGetValue(KeyOf(provider, externalId), out var entry)) return;
+                if (!_entries.TryGetValue(key, out var entry)) return;
                 Add(entry, kind, text, detail);
+                afterEnd = entry.Finished;
             }
+            if (afterEnd && LoggedAfterEnd is { } listeners)
+                foreach (var listener in listeners.GetInvocationList().Cast<Action<string>>())
+                {
+                    try { listener(key); }
+                    catch (Exception ex) { _logger.LogDebug("Acquisition log listener failed: {Message}", ex.Message); }
+                }
         });
     }
 

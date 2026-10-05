@@ -55,6 +55,8 @@ public class ActivityController(IServiceProvider services, BrowseSessionStore se
             if (services.GetService<LyricsLibraryWorker>() is { } lyrics && Lyrics(lyrics.Current, lyrics.IsRunning, now) is { } l) items.Add(l);
             if (services.GetService<UpgradeQueue>() is { } upgrades && Upgrades(upgrades.Snapshot(), now) is { } u) items.Add(u);
             if (user is not null && services.GetService<ImportService>() is { } imports) items.AddRange(Imports(imports.Overview(user), now));
+            if (sessions.NavidromeUserOf(browse) is { } admin && services.GetService<SongFinder>() is { } finder
+                && Find(finder.ForUser(admin), now) is { } f) items.Add(f);
         }
         if (services.GetService<AcquisitionTracker>() is { } acquisitions && Downloads(acquisitions.All(), now) is { } d) items.Add(d);
         if (services.GetService<DuplicateScanWorker>() is { } duplicates && Duplicates(duplicates, now) is { } dup) items.Add(dup);
@@ -215,6 +217,33 @@ public class ActivityController(IServiceProvider services, BrowseSessionStore se
         AcquisitionState.Importing => "adding it to your library",
         _ => state.ToString().ToLowerInvariant(),
     };
+
+    /// <summary>
+    /// Find songs from the dashboard: the newest search this admin has running, or the newest one
+    /// that ended a moment ago, with how many copies it has found. A pick from it is a download
+    /// (or, for a library song, a better copy) and gets that card.
+    /// </summary>
+    internal static ActivityItem? Find(IReadOnlyList<FindSnapshot> looks, DateTime now)
+    {
+        var look = looks.FirstOrDefault(l => l.State == FindStates.Searching)
+                   ?? looks.FirstOrDefault(l => now - l.UpdatedAt < RecentWindow);
+        if (look is null) return null;
+        var title = $"Finding copies of {look.Target.Title}";
+        var copies = look.Copies.Count;
+        var count = $"{copies:N0} {(copies == 1 ? "copy" : "copies")}";
+        if (look.State == FindStates.Searching)
+        {
+            var asking = string.Join(" and ", look.Sources.Where(s => s.State == FindStates.Searching).Select(s => s.Name));
+            return new ActivityItem($"find:{look.Id}", "find", "fetched", title, "running",
+                Detail: copies > 0 ? $"{count} so far" : asking.Length > 0 ? $"Asking {asking}" : null, StartedUtc: look.StartedAt);
+        }
+        return look.State == FindStates.Failed
+            ? new ActivityItem($"find:{look.Id}", "find", "fetched", title, "failed", Detail: look.Error,
+                StartedUtc: look.StartedAt, FinishedUtc: look.UpdatedAt, Error: look.Error)
+            : new ActivityItem($"find:{look.Id}", "find", "fetched", $"Looked for copies of {look.Target.Title}", "done",
+                Detail: copies > 0 ? $"{count} found. Pick one on Fetched songs" : "No copies were found",
+                StartedUtc: look.StartedAt, FinishedUtc: look.UpdatedAt);
+    }
 
     internal static IEnumerable<ActivityItem> Imports(ImportOverview overview, DateTime now)
     {

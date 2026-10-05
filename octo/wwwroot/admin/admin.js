@@ -3554,6 +3554,7 @@ async function loadAcquisitions() {
   acqMoving = moving;
 
   wrap.hidden = rows.length === 0;
+  const focused = dlogFocusKey(list);
   list.innerHTML = rows.map(a => {
     const pct = typeof a.progress === 'number' ? Math.round(a.progress * 100) : null;
     const failed = a.state === 'failed';
@@ -3580,7 +3581,7 @@ async function loadAcquisitions() {
           : '';
     // No cover yet for a song still on its way: its state's glyph on a tile instead.
     const glyph = failed ? 'i-warning' : a.state === 'queued' ? 'i-clock' : 'i-tray-arrow-down';
-    return `<div class="acq-card${failed ? ' failed' : ''}">
+    return `<div class="acq-card${failed ? ' failed' : ''}${dlogIsOpen(a.key) ? ' has-log' : ''}">
       <div class="acq-art"><svg class="icon" aria-hidden="true"><use href="#${glyph}"/></svg></div>
       <div class="dl-main">
         <div class="acq-head">
@@ -3589,9 +3590,12 @@ async function loadAcquisitions() {
         </div>
         <div class="dl-sub">${sub}</div>
         ${detail}
+        ${acqActions(a)}
       </div>
+      ${acqLog(a)}
     </div>`;
   }).join('');
+  dlogAfterRender(list, focused);
 
   const open = document.querySelector('section[data-pane="fetched"]')?.classList.contains('active');
   if (moving.size && open) acqTimer = setTimeout(loadAcquisitions, 3000);
@@ -3630,13 +3634,13 @@ async function loadFetched({ withAcquisitions = true } = {}) {
         <div class="dl-main">
           <div class="dl-title">${escapeHtml(d.title)}</div>
           <div class="dl-by">${by}</div>
-          <div class="dl-path" title="${escapeHtml(d.path)}">${escapeHtml(d.path)}</div>
+          <div class="dl-path" title="${escapeHtml(d.path)}"><bdi>${escapeHtml(d.path)}</bdi></div>
         </div>
         <div class="dl-side">
-          <div class="dl-tags"><span class="dl-badge ${badgeClass}">${escapeHtml(fmt)}</span><span class="dl-source">${escapeHtml(d.source)}</span></div>
+          <div class="dl-tags"><span class="dl-badge ${badgeClass}">${escapeHtml(fmt)}</span><span class="dl-source">${escapeHtml(d.source)}</span>${fetchedFindButton(d)}</div>
           <div class="dl-sub">${escapeHtml(relTime(d.downloadedAt))}${size ? ' · ' + size : ''}${who ? ' · ' + who : ''}</div>
         </div>
-      </div>${d.tagging ? `<details class="dl-tagging"><summary>How it was tagged</summary>${renderTagReport(d.tagging)}</details>` : ''}`;
+      </div>${d.tagging ? `<details class="dl-tagging"><summary>How it was tagged</summary>${renderTagReport(d.tagging)}</details>` : ''}${fetchedLog(d)}`;
     }).join('');
   } catch (e) {
     list.innerHTML = stateBlock('error', `Couldn't load the log: ${e.message || 'error'}`);
@@ -3833,6 +3837,523 @@ document.getElementById('tags-preview-run')?.addEventListener('click', async () 
     button.disabled = false;
   }
 });
+
+// ────────────────────────────────────────────────────────────────
+// Download logs, Find songs and Recently removed: what the Octo apps show, for every admin
+// ────────────────────────────────────────────────────────────────
+// Every call here needs a Navidrome admin's own sign-in (the recovery code is not enough: these
+// name peers and files), so a refusal opens the same Navidrome sign-in the Better quality page uses.
+async function parityFetch(path, options = {}, holder = null) {
+  let response = await api(path, { credentials: 'same-origin', cache: 'no-store', ...options });
+  if (response.status === 401 && await browseAuthenticate(holder)) {
+    response = await api(path, { credentials: 'same-origin', cache: 'no-store', ...options });
+  }
+  return response;
+}
+const parityJson = body => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+async function parityError(response) {
+  const body = await response.json().catch(() => ({}));
+  return body.error || body.title || `Octo answered ${response.status}.`;
+}
+
+// "3:07" from seconds.
+function parityLength(seconds) {
+  if (typeof seconds !== 'number' || seconds <= 0) return '';
+  const s = Math.round(seconds);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+const parityLossless = format => ['flac', 'wav', 'alac', 'ape', 'aiff', 'aif', 'wv'].includes(String(format || '').toLowerCase().replace(/^\./, '').split(/[ -]/)[0]);
+const parityFileName = path => String(path || '').split(/[\\/]/).filter(Boolean).pop() || '';
+
+// ── A download's log ────────────────────────────────────────────────────────
+// The same timeline the apps' downloads drawer draws: the searches, the copies found (best
+// first, with why each was passed over), the one tried and why, the checks, the tags, the cover,
+// the lyrics, the library and the end. In progress cards open it in place; Fetched songs rows
+// fold it under the row like "How it was tagged". Saved logs outlive the live list's 3 hours.
+const DLOG_GLYPH = {
+  queued: 'i-clock', search: 'i-magnifying-glass', found: 'i-stack', try: 'i-arrow-square-out',
+  transfer: 'i-tray-arrow-down', check: 'i-check-circle', tags: 'i-tag', cover: 'i-image-square',
+  lyrics: 'i-microphone-stage', library: 'i-folder-open', done: 'i-check-circle-fill',
+  failed: 'i-x-circle-fill', note: 'i-info',
+};
+const dlog = { open: new Set(), cache: new Map(), loading: new Set() };
+const dlogIsOpen = key => !!key && dlog.open.has(key);
+
+function dlogClock(iso) {
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? '' : new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+// One copy on a log line: its quality, size, length and peer, and Octo's verdict on it.
+function dlogCopy(c) {
+  const facts = [c.quality || (c.format || '').toUpperCase(), fmtSize(c.size), parityLength(c.length),
+    c.peer ? `from ${c.peer}` : '', typeof c.queueLength === 'number' && c.queueLength > 0 ? `${c.queueLength} in their queue` : '',
+    c.freeSlot === true ? 'free slot' : ''].filter(Boolean);
+  const verdict = typeof c.rank === 'number'
+    ? `<span class="dl-badge good">${c.rank === 1 ? "Octo's first choice" : `Choice ${c.rank}`}</span>`
+    : '';
+  return `<div class="dlog-copy">
+    <div class="dlog-copy-head">${verdict}<span class="dlog-copy-facts">${escapeHtml(facts.join(' · '))}</span></div>
+    ${c.file ? `<div class="dl-path" title="${escapeHtml(c.file)}"><bdi>${escapeHtml(c.file)}</bdi></div>` : ''}
+    ${c.note ? `<div class="dlog-copy-note">${escapeHtml(c.note)}</div>` : ''}
+  </div>`;
+}
+
+function renderDlog(events) {
+  if (!events?.length) return stateBlock('empty', 'Nothing logged yet.');
+  return `<ol class="dlog">${events.map(line => {
+    const kind = DLOG_GLYPH[line.kind] ? line.kind : 'note';
+    const copies = Array.isArray(line.candidate) ? line.candidate : [];
+    const many = copies.length > 3;
+    const list = copies.length
+      ? (many
+        ? `<details class="dlog-more"><summary>${copies.length} copies</summary><div class="dlog-copies">${copies.map(dlogCopy).join('')}</div></details>`
+        : `<div class="dlog-copies">${copies.map(dlogCopy).join('')}</div>`)
+      : '';
+    return `<li class="dlog-line k-${kind}">
+      <span class="dlog-dot">${icon(DLOG_GLYPH[kind])}</span>
+      <div class="dlog-body">
+        <div class="dlog-head"><span class="dlog-text">${escapeHtml(line.text)}</span><time class="dlog-time" datetime="${escapeHtml(line.at)}">${escapeHtml(dlogClock(line.at))}</time></div>
+        ${line.detail ? `<div class="dlog-detail">${escapeHtml(line.detail)}</div>` : ''}
+        ${list}
+      </div>
+    </li>`;
+  }).join('')}</ol>`;
+}
+
+const DLOG_NONE = 'Octo did not keep a log for this download. It saves each download\'s log from this version on, and lets the oldest ones go once they fill their room.';
+
+// What a log answer draws, cached so a list that redraws every few seconds keeps it in place.
+function dlogBody(entry) {
+  if (!entry) return stateBlock('loading', 'Reading the log…');
+  if (entry.error) return stateBlock('error', entry.error);
+  if (entry.kept === 'none') return stateBlock('empty', DLOG_NONE);
+  return renderDlog(entry.events);
+}
+
+async function dlogLoad(cacheKey, key, at, holder) {
+  if (!key) { dlog.cache.set(cacheKey, { kept: 'none', events: [] }); if (holder) holder.innerHTML = dlogBody(dlog.cache.get(cacheKey)); return; }
+  if (dlog.loading.has(cacheKey)) return;
+  dlog.loading.add(cacheKey);
+  try {
+    const query = new URLSearchParams({ key });
+    if (at) query.set('at', at);
+    const response = await parityFetch(`/api/admin/downloads/log?${query}`, {}, holder);
+    if (!response.ok) throw new Error(await parityError(response));
+    const body = await response.json();
+    dlog.cache.set(cacheKey, { kept: body.kept, events: body.event || [] });
+  } catch (error) {
+    dlog.cache.set(cacheKey, { error: `Could not read the log: ${error.message}` });
+  } finally {
+    dlog.loading.delete(cacheKey);
+  }
+  // The row may have been drawn again meanwhile; fill whichever holder is on the page now.
+  document.querySelectorAll('[data-dlog-holder]').forEach(el => {
+    if (el.dataset.dlogHolder === cacheKey) el.innerHTML = dlogBody(dlog.cache.get(cacheKey));
+  });
+}
+
+// In progress: Log and Find songs under each card, and the log across the panel when open.
+function acqActions(a) {
+  if (!a.key) return '';
+  const open = dlogIsOpen(a.key);
+  return `<div class="acq-actions">
+    <button type="button" class="btn btn-ghost btn-sm" data-dlog-toggle="${escapeHtml(a.key)}" aria-expanded="${open}" data-focus-id="log:${escapeHtml(a.key)}">${icon(open ? 'i-caret-down' : 'i-caret-right')}<span>Log${a.logLines ? ` (${a.logLines})` : ''}</span></button>
+    <button type="button" class="btn btn-ghost btn-sm" data-find-id="${escapeHtml(a.key)}" data-find-title="${escapeHtml(a.title || '')}" data-find-artist="${escapeHtml(a.artist || '')}" data-focus-id="find:${escapeHtml(a.key)}">${icon('i-magnifying-glass')}<span>Find songs</span></button>
+  </div>`;
+}
+function acqLog(a) {
+  if (!dlogIsOpen(a.key)) return '';
+  return `<div class="acq-log" data-dlog-holder="${escapeHtml(a.key)}">${dlogBody(dlog.cache.get(a.key))}</div>`;
+}
+// Which control had focus, so a redraw every few seconds never throws a keyboard user out.
+function dlogFocusKey(list) {
+  const active = document.activeElement;
+  return active && list.contains(active) ? active.dataset.focusId || null : null;
+}
+function dlogAfterRender(list, focused) {
+  // A running download's log keeps growing, so an open one is read again with each redraw.
+  for (const key of dlog.open) if (list.querySelector(`[data-dlog-holder="${CSS.escape(key)}"]`)) dlogLoad(key, key, null, null);
+  if (focused) list.querySelector(`[data-focus-id="${CSS.escape(focused)}"]`)?.focus();
+}
+document.getElementById('acq-list')?.addEventListener('click', event => {
+  const toggle = event.target.closest('[data-dlog-toggle]');
+  if (!toggle) return;
+  const key = toggle.dataset.dlogToggle;
+  const card = toggle.closest('.acq-card');
+  if (dlog.open.has(key)) {
+    dlog.open.delete(key);
+    card?.classList.remove('has-log');
+    card?.querySelector('.acq-log')?.remove();
+  } else {
+    dlog.open.add(key);
+    card?.classList.add('has-log');
+    card?.insertAdjacentHTML('beforeend', acqLog({ key }));
+    dlogLoad(key, key, null, card?.querySelector('.acq-log'));
+  }
+  const open = dlog.open.has(key);
+  toggle.setAttribute('aria-expanded', String(open));
+  toggle.querySelector('use')?.setAttribute('href', `#${open ? 'i-caret-down' : 'i-caret-right'}`);
+});
+
+// Fetched songs: the log folds under the row, read when it is first opened.
+function fetchedLog(d) {
+  const cacheKey = `${d.key || ''}|${d.downloadedAt || ''}`;
+  const open = dlog.open.has(cacheKey);
+  return `<details class="dl-tagging dl-log" data-dlog-key="${escapeHtml(d.key || '')}" data-dlog-at="${escapeHtml(d.downloadedAt || '')}"${open ? ' open' : ''}>
+    <summary>Download log${d.hasLog ? '' : d.key ? '' : ' (not kept)'}</summary>
+    <div data-dlog-holder="${escapeHtml(cacheKey)}">${open ? dlogBody(dlog.cache.get(cacheKey)) : ''}</div>
+  </details>`;
+}
+function fetchedFindButton(d) {
+  const title = d.title || '';
+  // An entry written before keys were kept is found by its name instead.
+  const data = d.key
+    ? `data-find-id="${escapeHtml(d.key)}"`
+    : `data-find-q="${escapeHtml([d.artist, title].filter(Boolean).join(' '))}"`;
+  return `<button type="button" class="btn btn-ghost btn-icon btn-sm dl-find" ${data} data-find-title="${escapeHtml(title)}" data-find-artist="${escapeHtml(d.artist || '')}" data-find-cover="${escapeHtml(d.coverArtUrl || '')}" aria-label="Find songs for ${escapeHtml(title)}" title="Find songs">${icon('i-magnifying-glass')}</button>`;
+}
+document.getElementById('fetched-list')?.addEventListener('toggle', event => {
+  const details = event.target;
+  if (!details.matches?.('details.dl-log')) return;
+  const key = details.dataset.dlogKey;
+  const cacheKey = `${key}|${details.dataset.dlogAt}`;
+  if (!details.open) { dlog.open.delete(cacheKey); return; }
+  dlog.open.add(cacheKey);
+  const holder = details.querySelector('[data-dlog-holder]');
+  const cached = dlog.cache.get(cacheKey);
+  holder.innerHTML = dlogBody(cached);
+  if (!cached || cached.error || cached.kept === 'live') dlogLoad(cacheKey, key, details.dataset.dlogAt, holder);
+}, true);
+
+// ── Find songs ─────────────────────────────────────────────────────────────
+// The apps' Find songs: a song's search run again on the admin's own download sources, every
+// copy listed with its details and Octo's verdict, and the one picked fetched through the same
+// checks as any download. A library song's pick replaces its file through Better quality, so it
+// asks first. Started from the search box, or from a row anywhere a song is listed.
+const finder = { search: null, look: null, hint: {}, timer: null, shown: 40, token: 0 };
+const FIND_PAGE = 40;
+const findEl = id => document.getElementById(id);
+const findCover = (song, hint) => hint?.cover || (song?.coverArt ? `/api/admin/find/cover?id=${encodeURIComponent(song.coverArt)}` : '');
+const findArt = (src, cls = 'dl-art') => src
+  ? `<img class="${cls}" src="${escapeHtml(src)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'${cls} dl-art-ph'}))">`
+  : `<div class="${cls} dl-art-ph"></div>`;
+
+function lossyFindButton(row) {
+  if (!row?.id) return '';
+  return ` <button type="button" class="btn btn-ghost btn-sm lossy-find" data-find-id="${esc(row.id)}" data-find-title="${esc(row.title || '')}" data-find-artist="${esc(row.artist || '')}">${icon('i-magnifying-glass')}<span>Find songs</span></button>`;
+}
+
+// Anywhere a row offers Find songs, it lands here.
+document.addEventListener('click', event => {
+  const button = event.target.closest('[data-find-id], [data-find-q]');
+  if (!button) return;
+  event.preventDefault();
+  const hint = { title: button.dataset.findTitle || '', artist: button.dataset.findArtist || '', cover: button.dataset.findCover || '' };
+  if (button.dataset.findId) findSongs(button.dataset.findId, hint);
+  else findSearch(button.dataset.findQ, true);
+});
+
+function findShowSection() {
+  if (!document.querySelector('section[data-pane="fetched"].active')) openTab('fetched');
+  findEl('find-section')?.scrollIntoView({ block: 'start', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+}
+
+// The search box: songs in the library (the lyrics page's search) and songs outside it (Octo's own search).
+async function findSearch(query, reveal = false) {
+  const q = String(query || '').trim();
+  const box = findEl('find-q');
+  if (box && box.value !== q) box.value = q;
+  if (reveal) findShowSection();
+  const holder = findEl('find-results');
+  if (!holder) return;
+  if (!q) { holder.hidden = true; holder.innerHTML = ''; return; }
+  holder.hidden = false;
+  holder.innerHTML = stateBlock('loading', 'Searching your library and beyond…');
+  const token = ++finder.token;
+  const [library, outside] = await Promise.all([
+    parityFetch(`/api/admin/lyrics/songs?q=${encodeURIComponent(q)}`, {}, holder)
+      .then(async r => (r.ok ? { songs: (await r.json()).songs || [] } : { error: await parityError(r) }))
+      .catch(error => ({ error: error.message })),
+    parityFetch(`/api/admin/find/outside?q=${encodeURIComponent(q)}`, {}, holder)
+      .then(async r => (r.ok ? await r.json() : { error: await parityError(r) }))
+      .catch(error => ({ error: error.message })),
+  ]);
+  if (token !== finder.token) return;
+  const row = (song, cover, where) => `<div class="dl-item find-hit">
+      ${findArt(cover)}
+      <div class="dl-main">
+        <div class="dl-title">${escapeHtml(song.title || '?')}</div>
+        <div class="dl-by">${[song.artist, song.album].filter(Boolean).map(escapeHtml).join(' <span class="dl-dash">·</span> ')}</div>
+        <div class="dl-sub">${escapeHtml([where, parityLength(song.duration)].filter(Boolean).join(' · '))}</div>
+      </div>
+      <div class="dl-side">
+        <button type="button" class="btn btn-ghost btn-sm" data-find-id="${escapeHtml(song.id)}" data-find-title="${escapeHtml(song.title || '')}" data-find-artist="${escapeHtml(song.artist || '')}" data-find-cover="${escapeHtml(where === 'In your library' ? '' : (cover || ''))}">${icon('i-magnifying-glass')}<span>Find copies</span></button>
+      </div>
+    </div>`;
+  const group = (title, body) => `<div class="find-group"><h4 class="find-group-title">${escapeHtml(title)}</h4>${body}</div>`;
+  const libraryBody = library.error ? stateBlock('error', library.error)
+    : library.songs.length ? library.songs.map(song => row(song, `/api/admin/find/cover?id=${encodeURIComponent(song.id)}`, 'In your library')).join('')
+      : stateBlock('empty', 'No song in your library matches.');
+  const outsideBody = outside.error ? stateBlock('error', outside.error)
+    : outside.available === false ? stateBlock('empty', 'Songs outside your library are found with Last.fm, which needs its API key under Last.fm radio.')
+      : (outside.songs || []).length ? outside.songs.map(song => row(song, song.coverUrl, 'Not in your library')).join('')
+        : stateBlock('empty', 'Nothing outside your library matches.');
+  holder.innerHTML = group('In your library', libraryBody) + group('Not in your library', outsideBody);
+}
+findEl('find-form')?.addEventListener('submit', event => {
+  event.preventDefault();
+  findSearch(findEl('find-q').value);
+});
+
+// A look: start it, then follow it until every source has answered.
+async function findSongs(id, hint = {}) {
+  const look = findEl('find-look');
+  if (!look) return;
+  clearTimeout(finder.timer);
+  const token = ++finder.token;
+  finder.look = null;
+  finder.hint = hint;
+  finder.shown = FIND_PAGE;
+  look.hidden = false;
+  look.innerHTML = findTargetHead({ title: hint.title, artist: hint.artist }, hint) + stateBlock('loading', 'Starting the search…');
+  findShowSection();
+  try {
+    const response = await parityFetch('/api/admin/find', parityJson({ id }), look);
+    if (!response.ok) throw new Error(await parityError(response));
+    if (token !== finder.token) return;
+    finder.look = await response.json();
+    renderFindLook();
+    findFollow(token);
+  } catch (error) {
+    if (token !== finder.token) return;
+    look.innerHTML = findTargetHead({ title: hint.title, artist: hint.artist }, hint) + stateBlock('error', error.message);
+  }
+}
+
+function findFollow(token) {
+  clearTimeout(finder.timer);
+  if (finder.look?.state !== 'searching') return;
+  finder.timer = setTimeout(async () => {
+    if (token !== finder.token) return;
+    try {
+      const response = await parityFetch(`/api/admin/find/${encodeURIComponent(finder.look.id)}`);
+      if (!response.ok) throw new Error(await parityError(response));
+      const body = await response.json();
+      if (token !== finder.token) return;
+      finder.look = body;
+      renderFindLook();
+    } catch (error) {
+      if (token !== finder.token) return;
+      finder.look = { ...finder.look, state: 'failed', error: error.message };
+      renderFindLook();
+      return;
+    }
+    findFollow(token);
+  }, 1500);
+}
+
+function findTargetHead(song, hint) {
+  const owned = song.libraryId
+    ? `In your library as ${[song.quality || (song.format || '').toUpperCase(), fmtSize(song.size)].filter(Boolean).join(', ')}`
+    : song.title ? 'Not in your library yet' : '';
+  return `<div class="find-target">
+    ${findArt(findCover(song, hint))}
+    <div class="dl-main">
+      <div class="find-target-title">${escapeHtml(song.title || hint.title || 'Finding the song…')}</div>
+      <div class="dl-by">${[song.artist || hint.artist, song.album].filter(Boolean).map(escapeHtml).join(' <span class="dl-dash">·</span> ')}${parityLength(song.duration) ? ` <span class="dl-dash">·</span> ${parityLength(song.duration)}` : ''}</div>
+      ${owned ? `<div class="dl-sub">${escapeHtml(owned)}</div>` : ''}
+    </div>
+    <button type="button" class="btn btn-ghost btn-icon" id="find-close" aria-label="Close this search" title="Close">${icon('i-x')}</button>
+  </div>`;
+}
+
+const FIND_SOURCE_WORDS = { searching: 'Searching', done: 'Done', failed: 'Failed', off: 'Off' };
+const FIND_SOURCE_TONE = { searching: 'state', done: 'good', failed: 'failed', off: 'mp3' };
+
+function findCopyRow(c, song, cover, searching) {
+  const lossless = parityLossless(c.format);
+  const quality = c.bitDepth && c.sampleRate
+    ? `${c.bitDepth}-bit ${(c.sampleRate / 1000).toLocaleString(undefined, { maximumFractionDigits: 1 })} kHz`
+    : c.bitRate ? `${c.bitRate} kbps` : '';
+  const facts = [quality, fmtSize(c.size), parityLength(c.length),
+    typeof c.queueLength === 'number' ? (c.queueLength > 0 ? `${c.queueLength} in their queue` : 'no queue') : '',
+    c.freeSlot === true ? 'free slot' : c.freeSlot === false ? 'no free slot' : '',
+    typeof c.speed === 'number' && c.speed > 0 ? `${fmtSize(c.speed)}/s` : ''].filter(Boolean);
+  const title = c.title || parityFileName(c.file) || song.title;
+  const ranked = typeof c.rank === 'number';
+  const why = ranked
+    ? `<div class="find-why good">${escapeHtml(c.rank === 1 ? "Octo's first choice" : `Octo's choice ${c.rank}`)}${c.note ? ` <span class="find-why-more">${escapeHtml(c.note)}</span>` : ''}</div>`
+    : c.note ? `<div class="find-why">${escapeHtml(c.note)}</div>` : '';
+  const format = (c.format || '').replace(/^\./, '').toUpperCase() || '?';
+  return `<div class="dl-item find-copy${ranked && c.rank === 1 ? ' best' : ''}">
+    ${findArt(cover)}
+    <div class="dl-main">
+      <div class="dl-title">${escapeHtml(title)}</div>
+      <div class="dl-by">${[c.album || song.album, c.source, c.peer].filter(Boolean).map(escapeHtml).join(' <span class="dl-dash">·</span> ')}</div>
+      ${c.file ? `<div class="dl-path" title="${escapeHtml(c.file)}"><bdi>${escapeHtml(c.file)}</bdi></div>` : ''}
+      ${why}
+    </div>
+    <div class="dl-side">
+      <div class="dl-tags"><span class="dl-badge ${lossless ? 'flac' : 'mp3'}">${escapeHtml(format)}</span></div>
+      ${facts.length ? `<div class="dl-sub">${escapeHtml(facts.join(' · '))}</div>` : ''}
+      <button type="button" class="btn btn-sm ${ranked && c.rank === 1 ? 'btn-primary' : 'btn-ghost'}" data-find-pick="${escapeHtml(c.id)}"
+        ${searching ? 'disabled title="Pick a copy once the search ends"' : ''}>Get this copy</button>
+    </div>
+  </div>`;
+}
+
+function renderFindLook() {
+  const look = findEl('find-look');
+  const found = finder.look;
+  if (!look || !found) return;
+  const song = found.song || {};
+  const cover = findCover(song, finder.hint);
+  const searching = found.state === 'searching';
+  const sources = (found.source || []).map(source => `<div class="find-source">
+      <strong>${escapeHtml(source.name)}</strong>
+      <span class="dl-badge ${FIND_SOURCE_TONE[source.state] || 'state'}">${escapeHtml(FIND_SOURCE_WORDS[source.state] || source.state)}</span>
+      ${source.text ? `<span class="find-source-text">${escapeHtml(source.text)}</span>` : ''}
+      ${(source.query || []).length ? `<span class="find-source-text">Asked: ${escapeHtml(source.query.join(', '))}</span>` : ''}
+    </div>`).join('');
+  const copies = found.candidate || [];
+  const shown = copies.slice(0, finder.shown);
+  const list = copies.length
+    ? `<div class="find-copies">${shown.map(c => findCopyRow(c, song, cover, searching)).join('')}</div>
+       ${copies.length > shown.length ? `<button type="button" class="btn btn-ghost" id="find-more">Show ${Math.min(FIND_PAGE, copies.length - shown.length)} more of ${copies.length - shown.length}</button>` : ''}`
+    : searching ? stateBlock('loading', 'Asking every peer. This takes up to a minute.') : stateBlock('empty', 'No copies were found.');
+  const failed = found.state === 'failed' && found.error ? `<div class="notice notice-warn">${escapeHtml(found.error)}</div>` : '';
+  const replaces = song.libraryId && copies.length
+    ? `<p class="set-info-d">A copy you pick replaces the one in your library through Better quality: only a lossless copy can, and yours stays until the new one passes every check.</p>` : '';
+  look.innerHTML = `${findTargetHead(song, finder.hint)}
+    <div class="find-sources">${sources}</div>
+    ${failed}${replaces}${list}`;
+}
+
+findEl('find-look')?.addEventListener('click', async event => {
+  if (event.target.closest('#find-close')) {
+    clearTimeout(finder.timer);
+    finder.token++;
+    finder.look = null;
+    findEl('find-look').hidden = true;
+    findEl('find-look').innerHTML = '';
+    return;
+  }
+  if (event.target.closest('#find-more')) { finder.shown += FIND_PAGE; renderFindLook(); return; }
+  const pick = event.target.closest('[data-find-pick]');
+  if (!pick || !finder.look) return;
+  const found = finder.look;
+  const song = found.song || {};
+  const copy = (found.candidate || []).find(c => c.id === pick.dataset.findPick);
+  if (song.libraryId) {
+    const what = [copy?.quality || (copy?.format || '').toUpperCase(), copy?.peer ? `from ${copy.peer}` : copy?.source].filter(Boolean).join(' ');
+    const yours = song.quality || (song.format || '').toUpperCase() || 'your copy';
+    if (!(await askConfirm(`Replace your copy of ${song.title}?`,
+      `Octo fetches ${what || 'this copy'} and puts it in place of your ${yours} once it passes every check. Your copy waits in the trash until then.`,
+      'Replace it'))) return;
+  }
+  pick.disabled = true;
+  try {
+    const response = await parityFetch(`/api/admin/find/${encodeURIComponent(found.id)}/pick`, parityJson({ copy: pick.dataset.findPick }), findEl('find-look'));
+    if (!response.ok) throw new Error(await parityError(response));
+    const outcome = await response.json();
+    const queued = outcome.state === 'queued';
+    note(pick, song.libraryId && queued ? `${outcome.detail} Follow it on Better quality.` : outcome.detail, queued ? 'ok' : 'info');
+    if (queued) loadAcquisitions();
+  } catch (error) {
+    note(pick, error.message, 'error');
+  } finally {
+    pick.disabled = false;
+  }
+});
+
+// ── Recently removed ─────────────────────────────────────────────────────────
+// The apps' Put back: the songs still in the server's trash, who removed each and when, how
+// long the sweep keeps it, and the lyrics that went with it. Read whenever Library actions opens.
+const TRASH_DAY = 24 * 3600 * 1000;
+function trashLeft(goneAt) {
+  if (!goneAt) return { text: 'Kept until you empty the trash', tone: 'mp3' };
+  const days = Math.ceil((Date.parse(goneAt) - Date.now()) / TRASH_DAY);
+  if (days <= 1) return { text: 'Deleted for good within a day', tone: 'warn' };
+  return { text: `${days} days left`, tone: days <= 3 ? 'warn' : 'state' };
+}
+
+async function loadTrash() {
+  const list = findEl('trash-list');
+  const summary = findEl('trash-summary');
+  if (!list) return;
+  list.innerHTML = stateBlock('loading', 'Reading the trash…');
+  try {
+    const response = await parityFetch('/api/admin/trash', {}, list);
+    if (!response.ok) throw new Error(await parityError(response));
+    const body = await response.json();
+    const songs = body.songs || [];
+    const keep = body.keepDays > 0 ? `The sweep deletes a song ${body.keepDays} ${body.keepDays === 1 ? 'day' : 'days'} after it was removed.` : 'Nothing is ever deleted from the trash.';
+    summary.textContent = `${songs.length} ${songs.length === 1 ? 'song' : 'songs'} in the trash. ${keep}`;
+    const rehearsal = body.dryRun ? `<div class="notice notice-warn">Library actions only rehearse while dry run is on, so Put back only says what it would do.</div>` : '';
+    if (!songs.length) { list.innerHTML = rehearsal + stateBlock('empty', 'Nothing has been removed lately.'); return; }
+    list.innerHTML = rehearsal + songs.map(song => {
+      const left = trashLeft(song.goneAt);
+      const sidecars = (song.sidecars || []).length ? `with ${song.sidecars.join(', ')}` : '';
+      const sub = [`Removed ${relTime(song.removedAt)} by ${song.removedBy || 'someone'}`, sidecars].filter(Boolean).join(' · ');
+      return `<div class="dl-item trash-item">
+        <div class="acq-art">${icon('i-trash')}</div>
+        <div class="dl-main">
+          <div class="dl-title">${escapeHtml(song.title || '?')}</div>
+          <div class="dl-by">${[song.artist, song.album].filter(Boolean).map(escapeHtml).join(' <span class="dl-dash">·</span> ')}</div>
+          <div class="dl-sub">${escapeHtml(sub)}</div>
+          ${song.blocksDownloads ? '<div class="dl-sub">Removed from disk, so a heart does not download it again.</div>' : ''}
+        </div>
+        <div class="dl-side">
+          <div class="dl-tags"><span class="dl-badge ${left.tone}">${escapeHtml(left.text)}</span></div>
+          <div class="trash-actions">
+            ${song.blocksDownloads ? `<button type="button" class="btn btn-ghost btn-sm" data-trash-allow="${escapeHtml(song.key || '')}">Allow downloading again</button>` : ''}
+            <button type="button" class="btn btn-primary btn-sm" data-trash-restore="${escapeHtml(song.id)}">${icon('i-arrow-counter-clockwise')}<span>Put back</span></button>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+  } catch (error) {
+    summary.textContent = 'Needs your Navidrome admin sign-in, and you on the allowed list above.';
+    list.innerHTML = `<div class="notice notice-warn">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+findEl('trash-refresh')?.addEventListener('click', loadTrash);
+findEl('trash-list')?.addEventListener('click', async event => {
+  const restore = event.target.closest('[data-trash-restore]');
+  const allow = event.target.closest('[data-trash-allow]');
+  const button = restore || allow;
+  if (!button) return;
+  button.disabled = true;
+  try {
+    const response = restore
+      ? await parityFetch('/api/admin/trash/restore', parityJson({ id: restore.dataset.trashRestore }), findEl('trash-list'))
+      : await parityFetch('/api/admin/library-actions/allow-download', parityJson({ key: allow.dataset.trashAllow }), findEl('trash-list'));
+    if (!response.ok) throw new Error(await parityError(response));
+    const body = await response.json().catch(() => ({}));
+    const done = restore ? body.state === 'applied' : true;
+    const words = restore ? body.detail || 'Put back.' : 'It can be downloaded again.';
+    if (!done) { note(button, words, body.state === 'rehearsed' ? 'info' : 'error'); button.disabled = false; return; }
+    toast(restore ? `${words} Navidrome shows it after its next scan.` : words);
+    await loadTrash();
+  } catch (error) {
+    note(button, error.message, 'error');
+    button.disabled = false;
+  }
+});
+// Read each time Library actions opens, without touching the shared tab switcher.
+(() => {
+  const pane = document.querySelector('section[data-pane="libraryactions"]');
+  if (!pane) return;
+  let wasActive = pane.classList.contains('active');
+  new MutationObserver(() => {
+    const active = pane.classList.contains('active');
+    if (active && !wasActive) loadTrash();
+    wasActive = active;
+  }).observe(pane, { attributes: true, attributeFilter: ['class'] });
+  if (wasActive) ready.then(loadTrash);
+})();
 
 // ────────────────────────────────────────────────────────────────
 // Segmented controls: buttons built from a hidden <select> they proxy to,
@@ -4969,7 +5490,7 @@ function renderLossy() {
             <span class="key">${esc(row.title)}<span class="lossy-sub">${esc(row.artist)}${row.fromYouTube ? ' · from YouTube' : ''}</span></span>
             <span class="value">${esc(row.album ?? '')}</span>
             <span><span class="dl-badge mp3">${esc((row.suffix || '?').toUpperCase())}</span></span>
-            <span>${lossyStatus(row)}</span>
+            <span>${lossyStatus(row)}${lossyFindButton(row)}</span>
           </label>`).join('')}
       </div>
       ${visible.length > shown.length
@@ -5025,7 +5546,7 @@ function renderLossyResults() {
     if (!r && job.detail) facts.push(['Why', esc(job.detail)]);
     return `<div class="lossy-result">
       <div class="lossy-result-head"><strong>${esc(job.title ?? job.id)} <span class="lossy-sub" style="display:inline">${esc(job.artist ?? '')}</span></strong>
-        <span class="dl-badge ${upgradeTone[job.state] ?? 'state'}">${esc(upgradeWords[job.state] ?? job.state)}</span></div>
+        <span class="dl-badge ${upgradeTone[job.state] ?? 'state'}">${esc(upgradeWords[job.state] ?? job.state)}</span>${lossyFindButton(job)}</div>
       ${facts.length ? `<dl>${facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>` : ''}
     </div>`;
   }).join('')}`;
