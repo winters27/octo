@@ -7,7 +7,11 @@ function api(url, options = {}) {
   const method = (options.method || 'GET').toUpperCase();
   const headers = new Headers(options.headers || {});
   if (method !== 'GET' && method !== 'HEAD') headers.set('X-Octo-Admin', '1');
-  return fetch(url, { credentials: 'same-origin', ...options, headers });
+  const sent = fetch(url, { credentials: 'same-origin', ...options, headers });
+  // A write may have started work somewhere (a scan, a re-tag, a download), so the activity
+  // cards look again soon instead of at their idle pace.
+  if (method !== 'GET' && method !== 'HEAD' && typeof activityKick === 'function') sent.finally(() => activityKick());
+  return sent;
 }
 
 // Every icon is one symbol in icons.svg: Phosphor glyphs as i-name, brand marks as b-name. The
@@ -43,6 +47,7 @@ function activateTab(name, { focus = false } = {}) {
     }
   });
   panes.forEach(p => p.classList.toggle('active', p.dataset.pane === name));
+  if (typeof activityTick === 'function' && activityCards) activityTick();
   if (location.hash !== `#${name}`) history.replaceState(null, '', `#${name}`);
   // Segmented thumbs can only be measured once their pane is visible.
   if (typeof syncSegments === 'function') syncSegments(false);
@@ -87,6 +92,225 @@ function followHash() {
 window.addEventListener('popstate', followHash);
 window.addEventListener('hashchange', followHash);
 // The #pane in the address on load is honoured at Boot, once every pane's loader exists.
+
+// ────────────────────────────────────────────────────────────────
+// Activity: live progress of Octo's background work
+// ────────────────────────────────────────────────────────────────
+// One card per job (a re-tag, a covers or lyrics run, better copies, hearted downloads, a
+// Spotify read, a duplicate scan, an slskd rescan, Navidrome's scan), updated in place from
+// GET /api/admin/activity, on whatever page is open. A card never repeats: a job is one card
+// for as long as it runs, then says how it ended and goes. The page that shows a job in full
+// hides its card, and is refreshed when that job starts or ends, so it is never left stale.
+// Asked every 2.5 s while something runs, every 20 s otherwise, and not while the tab is hidden.
+const ACTIVITY_FAST = 2500;
+const ACTIVITY_IDLE = 20000;
+const ACTIVITY_LINGER = 6000;   // a finished card stays this long; a failed one until dismissed
+// Navidrome rescans for a few seconds after every download; only a longer scan earns a card.
+const ACTIVITY_SCAN_GRACE = 5000;
+const activityCards = document.getElementById('activity-cards');
+const activitySay = document.getElementById('activity-say');
+const activityOpenedAt = Date.now();
+const activitySeen = new Map();      // key -> { id, state, firstRunningAt, json }
+const activityShownEnd = new Set();  // finished item ids already shown
+const activityDismissed = new Map(); // key -> item id dismissed
+let activityTimer = null;
+let activityFastUntil = 0;
+
+// What reloads a page when its job starts or ends.
+const ACTIVITY_PAGE_REFRESH = {
+  tags: () => typeof loadGenreBackfill === 'function' && loadGenreBackfill(),
+  covers: () => typeof loadCoverUpgrade === 'function' && loadCoverUpgrade(),
+  lyrics: () => typeof loadLyricsLibrary === 'function' && loadLyricsLibrary(),
+  lossy: () => typeof loadUpgrades === 'function' && loadUpgrades(),
+  fetched: () => typeof loadFetched === 'function' && loadFetched(),
+  imports: () => typeof loadImports === 'function' && loadImports(),
+  soulseek: () => typeof loadSharing === 'function' && loadSharing(),
+};
+
+// One card per job kind, so a run that becomes the next run, or a running batch that becomes
+// "Added 3 songs", stays the same card. A Spotify read and its trickle are two jobs.
+function activityKey(item) {
+  return item.kind === 'imports' ? item.id.split(':').slice(0, 2).join(':') : item.kind;
+}
+
+function activityPageOpen(page) {
+  return document.querySelector(`section[data-pane="${page}"]`)?.classList.contains('active') ?? false;
+}
+
+// The card's mark is the icon its page has in the sidebar, so a card reads as that page.
+function activityIcon(item) {
+  if (item.kind === 'scan') return icon('b-navidrome');
+  const use = document.querySelector(`.sidebar-nav-item[data-tab="${item.page}"] use`);
+  return icon(use?.getAttribute('href')?.replace('#', '') || 'i-pulse');
+}
+
+function activityFraction(item) {
+  if (typeof item.fraction === 'number') return Math.max(0, Math.min(1, item.fraction));
+  if (item.total > 0 && typeof item.done === 'number') return Math.max(0, Math.min(1, item.done / item.total));
+  return null;
+}
+
+function activityLeft(item, fraction) {
+  if (item.state !== 'running' || fraction === null || fraction < 0.04 || !item.startedUtc) return '';
+  const elapsed = (Date.now() - Date.parse(item.startedUtc)) / 1000;
+  if (!(elapsed > 15)) return '';
+  const left = elapsed * (1 - fraction) / fraction;
+  if (left < 45) return 'under a minute left';
+  if (left < 3600) return `about ${Math.round(left / 60)} min left`;
+  return `about ${Math.round(left / 3600)} h left`;
+}
+
+function activityLine(item) {
+  const fraction = activityFraction(item);
+  const parts = [];
+  if (item.state === 'running' && item.total > 0 && typeof item.done === 'number')
+    parts.push(`${item.done.toLocaleString()} of ${item.total.toLocaleString()}${item.unit ? ' ' + item.unit : ''}`);
+  else if (item.state === 'running' && typeof item.done === 'number' && item.unit)
+    parts.push(`${item.done.toLocaleString()} ${item.unit}`);
+  if (item.detail) parts.push(item.detail);
+  else if (item.state === 'failed' && item.error) parts.push(item.error);
+  const left = activityLeft(item, fraction);
+  if (left) parts.push(left);
+  return parts.join(' · ');
+}
+
+function activityCardHtml(item) {
+  const fraction = activityFraction(item);
+  const ended = item.state !== 'running';
+  const mark = item.state === 'done' ? icon('i-check-circle')
+    : item.state === 'failed' ? icon('i-warning-circle')
+    : activityIcon(item);
+  const bar = ended ? ''
+    : fraction === null
+      ? '<div class="act-bar indeterminate" aria-hidden="true"><span></span></div>'
+      : `<div class="act-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(fraction * 100)}"><span style="width:${(fraction * 100).toFixed(1)}%"></span></div>`;
+  const pct = !ended && fraction !== null ? `<span class="act-pct">${Math.round(fraction * 100)}%</span>` : '';
+  return `<button type="button" class="act-body" data-act-open="${escapeHtml(item.page)}" aria-label="${escapeHtml(item.title)}. Open its page.">
+      <span class="act-mark">${mark}</span>
+      <span class="act-text"><span class="act-title">${escapeHtml(item.title)}</span><span class="act-line">${escapeHtml(activityLine(item))}</span></span>
+      ${pct}
+    </button>
+    <button type="button" class="act-close" data-act-close aria-label="Dismiss"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+    ${bar}`;
+}
+
+function activityRemove(key) {
+  const el = activityCards?.querySelector(`[data-act-key="${CSS.escape(key)}"]`);
+  if (!el) return;
+  el.classList.add('leaving');
+  setTimeout(() => el.remove(), 220);
+}
+
+function renderActivity(items) {
+  if (!activityCards) return;
+  const now = Date.now();
+  const live = new Set();
+
+  for (const item of items) {
+    const key = activityKey(item);
+    const seen = activitySeen.get(key);
+    const running = item.state === 'running';
+    const json = JSON.stringify(item);
+    const changedState = !seen || seen.id !== item.id || seen.state !== item.state;
+
+    // The page that shows this job in full is refreshed when it starts or ends.
+    if (changedState && activityPageOpen(item.page)) ACTIVITY_PAGE_REFRESH[item.page]?.();
+
+    activitySeen.set(key, {
+      id: item.id,
+      state: item.state,
+      firstRunningAt: running ? (seen?.state === 'running' && seen.id === item.id ? seen.firstRunningAt : now) : seen?.firstRunningAt,
+      sawRunning: running || (seen?.sawRunning ?? false),
+      page: item.page,
+      json,
+    });
+
+    // A finished job earns a card once, and only if this page saw it run or it ended after the
+    // page was opened; a job that ended before you came is not news.
+    if (!running) {
+      const finished = item.finishedUtc ? Date.parse(item.finishedUtc) : NaN;
+      const fresh = (seen?.sawRunning ?? false) || (Number.isFinite(finished) && finished >= activityOpenedAt);
+      if (!fresh || activityShownEnd.has(item.id)) continue;
+    }
+    if (running && item.kind === 'scan' && now - activitySeen.get(key).firstRunningAt < ACTIVITY_SCAN_GRACE) continue;
+    if (activityDismissed.get(key) === item.id) continue;
+    if (activityPageOpen(item.page)) continue;
+
+    live.add(key);
+    let el = activityCards.querySelector(`[data-act-key="${CSS.escape(key)}"]`);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'act';
+      el.dataset.actKey = key;
+      activityCards.appendChild(el);
+    }
+    if (el.dataset.json !== json) {
+      el.dataset.json = json;
+      el.dataset.state = item.state;
+      el.dataset.itemId = item.id;
+      el.innerHTML = activityCardHtml(item);
+    }
+    if (!running && !activityShownEnd.has(item.id)) {
+      activityShownEnd.add(item.id);
+      if (activitySay) activitySay.textContent = `${item.title}. ${activityLine(item)}`;
+      if (item.state !== 'failed') setTimeout(() => {
+        if (activityCards.querySelector(`[data-act-key="${CSS.escape(key)}"]`)?.dataset.itemId === item.id) activityRemove(key);
+      }, ACTIVITY_LINGER);
+    }
+  }
+
+  // A job that is no longer listed: its card goes, unless it is showing how it ended.
+  for (const el of [...activityCards.children]) {
+    if (live.has(el.dataset.actKey)) continue;
+    if (el.dataset.state !== 'running' && !el.classList.contains('leaving')) continue;
+    activityRemove(el.dataset.actKey);
+  }
+  for (const [key, seen] of activitySeen) {
+    if (items.some(item => activityKey(item) === key)) continue;
+    // Gone from the list: whatever it was is over. A page showing it catches up once.
+    activitySeen.delete(key);
+    activityDismissed.delete(key);
+    if (seen.page && activityPageOpen(seen.page)) ACTIVITY_PAGE_REFRESH[seen.page]?.();
+  }
+}
+
+async function activityTick() {
+  clearTimeout(activityTimer);
+  activityTimer = null;
+  let items = [];
+  try {
+    const r = await api('/api/admin/activity', { cache: 'no-store' });
+    if (r.ok) items = (await r.json()).items || [];
+  } catch { /* Octo away: the status cards say so */ }
+  renderActivity(items);
+  if (document.hidden) return;
+  const busy = items.some(item => item.state === 'running') || Date.now() < activityFastUntil;
+  activityTimer = setTimeout(activityTick, busy ? ACTIVITY_FAST : ACTIVITY_IDLE);
+}
+
+// Something may have just started: look again in a moment, and keep looking quickly a while.
+function activityKick() {
+  activityFastUntil = Date.now() + 20000;
+  clearTimeout(activityTimer);
+  activityTimer = setTimeout(activityTick, 700);
+}
+
+activityCards?.addEventListener('click', e => {
+  const close = e.target.closest('[data-act-close]');
+  const card = e.target.closest('.act');
+  if (!card) return;
+  if (close) {
+    activityDismissed.set(card.dataset.actKey, card.dataset.itemId);
+    activityRemove(card.dataset.actKey);
+    return;
+  }
+  const page = e.target.closest('[data-act-open]')?.dataset.actOpen;
+  if (page && document.querySelector(`section[data-pane="${page}"]`)) {
+    openTab(page);
+    activityRemove(card.dataset.actKey);
+  }
+});
+document.addEventListener('visibilitychange', () => { if (!document.hidden) activityTick(); });
 
 // ────────────────────────────────────────────────────────────────
 // Toast helper
@@ -1241,8 +1465,16 @@ function renderGenreBackfill(run) {
 
 async function loadGenreBackfill(retry = false) {
   const response = await genreBackfillFetch('/api/admin/genre/backfill', {}, retry);
-  if (!response.ok) return null;
+  if (!response.ok) {
+    // Signed out or Octo away: stop asking every two seconds; the page catches up when opened.
+    if (genreBackfillPoll) { clearInterval(genreBackfillPoll); genreBackfillPoll = null; }
+    return null;
+  }
   const run = await response.json();
+  // Accepted but still reading the library: show it as starting, or the page reads the last
+  // run's answer right after Start and never begins watching.
+  if (run.pending && run.status !== 'Running')
+    Object.assign(run, { status: 'Running', starting: true, processed: 0, total: 0, changed: 0, preview: [] });
   const previous = lastBackfillRun;
   lastBackfillRun = run;
 
@@ -1537,7 +1769,10 @@ function renderCovers(run) {
 
 async function loadCoverUpgrade(retry = false) {
   const response = await genreBackfillFetch('/api/admin/covers/upgrade', {}, retry);
-  if (!response.ok) return null;
+  if (!response.ok) {
+    if (coverPoll) { clearInterval(coverPoll); coverPoll = null; }
+    return null;
+  }
   const run = await response.json();
   // Accepted but not started yet: show it as starting, so the page keeps watching and never
   // sits on the last run's results while a new one gets going.
@@ -5517,6 +5752,7 @@ impEl('imports-form')?.addEventListener('submit', () => setTimeout(loadImports, 
 if (location.hash) followHash();
 loadSettings();
 loadAmbient();
+activityTick();
 loadSignedIn();
 loadUpdate();
 renderSlskdOpen();

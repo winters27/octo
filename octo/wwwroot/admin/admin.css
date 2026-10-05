@@ -1823,27 +1823,106 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   to   { opacity: 1; transform: none; }
 }
 
-/* ── Toast: for news from elsewhere (a restart), never for a result beside the button ── */
-#toast {
+/* ── Activity: live progress cards, and the one-off toast under them ──
+ * Floating chrome over the page is dark glass, so bright lights or covers passing under it
+ * never wash out its words (Cider's rule). */
+.activity {
   position: fixed;
-  bottom: var(--s-page);
   right: var(--s-page);
-  background: var(--surface);
+  bottom: var(--s-page);
+  z-index: 110;
+  width: min(380px, calc(100vw - 2 * var(--s-xl)));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: none;
+}
+.activity-cards { display: flex; flex-direction: column; gap: 10px; }
+.act,
+#toast {
+  position: relative;
+  pointer-events: auto;
+  border-radius: 18px;
+  background: rgba(18, 17, 26, 0.92);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  backdrop-filter: blur(24px) saturate(160%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), inset 0 0 0 1px rgba(255, 255, 255, 0.07), 0 18px 44px rgba(0, 0, 0, 0.45);
   color: var(--ink);
-  border-radius: 16px;
+}
+.act { overflow: hidden; animation: act-in var(--t-card) var(--ease); }
+.act.leaving { animation: act-out 200ms var(--ease) forwards; }
+@keyframes act-in  { from { opacity: 0; transform: translateY(10px) scale(0.98); } to { opacity: 1; transform: none; } }
+@keyframes act-out { to { opacity: 0; transform: translateY(6px) scale(0.98); } }
+.act-body {
+  display: flex;
+  align-items: center;
+  gap: var(--s-l);
+  width: 100%;
+  padding: var(--s-l) 44px var(--s-l) var(--s-l);
+  border: none;
+  background: transparent;
+  text-align: left;
+  border-radius: inherit;
+}
+.act-body:hover { background: rgba(255, 255, 255, 0.04); }
+.act-body:focus-visible { outline-offset: -2px; }
+.act-mark {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  color: var(--accent);
+  background: rgb(var(--accent-rgb) / 0.14);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+.act-mark .icon { width: 20px; height: 20px; }
+.act[data-state="done"] .act-mark { color: var(--good); background: var(--good-wash); }
+.act[data-state="failed"] .act-mark { color: var(--bad); background: var(--bad-wash); }
+.act[data-state="failed"] { box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), inset 0 0 0 1px var(--bad-line), 0 18px 44px rgba(0, 0, 0, 0.45); }
+.act[data-state="stopped"] .act-mark { color: var(--text-secondary); background: rgba(255, 255, 255, 0.08); }
+.act-text { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
+.act-title { font-size: var(--t-table); font-weight: 650; color: var(--ink); overflow-wrap: anywhere; }
+.act-line { font-size: var(--t-label); color: var(--text-secondary); line-height: 1.45; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.act-pct { flex: 0 0 auto; font-size: var(--t-label); font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+.act-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+}
+.act-close:hover { background: rgba(255, 255, 255, 0.10); color: var(--ink); }
+.act-close .icon { width: 14px; height: 14px; }
+.act-bar { height: 4px; margin: 0 var(--s-l) var(--s-l); border-radius: var(--r-pill); background: rgba(255, 255, 255, 0.10); overflow: hidden; }
+.act-bar > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, rgb(var(--accent-rgb) / 0.7), var(--accent)); transition: width 600ms var(--ease); }
+.act-bar.indeterminate > span { width: 35%; animation: act-sweep 1.4s ease-in-out infinite; }
+@keyframes act-sweep { from { transform: translateX(-110%); } to { transform: translateX(320%); } }
+
+/* The one-off toast: news from elsewhere (a restart), never for a result beside the button. */
+#toast {
   padding: var(--s-l) var(--s-xl);
   font-size: var(--t-meta);
-  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.6), inset 0 0 0 1px var(--hairline), var(--shadow-float);
   opacity: 0;
   pointer-events: none;
   transform: translateY(8px);
   transition: opacity var(--t-card) var(--ease), transform var(--t-card) var(--ease);
-  max-width: 380px;
-  z-index: 110;
 }
+#toast:not(.show) { display: none; }
 #toast.show { opacity: 1; transform: none; pointer-events: auto; cursor: pointer; }
-#toast.ok    { box-shadow: inset 3px 0 0 var(--good), inset 0 0 0 1px var(--hairline), var(--shadow-float); }
-#toast.error { box-shadow: inset 3px 0 0 var(--bad), inset 0 0 0 1px var(--hairline), var(--shadow-float); }
+#toast.ok    { box-shadow: inset 3px 0 0 var(--good), inset 0 0 0 1px rgba(255, 255, 255, 0.07), 0 18px 44px rgba(0, 0, 0, 0.45); }
+#toast.error { box-shadow: inset 3px 0 0 var(--bad), inset 0 0 0 1px rgba(255, 255, 255, 0.07), 0 18px 44px rgba(0, 0, 0, 0.45); }
+@media (max-width: 760px) {
+  .activity { right: var(--s-xl); left: var(--s-xl); bottom: var(--s-xl); width: auto; }
+}
+@media (prefers-reduced-motion: reduce) { .act, .act.leaving { animation: none; } .act-bar.indeterminate > span { animation: none; width: 100%; opacity: 0.5; } }
 
 /* ────────────────────────────────────────────────────────────── */
 /*  Narrow windows                                                */

@@ -2448,7 +2448,12 @@
     </main>
   </div>
 
-  <div id="toast" role="status" aria-live="polite"></div>
+  <!-- Live progress of Octo's background work, one card per job, and the one-off toast under them. -->
+  <div class="activity" id="activity" role="region" aria-label="Activity">
+    <div class="activity-cards" id="activity-cards"></div>
+    <div id="toast" role="status" aria-live="polite"></div>
+  </div>
+  <div id="activity-say" class="visually-hidden" role="status" aria-live="polite"></div>
   <div id="sr-alert" class="visually-hidden" role="alert"></div>
 
   <!-- Sign-in modal for the folder browser. Hidden until needed; the browser
