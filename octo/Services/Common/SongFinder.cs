@@ -471,11 +471,18 @@ public sealed class SongFinder
         var settings = _services.GetService<IOptionsMonitor<SoulseekSettings>>()?.CurrentValue ?? new SoulseekSettings();
         var rejected = _services.GetService<RejectedPeerRegistry>();
         var remembers = _services.GetService<Octo.Services.Fingerprint.DownloadVerificationService>()?.RemembersRejections ?? false;
-        var copies = SoulseekCopies(found.Hits, found.Ranked, target, settings, rejected, remembers);
-        var peers = found.Hits.Select(h => h.Username).Distinct(StringComparer.OrdinalIgnoreCase).Count();
-        var text = found.Hits.Count == 0 ? "Nothing found"
-            : $"{found.Hits.Count} files from {peers} {(peers == 1 ? "peer" : "peers")}; {found.Ranked.Count} {(found.Ranked.Count == 1 ? "fits" : "fit")} the song";
+        var (copies, fit) = SoulseekFound(found.Hits, found.Ranked, target, settings, rejected, remembers);
+        var text = SoulseekSummary(found.Hits, fit);
         return (copies, found.Queries, text);
+    }
+
+    /// <summary>"998 files from 490 peers; 40 fit the song", with the same count of fitting copies
+    /// the list marks as Octo's choices or "Fits too".</summary>
+    internal static string SoulseekSummary(IReadOnlyList<SoulseekFileHit> hits, int fit)
+    {
+        if (hits.Count == 0) return "Nothing found";
+        var peers = hits.Select(h => h.Username).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+        return $"{hits.Count} files from {peers} {(peers == 1 ? "peer" : "peers")}; {fit} {(fit == 1 ? "fits" : "fit")} the song";
     }
 
     /// <summary>
@@ -483,10 +490,26 @@ public sealed class SongFinder
     /// order, then every other file, the likeliest first, each with the reason it was passed over.
     /// </summary>
     internal static IReadOnlyList<FoundCopy> SoulseekCopies(IReadOnlyList<SoulseekFileHit> hits, IReadOnlyList<SoulseekFileHit> ranked,
-        FindTarget target, SoulseekSettings settings, RejectedPeerRegistry? rejected, bool remembers)
+        FindTarget target, SoulseekSettings settings, RejectedPeerRegistry? rejected, bool remembers) =>
+        SoulseekFound(hits, ranked, target, settings, rejected, remembers).Copies;
+
+    /// <summary>Files passed over that the list keeps for each reason, however many fit.</summary>
+    internal const int SkippedPerReason = 5;
+
+    /// <summary>Room on the list kept for those, so a popular song's list still says why files were passed over.</summary>
+    internal const int SkippedRoom = 60;
+
+    /// <summary>
+    /// The list, and how many files fit the song: every check the download makes passed, which is
+    /// exactly the rows with no reason against them (Octo's choices and "Fits too"). Past
+    /// <see cref="MaxCopies"/>, a few files of each reason a file was passed over stay on the list,
+    /// and the fitting copies, best first, fill the rest.
+    /// </summary>
+    internal static (IReadOnlyList<FoundCopy> Copies, int Fit) SoulseekFound(IReadOnlyList<SoulseekFileHit> hits,
+        IReadOnlyList<SoulseekFileHit> ranked, FindTarget target, SoulseekSettings settings, RejectedPeerRegistry? rejected, bool remembers)
     {
         var order = ranked.Select((hit, i) => (hit, i)).ToDictionary(pair => (pair.hit.Username, pair.hit.Filename), pair => pair.i + 1);
-        return hits
+        var rows = hits
             .Where(hit => !string.IsNullOrEmpty(hit.Username) && !string.IsNullOrEmpty(hit.Filename))
             .Select(hit =>
             {
@@ -502,7 +525,18 @@ public sealed class SongFinder
             .ThenByDescending(row => row.hit.HasFreeUploadSlot == true)
             .ThenBy(row => row.hit.QueueLength ?? int.MaxValue)
             .ThenByDescending(row => row.hit.Size)
-            .Take(MaxCopies)
+            .ToList();
+        var fit = rows.Count(row => row.tier == 0);
+
+        var kept = new HashSet<int>();
+        if (rows.Count > MaxCopies)
+            foreach (var at in rows.Select((row, at) => (row, at)).Where(pair => pair.row.tier > 0)
+                         .GroupBy(pair => pair.row.note).SelectMany(reason => reason.Take(SkippedPerReason)).Take(SkippedRoom))
+                kept.Add(at.at);
+        for (var at = 0; at < rows.Count && kept.Count < MaxCopies; at++) kept.Add(at);
+
+        var copies = rows
+            .Where((_, at) => kept.Contains(at))
             .Select(row => new FoundCopy(SoulseekCandidates.Of(row.hit, row.rank, row.note), new PickedCopy
             {
                 Source = SoulseekSource, Peer = row.hit.Username, File = row.hit.Filename, Size = row.hit.Size,
@@ -510,6 +544,7 @@ public sealed class SongFinder
                 SampleRate = row.hit.SampleRate, Length = row.hit.Length,
             }))
             .ToList();
+        return (copies, fit);
     }
 
     private async Task<(IReadOnlyList<FoundCopy>, IReadOnlyList<string>, string?)> SearchLidarrAsync(FindTarget target,

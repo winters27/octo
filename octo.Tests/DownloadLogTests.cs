@@ -237,6 +237,33 @@ public class DownloadLogTests
         Assert.Equal("Daft Punk - Da Funk.flac", copies[0].Pick.ToHit()!.Filename);
     }
 
+    [Fact]
+    public void APopularSongsListKeepsAFewOfEachReason_AndItsSummaryCountsTheRowsThatFit()
+    {
+        var target = new FindTarget("Daft Punk", "Get Lucky", "Random Access Memories", 248, "id", ExternalId: "id");
+        SoulseekFileHit File(string peer, string name, string extension = "flac") => new()
+        {
+            Username = peer, Filename = $@"Music\Daft Punk\Random Access Memories\{name}.{extension}", Size = 30_000_000,
+            Length = 248, Extension = extension,
+        };
+        var fitting = Enumerable.Range(0, 400).Select(i => File($"flac{i}", "08 - Get Lucky")).ToList();
+        var mp3s = Enumerable.Range(0, 10).Select(i => File($"mp3{i}", "08 - Get Lucky", "mp3")).ToList();
+        var others = Enumerable.Range(0, 10).Select(i => File($"other{i}", "07 - Lose Yourself to Dance")).ToList();
+        var hits = fitting.Concat(mp3s).Concat(others).ToList();
+
+        var (copies, fit) = SongFinder.SoulseekFound(hits, fitting.Take(5).ToList(), target, new SoulseekSettings(), null, false);
+
+        Assert.Equal(SongFinder.MaxCopies, copies.Count);
+        Assert.Equal(SongFinder.SkippedPerReason, copies.Count(c => c.Shown.Note == "Not FLAC, which Octo looks for first"));
+        Assert.Equal(SongFinder.SkippedPerReason, copies.Count(c => c.Shown.Note == "The file name does not match the title"));
+        // Fitting copies first, then the reasons.
+        Assert.Equal(5, copies.TakeWhile(c => c.Shown.Rank is not null).Count());
+        Assert.Equal(400, fit);
+        Assert.Equal(400, hits.Count(hit => SoulseekCandidates.Judge(hit, target.Title, target.Album, target.Duration,
+            new SoulseekSettings(), null, false, target.Artist).Tier == 0));
+        Assert.Equal("420 files from 420 peers; 400 fit the song", SongFinder.SoulseekSummary(hits, fit));
+    }
+
     // ---------------------------------------------------------------------------------------
     // Find songs
     // ---------------------------------------------------------------------------------------
