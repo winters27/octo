@@ -9,6 +9,15 @@ namespace Octo.Services.Library;
 public sealed record NavidromeSongEntry(string FullPath, string? AlbumId, string? Artist, string? Title, string? Album,
     string? Lyrics)
 {
+    /// <summary>Navidrome's id for the song.</summary>
+    public string? Id { get; init; }
+
+    /// <summary>The length in seconds, as Navidrome read it.</summary>
+    public double? Duration { get; init; }
+
+    /// <summary>What Navidrome read from the advisory tag: "e" (explicit), "c" (clean) or "".</summary>
+    public string? ExplicitStatus { get; init; }
+
     /// <summary>Whether Navidrome read lyrics from the song's tags (not a file beside it).</summary>
     public bool HasTagLyrics => !string.IsNullOrWhiteSpace(Lyrics) && Lyrics.Trim() is not "[]" and not "null";
 }
@@ -59,7 +68,13 @@ public static class NavidromeSongList
                     if (Path.IsPathRooted(path)) paths.Add(Path.GetFullPath(path));
                     foreach (var full in paths)
                         songs.TryAdd(full, new NavidromeSongEntry(full, Str(song, "albumId"), Str(song, "artist"),
-                            Str(song, "title"), Str(song, "album"), Str(song, "lyrics")));
+                            Str(song, "title"), Str(song, "album"), Str(song, "lyrics"))
+                        {
+                            Id = Str(song, "id"),
+                            Duration = song.TryGetProperty("duration", out var length) && length.ValueKind == JsonValueKind.Number
+                                ? length.GetDouble() : null,
+                            ExplicitStatus = Str(song, "explicitStatus"),
+                        });
                 }
                 if (count < page) break;
             }

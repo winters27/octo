@@ -246,6 +246,14 @@ builder.Services.AddSingleton(sp => new Octo.Services.Library.TagEditJournal(
     System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "tag-edits.json"),
     sp.GetRequiredService<ILogger<Octo.Services.Library.TagEditJournal>>()));
 builder.Services.AddSingleton<Octo.Services.Library.LibraryRescan>();
+// Marking the library explicit or clean: a preview, then the writes it found, journaled in
+// tag-edits.json like the apps' edits so a run (or one song) can be undone.
+builder.Services.AddSingleton(sp => new Octo.Services.Library.ExplicitBackfillStore(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "explicit-backfill.json"),
+    sp.GetRequiredService<ILogger<Octo.Services.Library.ExplicitBackfillStore>>()));
+builder.Services.AddSingleton<Octo.Services.Tagging.IExplicitCatalog, Octo.Services.Tagging.DeezerExplicitCatalog>();
+builder.Services.AddSingleton<Octo.Services.Library.ExplicitBackfill>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<Octo.Services.Library.ExplicitBackfill>());
 builder.Services.AddSingleton<Octo.Services.Library.LibraryEditService>();
 
 // The playlists Octo fills to ask a person something (#47): what was asked and answered lives

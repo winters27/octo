@@ -233,6 +233,33 @@ public static class LibraryTagEdits
         }
     }
 
+    /// <summary>The advisory a file carries now, as the journal keeps it ("1", "2", "0"), or null.</summary>
+    public static string? ReadAdvisory(TagLib.File file) =>
+        TagWriterExtras.ReadAdvisory(file)?.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>Writes the explicit advisory (1 explicit, 2 clean, 0 neither), or takes it out when
+    /// <paramref name="advisory"/> is null. In place, like every edit here.</summary>
+    public static TagEditResult SetAdvisory(string path, int? advisory)
+    {
+        try
+        {
+            using var file = TagLib.File.Create(path);
+            var was = ReadAdvisory(file);
+            var now = advisory?.ToString(CultureInfo.InvariantCulture);
+            if (was == now) return new(false, null, AdvisoryOnly(was), AdvisoryOnly(was));
+            if (advisory is null) TagWriterExtras.ClearAdvisory(file);
+            else TagWriterExtras.SetAdvisory(file, advisory);
+            file.Save();
+            return new(true, null, AdvisoryOnly(was), AdvisoryOnly(now));
+        }
+        catch (Exception ex)
+        {
+            return TagEditResult.Failed(Why(ex));
+        }
+    }
+
+    internal static Dictionary<string, string?> AdvisoryOnly(string? value) => new() { [TagEditKinds.Advisory] = value };
+
     /// <summary>Whether the file carries a picture of its own.</summary>
     public static bool HasPicture(string path)
     {
@@ -320,6 +347,10 @@ public sealed record TagEditEntry(
     public KeptIdentity? AlbumBefore { get; init; }
 
     public bool Undone { get; init; }
+
+    /// <summary>The library-wide run that made this edit, when one did (the explicit marking),
+    /// so the whole run can be undone at once.</summary>
+    public string? RunId { get; init; }
 }
 
 public static class TagEditKinds
@@ -327,6 +358,8 @@ public static class TagEditKinds
     public const string Retag = "retag";
     public const string JoinAlbum = "joinAlbum";
     public const string Cover = "cover";
+    /// <summary>The explicit advisory, written by the library-wide explicit marking.</summary>
+    public const string Advisory = "advisory";
 }
 
 /// <summary>
@@ -336,7 +369,8 @@ public static class TagEditKinds
 /// </summary>
 public sealed class TagEditJournal
 {
-    private const int MaxEntries = 2000;
+    /// <summary>Room for a library-wide run's edits beside the apps' own.</summary>
+    private const int MaxEntries = 20000;
     private readonly string? _path;
     private readonly ILogger<TagEditJournal>? _logger;
     private readonly object _lock = new();
@@ -357,15 +391,30 @@ public sealed class TagEditJournal
         }
     }
 
-    /// <summary>False when it could not be kept on disk.</summary>
-    public bool Record(TagEditEntry entry)
+    /// <summary>False when it could not be kept on disk. A library-wide run passes
+    /// <paramref name="save"/> false and calls <see cref="Flush"/> every few files, since every
+    /// save rewrites the whole journal.</summary>
+    public bool Record(TagEditEntry entry, bool save = true)
     {
         lock (_lock)
         {
             _entries.Add(entry);
             if (_entries.Count > MaxEntries) _entries.RemoveRange(0, _entries.Count - MaxEntries);
-            return Save();
+            return !save || Save();
         }
+    }
+
+    /// <summary>Writes what <see cref="Record"/> and <see cref="MarkUndone"/> kept in memory.</summary>
+    public bool Flush()
+    {
+        lock (_lock) return Save();
+    }
+
+    /// <summary>The edits one run made that are not undone yet, oldest first.</summary>
+    public IReadOnlyList<TagEditEntry> OfRun(string runId)
+    {
+        lock (_lock)
+            return _entries.Where(entry => entry.RunId == runId && !entry.Undone).ToList();
     }
 
     /// <summary>The newest edit of this song not undone yet.</summary>
@@ -381,14 +430,14 @@ public sealed class TagEditJournal
             return _entries.AsEnumerable().Reverse().Take(limit).ToList();
     }
 
-    public bool MarkUndone(string entryId)
+    public bool MarkUndone(string entryId, bool save = true)
     {
         lock (_lock)
         {
             var at = _entries.FindIndex(entry => entry.Id == entryId);
             if (at < 0) return false;
             _entries[at] = _entries[at] with { Undone = true };
-            return Save();
+            return !save || Save();
         }
     }
 

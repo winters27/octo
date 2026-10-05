@@ -1108,6 +1108,19 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: inset 0 1px 
 .config-row .value.secret { letter-spacing: 0.18em; color: var(--text-muted); }
 .config-loading { padding: var(--s-page); color: var(--text-muted); text-align: center; font-size: var(--t-meta); }
 
+/* Explicit marking: the same shell, file / found / how. */
+.explicit-row { grid-template-columns: 2fr 1fr 2fr; gap: var(--s-l); }
+.explicit-row .found-explicit { color: var(--ink-1); font-weight: 600; }
+.explicit-row .value { word-break: normal; overflow-wrap: anywhere; }
+#explicit-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-xl) var(--s-xl); }
+#explicit-backfill-filter { display: flex; flex-wrap: wrap; gap: var(--s-s); padding: 0 var(--s-xl) var(--s-l); }
+#explicit-backfill-filter[hidden] { display: none; }
+#explicit-backfill-filter .btn[aria-pressed="true"] { color: var(--ink); box-shadow: inset 0 0 0 1px var(--accent); }
+@container (max-width: 640px) {
+  .explicit-row { grid-template-columns: 1fr 1fr; }
+  .explicit-row > span:first-child { grid-column: 1 / -1; }
+}
+
 /* Genre backfill preview: the config-sources shell with four columns instead of two. */
 .genre-change-row { grid-template-columns: 2fr 1fr 1fr 1fr; gap: var(--s-l); }
 #genre-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-xl) var(--s-xl); }

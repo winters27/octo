@@ -131,7 +131,8 @@ public class CoverChainTests
 
         Assert.Equal("Cover Art Archive", choice!.Source);
         Assert.Contains(calls, url => url.Contains("release/rel-1/front-1200"));
-        Assert.DoesNotContain(calls, url => url.Contains("deezer.example"));
+        // Asked as well: a larger copy of the same art may come after a sharp one.
+        Assert.Contains(calls, url => url.Contains("deezer.example"));
     }
 
     private static Song MatchedRelease() => new()
@@ -343,7 +344,6 @@ public class CoverChainTests
 
         Assert.Equal("iTunes", choice!.Source);
         Assert.Equal((3000, 3000), CoverImage.Measure(choice.Bytes));
-        Assert.DoesNotContain(calls, url => url.Contains("deezer.example"));
     }
 
     /// <summary>A barcode the chooser found asks Apple by barcode, never by search: one lookup,

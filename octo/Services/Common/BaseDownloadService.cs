@@ -107,6 +107,10 @@ public abstract class BaseDownloadService : IDownloadService
     /// <summary>The library file this download replaces, or null for an ordinary download.</summary>
     protected static string? ReplacingPath => ReplacingPathLocal.Value;
 
+    /// <summary>Runs what follows as the replacement of <paramref name="path"/>, as a library
+    /// action's download does, for tests that tag a file without downloading one.</summary>
+    internal static void ActAsReplacementOf(string? path) => ReplacingPathLocal.Value = path;
+
     /// <summary>
     /// The source a backend fetched a song from, when the format alone does not say: a FLAC
     /// can be Lidarr's as well as Soulseek's. Weak, so a finished song takes its entry with it.
@@ -1622,18 +1626,28 @@ public abstract class BaseDownloadService : IDownloadService
             // gets it whole.
             try
             {
-                // The art of the album the file was filed away from is not this album's, so it never
-                // outranks the chain; it stays on the file only when the chain finds nothing.
-                var embedded = filedElsewhere ? null
-                    : tagFile.Tag.Pictures.FirstOrDefault(picture => picture.Type == TagLib.PictureType.FrontCover)
-                        ?? tagFile.Tag.Pictures.FirstOrDefault();
+                // The file's own cover is judged before the chain replaces it: the same art at a
+                // good size stays. The art of the album the file was filed away from is not this
+                // album's, so it never outranks the chain; it stays on the file only when the chain
+                // finds nothing. A replacement of a library song also weighs the old copy's cover,
+                // which is the picture the album shows now.
+                var embedded = OwnCover(tagFile);
                 var resolver = _serviceProvider.GetService<Octo.Services.CoverArt.DownloadCoverResolver>();
                 var cover = resolver is null ? null
-                    : await resolver.ResolveAsync(song, embedded?.Data?.Data, cancellationToken);
+                    : await resolver.ChooseAsync(song, new Octo.Services.CoverArt.CoversOnHand(
+                        embedded, filedElsewhere, LibraryCopyCover(filePath)), cancellationToken);
                 if (cover is not null)
                 {
                     chosenCover = cover.Bytes;
-                    if (!cover.KeepsExisting)
+                    if (cover.KeepsExisting)
+                    {
+                        if (cover.Headline is { } kept)
+                        {
+                            Logger.LogInformation("Cover kept for {Path}: {Note}", filePath, cover.Note);
+                            LogStep(song, AcquisitionEventKinds.Cover, kept, cover.Note);
+                        }
+                    }
+                    else
                     {
                         var embed = MetadataSettingsValue.EmbedFullSizeCovers ? cover.Bytes
                             : Octo.Services.CoverArt.CoverImage.FitWithin(cover.Bytes, MetadataSettings.EmbeddedCoverSide);
@@ -1648,9 +1662,17 @@ public abstract class BaseDownloadService : IDownloadService
                             },
                         };
                         Logger.LogInformation("Cover art embedded from {Source}: {Size} bytes", cover.Source, embed.Length);
-                        LogStep(song, AcquisitionEventKinds.Cover, $"Cover from {cover.Source}",
-                            Octo.Services.CoverArt.CoverImage.Measure(embed) is { } side
-                                ? $"{side.Width} x {side.Height} px, embedded in the song" : "Embedded in the song");
+                        var where = Octo.Services.CoverArt.CoverImage.Measure(embed) is { } side
+                            ? Octo.Services.CoverArt.CoverImage.Measure(cover.Bytes) == side
+                                ? "embedded in the song" : $"embedded in the song at {side.Width} x {side.Height} px"
+                            : "embedded in the song";
+                        if (cover.Headline is { } headline)
+                            LogStep(song, AcquisitionEventKinds.Cover, headline,
+                                cover.Note is { } note ? $"{note} Now {where}." : $"Now {where}.");
+                        else
+                            LogStep(song, AcquisitionEventKinds.Cover, $"Cover from {cover.Source}",
+                                Octo.Services.CoverArt.CoverImage.Measure(embed) is { } size
+                                    ? $"{size.Width} x {size.Height} px, embedded in the song" : "Embedded in the song");
                     }
                 }
             }
@@ -1671,8 +1693,34 @@ public abstract class BaseDownloadService : IDownloadService
         }
     }
     
+    /// <summary>The front cover a file carries, or its first picture when none is marked front.</summary>
+    private static byte[]? OwnCover(TagLib.File file) =>
+        (file.Tag.Pictures.FirstOrDefault(picture => picture.Type == TagLib.PictureType.FrontCover)
+            ?? file.Tag.Pictures.FirstOrDefault())?.Data?.Data;
+
+    /// <summary>
+    /// For a replacement of a library song (Better quality, wrong song, a picked copy): the cover
+    /// of the copy being replaced, still in place while the new one is tagged. Null for an
+    /// ordinary download, or when that file cannot be read.
+    /// </summary>
+    private byte[]? LibraryCopyCover(string newPath)
+    {
+        if (ReplacingPath is not { Length: > 0 } original || !System.IO.File.Exists(original)
+            || string.Equals(Path.GetFullPath(original), Path.GetFullPath(newPath), StringComparison.Ordinal)) return null;
+        try
+        {
+            using var file = TagLib.File.Create(original);
+            return OwnCover(file);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogDebug("Could not read the cover of {Path}: {M}", original, ex.Message);
+            return null;
+        }
+    }
+
     #endregion
-    
+
     #region Utility Methods
     
     /// <summary>

@@ -161,6 +161,8 @@ public sealed class LibraryEditService
             TagEditResult result = entry.Kind switch
             {
                 TagEditKinds.Cover => LibraryTagEdits.RemoveCover(path),
+                TagEditKinds.Advisory => LibraryTagEdits.SetAdvisory(path,
+                    int.TryParse(entry.Before.GetValueOrDefault(TagEditKinds.Advisory), out var advisory) ? advisory : null),
                 TagEditKinds.JoinAlbum when entry.AlbumBefore is { } album =>
                     LibraryTagEdits.RestoreAlbum(path, album, entry.Before.GetValueOrDefault(SongTagFields.Year)),
                 _ => LibraryTagEdits.Write(path, entry.Before

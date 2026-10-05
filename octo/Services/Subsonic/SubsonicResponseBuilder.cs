@@ -299,6 +299,7 @@ public partial class SubsonicResponseBuilder
             // it; this builds the album DETAIL and did not, so the two disagreed.
             ["created"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
             ["releaseTypes"] = album.ReleaseTypes.ToArray(),
+            ["explicitStatus"] = ExplicitStatus.ForClients(album.ExplicitContentLyrics),
         };
         if (album.ArtistId is not null) fields["artistId"] = album.ArtistId;
         if (album.Year is int albumYear) fields["year"] = albumYear;
@@ -851,7 +852,10 @@ public partial class SubsonicResponseBuilder
             ["albumArtists"] = albumArtistList,
             ["displayAlbumArtist"] = song.Artist ?? "",
             ["contributors"] = Array.Empty<object>(),
-            ["explicitStatus"] = "",
+            // OpenSubsonic's word for the catalog's flag ("explicit", "clean" or ""), so a client
+            // can mark an outside song before it is added. A library song that reaches here
+            // carries what Navidrome said of it, or nothing.
+            ["explicitStatus"] = ExplicitStatus.ForClients(song.ExplicitContentLyrics),
             // OpenSubsonic's isrc is a list. An album track Deezer described carries its code,
             // and a library song keeps the ones Navidrome gave it.
             ["isrc"] = song.IsrcsForClients().ToArray(),
@@ -919,6 +923,7 @@ public partial class SubsonicResponseBuilder
             // speaks it. Only an outside album comes through here; a library album keeps the
             // types Navidrome gave it.
             ["releaseTypes"] = album.ReleaseTypes.ToArray(),
+            ["explicitStatus"] = ExplicitStatus.ForClients(album.ExplicitContentLyrics),
             ["sortName"] = (album.Title ?? "").ToLowerInvariant(),
             ["isExternal"] = !album.IsLocal,
         };

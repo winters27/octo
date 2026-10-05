@@ -28,6 +28,10 @@ public class Album
     /// songs were not looked at, which a client reads as it always has.
     /// </summary>
     public int? OwnedCount { get; set; }
+
+    /// <summary>Whether the album's words are explicit (1), the clean edit (3) or neither (0), as
+    /// the catalog says; null when it does not. See <see cref="ExplicitStatus"/>.</summary>
+    public int? ExplicitContentLyrics { get; set; }
     public string? ExternalProvider { get; set; }
     public string? ExternalId { get; set; }
     public List<Song> Songs { get; set; } = new();

@@ -271,6 +271,7 @@ async function loadSettings() {
   // retry: false, so a page load never pops a sign-in prompt. Without a session the section
   // simply stays empty until the user asks for a preview.
   loadGenreBackfill();
+  loadExplicitBackfill();
   loadCoverUpgrade();
   loadLyricsLibrary();
   loadLyricsChoices();
@@ -1345,6 +1346,161 @@ document.getElementById('genre-backfill-undo')?.addEventListener('click', async 
   if (!response.ok) { backfillNote(body.error || 'Could not undo.', 'error'); return; }
   backfillNote('Restoring genres.', 'info');
   await loadGenreBackfill();
+});
+
+// ---- Mark explicit songs ----------------------------------------------------------
+// Look up (writes nothing), then mark what the lookup found explicit or clean, then undo.
+// Every call needs the browse sign-in, like the genre re-tag.
+
+let explicitPoll = null;
+let lastExplicitRun = null;
+let explicitShow = '';
+
+const explicitWords = { explicit: 'Explicit', clean: 'Clean edit', notExplicit: 'Not explicit', unsure: 'Unsure' };
+
+function explicitNote(message, kind = 'ok') {
+  note(document.querySelector('#explicit-backfill-actions .genre-preset-actions'), message, kind);
+}
+
+function renderExplicitBackfill(run) {
+  const status = document.getElementById('explicit-backfill-status');
+  const results = document.getElementById('explicit-backfill-results');
+  const filter = document.getElementById('explicit-backfill-filter');
+  if (!status || !results || !filter) return;
+  const running = run.status === 'Running';
+  document.getElementById('explicit-backfill-cancel').hidden = !running;
+  document.getElementById('explicit-backfill-apply').hidden = running || !run.canApply;
+  document.getElementById('explicit-backfill-apply').textContent = run.toWrite ? `Mark ${run.toWrite.toLocaleString()} song${run.toWrite === 1 ? '' : 's'}` : 'Mark songs';
+  document.getElementById('explicit-backfill-resume').hidden = running || !run.canResume;
+  document.getElementById('explicit-backfill-undo').hidden = running || !run.canUndo;
+  document.getElementById('explicit-backfill-preview').disabled = running;
+
+  if (run.status === 'Idle') {
+    status.innerHTML = '';
+    results.innerHTML = '';
+    filter.hidden = true;
+    return;
+  }
+
+  const writing = run.mode === 'Apply';
+  const undoing = run.mode === 'Undo';
+  const label = running
+    ? (writing ? 'Marking songs' : undoing ? 'Taking the marks out' : 'Looking songs up')
+    : ({ Completed: 'Done', Cancelled: 'Stopped', Interrupted: 'Interrupted', Failed: 'Stopped' }[run.status] ?? run.status);
+  const n = v => (v ?? 0).toLocaleString();
+  const counts = writing || undoing
+    ? [`${n(run.stepDone)} of ${n(run.stepTotal)} songs`, `${n(run.written)} ${undoing ? 'put back' : 'marked'}`,
+       run.leftAlone ? `${n(run.leftAlone)} changed since, left alone` : null, run.failed ? `${n(run.failed)} failed` : null]
+    : [`${n(run.processed)} of ${n(run.total)} songs looked up`, `${n(run.explicit)} explicit`, `${n(run.clean)} clean`,
+       `${n(run.notExplicit)} not explicit`, `${n(run.unsure)} unsure`,
+       run.alreadyMarked ? `${n(run.alreadyMarked)} already marked` : null, run.failed ? `${n(run.failed)} unreadable` : null];
+  status.innerHTML = `
+    <div class="set-info">
+      <div class="set-info-t">${esc(label)}</div>
+      <div class="set-info-d">${esc(counts.filter(Boolean).join(' · '))}${run.reason ? `. ${esc(run.reason)}` : ''}</div>
+      ${running && run.lastSong ? `<div class="set-info-more">${esc(run.lastSong)}</div>` : ''}
+    </div>`;
+
+  const kinds = ['explicit', 'clean', 'unsure', 'notExplicit'].filter(kind => (run[kind] ?? 0) > 0);
+  filter.hidden = kinds.length === 0;
+  filter.innerHTML = [['', 'All'], ...kinds.map(kind => [kind, explicitWords[kind]])].map(([kind, word]) =>
+    `<button class="btn btn-ghost btn-sm" type="button" data-show="${kind}" aria-pressed="${explicitShow === kind}">${esc(word)}</button>`).join('');
+
+  if (!run.rows?.length) {
+    results.innerHTML = run.errors?.length ? `<div class="field-error" role="alert">${esc(run.errors[run.errors.length - 1])}</div>` : '';
+    return;
+  }
+  const rows = run.rows.map(row => `
+    <div class="config-row explicit-row">
+      <span class="key">${esc(row.artist && row.title ? `${row.title} by ${row.artist}` : row.path)}</span>
+      <span class="value${row.outcome === 'explicit' || row.outcome === 'clean' ? ' found-explicit' : ''}">${esc(explicitWords[row.outcome] ?? row.outcome)}${row.written ? ', marked' : ''}</span>
+      <span class="value">${esc(row.how)}</span>
+    </div>`).join('');
+  const shown = explicitShow ? (run[explicitShow] ?? 0) : (run.explicit + run.clean + run.notExplicit + run.unsure);
+  results.innerHTML = `
+    <div class="config-table">
+      <div class="config-row config-row-head explicit-row"><span>Song</span><span>Found</span><span>How</span></div>
+      ${rows}
+    </div>
+    ${shown > run.rows.length ? `<p class="set-info-d">Showing ${run.rows.length.toLocaleString()} of ${shown.toLocaleString()}.</p>` : ''}`;
+}
+
+async function loadExplicitBackfill(retry = false) {
+  const query = explicitShow ? `?show=${encodeURIComponent(explicitShow)}` : '';
+  const response = await genreBackfillFetch(`/api/admin/explicit/backfill${query}`, {}, retry);
+  if (!response.ok) return null;
+  const run = await response.json();
+  const previous = lastExplicitRun;
+  lastExplicitRun = run;
+  renderExplicitBackfill(run);
+  if (previous?.status === 'Running' && run.status !== 'Running') {
+    explicitNote(run.reason || 'Finished.', run.status === 'Failed' ? 'error' : 'ok');
+  }
+  if (run.status === 'Running') {
+    if (!explicitPoll) explicitPoll = setInterval(() => loadExplicitBackfill(), 2000);
+  } else if (explicitPoll) {
+    clearInterval(explicitPoll);
+    explicitPoll = null;
+  }
+  return run;
+}
+
+async function explicitPost(path, body = null) {
+  const response = await genreBackfillFetch(`/api/admin/explicit/backfill/${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : null,
+  });
+  const answer = await response.json().catch(() => ({}));
+  if (!response.ok) explicitNote(answer.error || `Could not do that: HTTP ${response.status}`, 'error');
+  return response.ok;
+}
+
+// A short run can be over before the first poll, so the note says how it ended, not that it began.
+async function explicitStarted(words) {
+  await new Promise(resolve => setTimeout(resolve, 600));
+  const run = await loadExplicitBackfill();
+  if (run && run.status !== 'Running') explicitNote(run.reason || 'Done.', run.status === 'Failed' ? 'error' : 'ok');
+  else explicitNote(words, 'info');
+}
+
+document.getElementById('explicit-backfill-filter')?.addEventListener('click', event => {
+  const button = event.target.closest('button[data-show]');
+  if (!button) return;
+  explicitShow = button.dataset.show;
+  loadExplicitBackfill();
+});
+document.getElementById('explicit-backfill-preview')?.addEventListener('click', async () => {
+  if (await explicitPost('preview')) {
+    explicitNote('Looking songs up. Nothing is being written.', 'info');
+    await loadExplicitBackfill();
+  }
+});
+document.getElementById('explicit-backfill-resume')?.addEventListener('click', async () => {
+  if (await explicitPost('resume')) await loadExplicitBackfill();
+});
+document.getElementById('explicit-backfill-cancel')?.addEventListener('click', async () => {
+  if (await explicitPost('cancel')) {
+    explicitNote('Stopping after the current song.', 'info');
+    await loadExplicitBackfill();
+  }
+});
+document.getElementById('explicit-backfill-apply')?.addEventListener('click', async () => {
+  const run = await loadExplicitBackfill(true);
+  if (!run?.canApply) return;
+  const expected = run.musicPath ?? '';
+  const confirm = await askDialog({
+    title: `Mark ${run.toWrite.toLocaleString()} song${run.toWrite === 1 ? '' : 's'} explicit or clean?`,
+    message: `This writes the mark into the files under:\n${expected}\nincluding music Octo never downloaded. Type that path exactly to continue.`,
+    confirm: 'Mark songs', danger: true,
+    input: { label: 'Music folder', placeholder: expected, mustEqual: expected },
+  });
+  if (confirm === null) return;
+  if (await explicitPost('apply', { confirm })) await explicitStarted('Marking songs.');
+});
+document.getElementById('explicit-backfill-undo')?.addEventListener('click', async () => {
+  if (!(await askConfirm('Take the marks back out?', 'Every song the last run marked loses its mark, except a file changed since.', 'Take them out'))) return;
+  if (await explicitPost('undo')) await explicitStarted('Taking the marks out.');
 });
 
 // ---- Cover art: the soft covers wall ------------------------------------------

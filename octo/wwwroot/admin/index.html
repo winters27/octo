@@ -1179,6 +1179,39 @@
             </div>
           </div>
         </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Mark explicit songs</h3>
+            <p class="set-desc">New downloads are marked explicit or clean already. This marks the songs already in your library, so the apps can show which version you have.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Look them up</div>
+                <div class="set-info-d">Finds each unmarked song in the catalog, by its ISRC when it has one, otherwise by artist, title and length. Writes nothing.</div>
+                <div class="set-info-more">Takes about a second a song, so a big library takes a while. Only a match the catalog is sure of counts: when a clean and an explicit copy both fit, the song is left alone.</div>
+              </div>
+              <button class="btn btn-ghost" type="button" id="explicit-backfill-preview">Look up songs</button>
+            </div>
+            <div id="explicit-backfill-status" class="set-row stack"></div>
+            <div id="explicit-backfill-filter" class="seg-row" hidden></div>
+            <div id="explicit-backfill-results"></div>
+            <div class="set-row" id="explicit-backfill-actions">
+              <div class="set-info">
+                <div class="set-info-t">Mark them</div>
+                <div class="set-info-d">Writes the explicit and clean marks the lookup found, in place, so Navidrome keeps every song's plays and playlists. Songs that are not explicit are left as they are.</div>
+                <div class="set-info-more">Asks you to type the music path to confirm. Undo takes every mark back out, except on a file changed since.</div>
+              </div>
+              <div class="genre-preset-actions">
+                <button class="btn" type="button" id="explicit-backfill-apply" hidden>Mark songs</button>
+                <button class="btn btn-ghost" type="button" id="explicit-backfill-resume" hidden>Resume</button>
+                <button class="btn btn-ghost" type="button" id="explicit-backfill-cancel" hidden>Stop</button>
+                <button class="btn btn-ghost" type="button" id="explicit-backfill-undo" hidden>Undo the marks</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- ─── LISTENBRAINZ ───────────────────────────────────── -->

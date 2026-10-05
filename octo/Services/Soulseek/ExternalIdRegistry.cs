@@ -55,6 +55,9 @@ public class ExternalIdRegistry : IDisposable
             // And the catalog artist an artist search or page settled on: every album row
             // mints its artist again by name alone, and must not undo that choice.
             routing.ExternalArtistId ??= previous.ExternalArtistId;
+            // And what the catalog said of its words: a search row mints the song again before
+            // the catalog is asked.
+            routing.ExplicitContent ??= previous.ExplicitContent;
         }
 
         _byId[id] = routing;
@@ -122,7 +125,7 @@ public class ExternalIdRegistry : IDisposable
         return true;
     }
 
-    private static string MakeShortId(SoulseekRouting r)
+    internal static string MakeShortId(SoulseekRouting r)
     {
         // Derive 22 base62 chars from sha256 of routing fields. Same input -> same id.
         // The Kind prefix is critical: a song "Drake - Hotline Bling" must hash to a
@@ -134,6 +137,11 @@ public class ExternalIdRegistry : IDisposable
             RoutingKind.Artist => $"k:artist|a:{r.Artist}",
             _                  => $"k:song|yt:{r.YouTubeId}|a:{r.Artist}|t:{r.Title}|d:{r.Duration}",
         };
+        // A clean edit shares its artist, title and often its length with the explicit original,
+        // so it gets a mark of its own. Only a clean one: the explicit and the unknown keep the
+        // seed they always had, and with it every id already handed out.
+        if (r.Kind != RoutingKind.Artist && string.Equals(r.Version, Octo.Models.Domain.ExplicitStatus.CleanWord, StringComparison.Ordinal))
+            seed += $"|v:{Octo.Models.Domain.ExplicitStatus.CleanWord}";
         Span<byte> hash = stackalloc byte[32];
         SHA256.HashData(Encoding.UTF8.GetBytes(seed), hash);
         return ToBase62(hash, 22);
