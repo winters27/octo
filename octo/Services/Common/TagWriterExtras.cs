@@ -201,6 +201,20 @@ internal static class TagWriterExtras
         }
     }
 
+    /// <summary>Takes the advisory out of every frame <see cref="SetAdvisory"/> writes, to undo it.</summary>
+    public static void ClearAdvisory(TagLib.File file)
+    {
+        var (id3, xiph, apple) = NativeTags(file);
+        if (id3 is not null && TagLib.Id3v2.UserTextInformationFrame.Get(id3, TagFields.Advisory.Id3Description!, false) is { } frame)
+            id3.RemoveFrame(frame);
+        xiph?.RemoveField(TagFields.Advisory.Vorbis);
+        if (apple is not null)
+        {
+            apple.ClearData(Rating);
+            if (apple.GetDashBox(AppleMean, TagFields.Advisory.Mp4) is not null) apple.SetDashBox(AppleMean, TagFields.Advisory.Mp4, null);
+        }
+    }
+
     /// <summary>The advisory a file carries, from whichever frame holds it; null when none does.</summary>
     public static int? ReadAdvisory(TagLib.File file)
     {
