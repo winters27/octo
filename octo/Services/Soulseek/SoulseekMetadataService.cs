@@ -101,6 +101,7 @@ public class SoulseekMetadataService : IMusicMetadataService
                 Artist = artist,
                 Album = "",
                 Duration = effectiveDuration,
+                ExplicitContentLyrics = _idRegistry.Lookup(externalId)?.ExplicitContent,
                 IsLocal = false,
                 ExternalProvider = ProviderName,
                 ExternalId = externalId
@@ -148,6 +149,7 @@ public class SoulseekMetadataService : IMusicMetadataService
                 if (meta.Duration is int d && d > 0) song.Duration = d;
                 if (!string.IsNullOrWhiteSpace(meta.AlbumTitle)) song.Album = meta.AlbumTitle;
                 if (meta.Year is int y) song.Year = y;
+                if (meta.ExplicitContent is int words) song.ExplicitContentLyrics = words;
 
                 // Reflect onto the shared routing so getSong stays consistent.
                 var routing = _idRegistry.Lookup(song.Id);
@@ -155,6 +157,7 @@ public class SoulseekMetadataService : IMusicMetadataService
                 {
                     if (meta.Duration is int rd && rd > 0) routing.Duration = rd;
                     if (!string.IsNullOrWhiteSpace(meta.AlbumTitle)) routing.Album = meta.AlbumTitle;
+                    if (meta.ExplicitContent is int said) routing.ExplicitContent = said;
                 }
                 _idRegistry.RememberLength(song.Id, meta.Duration, LengthSource.Deezer);
             }
@@ -194,6 +197,7 @@ public class SoulseekMetadataService : IMusicMetadataService
 
             if (meta.Duration is int d && d > 0) song.Duration = d;
             if (!string.IsNullOrWhiteSpace(meta.AlbumTitle)) song.Album = meta.AlbumTitle;
+            if (meta.ExplicitContent is int words) song.ExplicitContentLyrics = words;
 
             // Reflect onto the shared routing so getSong stays consistent.
             var routing = _idRegistry.Lookup(song.Id);
@@ -201,6 +205,7 @@ public class SoulseekMetadataService : IMusicMetadataService
             {
                 if (meta.Duration is int rd && rd > 0) routing.Duration = rd;
                 if (!string.IsNullOrWhiteSpace(meta.AlbumTitle)) routing.Album = meta.AlbumTitle;
+                if (meta.ExplicitContent is int said) routing.ExplicitContent = said;
             }
             _idRegistry.RememberLength(song.Id, meta.Duration, LengthSource.Deezer);
         }
@@ -494,18 +499,25 @@ public class SoulseekMetadataService : IMusicMetadataService
 
         var hits = await _deezer.SearchAlbumsAsync(query, limit, ct);
         var albums = new List<Album>(hits.Count);
+        var cleanCopies = CleanCopies(hits);
 
         foreach (var hit in hits)
         {
             // The registry id is the external id everywhere: getAlbum, getCoverArt and
             // star all round-trip through it. The Deezer id rides along on the routing
-            // so album detail can fetch the exact tracklist without a name lookup.
+            // so album detail can fetch the exact tracklist without a name lookup. A clean copy
+            // listed beside its explicit original gets an id of its own, or the two rows would
+            // open the same album.
+            var words = cleanCopies.Contains(hit.DeezerId) ? ExplicitStatus.Clean
+                : hit.ExplicitLyrics == true ? ExplicitStatus.Explicit : (int?)null;
             var albumId = _idRegistry.Register(new SoulseekRouting
             {
                 Kind = RoutingKind.Album,
                 Artist = hit.Artist,
                 Album = hit.Title,
                 ExternalAlbumId = hit.DeezerId,
+                ExplicitContent = words,
+                Version = ExplicitStatus.VersionOf(words),
             });
             var artistId = _idRegistry.Register(new SoulseekRouting
             {
@@ -523,6 +535,7 @@ public class SoulseekMetadataService : IMusicMetadataService
                 SongCount = hit.TrackCount,
                 CoverArtUrl = hit.CoverUrl,
                 ReleaseTypes = ReleaseTypes(hit.RecordType),
+                ExplicitContentLyrics = words,
                 IsLocal = false,
                 ExternalProvider = ProviderName,
                 ExternalId = albumId,
@@ -531,6 +544,17 @@ public class SoulseekMetadataService : IMusicMetadataService
 
         return albums;
     }
+
+    /// <summary>
+    /// The catalog ids of the clean copies in an album listing: a release that is not marked
+    /// explicit beside one of the same artist and title that is. The listing alone does not tell
+    /// a clean edit from an album that never had explicit words, but its explicit twin does.
+    /// </summary>
+    internal static IReadOnlySet<string> CleanCopies(IEnumerable<DeezerMetadataService.AlbumHit> hits) =>
+        hits.GroupBy(hit => (SongIdentity.Key(hit.Artist), SongIdentity.Key(hit.Title)))
+            .Where(group => group.Any(hit => hit.ExplicitLyrics == true))
+            .SelectMany(group => group.Where(hit => hit.ExplicitLyrics == false).Select(hit => hit.DeezerId))
+            .ToHashSet(StringComparer.Ordinal);
 
     public async Task<List<Artist>> SearchArtistsAsync(string query, int limit = 20)
     {
@@ -608,6 +632,7 @@ public class SoulseekMetadataService : IMusicMetadataService
             TotalTracks = routing.TotalTracks,
             Duration = routing.Duration,
             Isrc = routing.Isrc,
+            ExplicitContentLyrics = routing.ExplicitContent,
             IsLocal = false,
             ExternalProvider = ProviderName,
             ExternalId = externalId
@@ -686,6 +711,7 @@ public class SoulseekMetadataService : IMusicMetadataService
         album.Genre = detail.Genre;
         album.CoverArtUrl = detail.CoverUrl ?? album.CoverArtUrl;
         album.ReleaseTypes = ReleaseTypes(detail.RecordType);
+        album.ExplicitContentLyrics = detail.ExplicitContent ?? routing.ExplicitContent;
         // Defence in depth: the Deezer layer no longer returns a tracklist-less album,
         // but if one ever gets through, reporting zero is worse than saying nothing.
         if (detail.Tracks.Count > 0) album.SongCount = detail.Tracks.Count;
@@ -710,6 +736,9 @@ public class SoulseekMetadataService : IMusicMetadataService
                 DiscNumber = track.DiscNumber,
                 TotalTracks = detail.Tracks.Count,
                 Isrc = track.Isrc,
+                // A clean edit's track has an id of its own, apart from the explicit album's.
+                ExplicitContent = track.ExplicitContent,
+                Version = ExplicitStatus.VersionOf(track.ExplicitContent),
             });
 
             album.Songs.Add(new Song
@@ -724,6 +753,7 @@ public class SoulseekMetadataService : IMusicMetadataService
                 Track = track.TrackPosition,
                 DiscNumber = track.DiscNumber,
                 Isrc = track.Isrc,
+                ExplicitContentLyrics = track.ExplicitContent,
                 Year = detail.Year,
                 Genre = detail.Genre,
                 CoverArtUrl = detail.CoverUrl,
@@ -1044,6 +1074,7 @@ public class SoulseekMetadataService : IMusicMetadataService
                 Artist = name,
                 Album = release.Title,
                 ExternalAlbumId = release.DeezerId,
+                ExplicitContent = release.ExplicitLyrics == true ? ExplicitStatus.Explicit : null,
             });
             albums.Add(new Album
             {
@@ -1053,6 +1084,7 @@ public class SoulseekMetadataService : IMusicMetadataService
                 SongCount = count ?? release.TrackCount,
                 CoverArtUrl = release.CoverUrl,
                 ReleaseTypes = ReleaseTypes(release.RecordType),
+                ExplicitContentLyrics = release.ExplicitLyrics == true ? ExplicitStatus.Explicit : null,
                 IsLocal = false,
                 ExternalProvider = ProviderName,
                 ExternalId = albumId,
@@ -1182,6 +1214,16 @@ public class SoulseekRouting
     /// <summary>Where <see cref="ShownDuration"/> came from, so a weaker source never
     /// replaces a stronger one.</summary>
     public LengthSource ShownDurationSource { get; set; }
+
+    /// <summary>Whether the words are explicit (1), the clean edit (3) or neither (0), as the
+    /// catalog said, so every later response for this id carries it. Display only, not part of
+    /// the id: see <see cref="Octo.Models.Domain.ExplicitStatus"/>.</summary>
+    public int? ExplicitContent { get; set; }
+
+    /// <summary>"clean" for a clean edit, which gets an id of its own so it can be listed beside
+    /// the explicit original. Null for every other song or album, so every id minted before
+    /// this existed (stars, playlists, pins) stays the same.</summary>
+    public string? Version { get; set; }
 
     public bool HasYouTube => !string.IsNullOrEmpty(YouTubeId);
     public bool HasArtistTitle => !string.IsNullOrEmpty(Artist) && !string.IsNullOrEmpty(Title);

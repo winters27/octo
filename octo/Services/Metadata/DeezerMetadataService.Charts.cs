@@ -12,7 +12,11 @@ public partial class DeezerMetadataService
     /// <summary>One track of a popularity list, in the list's own order.</summary>
     public sealed record ChartTrack(
         string DeezerId, string Title, string Artist, string? ArtistId,
-        string? Album, string? AlbumId, string? CoverUrl, int? Duration, bool? Explicit);
+        string? Album, string? AlbumId, string? CoverUrl, int? Duration, bool? Explicit)
+    {
+        /// <summary>The catalog's word for this copy's lyrics: 1 explicit, 3 the clean edit, 0 neither.</summary>
+        public int? ExplicitContent { get; init; }
+    }
 
     /// <summary>The most Deezer lists for an artist, and for its chart.</summary>
     public const int ChartLimit = 100;
@@ -94,6 +98,9 @@ public partial class DeezerMetadataService
         bool? explicitLyrics = t.TryGetProperty("explicit_lyrics", out var ex)
             && ex.ValueKind is JsonValueKind.True or JsonValueKind.False ? ex.GetBoolean() : null;
         return new ChartTrack(id, title!, artist!, artistId, album, albumId, cover,
-            Int(t, "duration") is > 0 and var seconds ? seconds : null, explicitLyrics);
+            Int(t, "duration") is > 0 and var seconds ? seconds : null, explicitLyrics)
+        {
+            ExplicitContent = Octo.Models.Domain.ExplicitStatus.FromCatalog(Int(t, "explicit_content_lyrics"), explicitLyrics),
+        };
     }
 }

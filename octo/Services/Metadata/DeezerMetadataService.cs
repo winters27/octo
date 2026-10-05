@@ -19,7 +19,12 @@ namespace Octo.Services.Metadata;
 public partial class DeezerMetadataService : IDisposable
 {
     public record TrackMeta(string? AlbumTitle, string? AlbumCoverUrl, int? Year, int? Duration,
-        string? ArtistName, string? ArtistImageUrl);
+        string? ArtistName, string? ArtistImageUrl)
+    {
+        /// <summary>Whether the song's words are explicit (1), the clean edit (3) or neither (0),
+        /// null when the catalog does not say. See <see cref="Octo.Models.Domain.ExplicitStatus"/>.</summary>
+        public int? ExplicitContent { get; init; }
+    }
     public record ArtistMeta(string? Name, string? ImageUrl);
 
     /// <summary>
@@ -54,17 +59,30 @@ public partial class DeezerMetadataService : IDisposable
     /// <summary>One album from a catalog search. Year is not on the search payload;
     /// the detail call fills it.</summary>
     public record AlbumHit(string DeezerId, string Title, string Artist,
-        string? CoverUrl, int? Year, int TrackCount, string? RecordType);
+        string? CoverUrl, int? Year, int TrackCount, string? RecordType)
+    {
+        /// <summary>The listing's explicit flag. False is not "clean": a listing does not tell a
+        /// clean edit from an album that never had explicit words.</summary>
+        public bool? ExplicitLyrics { get; init; }
+    }
 
     /// <summary>One track of an album, with the real length and position.</summary>
     public record AlbumTrack(string Title, string Artist, int? Duration,
-        int? TrackPosition, int? DiscNumber, string? Isrc);
+        int? TrackPosition, int? DiscNumber, string? Isrc)
+    {
+        /// <summary>1 explicit, 3 the clean edit, 0 neither, null not said.</summary>
+        public int? ExplicitContent { get; init; }
+    }
 
     /// <summary>An album plus its full tracklist. RecordType is the catalog's own word for it:
     /// album, ep, single or compile.</summary>
     public record AlbumDetail(string DeezerId, string Title, string Artist,
         string? CoverUrl, int? Year, string? Genre, string? Label, List<AlbumTrack> Tracks,
-        string? RecordType = null);
+        string? RecordType = null)
+    {
+        /// <summary>The album's own word: 1 explicit (or partly), 3 the clean edit, 0 neither.</summary>
+        public int? ExplicitContent { get; init; }
+    }
 
     /// <summary>What the catalog said when asked for an album's detail.</summary>
     public enum AlbumAnswer
@@ -267,7 +285,10 @@ public partial class DeezerMetadataService : IDisposable
                     year = y;
                     yearUnresolved = yearTransient;
                 }
-                meta = new TrackMeta(albTitle, cover, year, duration, artName, artImg);
+                meta = new TrackMeta(albTitle, cover, year, duration, artName, artImg)
+                {
+                    ExplicitContent = SongExplicitness(r?.Doc, artist, title, t),
+                };
             }
         }
         catch (Exception ex)
@@ -569,7 +590,7 @@ public partial class DeezerMetadataService : IDisposable
                     hits.Add(new AlbumHit(
                         id, title, artist ?? "",
                         Str(a, "cover_xl") ?? Str(a, "cover_medium"),
-                        null, trackCount, recordType));
+                        null, trackCount, recordType) { ExplicitLyrics = Bool(a, "explicit_lyrics") });
                 }
             }
         }
@@ -628,7 +649,8 @@ public partial class DeezerMetadataService : IDisposable
                     var released = Str(a, "release_date");
                     int? year = released is { Length: >= 4 } && int.TryParse(released[..4], out var y) && y > 0 ? y : null;
                     var hit = new AlbumHit(albumId, title, artistName,
-                        Str(a, "cover_xl") ?? Str(a, "cover_medium"), year, Int(a, "nb_tracks") ?? 0, recordType);
+                        Str(a, "cover_xl") ?? Str(a, "cover_medium"), year, Int(a, "nb_tracks") ?? 0, recordType)
+                    { ExplicitLyrics = Bool(a, "explicit_lyrics") };
 
                     var titleKey = Octo.Services.Common.SongIdentity.Key(title);
                     if (!byTitle.TryGetValue(titleKey, out var at))
@@ -636,7 +658,11 @@ public partial class DeezerMetadataService : IDisposable
                         byTitle[titleKey] = releases.Count;
                         releases.Add(hit);
                     }
-                    else if (ReleaseRank(recordType) < ReleaseRank(releases[at].RecordType))
+                    else if (ReleaseRank(recordType) < ReleaseRank(releases[at].RecordType)
+                             // Of a clean and an explicit copy of one release, the explicit one: the
+                             // original, and the one a search row of its songs stands for.
+                             || (ReleaseRank(recordType) == ReleaseRank(releases[at].RecordType)
+                                 && hit.ExplicitLyrics == true && releases[at].ExplicitLyrics != true))
                     {
                         releases[at] = hit;
                     }
@@ -792,6 +818,7 @@ public partial class DeezerMetadataService : IDisposable
         {
             string title = "", artist = "", genre = "", label = "", cover = "";
             string? recordType = null;
+            int? albumExplicit = null;
             int? year = null;
             // Declared out here on purpose: the document below is disposed before the
             // tracklist call, and this is what tells an empty tracklist apart from an
@@ -820,6 +847,8 @@ public partial class DeezerMetadataService : IDisposable
                     cover = Str(root, "cover_xl") ?? Str(root, "cover_medium") ?? "";
                     label = Str(root, "label") ?? "";
                     recordType = Str(root, "record_type");
+                    albumExplicit = Octo.Models.Domain.ExplicitStatus.FromCatalog(
+                        Int(root, "explicit_content_lyrics"), Bool(root, "explicit_lyrics"));
                     var rd = Str(root, "release_date");
                     if (!string.IsNullOrEmpty(rd) && rd.Length >= 4 && int.TryParse(rd[..4], out var yr))
                         year = yr;
@@ -859,7 +888,11 @@ public partial class DeezerMetadataService : IDisposable
                         var tArtist = t.TryGetProperty("artist", out var ta) ? Str(ta, "name") : null;
                         tracks.Add(new AlbumTrack(
                             tTitle, tArtist ?? artist, Int(t, "duration"),
-                            Int(t, "track_position"), Int(t, "disk_number"), Str(t, "isrc")));
+                            Int(t, "track_position"), Int(t, "disk_number"), Str(t, "isrc"))
+                        {
+                            ExplicitContent = Octo.Models.Domain.ExplicitStatus.FromCatalog(
+                                Int(t, "explicit_content_lyrics"), Bool(t, "explicit_lyrics")),
+                        });
                     }
 
                     var total = Int(tr.Doc.RootElement, "total");
@@ -897,7 +930,7 @@ public partial class DeezerMetadataService : IDisposable
                 string.IsNullOrEmpty(cover) ? null : cover, year,
                 string.IsNullOrEmpty(genre) ? null : genre,
                 string.IsNullOrEmpty(label) ? null : label,
-                tracks, recordType);
+                tracks, recordType) { ExplicitContent = albumExplicit };
         }
         catch (Exception ex)
         {
@@ -1017,6 +1050,26 @@ public partial class DeezerMetadataService : IDisposable
             _logger.LogDebug("deezer request {Url} failed: {M}", url, ex.Message);
             return new DeezerResponse { Transient = true };
         }
+    }
+
+    /// <summary>
+    /// Whether a search row's song is explicit. The row stands for the song, not one copy of it,
+    /// and the catalog lists the explicit original and its clean edit side by side under the same
+    /// title: when any hit of this very song (the same version as the one matched) is explicit,
+    /// the song is; otherwise the matched hit says.
+    /// </summary>
+    internal static int? SongExplicitness(JsonDocument? doc, string? artist, string? title, JsonElement matched)
+    {
+        var mine = Octo.Models.Domain.ExplicitStatus.FromCatalog(Int(matched, "explicit_content_lyrics"), Bool(matched, "explicit_lyrics"));
+        var version = SongIdentity.DistinctVersions(SongIdentity.ParseTitle(Str(matched, "title")));
+        foreach (var hit in AllMatches(doc, artist, title))
+        {
+            if (!SongIdentity.DistinctVersions(SongIdentity.ParseTitle(Str(hit, "title"))).SetEquals(version)) continue;
+            if (Octo.Models.Domain.ExplicitStatus.FromCatalog(Int(hit, "explicit_content_lyrics"), Bool(hit, "explicit_lyrics"))
+                == Octo.Models.Domain.ExplicitStatus.Explicit)
+                return Octo.Models.Domain.ExplicitStatus.Explicit;
+        }
+        return mine;
     }
 
     /// <summary>How many searches one track lookup may make: the song as asked, then written
@@ -1151,6 +1204,9 @@ public partial class DeezerMetadataService : IDisposable
 
     private static string? Str(JsonElement e, string name)
         => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+    private static bool? Bool(JsonElement e, string name)
+        => e.TryGetProperty(name, out var v) && v.ValueKind is JsonValueKind.True or JsonValueKind.False ? v.GetBoolean() : null;
 
     private static int? Int(JsonElement e, string name)
         => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : (int?)null;

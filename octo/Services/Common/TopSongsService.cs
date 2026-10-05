@@ -282,6 +282,7 @@ public sealed class TopSongsService : IDisposable
             Title = track.Title,
             Album = track.Album,
             Duration = track.Duration,
+            ExplicitContent = track.ExplicitContent ?? (track.Explicit == true ? 1 : null),
         });
         _registry.RememberLength(id, track.Duration, LengthSource.Deezer);
         return new Song
@@ -295,7 +296,7 @@ public sealed class TopSongsService : IDisposable
             Duration = track.Duration,
             CoverArtUrl = track.CoverUrl,
             CoverArtUrlLarge = track.CoverUrl,
-            ExplicitContentLyrics = track.Explicit switch { true => 1, false => 0, null => null },
+            ExplicitContentLyrics = track.ExplicitContent ?? track.Explicit switch { true => 1, false => 0, null => null },
             IsLocal = false,
             ExternalProvider = SoulseekMetadataService.ProviderName,
             ExternalId = id,
