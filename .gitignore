@@ -81,6 +81,7 @@ octo/downloads/
 # Local runtime state
 octo-config/
 slskd-state/
+navidrome-data/
 # The compose default for DOWNLOAD_PATH, so a default install creates it here.
 /downloads/
 

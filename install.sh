@@ -147,6 +147,10 @@ if [ -f .env ]; then
   done < .env
 fi
 existing() { echo "${EXISTING[$1]-}"; }
+# The saved value, or the default when there is none. Not `existing X || echo default`:
+# existing always succeeds, so that default never applied and a fresh install got blanks
+# (an empty music folder became the Octo folder itself).
+existing_or() { local v="${EXISTING[$1]-}"; echo "${v:-$2}"; }
 
 # ─────────────────────────────────────────────────────────────────
 # Run
@@ -208,7 +212,7 @@ if [ "$STARTER" = true ]; then
   green "  ✓ Navidrome will start beside Octo"
 else
 while true; do
-  SUBSONIC_URL=$(ask "Navidrome URL" "$(existing SUBSONIC_URL || echo "http://192.168.1.10:4533")")
+  SUBSONIC_URL=$(ask "Navidrome URL" "$(existing_or SUBSONIC_URL "http://192.168.1.10:4533")")
   # localhost trap: containers can't reach the host's loopback by default
   if [[ "$SUBSONIC_URL" =~ ^https?://(localhost|127\.0\.0\.1) ]]; then
     yellow "  ⚠ 'localhost' inside the Octo container won't reach Navidrome on the host."
@@ -227,7 +231,7 @@ fi
 echo
 
 DOWNLOAD_PATH_RAW=$(ask "Music directory on this host (where downloads will land)" \
-  "$(existing DOWNLOAD_PATH || echo "./downloads")")
+  "$(existing_or DOWNLOAD_PATH "./downloads")")
 DOWNLOAD_PATH=$(abs_path "$DOWNLOAD_PATH_RAW")
 if [ "$DOWNLOAD_PATH" != "$DOWNLOAD_PATH_RAW" ]; then
   dim "  resolved to absolute: $DOWNLOAD_PATH"
@@ -283,14 +287,14 @@ echo
 bold "─── Heart download source ──────────────────────────────────"
 echo "  Soulseek — individual lossless tracks (default)"
 echo "  Lidarr   — your existing Lidarr server; always fetches the full album"
-DOWNLOAD_SOURCE=$(ask "Heart download source" "$(existing DOWNLOAD_SOURCE || echo "Soulseek")")
+DOWNLOAD_SOURCE=$(ask "Heart download source" "$(existing_or DOWNLOAD_SOURCE "Soulseek")")
 LIDARR_URL="$(existing LIDARR_URL)"
 LIDARR_API_KEY="$(existing LIDARR_API_KEY)"
 LIDARR_ROOT_FOLDER_PATH="$(existing LIDARR_ROOT_FOLDER_PATH)"
-LIDARR_QUALITY_PROFILE_ID="$(existing LIDARR_QUALITY_PROFILE_ID || echo "0")"
-LIDARR_METADATA_PROFILE_ID="$(existing LIDARR_METADATA_PROFILE_ID || echo "0")"
-LIDARR_COMPLETION_MODE="$(existing LIDARR_COMPLETION_MODE || echo "Accepted")"
-LIDARR_IMPORT_TIMEOUT_SECONDS="$(existing LIDARR_IMPORT_TIMEOUT_SECONDS || echo "1800")"
+LIDARR_QUALITY_PROFILE_ID="$(existing_or LIDARR_QUALITY_PROFILE_ID "0")"
+LIDARR_METADATA_PROFILE_ID="$(existing_or LIDARR_METADATA_PROFILE_ID "0")"
+LIDARR_COMPLETION_MODE="$(existing_or LIDARR_COMPLETION_MODE "Accepted")"
+LIDARR_IMPORT_TIMEOUT_SECONDS="$(existing_or LIDARR_IMPORT_TIMEOUT_SECONDS "1800")"
 if [ "${DOWNLOAD_SOURCE,,}" = "lidarr" ]; then
   echo "  Lidarr must already have working indexers and a download client."
   LIDARR_URL=$(ask "Lidarr URL (reachable from the Octo container)" "$LIDARR_URL")
@@ -306,15 +310,15 @@ bold "─── Storage / layout ───────────────�
 echo "  Stream     — preview only; star a song to download (recommended)"
 echo "  Permanent  — download every song you play"
 echo "  Cache      — temporary, auto-cleanup"
-STORAGE_MODE=$(ask "Storage mode" "$(existing STORAGE_MODE || echo "Stream")")
+STORAGE_MODE=$(ask "Storage mode" "$(existing_or STORAGE_MODE "Stream")")
 echo
 echo "  Flat       — Artist - Title.flac (no subfolders, easier to browse)"
 echo "  Organized  — Artist/Title/file.flac"
-FOLDER_STRUCTURE=$(ask "Folder layout" "$(existing FOLDER_STRUCTURE || echo "Flat")")
+FOLDER_STRUCTURE=$(ask "Folder layout" "$(existing_or FOLDER_STRUCTURE "Flat")")
 echo
 
 # slskd web UI admin — auto-generate on first run, preserve on re-run
-SLSKD_USERNAME="$(existing SLSKD_USERNAME || echo "admin")"
+SLSKD_USERNAME="$(existing_or SLSKD_USERNAME "admin")"
 SLSKD_PASSWORD="$(existing SLSKD_PASSWORD)"
 if [ -z "$SLSKD_PASSWORD" ]; then
   SLSKD_PASSWORD="$(random_password)"
