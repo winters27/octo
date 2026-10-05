@@ -587,11 +587,32 @@ public static class SongIdentity
     public static string StripFeatures(string? title)
     {
         var text = (title ?? "").Trim();
-        text = Bracket.Replace(text, match => Read(Fold(match.Groups[1].Value)).Kind == Kind.Feature ? "" : match.Value);
+        text = Bracket.Replace(text, match =>
+        {
+            var inner = match.Groups[1].Value;
+            if (Read(Fold(inner)).Kind == Kind.Feature) return "";
+            // "(Radio Edit - feat. Pharrell Williams)": the credit goes, the version stays.
+            var credit = InnerFeature.Match(inner);
+            if (!credit.Success || credit.Index == 0) return match.Value;
+            var kept = inner[..credit.Index].Trim().TrimEnd('-', '–', ',', ';', '/', ' ');
+            return kept.Length == 0 ? "" : match.Value.Replace(inner, kept);
+        });
         var trailing = TrailingFeature.Match(text);
-        if (trailing.Success && trailing.Index > 0) text = text[..trailing.Index];
+        if (trailing.Success && trailing.Index > 0)
+        {
+            // "Song feat. X (Radio Edit)": the credit goes, a bracket after it stays.
+            var rest = text[trailing.Index..];
+            var bracket = rest.IndexOfAny(['(', '[']);
+            text = text[..trailing.Index] + (bracket > 0 ? " " + rest[bracket..] : "");
+        }
+        // "Song - Radio Edit - feat. X" leaves the dash that led to the credit.
+        text = text.TrimEnd().TrimEnd('-', '–', ',', ' ');
         return Whitespace.Replace(text, " ").Trim();
     }
+
+    /// <summary>A guest credit run on after a version inside one bracket, "Radio Edit - feat. X".</summary>
+    private static readonly Regex InnerFeature = new(
+        @"\s*(?:[-–,;/]\s*)?\b(?:feat\.?|ft\.?|featuring)\s+.+$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     // ---- artists ------------------------------------------------------------------------
 

@@ -53,6 +53,45 @@ public sealed class DownloadMatchingTests : IDisposable
     public void TheNameTitleDropsOnlyGuestsAndVersionTags(string title, string expected) =>
         Assert.Equal(expected, SoulseekDownloadService.NameTitle(title));
 
+    [Theory]
+    [InlineData("Get Lucky (Radio Edit - feat. Pharrell Williams and Nile Rodgers)")]
+    [InlineData("Get Lucky [Radio Edit - feat. Pharrell Williams and Nile Rodgers]")]
+    [InlineData("Get Lucky (Radio Edit, feat. Pharrell Williams & Nile Rodgers)")]
+    [InlineData("Get Lucky - Radio Edit - feat. Pharrell Williams and Nile Rodgers")]
+    [InlineData("Get Lucky (feat. Pharrell Williams and Nile Rodgers) - Radio Edit")]
+    [InlineData("Get Lucky feat. Pharrell Williams and Nile Rodgers (Radio Edit)")]
+    public void AGuestCreditInsideAVersionTagLeavesTheBareTitle(string title)
+    {
+        Assert.Equal("Get Lucky", SoulseekDownloadService.NameTitle(title));
+        Assert.True(SoulseekDownloadService.FilenamePlausiblyMatchesTitle(@"Daft Punk - Get Lucky (2013) [FLAC]\01. Get Lucky.flac", title));
+    }
+
+    [Fact]
+    public void AGuestCreditInsideAVersionTagKeepsTheVersion()
+    {
+        Assert.Equal("Get Lucky (Radio Edit)", SongIdentity.StripFeatures("Get Lucky (Radio Edit - feat. Pharrell Williams and Nile Rodgers)"));
+        Assert.Equal("Get Lucky (Radio Edit)", SongIdentity.StripFeatures("Get Lucky feat. Pharrell Williams (Radio Edit)"));
+        Assert.Equal("Get Lucky - Radio Edit", SongIdentity.StripFeatures("Get Lucky - Radio Edit - feat. Pharrell Williams"));
+    }
+
+    [Fact]
+    public void ThePlainSingleIsTakenForTheRadioEditWithAGuestCredit()
+    {
+        // The live refusal: a plainly named single of 4:07 for the 4:08 radio edit.
+        var single = new SoulseekFileHit
+        {
+            Username = "peer", Filename = @"Music\Daft Punk - Get Lucky (2013) [FLAC]\01. Get Lucky.flac",
+            Size = 30_000_000, Length = 247, Extension = "flac",
+        };
+
+        var ranked = SoulseekDownloadService.Rank([single],
+            new SoulseekDownloadService.CandidateWant("Get Lucky (Radio Edit - feat. Pharrell Williams and Nile Rodgers)", 248,
+                Album: "Get Lucky", Artist: "Daft Punk"),
+            "flac", 0, _ => true);
+
+        Assert.Same(single, Assert.Single(ranked));
+    }
+
     [Fact]
     public void ARadioEditRequestHearsAPlainlyNamedSingle() =>
         Assert.True(SoulseekDownloadService.FilenamePlausiblyMatchesTitle(
