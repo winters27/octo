@@ -160,6 +160,7 @@ public class CoverKeepTests
     public void IsMuchLarger_NeedsAQuarterMoreSide(int found, int own, bool expected) =>
         Assert.Equal(expected, CoverKeep.IsMuchLarger(found, own));
 
+
     // ---- The resolver -----------------------------------------------------------------------
 
     private sealed class FixedSource(byte[]? bytes) : ICoverArtSource
@@ -181,11 +182,12 @@ public class CoverKeepTests
             .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
             .ReturnsAsync((HttpRequestMessage request, CancellationToken _) =>
             {
-                lock (calls ?? new List<string>()) calls?.Add(request.RequestUri!.ToString());
+                if (calls is not null) lock (calls) calls.Add(request.RequestUri!.ToString());
                 return answer(request);
             });
         var factory = new Mock<IHttpClientFactory>();
-        factory.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(() => new HttpClient(handler.Object));
+        factory.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(() =>
+            new HttpClient(handler.Object) { BaseAddress = new Uri("https://coverartarchive.org/") });
         return factory.Object;
     }
 
@@ -193,7 +195,7 @@ public class CoverKeepTests
     private static HttpResponseMessage Json(string body) => new(HttpStatusCode.OK) { Content = new StringContent(body) };
     private static HttpResponseMessage NotFound() => new(HttpStatusCode.NotFound);
 
-    private static string AppleAlbum(string artist, string album) =>
+    private static string Apple(string artist, string album, string? track = null) =>
         System.Text.Json.JsonSerializer.Serialize(new
         {
             resultCount = 1,
@@ -201,20 +203,25 @@ public class CoverKeepTests
             {
                 new Dictionary<string, string?>
                 {
-                    ["wrapperType"] = "collection", ["artistName"] = artist, ["collectionName"] = album,
+                    ["wrapperType"] = track is null ? "collection" : "track", ["artistName"] = artist,
+                    ["collectionName"] = album, ["trackName"] = track,
                     ["collectionExplicitness"] = "notExplicit", ["artworkUrl100"] = "https://is1.example/Music/m/100x100bb.jpg",
                 },
             },
         });
 
-    /// <summary>The catalog answers with <paramref name="catalog"/>, Apple with <paramref name="master"/>
-    /// (or not at all when null).</summary>
-    private static IHttpClientFactory Sources(byte[]? catalog, byte[]? master, List<string> calls) =>
+    /// <summary>The catalog answers with <paramref name="catalog"/>, the archive with
+    /// <paramref name="archive"/>, Apple with <paramref name="master"/> for the album asked
+    /// (or, when <paramref name="appleAlbum"/> is another album, lists the song only there).</summary>
+    private static IHttpClientFactory Sources(byte[]? catalog, byte[]? master, List<string> calls,
+        byte[]? archive = null, string appleAlbum = "Dandelion") =>
         Http(request => request.RequestUri!.ToString() switch
         {
             var url when url.Contains("deezer.example") => catalog is null ? NotFound() : Picture(catalog),
+            var url when url.Contains("coverartarchive") => archive is null ? NotFound() : Picture(archive),
             var url when url.Contains("itunes.apple.com/search") =>
-                master is null ? Json("{\"resultCount\":0,\"results\":[]}") : Json(AppleAlbum("Ella Langley", "Dandelion")),
+                master is null ? Json("{\"resultCount\":0,\"results\":[]}")
+                    : Json(Apple("Ella Langley", appleAlbum, url.Contains("entity=song") ? "Be Her" : null)),
             var url when url.Contains("is1.example") && master is not null => Picture(master),
             _ => NotFound(),
         }, calls);
@@ -231,33 +238,75 @@ public class CoverKeepTests
         CoverArtUrlLarge = catalog ? "https://deezer.example/cover.jpg" : null,
     };
 
-    /// <summary>Brandon's case: the file came with a good copy of the art, and Apple's master
-    /// used to replace it anyway.</summary>
+    /// <summary>The live case (canary, "Be Her"): Apple lists the song only on the album
+    /// "Dandelion", the archive has the single at 1200 px and stopped the chain, and the file's
+    /// own 1400 px cover of the same art was replaced. Now it stays, and the timeline names
+    /// everything that was looked at.</summary>
+    private static Song BeHer() => new()
+    {
+        Artist = "Ella Langley", Title = "Be Her", Album = "Be Her",
+        MusicBrainzReleaseId = "rel-be-her", MusicBrainzAlbumTitle = "Be Her",
+        CoverArtUrlLarge = "https://deezer.example/cover.jpg",
+    };
+
     [Fact]
-    public async Task Choose_TheSameArtAt1400_IsKeptAndAppleIsNeverAsked()
+    public async Task Choose_BeHer_ItsOwn1400PxCoverStays_AndTheTimelineSaysWhatElseWasSeen()
     {
         var calls = new List<string>();
-        var choice = await Resolver(Sources(Catalog, Art(1, 3000), calls))
-            .ChooseAsync(Song(), new CoversOnHand(Art(1, 1400)), CancellationToken.None);
+        var choice = await Resolver(Sources(Catalog, Art(9, 3000), calls, archive: Art(1, 1200)))
+            .ChooseAsync(BeHer(), new CoversOnHand(Art(1, 1400)), CancellationToken.None);
 
         Assert.True(choice!.KeepsExisting);
         Assert.Equal("Kept the cover it came with", choice.Headline);
+        Assert.Matches(@"^1400 x 1400 px, \d+ KB, the same art\. Also looked at: iTunes had none, "
+            + @"Cover Art Archive 1200 px, the catalog 1000 px\.$", choice.Note);
+        Assert.Contains(calls, url => url.Contains("coverartarchive"));
+    }
+
+    /// <summary>A sharper picture of another album never stands in for the release's art.</summary>
+    [Fact]
+    public async Task Choose_BeHer_ASmallOwnCoverGoesToTheLargestCopyOfTheSameArt_NeverToAnotherPicture()
+    {
+        var choice = await Resolver(Sources(Catalog, Art(9, 3000), [], archive: Art(1, 1200), appleAlbum: "Be Her"))
+            .ChooseAsync(BeHer(), new CoversOnHand(Art(1, 300)), CancellationToken.None);
+
+        Assert.Equal("Cover Art Archive", choice!.Source);
+        Assert.Equal("Replaced its 300 px cover with a 1200 x 1200 px one from Cover Art Archive", choice.Headline);
+        Assert.Contains("iTunes 3000 px of a different picture", choice.Note);
+    }
+
+    [Fact]
+    public async Task Choose_TheSameArtAt1400_IsKeptOverSmallerCopies()
+    {
+        var choice = await Resolver(Sources(Catalog, Art(1, 1200), []))
+            .ChooseAsync(Song(), new CoversOnHand(Art(1, 1400)), CancellationToken.None);
+
+        Assert.True(choice!.KeepsExisting);
         Assert.StartsWith("1400 x 1400 px, ", choice.Note);
-        Assert.EndsWith("KB, the same art", choice.Note);
-        Assert.DoesNotContain(calls, url => url.Contains("itunes"));
+        Assert.Contains("the same art. Also looked at: iTunes 1200 px, the catalog 1000 px.", choice.Note);
+    }
+
+    /// <summary>A much larger copy of the same art is still worth having: Apple's master over a
+    /// 1400 px scan.</summary>
+    [Fact]
+    public async Task Choose_AMuchLargerCopyOfTheSameArt_ReplacesItsOwn()
+    {
+        var choice = await Resolver(Sources(Catalog, Art(1, 3000), []))
+            .ChooseAsync(Song(), new CoversOnHand(Art(1, 1400)), CancellationToken.None);
+
+        Assert.Equal("iTunes", choice!.Source);
+        Assert.Equal("Replaced its 1400 px cover with a 3000 x 3000 px one from iTunes", choice.Headline);
+        Assert.StartsWith("iTunes has the same art much larger.", choice.Note);
     }
 
     [Fact]
     public async Task Choose_ASmallCoverIsReplacedByAppleAndSaysSo()
     {
-        var calls = new List<string>();
-        var choice = await Resolver(Sources(Catalog, Art(1, 3000), calls))
+        var choice = await Resolver(Sources(Catalog, Art(1, 3000), []))
             .ChooseAsync(Song(), new CoversOnHand(Art(1, 300)), CancellationToken.None);
 
         Assert.False(choice!.KeepsExisting);
-        Assert.Equal("iTunes", choice.Source);
         Assert.Equal("Replaced its 300 px cover with a 3000 x 3000 px one from iTunes", choice.Headline);
-        Assert.Equal("It was much smaller.", choice.Note);
     }
 
     [Fact]
@@ -267,7 +316,7 @@ public class CoverKeepTests
             .ChooseAsync(Song(), new CoversOnHand(Art(1, 900)), CancellationToken.None);
 
         Assert.True(choice!.KeepsExisting);
-        Assert.Contains("nothing found was much larger (the catalog, 1000 x 1000 px)", choice.Note);
+        Assert.Contains("the same art; nothing found was much larger. Also looked at: iTunes had none, the catalog 1000 px.", choice.Note);
     }
 
     [Fact]
@@ -279,7 +328,7 @@ public class CoverKeepTests
         Assert.False(choice!.KeepsExisting);
         Assert.Equal("the catalog", choice.Source);
         Assert.Equal("Replaced its 1400 px cover with a 1000 x 1000 px one from the catalog", choice.Headline);
-        Assert.Equal("It was a different picture from the album's cover.", choice.Note);
+        Assert.StartsWith("It was a different picture from the album's cover.", choice.Note);
     }
 
     [Fact]
@@ -289,21 +338,25 @@ public class CoverKeepTests
             .ChooseAsync(Song(), new CoversOnHand(BlownUp(1, 200, 1400)), CancellationToken.None);
 
         Assert.Equal("iTunes", choice!.Source);
-        Assert.Equal("It was a smaller picture blown up.", choice.Note);
+        Assert.StartsWith("It was a smaller picture blown up.", choice.Note);
     }
 
-    /// <summary>No catalog cover to compare with: the chain's own find says what the album looks like.</summary>
+    /// <summary>With no strict source, a cover search by name is weak evidence: it may add a
+    /// larger copy of the same art, never swap the picture.</summary>
     [Fact]
-    public async Task Choose_WithoutACatalogCover_TheChainsFindDecides()
+    public async Task Choose_WithoutAStrictSource_ACoverSearchMayNotSwapThePicture()
     {
-        var same = await Resolver(Sources(null, master: null, []), new FixedSource(Art(1, 1200)))
-            .ChooseAsync(Song(catalog: false), new CoversOnHand(Art(1, 1400)), CancellationToken.None);
         var other = await Resolver(Sources(null, master: null, []), new FixedSource(Art(3, 1200)))
-            .ChooseAsync(Song(catalog: false), new CoversOnHand(Art(1, 1400)), CancellationToken.None);
+            .ChooseAsync(Song(catalog: false), new CoversOnHand(Art(1, 900)), CancellationToken.None);
+        var larger = await Resolver(Sources(null, master: null, []), new FixedSource(Art(1, 1200)))
+            .ChooseAsync(Song(catalog: false), new CoversOnHand(Art(1, 1000)), CancellationToken.None);
 
-        Assert.True(same!.KeepsExisting);
-        Assert.False(other!.KeepsExisting);
-        Assert.Equal("a cover search", other.Source);
+        Assert.True(other!.KeepsExisting);
+        Assert.Contains("a cover search 1200 px of a different picture", other.Note);
+        Assert.True(larger!.KeepsExisting);
+        var muchLarger = await Resolver(Sources(null, master: null, []), new FixedSource(Art(1, 1200)))
+            .ChooseAsync(Song(catalog: false), new CoversOnHand(Art(1, 600)), CancellationToken.None);
+        Assert.Equal("a cover search", muchLarger!.Source);
     }
 
     [Fact]
@@ -358,14 +411,13 @@ public class CoverKeepTests
     }
 
     [Fact]
-    public async Task Choose_NoCoverOfItsOwn_TakesTheChainsAsBefore()
+    public async Task Choose_NoCoverOfItsOwn_SaysSo()
     {
-        var calls = new List<string>();
-        var choice = await Resolver(Sources(Catalog, Art(1, 3000), calls))
+        var choice = await Resolver(Sources(Catalog, Art(1, 3000), []))
             .ChooseAsync(Song(), new CoversOnHand(null), CancellationToken.None);
 
         Assert.Equal("iTunes", choice!.Source);
-        Assert.Null(choice.Headline);
-        Assert.DoesNotContain(calls, url => url.Contains("deezer.example"));
+        Assert.Equal("Cover from iTunes, 3000 x 3000 px", choice.Headline);
+        Assert.Equal("It came with no cover of its own. Also looked at: iTunes 3000 px, the catalog 1000 px.", choice.Note);
     }
 }

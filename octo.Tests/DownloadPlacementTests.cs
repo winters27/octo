@@ -651,7 +651,7 @@ public sealed class DownloadPlacementTests : IDisposable
         Assert.Equal(own, CoverOf(path));
         var line = tracker.Detail("test:x", "alice")!.Events!.Single(e => e.Kind == AcquisitionEventKinds.Cover);
         Assert.Equal("Kept the cover it came with", line.Text);
-        Assert.Matches(@"^1400 x 1400 px, \d+ KB, the same art$", line.Detail);
+        Assert.Matches(@"^1400 x 1400 px, \d+ KB, the same art\. Also looked at: the catalog 1000 px\.$", line.Detail);
     }
 
     [Fact]
@@ -667,7 +667,7 @@ public sealed class DownloadPlacementTests : IDisposable
         Assert.Equal(catalog, CoverOf(path));
         var line = tracker.Detail("test:x", "alice")!.Events!.Single(e => e.Kind == AcquisitionEventKinds.Cover);
         Assert.Equal("Replaced its 1400 px cover with a 1000 x 1000 px one from the catalog", line.Text);
-        Assert.Equal("It was a different picture from the album's cover. Now embedded in the song.", line.Detail);
+        Assert.Equal("It was a different picture from the album's cover. Also looked at: the catalog 1000 px. Now embedded in the song.", line.Detail);
     }
 
     /// <summary>Better quality: the new copy gets the old copy's cover, the picture the album
