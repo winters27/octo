@@ -16,14 +16,15 @@ namespace Octo.Tests;
 /// </summary>
 public class SoulseekShareSwitchTests
 {
-    // The start of the commented-out slskd.yml slskd writes on first run.
-    private const string StockFile = """
+    // The start of the commented-out slskd.yml slskd writes on first run, with
+    // the Linux line ends slskd writes whatever this file was checked out with.
+    private static readonly string StockFile = """
         # debug: false
         # remote_configuration: false
         # shares:
         #   directories:
         #     - 'D:\Music'
-        """;
+        """.ReplaceLineEndings("\n");
 
     private sealed class FakeSlskd
     {
