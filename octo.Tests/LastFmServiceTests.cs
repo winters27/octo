@@ -173,6 +173,29 @@ public class LastFmServiceTests
         Assert.Contains(("artist.getsimilar", "Radiohead"), asked);
     }
 
+    [Fact]
+    public async Task SimilarTracks_ASmallCachedAnswerDoesNotShortChangeABiggerAsk()
+    {
+        // A station refresh asks for a few; a player's radio then asks for many.
+        var handler = new FixtureHandler(request =>
+        {
+            var query = System.Web.HttpUtility.ParseQueryString(request.RequestUri!.Query);
+            var limit = int.Parse(query["limit"] ?? "50");
+            var tracks = string.Join(",", Enumerable.Range(0, limit).Select(index =>
+                $"{{\"name\":\"song-{index}\",\"match\":1,\"artist\":{{\"name\":\"Artist {index}\"}}}}"));
+            return query["method"] == "track.getsimilar" ? $"{{\"similartracks\":{{\"track\":[{tracks}]}}}}" : "{}";
+        });
+        var service = Service(handler);
+
+        Assert.Equal(5, (await service.GetSimilarTracksAsync("Radiohead", "Creep", 5)).Count);
+        Assert.Equal(20, (await service.GetSimilarTracksAsync("Radiohead", "Creep", 20)).Count);
+        Assert.Equal(2, handler.Count);
+
+        // A smaller ask after that is served from the bigger answer.
+        Assert.Equal(10, (await service.GetSimilarTracksAsync("Radiohead", "Creep", 10)).Count);
+        Assert.Equal(2, handler.Count);
+    }
+
     private static LastFmService Service(HttpMessageHandler handler) => new(new HttpClient(handler),
         TestOptions.Monitor(new LastFmSettings { ApiKey = "key", RadioCacheDurationHours = 2 }),
         Options.Create(new MetadataSettings { Language = "en" }),

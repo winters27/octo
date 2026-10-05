@@ -15,6 +15,7 @@ using Octo.Services.Common;
 using Octo.Services.Local;
 using Octo.Services.Subsonic;
 using Octo.Services.LastFm;
+using Octo.Services.Radio;
 using Octo.Services.CoverArt;
 using Octo.Services.Soulseek;
 
@@ -41,6 +42,8 @@ public partial class SubsonicController : ControllerBase
     private readonly PlaylistSyncService? _playlistSyncService;
     private readonly LastFmService? _lastFmService;
     private readonly LastFmRadioTrackResolver _radioTrackResolver;
+    private readonly Octo.Services.Radio.SongRadioService _songRadio;
+    private readonly RadioOutcomeStore? _radioOutcomes;
     private readonly Octo.Services.ListenBrainz.ListenBrainzService? _listenBrainz;
     private readonly LastFmScrobbleService? _lastFmScrobbles;
     private readonly IOptionsMonitor<LastFmSettings> _lastFmSettingsOptions;
@@ -106,6 +109,8 @@ public partial class SubsonicController : ControllerBase
         RadioQueueStore radioQueueStore,
         NavidromeIdentityService navIdentity,
         LastFmRadioTrackResolver radioTrackResolver,
+        Octo.Services.Radio.SongRadioService songRadio,
+        RadioOutcomeStore radioOutcomes,
         ILogger<SubsonicController> logger,
         IOptionsMonitor<LastFmSettings> lastFmSettings,
         LastFmRadioStreamSessionStore radioStreamSessions,
@@ -176,6 +181,8 @@ public partial class SubsonicController : ControllerBase
         _radioQueueStore = radioQueueStore;
         _navIdentity = navIdentity;
         _radioTrackResolver = radioTrackResolver;
+        _songRadio = songRadio;
+        _radioOutcomes = radioOutcomes;
         _playlistSyncService = playlistSyncService;
         _lastFmService = lastFmService;
         _lastFmSettingsOptions = lastFmSettings;
@@ -468,6 +475,8 @@ public partial class SubsonicController : ControllerBase
             return _responseBuilder.CreateError(format, 40, "Wrong username or password");
 
         var songs = await MaterializeStationAsync(station, parameters);
+        var suggested = songs.Where(song => song.SuggestedBy is not null).GroupBy(song => song.Id)
+            .ToDictionary(group => group.Key, group => group.First().SuggestedBy!);
         if (_generatedPlaylists is not null)
             songs = (await _generatedPlaylists.BlendIntoDiscoveryAsync(username, station, songs, parameters,
                 HttpContext.RequestAborted)).ToList();
@@ -482,6 +491,14 @@ public partial class SubsonicController : ControllerBase
         if (_syncCatalog is not null)
             songs = songs.Select(song =>
                 !song.IsLocal && _syncCatalog.TryGetSong(username, song.Id, out var synced) ? synced : song).ToList();
+        // The discovery blend and the catalog swap hand back other objects; the source rides on by
+        // id, on a copy, since a catalog row is shared with other responses.
+        songs = songs.Select(song => suggested.TryGetValue(song.Id, out var by) && song.SuggestedBy != by
+            ? WithSuggestion(song, by) : song).ToList();
+        // A station refetched by a syncing client is not the listener choosing it, so it never
+        // renews the window in which a start counts for radio.
+        _radioOutcomes?.Served(username, songs.Select(song => (song.Id, RadioProvider.FromDisplayName(song.SuggestedBy))),
+            refresh: false);
         _radioQueueStore.Register(songs.Select(song => song.Id));
         _ = _metadataService.PrewarmYouTubeIdsAsync(songs, topN: 8);
         QueueRefreshIfStale(username);
@@ -893,6 +910,13 @@ public partial class SubsonicController : ControllerBase
             });
     }
 
+    private static Song WithSuggestion(Song song, string by)
+    {
+        var copy = song.Copy();
+        copy.SuggestedBy = by;
+        return copy;
+    }
+
     private async Task<List<Song>> MaterializeStationAsync(LastFmRadioStation station,
         IReadOnlyDictionary<string, string> parameters)
     {
@@ -902,14 +926,19 @@ public partial class SubsonicController : ControllerBase
             await gate.WaitAsync(HttpContext.RequestAborted);
             try
             {
-                return await _radioTrackResolver.ResolveAsync(track.Artist, track.Title, track.Duration,
-                    parameters, HttpContext.RequestAborted) ?? new Song
+                var song = await _radioTrackResolver.ResolveAsync(track.Artist, track.Title, track.Duration,
+                    parameters, HttpContext.RequestAborted, track.YouTubeId) ?? new Song
                 {
                     Id = track.ResolvedId ?? "", Artist = track.Artist, Title = track.Title,
                     Album = track.Album ?? track.Title, Genre = track.Genre, Duration = track.Duration,
                     Year = track.Year, IsLocal = false, ExternalProvider = track.ExternalProvider,
                     ExternalId = track.ResolvedId
                 };
+                // A song that sounded like the seed was a library song; if it is gone, it is not
+                // worth streaming a stranger's copy of it.
+                if (track.Source == RadioProvider.SoundsAlike && !song.IsLocal) return new Song { Id = "" };
+                song.SuggestedBy = RadioProvider.DisplayName(track.Source);
+                return song;
             }
             finally { gate.Release(); }
         });
@@ -2624,7 +2653,8 @@ public partial class SubsonicController : ControllerBase
             relay.Success ? relay.Body : null, relay.ContentType,
             lyricsChoices: _lyricsChoices is not null && _metadataSettings?.CurrentValue.FetchLyrics == true,
             libraryActions: _libraryActions is not null && _libraryActionSettings.CurrentValue.Enabled,
-            topSongs: _subsonicSettings.EnableSearchDiscovery);
+            topSongs: _subsonicSettings.EnableSearchDiscovery,
+            radioSources: _songRadio.Enabled);
     }
 
     /// <summary>
@@ -2877,7 +2907,20 @@ public partial class SubsonicController : ControllerBase
 
         // An external id is not a Navidrome song, and relaying one errors "data not found".
         if (!string.IsNullOrEmpty(itemId) && _localLibraryService.ParseSongId(itemId).isExternal)
+        {
+            // Nothing to relay, so a ping is the auth check before the listener's radio changes.
+            if (_radioStateStore is not null && int.TryParse(ratingText, out var externalStars)
+                && parameters.GetValueOrDefault("u") is { Length: > 0 } externalRater)
+            {
+                var auth = parameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+                auth.Remove("id");
+                auth.Remove("rating");
+                var check = await _proxyService.RelaySafeAsync("rest/ping", auth);
+                if (check.Success && check.Body is not null && IsSuccessfulSubsonicResponse(check.Body, format))
+                    await RecordRadioBanAsync(externalRater, itemId, externalStars, parameters);
+            }
             return _responseBuilder.CreateResponse(format, "setRating", new { });
+        }
 
         byte[] body;
         string? contentType;
@@ -2890,6 +2933,10 @@ public partial class SubsonicController : ControllerBase
         {
             return _responseBuilder.CreateError(format, 0, $"Error connecting to Subsonic server: {ex.Message}");
         }
+
+        if (IsSuccessfulSubsonicResponse(body, format) && int.TryParse(ratingText, out var stars)
+            && parameters.GetValueOrDefault("u") is { Length: > 0 } rater && !string.IsNullOrEmpty(itemId))
+            await RecordRadioBanAsync(rater, itemId, stars, parameters);
 
         if (_ratingActions is not null
             && IsSuccessfulSubsonicResponse(body, format)
@@ -2920,6 +2967,27 @@ public partial class SubsonicController : ControllerBase
         || (_noticeQueue?.IsQueued(username, itemId) ?? false);
 
     /// <summary>
+    /// One star keeps a song off this listener's radio; any other rating lifts that. Never
+    /// fails the rating itself: the radio is a side effect of it.
+    /// </summary>
+    private async Task RecordRadioBanAsync(string username, string itemId, int stars,
+        IReadOnlyDictionary<string, string> parameters)
+    {
+        if (_radioStateStore is null) return;
+        try
+        {
+            var rated = await _radioTrackResolver.ResolveScrobbleAsync(itemId, parameters);
+            if (rated is not null)
+                _radioStateStore.SetRadioBan(username, itemId, rated.Artist, rated.Title, stars == 1);
+            if (stars == 1) _radioOutcomes?.Disliked(username, itemId, DateTime.UtcNow);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "radio ban for rating on {Id} failed", itemId);
+        }
+    }
+
+    /// <summary>
     /// Gets similar songs for radio feature using Last.fm recommendations.
     /// </summary>
     [HttpGet, HttpPost]
@@ -2947,7 +3015,7 @@ public partial class SubsonicController : ControllerBase
         }
 
         // Check if Last.fm radio is configured and enabled
-        if (_lastFmService == null || !_lastFmService.IsRadioEnabled)
+        if (!_songRadio.Enabled)
         {
             _logger.LogDebug("Last.fm radio not configured, relaying to upstream server");
             try
@@ -2964,6 +3032,8 @@ public partial class SubsonicController : ControllerBase
         // Get the seed song metadata
         string artistName = "";
         string trackTitle = "";
+        Song? librarySeed = null;
+        string? seedVideo = null;
 
         var (isExternal, provider, externalId) = _localLibraryService.ParseSongId(id);
 
@@ -2976,85 +3046,63 @@ public partial class SubsonicController : ControllerBase
                 artistName = song.Artist ?? "";
                 trackTitle = song.Title;
             }
+            // An outside song already playing from YouTube names its video: its radio needs no search.
+            seedVideo = _idRegistry.Lookup(id)?.YouTubeId;
         }
         else
         {
-            // Local song - get metadata from Navidrome
-            try
+            // A library song, or an album or artist, which Subsonic's getSimilarSongs also takes.
+            // Read with the caller's own credentials, so it is their library being asked.
+            var seed = await _radioTrackResolver.ReadSeedAsync(id, parameters);
+            if (seed is null)
             {
-                // Build parameters with auth from original request
-                var getSongParams = new Dictionary<string, string>(parameters)
-                {
-                    ["id"] = id,
-                    ["f"] = "json"
-                };
-                var result = await _proxyService.RelayAsync("rest/getSong", getSongParams);
-
-                var json = System.Text.Encoding.UTF8.GetString(result.Body);
-                var doc = JsonDocument.Parse(json);
-
-                if (doc.RootElement.TryGetProperty("subsonic-response", out var response) &&
-                    response.TryGetProperty("song", out var songElement))
-                {
-                    artistName = songElement.TryGetProperty("artist", out var artist) ? artist.GetString() ?? "" : "";
-                    trackTitle = songElement.TryGetProperty("title", out var title) ? title.GetString() ?? "" : "";
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to get song metadata for {Id}", id);
+                _logger.LogWarning("Could not read radio seed {Id} from Navidrome", id);
                 return _responseBuilder.CreateResponse(format, responseKey, new { });
             }
+            librarySeed = seed.Song;
+            artistName = seed.Artist;
+            trackTitle = seed.Song?.Title ?? "";
         }
 
-        if (string.IsNullOrEmpty(artistName) || string.IsNullOrEmpty(trackTitle))
+        if (string.IsNullOrEmpty(artistName) || (string.IsNullOrEmpty(trackTitle) && isExternal))
         {
             _logger.LogWarning("Could not get artist/title for song {Id}", id);
             return _responseBuilder.CreateResponse(format, responseKey, new { });
         }
 
-        // Strip collab/feature decoration so Last.fm finds the canonical artist.
-        var lookupArtist = LastFmRadioSeedNormalizer.Artist(artistName) ?? artistName;
-        var lookupTitle  = LastFmRadioSeedNormalizer.Title(trackTitle) ?? trackTitle;
-        _logger.LogInformation("Getting similar songs for {Artist} - {Title} (lookup: {LookA} - {LookT})",
-            artistName, trackTitle, lookupArtist, lookupTitle);
-
-        var similarTracks = await _lastFmService.GetSimilarTracksAsync(lookupArtist, lookupTitle, count);
-
-        if (similarTracks.Count == 0)
+        // Who the radio is for, once Navidrome has accepted their sign-in: a library seed was just
+        // read with it, an outside one is checked with a ping, as setRating does. Unchecked, the
+        // radio applies no one-star bans, uses the base weights and teaches nothing, so nobody can
+        // read or steer another listener's radio by naming them. Named as scrobbles name them.
+        var verified = !isExternal;
+        if (isExternal)
         {
-            _logger.LogInformation("No similar tracks found from Last.fm");
+            var auth = parameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+            auth.Remove("id");
+            var check = await _proxyService.RelaySafeAsync("rest/ping", auth);
+            verified = check.Success && check.Body is not null && IsSuccessfulSubsonicResponse(check.Body, format);
+        }
+        var listener = verified
+            ? await _requestIdentity.UsernameAsync(parameters, _proxyService, HttpContext.RequestAborted)
+            : null;
+        var bans = listener is not null && _radioStateStore is not null
+            ? _radioStateStore.RadioBanKeys(listener)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var resolvedSongs = await _songRadio.BuildAsync(
+            new Octo.Services.Radio.RadioSeed(artistName, trackTitle, librarySeed?.Duration, librarySeed, seedVideo),
+            count, listener, parameters, bans, HttpContext.RequestAborted);
+        if (resolvedSongs.Count == 0)
+        {
+            // Nothing from Octo's sources (no Last.fm key, say, and an artist none of the others
+            // knows): Navidrome's own agents may still answer, as they did before Octo's radio.
+            if (!isExternal)
+            {
+                var upstream = await _proxyService.RelaySafeAsync(Request.Path.Value ?? "rest/getSimilarSongs", parameters);
+                if (upstream.Success && upstream.Body is { Length: > 0 })
+                    return File(upstream.Body, upstream.ContentType ?? $"application/{format}");
+            }
             return _responseBuilder.CreateResponse(format, responseKey, new { });
         }
-
-        _logger.LogInformation("Found {Count} similar tracks from Last.fm; building radio queue",
-            similarTracks.Count);
-
-        // For each Last.fm recommendation, prefer the local copy if we own it.
-        // Tracks the user already has play at full FLAC quality from Navidrome
-        // and avoid the yt-dlp roundtrip entirely. Lookups go in parallel
-        // against Navidrome — at 50ms each that's ~150ms total under a
-        // semaphore=10 cap, which fits comfortably inside Arpeggi's HTTP
-        // budget.
-        var sem = new SemaphoreSlim(10);
-        var resolveTasks = similarTracks.Take(count).Select(async track =>
-        {
-            await sem.WaitAsync();
-            try
-            {
-                return await _radioTrackResolver.ResolveAsync(
-                    track.Artist, track.Title, track.Duration, parameters);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "radio resolve failed for {Artist} - {Title}", track.Artist, track.Title);
-                return null;
-            }
-            finally { sem.Release(); }
-        }).ToList();
-        var resolvedSongs = LastFmRadioSpacing.Spread(
-            (await Task.WhenAll(resolveTasks)).Where(s => s != null).Cast<Song>().ToList(),
-            s => s.Artist, artistName);
 
         var localCount = resolvedSongs.Count(s => s.IsLocal);
         var externalCount = resolvedSongs.Count - localCount;
@@ -3201,6 +3249,9 @@ public partial class SubsonicController : ControllerBase
         var username = await _requestIdentity.UsernameAsync(authenticatedParameters, _proxyService,
             HttpContext.RequestAborted);
         if (string.IsNullOrEmpty(username)) return;
+        // What radio learns: a song it suggested, started and then played through, or started and
+        // never finished. Before the early return below, so it works with stations off.
+        _radioOutcomes?.Observe(username, ids, submissions, DateTime.UtcNow);
         var learning = _radioStateStore is not null && _lastFmSettings.EnableRadio
             && _lastFmSettings.EnablePersonalizedStations;
         var submitting = _listenBrainz is not null && _listenBrainz.IsEnabledFor(username);
@@ -3839,8 +3890,16 @@ public partial class SubsonicController : ControllerBase
     }
 
     [Route("{**endpoint}")]
-    public async Task<IActionResult> GenericEndpoint(string endpoint)
+    public async Task<IActionResult> GenericEndpoint(string? endpoint)
     {
+        // The bare address binds no endpoint at all. Required by [ApiController], that null was
+        // a 400 before any of this ran, and Amperfy checks the server address before signing in
+        // (#80). Navidrome answers it with its web app, so Octo does too; relative, so a reverse
+        // proxy's path prefix is kept.
+        endpoint ??= "";
+        if (endpoint.Length == 0 && (HttpMethods.IsGet(Request.Method) || HttpMethods.IsHead(Request.Method)))
+            return Redirect("app/");
+
         if (IsOctoOwnedPath(endpoint))
         {
             return NotFound();

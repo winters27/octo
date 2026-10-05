@@ -314,6 +314,7 @@ internal sealed class SearchPagingWebFactory : WebApplicationFactory<Program>
                 ["Subsonic:AutoDetectDownloadPath"] = "false",
                 ["Subsonic:EnableSearchDiscovery"] = _discovery ? "true" : "false",
                 ["Library:DownloadPath"] = _directory,
+                ["Octo:StateDirectory"] = _directory,
                 ["LastFm:ApiKey"] = "test-key",
             }));
         builder.ConfigureServices(services =>

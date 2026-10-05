@@ -413,6 +413,7 @@ internal sealed class SyncWebFactory : WebApplicationFactory<Program>
                 ["Subsonic:Url"] = "http://navidrome.test",
                 ["Subsonic:AutoDetectDownloadPath"] = "false",
                 ["Library:DownloadPath"] = _directory,
+                ["Octo:StateDirectory"] = _directory,
                 ["LastFm:EnableRadio"] = "true",
                 ["LastFm:EnablePersonalizedStations"] = "true",
                 ["LastFm:ExposeRadioAsPlaylists"] = "true",

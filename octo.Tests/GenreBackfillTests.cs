@@ -295,6 +295,7 @@ internal sealed class AdminWebFactory : WebApplicationFactory<Program>
         builder.ConfigureHostConfiguration(config => config.AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["Library:DownloadPath"] = _directory,
+            ["Octo:StateDirectory"] = _directory,
             // Every upstream points at a closed local port. With no Subsonic URL, Octo's first-run
             // automation scans the LAN and adopts whatever Navidrome answers, writing it into
             // /app/config/settings.json; a test run must never find a real server.

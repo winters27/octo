@@ -1,3 +1,6 @@
-# Test-only dependencies. Deliberately not installed into the runtime image --
-# the shim ships flask, gunicorn and requests and nothing else.
+# Test dependencies: pytest, plus what app.py imports, so CI runs every shim test instead of
+# skipping the ones that import app.
 pytest
+flask
+requests
+ytmusicapi>=1.12,<2

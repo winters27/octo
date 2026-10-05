@@ -83,6 +83,7 @@ public sealed class AcquisitionEndpointTests
                     ["Soulseek:BaseUrl"] = "http://127.0.0.1:1",
                     ["YouTube:ShimUrl"] = "http://127.0.0.1:1",
                     ["Library:DownloadPath"] = _directory,
+                    ["Octo:StateDirectory"] = _directory,
                 }).AddInMemoryCollection(_settings));
             builder.ConfigureServices(services =>
             {

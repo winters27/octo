@@ -1,0 +1,602 @@
+using System.Collections.Concurrent;
+using System.Net;
+using System.Text;
+using System.Text.Json;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Moq;
+using Octo.Controllers;
+using Octo.Models.Domain;
+using Octo.Models.Settings;
+using Octo.Services;
+using Octo.Services.LastFm;
+using Octo.Services.Soulseek;
+
+namespace Octo.Tests;
+
+/// <summary>
+/// A radio from a song Last.fm cannot place (#78), the songs of a library built from YouTube
+/// playlists: the artist is the uploader and the album is the playlist. The seed's own album and
+/// genre lead, and similar artists to an uploader's name stay out. Also the bare server address
+/// a client checks before signing in (#80).
+/// </summary>
+public sealed class SimilarSongsSeedTests
+{
+    [Fact]
+    public async Task UnknownUpload_LeadsWithItsPlaylistAndGenre_AndLeavesOutTheUploadersSimilarArtists()
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient();
+
+        var songs = await RadioIds(client, "spooky");
+
+        Assert.NotEmpty(songs);
+        Assert.DoesNotContain("spooky", songs);
+        // The playlist's own songs and the library's phonk, then Last.fm's phonk.
+        Assert.Contains("pl-2", songs);
+        Assert.Contains("pl-3", songs);
+        Assert.Contains("genre-1", songs);
+        Assert.Contains(songs, id => id.StartsWith("ext-Kordhell", StringComparison.Ordinal));
+        Assert.True(songs.IndexOf(songs.First(id => id.StartsWith("ext-", StringComparison.Ordinal)))
+            > 0, "a library song plays first");
+        // Last.fm never heard of "Missigno - SPOOKY", so artists like that name are a guess.
+        Assert.DoesNotContain(songs, id => id.Contains("The Year", StringComparison.Ordinal));
+        Assert.Contains(fixture.Handler.Calls, call => call.Contains("tag.gettoptracks", StringComparison.Ordinal)
+            && call.Contains("tag=Phonk", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task KnownSong_IsLastFmsRadioAsBefore()
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient();
+
+        var songs = await RadioIds(client, "teardrop");
+
+        // A full answer for the song itself: Last.fm's order, and the library is not asked.
+        Assert.Equal(["ext-Portishead-Glory Box", "ext-Morcheeba-Trigger Hippie"], songs.Take(2));
+        Assert.Equal(20, songs.Count);
+        Assert.DoesNotContain(fixture.Handler.Calls, call => call.Contains("rest/getAlbum", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("json")]
+    [InlineData("xml")]
+    public async Task EveryRadioSong_SaysWhichSourceSuggestedIt(string format)
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient();
+
+        var body = await client.GetStringAsync($"/rest/getSimilarSongs2?id=spooky&u=alice&t=token&s=salt&f={format}&count=20");
+
+        // Last.fm's chart for the genre, and the playlist's own songs.
+        Assert.Contains(format == "json" ? "\"octoSuggestedBy\":\"Last.fm\"" : "octoSuggestedBy=\"Last.fm\"", body);
+        Assert.Contains(format == "json" ? "\"octoSuggestedBy\":\"Your library\"" : "octoSuggestedBy=\"Your library\"", body);
+    }
+
+    [Theory]
+    [InlineData("true", true)]
+    [InlineData("false", false)]
+    public async Task TheRadioSourcesExtension_IsListedWhileRadioCanAnswer(string radio, bool listed)
+    {
+        await using var fixture = new Factory(new() { ["LastFm:EnableRadio"] = radio });
+        using var client = fixture.CreateClient();
+
+        var body = await client.GetStringAsync("/rest/getOpenSubsonicExtensions?f=json");
+
+        Assert.Equal(listed, body.Contains("octoRadioSources", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task YouTubeMusic_JoinsTheRadioOfAnUploadLastFmDoesNotKnow()
+    {
+        await using var fixture = new Factory(new() { ["RadioSources:YouTubeMusic"] = "true" });
+        using var client = fixture.CreateClient();
+
+        var body = await client.GetStringAsync("/rest/getSimilarSongs2?id=spooky&u=alice&t=token&s=salt&f=json&count=20");
+        var songs = Songs(body);
+
+        Assert.Contains(songs, song => song.Id == "ext-Phonk Lord-DRIFT KING" && song.By == "YouTube Music");
+        Assert.DoesNotContain(songs, song => song.Id.Contains("SPOOKY", StringComparison.Ordinal));
+        // Two songs like it is a thin answer, so the playlist's own songs still lead.
+        Assert.StartsWith("pl-", songs[0].Id);
+    }
+
+    [Fact]
+    public async Task ASongLastFmAndYouTubeMusicBothSuggest_ComesFirst_AndUploadsStayOffAReleasesRadio()
+    {
+        await using var fixture = new Factory(new() { ["RadioSources:YouTubeMusic"] = "true" });
+        using var client = fixture.CreateClient();
+
+        var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=teardrop&u=alice&t=token&s=salt&f=json&count=50"));
+
+        Assert.Equal("ext-Portishead-Glory Box", songs[0].Id);
+        // YouTube Music's two songs are a thin answer next to Last.fm's 25: its own pick plays,
+        // but after Last.fm's.
+        var sourTimes = songs.FindIndex(song => song.Id == "ext-Portishead-Sour Times" && song.By == "YouTube Music");
+        Assert.True(sourTimes > 20, $"Sour Times at {sourTimes}");
+        Assert.DoesNotContain(songs, song => song.Id.Contains("cover", StringComparison.Ordinal) || song.Id.Contains("Episode", StringComparison.Ordinal));
+    }
+
+    private static List<(string Id, string? By)> Songs(string body)
+    {
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.GetProperty("subsonic-response").GetProperty("similarSongs2").GetProperty("song")
+            .EnumerateArray().Select(song => (song.GetProperty("id").GetString()!,
+                song.TryGetProperty("octoSuggestedBy", out var by) ? by.GetString() : null)).ToList();
+    }
+
+    /// <summary>23 numbers with the second one placing the song along a line: songs close on the
+    /// line sound alike.</summary>
+    private static Octo.Services.Sonic.SonicSong Sound(float at, string title)
+    {
+        var f = new float[23];
+        f[1] = at;
+        return new Octo.Services.Sonic.SonicSong { Stamp = "1:1", Title = title, Artist = "Artist", Version = 2, F = f };
+    }
+
+    [Fact]
+    public async Task SoundsAlike_AddsLibrarySongsThatSoundLikeIt_ReadAgainWithTheListenersSignIn()
+    {
+        await using var fixture = new Factory(new() { ["RadioSources:SoundsAlike"] = "true" });
+        fixture.Services.GetRequiredService<Octo.Services.Sonic.SonicStore>().Write(s =>
+        {
+            s.Songs["teardrop"] = Sound(0, "Teardrop");
+            s.Songs["roads"] = Sound(0.1f, "Roads");
+            // In the store but not in this listener's Navidrome: never sent.
+            s.Songs["elsewhere"] = Sound(0.05f, "Elsewhere");
+        });
+        using var client = fixture.CreateClient();
+
+        var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=teardrop&u=alice&t=token&s=salt&f=json&count=50"));
+
+        Assert.Contains(songs, song => song.Id == "roads" && song.By == "Sounds alike");
+        Assert.DoesNotContain(songs, song => song.Id == "elsewhere");
+        Assert.Contains(fixture.Handler.Calls, call => call.Contains("rest/getSong", StringComparison.Ordinal)
+            && call.Contains("id=roads", StringComparison.Ordinal) && call.Contains("u=alice", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task TheSoundCheck_PutsALibrarySongThatSoundsCloseAboveOneThatSoundsFar()
+    {
+        await using var fixture = new Factory(new() { ["RadioSources:SoundsAlike"] = "true" });
+        fixture.Services.GetRequiredService<Octo.Services.Sonic.SonicStore>().Write(s =>
+        {
+            s.Songs["spooky"] = Sound(0, "SPOOKY");
+            s.Songs["pl-3"] = Sound(0.05f, "NIGHT RIDE");
+            s.Songs["genre-1"] = Sound(0.5f, "GHOST");
+            s.Songs["pl-2"] = Sound(0.95f, "DRIFT");
+            // The rest of the library, for the seed's spread.
+            for (var i = 0; i < 10; i++) s.Songs[$"other-{i}"] = Sound(0.1f * i, $"Other {i}");
+        });
+        using var client = fixture.CreateClient();
+
+        var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=spooky&u=alice&t=token&s=salt&f=json&count=20"))
+            .Select(song => song.Id).ToList();
+
+        // The playlist's two songs come back in either order from the album; the sound decides.
+        Assert.True(songs.IndexOf("pl-3") < songs.IndexOf("pl-2"), string.Join(", ", songs));
+    }
+
+    private static Dictionary<string, string?> Learning() => new()
+    {
+        ["RadioSources:YouTubeMusic"] = "true",
+        ["RadioSources:LearnFromListening"] = "true",
+    };
+
+    private static async Task Scrobble(HttpClient client, string user, string id, bool finished)
+    {
+        using var response = await client.GetAsync(
+            $"/rest/scrobble?id={Uri.EscapeDataString(id)}&submission={(finished ? "true" : "false")}&u={user}&t=token&s=salt&f=json");
+        response.EnsureSuccessStatusCode();
+    }
+
+    [Fact]
+    public async Task ARadioSongPlayedThrough_CountsForTheSourceThatSuggestedIt()
+    {
+        await using var fixture = new Factory(Learning());
+        using var client = fixture.CreateClient();
+        var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=spooky&u=alice&t=token&s=salt&f=json&count=20"));
+        var ytm = songs.First(song => song.By == "YouTube Music").Id;
+        // The test plays the song through at once; a real one is heard for more than 30 s.
+        fixture.Services.GetRequiredService<Octo.Services.Radio.RadioOutcomeStore>().ShortestKeep = TimeSpan.Zero;
+
+        await Scrobble(client, "alice", ytm, finished: false);
+        await Scrobble(client, "alice", ytm, finished: true);
+
+        using var doc = JsonDocument.Parse(await client.GetStringAsync("/api/admin/radio-outcomes"));
+        var row = doc.RootElement.EnumerateArray().Single(item => item.GetProperty("provider").GetString() == "youtube-music");
+        Assert.Equal(1, row.GetProperty("plays").GetInt32());
+        Assert.Equal(1.0, row.GetProperty("keepRate").GetDouble());
+    }
+
+    [Fact]
+    public async Task AScrobbleNavidromeRefuses_TeachesNothing()
+    {
+        await using var fixture = new Factory(Learning());
+        using var client = fixture.CreateClient();
+        var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=spooky&u=mallory&t=token&s=salt&f=json&count=20"));
+        var ytm = songs.First(song => song.By == "YouTube Music").Id;
+
+        await Scrobble(client, "mallory", ytm, finished: false);
+        await Scrobble(client, "mallory", ytm, finished: true);
+
+        Assert.True("[]" == (await client.GetStringAsync("/api/admin/radio-outcomes")).Trim(),
+            string.Join(" | ", fixture.Handler.Calls.Where(call => call.Contains("scrobble") || call.Contains("ping"))));
+    }
+
+    [Fact]
+    public async Task RadioStateFiles_StayInTheHostsOwnFolder()
+    {
+        await using var fixture = new Factory(Learning());
+        fixture.Services.GetRequiredService<Octo.Services.Radio.RadioOutcomeStore>().Forget();
+        fixture.Services.GetRequiredService<Octo.Services.Sonic.SonicStore>().Write(s => s.Pass = 1);
+        fixture.Services.GetRequiredService<Octo.Services.Sonic.SonicStore>().Flush();
+
+        // Not under the fixed /app/config path, which on Windows is C:pp\config.
+        Assert.True(File.Exists(Path.Combine(fixture.StateFolder, "radio-outcomes.json")));
+        Assert.True(File.Exists(Path.Combine(fixture.StateFolder, "sonic-features.json")));
+    }
+
+    [Fact]
+    public async Task ForgettingWhatRadioLearned_NeedsTheDashboardsHeader()
+    {
+        await using var fixture = new Factory(Learning());
+        using var client = fixture.CreateClient();
+
+        using var refused = await client.PostAsync("/api/admin/radio-outcomes/reset", null);
+        Assert.Equal(HttpStatusCode.Forbidden, refused.StatusCode);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/admin/radio-outcomes/reset");
+        request.Headers.Add("X-Octo-Admin", "1");
+        using var allowed = await client.SendAsync(request);
+        allowed.EnsureSuccessStatusCode();
+    }
+
+    [Fact]
+    public async Task ASongTheListenerRatedOneStar_StaysOffTheirRadio()
+    {
+        await using var fixture = new Factory();
+        fixture.Services.GetRequiredService<LastFmRadioStateStore>()
+            .SetRadioBan("alice", "glory-box", "Portishead", "Glory Box", true);
+        using var client = fixture.CreateClient();
+
+        var songs = await RadioIds(client, "teardrop");
+
+        Assert.DoesNotContain("ext-Portishead-Glory Box", songs);
+        Assert.Contains("ext-Morcheeba-Trigger Hippie", songs);
+    }
+
+    [Fact]
+    public async Task AThinExactAnswer_IsFilledFromTheLibrary()
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient();
+
+        var songs = await RadioIds(client, "roads");
+
+        // Last.fm knows the song but has two songs like it: too few to be the radio alone.
+        Assert.Contains("ext-Massive Attack-Angel", songs);
+        Assert.Contains("ext-Massive Attack-Unfinished Sympathy", songs);
+        Assert.Contains("dummy-2", songs);
+        Assert.Contains(fixture.Handler.Calls, call => call.Contains("rest/getAlbum", StringComparison.Ordinal)
+            && call.Contains("id=al-dummy", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task NightcoreUpload_TriesTheArtistItsTitleNames_AndKeepsItsPlaylistFirst()
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient();
+
+        var songs = await RadioIds(client, "faded-nightcore");
+
+        // Last.fm knows "Alan Walker - Faded", the song this upload came from, and its songs are
+        // like the original: they play, but behind the playlist the nightcore upload sits in.
+        Assert.Contains(fixture.Handler.Calls, call => call.Contains("method=track.getsimilar", StringComparison.Ordinal)
+            && call.Contains("artist=Alan%20Walker", StringComparison.Ordinal));
+        Assert.Contains("ext-Avicii-Wake Me Up", songs);
+        Assert.StartsWith("pl-", songs[0]);
+    }
+
+    [Fact]
+    public async Task NewSongByAKnownArtist_StillGetsArtistsLikeThem()
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient();
+
+        var songs = await RadioIds(client, "brand-new");
+
+        // Not on Last.fm yet, but Drake is, with an audience: artists like him are no guess.
+        Assert.Equal(["ext-Future-Mask Off"], songs);
+    }
+
+    [Fact]
+    public async Task AlbumId_IsARadioFromItsFirstSong()
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient();
+
+        var songs = await RadioIds(client, "album-trip");
+
+        Assert.Equal(["ext-Portishead-Glory Box", "ext-Morcheeba-Trigger Hippie"], songs.Take(2));
+    }
+
+    [Fact]
+    public async Task ArtistId_IsTheTopSongsOfArtistsLikeThem()
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient();
+
+        var songs = await RadioIds(client, "artist-massive");
+
+        Assert.Equal(["ext-Portishead-Roads"], songs);
+    }
+
+    [Theory]
+    [InlineData("GET")]
+    [InlineData("HEAD")]
+    public async Task BareAddress_SendsToTheWebAppLikeNavidrome(string method)
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient(new WebApplicationFactoryClientOptions { AllowAutoRedirect = false });
+
+        using var response = await client.SendAsync(new HttpRequestMessage(new HttpMethod(method), "/"));
+
+        Assert.Equal(HttpStatusCode.Redirect, response.StatusCode);
+        Assert.Equal("app/", response.Headers.Location?.OriginalString);
+    }
+
+    [Theory]
+    [InlineData("Phonk", "Phonk")]
+    [InlineData("Phonk; Drift Phonk", "Phonk")]
+    [InlineData("Electronic/Dance", "Electronic")]
+    [InlineData("Unknown", null)]
+    [InlineData("", null)]
+    [InlineData(null, null)]
+    public void PrimaryGenre_IsTheFirstRealOne(string? genre, string? expected) =>
+        Assert.Equal(expected, Octo.Services.Radio.RadioBlend.PrimaryGenre(genre));
+
+    [Fact]
+    public void Interleave_TakesOneFromEachInTurn() =>
+        Assert.Equal([1, 10, 2, 20, 3], LastFmRadioTrackResolver.Interleave<int>([[1, 2, 3], [10, 20]]));
+
+    [Fact]
+    public async Task NothingFromOctosSources_LetsNavidromeAnswer()
+    {
+        await using var fixture = new Factory(new Dictionary<string, string?> { ["LastFm:ApiKey"] = "" });
+        using var client = fixture.CreateClient();
+        Assert.Equal(["nd-1"], await RadioIds(client, "teardrop"));
+    }
+
+    private static async Task<List<string>> RadioIds(HttpClient client, string id)
+    {
+        var body = await client.GetStringAsync($"/rest/getSimilarSongs2?id={id}&u=alice&t=token&s=salt&f=json&count=20");
+        using var doc = JsonDocument.Parse(body);
+        var response = doc.RootElement.GetProperty("subsonic-response");
+        if (!response.TryGetProperty("similarSongs2", out var similar)
+            || !similar.TryGetProperty("song", out var songs)) return [];
+        return songs.EnumerateArray().Select(song => song.GetProperty("id").GetString()!).ToList();
+    }
+
+    private sealed class Handler : HttpMessageHandler
+    {
+        public ConcurrentQueue<string> Calls { get; } = new();
+
+        private static string Song(string id, string title, string artist, string album, string albumId, string genre) =>
+            $$"""{"id":"{{id}}","title":"{{title}}","artist":"{{artist}}","album":"{{album}}","albumId":"{{albumId}}","genre":"{{genre}}","duration":180}""";
+
+        private static string Album(string id, string name, string artist, params string[] songs) =>
+            $$"""{"album":{"id":"{{id}}","name":"{{name}}","artist":"{{artist}}","song":[""" + string.Join(",", songs) + "]}}";
+
+        private static readonly Dictionary<string, string> LibrarySongs = new()
+        {
+            ["spooky"] = Song("spooky", "SPOOKY", "Missigno", "PHONK", "al-phonk", "Phonk"),
+            ["teardrop"] = Song("teardrop", "Teardrop", "Massive Attack", "Mezzanine", "al-mezz", "Trip-Hop"),
+            ["roads"] = Song("roads", "Roads", "Portishead", "Dummy", "al-dummy", "Trip-Hop"),
+            ["brand-new"] = Song("brand-new", "Brand New", "Drake", "Brand New", "al-brand-new", "Hip-Hop"),
+            ["faded-nightcore"] = Song("faded-nightcore", "Alan Walker - Faded (Nightcore)", "Nightcore Galaxy",
+                "Nightcore", "al-nightcore", ""),
+        };
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var uri = request.RequestUri!;
+            Calls.Enqueue(uri.AbsolutePath + uri.Query);
+            var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+            if (uri.Host == "ws.audioscrobbler.com") return Json(LastFm(query));
+
+            var path = uri.AbsolutePath;
+            if (path.StartsWith("/ytm/", StringComparison.Ordinal)) return Json(YouTubeMusic(path, query));
+            // Navidrome refuses mallory's sign-in.
+            if (query["u"] == "mallory" && (path.EndsWith("/rest/ping") || path.EndsWith("/rest/scrobble")))
+                return Json("""{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":40,"message":"Wrong username or password"}}}""");
+            var id = query["id"] ?? "";
+            string? answer = path switch
+            {
+                _ when path.EndsWith("/rest/getSong") => LibrarySongs.TryGetValue(id, out var song)
+                    ? $$"""{"song":{{song}}}""" : null,
+                _ when path.EndsWith("/rest/getAlbum") => id switch
+                {
+                    "al-phonk" => Album("al-phonk", "PHONK", "Missigno", LibrarySongs["spooky"], Song("pl-2", "DRIFT", "Missigno", "PHONK", "al-phonk", "Phonk"), Song("pl-3", "NIGHT RIDE", "Missigno", "PHONK", "al-phonk", "Phonk")),
+                    "al-nightcore" => Album("al-nightcore", "Nightcore", "Nightcore Galaxy", LibrarySongs["faded-nightcore"], Song("pl-9", "Alone (Nightcore)", "Nightcore Galaxy", "Nightcore", "al-nightcore", "")),
+                    "album-trip" => Album("album-trip", "Mezzanine", "Massive Attack", LibrarySongs["teardrop"]),
+                    "al-dummy" => Album("al-dummy", "Dummy", "Portishead", LibrarySongs["roads"],
+                        Song("dummy-2", "Sour Times", "Portishead", "Dummy", "al-dummy", "Trip-Hop")),
+                    _ => null,
+                },
+                _ when path.EndsWith("/rest/getArtist") => id == "artist-massive"
+                    ? """{"artist":{"id":"artist-massive","name":"Massive Attack"}}""" : null,
+                _ when path.EndsWith("/rest/getRandomSongs") => query["genre"] == "Phonk"
+                    ? """{"randomSongs":{"song":[""" + Song("genre-1", "GHOST", "Kaito", "Phonk Mix", "al-mix", "Phonk") + "," + LibrarySongs["spooky"] + "]}}"
+                    : """{"randomSongs":{"song":[]}}""",
+                _ when path.EndsWith("/rest/search3") => """{"searchResult3":{}}""",
+                // Navidrome's own agents, for when Octo's sources have nothing.
+                _ when path.EndsWith("/rest/getSimilarSongs2") => """{"similarSongs2":{"song":[""" + Song("nd-1", "Unfinished Sympathy", "Massive Attack", "Blue Lines", "al-blue", "Trip-Hop") + "]}}",
+                _ when path.EndsWith("/rest/ping") => "",
+                _ when path.EndsWith("/rest/scrobble") => "",
+                _ when path.EndsWith("/rest/getOpenSubsonicExtensions") => """{"openSubsonic":true,"openSubsonicExtensions":[]}""",
+                _ => null,
+            };
+            await Task.Yield();
+            return answer is null
+                ? Json("""{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":70,"message":"not found"}}}""")
+                : Json(Ok(answer));
+        }
+
+        private static string Ytm(string id, string title, string artist, int seconds, string type) =>
+            $$"""{"videoId":"{{id}}","title":"{{title}}","artists":["{{artist}}"],"durationSeconds":{{seconds}},"videoType":"{{type}}"}""";
+
+        /// <summary>The shim's YouTube Music answers: the upload is found among videos, its radio is
+        /// phonk uploads; Teardrop's radio has Glory Box, an upload and a podcast.</summary>
+        private static string YouTubeMusic(string path, System.Collections.Specialized.NameValueCollection query)
+        {
+            const string atv = "MUSIC_VIDEO_TYPE_ATV", ugc = "MUSIC_VIDEO_TYPE_UGC";
+            var rows = path switch
+            {
+                "/ytm/search" => (query["filter"], query["q"]) switch
+                {
+                    ("videos", "Missigno SPOOKY") => [Ytm("spooky-v", "SPOOKY", "Missigno", 180, ugc)],
+                    ("songs", "Massive Attack Teardrop") => [Ytm("teardrop-v", "Teardrop", "Massive Attack", 180, atv)],
+                    _ => Array.Empty<string>(),
+                },
+                "/ytm/radio" => query["videoId"] switch
+                {
+                    "spooky-v" => [Ytm("spooky-v", "SPOOKY", "Missigno", 180, ugc), Ytm("d1", "DRIFT KING", "Phonk Lord", 150, ugc),
+                        Ytm("d2", "NIGHT RUN", "Phonk Lord II", 160, ugc)],
+                    "teardrop-v" => [Ytm("g", "Glory Box", "Portishead", 305, atv), Ytm("u", "Teardrop cover", "Some Channel", 300, ugc),
+                        Ytm("p", "Episode 4", "A Podcast", 2400, "MUSIC_VIDEO_TYPE_PODCAST_EPISODE"), Ytm("s", "Sour Times", "Portishead", 250, atv)],
+                    _ => Array.Empty<string>(),
+                },
+                _ => Array.Empty<string>(),
+            };
+            return """{"tracks":[""" + string.Join(",", rows) + "]}";
+        }
+
+        private static string LastFm(System.Collections.Specialized.NameValueCollection query)
+        {
+            var artist = query["artist"] ?? "";
+            var track = query["track"] ?? "";
+            return query["method"] switch
+            {
+                "track.getsimilar" => (artist, track) switch
+                {
+                    // A full answer: Last.fm knows this song well.
+                    ("Massive Attack", "Teardrop") => """{"similartracks":{"track":[{"name":"Glory Box","artist":{"name":"Portishead"},"match":0.9},{"name":"Trigger Hippie","artist":{"name":"Morcheeba"},"match":0.8},{"name":"Song 1","artist":{"name":"Artist 1"},"match":0.69},{"name":"Song 2","artist":{"name":"Artist 2"},"match":0.68},{"name":"Song 3","artist":{"name":"Artist 3"},"match":0.67},{"name":"Song 4","artist":{"name":"Artist 4"},"match":0.66},{"name":"Song 5","artist":{"name":"Artist 5"},"match":0.65},{"name":"Song 6","artist":{"name":"Artist 6"},"match":0.64},{"name":"Song 7","artist":{"name":"Artist 7"},"match":0.63},{"name":"Song 8","artist":{"name":"Artist 8"},"match":0.62},{"name":"Song 9","artist":{"name":"Artist 9"},"match":0.61},{"name":"Song 10","artist":{"name":"Artist 10"},"match":0.60},{"name":"Song 11","artist":{"name":"Artist 11"},"match":0.59},{"name":"Song 12","artist":{"name":"Artist 12"},"match":0.58},{"name":"Song 13","artist":{"name":"Artist 13"},"match":0.57},{"name":"Song 14","artist":{"name":"Artist 14"},"match":0.56},{"name":"Song 15","artist":{"name":"Artist 15"},"match":0.55},{"name":"Song 16","artist":{"name":"Artist 16"},"match":0.54},{"name":"Song 17","artist":{"name":"Artist 17"},"match":0.53},{"name":"Song 18","artist":{"name":"Artist 18"},"match":0.52},{"name":"Song 19","artist":{"name":"Artist 19"},"match":0.51},{"name":"Song 20","artist":{"name":"Artist 20"},"match":0.50},{"name":"Song 21","artist":{"name":"Artist 21"},"match":0.49},{"name":"Song 22","artist":{"name":"Artist 22"},"match":0.48},{"name":"Song 23","artist":{"name":"Artist 23"},"match":0.47}]}}""",
+                    // A thin one: two songs like it.
+                    ("Portishead", "Roads") => """{"similartracks":{"track":[{"name":"Angel","artist":{"name":"Massive Attack"},"match":0.9},{"name":"Unfinished Sympathy","artist":{"name":"Massive Attack"},"match":0.8}]}}""",
+                    ("Alan Walker", "Faded") => """{"similartracks":{"track":[{"name":"Wake Me Up","artist":{"name":"Avicii"},"match":0.9}]}}""",
+                    _ => """{"similartracks":{"track":[]}}""",
+                },
+                "artist.getsimilar" => artist switch
+                {
+                    "Massive Attack" => """{"similarartists":{"artist":[{"name":"Portishead"}]}}""",
+                    "Drake" => """{"similarartists":{"artist":[{"name":"Future"}]}}""",
+                    _ => """{"similarartists":{"artist":[{"name":"The Year"}]}}""",
+                },
+                "artist.gettoptracks" => artist switch
+                {
+                    "Portishead" => """{"toptracks":{"track":[{"name":"Roads"}]}}""",
+                    "Future" => """{"toptracks":{"track":[{"name":"Mask Off"}]}}""",
+                    _ => """{"toptracks":{"track":[{"name":"Full Damage"}]}}""",
+                },
+                // An uploader's name can be on Last.fm too, scrobbled by a few people.
+                "artist.getInfo" => artist == "Drake"
+                    ? """{"artist":{"name":"Drake","stats":{"listeners":"5200000"}}}"""
+                    : """{"artist":{"name":"Missigno","stats":{"listeners":"40"}}}""",
+                "track.getInfo" or "track.getinfo" => """{"error":6,"message":"Track not found"}""",
+                "tag.gettoptracks" => query["tag"] == "Phonk"
+                    ? """{"tracks":{"track":[{"name":"Murder In My Mind","artist":{"name":"Kordhell"}}]}}"""
+                    : """{"tracks":{"track":[]}}""",
+                _ => "{}",
+            };
+        }
+
+        /// <summary>A Subsonic "ok" carrying the answer's fields.</summary>
+        private static string Ok(string answer)
+        {
+            var fields = System.Text.Json.Nodes.JsonNode.Parse(answer.Length > 0 ? answer : "{}")!.AsObject();
+            fields["status"] = "ok";
+            fields["version"] = "1.16.1";
+            return new System.Text.Json.Nodes.JsonObject { ["subsonic-response"] = fields }.ToJsonString();
+        }
+
+        private static HttpResponseMessage Json(string body) =>
+            new(HttpStatusCode.OK) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
+    }
+
+    private sealed class Factory : WebApplicationFactory<Program>
+    {
+        private readonly string _directory = Path.Combine(Path.GetTempPath(), "octo-similar-seed-" + Guid.NewGuid());
+        public Handler Handler { get; } = new();
+        private readonly Mock<IMusicMetadataService> _metadata = new();
+
+        private readonly Dictionary<string, string?> _settings;
+        /// <summary>Where this host keeps its state files (Octo:StateDirectory).</summary>
+        public string StateFolder => _directory;
+
+        /// <param name="settings">On top of the defaults below, which leave every radio source but
+        /// Last.fm off, so a test switches on the ones it is about.</param>
+        public Factory(Dictionary<string, string?>? settings = null)
+        {
+            _settings = settings ?? [];
+            Directory.CreateDirectory(_directory);
+            // Every Last.fm pick not in the library comes back as an outside copy named after it.
+            _metadata.Setup(service => service.SearchSongsByArtistTitleAsync(
+                    It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int>(), It.IsAny<int?>()))
+                .ReturnsAsync((string artist, string title, int _, int? _) =>
+                    [new Song { Id = $"ext-{artist}-{title}", Artist = artist, Title = title, IsLocal = false }]);
+            _metadata.Setup(service => service.PrewarmYouTubeIdsAsync(
+                    It.IsAny<IEnumerable<Song>>(), It.IsAny<int>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+        }
+
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(
+                new Dictionary<string, string?>
+                {
+                    ["Subsonic:Url"] = "http://navidrome.test",
+                    ["Subsonic:AutoDetectDownloadPath"] = "false",
+                    ["Library:DownloadPath"] = _directory,
+                    ["Soulseek:BaseUrl"] = "http://127.0.0.1:1",
+                    ["YouTube:ShimUrl"] = "http://127.0.0.1:1",
+                    ["LastFm:ApiKey"] = "test-key",
+                    ["LastFm:EnableRadio"] = "true",
+                    ["RadioSources:YouTubeMusic"] = "false",
+                    ["RadioSources:ListenBrainz"] = "false",
+                    ["RadioSources:SoundsAlike"] = "false",
+                    ["RadioSources:LearnFromListening"] = "false",
+                    ["Octo:StateDirectory"] = _directory,
+                }).AddInMemoryCollection(_settings));
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<IHostedService>();
+                services.RemoveAll<IHttpClientFactory>();
+                services.AddSingleton<IHttpClientFactory>(new ReviewFixtures.OneClientFactory(Handler));
+                services.RemoveAll<IMusicMetadataService>();
+                services.AddSingleton(_metadata.Object);
+                services.RemoveAll<Octo.Services.Admin.SettingsFileWriter>();
+                services.AddSingleton(new Octo.Services.Admin.SettingsFileWriter(Path.Combine(_directory, "settings.json")));
+                services.RemoveAll<LastFmRadioStateStore>();
+                services.AddSingleton(provider => new LastFmRadioStateStore(
+                    Path.Combine(_directory, "radio-state.json"),
+                    provider.GetRequiredService<IOptionsMonitor<LastFmSettings>>(),
+                    provider.GetRequiredService<ExternalIdRegistry>(),
+                    provider.GetRequiredService<ILogger<LastFmRadioStateStore>>()));
+            });
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            await base.DisposeAsync();
+            try { Directory.Delete(_directory, true); } catch { }
+        }
+    }
+}

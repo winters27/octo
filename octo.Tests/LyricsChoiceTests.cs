@@ -134,6 +134,7 @@ public sealed class LyricsChoiceTests : IDisposable
                     ["Soulseek:BaseUrl"] = "http://127.0.0.1:1",
                     ["YouTube:ShimUrl"] = "http://127.0.0.1:1",
                     ["Library:DownloadPath"] = _directory,
+                    ["Octo:StateDirectory"] = _directory,
                     ["Metadata:FetchLyrics"] = fetch ? "true" : "false",
                     ["Metadata:LyricsSources"] = Order ?? string.Join(',', sources.Select(source => source.Key)),
                     ["Metadata:PreferWordTimedLyrics"] = PreferWords ? "true" : "false",
