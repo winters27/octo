@@ -94,6 +94,45 @@ public sealed class SimilarSongsSeedTests
     }
 
     [Fact]
+    public async Task YouTubeMusic_JoinsTheRadioOfAnUploadLastFmDoesNotKnow()
+    {
+        await using var fixture = new Factory(new() { ["RadioSources:YouTubeMusic"] = "true" });
+        using var client = fixture.CreateClient();
+
+        var body = await client.GetStringAsync("/rest/getSimilarSongs2?id=spooky&u=alice&t=token&s=salt&f=json&count=20");
+        var songs = Songs(body);
+
+        Assert.Contains(songs, song => song.Id == "ext-Phonk Lord-DRIFT KING" && song.By == "YouTube Music");
+        Assert.DoesNotContain(songs, song => song.Id.Contains("SPOOKY", StringComparison.Ordinal));
+        // Two songs like it is a thin answer, so the playlist's own songs still lead.
+        Assert.StartsWith("pl-", songs[0].Id);
+    }
+
+    [Fact]
+    public async Task ASongLastFmAndYouTubeMusicBothSuggest_ComesFirst_AndUploadsStayOffAReleasesRadio()
+    {
+        await using var fixture = new Factory(new() { ["RadioSources:YouTubeMusic"] = "true" });
+        using var client = fixture.CreateClient();
+
+        var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=teardrop&u=alice&t=token&s=salt&f=json&count=50"));
+
+        Assert.Equal("ext-Portishead-Glory Box", songs[0].Id);
+        // YouTube Music's two songs are a thin answer next to Last.fm's 25: its own pick plays,
+        // but after Last.fm's.
+        var sourTimes = songs.FindIndex(song => song.Id == "ext-Portishead-Sour Times" && song.By == "YouTube Music");
+        Assert.True(sourTimes > 20, $"Sour Times at {sourTimes}");
+        Assert.DoesNotContain(songs, song => song.Id.Contains("cover", StringComparison.Ordinal) || song.Id.Contains("Episode", StringComparison.Ordinal));
+    }
+
+    private static List<(string Id, string? By)> Songs(string body)
+    {
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.GetProperty("subsonic-response").GetProperty("similarSongs2").GetProperty("song")
+            .EnumerateArray().Select(song => (song.GetProperty("id").GetString()!,
+                song.TryGetProperty("octoSuggestedBy", out var by) ? by.GetString() : null)).ToList();
+    }
+
+    [Fact]
     public async Task ASongTheListenerRatedOneStar_StaysOffTheirRadio()
     {
         await using var fixture = new Factory();
@@ -239,6 +278,7 @@ public sealed class SimilarSongsSeedTests
             if (uri.Host == "ws.audioscrobbler.com") return Json(LastFm(query));
 
             var path = uri.AbsolutePath;
+            if (path.StartsWith("/ytm/", StringComparison.Ordinal)) return Json(YouTubeMusic(path, query));
             var id = query["id"] ?? "";
             string? answer = path switch
             {
@@ -267,6 +307,35 @@ public sealed class SimilarSongsSeedTests
             return answer is null
                 ? Json("""{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":70,"message":"not found"}}}""")
                 : Json(Ok(answer));
+        }
+
+        private static string Ytm(string id, string title, string artist, int seconds, string type) =>
+            $$"""{"videoId":"{{id}}","title":"{{title}}","artists":["{{artist}}"],"durationSeconds":{{seconds}},"videoType":"{{type}}"}""";
+
+        /// <summary>The shim's YouTube Music answers: the upload is found among videos, its radio is
+        /// phonk uploads; Teardrop's radio has Glory Box, an upload and a podcast.</summary>
+        private static string YouTubeMusic(string path, System.Collections.Specialized.NameValueCollection query)
+        {
+            const string atv = "MUSIC_VIDEO_TYPE_ATV", ugc = "MUSIC_VIDEO_TYPE_UGC";
+            var rows = path switch
+            {
+                "/ytm/search" => (query["filter"], query["q"]) switch
+                {
+                    ("videos", "Missigno SPOOKY") => [Ytm("spooky-v", "SPOOKY", "Missigno", 180, ugc)],
+                    ("songs", "Massive Attack Teardrop") => [Ytm("teardrop-v", "Teardrop", "Massive Attack", 180, atv)],
+                    _ => Array.Empty<string>(),
+                },
+                "/ytm/radio" => query["videoId"] switch
+                {
+                    "spooky-v" => [Ytm("spooky-v", "SPOOKY", "Missigno", 180, ugc), Ytm("d1", "DRIFT KING", "Phonk Lord", 150, ugc),
+                        Ytm("d2", "NIGHT RUN", "Phonk Lord II", 160, ugc)],
+                    "teardrop-v" => [Ytm("g", "Glory Box", "Portishead", 305, atv), Ytm("u", "Teardrop cover", "Some Channel", 300, ugc),
+                        Ytm("p", "Episode 4", "A Podcast", 2400, "MUSIC_VIDEO_TYPE_PODCAST_EPISODE"), Ytm("s", "Sour Times", "Portishead", 250, atv)],
+                    _ => Array.Empty<string>(),
+                },
+                _ => Array.Empty<string>(),
+            };
+            return """{"tracks":[""" + string.Join(",", rows) + "]}";
         }
 
         private static string LastFm(System.Collections.Specialized.NameValueCollection query)

@@ -427,15 +427,34 @@ public class LastFmRadioTrackResolverTests
         Assert.Same(expected, song);
     }
 
+    [Fact]
+    public async Task Resolver_KeepsTheVideoASourceNamed_WithoutReplacingOneAlreadyFound()
+    {
+        var handler = new DelegateHandler(_ =>
+            "{\"subsonic-response\":{\"status\":\"ok\",\"searchResult3\":{\"song\":[]}}}");
+        var registry = new ExternalIdRegistry();
+        var id = registry.Register(new SoulseekRouting { Artist = "A", Title = "T", Duration = 180 });
+        var metadata = new Mock<IMusicMetadataService>();
+        metadata.Setup(service => service.SearchSongsByArtistTitleAsync("A", "T", 1, 180))
+            .ReturnsAsync([new Song { Id = id, Artist = "A", Title = "T", IsLocal = false }]);
+        var resolver = Resolver(handler, metadata.Object, registry);
+
+        await resolver.ResolveAsync("A", "T", 180, new Dictionary<string, string>(), default, "video-1");
+        Assert.Equal("video-1", registry.Lookup(id)!.YouTubeId);
+
+        await resolver.ResolveAsync("A", "T", 180, new Dictionary<string, string>(), default, "video-2");
+        Assert.Equal("video-1", registry.Lookup(id)!.YouTubeId);
+    }
+
     private static LastFmRadioTrackResolver Resolver(HttpMessageHandler handler,
-        IMusicMetadataService metadata)
+        IMusicMetadataService metadata, ExternalIdRegistry? registry = null)
     {
         var factory = new Mock<IHttpClientFactory>();
         factory.Setup(item => item.CreateClient(It.IsAny<string>())).Returns(new HttpClient(handler));
         var proxy = new SubsonicProxyService(factory.Object,
             TestOptions.Monitor(new SubsonicSettings { Url = "http://navidrome.test" }),
             new HttpContextAccessor { HttpContext = new DefaultHttpContext() });
-        return new LastFmRadioTrackResolver(proxy, metadata, new ExternalIdRegistry(),
+        return new LastFmRadioTrackResolver(proxy, metadata, registry ?? new ExternalIdRegistry(),
             new Mock<ILogger<LastFmRadioTrackResolver>>().Object);
     }
 

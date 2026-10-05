@@ -136,6 +136,7 @@ builder.Services.AddSingleton(sp => new Octo.Services.Common.SoulseekHoldStore(
     System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "soulseek-holds.json"),
     sp.GetRequiredService<ILogger<Octo.Services.Common.SoulseekHoldStore>>()));
 builder.Services.AddSingleton<YouTubeResolver>();
+builder.Services.AddSingleton<Octo.Services.YouTube.YouTubeMusicClient>();
 
 // Two named HTTP clients for the yt-dlp shim:
 //   - search: short timeout, used for /search and /health
@@ -442,6 +443,7 @@ builder.Services.AddHttpClient<LastFmService>();
 builder.Services.AddSingleton<LastFmService>();
 // Radio's suggestion sources, asked together and blended (multi-source radio).
 builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.LastFmRadioSource>();
+builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.YouTubeMusicRadioSource>();
 builder.Services.AddSingleton<Octo.Services.Radio.RadioSourceSet>();
 builder.Services.AddScoped<Octo.Services.Radio.SongRadioService>();
 
