@@ -335,6 +335,8 @@ public class LibraryHealthServerTests
         Assert.Equal("Fixing copies", busy.Label);
         Assert.NotNull(health.StartUndo("winters"));
 
+        // Stop while the first song is being sent.
+        for (var i = 0; i < 500 && Volatile.Read(ref sent) == 0; i++) await Task.Delay(10);
         Assert.True(health.Stop());
         gate.SetResult();
         var run = await Finished(health);
