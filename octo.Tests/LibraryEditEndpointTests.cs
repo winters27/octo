@@ -507,6 +507,33 @@ public sealed class LibraryEditEndpointTests
     }
 
     [Fact]
+    public async Task JoinAlbum_AcrossAlbumArtists_GivesTheSongTheLeadsAlbumArtist_KeepsItsOwnArtist_AndUndoes()
+    {
+        // One album filed under each of its artists, as the live library had it: Drake's songs
+        // on a part of their own, with no year, beside PARTYNEXTDOOR's.
+        await using var factory = new Factory();
+        var lead = factory.Song("lead", "PARTYNEXTDOOR/$ome $exy $ongs 4 U/CELIBACY.flac", "CELIBACY", "PARTYNEXTDOOR",
+            "$ome $exy $ongs 4 U", "PARTYNEXTDOOR", 2025);
+        var stray = factory.Song("stray", "Drake/$ome $exy $ongs 4 U/GIMME A HUG.flac", "GIMME A HUG", "Drake",
+            "$ome $exy $ongs 4 U", "Drake");
+        using var client = factory.CreateClient();
+
+        Assert.Equal("applied", State(await Call(client, "id=stray&action=joinAlbum&like=lead")));
+
+        var joined = KeptIdentityTags.Read(stray)!;
+        var leading = KeptIdentityTags.Read(lead)!;
+        Assert.Equal(leading.AlbumArtist, joined.AlbumArtist);
+        Assert.Equal(leading.AlbumArtists, joined.AlbumArtists);
+        Assert.Equal(KeptIdentityTags.PidInputs(leading with { Title = "" }), KeptIdentityTags.PidInputs(joined with { Title = "" }));
+        Assert.Equal("Drake", Tags(stray)["artist"]);
+        Assert.Equal("2025", Tags(stray)["year"]);
+
+        Assert.Equal("applied", State(await Call(client, "id=stray&action=undo")));
+        Assert.Equal(["Drake"], KeptIdentityTags.Read(stray)!.AlbumArtist);
+        Assert.Null(Tags(stray)["year"]);
+    }
+
+    [Fact]
     public async Task JoinAlbum_TakesAwayAPeersStrayAlbumId_ReleaseDate_AndVersion_WhenTheAlbumHasNone()
     {
         await using var factory = new Factory();
