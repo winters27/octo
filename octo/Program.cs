@@ -296,6 +296,9 @@ builder.Services.AddSingleton(sp => new Octo.Services.Library.UpgradeQueue(
 builder.Services.AddSingleton<Octo.Services.Library.UpgradeWorker>();
 // Whether a newer Octo release is out, and the files that hand Update now to the host helper.
 builder.Services.AddHttpClient(Octo.Services.Updates.ReleaseCheck.ClientName, c => c.Timeout = TimeSpan.FromSeconds(15));
+// The dashboard's light: the colours of the fetched songs' covers.
+builder.Services.AddHttpClient(Octo.Services.Admin.AmbientPaletteService.ClientName, c => c.Timeout = TimeSpan.FromSeconds(6));
+builder.Services.AddSingleton<Octo.Services.Admin.AmbientPaletteService>();
 builder.Services.AddSingleton(sp => new Octo.Services.Updates.ReleaseCheck(
     System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "update", "release.json"),
     sp.GetRequiredService<IHttpClientFactory>(),
