@@ -86,6 +86,9 @@ builder.Services.Configure<ListenBrainzSettings>(
     builder.Configuration.GetSection("ListenBrainz"));
 builder.Services.Configure<UpdateSettings>(
     builder.Configuration.GetSection("Updates"));
+// Who may use the dashboard and the admin API; see AdminSignInGate.
+builder.Services.Configure<AdminSettings>(
+    builder.Configuration.GetSection("Admin"));
 // Listens are records of plays that already happened; a slow ListenBrainz must not
 // hold a scrobble response or a radio stream, so the client is short-fused.
 builder.Services.AddHttpClient(Octo.Services.ListenBrainz.ListenBrainzService.ClientName,
@@ -162,13 +165,18 @@ builder.Services.AddSingleton<Octo.Services.Subsonic.NavidromeIdentityService>()
 builder.Services.AddSingleton<Octo.Services.Subsonic.SubsonicDiscoveryService>();
 builder.Services.AddSingleton<Octo.Services.Subsonic.SyncCatalogService>();
 builder.Services.AddSingleton<Octo.Services.Admin.DirectoryBrowser>();
-// Singleton so browse tokens survive between requests; they are in-memory only,
-// so a restart ends every browse session, which is the right trade for a token
-// that grants filesystem visibility.
 // Dashboard sign-ins, remembered per browser across restarts; only token hashes are written.
 builder.Services.AddSingleton(sp => new Octo.Services.Admin.BrowseSessionStore(
     System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "browse-sessions.json"),
     sp.GetRequiredService<ILogger<Octo.Services.Admin.BrowseSessionStore>>()));
+// Ten wrong sign-ins per address per fifteen minutes, then a wait.
+builder.Services.AddSingleton<Octo.Services.Admin.SignInThrottle>();
+// The one-time way in when Navidrome cannot vouch for anyone.
+builder.Services.AddSingleton(sp => new Octo.Services.Admin.AdminRecoveryCode(
+    System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "admin-recovery-code"),
+    sp.GetRequiredService<ILogger<Octo.Services.Admin.AdminRecoveryCode>>()));
+// Ends the sign-ins of someone Navidrome no longer counts as an admin.
+builder.Services.AddSingleton<Octo.Services.Admin.AdminRoleCheck>();
 builder.Services.AddSingleton<Octo.Services.Metadata.DeezerMetadataService>();
 
 // Deezer's public API allows roughly 50 requests per 5 seconds and signals refusal with
@@ -538,11 +546,42 @@ builder.Services.AddCors(options =>
     });
 });
 
+// The dashboard on a port of its own, when asked for. Kestrel takes one list of addresses, so the
+// admin port is added to the ones Octo already listens on; Listen() in code would REPLACE them.
+var adminPort = builder.Configuration.GetValue<int>("Admin:Port");
+if (AdminPortSplit.ListenUrls(builder.Configuration["urls"], builder.Configuration["http_ports"], adminPort) is { } listen)
+    builder.WebHost.UseUrls(listen);
+else if (adminPort > 0)
+{
+    Console.Error.WriteLine($"Admin:Port {adminPort} is already one of Octo's own ports, so the dashboard keeps sharing it.");
+    adminPort = 0;
+}
+
 var app = builder.Build();
 
 // Resolved here so it snapshots the values this process actually started with, before the
 // dashboard or first-run automation can change anything.
 app.Services.GetRequiredService<Octo.Services.Admin.RestartTracker>();
+
+// Make the recovery code exist, and say where it is. While no Navidrome is set there is no other
+// way in, so the code itself goes to the log too.
+{
+    var adminOpts = app.Services.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<AdminSettings>>().CurrentValue;
+    var startLog = app.Services.GetRequiredService<ILogger<Program>>();
+    if (adminOpts.SignIn?.Trim().ToLowerInvariant() is not ("required" or "off"))
+        startLog.LogWarning("Admin:SignIn is \"{Value}\", which Octo does not know, so the dashboard sign-in stays on.", adminOpts.SignIn);
+    if (adminOpts.SignInOff)
+        startLog.LogWarning("The dashboard sign-in is OFF (ADMIN_SIGN_IN=off). Anyone who can reach Octo can change it.");
+    else
+    {
+        var recovery = app.Services.GetRequiredService<Octo.Services.Admin.AdminRecoveryCode>();
+        var code = recovery.Current();
+        if (string.IsNullOrWhiteSpace(app.Configuration["Subsonic:Url"]) && code is not null)
+            startLog.LogWarning("No Navidrome is set yet, so sign in to the dashboard with the recovery code {Code} (also in {Path}).", code, recovery.FilePath);
+        else
+            startLog.LogInformation("Locked out of the dashboard? The recovery code is in {Path}.", recovery.FilePath);
+    }
+}
 
 // Built now rather than on the first Subsonic request, so it is already listening when the
 // first download finishes.
@@ -598,10 +637,15 @@ _ = Task.Run(async () =>
 
 // This must run before any middleware or controller reads Request.Scheme.
 app.UseForwardedHeaders();
+// Before anything else answers, so the wrong port never even serves a static file.
+app.UseAdminPortSplit(adminPort);
+app.UseAdminSecurityHeaders();
 app.UseExceptionHandler(_ => { });
 // Ahead of UseCors on purpose: it strips the CORS headers from /api/admin answers and refuses
 // admin writes that lack X-Octo-Admin. See AdminRequestGuard for what it does and does not stop.
 app.UseAdminRequestGuard();
+// Then the sign-in itself: nothing under /api/admin answers a caller who is not signed in.
+app.UseAdminSignInGate();
 
 // Capture the raw request body for body-carrying methods so the proxy can
 // faithfully forward it after parameter extraction has consumed/closed the

@@ -1,19 +1,16 @@
 namespace Octo.Middleware;
 
 /// <summary>
-/// The admin API has no login, so the browser's same-origin policy is the only thing between it
-/// and any web page a LAN user happens to visit. Octo's CORS policy allows every origin, which
-/// Subsonic web players need, and it used to apply to /api/admin as well: a page anywhere could
-/// read every stored key and password and post new settings.
+/// Stops other websites; AdminSignInGate stops people. Octo's CORS policy allows every origin,
+/// which Subsonic web players need, and it used to apply to /api/admin as well: a page anywhere
+/// could read every stored key and password and post new settings. The sign-in cookie does not
+/// end that on its own, because a page on another port of the same host, or a sibling subdomain,
+/// is same-site and the browser sends it the cookie.
 ///
 /// Reads: CORS headers are stripped, so a browser on another origin cannot read the answer.
 /// Writes: must carry X-Octo-Admin. A page on another origin cannot add a custom header without
 /// a preflight, and the preflight is answered without CORS approval, so the write never leaves
-/// the browser. A script (curl, Home Assistant) can send the header deliberately.
-///
-/// This is not authentication. Anyone who can reach the port directly, or a DNS-rebinding page
-/// that makes itself look same-origin, still gets through. /admin and /api/admin must stay off
-/// the internet.
+/// the browser. A script (curl, Home Assistant) sends the header deliberately, with its cookie.
 /// </summary>
 public static class AdminRequestGuard
 {
