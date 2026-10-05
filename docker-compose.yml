@@ -381,11 +381,18 @@ services:
   # COMPOSE_PROFILES=navidrome to .env, or run `docker compose --profile navidrome up -d`.
   # It reads the same music folder Octo writes to, so a kept song shows up in the
   # library as soon as Octo asks for a scan.
-  navidrome:
+  # Named navidrome-starter, not navidrome: a Navidrome of your own defined in an
+  # override file as "navidrome" would otherwise merge with this one, take on its
+  # profile, and leave nothing for Octo to start. Octo still reaches it as
+  # http://navidrome:4533 through the alias below.
+  navidrome-starter:
     image: deluan/navidrome:latest
     container_name: navidrome
     restart: unless-stopped
     profiles: ["navidrome"]
+    networks:
+      default:
+        aliases: [navidrome]
     ports:
       # Navidrome's own pages: add the people who listen, change passwords, and
       # its web player. Music apps go to Octo on 5274, never here.
