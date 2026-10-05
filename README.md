@@ -95,7 +95,7 @@ The installer asks for your Navidrome URL (and, optionally, Last.fm and Soulseek
 - Point your Subsonic apps at `http://<your-host>:5274`, **not** Navidrome's own address.
 - Octo checks your Navidrome sign-in before it plays or fetches a song from outside your library; while it cannot reach Navidrome, those songs are refused.
 - Open the admin dashboard at **`http://<your-host>:5274/admin`** to manage every setting from the browser, with no config files to edit by hand.
-  It is unauthenticated, so keep Octo on a trusted network. See [Admin dashboard](#admin-dashboard).
+  Sign in with a Navidrome admin account. See [Admin dashboard](#admin-dashboard).
 - If a client reports the server is unreachable, that is Octo telling you setup is not finished: its ping response spells out exactly what to fix (usually the Navidrome URL).
 
 ## Compatible apps
@@ -200,31 +200,53 @@ Prebuilt multi-arch images are also published to `ghcr.io/winters27/octo`, tagge
 
 Every setting has a form, every backing service has a live status indicator, and the **Raw Config** tab lets you edit the whole effective configuration as a JSON file if you'd rather work that way. Changes hot-reload: no rebuild, and no restart for most settings. The few that only apply after a restart are marked **Restart** where you edit them, and anything saved but still waiting on a restart is listed at the top of every page until you restart Octo.
 
-> [!WARNING]
-> **The admin dashboard has no authentication, so run Octo on a trusted network only.**
->
-> Anyone who can reach port 5274 can change every setting, including your Last.fm API key
-> and shared secret, your Navidrome admin login, and the slskd sign-in Octo uses, and
-> connect or disconnect each listener's Last.fm. The passwords and the shared secret show
-> only as a placeholder, but most other settings, API keys included, can be read.
-> Nothing on that page asks who you are.
->
-> Do not port-forward 5274 or put it on a public hostname. If you need Octo from
-> outside your network, reach it over a VPN such as [Tailscale](https://tailscale.com/)
-> or [WireGuard](https://www.wireguard.com/), or put it behind a reverse proxy that
-> requires authentication and blocks `/admin` outright. A proxy that only fronts the
-> Subsonic API and refuses `/admin` and `/api` is enough for music clients, since those
-> only need `/rest`.
->
-> Octo does refuse admin changes from other websites and stops them reading the admin API:
-> a write has to carry an `X-Octo-Admin` header, which a page on another origin cannot add.
-> A script that changes settings must send that header too. **This is not a login.** Anyone
-> who can reach port 5274 directly, or a DNS-rebinding page, can still use the dashboard, so
-> the advice above stands.
->
-> Saved passwords, API keys, tokens and webhook addresses never come back out of the admin
-> API: they read as "(saved, not shown)", and saving that back keeps what is stored. A saved
-> one is also never sent to a new server address unless it is typed again with the address.
+### Signing in
+
+The dashboard asks for a **Navidrome admin** account. Octo checks it with your Navidrome and
+never keeps the password. A browser stays signed in for 90 days after its last visit, across
+restarts. **Sign out** at the bottom of the sidebar ends it now, and **Sign out everywhere**
+ends every browser and script signed in as you. Octo also ends them within an hour of
+Navidrome removing your admin role or your account.
+
+- **Locked out?** If Navidrome is down or its address is wrong, choose **Use the recovery
+  code** and type the code from `admin-recovery-code` in Octo's config folder
+  (`docker exec octo cat /app/config/admin-recovery-code`). Each code works once, signs in for
+  an hour, and can change settings but not library files. On a fresh install with no Navidrome
+  found, the code is also printed in `docker logs octo`. Setting the Navidrome address restarts
+  Octo, which ends a recovery sign-in; sign in with Navidrome after that.
+- **Scripts** sign in the same way and keep the cookie. Keep the login in a file rather than
+  on the command line, where it lands in shell history:
+
+  ```bash
+  # octo-login.json holds {"username":"admin","password":"..."}; chmod 600 it.
+  curl -c octo.cookies -H 'Content-Type: application/json' -H 'X-Octo-Admin: 1' \
+    --data @octo-login.json http://<your-host>:5274/api/admin/browse/auth
+  curl -b octo.cookies -c octo.cookies -H 'X-Octo-Admin: 1' -X POST \
+    http://<your-host>:5274/api/admin/update/check
+  ```
+
+- **Behind a proxy that signs people in** (Authelia, Authentik), set `ADMIN_SIGN_IN=off` to
+  skip Octo's own sign-in. The dashboard shows a red banner while it is off, because anyone
+  who reaches it can then change Octo.
+- **A port of its own:** `ADMIN_PORT=5275` serves the dashboard only on that port and refuses
+  it on 5274, so 5274 can face your music apps while 5275 stays at home. Uncomment the
+  matching `ports` line in `docker-compose.yml`.
+- Your Navidrome decides who is an admin. On a fresh install Octo adopts the one Navidrome it
+  finds on your network, so check that the **Music server** page names yours.
+- Ten wrong sign-ins from one address in 15 minutes make that address wait.
+- Over plain HTTP the password crosses your network the way Navidrome's own login does; put an
+  HTTPS proxy in front if that matters to you.
+- Saving settings, saving the raw config and restarting Octo each write a log line naming who
+  did it.
+
+Music apps never need the dashboard; they only use `/rest`. Keeping `/admin` and `/api/admin`
+off a public hostname is still a good idea. Writes to the admin API must also carry an
+`X-Octo-Admin` header, which a page on another website cannot add, so a site you visit cannot
+change Octo through your signed-in browser.
+
+Saved passwords, API keys, tokens and webhook addresses never come back out of the admin API:
+they read as "(saved, not shown)", and saving that back keeps what is stored. A saved one is
+also never sent to a new server address unless it is typed again with the address.
 
 ## Notifications
 
@@ -381,7 +403,7 @@ has a re-tag tool: pick a scope, **Preview changes** walks every file and writes
 then can you apply. Apply is withheld if you change the scope or the rules after previewing,
 because it would write something other than what the preview showed. An undo that is cancelled
 or cannot reach a file keeps that file's entry, so running Undo again finishes the job. Every one of its endpoints requires signing in with a Navidrome admin
-account, because `/api/admin` has no authentication of its own and this rewrites tags.
+account (not the recovery code), because this rewrites tags.
 
 Applying records each changed genre frame in `/app/config/genre-backfill-journal.jsonl`, which
 backs a one-click undo. **Undo restores the genre and nothing else**: writing a tag rewrites the

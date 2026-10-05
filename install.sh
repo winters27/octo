@@ -413,7 +413,7 @@ check_svc() {
   else
     local detail
     detail=$(echo "$status_json" | sed -n "s/.*\"$key\":{[^}]*\"detail\":\"\\([^\"]*\\)\".*/\\1/p" | head -c 100)
-    printf "  %-14s " "$name"; yellow "⚠ ${detail:-not reachable}"
+    printf "  %-14s " "$name"; yellow "⚠ ${detail:-not reachable, see the dashboard for why}"
   fi
 }
 check_svc "Navidrome"  "navidrome"

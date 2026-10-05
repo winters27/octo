@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     ports:
       - "5274:8080"
+      # The dashboard on a port of its own: set ADMIN_PORT=5275 in .env, then uncomment.
+      # 127.0.0.1 keeps it on this machine; use this machine's LAN address to reach it from home.
+      # - "127.0.0.1:5275:5275"
     environment:
       ASPNETCORE_ENVIRONMENT: Production
 
@@ -251,6 +254,11 @@ services:
       # install it (see "Updating" in the README).
       Updates__Check: ${UPDATES_CHECK:-true}
       Updates__Repo: ${UPDATES_REPO:-winters27/octo}
+      # ----- Dashboard sign-in -----
+      # A Navidrome admin account signs in to the dashboard. off only behind a proxy
+      # that signs people in itself. ADMIN_PORT gives the dashboard a port of its own.
+      Admin__SignIn: ${ADMIN_SIGN_IN:-required}
+      Admin__Port: ${ADMIN_PORT:-0}
     volumes:
       - ${DOWNLOAD_PATH:-./downloads}:/music
       # Editable settings file: the admin UI writes here, ASP.NET hot-reloads on
