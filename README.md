@@ -735,6 +735,7 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `getAcquisitions`, `getAcquisition`, `clearAcquisitions` | the `octoAcquisitions` extension: the caller's downloads; version 2 adds each one's log and clearing finished ones |
 | `findSongs`, `getFoundSongs`, `pickFoundSong` | `octoAcquisitions` 2: a song's search run again on the caller's download sources, every copy found, and fetching the one picked |
 | `getImports`, `getImport`, `importAction` | the `octoImports` extension: the caller's Spotify sign-in, imported lists with what the library has of each, and the trickle |
+| `getTopSongs` | the standard top songs of an artist (by name, or by id as Navidrome's `topSongsByArtistId`), for every app: ranked as `getArtistTopSongs` ranks them, songs you have as your library's own and the rest as outside songs (only yours while search discovery is off); Navidrome's answer when Octo has none |
 | `getArtistTopSongs`, `getTopChart` | the `octoTopSongs` extension: an artist's most played songs and the chart of the moment, each marked in the caller's library or playable from outside it |
 | `/api/artist/{id}`, `/api/album?artist_id=` | Navidrome's own API, for clients that use it (Feishin): an outside artist's page and its albums |
 | `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 and 2, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` (while search discovery is on), `octoImports` and `songLyrics` 1 and 2 |
