@@ -65,6 +65,34 @@ public sealed class SimilarSongsSeedTests
         Assert.DoesNotContain(fixture.Handler.Calls, call => call.Contains("rest/getAlbum", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData("json")]
+    [InlineData("xml")]
+    public async Task EveryRadioSong_SaysWhichSourceSuggestedIt(string format)
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient();
+
+        var body = await client.GetStringAsync($"/rest/getSimilarSongs2?id=spooky&u=alice&t=token&s=salt&f={format}&count=20");
+
+        // Last.fm's chart for the genre, and the playlist's own songs.
+        Assert.Contains(format == "json" ? "\"octoSuggestedBy\":\"Last.fm\"" : "octoSuggestedBy=\"Last.fm\"", body);
+        Assert.Contains(format == "json" ? "\"octoSuggestedBy\":\"Your library\"" : "octoSuggestedBy=\"Your library\"", body);
+    }
+
+    [Theory]
+    [InlineData("true", true)]
+    [InlineData("false", false)]
+    public async Task TheRadioSourcesExtension_IsListedWhileRadioCanAnswer(string radio, bool listed)
+    {
+        await using var fixture = new Factory(new() { ["LastFm:EnableRadio"] = radio });
+        using var client = fixture.CreateClient();
+
+        var body = await client.GetStringAsync("/rest/getOpenSubsonicExtensions?f=json");
+
+        Assert.Equal(listed, body.Contains("octoRadioSources", StringComparison.Ordinal));
+    }
+
     [Fact]
     public async Task ASongTheListenerRatedOneStar_StaysOffTheirRadio()
     {
@@ -232,6 +260,7 @@ public sealed class SimilarSongsSeedTests
                     : """{"randomSongs":{"song":[]}}""",
                 _ when path.EndsWith("/rest/search3") => """{"searchResult3":{}}""",
                 _ when path.EndsWith("/rest/ping") => "",
+                _ when path.EndsWith("/rest/getOpenSubsonicExtensions") => """{"openSubsonic":true,"openSubsonicExtensions":[]}""",
                 _ => null,
             };
             await Task.Yield();
@@ -298,8 +327,13 @@ public sealed class SimilarSongsSeedTests
         public Handler Handler { get; } = new();
         private readonly Mock<IMusicMetadataService> _metadata = new();
 
-        public Factory()
+        private readonly Dictionary<string, string?> _settings;
+
+        /// <param name="settings">On top of the defaults below, which leave every radio source but
+        /// Last.fm off, so a test switches on the ones it is about.</param>
+        public Factory(Dictionary<string, string?>? settings = null)
         {
+            _settings = settings ?? [];
             Directory.CreateDirectory(_directory);
             // Every Last.fm pick not in the library comes back as an outside copy named after it.
             _metadata.Setup(service => service.SearchSongsByArtistTitleAsync(
@@ -323,7 +357,12 @@ public sealed class SimilarSongsSeedTests
                     ["YouTube:ShimUrl"] = "http://127.0.0.1:1",
                     ["LastFm:ApiKey"] = "test-key",
                     ["LastFm:EnableRadio"] = "true",
-                }));
+                    ["RadioSources:YouTubeMusic"] = "false",
+                    ["RadioSources:ListenBrainz"] = "false",
+                    ["RadioSources:SoundsAlike"] = "false",
+                    ["RadioSources:LearnFromListening"] = "false",
+                    ["Octo:StateDirectory"] = _directory,
+                }).AddInMemoryCollection(_settings));
             builder.ConfigureServices(services =>
             {
                 services.RemoveAll<IHostedService>();

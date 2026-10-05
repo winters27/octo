@@ -15,6 +15,7 @@ using Octo.Services.Common;
 using Octo.Services.Local;
 using Octo.Services.Subsonic;
 using Octo.Services.LastFm;
+using Octo.Services.Radio;
 using Octo.Services.CoverArt;
 using Octo.Services.Soulseek;
 
@@ -461,6 +462,8 @@ public partial class SubsonicController : ControllerBase
             return _responseBuilder.CreateError(format, 40, "Wrong username or password");
 
         var songs = await MaterializeStationAsync(station, parameters);
+        var suggested = songs.Where(song => song.SuggestedBy is not null).GroupBy(song => song.Id)
+            .ToDictionary(group => group.Key, group => group.First().SuggestedBy!);
         if (_generatedPlaylists is not null)
             songs = (await _generatedPlaylists.BlendIntoDiscoveryAsync(username, station, songs, parameters,
                 HttpContext.RequestAborted)).ToList();
@@ -475,6 +478,10 @@ public partial class SubsonicController : ControllerBase
         if (_syncCatalog is not null)
             songs = songs.Select(song =>
                 !song.IsLocal && _syncCatalog.TryGetSong(username, song.Id, out var synced) ? synced : song).ToList();
+        // The discovery blend and the catalog swap hand back other objects; the source rides on by
+        // id, on a copy, since a catalog row is shared with other responses.
+        songs = songs.Select(song => suggested.TryGetValue(song.Id, out var by) && song.SuggestedBy != by
+            ? WithSuggestion(song, by) : song).ToList();
         _radioQueueStore.Register(songs.Select(song => song.Id));
         _ = _metadataService.PrewarmYouTubeIdsAsync(songs, topN: 8);
         QueueRefreshIfStale(username);
@@ -886,6 +893,13 @@ public partial class SubsonicController : ControllerBase
             });
     }
 
+    private static Song WithSuggestion(Song song, string by)
+    {
+        var copy = song.Copy();
+        copy.SuggestedBy = by;
+        return copy;
+    }
+
     private async Task<List<Song>> MaterializeStationAsync(LastFmRadioStation station,
         IReadOnlyDictionary<string, string> parameters)
     {
@@ -895,14 +909,19 @@ public partial class SubsonicController : ControllerBase
             await gate.WaitAsync(HttpContext.RequestAborted);
             try
             {
-                return await _radioTrackResolver.ResolveAsync(track.Artist, track.Title, track.Duration,
-                    parameters, HttpContext.RequestAborted) ?? new Song
+                var song = await _radioTrackResolver.ResolveAsync(track.Artist, track.Title, track.Duration,
+                    parameters, HttpContext.RequestAborted, track.YouTubeId) ?? new Song
                 {
                     Id = track.ResolvedId ?? "", Artist = track.Artist, Title = track.Title,
                     Album = track.Album ?? track.Title, Genre = track.Genre, Duration = track.Duration,
                     Year = track.Year, IsLocal = false, ExternalProvider = track.ExternalProvider,
                     ExternalId = track.ResolvedId
                 };
+                // A song that sounded like the seed was a library song; if it is gone, it is not
+                // worth streaming a stranger's copy of it.
+                if (track.Source == RadioProvider.SoundsAlike && !song.IsLocal) return new Song { Id = "" };
+                song.SuggestedBy = RadioProvider.DisplayName(track.Source);
+                return song;
             }
             finally { gate.Release(); }
         });
@@ -2577,7 +2596,8 @@ public partial class SubsonicController : ControllerBase
             relay.Success ? relay.Body : null, relay.ContentType,
             lyricsChoices: _lyricsChoices is not null && _metadataSettings?.CurrentValue.FetchLyrics == true,
             libraryActions: _libraryActions is not null && _libraryActionSettings.CurrentValue.Enabled,
-            topSongs: _subsonicSettings.EnableSearchDiscovery);
+            topSongs: _subsonicSettings.EnableSearchDiscovery,
+            radioSources: _songRadio.Enabled);
     }
 
     /// <summary>
