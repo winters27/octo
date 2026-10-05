@@ -137,6 +137,13 @@ services:
       LastFm__DiscoveryPercent: ${LASTFM_DISCOVERY_PERCENT:-35}
       LastFm__RefreshIntervalHours: ${LASTFM_REFRESH_INTERVAL_HOURS:-12}
       LastFm__MinimumPlays: ${LASTFM_MINIMUM_PLAYS:-10}
+      # Radio's other sources (multi-source radio). Weights live on the dashboard's Radio page.
+      RadioSources__YouTubeMusic: ${RADIO_YOUTUBE_MUSIC:-true}
+      RadioSources__ListenBrainz: ${RADIO_LISTENBRAINZ:-true}
+      RadioSources__SoundsAlike: ${RADIO_SOUNDS_ALIKE:-true}
+      RadioSources__SonicUrl: ${RADIO_SONIC_URL:-http://octo-sonic:8080}
+      RadioSources__SonicPauseSeconds: ${RADIO_SONIC_PAUSE_SECONDS:-2}
+      RadioSources__LearnFromListening: ${RADIO_LEARN_FROM_LISTENING:-true}
 
       # ----- Mixes: genre and decade playlists drawn from your own library -----
       # Served by Octo per listener, like the radio stations; nothing is written to Navidrome.

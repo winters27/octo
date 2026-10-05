@@ -363,15 +363,45 @@ bounded 24-hour/512 MiB temporary cache. Unplayable tracks are rejected for 24 h
 and replaced through the normal refresh path; no prepared track is added to the music
 library. **Start radio from this song** remains a one-time `getSimilarSongs[2]` queue.
 
-That queue is Last.fm's songs like the seed, found by its artist and title. When Last.fm
-has nothing for that very song, as with a YouTube upload tagged with its uploader for the
-artist, the radio leads with the seed's own tags instead: the rest of its album (for a
-library downloaded from playlists, the playlist), library songs with its genre, then
-Last.fm's top songs for that genre. Artists like the seed's artist join only when Last.fm
-knows the artist, so an uploader's name never picks the music. A nightcore, sped up or
-remixed seed whose original Last.fm knows gets songs like the original too, behind its
-album and genre. A title written "Artist - Title" is also looked up under the artist it
-names. An album id starts from its first song, an artist id from artists like them.
+#### Radio sources
+
+That queue, and every station, draws on four sources and blends their answers:
+
+| Source | What it gives |
+| --- | --- |
+| Last.fm | songs like the seed, by its artist and title; similar artists; tag charts |
+| YouTube Music | YouTube Music's radio for the song, which knows uploads Last.fm never heard of (nightcore and phonk channels included); for an artist, the artist's radio |
+| ListenBrainz | recordings people play alongside it, from ListenBrainz's open listening data; with a ListenBrainz token, LB Radio for artist and genre stations |
+| Sounds alike | library songs that sound like it (tempo, timbre, loudness, harmony), from Octo's own analysis of every file |
+
+Each song scores its source's weight, times how closely that source matched the seed itself,
+times its place in the source's list; a song more than one source suggests adds up. A source
+with only a few songs counts less. When the catalogs have fewer than 20 songs like the seed
+itself, as with a YouTube upload tagged with its uploader for the artist, the seed's own tags
+lead: the rest of its album (for a library downloaded from playlists, the playlist), library
+songs with its genre, and the top songs for that genre. Similar artists to the seed's artist
+join only when the source knows the artist, so an uploader's name never picks the music. A
+nightcore, sped up or remixed seed whose original is known gets songs like the original too,
+behind its album and genre. A title written "Artist - Title" is also looked up under the artist
+it names. An album id starts from its first song, an artist id from artists like them. In song
+radio a library song that sounds far from the seed slips down and one that sounds close moves
+up.
+
+Every radio song carries `octoSuggestedBy`, the source that counted most for it, and the Octo
+apps show it in the song's info. Radio also learns from listening: a radio song played through
+counts for its source and one skipped counts against it, per listener, and each listener's
+weights lean on the sources they keep (never below 0.3 or above 1.5). The dashboard's Radio page
+has the switches, the base weights (YouTube Music 1.0, Last.fm 0.9, ListenBrainz 0.7, Sounds
+alike 0.4), what radio has learned, and "Forget what radio learned". `RADIO_YOUTUBE_MUSIC`,
+`RADIO_LISTENBRAINZ`, `RADIO_SOUNDS_ALIKE` and `RADIO_LEARN_FROM_LISTENING` switch them in `.env`.
+YouTube Music and ListenBrainz receive the artist and title of the song a radio starts from.
+
+Sounds alike runs in the `octo-sonic` service (bliss-rs). It reads each song once, one at a time
+with `RADIO_SONIC_PAUSE_SECONDS` between, only while nothing downloads, then keeps up with new
+and changed songs; a damaged file costs only that file. On a network mount the first pass takes
+a while, and the dashboard shows how far it is, with Pause and Start over. `SONIC_CPUS` (default
+1) caps the CPUs it may use; never set it above the machine's count, or Docker will not start it.
+The first `docker compose build` compiles it, which takes several minutes.
 
 `GENRE_NORMALIZE` collapses the genres downloads arrive with into a list you can browse.
 Rules are a pattern-to-genre table applied **in order, first match wins**, edited in the
@@ -700,7 +730,7 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | Endpoint | Why |
 |---|---|
 | `search3` | merge local + Last.fm-driven external songs and Deezer-driven external albums; later pages carry on through the outside songs page one started |
-| `getSimilarSongs2` | radio queue with local-first preference; a song Last.fm cannot place is led by its album and genre |
+| `getSimilarSongs2` | radio queue blended from Last.fm, YouTube Music, ListenBrainz and Sounds alike, local first; a song the catalogs cannot place is led by its album and genre; each song carries `octoSuggestedBy` |
 | `getPlaylists`, `getPlaylist` | append authenticated per-user read-only Radio snapshots and materialize tracks local-first |
 | `createPlaylist`, `updatePlaylist`, `deletePlaylist` | protect reserved Radio IDs while relaying ordinary mutations |
 | `getInternetRadioStations` | append startup-warmed authenticated Octo stations immediately, with a one-starter same-request fallback, while preserving ordinary internet radio |
@@ -721,7 +751,7 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `getImports`, `getImport`, `importAction` | the `octoImports` extension: the caller's Spotify sign-in, imported lists with what the library has of each, and the trickle |
 | `getArtistTopSongs`, `getTopChart` | the `octoTopSongs` extension: an artist's most played songs and the chart of the moment, each marked in the caller's library or playable from outside it |
 | `/api/artist/{id}`, `/api/album?artist_id=` | Navidrome's own API, for clients that use it (Feishin): an outside artist's page and its albums |
-| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 and 2, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` (while search discovery is on), `octoImports` and `songLyrics` 1 and 2 |
+| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 and 2, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`) and `songLyrics` 1 and 2 |
 
 ### Soulseek download details
 

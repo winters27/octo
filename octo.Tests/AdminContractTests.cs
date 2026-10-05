@@ -25,6 +25,7 @@ public class AdminContractTests
         ("Soulseek", typeof(SoulseekSettings)),
         ("Lidarr", typeof(LidarrSettings)),
         ("LastFm", typeof(LastFmSettings)),
+        ("RadioSources", typeof(RadioSourceSettings)),
         ("Genre", typeof(GenreSettings)),
         ("LibraryActions", typeof(LibraryActionSettings)),
         ("Notifications", typeof(NotificationSettings)),

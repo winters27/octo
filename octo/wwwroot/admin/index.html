@@ -827,6 +827,34 @@
         </div>
 
         <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Radio sources</h3>
+            <p class="set-desc">Radio asks every source that is on, besides Last.fm, and blends their answers. A song more than one source suggests counts more. YouTube Music and ListenBrainz receive the artist and title of the song a radio starts from.</p>
+          </div>
+          <form data-section="radio-sources" class="set-card" id="radio-sources-form">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">YouTube Music</div><div class="set-info-d">YouTube Music's radio for the song. It knows uploads Last.fm has never heard of, nightcore and phonk channels included.</div></div>
+              <label class="switch"><input type="checkbox" name="RadioSources.YouTubeMusic" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">ListenBrainz</div><div class="set-info-d">Songs people play alongside it, from ListenBrainz's open listening data. With a ListenBrainz token, its radio also fills artist and genre stations.</div></div>
+              <label class="switch"><input type="checkbox" name="RadioSources.ListenBrainz" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Sounds alike</div><div class="set-info-d">Library songs that sound like it. Octo reads every song once to learn how it sounds, one song at a time and only while nothing is downloading.</div></div>
+              <label class="switch"><input type="checkbox" name="RadioSources.SoundsAlike" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <details class="radio-advanced">
+              <summary>How much each source counts</summary>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">YouTube Music</div><div class="set-info-d">0 to 3. 0 leaves the source out. Default: 1.0.</div></div><input class="set-input" name="RadioSources.YouTubeMusicWeight" type="number" min="0" max="3" step="0.1" /></div>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">Last.fm</div><div class="set-info-d">Default: 0.9.</div></div><input class="set-input" name="RadioSources.LastFmWeight" type="number" min="0" max="3" step="0.1" /></div>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">ListenBrainz</div><div class="set-info-d">Default: 0.7.</div></div><input class="set-input" name="RadioSources.ListenBrainzWeight" type="number" min="0" max="3" step="0.1" /></div>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">Sounds alike</div><div class="set-info-d">How a song sounds says tempo and timbre, not genre or mood, so alone it counts least. When no catalog knows the song, it counts at least 0.8. Default: 0.4.</div></div><input class="set-input" name="RadioSources.SoundsAlikeWeight" type="number" min="0" max="3" step="0.1" /></div>
+            </details>
+          </form>
+        </div>
+
+        <div class="set-section">
           <div class="set-head"><h3 class="set-title">Pinned stations</h3><p class="set-desc">You choose fixed names and tag categories; Octo refreshes the tracks inside them automatically. Add up to 12, each combining up to five Last.fm tags.</p></div>
           <form data-section="lastfm-discovery" class="set-card" id="radio-discovery-form">
             <div class="set-row">
