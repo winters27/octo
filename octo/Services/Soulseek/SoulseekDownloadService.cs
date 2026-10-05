@@ -683,6 +683,22 @@ public class SoulseekDownloadService : BaseDownloadService
 
         // A copy picked in Find songs is the only one tried: no search, and no other peer after it.
         var picked = OptionalService<DownloadPicks>()?.Take(trackKey, SongFinder.SoulseekSource)?.ToHit();
+        // Never a file already found to be the wrong recording, and, in place of a library file,
+        // only one that passes the search's own name, length and version checks.
+        if (picked is not null
+            && SoulseekCandidates.PickRefusal(picked, routing.Title!, routing.Album, routing.Duration, _settings, _rejectedPeers,
+                _verification.RemembersRejections, routing.Artist, replacing: ReplacingPath is not null) is { } refusal)
+        {
+            Logger.LogWarning("Soulseek: the copy picked for '{Artist} - {Title}' ({User} -> {File}) is not fetched: {Why}",
+                routing.Artist, routing.Title, picked.Username, picked.Filename, refusal);
+            LogStep(trackKey, AcquisitionEventKinds.Check, "The copy you picked was not fetched", refusal);
+            throw new FileNotFoundException($"The copy you picked was not fetched: {refusal}");
+        }
+        // Whether the picked file's own name and folder say it is the song. When they do not, the
+        // person's pick, not the name, is what stands behind it.
+        var pickedUnmatched = picked is not null
+            && SoulseekCandidates.Judge(picked, routing.Title!, routing.Album, routing.Duration, _settings, _rejectedPeers,
+                _verification.RemembersRejections, routing.Artist).Tier >= 2;
         // An album walk may have queued this song's file already, from one peer's folder of the
         // album. That file is tried first, without a search; the search runs only if it fails.
         PreparedTransfer? prepared = null;
@@ -1089,7 +1105,7 @@ public class SoulseekDownloadService : BaseDownloadService
                     // the album and the credit it will be filed under.
                     Logger.LogInformation("Soulseek download complete (attempt {N}, slskd state={State}{Aborted}): {Path}",
                         attemptIdx, state?.ToString() ?? "interrupted", callerGaveUp ? ", caller had already left" : "", localPath);
-                    LogStep(trackKey, AcquisitionEventKinds.Check, "Passed the checks", ChecksPassed(verdict, spectrum));
+                    LogStep(trackKey, AcquisitionEventKinds.Check, "Passed the checks", ChecksPassed(verdict, spectrum, pickedUnmatched));
                     return Accept(localPath, hit, verdict, transcodedFrom: null);
                 }
 
@@ -1152,12 +1168,24 @@ public class SoulseekDownloadService : BaseDownloadService
     }
 
     /// <summary>The checks a kept file passed, in words, for the log.</summary>
-    private string ChecksPassed(Octo.Services.Fingerprint.VerificationResult verdict, Octo.Services.Fingerprint.SpectrumReport spectrum)
+    private string ChecksPassed(Octo.Services.Fingerprint.VerificationResult verdict, Octo.Services.Fingerprint.SpectrumReport spectrum,
+        bool pickedUnmatched) =>
+        ChecksPassedText(verdict.Verdict == Octo.Services.Fingerprint.VerificationVerdict.Confirmed,
+            !spectrum.IsLikelyLossy && _settings.DetectTranscodes, pickedUnmatched);
+
+    /// <summary>
+    /// The checks a kept file passed, in words. Without AcoustID's word, the file's name and
+    /// length are what stand behind it, except for a copy someone picked whose name or folder did
+    /// not match the song: then it is their pick, and the log says so rather than claim a check
+    /// that never passed.
+    /// </summary>
+    internal static string ChecksPassedText(bool confirmed, bool reallyLossless, bool pickedUnmatched)
     {
         var parts = new List<string> { "the right length" };
-        parts.Add(verdict.Verdict == Octo.Services.Fingerprint.VerificationVerdict.Confirmed
-            ? "AcoustID: the same recording" : "AcoustID could not say, so the name and length decide");
-        if (!spectrum.IsLikelyLossy && _settings.DetectTranscodes) parts.Add("the spectrum: really lossless");
+        parts.Add(confirmed ? "AcoustID: the same recording"
+            : pickedUnmatched ? "AcoustID could not say, and its name or folder did not fit the song: kept because you picked it"
+            : "AcoustID could not say, so the name and length decide");
+        if (reallyLossless) parts.Add("the spectrum: really lossless");
         return string.Join("; ", parts);
     }
 

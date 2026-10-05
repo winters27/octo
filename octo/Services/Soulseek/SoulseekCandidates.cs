@@ -107,6 +107,23 @@ internal static class SoulseekCandidates
         return (null, 0);
     }
 
+    /// <summary>
+    /// Why a copy picked in Find songs may not be fetched, or null when it may. A file Octo
+    /// downloaded before and found to be the wrong recording is never fetched again. A pick that
+    /// would replace a library file meets the download's own name, length and version checks too,
+    /// only the format preference relaxed: a person can see a copy is lossless, not that a file
+    /// from a live album or of another version is the song in their library.
+    /// </summary>
+    public static string? PickRefusal(SoulseekFileHit hit, string title, string? album, int? duration,
+        SoulseekSettings settings, RejectedPeerRegistry? rejected, bool remembersRejections, string? artist, bool replacing)
+    {
+        if (!SoulseekDownloadService.CandidateAllowed(hit, rejected, remembersRejections))
+            return "Octo downloaded this file before and it was the wrong recording";
+        if (!replacing) return null;
+        var (note, tier) = Judge(hit, title, album, duration, settings, rejected, remembersRejections, artist);
+        return tier >= 2 ? note : null;
+    }
+
     /// <summary>"3:58".</summary>
     public static string LengthText(int seconds) =>
         $"{seconds / 60}:{(seconds % 60).ToString("00", CultureInfo.InvariantCulture)}";

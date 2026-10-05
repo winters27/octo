@@ -356,7 +356,8 @@ public class DownloadLogTests
     {
         var mp3Owned = new FindTarget("Air", "Sexy Boy", null, null, "nd-1", LibraryId: "nd-1", OwnedFormat: "mp3");
         var flacOwned = mp3Owned with { OwnedFormat = "flac" };
-        var flac = Copy("Soulseek", 1, "a.flac");
+        var flac = Copy("Soulseek", 1, "Air - Sexy Boy.flac");
+        flac.Pick.Size = 30_000_000;
         var mp3 = new FoundCopy(new AcquisitionCandidate("Soulseek", Format: "mp3"), new PickedCopy { Source = "Soulseek" });
         var lidarrMp3 = new FoundCopy(new AcquisitionCandidate("Lidarr", Format: "MP3-320"),
             new PickedCopy { Source = "Lidarr", ReleaseGuid = "g", IndexerId = 1 });

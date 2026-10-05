@@ -285,6 +285,98 @@ public sealed class DownloadMatchingTests : IDisposable
         Assert.All(slskd.Searches, s => Assert.Equal(2_000, s.FileLimit));
     }
 
+    // ---- A picked copy meets the same filters --------------------------------------------------
+
+    private const string LiveTake = @"Music\Drake\Take Care (Live at the O2 Arena 2012)\04 - Take Care.flac";
+
+    private static PickedCopy Picked(string file) =>
+        new() { Source = "Soulseek", Peer = "livepeer", File = file, Size = Flac(277).Length, Format = "flac", Length = 277 };
+
+    [Fact]
+    public async Task APickFromALiveAlbumNeverTakesTheLibraryFilesPlace()
+    {
+        var picks = new DownloadPicks();
+        var (service, slskd, song) = Build((_, _) => ([], "Completed, TimedOut"), picks);
+        picks.Pin(song.ExternalId!, Picked(LiveTake));
+        var original = Path.Combine(_root, "library", "04 - Take Care.mp3");
+        Directory.CreateDirectory(Path.GetDirectoryName(original)!);
+        File.WriteAllBytes(original, [1, 2, 3]);
+        var handoff = new Octo.Services.Library.ReplacementHandoff
+        {
+            OriginalPath = original,
+            Identity = new Octo.Services.Library.KeptIdentity("Take Care", "Take Care", ["Drake"], ["Drake"], null, null, null, null,
+                4, 0, 1, 0, false),
+            BeforeReveal = _ => Task.FromResult<string?>(null),
+        };
+
+        var refused = await Assert.ThrowsAnyAsync<Exception>(() => service.ExecuteAcquisitionAsync("soulseek", song.ExternalId!, false, true,
+            DownloadSource.Soulseek, CancellationToken.None, upgradeSearch: true, replacement: handoff).WaitAsync(TimeSpan.FromSeconds(60)));
+
+        Assert.Contains("From a live album", refused.Message);
+        Assert.Empty(slskd.Batches);
+        Assert.Empty(slskd.Searches);
+    }
+
+    [Fact]
+    public async Task APickForASongNotInTheLibraryIsFetchedAsPicked()
+    {
+        var picks = new DownloadPicks();
+        var (service, slskd, song) = Build((_, _) => ([], "Completed, TimedOut"), picks);
+        picks.Pin(song.ExternalId!, Picked(LiveTake));
+        slskd.Length(LiveTake, 277);
+
+        var path = await service.ExecuteAcquisitionAsync("soulseek", song.ExternalId!, false, true,
+            DownloadSource.Soulseek, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal("livepeer", Assert.Single(slskd.Batches).User);
+        Assert.Empty(slskd.Searches);
+        Assert.EndsWith(".flac", path);
+    }
+
+    [Fact]
+    public void APickedCopyMeetsTheDenyListAlways_AndTheSearchsChecksWhenItReplacesAFile()
+    {
+        var settings = new SoulseekSettings();
+        var live = new SoulseekFileHit { Username = "livepeer", Filename = LiveTake, Size = 30_000_000, Length = 277, Extension = "flac" };
+        var plain = new SoulseekFileHit { Username = "peer", Filename = @"Music\Drake\Take Care (2011)\04 - Take Care.flac", Size = 30_000_000, Length = 277, Extension = "flac" };
+        var mp3 = new SoulseekFileHit { Username = "peer", Filename = @"Music\Drake\Take Care (2011)\04 - Take Care.mp3", Size = 11_000_000, Length = 277, Extension = "mp3" };
+        var denied = new RejectedPeerRegistry();
+        denied.Deny(plain.Username, plain.Filename, "AcoustID: another recording", "Drake - Take Care");
+
+        string? Refusal(SoulseekFileHit hit, bool replacing, RejectedPeerRegistry? rejected = null) =>
+            SoulseekCandidates.PickRefusal(hit, "Take Care (feat. Rihanna)", "Take Care", 277, settings, rejected, rejected is not null,
+                "Drake", replacing);
+
+        Assert.Null(Refusal(live, replacing: false));
+        Assert.Equal("From a live album", Refusal(live, replacing: true));
+        Assert.Null(Refusal(plain, replacing: true));
+        // The format is the one check a person can see for themselves.
+        Assert.Null(Refusal(mp3, replacing: true));
+        Assert.Equal("Octo downloaded this file before and it was the wrong recording", Refusal(plain, replacing: false, denied));
+    }
+
+    [Fact]
+    public void FindSongsRefusesALiveTakeInPlaceOfALibrarySong()
+    {
+        var target = new FindTarget("Drake", "Take Care (feat. Rihanna)", "Take Care", 277, "nd-1", LibraryId: "nd-1", OwnedFormat: "mp3");
+        var pick = Picked(LiveTake);
+        pick.Size = 30_000_000;
+        var copy = new FoundCopy(SoulseekCandidates.Of(pick.ToHit()!), pick);
+
+        Assert.Equal("From a live album, so it cannot take the place of the one in your library.", SongFinder.ReplaceRefusal(target, copy));
+    }
+
+    [Fact]
+    public void ALogSaysAPickedCopyWasKeptOnTheWordOfThePick_NotOfItsName()
+    {
+        Assert.Equal("the right length; AcoustID could not say, so the name and length decide",
+            SoulseekDownloadService.ChecksPassedText(confirmed: false, reallyLossless: false, pickedUnmatched: false));
+        Assert.Equal("the right length; AcoustID could not say, and its name or folder did not fit the song: kept because you picked it",
+            SoulseekDownloadService.ChecksPassedText(confirmed: false, reallyLossless: false, pickedUnmatched: true));
+        Assert.StartsWith("the right length; AcoustID: the same recording",
+            SoulseekDownloadService.ChecksPassedText(confirmed: true, reallyLossless: true, pickedUnmatched: true));
+    }
+
     private static object[] Mp3Wall() => Enumerable.Range(1, 30).Select(i => (object)new
     {
         username = $"mp3peer{i}", uploadSpeed = 5_000_000, queueLength = 0, hasFreeUploadSlot = true,
@@ -393,7 +485,7 @@ public sealed class DownloadMatchingTests : IDisposable
 
     /// <summary>One song, "Drake - Take Care (feat. Rihanna)" from the album Take Care, ready to star.</summary>
     private (SoulseekDownloadService Service, FakeSlskd Slskd, Song Song) Build(
-        Func<string, int, (object[] Responses, string State)> answer)
+        Func<string, int, (object[] Responses, string State)> answer, DownloadPicks? picks = null)
     {
         var registry = new ExternalIdRegistry();
         var id = registry.Register(new SoulseekRouting
@@ -429,6 +521,7 @@ public sealed class DownloadMatchingTests : IDisposable
         var services = new ServiceCollection()
             .AddSingleton<IOptionsMonitor<SoulseekSettings>>(monitor)
             .AddSingleton(new DownloadConcurrency(monitor))
+            .AddSingleton(picks ?? new DownloadPicks())
             .BuildServiceProvider();
         var config = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?> { ["Library:DownloadPath"] = _root }).Build();

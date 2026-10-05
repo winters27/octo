@@ -106,6 +106,8 @@ public sealed class SongFinder
 
     private DateTime Now => _time.GetUtcNow().UtcDateTime;
 
+    private bool Remembers => _services.GetService<Octo.Services.Fingerprint.DownloadVerificationService>()?.RemembersRejections ?? false;
+
     // ---------------------------------------------------------------------------------------
     // Looking
     // ---------------------------------------------------------------------------------------
@@ -258,23 +260,40 @@ public sealed class SongFinder
 
     /// <summary>
     /// Why a picked copy cannot replace a library song, or null when it can: only a lossless copy
-    /// replaces a lossy one, which is what Better quality checks again when the file arrives.
+    /// replaces a lossy one, which is what Better quality checks again when the file arrives, and
+    /// a Soulseek file must pass the download's own name, length and version checks (see
+    /// <see cref="SoulseekCandidates.PickRefusal"/>).
     /// </summary>
-    internal static string? ReplaceRefusal(FindTarget target, FoundCopy copy)
+    internal static string? ReplaceRefusal(FindTarget target, FoundCopy copy, SoulseekSettings? settings = null,
+        RejectedPeerRegistry? rejected = null, bool remembers = false)
     {
         if (IsLossless(target.OwnedFormat)) return "Your copy is already lossless, so nothing would be better.";
         if (copy.Pick.IsSoulseek && !IsLossless(copy.Shown.Format))
             return "Only a lossless copy can take the place of the one in your library.";
         if (!copy.Pick.IsSoulseek && copy.Pick.Release is not null && !IsLossless(FirstWord(copy.Shown.Format)))
             return "Only a lossless release can take the place of the one in your library.";
+        if (copy.Pick.ToHit() is { } hit
+            && SoulseekCandidates.PickRefusal(hit, target.Title, target.Album, target.Duration, settings ?? new SoulseekSettings(),
+                rejected, remembers, target.Artist, replacing: true) is { } why)
+            return $"{why}, so it cannot take the place of the one in your library.";
         return null;
     }
+
+    /// <summary>Why a picked copy of a song not in the library may not be fetched, or null.</summary>
+    internal static string? PickRefusal(FindTarget target, FoundCopy copy, RejectedPeerRegistry? rejected, bool remembers) =>
+        copy.Pick.ToHit() is { } hit
+        && SoulseekCandidates.PickRefusal(hit, target.Title, target.Album, target.Duration, new SoulseekSettings(),
+            rejected, remembers, target.Artist, replacing: false) is { } why
+            ? $"{why}, so it is not fetched again."
+            : null;
 
     private async Task<PickOutcome> FetchAsync(FindTarget target, FoundCopy copy, string user)
     {
         if (target.LibraryId is { } libraryId)
         {
-            if (ReplaceRefusal(target, copy) is { } refused) return new(LibraryActionStates.Skipped, refused);
+            if (ReplaceRefusal(target, copy, _services.GetService<IOptionsMonitor<SoulseekSettings>>()?.CurrentValue,
+                    _services.GetService<RejectedPeerRegistry>(), Remembers) is { } refused)
+                return new(LibraryActionStates.Skipped, refused);
             var settings = _services.GetService<IOptionsMonitor<LibraryActionSettings>>()?.CurrentValue;
             var queue = _services.GetService<UpgradeQueue>();
             var sources = _services.GetService<UpgradeSources>();
@@ -291,6 +310,8 @@ public sealed class SongFinder
             return new(LibraryActionStates.Queued, "Getting the copy you picked. Your copy stays until the new one passes every check.");
         }
 
+        if (PickRefusal(target, copy, _services.GetService<RejectedPeerRegistry>(), Remembers) is { } denied)
+            return new(LibraryActionStates.Skipped, denied);
         var externalId = target.ExternalId!;
         var provider = SoulseekMetadataService.ProviderName;
         var tracker = _services.GetService<AcquisitionTracker>();
