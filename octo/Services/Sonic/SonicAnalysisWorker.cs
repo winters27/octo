@@ -85,7 +85,7 @@ public sealed class SonicAnalysisWorker : BackgroundService
             tracker.Ended += end => { if (end.Done && end.LibraryId is { Length: > 0 } id) ArrivedFirst(id); };
     }
 
-    /// <summary>A song that just arrived in the library is analysed before the rest of the pass.</summary>
+    /// <summary>A song that just arrived in the library is analyzed before the rest of the pass.</summary>
     internal void ArrivedFirst(string libraryId) => _first.Enqueue(libraryId);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -125,7 +125,7 @@ public sealed class SonicAnalysisWorker : BackgroundService
         // again or counting a pass.
         var arrivalsOnly = _rows is null && _store.Read(s => s.NextPassUtc > now);
         if (arrivalsOnly && _first.IsEmpty)
-            return Hold("Done", "Every song has been analysed. New or changed ones are looked for later.", IdleCheck);
+            return Hold("Done", "Every song has been analyzed. New or changed ones are looked for later.", IdleCheck);
 
         var generation = Volatile.Read(ref _generation);
         if (_rows is null && !arrivalsOnly)
@@ -141,7 +141,7 @@ public sealed class SonicAnalysisWorker : BackgroundService
         if (target is null)
         {
             if (arrivalsOnly)
-                return Hold("Done", "Every song has been analysed. New or changed ones are looked for later.", IdleCheck);
+                return Hold("Done", "Every song has been analyzed. New or changed ones are looked for later.", IdleCheck);
             if (generation != Volatile.Read(ref _generation)) return TimeSpan.Zero;
             var present = _rows!.Select(row => row.Id).ToHashSet(StringComparer.Ordinal);
             var complete = _complete;
@@ -157,7 +157,7 @@ public sealed class SonicAnalysisWorker : BackgroundService
             _store.Flush();
             _logger.LogInformation("Sounds alike finished a pass over {Count} song(s), {Skipped} left out", _rows.Count, _skipped.Count);
             _rows = null;
-            return Hold("Done", "Every song has been analysed. New or changed ones are looked for later.", IdleCheck);
+            return Hold("Done", "Every song has been analyzed. New or changed ones are looked for later.", IdleCheck);
         }
 
         var (row, file, stamp) = target.Value;
@@ -231,7 +231,7 @@ public sealed class SonicAnalysisWorker : BackgroundService
         if (row.Duration is null or <= 0 or > LongestSeconds) { _skipped.Add(row.Id); return null; }
         var known = _store.Read(s => (s.Songs.GetValueOrDefault(row.Id), s.Failed.GetValueOrDefault(row.Id)));
         // Cheap checks first, without touching the disk (a stat over a network mount is slow):
-        // a song already analysed at this size and version, or one that failed at this size lately.
+        // a song already analyzed at this size and version, or one that failed at this size lately.
         if (known.Item1 is { } done && done.Version == version && done.Stamp.StartsWith(row.Size + ":", StringComparison.Ordinal))
             return null;
         if (known.Item2 is { } lately && lately.Stamp.StartsWith(row.Size + ":", StringComparison.Ordinal)

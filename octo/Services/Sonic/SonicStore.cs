@@ -2,7 +2,7 @@ using System.Text.Json;
 
 namespace Octo.Services.Sonic;
 
-/// <summary>One analysed song.</summary>
+/// <summary>One analyzed song.</summary>
 public sealed class SonicSong
 {
     public string Stamp { get; set; } = "";
@@ -33,7 +33,7 @@ public sealed class SonicState
 }
 
 /// <summary>
-/// What every analysed song sounds like, on disk beside the settings, and the songs nearest a
+/// What every analyzed song sounds like, on disk beside the settings, and the songs nearest a
 /// seed. Written at most every few seconds, like the review sweep's store.
 /// </summary>
 public sealed class SonicStore
@@ -87,7 +87,7 @@ public sealed class SonicStore
         }
     }
 
-    /// <summary>Library songs that sound most like the seed, nearest first. Nothing for a song not analysed yet.</summary>
+    /// <summary>Library songs that sound most like the seed, nearest first. Nothing for a song not analyzed yet.</summary>
     public IReadOnlyList<(string Id, SonicSong Song, double Distance)> Nearest(string seedId, int count)
     {
         lock (_lock)
@@ -133,7 +133,7 @@ public sealed class SonicStore
     /// at or under the 25th percentile of the seed's distances to the whole library,
     /// <see cref="FitFar"/> at or over the 75th, in a straight line between. Measured against the
     /// seed's own spread, because how far "close" is differs from library to library and song to
-    /// song. Empty when the seed has not been analysed; a candidate without a sound is left out.
+    /// song. Empty when the seed has not been analyzed; a candidate without a sound is left out.
     /// </summary>
     public IReadOnlyDictionary<string, double> FitFactors(string seedId, IEnumerable<string> candidateIds)
     {

@@ -1914,7 +1914,7 @@ loadReviewSweep();
 setInterval(() => { if (document.visibilityState === 'visible') loadReviewSweep(); }, 30000);
 
 // Sounds alike: octo-sonic's analysis of every song, on the Last.fm radio page.
-const sonicStates = { Off: 'Off', Paused: 'Paused', Waiting: 'Waiting', Running: 'Analysing', Done: 'Up to date' };
+const sonicStates = { Off: 'Off', Paused: 'Paused', Waiting: 'Waiting', Running: 'Analyzing', Done: 'Up to date' };
 
 async function loadSonic() {
   const status = document.getElementById('sonic-status');
@@ -1924,7 +1924,7 @@ async function loadSonic() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const s = await response.json();
     const parts = [`${sonicStates[s.state] || s.state}.`];
-    if (s.total > 0) parts.push(`${s.analysed} of ${s.total} songs analysed (pass ${s.pass}).`);
+    if (s.total > 0) parts.push(`${s.analysed} of ${s.total} songs analyzed (pass ${s.pass}).`);
     if (s.failed > 0) parts.push(`${s.failed} could not be read.`);
     if (s.skipped > 0) parts.push(`${s.skipped} left out: Octo cannot find the file, or the song has no length or runs over 45 minutes.`);
     if (s.reason) parts.push(s.reason);
@@ -1960,7 +1960,7 @@ document.getElementById('sonic-toggle')?.addEventListener('click', (event) => {
 document.getElementById('sonic-reset')?.addEventListener('click', async (event) => {
   // Taken before the question: once it is awaited the event no longer says which button it was.
   const button = event.currentTarget;
-  if (!(await askConfirm('Analyse every song again?', 'Octo forgets what every song sounds like and reads them all again, one at a time.', 'Start over'))) return;
+  if (!(await askConfirm('Analyze every song again?', 'Octo forgets what every song sounds like and reads them all again, one at a time.', 'Start over'))) return;
   sonicPost(button, '/api/admin/sonic/reset', 'Starting over.');
 });
 loadSonic();

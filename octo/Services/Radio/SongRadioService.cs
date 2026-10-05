@@ -83,7 +83,7 @@ public sealed class SongRadioService(RadioSourceSet sources, LastFmRadioTrackRes
             .Select(item => (Song: item.Song!, item.Score)).DistinctBy(item => item.Song.Id).ToList();
         // Sound check: a library pick that sounds far from the seed slips down, one that sounds
         // close moves up. It catches a catalog's wrong-mood pick that the other sources missed.
-        // Only songs Octo has analysed have a sound, so outside songs keep their score.
+        // Only songs Octo has analyzed have a sound, so outside songs keep their score.
         if (sonic is not null && radioSettings.CurrentValue.SoundsAlike && seed.LibrarySong is { Id.Length: > 0 } seedSong)
         {
             var fit = sonic.FitFactors(seedSong.Id, scored.Where(item => item.Song.IsLocal).Select(item => item.Song.Id));

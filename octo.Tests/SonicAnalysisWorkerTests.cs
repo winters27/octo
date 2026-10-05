@@ -173,7 +173,7 @@ public sealed class SonicAnalysisWorkerTests : IDisposable
         await t.Worker.TickAsync(default);
         Assert.Equal("Done", t.Worker.Status().State);
         Assert.Equal(1, t.Store.Read(s => s.Pass));
-        // Analysed songs at the same size are passed over without asking for their files.
+        // Analyzed songs at the same size are passed over without asking for their files.
         Assert.Equal(lookups, t.Library.FileLookups);
         Assert.Equal(2, t.Sidecar.Analysed.Count);
     }
