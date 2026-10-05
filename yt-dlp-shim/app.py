@@ -39,6 +39,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from flask import Flask, Response, abort, jsonify, request, stream_with_context
 
+import ytm
+
 from gate import TieredGate
 
 # The binary baked into the image. Never written to, so a rebuild is always a
@@ -704,6 +706,95 @@ def _open_upstream(url: str, headers: dict, video_id: str):
     except Exception as e:
         log.warning("stream upstream failed for %s: %s", video_id, e)
         return None
+
+
+# --- YouTube Music (Octo's radio) -------------------------------------------------
+# Search and radio through ytmusicapi, no sign-in. These are plain HTTP calls to YouTube
+# Music, not yt-dlp processes, so they have their own small gate instead of TieredGate.
+_YTM_GATE = threading.BoundedSemaphore(int(os.environ.get("YTM_MAX_CONCURRENT", "3")))
+_YTM_CACHE: "OrderedDict[tuple, tuple[float, object]]" = OrderedDict()
+_YTM_LOCK = threading.Lock()
+_YTM_TTL = {"search": 24 * 3600, "radio": 3600, "artist": 3600}
+
+
+def _arg_int(name, default, low, high):
+    try:
+        return min(max(int(request.args.get(name, default)), low), high)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ytm_cached(kind, key, load, limit=2000):
+    """A cached answer, else load() under the gate; None when the gate stays full."""
+    now = time.time()
+    with _YTM_LOCK:
+        hit = _YTM_CACHE.get((kind, key))
+        if hit and now - hit[0] < _YTM_TTL[kind]:
+            _YTM_CACHE.move_to_end((kind, key))
+            return hit[1]
+    if not _YTM_GATE.acquire(timeout=20):
+        return None
+    try:
+        value = load()
+    finally:
+        _YTM_GATE.release()
+    with _YTM_LOCK:
+        _YTM_CACHE[(kind, key)] = (now, value)
+        while len(_YTM_CACHE) > limit:
+            _YTM_CACHE.popitem(last=False)
+    return value
+
+
+@app.get("/ytm/search")
+def ytm_search():
+    q = request.args.get("q", "").strip()
+    if not q:
+        abort(400, "missing q")
+    filter_name = request.args.get("filter", "songs")
+    if filter_name not in ("songs", "videos"):
+        abort(400, "filter must be songs or videos")
+    limit = _arg_int("limit", 10, 1, 20)
+    try:
+        rows = _ytm_cached("search", (q.lower(), filter_name, limit), lambda: ytm.search(q, filter_name, limit))
+    except Exception as e:  # ytmusicapi raises plain exceptions when YouTube Music changes its pages
+        log.warning("ytm search failed for %r: %s", q, e)
+        return jsonify(error="ytm_failed"), 502
+    if rows is None:
+        return jsonify(error="busy"), 503
+    return jsonify(tracks=rows)
+
+
+@app.get("/ytm/radio")
+def ytm_radio():
+    video_id = request.args.get("videoId", "").strip()
+    if not video_id:
+        abort(400, "missing videoId")
+    limit = _arg_int("limit", 50, 1, 100)
+    try:
+        rows = _ytm_cached("radio", (video_id, limit), lambda: ytm.radio(video_id, limit), limit=500)
+    except Exception as e:
+        log.warning("ytm radio failed for %s: %s", video_id, e)
+        return jsonify(error="ytm_failed"), 502
+    if rows is None:
+        return jsonify(error="busy"), 503
+    return jsonify(tracks=rows)
+
+
+@app.get("/ytm/artist-radio")
+def ytm_artist_radio():
+    q = request.args.get("q", "").strip()
+    if not q:
+        abort(400, "missing q")
+    limit = _arg_int("limit", 50, 1, 100)
+    try:
+        found = _ytm_cached("artist", (q.lower(), limit), lambda: ytm.artist_radio(q, limit), limit=500)
+    except Exception as e:
+        log.warning("ytm artist radio failed for %r: %s", q, e)
+        return jsonify(error="ytm_failed"), 502
+    if found is None:
+        return jsonify(error="busy"), 503
+    artist, rows = found
+    return jsonify(artist=artist, tracks=rows)
 
 
 @app.get("/stream")
