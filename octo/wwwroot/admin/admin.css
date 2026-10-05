@@ -1055,6 +1055,8 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   color: var(--accent);
 }
 .status-card-head .icon { width: 22px; height: 22px; }
+/* Octo's own card carries the octopus, the same mark as the sidebar. */
+.status-card-logo { width: 28px; height: 28px; border-radius: 8px; }
 .status-card-head .status-dot { margin-left: auto; }
 .status-card-title { font-size: var(--t-body); font-weight: 600; color: var(--ink); }
 .status-card-body {
