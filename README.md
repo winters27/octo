@@ -20,7 +20,9 @@ Octo gives a home server what a streaming app has: search that reaches past your
 
 It runs on [Navidrome](https://www.navidrome.org/), the open-source music server. If you already run Navidrome, Octo sits in front of it and your library stays as it is. If you don't, the installer starts one for you.
 
-![Home in the Octo desktop app](docs/images/players/desktop-home.webp)
+![Searching Fleetwood Mac in the Octo desktop app, playing "Go Your Own Way" from Rumours, pressing + and watching Octo download it into the library](docs/images/demo.gif)
+
+<sub>Recorded in the Octo desktop app on a real server: search, play, press <b>+</b>, and the song is downloaded into the library. The download is shown faster than it ran, and the Soulseek users the copies came from are renamed.</sub>
 
 ## What you get
 
@@ -76,6 +78,8 @@ On the starter stack Navidrome runs from the same `docker-compose.yml`, turned o
 ## Octo's own apps
 
 Any Subsonic app works with Octo. Its own apps for desktop and Android are made for it: the music Octo finds sits beside your library, and keeping a song is just **Add to library**.
+
+![Home in the Octo desktop app](docs/images/players/desktop-home.webp)
 
 - **Add songs to your library.** Press **+** on a song, an album or a search result and it joins your library.
 - **One search for everything.** Your music comes first, then what Octo found, and all of it plays straight away.
