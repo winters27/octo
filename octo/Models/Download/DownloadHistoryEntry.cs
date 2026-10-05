@@ -47,4 +47,18 @@ public class DownloadHistoryEntry
     /// got there first would attribute the file to one of them and silently drop the rest.
     /// </summary>
     public List<string>? RequestedBy { get; set; }
+
+    /// <summary>
+    /// The download's row in the live downloads list ("provider:id"), the key getAcquisition and
+    /// the dashboard read its log by. Null for entries written before this existed.
+    /// </summary>
+    public string? Key { get; set; }
+
+    /// <summary>
+    /// The download's log, saved when it ended so the dashboard can show it after the live list
+    /// forgets it (three hours). Trimmed to stay small: see
+    /// <see cref="Octo.Services.Local.DownloadHistoryService.AttachLog"/>. Null for entries written
+    /// before this existed, and for older entries whose log was let go to keep the file small.
+    /// </summary>
+    public List<Octo.Services.Common.AcquisitionEvent>? Log { get; set; }
 }

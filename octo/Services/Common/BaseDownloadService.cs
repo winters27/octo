@@ -327,7 +327,7 @@ public abstract class BaseDownloadService : IDownloadService
     /// format + source are derived from the file extension (flac -> Soulseek/lossless,
     /// otherwise -> YouTube/lossy), which matches Octo's two download sources.</summary>
     private async Task RecordHistoryAsync(Song song, string localPath, bool suppressNotify,
-        IReadOnlyList<string>? requestedBy = null)
+        IReadOnlyList<string>? requestedBy = null, string? key = null)
     {
         try
         {
@@ -372,6 +372,8 @@ public abstract class BaseDownloadService : IDownloadService
                 Tagging = song.TagPlan?.ToReport(),
                 DownloadedAt = DateTime.UtcNow.ToString("o"),
                 RequestedBy = requestedBy is { Count: > 0 } ? [.. requestedBy] : null,
+                // The live row's key, which its saved log is found by on the dashboard.
+                Key = key,
             });
 
             // Same chokepoint as the fetched-songs log, reusing the locals it just
@@ -732,7 +734,8 @@ public abstract class BaseDownloadService : IDownloadService
             if (!isCache)
             {
                 await LocalLibraryService.RegisterDownloadedSongAsync(song, localPath);
-                await RecordHistoryAsync(song, localPath, silence || Muted.TryGetValue(song, out _), requestedBy);
+                await RecordHistoryAsync(song, localPath, silence || Muted.TryGetValue(song, out _), requestedBy,
+                    AcquisitionTracker.KeyOf(externalProvider, externalId));
                 AskForReview(song, localPath, requestedBy);
                 Track(t => t.Imported(externalProvider, externalId, song.Artist, song.Title, localPath));
 

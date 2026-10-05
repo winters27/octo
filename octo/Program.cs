@@ -442,8 +442,16 @@ builder.Services.AddHostedService<Octo.Services.Common.AcquisitionWorker>();
 
 // Where each hearted download has got to, for the app's progress ring (getAcquisitions) and
 // the dashboard. In memory only; it watches the pipeline and never steers it.
-builder.Services.AddSingleton(sp => new Octo.Services.Common.AcquisitionTracker(
-    sp.GetRequiredService<ILogger<Octo.Services.Common.AcquisitionTracker>>(), sp));
+builder.Services.AddSingleton(sp =>
+{
+    var tracker = new Octo.Services.Common.AcquisitionTracker(
+        sp.GetRequiredService<ILogger<Octo.Services.Common.AcquisitionTracker>>(), sp);
+    // Each finished download's log is saved with its fetched-songs entry, for the dashboard.
+    Octo.Services.Common.DownloadLogKeeper.Attach(tracker,
+        sp.GetRequiredService<Octo.Services.Local.DownloadHistoryService>(),
+        sp.GetRequiredService<ILogger<Octo.Services.Common.DownloadLogKeeper>>());
+    return tracker;
+});
 // Favorites a starred outside song for whoever starred it once Navidrome shows it (#71).
 builder.Services.AddSingleton<Octo.Services.Common.StarOnArrival>();
 // Find songs in the apps' downloads drawer: a search run again by hand, and the copy picked from
