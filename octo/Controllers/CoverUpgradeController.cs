@@ -31,7 +31,7 @@ public sealed class CoverUpgradeController : ControllerBase
     }
 
     private bool Signed(string? header) =>
-        _sessions.Validate(Request.Cookies[AdminController.BrowseCookieName] ?? header);
+        _sessions.NavidromeUserOf(Request.Cookies[AdminController.BrowseCookieName] ?? header) is not null;
 
     private IActionResult SignIn() => Unauthorized(new { error = "Sign in with your Navidrome admin account first." });
 

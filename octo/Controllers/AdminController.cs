@@ -169,10 +169,16 @@ public class AdminController : ControllerBase
     }
 
     [HttpGet("lastfm/radio")]
+    [AdminAppCall(adminOnly: false)]
     public IActionResult GetLastFmRadio([FromQuery] string? user = null)
     {
         if (_radioState is null) return Ok(new { users = Array.Empty<object>(), stations = Array.Empty<object>() });
-        var summaries = _radioState.GetSummaries();
+        // The Octo app with a listener's own sign-in sees that listener and nobody else.
+        var listener = AdminCaller.Of(HttpContext) is { Kind: AdminCallerKind.Listener } caller ? caller.User : null;
+        if (listener is not null) user = listener;
+        var summaries = _radioState.GetSummaries()
+            .Where(summary => listener is null || string.Equals(summary.Username, listener, StringComparison.OrdinalIgnoreCase))
+            .ToList();
         var selected = string.IsNullOrWhiteSpace(user) ? summaries.FirstOrDefault()?.Username : user.Trim();
         var state = selected is null ? null : _radioState.GetUser(selected);
         var settings = _lastFmOpts.CurrentValue;
@@ -350,8 +356,12 @@ public class AdminController : ControllerBase
     }
 
     [HttpPost("lastfm/radio/refresh")]
+    [AdminAppCall(adminOnly: false)]
     public IActionResult RefreshLastFmRadio([FromBody] RadioUserRequest request)
     {
+        // A listener signed in from the Octo app rebuilds their own stations, whoever the body names.
+        if (AdminCaller.Of(HttpContext) is { Kind: AdminCallerKind.Listener, User: { } listener })
+            request.User = listener;
         if (_radioRefresh is null || string.IsNullOrWhiteSpace(request.User))
             return BadRequest(new { error = "A known Navidrome user is required" });
         var queued = _radioRefresh.Enqueue(request.User, request.StationId);
@@ -396,6 +406,7 @@ public class AdminController : ControllerBase
     /// UI instead of the container logs.
     /// </summary>
     [HttpGet("library-status")]
+    [AdminAppCall(adminOnly: true)]
     public async Task<IActionResult> LibraryStatus(CancellationToken ct)
     {
         var subsonic = _subsonicOpts.CurrentValue;
@@ -429,7 +440,7 @@ public class AdminController : ControllerBase
     }
 
     /// <summary>
-    /// Exchange Navidrome admin credentials for a short-lived browse token.
+    /// Exchange Navidrome admin credentials for a dashboard sign-in, remembered by this browser.
     ///
     /// Credentials arrive in the body, never the query string, so they cannot end up
     /// in access logs or a referrer. Verification is delegated to the Navidrome Octo
@@ -437,13 +448,22 @@ public class AdminController : ControllerBase
     /// rather than something Octo asserts for itself.
     /// </summary>
     [HttpPost("browse/auth")]
+    [AdminOpen]
     public async Task<IActionResult> BrowseAuth([FromBody] BrowseAuthRequest req, CancellationToken ct)
     {
         var url = _subsonicOpts.CurrentValue.Url?.TrimEnd('/');
         if (string.IsNullOrEmpty(url))
-            return StatusCode(503, new { error = "Navidrome URL is not configured yet." });
+            return StatusCode(503, new { error = "Navidrome URL is not configured yet. Use the recovery code instead." });
         if (req is null || string.IsNullOrWhiteSpace(req.Username) || string.IsNullOrWhiteSpace(req.Password))
             return Unauthorized(new { error = "Username and password are required." });
+
+        var throttle = HttpContext.RequestServices.GetService<SignInThrottle>();
+        var tryKey = SignInThrottle.KeyOf(HttpContext);
+        if (throttle?.RetryAfter(tryKey) is { } wait)
+        {
+            Response.Headers.RetryAfter = ((int)Math.Ceiling(wait.TotalSeconds)).ToString();
+            return StatusCode(429, new { error = $"Too many wrong sign-ins. Try again in {SignInThrottle.Minutes(wait)}." });
+        }
 
         try
         {
@@ -451,15 +471,27 @@ public class AdminController : ControllerBase
             var payload = JsonSerializer.Serialize(new { username = req.Username, password = req.Password });
             using var content = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
             using var resp = await http.PostAsync($"{url}/auth/login", content, ct);
+            // Navidrome's own limit (5 sign-ins per 20 seconds per address) counts every sign-in
+            // through Octo as Octo's, so say so rather than calling the password wrong.
+            if (resp.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                return StatusCode(429, new { error = "Navidrome is limiting sign-ins right now. Wait half a minute and try again." });
             if (!resp.IsSuccessStatusCode)
+            {
+                throttle?.Failed(tryKey);
                 return Unauthorized(new { error = "Navidrome rejected those credentials." });
+            }
 
-            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
+            var loginBody = await resp.Content.ReadAsByteArrayAsync(ct);
+            using var doc = JsonDocument.Parse(loginBody);
             var isAdmin = doc.RootElement.TryGetProperty("isAdmin", out var adminEl)
                           && adminEl.ValueKind == JsonValueKind.True;
             if (!isAdmin)
                 return Unauthorized(new { error = "That account is not a Navidrome admin." });
 
+            // Octo's own admin identity, as a relayed admin login already sets it: rescans and the
+            // hourly role check need one, and a fresh install may have no other.
+            _navIdentity.CaptureLogin(loginBody);
+            throttle?.Succeeded(tryKey);
             _logger.LogInformation("Browse session opened for Navidrome admin {User}", req.Username);
             var token = _browseSessions.Create(req.Username);
 
@@ -475,8 +507,42 @@ public class AdminController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogWarning("Browse auth against Navidrome failed: {Msg}", ex.Message);
-            return StatusCode(502, new { error = "Could not reach Navidrome to verify credentials." });
+            return StatusCode(502, new { error = "Could not reach Navidrome to verify credentials. If it is down, use the recovery code." });
         }
+    }
+
+    /// <summary>The recovery code, typed on the sign-in screen. Body-only, like the password.</summary>
+    public record RecoveryRequest(string? Code);
+
+    /// <summary>
+    /// Sign in with the one-time code from admin-recovery-code, for when Navidrome cannot vouch for
+    /// anyone. The session lasts an hour, is never written to disk, and cannot reach the endpoints
+    /// that change library files. The code is replaced as soon as it works.
+    /// </summary>
+    [HttpPost("auth/recovery")]
+    [AdminOpen]
+    public IActionResult RecoverySignIn([FromBody] RecoveryRequest? req)
+    {
+        var throttle = HttpContext.RequestServices.GetService<SignInThrottle>();
+        var recovery = HttpContext.RequestServices.GetService<AdminRecoveryCode>();
+        if (recovery is null) return StatusCode(503, new { error = "The recovery code is not available on this host." });
+        var tryKey = SignInThrottle.KeyOf(HttpContext);
+        if (throttle?.RetryAfter(tryKey) is { } wait)
+        {
+            Response.Headers.RetryAfter = ((int)Math.Ceiling(wait.TotalSeconds)).ToString();
+            return StatusCode(429, new { error = $"Too many wrong tries. Try again in {SignInThrottle.Minutes(wait)}." });
+        }
+        if (!recovery.TryUse(req?.Code))
+        {
+            throttle?.Failed(tryKey);
+            return Unauthorized(new { error = "That is not the recovery code. Each code works once, so read the file again." });
+        }
+        throttle?.Succeeded(tryKey);
+        _logger.LogWarning("The dashboard was opened with the recovery code from {Address}. A new code is in {Path}.",
+            tryKey, recovery.FilePath);
+        var token = _browseSessions.CreateRecovery();
+        Response.Cookies.Append(BrowseCookieName, token, AdminCookie.Options(Request, BrowseSessionStore.RecoveryTtl));
+        return Ok(new { ok = true, user = BrowseSessionStore.RecoveryUser, recovery = true });
     }
 
     /// <summary>
@@ -527,50 +593,69 @@ public class AdminController : ControllerBase
 
     /// <summary>Cookie carrying the browse session. Scoped to /api/admin so it is
     /// never sent with the Subsonic traffic Octo proxies.</summary>
-    internal const string BrowseCookieName = "octo_browse";
+    internal const string BrowseCookieName = AdminCookie.Name;
 
     /// <summary>
     /// The cookie's terms. Secure only over HTTPS, since this is normally reached over plain HTTP
     /// on a LAN and a Secure cookie would simply be dropped there. Its age is set again on every
     /// signed-in request, so the browser keeps it exactly as long as the server keeps the session.
     /// </summary>
-    private CookieOptions BrowseCookieOptions() => new()
-    {
-        HttpOnly = true,
-        SameSite = SameSiteMode.Strict,
-        Secure = Request.IsHttps,
-        Path = "/api/admin",
-        MaxAge = BrowseSessionStore.Ttl,
-    };
+    private CookieOptions BrowseCookieOptions() => AdminCookie.Options(Request);
 
     /// <summary>
     /// The Navidrome admin this request is signed in as, or null. Cookie first (how the admin UI
     /// signs in), header second so the endpoints stay usable from curl. A live cookie is renewed.
+    /// A recovery-code session is not one: it cannot reach the endpoints that touch library files.
     /// </summary>
     private string? BrowseUser(string? headerToken)
     {
         var cookie = Request.Cookies[BrowseCookieName];
-        var user = _browseSessions.UserOf(cookie ?? headerToken);
+        var user = _browseSessions.NavidromeUserOf(cookie ?? headerToken);
         if (user is not null && cookie is not null) Response.Cookies.Append(BrowseCookieName, cookie, BrowseCookieOptions());
         return user;
     }
 
-    /// <summary>Who this browser is signed in as, for the dashboard's footer. Never prompts.</summary>
+    /// <summary>
+    /// Who this browser is signed in as, and whether the sign-in is off. Never prompts; answers
+    /// without a sign-in.
+    /// </summary>
     [HttpGet("browse/session")]
-    public IActionResult BrowseSession() =>
-        BrowseUser(null) is { } user ? Ok(new { signedIn = true, user }) : Ok(new { signedIn = false });
-
-    /// <summary>Sign this browser out: the session is forgotten and the cookie removed.</summary>
-    [HttpPost("browse/signout")]
-    public IActionResult BrowseSignOut()
+    [AdminOpen]
+    public IActionResult BrowseSession()
     {
-        _browseSessions.Revoke(Request.Cookies[BrowseCookieName]);
+        var cookie = Request.Cookies[BrowseCookieName];
+        var user = _browseSessions.UserOf(cookie);
+        var recovery = user == BrowseSessionStore.RecoveryUser;
+        if (user is not null && cookie is not null)
+            Response.Cookies.Append(BrowseCookieName, cookie, AdminCookie.Options(Request, recovery ? BrowseSessionStore.RecoveryTtl : null));
+        var off = HttpContext.RequestServices.GetService<IOptionsMonitor<AdminSettings>>()?.CurrentValue.SignInOff == true;
+        return Ok(new { signedIn = user is not null, user, recovery, signInOff = off });
+    }
+
+    /// <summary>
+    /// Sign this browser out: the session is forgotten and the cookie removed. With everywhere, every
+    /// browser and script signed in as the same person is signed out too.
+    /// </summary>
+    [HttpPost("browse/signout")]
+    [AdminOpen]
+    public IActionResult BrowseSignOut([FromQuery] bool everywhere = false)
+    {
+        var cookie = Request.Cookies[BrowseCookieName];
+        var ended = 0;
+        if (everywhere && _browseSessions.UserOf(cookie) is { } user && user != BrowseSessionStore.RecoveryUser)
+        {
+            ended = _browseSessions.RevokeUser(user);
+            _logger.LogInformation("{User} signed out everywhere ({Count} sign-ins ended)", user, ended);
+        }
+        else
+            _browseSessions.Revoke(cookie);
         Response.Cookies.Delete(BrowseCookieName, new CookieOptions { Path = "/api/admin" });
-        return Ok(new { ok = true });
+        return Ok(new { ok = true, ended });
     }
 
     /// <summary>The running log of songs Octo has fetched, newest first.</summary>
     [HttpGet("downloads")]
+    [AdminAppCall(adminOnly: true)]
     public IActionResult Downloads()
     {
         return Ok(new { downloads = _history.GetRecent(200) });
@@ -1082,7 +1167,7 @@ public class AdminController : ControllerBase
         {
             // UserTokens is a dictionary: merged, a user removed in the dashboard would stay.
             var merged = _settings.Merge(patch, ["ListenBrainz.UserTokens"]);
-            _logger.LogInformation("Admin settings updated: {Keys}",
+            _logger.LogInformation("{Who} saved settings: {Keys}", AdminCaller.Describe(HttpContext),
                 string.Join(",", patch.Select(kv => kv.Key)));
             return new JsonResult(new { ok = true, persisted = RedactSecrets(merged) });
         }
@@ -2008,7 +2093,7 @@ public class AdminController : ControllerBase
                 return BadRequest(new { error = $"Connect {typedInto} to Last.fm again, or paste their whole session key; it was added to the hidden placeholder." });
             var pretty = parsed.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
             _settings.Replace(parsed);
-            _logger.LogInformation("Admin raw-config saved ({Bytes} bytes)", pretty.Length);
+            _logger.LogInformation("{Who} saved the raw config ({Bytes} bytes)", AdminCaller.Describe(HttpContext), pretty.Length);
             return new JsonResult(new { ok = true, bytes = pretty.Length });
         }
         catch (Exception ex)
@@ -2138,9 +2223,24 @@ public class AdminController : ControllerBase
     /// Navidrome, slskd, Lidarr, the yt-dlp shim, and Last.fm.
     /// </summary>
     [HttpGet("status")]
+    [AdminOpen]
+    [AdminAppCall(adminOnly: true)]
     public async Task<IActionResult> GetStatus(CancellationToken ct)
     {
-        // Probe each in parallel — total time is the slowest probe, not sum.
+        if (AdminCaller.Of(HttpContext) is not { IsAdmin: true })
+            return new JsonResult(await AnonymousStatusAsync(ct));
+        var results = await ProbeAllAsync(ct);
+        return new JsonResult(new
+        {
+            octo = new ServiceProbe(true, "Octo is responding"),
+            services = results,
+            time = DateTimeOffset.UtcNow.ToString("O"),
+        });
+    }
+
+    // Probe each in parallel: total time is the slowest probe, not the sum.
+    private async Task<Dictionary<string, ServiceProbe>> ProbeAllAsync(CancellationToken ct)
+    {
         var probeTasks = new Dictionary<string, Task<ServiceProbe>>
         {
             ["navidrome"] = ProbeNavidromeAsync(ct),
@@ -2150,17 +2250,35 @@ public class AdminController : ControllerBase
             ["lastfm"] = ProbeLastFmAsync(ct),
         };
         await Task.WhenAll(probeTasks.Values);
+        return probeTasks.ToDictionary(kv => kv.Key, kv => kv.Value.Result);
+    }
 
-        var results = probeTasks.ToDictionary(
-            kv => kv.Key,
-            kv => kv.Value.Result);
+    // Before a sign-in, status says only whether each service is up: enough for install.sh and for
+    // the app to tell this is Octo, and nothing about addresses or errors. Kept ten seconds, because
+    // the Last.fm probe spends the API key and this answers anyone.
+    private static readonly SemaphoreSlim AnonymousStatusLock = new(1, 1);
+    private static (DateTime At, object Answer)? _anonymousStatus;
+    private static readonly TimeSpan AnonymousStatusFor = TimeSpan.FromSeconds(10);
 
-        return new JsonResult(new
+    private async Task<object> AnonymousStatusAsync(CancellationToken ct)
+    {
+        await AnonymousStatusLock.WaitAsync(ct);
+        try
         {
-            octo = new ServiceProbe(true, "Octo is responding"),
-            services = results,
-            time = DateTimeOffset.UtcNow.ToString("O"),
-        });
+            if (_anonymousStatus is { } kept && DateTime.UtcNow - kept.At < AnonymousStatusFor) return kept.Answer;
+            var probes = await ProbeAllAsync(ct);
+            object answer = new
+            {
+                octo = new { ok = true },
+                // configured too, so an optional service nobody set up reads as off, not as working.
+                services = probes.ToDictionary(kv => kv.Key, kv => (object)new { ok = kv.Value.Ok, configured = kv.Value.Configured }),
+                time = DateTimeOffset.UtcNow.ToString("O"),
+                signedIn = false,
+            };
+            _anonymousStatus = (DateTime.UtcNow, answer);
+            return answer;
+        }
+        finally { AnonymousStatusLock.Release(); }
     }
 
     /// <summary>Choices owned by the connected Lidarr instance for add-album defaults.</summary>
@@ -2196,7 +2314,7 @@ public class AdminController : ControllerBase
     [HttpPost("restart")]
     public IActionResult Restart()
     {
-        _logger.LogWarning("Admin requested restart; container will exit in 1s");
+        _logger.LogWarning("{Who} restarted Octo from the dashboard; it exits in 1s", AdminCaller.Describe(HttpContext));
         // Fire-and-forget so the response can be returned first.
         _ = Task.Run(async () =>
         {

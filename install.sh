@@ -147,21 +147,26 @@ if [ -f .env ]; then
   done < .env
 fi
 existing() { echo "${EXISTING[$1]-}"; }
+# The saved value, or the default when there is none. Not `existing X || echo default`:
+# existing always succeeds, so that default never applied and a fresh install got blanks
+# (an empty music folder became the Octo folder itself).
+existing_or() { local v="${EXISTING[$1]-}"; echo "${v:-$2}"; }
 
 # ─────────────────────────────────────────────────────────────────
 # Run
 # ─────────────────────────────────────────────────────────────────
-clear
+clear 2>/dev/null || true   # a terminal without the capability (TERM=dumb, CI) must not end the install
 bold "═══════════════════════════════════════════════════════════"
 bold "  Octo · installer"
 bold "═══════════════════════════════════════════════════════════"
 echo
-echo "Sets up Octo (admin UI + proxy), yt-dlp shim, and slskd in"
-echo "one Docker Compose stack. Talks to your existing Navidrome."
+echo "Sets up your own music service in one Docker Compose stack: Octo"
+echo "(search, radio, previews and downloads), a yt-dlp shim, slskd, and, if"
+echo "you don't run one yet, a Navidrome music server."
 echo
 echo "What you'll need handy:"
-echo "  • A Navidrome server URL (running already)"
-echo "  • A free Last.fm API key — https://www.last.fm/api/account/create"
+echo "  • Your Navidrome address, if you already run one"
+echo "  • A free Last.fm API key: https://www.last.fm/api/account/create"
 echo "  • A free Soulseek (slsknet.org) account"
 echo "  • Optionally, an existing Lidarr server"
 echo
@@ -172,9 +177,42 @@ echo
 # ─────────────────────────────────────────────────────────────────
 # Required: Navidrome URL + music directory
 # ─────────────────────────────────────────────────────────────────
-bold "─── Required ───────────────────────────────────────────────"
+bold "─── Your music server ──────────────────────────────────────"
+echo "  Octo plays your library through Navidrome, a self-hosted music server."
+echo "  Already run one? Octo sits in front of it. If not, Octo starts one for"
+echo "  you in the same stack, reading the same music folder."
+HAVE_NAVIDROME_DEFAULT="n"
+if [ -n "$(existing SUBSONIC_URL)" ] && [ "$(existing SUBSONIC_URL)" != "http://navidrome:4533" ]; then
+  HAVE_NAVIDROME_DEFAULT="y"
+fi
+STARTER=false
+COMPOSE_PROFILES=""
+NAVIDROME_ADMIN_PASSWORD=""
+SUBSONIC_ADMIN_USERNAME="$(existing SUBSONIC_ADMIN_USERNAME)"
+SUBSONIC_ADMIN_PASSWORD="$(existing SUBSONIC_ADMIN_PASSWORD)"
+if ask_yn "  Do you already run Navidrome?" "$HAVE_NAVIDROME_DEFAULT"; then
+  echo
+else
+  STARTER=true
+fi
+echo
+
+if [ "$STARTER" = true ]; then
+  SUBSONIC_URL="http://navidrome:4533"
+  COMPOSE_PROFILES="navidrome"
+  # Creates Navidrome's "admin" user on its first start; kept on re-runs so it
+  # always matches what Navidrome already has.
+  NAVIDROME_ADMIN_PASSWORD="$(existing NAVIDROME_ADMIN_PASSWORD)"
+  if [ -z "$NAVIDROME_ADMIN_PASSWORD" ]; then
+    NAVIDROME_ADMIN_PASSWORD="$(random_password)"
+    green "  ✓ generated a password for Navidrome's admin user (saved in .env)"
+  fi
+  SUBSONIC_ADMIN_USERNAME="admin"
+  SUBSONIC_ADMIN_PASSWORD="$NAVIDROME_ADMIN_PASSWORD"
+  green "  ✓ Navidrome will start beside Octo"
+else
 while true; do
-  SUBSONIC_URL=$(ask "Navidrome URL" "$(existing SUBSONIC_URL || echo "http://192.168.1.10:4533")")
+  SUBSONIC_URL=$(ask "Navidrome URL" "$(existing_or SUBSONIC_URL "http://192.168.1.10:4533")")
   # localhost trap: containers can't reach the host's loopback by default
   if [[ "$SUBSONIC_URL" =~ ^https?://(localhost|127\.0\.0\.1) ]]; then
     yellow "  ⚠ 'localhost' inside the Octo container won't reach Navidrome on the host."
@@ -189,10 +227,11 @@ while true; do
   if ask_yn "  Continue with this URL anyway?" "n"; then break; fi
   echo
 done
+fi
 echo
 
 DOWNLOAD_PATH_RAW=$(ask "Music directory on this host (where downloads will land)" \
-  "$(existing DOWNLOAD_PATH || echo "./downloads")")
+  "$(existing_or DOWNLOAD_PATH "./downloads")")
 DOWNLOAD_PATH=$(abs_path "$DOWNLOAD_PATH_RAW")
 if [ "$DOWNLOAD_PATH" != "$DOWNLOAD_PATH_RAW" ]; then
   dim "  resolved to absolute: $DOWNLOAD_PATH"
@@ -248,14 +287,14 @@ echo
 bold "─── Heart download source ──────────────────────────────────"
 echo "  Soulseek — individual lossless tracks (default)"
 echo "  Lidarr   — your existing Lidarr server; always fetches the full album"
-DOWNLOAD_SOURCE=$(ask "Heart download source" "$(existing DOWNLOAD_SOURCE || echo "Soulseek")")
+DOWNLOAD_SOURCE=$(ask "Heart download source" "$(existing_or DOWNLOAD_SOURCE "Soulseek")")
 LIDARR_URL="$(existing LIDARR_URL)"
 LIDARR_API_KEY="$(existing LIDARR_API_KEY)"
 LIDARR_ROOT_FOLDER_PATH="$(existing LIDARR_ROOT_FOLDER_PATH)"
-LIDARR_QUALITY_PROFILE_ID="$(existing LIDARR_QUALITY_PROFILE_ID || echo "0")"
-LIDARR_METADATA_PROFILE_ID="$(existing LIDARR_METADATA_PROFILE_ID || echo "0")"
-LIDARR_COMPLETION_MODE="$(existing LIDARR_COMPLETION_MODE || echo "Accepted")"
-LIDARR_IMPORT_TIMEOUT_SECONDS="$(existing LIDARR_IMPORT_TIMEOUT_SECONDS || echo "1800")"
+LIDARR_QUALITY_PROFILE_ID="$(existing_or LIDARR_QUALITY_PROFILE_ID "0")"
+LIDARR_METADATA_PROFILE_ID="$(existing_or LIDARR_METADATA_PROFILE_ID "0")"
+LIDARR_COMPLETION_MODE="$(existing_or LIDARR_COMPLETION_MODE "Accepted")"
+LIDARR_IMPORT_TIMEOUT_SECONDS="$(existing_or LIDARR_IMPORT_TIMEOUT_SECONDS "1800")"
 if [ "${DOWNLOAD_SOURCE,,}" = "lidarr" ]; then
   echo "  Lidarr must already have working indexers and a download client."
   LIDARR_URL=$(ask "Lidarr URL (reachable from the Octo container)" "$LIDARR_URL")
@@ -271,15 +310,15 @@ bold "─── Storage / layout ───────────────�
 echo "  Stream     — preview only; star a song to download (recommended)"
 echo "  Permanent  — download every song you play"
 echo "  Cache      — temporary, auto-cleanup"
-STORAGE_MODE=$(ask "Storage mode" "$(existing STORAGE_MODE || echo "Stream")")
+STORAGE_MODE=$(ask "Storage mode" "$(existing_or STORAGE_MODE "Stream")")
 echo
 echo "  Flat       — Artist - Title.flac (no subfolders, easier to browse)"
 echo "  Organized  — Artist/Title/file.flac"
-FOLDER_STRUCTURE=$(ask "Folder layout" "$(existing FOLDER_STRUCTURE || echo "Flat")")
+FOLDER_STRUCTURE=$(ask "Folder layout" "$(existing_or FOLDER_STRUCTURE "Flat")")
 echo
 
 # slskd web UI admin — auto-generate on first run, preserve on re-run
-SLSKD_USERNAME="$(existing SLSKD_USERNAME || echo "admin")"
+SLSKD_USERNAME="$(existing_or SLSKD_USERNAME "admin")"
 SLSKD_PASSWORD="$(existing SLSKD_PASSWORD)"
 if [ -z "$SLSKD_PASSWORD" ]; then
   SLSKD_PASSWORD="$(random_password)"
@@ -298,6 +337,13 @@ cat > .env <<EOF
 # === Required ===
 SUBSONIC_URL=$SUBSONIC_URL
 DOWNLOAD_PATH=$DOWNLOAD_PATH
+# Navidrome admin login Octo uses for rescans and its own checks.
+SUBSONIC_ADMIN_USERNAME=$SUBSONIC_ADMIN_USERNAME
+SUBSONIC_ADMIN_PASSWORD="$SUBSONIC_ADMIN_PASSWORD"
+
+# === Starter stack (Navidrome started beside Octo) ===
+COMPOSE_PROFILES=$COMPOSE_PROFILES
+NAVIDROME_ADMIN_PASSWORD="$NAVIDROME_ADMIN_PASSWORD"
 
 # === Last.fm ===
 LASTFM_API_KEY=$LASTFM_API_KEY
@@ -354,7 +400,8 @@ YTDLP_URL_CACHE_MAX=512
 YTDLP_URL_CACHE_TTL=3600
 EOF
 # Kept from the old .env when they were set there: settings this installer never asks about.
-for key in OCTO_CONFIG_DIR SLSKD_STATE_DIR UPDATES_CHECK UPDATES_REPO \
+for key in OCTO_CONFIG_DIR SLSKD_STATE_DIR NAVIDROME_DATA_DIR NAVIDROME_PORT ADMIN_SIGN_IN ADMIN_PORT \
+           UPDATES_CHECK UPDATES_REPO \
            SLSKD_SHARED_DIR SLSKD_SHARE_RESCAN_MINUTES SLSKD_UPLOAD_SLOTS SLSKD_UPLOAD_SPEED_LIMIT \
            SLSKD_CHECK_PORT SLSKD_WEB_URL \
            IMPORTS_SPOTIFY_CLIENT_ID IMPORTS_SPOTIFY_REDIRECT_URI IMPORTS_SONGS_PER_HOUR IMPORTS_REFRESH_HOURS; do
@@ -368,6 +415,9 @@ green "✓ wrote .env (chmod 600)"
 
 # Make sure the bind-mount targets exist so docker doesn't create them root-owned.
 mkdir -p "$(existing OCTO_CONFIG_DIR | grep . || echo octo-config)" "$(existing SLSKD_STATE_DIR | grep . || echo slskd-state)"
+if [ "$STARTER" = true ]; then
+  mkdir -p "$(existing NAVIDROME_DATA_DIR | grep . || echo navidrome-data)"
+fi
 
 # ─────────────────────────────────────────────────────────────────
 # Build + start
@@ -408,12 +458,14 @@ bold "─── Service health ────────────────�
 status_json=$(curl -sS -m 5 "http://localhost:5274/api/admin/status" 2>/dev/null || echo "{}")
 check_svc() {
   local name="$1" key="$2"
-  if echo "$status_json" | grep -q "\"$key\":{\"ok\":true"; then
+  if echo "$status_json" | grep -q "\"$key\":{\"ok\":true,\"configured\":false"; then
+    printf "  %-14s " "$name"; dim "- off (optional)"
+  elif echo "$status_json" | grep -q "\"$key\":{\"ok\":true"; then
     printf "  %-14s " "$name"; green "✓ ok"
   else
     local detail
     detail=$(echo "$status_json" | sed -n "s/.*\"$key\":{[^}]*\"detail\":\"\\([^\"]*\\)\".*/\\1/p" | head -c 100)
-    printf "  %-14s " "$name"; yellow "⚠ ${detail:-not reachable}"
+    printf "  %-14s " "$name"; yellow "⚠ ${detail:-not reachable, see the dashboard for why}"
   fi
 }
 check_svc "Navidrome"  "navidrome"
@@ -447,12 +499,23 @@ echo
 bold "═══════════════════════════════════════════════════════════"
 green "  Done. Three things to do next:"
 echo
-echo "  1. Open the admin dashboard to review settings:"
+if [ "$STARTER" = true ]; then
+  echo "  Your music server is Navidrome, started beside Octo. Its admin login,"
+  echo "  for the dashboard and your music apps:"
+  bold  "       admin / $NAVIDROME_ADMIN_PASSWORD"
+  echo "     (also in .env as NAVIDROME_ADMIN_PASSWORD)"
+  echo
+fi
+echo "  1. Open the dashboard to review settings (sign in with a Navidrome admin):"
 bold  "       http://localhost:5274/admin"
 echo
-echo "  2. Point your Subsonic apps (Feishin, Arpeggi, Narjo, …) at:"
+echo "  2. Point your music apps (Octo's own, Feishin, Arpeggi, Narjo, …) at:"
 bold  "       http://<this-host>:5274"
-echo "     Use your existing Navidrome credentials — Octo just proxies."
+if [ "$STARTER" = true ]; then
+  echo "     Add the people who listen in Navidrome's own pages: http://<this-host>:4533"
+else
+  echo "     Sign in with your Navidrome login; Octo passes it through."
+fi
 echo
 echo "  3. Test it: search for an artist you don't fully own. Owned tracks come"
 echo "     up first; recommendations from Last.fm fill the rest. Tap one to hear"
@@ -464,6 +527,9 @@ fi
 echo
 dim "  slskd web UI:    http://<this-host>:5030    (SLSKD_USERNAME and SLSKD_PASSWORD in .env; or Open slskd on the dashboard)"
 dim "  Sharing:         forward TCP 50300 to this machine; the dashboard's Soulseek page tests it"
+if [ "$STARTER" = true ]; then
+  dim "  Navidrome:       http://<this-host>:4533   (add people, change passwords; music apps use 5274)"
+fi
 dim "  Stop:            docker compose down"
 dim "  Update later:    admin dashboard, About (or see Updating in the README)"
 bold "═══════════════════════════════════════════════════════════"

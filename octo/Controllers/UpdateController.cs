@@ -41,7 +41,10 @@ public class UpdateController(ReleaseCheck releases, UpdateHost host, BrowseSess
         if (host.Busy())
             return Conflict(new { error = "An update is already under way." });
 
-        var user = sessions?.UserOf(Request.Cookies[AdminController.BrowseCookieName]) ?? "dashboard";
+        // Who asked, for the update log: a script signed in with a cookie jar or a header counts too.
+        var user = AdminCaller.Of(HttpContext) is not null
+            ? AdminCaller.Describe(HttpContext)
+            : sessions?.UserOf(Request.Cookies[AdminController.BrowseCookieName]) ?? "dashboard";
         var id = host.Request(view.Latest.Tag, user);
         return Accepted(new { ok = true, id, tag = view.Latest.Tag });
     }

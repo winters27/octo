@@ -1,14 +1,94 @@
 // Octo admin UI. Vanilla JS, no build step.
 
 // Every call to Octo's admin API goes through here. Writes carry X-Octo-Admin, which a page on
-// another origin cannot add without a preflight Octo refuses, so a site you happen to visit
-// cannot change settings or restart Octo on your behalf. It is not a login: see README.
-function api(url, options = {}) {
-  const method = (options.method || 'GET').toUpperCase();
-  const headers = new Headers(options.headers || {});
-  if (method !== 'GET' && method !== 'HEAD') headers.set('X-Octo-Admin', '1');
-  return fetch(url, { credentials: 'same-origin', ...options, headers });
+// another origin cannot add without a preflight Octo refuses. A 401 that asks for a sign-in shows
+// the sign-in screen, and the call is sent again once someone has signed in.
+async function api(url, options = {}) {
+  const send = () => {
+    const method = (options.method || 'GET').toUpperCase();
+    const headers = new Headers(options.headers || {});
+    if (method !== 'GET' && method !== 'HEAD') headers.set('X-Octo-Admin', '1');
+    return fetch(url, { credentials: 'same-origin', ...options, headers });
+  };
+  const r = await send();
+  if (r.status !== 401) return r;
+  const body = await r.clone().json().catch(() => ({}));
+  if (!body.signIn) return r;
+  await signInGate();
+  return send();
 }
+
+// The sign-in screen. However many calls ask at once there is one screen, and they all wait on
+// the same promise. Navidrome admin by default; the recovery code for when Navidrome cannot vouch.
+let gatePromise = null;
+function signInGate() {
+  if (gatePromise) return gatePromise;
+  gatePromise = new Promise(resolve => {
+    const gate = document.getElementById('signin-gate');
+    const app = document.querySelector('.app');
+    const user = document.getElementById('gate-user');
+    const pass = document.getElementById('gate-pass');
+    const code = document.getElementById('gate-code');
+    const err = document.getElementById('gate-error');
+    const toggle = document.getElementById('gate-use-code');
+    let useCode = false;
+    const show = () => {
+      document.getElementById('gate-navidrome').hidden = useCode;
+      document.getElementById('gate-recovery').hidden = !useCode;
+      toggle.textContent = useCode ? 'Sign in with Navidrome instead' : 'Use the recovery code';
+      (useCode ? code : user).focus();
+    };
+    if (app) app.inert = true;
+    gate.hidden = false;
+    err.textContent = '';
+    show();
+    toggle.onclick = () => { useCode = !useCode; err.textContent = ''; show(); };
+    document.getElementById('gate-form').onsubmit = async event => {
+      event.preventDefault();
+      err.textContent = '';
+      const [path, payload] = useCode
+        ? ['/api/admin/auth/recovery', { code: code.value.trim() }]
+        : ['/api/admin/browse/auth', { username: user.value.trim(), password: pass.value }];
+      if (useCode ? !payload.code : !(payload.username && payload.password)) {
+        err.textContent = useCode ? 'Type the recovery code.' : 'Both a username and a password are required.';
+        return;
+      }
+      const r = await fetch(path, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-Octo-Admin': '1' },
+        body: JSON.stringify(payload),
+      }).catch(() => null);
+      const data = r ? await r.json().catch(() => ({})) : {};
+      if (!r || !r.ok) { err.textContent = data.error || 'Octo did not answer.'; return; }
+      // A browser that refuses the cookie would loop back to this screen on every call; say why instead.
+      const kept = await fetch('/api/admin/browse/session', { credentials: 'same-origin' }).then(x => x.json()).catch(() => ({}));
+      if (!kept.signedIn) {
+        err.textContent = 'Signed in, but this browser did not keep the sign-in. Allow cookies for this address, and open Octo by the same address each time.';
+        return;
+      }
+      pass.value = '';
+      code.value = '';
+      gate.hidden = true;
+      if (app) app.inert = false;
+      showSignedIn(data.user, data.recovery);
+      gatePromise = null;
+      resolve();
+    };
+  });
+  return gatePromise;
+}
+
+// Asked once at load: already signed in, sign-in switched off, or the sign-in screen first.
+async function ensureSignedIn() {
+  let body = {};
+  try { body = await (await fetch('/api/admin/browse/session', { credentials: 'same-origin' })).json(); } catch { }
+  document.getElementById('signin-off-banner').hidden = !body.signInOff;
+  if (body.signedIn) { showSignedIn(body.user, body.recovery); return; }
+  if (body.signInOff) return;
+  await signInGate();
+}
+const ready = ensureSignedIn();
 
 // Every icon is one symbol in icons.svg: Phosphor glyphs as i-name, brand marks as b-name. The
 // sprite is put in the page itself, because a <use> pointing into another file cannot paint a
@@ -202,7 +282,7 @@ function setStatusCard(svc, probe) {
 }
 
 document.getElementById('status-refresh')?.addEventListener('click', refreshStatus);
-refreshStatus();
+ready.then(refreshStatus);
 // No point probing every service while nobody is looking; catch up when the tab returns.
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 30_000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshStatus(); });
@@ -2064,8 +2144,9 @@ document.getElementById('review-sweep-reset')?.addEventListener('click', async (
   if (!(await askConfirm('Check every song again?', 'From the start. Questions you answered recently are not asked again.', 'Start over'))) return;
   reviewSweepPost(button, '/api/admin/review-sweep/reset', 'Starting over.');
 });
-loadReviewSweep();
-setInterval(() => { if (document.visibilityState === 'visible') loadReviewSweep(); }, 30000);
+ready.then(loadReviewSweep);
+// Not while the sign-in screen is up: every refused poll would wait behind it and fire at once after.
+setInterval(() => { if (document.visibilityState === 'visible' && !gatePromise) loadReviewSweep(); }, 30000);
 
 const upgradeOutcomes = { Applied: 'upgraded', Failed: 'no better copy found', Rehearsed: 'dry run',
   Skipped: 'skipped', Unresolved: 'file not found', Nothing: 'nothing left to try' };
@@ -2851,7 +2932,7 @@ async function refreshLibraryStatus() {
     }
   } catch { /* status is informational; never block the settings UI on it */ }
 }
-refreshLibraryStatus();
+ready.then(refreshLibraryStatus);
 
 // ── Browse for a download folder ────────────────────────────────
 // The endpoint requires a Navidrome admin, because an unauthenticated directory
@@ -3043,26 +3124,35 @@ async function browseAuthenticate(result) {
 }
 
 // The footer says who this browser is signed in as. The sign-in is remembered across restarts
-// and lapses only after 90 days without a visit; Sign out forgets it now.
-function showSignedIn(user) {
+// and lapses only after 90 days without a visit (an hour for the recovery code); Sign out ends it now.
+function showSignedIn(user, recovery = false) {
   const line = document.getElementById('signed-in');
   if (!line) return;
   line.hidden = !user;
-  document.getElementById('signed-in-user').textContent = user ? `Signed in as ${user}` : '';
+  document.getElementById('signed-in-user').textContent =
+    !user ? '' : recovery ? 'Signed in with the recovery code' : `Signed in as ${user}`;
+  const everywhere = document.getElementById('sign-out-everywhere');
+  if (everywhere) everywhere.hidden = !user || recovery;
 }
 
 async function loadSignedIn() {
   try {
     const r = await api('/api/admin/browse/session', { credentials: 'same-origin' });
     const body = await r.json();
-    showSignedIn(body.signedIn ? body.user : null);
+    showSignedIn(body.signedIn ? body.user : null, body.recovery);
   } catch { showSignedIn(null); }
 }
 
 document.getElementById('sign-out')?.addEventListener('click', async () => {
   await api('/api/admin/browse/signout', { method: 'POST', credentials: 'same-origin' });
-  showSignedIn(null);
-  toast('Signed out of this browser.');
+  // Back to the sign-in screen, or to the dashboard when the sign-in is off.
+  location.reload();
+});
+
+document.getElementById('sign-out-everywhere')?.addEventListener('click', async () => {
+  if (!await askConfirm('Sign out everywhere?', 'Every browser and script signed in as you has to sign in again.', 'Sign out everywhere', true)) return;
+  await api('/api/admin/browse/signout?everywhere=true', { method: 'POST' });
+  location.reload();
 });
 
 function renderBrowse(data, result, input) {
@@ -5550,8 +5640,10 @@ impEl('imports-form')?.addEventListener('submit', () => setTimeout(loadImports, 
 // ────────────────────────────────────────────────────────────────
 // Boot
 // ────────────────────────────────────────────────────────────────
-if (location.hash) followHash();
-loadSettings();
-loadSignedIn();
-loadUpdate();
-renderSlskdOpen();
+ready.then(() => {
+  if (location.hash) followHash();
+  loadSettings();
+  loadSignedIn();
+  loadUpdate();
+  renderSlskdOpen();
+});

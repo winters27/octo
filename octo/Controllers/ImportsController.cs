@@ -27,7 +27,7 @@ public sealed class ImportsController : ControllerBase
         _logger = logger;
     }
 
-    private string? SignedIn(string? header) => _sessions.UserOf(Request.Cookies[AdminController.BrowseCookieName] ?? header);
+    private string? SignedIn(string? header) => _sessions.NavidromeUserOf(Request.Cookies[AdminController.BrowseCookieName] ?? header);
 
     private IActionResult SignIn() => Unauthorized(new { error = "Sign in with your Navidrome account first." });
 

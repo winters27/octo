@@ -137,6 +137,7 @@
         <p class="sidebar-signed-in" id="signed-in" hidden>
           <span id="signed-in-user"></span>
           <button type="button" class="link-btn" id="sign-out">Sign out</button>
+          <button type="button" class="link-btn" id="sign-out-everywhere">Sign out everywhere</button>
         </p>
         <button id="restart-btn" class="btn btn-ghost btn-block" title="Restart container so settings flagged 'restart required' take effect">
           <svg class="icon" aria-hidden="true"><use href="#i-arrow-clockwise"/></svg>
@@ -149,6 +150,9 @@
     <!--  CONTENT                                                    -->
     <!-- ══════════════════════════════════════════════════════════ -->
     <main class="content">
+      <div class="notice notice-error app-banner" id="signin-off-banner" role="alert" hidden>
+        Sign-in is off (<code>ADMIN_SIGN_IN=off</code>), so anyone who can reach this page can change Octo. Only run it this way behind a proxy that signs people in.
+      </div>
       <div class="notice notice-error app-banner" id="settings-unavailable" role="alert" hidden>
         <span><span class="msg"></span> Saving is off until they load, so nothing blank is written over them.</span>
         <button type="button" class="btn btn-ghost" id="settings-retry">Try again</button>
@@ -2467,12 +2471,32 @@
   <div id="toast" role="status" aria-live="polite"></div>
   <div id="sr-alert" class="visually-hidden" role="alert"></div>
 
+  <!-- The dashboard's sign-in. Everything waits behind it until someone signs in, unless
+       ADMIN_SIGN_IN is off. -->
+  <div class="signin-gate" id="signin-gate" hidden>
+    <form class="signin-card" id="gate-form" aria-labelledby="gate-title" novalidate>
+      <h1 class="signin-title" id="gate-title">Sign in to Octo</h1>
+      <div class="signin-fields" id="gate-navidrome">
+        <p class="signin-desc">Use a Navidrome <strong>admin</strong> account. Octo checks it with your Navidrome server and never keeps the password.</p>
+        <input class="set-input" id="gate-user" type="text" autocomplete="username" placeholder="Username" aria-label="Username" />
+        <input class="set-input" id="gate-pass" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password" />
+      </div>
+      <div class="signin-fields" id="gate-recovery" hidden>
+        <p class="signin-desc">The recovery code is in <code>admin-recovery-code</code> in Octo's config folder. With Docker: <code>docker exec octo cat /app/config/admin-recovery-code</code>. Each code works once.</p>
+        <input class="set-input" id="gate-code" type="text" autocomplete="one-time-code" spellcheck="false" placeholder="Recovery code" aria-label="Recovery code" />
+      </div>
+      <div class="modal-error" id="gate-error" role="alert"></div>
+      <button type="submit" class="btn btn-primary signin-submit">Sign in</button>
+      <button type="button" class="link-btn" id="gate-use-code">Use the recovery code</button>
+    </form>
+  </div>
+
   <!-- Sign-in modal for the folder browser. Hidden until needed; the browser
        endpoint refuses to list anything without a Navidrome admin. -->
   <div class="modal-backdrop" id="signin-modal" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="signin-title" aria-describedby="signin-desc">
-      <div class="modal-title" id="signin-title">Sign in to browse</div>
-      <div class="modal-desc" id="signin-desc">Browsing folders needs a Navidrome <strong>admin</strong> account. Octo checks it with your Navidrome server and never stores it.</div>
+      <div class="modal-title" id="signin-title">Sign in with Navidrome</div>
+      <div class="modal-desc" id="signin-desc">This needs a Navidrome <strong>admin</strong> account, not the recovery code. Octo checks it with your Navidrome server and never stores it.</div>
       <div class="modal-fields">
         <input class="set-input" id="signin-user" type="text" autocomplete="username" placeholder="Username" />
         <input class="set-input" id="signin-pass" type="password" autocomplete="current-password" placeholder="Password" />

@@ -122,4 +122,44 @@ public class BrowseSessionStoreTests
         }
         finally { Directory.Delete(Path.GetDirectoryName(path)!, recursive: true); }
     }
+
+    [Fact]
+    public void ARecoverySignInLapsesAfterAnHour_ANavidromeOneDoesNot()
+    {
+        var now = DateTime.UtcNow;
+        var store = new BrowseSessionStore { Clock = () => now };
+        var recovery = store.CreateRecovery();
+        var navidrome = store.Create("winters");
+
+        now = now.Add(BrowseSessionStore.RecoveryTtl).AddMinutes(1);
+
+        Assert.Null(store.UserOf(recovery));
+        Assert.Equal("winters", store.UserOf(navidrome));
+    }
+
+    [Fact]
+    public void ARecoverySignInNeverCountsAsANavidromeAdmin()
+    {
+        var store = new BrowseSessionStore();
+        var recovery = store.CreateRecovery();
+
+        Assert.Equal(BrowseSessionStore.RecoveryUser, store.UserOf(recovery));
+        Assert.Null(store.NavidromeUserOf(recovery));
+        Assert.Equal("winters", store.NavidromeUserOf(store.Create("winters")));
+    }
+
+    [Fact]
+    public void RevokeUserEndsEverySignInOfThatPersonAndNoOneElse()
+    {
+        var store = new BrowseSessionStore();
+        var phone = store.Create("winters");
+        var laptop = store.Create("Winters");
+        var someoneElse = store.Create("guest");
+
+        Assert.Equal(2, store.RevokeUser("WINTERS"));
+
+        Assert.Null(store.UserOf(phone));
+        Assert.Null(store.UserOf(laptop));
+        Assert.Equal("guest", store.UserOf(someoneElse));
+    }
 }
