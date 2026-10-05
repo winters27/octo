@@ -310,6 +310,23 @@
             <svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg>
           </button>
         </header>
+        <!-- ─── Find songs: the apps' search run again by hand, for every admin ─── -->
+        <div class="set-section find-section" id="find-section">
+          <div class="set-head">
+            <h3 class="set-title">Find songs</h3>
+            <p class="set-desc">Look for every copy of a song on your download sources, see which one Octo would choose and why, and pick the copy to fetch yourself.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row stack">
+              <form class="set-inline" id="find-form" role="search">
+                <input class="set-input" id="find-q" type="search" placeholder="Title, artist or both" aria-label="Song to find" autocomplete="off" spellcheck="false" />
+                <button class="btn" type="submit"><svg class="icon" aria-hidden="true"><use href="#i-magnifying-glass"/></svg><span>Search</span></button>
+              </form>
+              <div id="find-results" class="find-results" aria-live="polite" hidden></div>
+            </div>
+            <div class="set-row stack find-look" id="find-look" aria-live="polite" hidden></div>
+          </div>
+        </div>
         <div id="acq-wrap" class="acq-wrap" hidden>
           <div class="set-head"><h3 class="set-title">In progress</h3><p class="set-desc">Hearted songs on their way, and any that failed in the last half hour.</p></div>
           <div id="acq-list" class="acq-list" aria-live="polite"></div>
@@ -2244,6 +2261,25 @@
               </select>
             </div>
           </form>
+        </div>
+
+        <!-- ─── Recently removed: the apps' Put back, for every admin ─── -->
+        <div class="set-section" id="trash-section">
+          <div class="set-head">
+            <h3 class="set-title">Recently removed</h3>
+            <p class="set-desc">Songs taken out of the library that still wait in the trash. Put one back, with its lyrics, before the sweep deletes it for good.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">In the trash</div><div class="set-info-d" id="trash-summary">Needs your Navidrome admin sign-in, and you on the allowed list above.</div></div>
+              <div class="set-ctrl">
+                <button class="btn btn-ghost btn-icon" type="button" id="trash-refresh" aria-label="Refresh the trash" title="Refresh">
+                  <svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg>
+                </button>
+              </div>
+            </div>
+            <div id="trash-list" class="trash-list"></div>
+          </div>
         </div>
 
         <div class="set-section">
