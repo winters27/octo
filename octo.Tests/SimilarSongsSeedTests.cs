@@ -184,6 +184,79 @@ public sealed class SimilarSongsSeedTests
         Assert.True(songs.IndexOf("pl-3") < songs.IndexOf("pl-2"), string.Join(", ", songs));
     }
 
+    private static Dictionary<string, string?> Learning() => new()
+    {
+        ["RadioSources:YouTubeMusic"] = "true",
+        ["RadioSources:LearnFromListening"] = "true",
+    };
+
+    private static async Task Scrobble(HttpClient client, string user, string id, bool finished)
+    {
+        using var response = await client.GetAsync(
+            $"/rest/scrobble?id={Uri.EscapeDataString(id)}&submission={(finished ? "true" : "false")}&u={user}&t=token&s=salt&f=json");
+        response.EnsureSuccessStatusCode();
+    }
+
+    [Fact]
+    public async Task ARadioSongPlayedThrough_CountsForTheSourceThatSuggestedIt()
+    {
+        await using var fixture = new Factory(Learning());
+        using var client = fixture.CreateClient();
+        var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=spooky&u=alice&t=token&s=salt&f=json&count=20"));
+        var ytm = songs.First(song => song.By == "YouTube Music").Id;
+
+        await Scrobble(client, "alice", ytm, finished: false);
+        await Scrobble(client, "alice", ytm, finished: true);
+
+        using var doc = JsonDocument.Parse(await client.GetStringAsync("/api/admin/radio-outcomes"));
+        var row = doc.RootElement.EnumerateArray().Single(item => item.GetProperty("provider").GetString() == "youtube-music");
+        Assert.Equal(1, row.GetProperty("plays").GetInt32());
+        Assert.Equal(1.0, row.GetProperty("keepRate").GetDouble());
+    }
+
+    [Fact]
+    public async Task AScrobbleNavidromeRefuses_TeachesNothing()
+    {
+        await using var fixture = new Factory(Learning());
+        using var client = fixture.CreateClient();
+        var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=spooky&u=mallory&t=token&s=salt&f=json&count=20"));
+        var ytm = songs.First(song => song.By == "YouTube Music").Id;
+
+        await Scrobble(client, "mallory", ytm, finished: false);
+        await Scrobble(client, "mallory", ytm, finished: true);
+
+        Assert.True("[]" == (await client.GetStringAsync("/api/admin/radio-outcomes")).Trim(),
+            string.Join(" | ", fixture.Handler.Calls.Where(call => call.Contains("scrobble") || call.Contains("ping"))));
+    }
+
+    [Fact]
+    public async Task RadioStateFiles_StayInTheHostsOwnFolder()
+    {
+        await using var fixture = new Factory(Learning());
+        fixture.Services.GetRequiredService<Octo.Services.Radio.RadioOutcomeStore>().Forget();
+        fixture.Services.GetRequiredService<Octo.Services.Sonic.SonicStore>().Write(s => s.Pass = 1);
+        fixture.Services.GetRequiredService<Octo.Services.Sonic.SonicStore>().Flush();
+
+        // Not under the fixed /app/config path, which on Windows is C:pp\config.
+        Assert.True(File.Exists(Path.Combine(fixture.StateFolder, "radio-outcomes.json")));
+        Assert.True(File.Exists(Path.Combine(fixture.StateFolder, "sonic-features.json")));
+    }
+
+    [Fact]
+    public async Task ForgettingWhatRadioLearned_NeedsTheDashboardsHeader()
+    {
+        await using var fixture = new Factory(Learning());
+        using var client = fixture.CreateClient();
+
+        using var refused = await client.PostAsync("/api/admin/radio-outcomes/reset", null);
+        Assert.Equal(HttpStatusCode.Forbidden, refused.StatusCode);
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/admin/radio-outcomes/reset");
+        request.Headers.Add("X-Octo-Admin", "1");
+        using var allowed = await client.SendAsync(request);
+        allowed.EnsureSuccessStatusCode();
+    }
+
     [Fact]
     public async Task ASongTheListenerRatedOneStar_StaysOffTheirRadio()
     {
@@ -331,6 +404,9 @@ public sealed class SimilarSongsSeedTests
 
             var path = uri.AbsolutePath;
             if (path.StartsWith("/ytm/", StringComparison.Ordinal)) return Json(YouTubeMusic(path, query));
+            // Navidrome refuses mallory's sign-in.
+            if (query["u"] == "mallory" && (path.EndsWith("/rest/ping") || path.EndsWith("/rest/scrobble")))
+                return Json("""{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":40,"message":"Wrong username or password"}}}""");
             var id = query["id"] ?? "";
             string? answer = path switch
             {
@@ -352,6 +428,7 @@ public sealed class SimilarSongsSeedTests
                     : """{"randomSongs":{"song":[]}}""",
                 _ when path.EndsWith("/rest/search3") => """{"searchResult3":{}}""",
                 _ when path.EndsWith("/rest/ping") => "",
+                _ when path.EndsWith("/rest/scrobble") => "",
                 _ when path.EndsWith("/rest/getOpenSubsonicExtensions") => """{"openSubsonic":true,"openSubsonicExtensions":[]}""",
                 _ => null,
             };
@@ -449,6 +526,8 @@ public sealed class SimilarSongsSeedTests
         private readonly Mock<IMusicMetadataService> _metadata = new();
 
         private readonly Dictionary<string, string?> _settings;
+        /// <summary>Where this host keeps its state files (Octo:StateDirectory).</summary>
+        public string StateFolder => _directory;
 
         /// <param name="settings">On top of the defaults below, which leave every radio source but
         /// Last.fm off, so a test switches on the ones it is about.</param>

@@ -5,7 +5,8 @@ namespace Octo.Services.Radio;
 
 /// <summary>Every radio source, asked together. One slow or failing source costs its own answer, never the radio.</summary>
 public sealed class RadioSourceSet(IEnumerable<IRadioSource> sources,
-    IOptionsMonitor<RadioSourceSettings> settings, ILogger<RadioSourceSet> logger)
+    IOptionsMonitor<RadioSourceSettings> settings, ILogger<RadioSourceSet> logger,
+    RadioOutcomeStore? outcomes = null)
 {
     internal TimeSpan SourceTimeout { get; set; } = TimeSpan.FromSeconds(8);
     /// <summary>Failures or timeouts in a row before a source is rested, and for how long. A
@@ -30,7 +31,7 @@ public sealed class RadioSourceSet(IEnumerable<IRadioSource> sources,
     public IReadOnlyDictionary<string, double> Weights(string? listener = null, bool libraryLed = false)
     {
         var current = settings.CurrentValue;
-        var learned = new Dictionary<string, double>();
+        var learned = outcomes?.Multipliers(listener) ?? new Dictionary<string, double>();
         var sound = RadioSourceSettings.EffectiveWeight(current.SoundsAlikeWeight);
         if (libraryLed && sound > 0) sound = Math.Max(sound, RadioBlend.SoundsAlikeWhenUnknown);
         // The bounds never undo the admin: a base set below 0.3 or above 1.5 is itself the bound.

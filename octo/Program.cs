@@ -454,18 +454,31 @@ builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Ra
 builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.ListenBrainzRadioSource>();
 // Sounds alike (multi-source radio): what every library song sounds like, from octo-sonic.
 // Where its state files go: tests point it at their own folder, since SettingsFilePath is a
-// fixed /app/config path (C:\app\config on a developer's Windows machine).
-var radioStateDirectory = builder.Configuration["Octo:StateDirectory"] is { Length: > 0 } stateDir
-    ? stateDir : System.IO.Path.GetDirectoryName(SettingsFilePath)!;
+// fixed /app/config path (C:\app\config on a developer's Windows machine). Read when the store
+// is made, not here: a test host's settings are not in builder.Configuration yet at this point.
+static string RadioStateDirectory(IServiceProvider sp) =>
+    sp.GetRequiredService<IConfiguration>()["Octo:StateDirectory"] is { Length: > 0 } stateDir
+        ? stateDir : System.IO.Path.GetDirectoryName(SettingsFilePath)!;
 builder.Services.AddHttpClient(Octo.Services.Sonic.SonicClient.ClientName, c => c.Timeout = TimeSpan.FromMinutes(11));
 builder.Services.AddSingleton<Octo.Services.Sonic.SonicClient>();
 builder.Services.AddSingleton(sp => new Octo.Services.Sonic.SonicStore(
-    System.IO.Path.Combine(radioStateDirectory, "sonic-features.json"),
+    System.IO.Path.Combine(RadioStateDirectory(sp), "sonic-features.json"),
     sp.GetRequiredService<ILogger<Octo.Services.Sonic.SonicStore>>()));
 builder.Services.AddSingleton<Octo.Services.Sonic.ISonicLibrary, Octo.Services.Sonic.NavidromeSonicLibrary>();
 builder.Services.AddSingleton<Octo.Services.Sonic.SonicAnalysisWorker>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<Octo.Services.Sonic.SonicAnalysisWorker>());
 builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.SoundsAlikeRadioSource>();
+// What radio learns from listening: which source's songs each listener plays through or skips.
+builder.Services.AddSingleton(sp =>
+{
+    var store = new Octo.Services.Radio.RadioOutcomeStore(
+        System.IO.Path.Combine(RadioStateDirectory(sp), "radio-outcomes.json"),
+        sp.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<RadioSourceSettings>>(),
+        sp.GetRequiredService<ILogger<Octo.Services.Radio.RadioOutcomeStore>>());
+    // It writes every few seconds at most; whatever changed since goes down on the way out.
+    sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping.Register(store.Flush);
+    return store;
+});
 builder.Services.AddSingleton<Octo.Services.Radio.RadioSourceSet>();
 builder.Services.AddScoped<Octo.Services.Radio.SongRadioService>();
 
