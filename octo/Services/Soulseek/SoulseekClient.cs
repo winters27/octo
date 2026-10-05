@@ -225,6 +225,83 @@ public class SoulseekClient
         }
     }
 
+    /// <summary>
+    /// slskd's own settings file (slskd.yml) as text. Status is slskd's answer: 403 means slskd does
+    /// not allow remote configuration, so nothing in it can be changed from here.
+    /// </summary>
+    public async Task<(int Status, string? Yaml)> ReadSettingsFileAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var resp = await SendAsync(HttpMethod.Get, $"{Base}/api/v0/options/yaml", null, ct);
+            if (!resp.IsSuccessStatusCode) return ((int)resp.StatusCode, null);
+            var text = await resp.Content.ReadAsStringAsync(ct);
+            // slskd answers with the text itself, or with it as a JSON string when asked for JSON.
+            if (resp.Content.Headers.ContentType?.MediaType?.Contains("json", StringComparison.OrdinalIgnoreCase) == true)
+                text = JsonSerializer.Deserialize<string>(text) ?? "";
+            return ((int)resp.StatusCode, text);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogDebug("slskd settings file not readable at {Base}: {Msg}", Base, ex.Message);
+            return (0, null);
+        }
+    }
+
+    /// <summary>
+    /// Replaces slskd.yml. slskd checks it first and keeps the old file as slskd.yml.bak; with its
+    /// file watch on, it applies the new one without a restart. Null when written, otherwise why not.
+    /// </summary>
+    public async Task<string?> WriteSettingsFileAsync(string yaml, CancellationToken ct = default)
+    {
+        try
+        {
+            using var resp = await SendAsync(HttpMethod.Put, $"{Base}/api/v0/options/yaml",
+                new StringContent(JsonSerializer.Serialize(yaml), Encoding.UTF8, "application/json"), ct);
+            if (resp.IsSuccessStatusCode) return null;
+            if (resp.StatusCode == System.Net.HttpStatusCode.Forbidden)
+                return "slskd does not let Octo change its settings (remote configuration is off).";
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            return $"slskd refused the change (HTTP {(int)resp.StatusCode}){(string.IsNullOrWhiteSpace(body) ? "" : $": {body.Trim()}")}.";
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogWarning("Could not write slskd settings at {Base}: {Msg}", Base, ex.Message);
+            return "Octo cannot reach slskd.";
+        }
+    }
+
+    /// <summary>Stops a share scan in progress. False when none was running or slskd did not answer.</summary>
+    public async Task<bool> CancelShareScanAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            using var resp = await SendAsync(HttpMethod.Delete, $"{Base}/api/v0/shares", null, ct);
+            return resp.IsSuccessStatusCode;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogDebug("slskd share scan cancel failed at {Base}: {Msg}", Base, ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>Cancels one upload to someone. False when slskd would not.</summary>
+    public async Task<bool> CancelUploadAsync(string username, string id, CancellationToken ct = default)
+    {
+        try
+        {
+            using var resp = await SendAsync(HttpMethod.Delete,
+                $"{Base}/api/v0/transfers/uploads/{Uri.EscapeDataString(username)}/{Uri.EscapeDataString(id)}", null, ct);
+            return resp.IsSuccessStatusCode;
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            _logger.LogDebug("slskd upload cancel failed at {Base}: {Msg}", Base, ex.Message);
+            return false;
+        }
+    }
+
     private static bool? Flag(JsonElement element, string name) =>
         TryGetPropertyIgnoreCase(element, name, out var v) && v.ValueKind is JsonValueKind.True or JsonValueKind.False
             ? v.GetBoolean() : null;

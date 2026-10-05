@@ -1322,6 +1322,14 @@
             <p class="set-desc">Soulseek works because people share. slskd shares your music folder, read-only, so the people you download from can download from you too.</p>
           </div>
           <div class="set-card share-card" id="share-card">
+            <div class="set-row">
+              <div class="set-info">
+                <label class="set-info-t" for="share-switch">Share my library on Soulseek</label>
+                <div class="set-info-d">The people you download from can download from you too, read-only, a few songs at a time. Takes effect in seconds.</div>
+                <div class="set-info-more">Off shares nothing at all: slskd forgets your folders and uploads still waiting or under way are cancelled. Octo sets this in slskd's own settings file, slskd.yml, in a part marked as Octo's. Shares you set in slskd.yml yourself are left alone, and this switch stands aside.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="share-switch" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
             <div class="set-row stack">
               <p class="share-line" id="share-line" aria-live="polite">Asking slskd…</p>
               <dl class="share-facts" id="share-facts" hidden></dl>

@@ -16,6 +16,8 @@ public class SoulseekSharingTests
 {
     private static readonly DateTime Now = new(2026, 10, 4, 21, 0, 0, DateTimeKind.Utc);
     private static readonly PortCheckResult PortOpen = new(PortState.Open, 50300, Now, null);
+    private static readonly ShareSwitchState On = new(true, ShareControl.Octo, null);
+    private static readonly ShareSwitchState Off = new(false, ShareControl.Octo, null);
 
     // Logged in, sharing nothing, as LXC 111 was found.
     private const string AppSharingNothing = """
@@ -58,7 +60,7 @@ public class SoulseekSharingTests
     public void SharingNothing_SaysSo()
     {
         var report = SoulseekSharing.Build(AppSharingNothing, OptionsSharingNothing, """{ "local": [] }""", "[]",
-            PortOpen, defaultLogin: false, Now);
+            PortOpen, On, defaultLogin: false, Now);
 
         Assert.True(report.Reachable);
         Assert.Equal("LoggedIn", report.Login);
@@ -70,10 +72,36 @@ public class SoulseekSharingTests
         Assert.Equal(["nothingShared"], report.Warnings.Select(w => w.Code));
     }
 
+    /// <summary>Sharing switched off is a choice: no "you share nothing" warning, and the card
+    /// carries the switch as off.</summary>
+    [Fact]
+    public void SharingOffByChoice_IsNotAWarning()
+    {
+        var report = SoulseekSharing.Build(AppSharingNothing, OptionsSharingNothing, """{ "local": [] }""", "[]",
+            PortOpen, Off, defaultLogin: false, Now);
+
+        Assert.False(report.Switch.On);
+        Assert.Empty(report.Folders);
+        Assert.Empty(report.Warnings);
+    }
+
+    /// <summary>A switch slskd would not obey is said in its own words, in place of the generic
+    /// "you share nothing".</summary>
+    [Fact]
+    public void ASwitchProblem_IsTheWarning()
+    {
+        var stuck = new ShareSwitchState(true, ShareControl.Locked, "slskd does not let Octo change its shares.");
+
+        var report = SoulseekSharing.Build(AppSharingNothing, OptionsSharingNothing, """{ "local": [] }""", "[]",
+            PortOpen, stuck, defaultLogin: false, Now);
+
+        Assert.Equal(["switch"], report.Warnings.Select(w => w.Code));
+    }
+
     [Fact]
     public void ASharedLibrary_IsReportedWithItsLimits_AndNoWarning()
     {
-        var report = SoulseekSharing.Build(AppSharing, OptionsSharing, SharesSharing, "[]", PortOpen, false, Now);
+        var report = SoulseekSharing.Build(AppSharing, OptionsSharing, SharesSharing, "[]", PortOpen, On, false, Now);
 
         var folder = Assert.Single(report.Folders);
         Assert.Equal(new SharedFolder("Music", "/share", false, 13, 2438), folder);
@@ -90,7 +118,7 @@ public class SoulseekSharingTests
     {
         var closed = new PortCheckResult(PortState.Closed, 50300, Now, null);
 
-        var report = SoulseekSharing.Build(AppSharing, OptionsSharing, SharesSharing, "[]", closed, defaultLogin: true, Now);
+        var report = SoulseekSharing.Build(AppSharing, OptionsSharing, SharesSharing, "[]", closed, On, defaultLogin: true, Now);
 
         Assert.Equal(["defaultLogin", "portClosed"], report.Warnings.Select(w => w.Code));
         Assert.Contains("50300", report.Warnings[1].Text);
@@ -101,27 +129,27 @@ public class SoulseekSharingTests
     public void SignedOut_FailedScan_AndAShareWithNoFiles_AreEachWarnedAbout()
     {
         var signedOut = AppSharing.Replace("\"isLoggedIn\": true", "\"isLoggedIn\": false");
-        Assert.Contains("signedOut", SoulseekSharing.Build(signedOut, OptionsSharing, SharesSharing, "[]", PortOpen, false, Now)
+        Assert.Contains("signedOut", SoulseekSharing.Build(signedOut, OptionsSharing, SharesSharing, "[]", PortOpen, On, false, Now)
             .Warnings.Select(w => w.Code));
 
         var failed = AppSharing.Replace("\"faulted\": false", "\"faulted\": true");
-        var failedReport = SoulseekSharing.Build(failed, OptionsSharing, SharesSharing, "[]", PortOpen, false, Now);
+        var failedReport = SoulseekSharing.Build(failed, OptionsSharing, SharesSharing, "[]", PortOpen, On, false, Now);
         Assert.True(failedReport.ScanFailed);
         Assert.Equal(["scanFailed"], failedReport.Warnings.Select(w => w.Code));
 
         var empty = AppSharing.Replace("\"files\": 2438", "\"files\": 0");
-        Assert.Equal(["emptyShares"], SoulseekSharing.Build(empty, OptionsSharing, SharesSharing, "[]", PortOpen, false, Now)
+        Assert.Equal(["emptyShares"], SoulseekSharing.Build(empty, OptionsSharing, SharesSharing, "[]", PortOpen, On, false, Now)
             .Warnings.Select(w => w.Code));
 
         // An empty share being scanned is not empty yet.
         var scanning = empty.Replace("\"scanning\": false", "\"scanning\": true");
-        Assert.Empty(SoulseekSharing.Build(scanning, OptionsSharing, SharesSharing, "[]", PortOpen, false, Now).Warnings);
+        Assert.Empty(SoulseekSharing.Build(scanning, OptionsSharing, SharesSharing, "[]", PortOpen, On, false, Now).Warnings);
     }
 
     [Fact]
     public void Unreachable_IsOneWarning_AndNoZeroCounts()
     {
-        var report = SoulseekSharing.Build(null, null, null, null, PortOpen, false, Now);
+        var report = SoulseekSharing.Build(null, null, null, null, PortOpen, On, false, Now);
 
         Assert.False(report.Reachable);
         Assert.Null(report.Files);

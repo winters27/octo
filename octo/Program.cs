@@ -123,6 +123,9 @@ builder.Services.AddSingleton<ISoulseekLink>(sp => sp.GetRequiredService<Soulsee
 // What this server shares back with Soulseek, and whether people can connect to it, for the dashboard.
 builder.Services.AddHttpClient(SoulseekPortCheck.ClientName, c => c.Timeout = TimeSpan.FromSeconds(20));
 builder.Services.AddSingleton<SoulseekPortCheck>();
+// The Share my library switch: keeps slskd.yml's share list to it, and checks every 10 minutes.
+builder.Services.AddSingleton<SoulseekShareSwitch>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<SoulseekShareSwitch>());
 builder.Services.AddSingleton<SoulseekSharing>();
 // How many downloads transfer at once: one until slskd has put a download in its own folder.
 builder.Services.AddSingleton<Octo.Services.Common.DownloadConcurrency>();

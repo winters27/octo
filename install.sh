@@ -226,9 +226,20 @@ echo "  Sign up free at https://www.slsknet.org/news/node/1"
 echo "  These are your Soulseek-network credentials — slskd uses them to log in."
 SLSKD_SOULSEEK_USERNAME=$(ask "Your Soulseek username" "$(existing SLSKD_SOULSEEK_USERNAME)")
 SLSKD_SOULSEEK_PASSWORD=$(ask_secret "Your Soulseek password" "$(existing SLSKD_SOULSEEK_PASSWORD)")
-echo "  slskd shares your music folder back, read-only: many Soulseek users will"
-echo "  not send files to someone who shares nothing. Forward TCP port 50300 on"
-echo "  your router to this machine so people can connect. Never forward 5030."
+echo
+echo "  Soulseek runs on sharing: many users will not send files to someone who"
+echo "  shares nothing. slskd can share your music folder back, read-only, with"
+echo "  4 uploads at a time. You can turn it on or off later on the dashboard's"
+echo "  Soulseek page."
+SHARE_DEFAULT="y"
+[ "$(existing SLSKD_SHARE_LIBRARY)" = "false" ] && SHARE_DEFAULT="n"
+if ask_yn "  Share your music library on Soulseek?" "$SHARE_DEFAULT"; then
+  SLSKD_SHARE_LIBRARY=true
+  echo "  Forward TCP port 50300 on your router to this machine so people can"
+  echo "  connect. Never forward 5030."
+else
+  SLSKD_SHARE_LIBRARY=false
+fi
 echo
 
 # ─────────────────────────────────────────────────────────────────
@@ -312,6 +323,7 @@ SLSKD_PREFERRED_EXTENSION=flac
 SLSKD_DOWNLOAD_TIMEOUT_SECONDS=180
 SLSKD_SOULSEEK_USERNAME=$SLSKD_SOULSEEK_USERNAME
 SLSKD_SOULSEEK_PASSWORD="$SLSKD_SOULSEEK_PASSWORD"
+SLSKD_SHARE_LIBRARY=$SLSKD_SHARE_LIBRARY
 
 # === Existing Lidarr (optional) ===
 LIDARR_URL=$LIDARR_URL
