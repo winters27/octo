@@ -2631,7 +2631,20 @@ public class SubsonicController : ControllerBase
 
         // An external id is not a Navidrome song, and relaying one errors "data not found".
         if (!string.IsNullOrEmpty(itemId) && _localLibraryService.ParseSongId(itemId).isExternal)
+        {
+            // Nothing to relay, so a ping is the auth check before the listener's radio changes.
+            if (_radioStateStore is not null && int.TryParse(ratingText, out var externalStars)
+                && parameters.GetValueOrDefault("u") is { Length: > 0 } externalRater)
+            {
+                var auth = parameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+                auth.Remove("id");
+                auth.Remove("rating");
+                var check = await _proxyService.RelaySafeAsync("rest/ping", auth);
+                if (check.Success && check.Body is not null && IsSuccessfulSubsonicResponse(check.Body, format))
+                    await RecordRadioBanAsync(externalRater, itemId, externalStars, parameters);
+            }
             return _responseBuilder.CreateResponse(format, "setRating", new { });
+        }
 
         byte[] body;
         string? contentType;
@@ -2644,6 +2657,10 @@ public class SubsonicController : ControllerBase
         {
             return _responseBuilder.CreateError(format, 0, $"Error connecting to Subsonic server: {ex.Message}");
         }
+
+        if (IsSuccessfulSubsonicResponse(body, format) && int.TryParse(ratingText, out var stars)
+            && parameters.GetValueOrDefault("u") is { Length: > 0 } rater && !string.IsNullOrEmpty(itemId))
+            await RecordRadioBanAsync(rater, itemId, stars, parameters);
 
         if (_ratingActions is not null
             && IsSuccessfulSubsonicResponse(body, format)
@@ -2672,6 +2689,26 @@ public class SubsonicController : ControllerBase
     private bool RatingInScope(string username, string itemId) =>
         _libraryActionSettings.CurrentValue.EffectiveRatingsScope == LibraryRatingScope.Global
         || (_noticeQueue?.IsQueued(username, itemId) ?? false);
+
+    /// <summary>
+    /// One star keeps a song off this listener's radio; any other rating lifts that. Never
+    /// fails the rating itself: the radio is a side effect of it.
+    /// </summary>
+    private async Task RecordRadioBanAsync(string username, string itemId, int stars,
+        IReadOnlyDictionary<string, string> parameters)
+    {
+        if (_radioStateStore is null) return;
+        try
+        {
+            var rated = await _radioTrackResolver.ResolveScrobbleAsync(itemId, parameters);
+            if (rated is not null)
+                _radioStateStore.SetRadioBan(username, itemId, rated.Artist, rated.Title, stars == 1);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "radio ban for rating on {Id} failed", itemId);
+        }
+    }
 
     /// <summary>
     /// Gets similar songs for radio feature using Last.fm recommendations.
@@ -2773,7 +2810,18 @@ public class SubsonicController : ControllerBase
         _logger.LogInformation("Getting similar songs for {Artist} - {Title} (lookup: {LookA} - {LookT})",
             artistName, trackTitle, lookupArtist, lookupTitle);
 
-        var similarTracks = await _lastFmService.GetSimilarTracksAsync(lookupArtist, lookupTitle, count);
+        // A few more than asked for: filler and songs the listener rated one star are left out.
+        // Their one-star songs count only when Navidrome has just answered getSong with their
+        // credentials, so nobody can read another listener's choices by comparing answers.
+        var fetched = await _lastFmService.GetSimilarTracksAsync(lookupArtist, lookupTitle, Math.Min(count + 10, 100));
+        var bans = !isExternal && _radioStateStore is not null
+            && parameters.GetValueOrDefault("u") is { Length: > 0 } listener
+            ? _radioStateStore.RadioBanKeys(listener)
+            : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var similarTracks = fetched
+            .Where(track => !RadioFiller.IsFiller(track.Title, track.Duration))
+            .Where(track => !bans.Contains(LastFmRadioSeedNormalizer.TrackKey(track.Artist, track.Title)))
+            .ToList();
 
         if (similarTracks.Count == 0)
         {

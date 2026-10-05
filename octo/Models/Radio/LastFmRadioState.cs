@@ -15,6 +15,7 @@ public sealed class LastFmRadioUserState
     public List<LastFmRadioPlay> Plays { get; set; } = [];
     public List<LastFmRadioStation> Stations { get; set; } = [];
     public List<LastFmRadioUnavailableTrack> UnavailableTracks { get; set; } = [];
+    public List<LastFmRadioBan> RadioBans { get; set; } = [];
     public DateTime? LastRefreshAttemptUtc { get; set; }
     public DateTime? LastRefreshSuccessUtc { get; set; }
     public string? LastRefreshError { get; set; }
@@ -28,6 +29,16 @@ public sealed class LastFmRadioUnavailableTrack
     public string Title { get; set; } = string.Empty;
     public DateTime FailedAtUtc { get; set; } = DateTime.UtcNow;
     public DateTime RetryAfterUtc { get; set; } = DateTime.UtcNow.AddHours(24);
+}
+
+/// <summary>A song the listener rated one star: it never plays on their radio.</summary>
+public sealed class LastFmRadioBan
+{
+    public string Key { get; set; } = string.Empty;
+    public string SongId { get; set; } = string.Empty;
+    public string Artist { get; set; } = string.Empty;
+    public string Title { get; set; } = string.Empty;
+    public DateTime BannedAtUtc { get; set; } = DateTime.UtcNow;
 }
 
 public sealed class LastFmRadioPlay
