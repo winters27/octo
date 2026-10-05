@@ -77,6 +77,16 @@ public sealed class AdminRoleCheck(
                     identity.InvalidateAdminJwt(jwt);
                     continue;
                 }
+                // Navidrome refuses the list to a non-admin with 403 "Permission denied" (0.64.2,
+                // seen on a real starter stack), so this token is no longer an admin's. When it
+                // came from this person's own login, that is the answer.
+                if (response.StatusCode == HttpStatusCode.Forbidden)
+                {
+                    identity.InvalidateAdminJwt(jwt);
+                    if (string.Equals(identity.UsernameForNativeToken(jwt), user, StringComparison.OrdinalIgnoreCase))
+                        return Role.NotAdmin;
+                    continue;
+                }
                 if (!response.IsSuccessStatusCode) return Role.Unknown;
 
                 using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(wait.Token));

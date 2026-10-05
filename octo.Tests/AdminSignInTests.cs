@@ -287,6 +287,19 @@ public class AdminSignInTests
     }
 
     [Fact]
+    public async Task ADemotedAdminIsSignedOutOnAServerThatShowsANonAdminOnlyThemselves()
+    {
+        await using var factory = new SignInWebFactory();
+        using var admin2 = factory.CreateClient();
+        Assert.Equal(HttpStatusCode.OK, (await SignInAsync(admin2, "admin2", "pw")).StatusCode);
+
+        factory.Navidrome.NonAdminSeesSelf = true;
+        factory.Navidrome.Admin2Demoted = true;
+
+        Assert.Equal(HttpStatusCode.Unauthorized, (await admin2.GetAsync("/api/admin/settings")).StatusCode);
+    }
+
+    [Fact]
     public async Task AStaleTokenIsDroppedAndTheSettingsLoginAsksAgain()
     {
         // Octo's token came from admin2, since demoted; checking someone else needs a real admin's
@@ -517,6 +530,7 @@ public class AdminSignInTests
         public bool UserListFails { get; set; }
         public bool UserListAsListener { get; set; }
         public bool Admin2Demoted { get; set; }
+        public bool NonAdminSeesSelf { get; set; }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
@@ -559,9 +573,16 @@ public class AdminSignInTests
                 Interlocked.Increment(ref _userListCalls);
                 if (UserListFails) return new HttpResponseMessage(HttpStatusCode.InternalServerError);
                 var auth = request.Headers.TryGetValues("X-Nd-Authorization", out var values) ? values.Single() : "";
-                // admin2's own token after Navidrome demoted admin2: a non-admin sees only themselves.
+                // admin2's own token after Navidrome demoted admin2. Real Navidrome 0.64.2 refuses the
+                // list to a non-admin outright (seen on LXC 131); NonAdminSeesSelf models a server that
+                // shows a non-admin only themselves instead.
                 if (auth == "Bearer jwt-admin2" && Admin2Demoted)
-                    return Answer(JsonSerializer.Serialize(new object[] { new { userName = "admin2", isAdmin = false } }));
+                    return NonAdminSeesSelf
+                        ? Answer(JsonSerializer.Serialize(new object[] { new { userName = "admin2", isAdmin = false } }))
+                        : new HttpResponseMessage(HttpStatusCode.Forbidden)
+                        {
+                            Content = new StringContent("{\"error\":\"Error reading user: Permission denied\"}", Encoding.UTF8, "application/json"),
+                        };
                 if (auth is not ("Bearer jwt-admin" or "Bearer jwt-admin2")) return new HttpResponseMessage(HttpStatusCode.Unauthorized);
                 object[] users = UserListAsListener
                     ? [new { userName = "listener", isAdmin = false }]
