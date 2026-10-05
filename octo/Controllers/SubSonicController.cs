@@ -3789,8 +3789,16 @@ public partial class SubsonicController : ControllerBase
     }
 
     [Route("{**endpoint}")]
-    public async Task<IActionResult> GenericEndpoint(string endpoint)
+    public async Task<IActionResult> GenericEndpoint(string? endpoint)
     {
+        // The bare address binds no endpoint at all. Required by [ApiController], that null was
+        // a 400 before any of this ran, and Amperfy checks the server address before signing in
+        // (#80). Navidrome answers it with its web app, so Octo does too; relative, so a reverse
+        // proxy's path prefix is kept.
+        endpoint ??= "";
+        if (endpoint.Length == 0 && (HttpMethods.IsGet(Request.Method) || HttpMethods.IsHead(Request.Method)))
+            return Redirect("app/");
+
         if (IsOctoOwnedPath(endpoint))
         {
             return NotFound();
