@@ -776,7 +776,8 @@ public partial class DeezerMetadataService : IDisposable
     /// Deezer has no such album, it has the album but no tracks for it, or it did not answer
     /// this time. Only the last may come right on its own a moment later.
     /// </summary>
-    public async Task<AlbumLookup> LookUpAlbumDetailAsync(string deezerId, CancellationToken ct = default)
+    public async Task<AlbumLookup> LookUpAlbumDetailAsync(string deezerId, CancellationToken ct = default,
+        bool background = false)
     {
         if (string.IsNullOrWhiteSpace(deezerId)) return new AlbumLookup(null, AlbumAnswer.NoSuchAlbum);
         var cacheKey = $"ad|{deezerId}";
@@ -797,9 +798,20 @@ public partial class DeezerMetadataService : IDisposable
             // album that genuinely has no tracks.
             int? nbTracks = null;
 
-            using (var r = await GetJsonAsync($"{Base}/album/{deezerId}", ct))
+            // Both calls at once: the tracklist does not depend on the album's answer, and an
+            // album opened or counted from a search waits on the slower of the two rather than
+            // on both in turn. When the album call says there is nothing, the tracklist's
+            // answer is dropped unread.
+            var tracksCall = GetJsonAsync($"{Base}/album/{deezerId}/tracks?limit=300", ct, background);
+            async Task<AlbumLookup> Without(AlbumLookup answer)
             {
-                if (r.Transient) return unavailable;
+                (await tracksCall).Dispose();
+                return answer;
+            }
+
+            using (var r = await GetJsonAsync($"{Base}/album/{deezerId}", ct, background))
+            {
+                if (r.Transient) return await Without(unavailable);
                 if (r.Doc is not null)
                 {
                     var root = r.Doc.RootElement;
@@ -825,11 +837,11 @@ public partial class DeezerMetadataService : IDisposable
             {
                 var none = new AlbumLookup(null, AlbumAnswer.NoSuchAlbum);
                 Put(cacheKey, none, NegativeTtl);
-                return none;
+                return await Without(none);
             }
 
             var tracks = new List<AlbumTrack>();
-            using (var tr = await GetJsonAsync($"{Base}/album/{deezerId}/tracks?limit=300", ct))
+            using (var tr = await tracksCall)
             {
                 // The album call can succeed while the tracklist call is throttled. That
                 // built a perfectly valid AlbumDetail carrying title, year and genre with
@@ -895,6 +907,24 @@ public partial class DeezerMetadataService : IDisposable
         var lookup = detail is null ? unavailable : new AlbumLookup(detail, AlbumAnswer.Found);
         Put(cacheKey, lookup, detail is null ? NegativeTtl : partial ? PartialTtl : PositiveTtl);
         return lookup;
+    }
+
+    /// <summary>
+    /// <see cref="LookUpAlbumDetailAsync"/> from the cache, or from one request shared by every
+    /// caller asking at once. The request runs without the caller's token, so a search that
+    /// stops waiting still leaves the answer cached for the next one. <paramref name="background"/>
+    /// puts it behind anything a listener is waiting on.
+    /// </summary>
+    /// <summary>The album's detail when it is already cached, without asking Deezer.</summary>
+    public AlbumLookup? CachedAlbumDetail(string deezerId) =>
+        !string.IsNullOrWhiteSpace(deezerId) && TryGetCached<AlbumLookup>($"ad|{deezerId}", out var cached) ? cached : null;
+
+    public Task<AlbumLookup> SharedAlbumDetailAsync(string deezerId, bool background, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(deezerId)) return Task.FromResult(new AlbumLookup(null, AlbumAnswer.NoSuchAlbum));
+        var cacheKey = $"ad|{deezerId}";
+        if (TryGetCached<AlbumLookup>(cacheKey, out var cached)) return Task.FromResult(cached!);
+        return SharedAsync(cacheKey, () => LookUpAlbumDetailAsync(deezerId, CancellationToken.None, background), ct);
     }
 
     private Task<(int? Year, bool Transient)> AlbumYearAsync(long albumId, CancellationToken ct)
