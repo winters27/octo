@@ -221,6 +221,10 @@ Every setting has a form, every backing service has a live status indicator, and
 > A script that changes settings must send that header too. **This is not a login.** Anyone
 > who can reach port 5274 directly, or a DNS-rebinding page, can still use the dashboard, so
 > the advice above stands.
+>
+> Saved passwords, API keys, tokens and webhook addresses never come back out of the admin
+> API: they read as "(saved, not shown)", and saving that back keeps what is stored. A saved
+> one is also never sent to a new server address unless it is typed again with the address.
 
 ## Notifications
 
