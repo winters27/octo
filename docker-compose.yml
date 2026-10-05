@@ -69,6 +69,13 @@ services:
       # Ask Soulseek's port test whether other people can reach slskd (sends the
       # port number only, at most every 6 hours).
       Soulseek__CheckListenPort: ${SLSKD_CHECK_PORT:-true}
+      # Share your library with the people you download from: where the
+      # dashboard's Share my library switch starts. The installer and
+      # .env.example turn it on; left unset it is off, so an update never
+      # starts sharing on an existing install by itself. The switch wins once
+      # flipped. SLSKD_SHARED_DIR is what is shared, as slskd sees it.
+      Soulseek__ShareLibrary: ${SLSKD_SHARE_LIBRARY:-false}
+      Soulseek__SharedFolders: ${SLSKD_SHARED_DIR:-[Music]/share}
       Soulseek__SearchWaitSeconds: ${SLSKD_SEARCH_WAIT_SECONDS:-30}
       Soulseek__UpgradeSearchWaitSeconds: ${SLSKD_UPGRADE_SEARCH_WAIT_SECONDS:-90}
       Soulseek__MinFileSizeBytes: ${SLSKD_MIN_FILE_SIZE_BYTES:-5242880}
@@ -311,6 +318,8 @@ services:
       - "5030:5030"
       - "50300:50300"
     environment:
+      # Lets slskd's administrator (Octo signs in as it) change slskd.yml through
+      # slskd's API. The dashboard's Share my library switch needs it.
       SLSKD_REMOTE_CONFIGURATION: "true"
       # Completed downloads go to the shared /music mount so Octo can see and
       # relocate them. Without this slskd defaults to <app>/downloads, which the
@@ -326,16 +335,17 @@ services:
       SLSKD_USERNAME: ${SLSKD_USERNAME:-slskd}
       SLSKD_PASSWORD: ${SLSKD_PASSWORD:-slskd}
       # ----- Sharing: give back to the people you download from -----
-      # Soulseek runs on sharing, and many users will not send files to someone
-      # who shares nothing. slskd shares your music library from the read-only
-      # /share mount below, so an upload can never change a file. Other people
-      # see it as a folder named Music. Several folders: separate them with ";".
-      # A shares list in ./slskd-state/slskd.yml outranks this.
-      SLSKD_SHARED_DIR: ${SLSKD_SHARED_DIR:-[Music]/share}
-      # Octo's own working files are never shared: partial and temporary
-      # copies, and its hidden folders (.octo-incoming, .octo-trash), which
+      # Whether slskd shares your library is the Share my library switch on
+      # the dashboard's Soulseek page (SLSKD_SHARE_LIBRARY sets where it starts).
+      # Octo applies it by writing the share list into slskd.yml through slskd's
+      # API, which is what remote configuration above allows, so do not set
+      # SLSKD_SHARED_DIR here: slskd would share it whatever the switch says.
+      # Shares come from the read-only /share mount below, so an upload can
+      # never change a file. Octo's own working files are never shared:
+      # partial and temporary copies, and its hidden folders (.octo-incoming,
+      # .octo-trash), which
       # slskd skips anyway because their names start with a dot.
-      SLSKD_SHARE_FILTER: '/\.octo-;\.octo-tmp$$;\.part$$;\.tmp$$'
+      SLSKD_SHARE_FILTER: '[\\/]\.octo-;\.octo-tmp$$;\.part$$;\.tmp$$'
       # Look through the shared folders again this often, in minutes (60 or
       # more), so songs added since are shared too. A library on a cloud drive
       # may want 10080, once a week: every look reads each file's header.
