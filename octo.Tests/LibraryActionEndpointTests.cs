@@ -279,6 +279,20 @@ public sealed class LibraryActionEndpointTests
     }
 
     [Fact]
+    public async Task GetLibraryActions_RemoveIsOfferedOnlyToANavidromeAdmin()
+    {
+        await using var factory = new LibraryActionWebFactory();
+        factory.Navidrome.Admin = false;
+        using var client = factory.CreateClient();
+
+        using var doc = await GetJson(client, $"/rest/getLibraryActions.view?{Auth("alice")}");
+
+        var actions = Envelope(doc).GetProperty("libraryActions");
+        Assert.False(actions.GetProperty("admin").GetBoolean());
+        Assert.DoesNotContain("remove", actions.GetProperty("actions").EnumerateArray().Select(a => a.GetString()));
+    }
+
+    [Fact]
     public async Task GetLibraryActions_DryRunOn_DeleteOff_KeptForever()
     {
         await using var factory = new LibraryActionWebFactory(new()

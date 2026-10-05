@@ -62,7 +62,7 @@ public partial class SubsonicResponseBuilder
                 ["enabled"] = settings.Enabled,
                 ["allowed"] = settings.IsAllowed(username),
                 ["dryRun"] = settings.DryRun,
-                ["actions"] = OfferedActions(settings, upgradeReady, edits, covers),
+                ["actions"] = OfferedActions(settings, upgradeReady, edits, covers, admin),
                 // Whether the caller is a Navidrome admin. Removing and every edit need it.
                 ["admin"] = admin,
                 // 0 means kept until someone removes it by hand.
@@ -74,11 +74,12 @@ public partial class SubsonicResponseBuilder
             },
         });
 
-    private static string[] OfferedActions(LibraryActionSettings settings, bool upgradeReady, bool edits, bool covers)
+    private static string[] OfferedActions(LibraryActionSettings settings, bool upgradeReady, bool edits, bool covers, bool admin)
     {
         var enabled = settings.EffectiveActions().Where(action => action.Enabled).Select(action => action.Action).ToHashSet();
         var offered = new List<string>();
-        if (enabled.Contains(LibraryAction.Delete)) offered.Add(RemoveAction);
+        // Removing needs a Navidrome admin, which libraryAction checks again; offered only to one.
+        if (enabled.Contains(LibraryAction.Delete) && admin) offered.Add(RemoveAction);
         if (enabled.Contains(LibraryAction.BetterQuality) && upgradeReady) offered.Add(UpgradeAction);
         if (edits)
         {
