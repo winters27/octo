@@ -75,8 +75,38 @@ jobs:
       - name: Install test dependencies
         run: pip install -r yt-dlp-shim/requirements-dev.txt
 
-      - name: Gate tests
+      - name: Shim tests
         run: pytest yt-dlp-shim/tests -q
+
+  # octo-sonic, the Sounds alike reader (Rust, bliss-rs over FFmpeg). Nothing else builds its
+  # image, so the image build is checked here too.
+  sonic:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sonic
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: FFmpeg libraries
+        run: sudo apt-get update && sudo apt-get install -y clang pkg-config libavformat-dev libavcodec-dev libavutil-dev libswresample-dev libavfilter-dev libavdevice-dev libswscale-dev
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+      - name: Image builds
+        working-directory: .
+        run: docker build ./sonic
 
   # The update helper runs as root on people's servers and is never built into
   # an image, so a mistake in it would surface only when someone presses Update

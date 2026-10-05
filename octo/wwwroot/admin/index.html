@@ -286,6 +286,15 @@
             <div class="status-card-body">Checking…</div>
             <div class="status-card-foot">Previews from YouTube</div>
           </article>
+          <article class="status-card" data-svc="sonic">
+            <div class="status-card-head">
+              <span class="status-card-mark"><svg class="icon" aria-hidden="true"><use href="#i-pulse"/></svg></span>
+              <span class="status-card-title">octo-sonic</span>
+              <span class="status-dot pending"></span>
+            </div>
+            <div class="status-card-body">Checking…</div>
+            <div class="status-card-foot">Sounds alike radio</div>
+          </article>
           <article class="status-card" data-svc="lastfm">
             <div class="status-card-head">
               <span class="status-card-mark"><svg class="icon brand" aria-hidden="true"><use href="#b-lastfm"/></svg></span>
@@ -865,6 +874,48 @@
               <div class="set-row stack"><div class="set-info"><div class="set-info-t">Completed plays before Your Mix</div><div class="set-info-d">Before this many completed plays, Octo offers Starter Radio. Afterward it can build Your Mix plus discovery, artist, and genre stations. Default: 10 plays.</div></div><input class="set-input" name="LastFm.MinimumPlays" type="number" min="3" max="100" /></div>
               <div class="set-row stack"><div class="set-info"><div class="set-info-t">Keep completed plays for (days)</div><div class="set-info-d">Older plays stop influencing dynamic stations and are removed from Octo's local listening history. Downloaded music is unaffected. Default: 90 days.</div></div><input class="set-input" name="LastFm.HistoryRetentionDays" type="number" min="7" max="365" /></div>
             </details>
+          </form>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">Radio sources</h3>
+            <p class="set-desc">Radio asks every source that is on, besides Last.fm, and blends their answers. A song more than one source suggests counts more. YouTube Music and ListenBrainz receive the artist and title of the song a radio starts from.</p>
+          </div>
+          <form data-section="radio-sources" class="set-card" id="radio-sources-form">
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">YouTube Music</div><div class="set-info-d">YouTube Music's radio for the song. It knows uploads Last.fm has never heard of, nightcore and phonk channels included.</div></div>
+              <label class="switch"><input type="checkbox" name="RadioSources.YouTubeMusic" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">ListenBrainz</div><div class="set-info-d">Songs people play alongside it, from ListenBrainz's open listening data. With a ListenBrainz token, its radio also fills artist and genre stations.</div></div>
+              <label class="switch"><input type="checkbox" name="RadioSources.ListenBrainz" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Sounds alike</div><div class="set-info-d">Library songs that sound like it. Octo reads every song once to learn how it sounds, one song at a time and only while nothing is downloading.</div></div>
+              <label class="switch"><input type="checkbox" name="RadioSources.SoundsAlike" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Sounds alike analysis</div><div class="set-info-d" id="sonic-status">Not loaded yet.</div></div>
+              <button class="btn btn-ghost" type="button" id="sonic-toggle"><span>Pause</span></button>
+              <button class="btn btn-ghost" type="button" id="sonic-reset"><svg class="icon" aria-hidden="true"><use href="#i-arrow-counter-clockwise"/></svg><span>Start over</span></button>
+            </div>
+            <details class="radio-advanced">
+              <summary>How much each source counts</summary>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">YouTube Music</div><div class="set-info-d">0 to 3. 0 leaves the source out. Default: 1.0.</div></div><input class="set-input" name="RadioSources.YouTubeMusicWeight" type="number" min="0" max="3" step="0.1" /></div>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">Last.fm</div><div class="set-info-d">Default: 0.9.</div></div><input class="set-input" name="RadioSources.LastFmWeight" type="number" min="0" max="3" step="0.1" /></div>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">ListenBrainz</div><div class="set-info-d">Default: 0.7.</div></div><input class="set-input" name="RadioSources.ListenBrainzWeight" type="number" min="0" max="3" step="0.1" /></div>
+              <div class="set-row stack"><div class="set-info"><div class="set-info-t">Sounds alike</div><div class="set-info-d">How a song sounds says tempo and timbre, not genre or mood, so alone it counts least. When no catalog knows the song, it counts at least 0.8. Default: 0.4.</div></div><input class="set-input" name="RadioSources.SoundsAlikeWeight" type="number" min="0" max="3" step="0.1" /></div>
+            </details>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Learn from listening</div><div class="set-info-d">Each listener's weights lean on the sources whose songs they play through. A radio song counts as kept when it is played through within a day of starting, skipped otherwise; weights move only after a source has a few dozen plays, and never below 0.3 or above 1.5.</div></div>
+              <label class="switch"><input type="checkbox" name="RadioSources.LearnFromListening" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row stack">
+              <div class="set-info"><div class="set-info-t">What radio has learned</div><div class="set-info-d" id="radio-outcomes-summary">Nothing yet: radio learns as songs it suggested are played or skipped.</div></div>
+              <table class="radio-outcomes" id="radio-outcomes" hidden><thead><tr><th>Source</th><th>Radio plays</th><th>Kept</th><th>Adjustment</th></tr></thead><tbody></tbody></table>
+              <button class="btn btn-ghost" type="button" id="radio-outcomes-reset"><svg class="icon" aria-hidden="true"><use href="#i-arrow-counter-clockwise"/></svg><span>Forget what radio learned</span></button>
+            </div>
           </form>
         </div>
 

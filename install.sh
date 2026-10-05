@@ -186,6 +186,11 @@ if [ -n "$(existing SUBSONIC_URL)" ] && [ "$(existing SUBSONIC_URL)" != "http://
   HAVE_NAVIDROME_DEFAULT="y"
 fi
 STARTER=false
+# octo-sonic (Sounds alike radio) starts unless an earlier .env left "sonic" out.
+WANT_SONIC=true
+if [ -n "${EXISTING[COMPOSE_PROFILES]+set}" ] && [[ ",${EXISTING[COMPOSE_PROFILES]// /}," != *",sonic,"* ]]; then
+  WANT_SONIC=false
+fi
 COMPOSE_PROFILES=""
 NAVIDROME_ADMIN_PASSWORD=""
 SUBSONIC_ADMIN_USERNAME="$(existing SUBSONIC_ADMIN_USERNAME)"
@@ -325,6 +330,11 @@ if [ -z "$SLSKD_PASSWORD" ]; then
   green "  ✓ generated random slskd web admin password (saved in .env)"
 fi
 
+# The optional services compose starts: octo-sonic first, then the starter Navidrome.
+if [ "$WANT_SONIC" = true ]; then
+  COMPOSE_PROFILES="sonic${COMPOSE_PROFILES:+,$COMPOSE_PROFILES}"
+fi
+
 # ─────────────────────────────────────────────────────────────────
 # Write .env
 # ─────────────────────────────────────────────────────────────────
@@ -341,7 +351,7 @@ DOWNLOAD_PATH=$DOWNLOAD_PATH
 SUBSONIC_ADMIN_USERNAME=$SUBSONIC_ADMIN_USERNAME
 SUBSONIC_ADMIN_PASSWORD="$SUBSONIC_ADMIN_PASSWORD"
 
-# === Starter stack (Navidrome started beside Octo) ===
+# === Optional services: sonic (Sounds alike), navidrome (the starter stack) ===
 COMPOSE_PROFILES=$COMPOSE_PROFILES
 NAVIDROME_ADMIN_PASSWORD="$NAVIDROME_ADMIN_PASSWORD"
 
@@ -406,7 +416,9 @@ for key in OCTO_CONFIG_DIR SLSKD_STATE_DIR NAVIDROME_DATA_DIR NAVIDROME_PORT ADM
            POPULAR_NOW \
            SLSKD_CHECK_PORT SLSKD_WEB_URL \
            IMPORTS_SPOTIFY_CLIENT_ID IMPORTS_SPOTIFY_REDIRECT_URI IMPORTS_SONGS_PER_HOUR IMPORTS_REFRESH_HOURS \
-           FOR_YOU_NEW_RELEASES FOR_YOU_REDISCOVER FOR_YOU_DEEP_CUTS NEW_RELEASE_WEEKS NEW_RELEASE_ARTISTS REDISCOVER_MONTHS; do
+           FOR_YOU_NEW_RELEASES FOR_YOU_REDISCOVER FOR_YOU_DEEP_CUTS NEW_RELEASE_WEEKS NEW_RELEASE_ARTISTS REDISCOVER_MONTHS \
+           RADIO_YOUTUBE_MUSIC RADIO_LISTENBRAINZ RADIO_LISTENBRAINZ_ALGORITHM RADIO_SOUNDS_ALIKE \
+           RADIO_SONIC_URL RADIO_SONIC_PAUSE_SECONDS RADIO_LEARN_FROM_LISTENING SONIC_CPUS SONIC_USER; do
   if [ -n "$(existing "$key")" ]; then
     printf '%s=%s
 ' "$key" "$(existing "$key")" >> .env
@@ -473,6 +485,7 @@ check_svc() {
 check_svc "Navidrome"  "navidrome"
 check_svc "Last.fm"    "lastfm"
 check_svc "yt-dlp shim" "ytDlpShim"
+check_svc "octo-sonic" "sonic"
 check_svc "slskd"      "slskd"
 if [ "${DOWNLOAD_SOURCE,,}" = "lidarr" ]; then
   check_svc "Lidarr" "lidarr"

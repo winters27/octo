@@ -344,6 +344,13 @@ public sealed class NavidromeSongPathResolver
     public string MusicRoot() =>
         _identity.EffectiveDownloadPath(_config["Library:DownloadPath"] ?? "./downloads");
 
+    /// <summary>The verified local file of a song from Navidrome's song list; null when Octo cannot
+    /// read it here (Sounds alike sends only files it can name to octo-sonic).</summary>
+    public FileInfo? LocalFile(LibrarySongRow row) =>
+        Verify(new Candidate(row.Id, row.Path, row.LibraryPath, row.Size, row.Title, row.Artist,
+                row.Album ?? "", row.Suffix, row.Duration, PathSource.NativeApi), MusicRoot(), quiet: true)
+            is { } resolved ? new FileInfo(resolved.AbsolutePath) : null;
+
     internal static Candidate? FromJson(JsonElement element, string id, PathSource source,
         string? libraryPathProperty)
     {

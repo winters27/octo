@@ -34,6 +34,7 @@ public class AdminController : ControllerBase
     private readonly IOptionsMonitor<SoulseekSettings> _soulseekOpts;
     private readonly IOptionsMonitor<LidarrSettings> _lidarrOpts;
     private readonly IOptionsMonitor<LastFmSettings> _lastFmOpts;
+    private readonly IOptionsMonitor<RadioSourceSettings> _radioSourceOpts;
     private readonly IOptionsMonitor<NotificationSettings> _notificationOpts;
     private readonly IOptionsMonitor<MetadataSettings> _metadataOpts;
     private readonly Octo.Services.Soulseek.RejectedPeerRegistry _rejectedPeers;
@@ -81,6 +82,7 @@ public class AdminController : ControllerBase
         IOptionsMonitor<SoulseekSettings> soulseekOpts,
         IOptionsMonitor<LidarrSettings> lidarrOpts,
         IOptionsMonitor<LastFmSettings> lastFmOpts,
+        IOptionsMonitor<RadioSourceSettings> radioSourceOpts,
         IOptionsMonitor<NotificationSettings> notificationOpts,
         IOptionsMonitor<MetadataSettings> metadataOpts,
         IOptionsMonitor<GenreSettings> genreOpts,
@@ -141,6 +143,7 @@ public class AdminController : ControllerBase
         _soulseekOpts = soulseekOpts;
         _lidarrOpts = lidarrOpts;
         _lastFmOpts = lastFmOpts;
+        _radioSourceOpts = radioSourceOpts;
         _notificationOpts = notificationOpts;
         _metadataOpts = metadataOpts;
         _rejectedPeers = rejectedPeers;
@@ -780,6 +783,7 @@ public class AdminController : ControllerBase
         var soulseek = _soulseekOpts.CurrentValue;
         var lidarr = _lidarrOpts.CurrentValue;
         var lastfm = _lastFmOpts.CurrentValue;
+        var radio = _radioSourceOpts.CurrentValue;
         var genre = _genreOpts.CurrentValue;
         var actions = _libraryActionOpts.CurrentValue;
         var mixes = _generatedOpts?.CurrentValue ?? new GeneratedPlaylistSettings();
@@ -894,6 +898,21 @@ public class AdminController : ControllerBase
             ["YouTube"] = new Dictionary<string, object>
             {
                 ["ShimUrl"] = _config["YouTube:ShimUrl"] ?? "",
+            },
+            // Radio's other sources and their weights (multi-source radio).
+            ["RadioSources"] = new Dictionary<string, object>
+            {
+                ["YouTubeMusic"] = radio.YouTubeMusic,
+                ["ListenBrainz"] = radio.ListenBrainz,
+                ["SoundsAlike"] = radio.SoundsAlike,
+                ["SonicUrl"] = radio.SonicUrl ?? "",
+                ["SonicPauseSeconds"] = radio.SonicPauseSeconds,
+                ["ListenBrainzAlgorithm"] = radio.ListenBrainzAlgorithm ?? "",
+                ["LastFmWeight"] = radio.LastFmWeight,
+                ["YouTubeMusicWeight"] = radio.YouTubeMusicWeight,
+                ["ListenBrainzWeight"] = radio.ListenBrainzWeight,
+                ["SoundsAlikeWeight"] = radio.SoundsAlikeWeight,
+                ["LearnFromListening"] = radio.LearnFromListening,
             },
             ["LastFm"] = new Dictionary<string, object>
             {
@@ -1812,6 +1831,7 @@ public class AdminController : ControllerBase
         var soulseek = _soulseekOpts.CurrentValue;
         var lidarr = _lidarrOpts.CurrentValue;
         var lastfm = _lastFmOpts.CurrentValue;
+        var radio = _radioSourceOpts.CurrentValue;
         var genre = _genreOpts.CurrentValue;
         var actions = _libraryActionOpts.CurrentValue;
         var mixes = _generatedOpts?.CurrentValue ?? new GeneratedPlaylistSettings();
@@ -1922,6 +1942,20 @@ public class AdminController : ControllerBase
             ["YouTube"] = new JsonObject
             {
                 ["ShimUrl"] = _config["YouTube:ShimUrl"] ?? "",
+            },
+            ["RadioSources"] = new JsonObject
+            {
+                ["YouTubeMusic"] = radio.YouTubeMusic,
+                ["ListenBrainz"] = radio.ListenBrainz,
+                ["SoundsAlike"] = radio.SoundsAlike,
+                ["SonicUrl"] = radio.SonicUrl ?? "",
+                ["SonicPauseSeconds"] = radio.SonicPauseSeconds,
+                ["ListenBrainzAlgorithm"] = radio.ListenBrainzAlgorithm ?? "",
+                ["LastFmWeight"] = radio.LastFmWeight,
+                ["YouTubeMusicWeight"] = radio.YouTubeMusicWeight,
+                ["ListenBrainzWeight"] = radio.ListenBrainzWeight,
+                ["SoundsAlikeWeight"] = radio.SoundsAlikeWeight,
+                ["LearnFromListening"] = radio.LearnFromListening,
             },
             ["LastFm"] = new JsonObject
             {
@@ -2202,6 +2236,8 @@ public class AdminController : ControllerBase
             "LastFm:HistoryRetentionDays", "LastFm:DiscoveryPercent",
             "LastFm:RefreshIntervalHours",
             "LastFm:MinimumPlays", "LastFm:DiscoveryStations",
+            "RadioSources:YouTubeMusic", "RadioSources:ListenBrainz", "RadioSources:SoundsAlike", "RadioSources:SonicUrl", "RadioSources:SonicPauseSeconds", "RadioSources:ListenBrainzAlgorithm",
+            "RadioSources:LastFmWeight", "RadioSources:YouTubeMusicWeight", "RadioSources:ListenBrainzWeight", "RadioSources:SoundsAlikeWeight", "RadioSources:LearnFromListening",
             "Metadata:Language", "Metadata:AlbumFromTitle", "Metadata:UseCoverArtArchive",
             "Metadata:ReplaceVideoCovers", "Metadata:WriteCoverFile", "Metadata:EmbedFullSizeCovers",
             "Metadata:FetchLyrics", "Metadata:LyricsSources", "Metadata:PreferWordTimedLyrics",
@@ -2280,6 +2316,7 @@ public class AdminController : ControllerBase
             ["slskd"] = ProbeSlskdAsync(ct),
             ["lidarr"] = ProbeLidarrAsync(ct),
             ["ytDlpShim"] = ProbeYouTubeShimAsync(ct),
+            ["sonic"] = ProbeSonicAsync(ct),
             ["lastfm"] = ProbeLastFmAsync(ct),
         };
         await Task.WhenAll(probeTasks.Values);
@@ -2418,6 +2455,22 @@ public class AdminController : ControllerBase
         {
             var ok = await _lidarr.IsReachableAsync(ct);
             return new ServiceProbe(ok, ok ? "reachable" : "unreachable / API key invalid");
+        }
+        catch (Exception ex) { return new ServiceProbe(false, ex.Message); }
+    }
+
+    /// <summary>octo-sonic, the Sounds alike reader; off when Sounds alike is switched off.</summary>
+    private async Task<ServiceProbe> ProbeSonicAsync(CancellationToken ct)
+    {
+        var radio = _radioSourceOpts.CurrentValue;
+        if (!radio.SoundsAlike) return new ServiceProbe(true, "Sounds alike is off", Configured: false);
+        try
+        {
+            var http = _httpFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(5);
+            using var resp = await http.GetAsync($"{radio.SonicUrl.TrimEnd('/')}/health", ct);
+            return new ServiceProbe(resp.IsSuccessStatusCode, resp.IsSuccessStatusCode ? "reachable"
+                : (int)resp.StatusCode == 503 ? "cannot see the music folder" : $"HTTP {(int)resp.StatusCode}");
         }
         catch (Exception ex) { return new ServiceProbe(false, ex.Message); }
     }

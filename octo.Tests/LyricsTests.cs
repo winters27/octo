@@ -400,6 +400,7 @@ public sealed class LyricsTests : IDisposable
                     ["Subsonic:Url"] = "http://127.0.0.1:1",
                     ["Subsonic:AutoDetectDownloadPath"] = "false",
                     ["Library:DownloadPath"] = _directory,
+                    ["Octo:StateDirectory"] = _directory,
                     ["Metadata:FetchLyrics"] = fetch ? "true" : "false",
                     ["Metadata:LyricsSources"] = "lrclib",
                 }));

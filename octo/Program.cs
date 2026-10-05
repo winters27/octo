@@ -76,6 +76,8 @@ builder.Services.Configure<LidarrSettings>(
     builder.Configuration.GetSection("Lidarr"));
 builder.Services.Configure<LastFmSettings>(
     builder.Configuration.GetSection("LastFm"));
+builder.Services.Configure<RadioSourceSettings>(
+    builder.Configuration.GetSection("RadioSources"));
 builder.Services.Configure<NotificationSettings>(
     builder.Configuration.GetSection("Notifications"));
 builder.Services.Configure<MetadataSettings>(
@@ -94,6 +96,13 @@ builder.Services.Configure<AdminSettings>(
 builder.Services.AddHttpClient(Octo.Services.ListenBrainz.ListenBrainzService.ClientName,
     c => c.Timeout = TimeSpan.FromSeconds(10));
 builder.Services.AddSingleton<Octo.Services.ListenBrainz.ListenBrainzService>();
+// ListenBrainz's listening data for radio (labs datasets, and LB Radio with a token).
+builder.Services.AddHttpClient(Octo.Services.ListenBrainz.ListenBrainzRadioClient.ClientName, c =>
+{
+    c.Timeout = TimeSpan.FromSeconds(10);
+    c.DefaultRequestHeaders.UserAgent.ParseAdd(Octo.Services.Common.OctoUserAgent.Value);
+});
+builder.Services.AddSingleton<Octo.Services.ListenBrainz.ListenBrainzRadioClient>();
 // Scrobbles of outside songs go out in the background, never inside a client's request, but a
 // hung call would still hold up every play queued behind it.
 builder.Services.AddHttpClient(LastFmScrobbleService.ClientName, c => c.Timeout = TimeSpan.FromSeconds(10));
@@ -137,6 +146,7 @@ builder.Services.AddSingleton(sp => new Octo.Services.Common.SoulseekHoldStore(
     System.IO.Path.Combine(System.IO.Path.GetDirectoryName(SettingsFilePath)!, "soulseek-holds.json"),
     sp.GetRequiredService<ILogger<Octo.Services.Common.SoulseekHoldStore>>()));
 builder.Services.AddSingleton<YouTubeResolver>();
+builder.Services.AddSingleton<Octo.Services.YouTube.YouTubeMusicClient>();
 
 // Two named HTTP clients for the yt-dlp shim:
 //   - search: short timeout, used for /search and /health
@@ -473,6 +483,39 @@ builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSe
 
 builder.Services.AddHttpClient<LastFmService>();
 builder.Services.AddSingleton<LastFmService>();
+// Radio's suggestion sources, asked together and blended (multi-source radio).
+builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.LastFmRadioSource>();
+builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.YouTubeMusicRadioSource>();
+builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.ListenBrainzRadioSource>();
+// Sounds alike (multi-source radio): what every library song sounds like, from octo-sonic.
+// Where its state files go: tests point it at their own folder, since SettingsFilePath is a
+// fixed /app/config path (C:\app\config on a developer's Windows machine). Read when the store
+// is made, not here: a test host's settings are not in builder.Configuration yet at this point.
+static string RadioStateDirectory(IServiceProvider sp) =>
+    sp.GetRequiredService<IConfiguration>()["Octo:StateDirectory"] is { Length: > 0 } stateDir
+        ? stateDir : System.IO.Path.GetDirectoryName(SettingsFilePath)!;
+builder.Services.AddHttpClient(Octo.Services.Sonic.SonicClient.ClientName, c => c.Timeout = TimeSpan.FromMinutes(11));
+builder.Services.AddSingleton<Octo.Services.Sonic.SonicClient>();
+builder.Services.AddSingleton(sp => new Octo.Services.Sonic.SonicStore(
+    System.IO.Path.Combine(RadioStateDirectory(sp), "sonic-features.json"),
+    sp.GetRequiredService<ILogger<Octo.Services.Sonic.SonicStore>>()));
+builder.Services.AddSingleton<Octo.Services.Sonic.ISonicLibrary, Octo.Services.Sonic.NavidromeSonicLibrary>();
+builder.Services.AddSingleton<Octo.Services.Sonic.SonicAnalysisWorker>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<Octo.Services.Sonic.SonicAnalysisWorker>());
+builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.SoundsAlikeRadioSource>();
+// What radio learns from listening: which source's songs each listener plays through or skips.
+builder.Services.AddSingleton(sp =>
+{
+    var store = new Octo.Services.Radio.RadioOutcomeStore(
+        System.IO.Path.Combine(RadioStateDirectory(sp), "radio-outcomes.json"),
+        sp.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<RadioSourceSettings>>(),
+        sp.GetRequiredService<ILogger<Octo.Services.Radio.RadioOutcomeStore>>());
+    // It writes every few seconds at most; whatever changed since goes down on the way out.
+    sp.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping.Register(store.Flush);
+    return store;
+});
+builder.Services.AddSingleton<Octo.Services.Radio.RadioSourceSet>();
+builder.Services.AddScoped<Octo.Services.Radio.SongRadioService>();
 
 // Push notifications (ntfy / Discord webhook). The orchestrator takes
 // IEnumerable<INotificationSink>, so adding a transport is one registration line.

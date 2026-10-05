@@ -821,6 +821,7 @@ internal sealed class RadioWebFactory : WebApplicationFactory<Program>
                 ["Subsonic:AutoDetectDownloadPath"] = "false",
                 ["Subsonic:ExplicitFilter"] = _explicitFilter,
                 ["Library:DownloadPath"] = _directory,
+                ["Octo:StateDirectory"] = _directory,
                 ["LastFm:EnableRadio"] = "true",
                 ["LastFm:EnablePersonalizedStations"] = "true",
                 ["LastFm:EnableDiscoveryStations"] = "true",

@@ -450,6 +450,7 @@ public sealed class SetRatingScopeTests
                     ["Subsonic:Url"] = "http://navidrome.test",
                     ["Subsonic:AutoDetectDownloadPath"] = "false",
                     ["Library:DownloadPath"] = _directory,
+                    ["Octo:StateDirectory"] = _directory,
                     ["LibraryActions:Enabled"] = "true",
                     ["LibraryActions:RatingsEnabled"] = "true",
                     ["LibraryActions:ReviewEnabled"] = "true",

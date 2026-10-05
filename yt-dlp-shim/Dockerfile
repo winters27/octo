@@ -44,12 +44,12 @@ RUN set -eux; \
     chmod +x /usr/local/bin/deno; \
     deno --version
 
-RUN pip install --no-cache-dir flask gunicorn requests
+RUN pip install --no-cache-dir flask gunicorn requests "ytmusicapi>=1.12,<2"
 
-# gate.py too, not just app.py -- app.py imports it at module scope, so omitting
+# gate.py and ytm.py too, not just app.py -- app.py imports them at module scope, so omitting
 # it here is a ModuleNotFoundError at startup and total loss of playback. The
 # shim image is never built in CI, so nothing else would catch that.
-COPY app.py gate.py /app/
+COPY app.py gate.py ytm.py /app/
 
 EXPOSE 8080
 

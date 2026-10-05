@@ -410,6 +410,7 @@ public sealed class GeneratedPlaylistControllerTests
                         ["Subsonic:Url"] = "http://navidrome.test",
                         ["Subsonic:AutoDetectDownloadPath"] = "false",
                         ["Library:DownloadPath"] = _directory,
+                        ["Octo:StateDirectory"] = _directory,
                         ["GeneratedPlaylists:Enabled"] = "true",
                     }));
             builder.ConfigureServices(services =>
