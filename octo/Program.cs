@@ -76,6 +76,8 @@ builder.Services.Configure<LidarrSettings>(
     builder.Configuration.GetSection("Lidarr"));
 builder.Services.Configure<LastFmSettings>(
     builder.Configuration.GetSection("LastFm"));
+builder.Services.Configure<RadioSourceSettings>(
+    builder.Configuration.GetSection("RadioSources"));
 builder.Services.Configure<NotificationSettings>(
     builder.Configuration.GetSection("Notifications"));
 builder.Services.Configure<MetadataSettings>(
@@ -438,6 +440,10 @@ builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSe
 
 builder.Services.AddHttpClient<LastFmService>();
 builder.Services.AddSingleton<LastFmService>();
+// Radio's suggestion sources, asked together and blended (multi-source radio).
+builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.LastFmRadioSource>();
+builder.Services.AddSingleton<Octo.Services.Radio.RadioSourceSet>();
+builder.Services.AddScoped<Octo.Services.Radio.SongRadioService>();
 
 // Push notifications (ntfy / Discord webhook). The orchestrator takes
 // IEnumerable<INotificationSink>, so adding a transport is one registration line.

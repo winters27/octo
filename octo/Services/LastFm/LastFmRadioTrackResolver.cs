@@ -47,13 +47,19 @@ public sealed class LastFmRadioTrackResolver
         catch (Exception ex) { _logger.LogDebug(ex, "scrobble metadata lookup failed for {Id}", id); return null; }
     }
 
+    /// <param name="youTubeId">A video a source already named for this song (YouTube Music).</param>
     public async Task<Song?> ResolveAsync(string artist, string title, int? duration,
         IReadOnlyDictionary<string, string> authenticatedParameters,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, string? youTubeId = null)
     {
         var local = await TryFindLocalMatchAsync(artist, title, authenticatedParameters);
         if (local is not null) return local;
         var hits = await _metadata.SearchSongsByArtistTitleAsync(artist, title, 1, duration);
+        // A source that already named the video saves the search later, and plays exactly what
+        // it suggested.
+        if (hits.Count > 0 && !string.IsNullOrEmpty(youTubeId)
+            && _registry.Lookup(hits[0].Id) is { } routing && string.IsNullOrEmpty(routing.YouTubeId))
+            routing.YouTubeId = youTubeId;
         return hits.Count > 0 ? hits[0] : null;
     }
 
@@ -102,6 +108,10 @@ public sealed class LastFmRadioTrackResolver
     /// album or an artist id; an album is read as its first song, an artist as the name alone.
     /// Null when Navidrome knows none of them for this listener.
     /// </summary>
+    /// <summary>One library song as this listener's Navidrome describes it; null when they cannot see it.</summary>
+    public async Task<Song?> ReadLibrarySongAsync(string id, IReadOnlyDictionary<string, string> authenticatedParameters) =>
+        await ReadAsync("rest/getSong", id, authenticatedParameters, "song") is { } song ? LibrarySong(song) : null;
+
     public async Task<LibrarySeed?> ReadSeedAsync(string id,
         IReadOnlyDictionary<string, string> authenticatedParameters)
     {
@@ -204,6 +214,7 @@ public sealed class LastFmRadioTrackResolver
         Suffix = NullableString(song, "suffix"),
         BitRate = Integer(song, "bitRate"),
         Isrcs = Texts(song, "isrc"),
+        MusicBrainzRecordingId = NullableString(song, "musicBrainzId"),
         IsLocal = true,
     };
 

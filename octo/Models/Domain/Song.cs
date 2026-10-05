@@ -134,6 +134,14 @@ public class Song
     /// </summary>
     public int? ExplicitContentLyrics { get; set; }
 
+    /// <summary>Which radio source suggested this song, as the apps show it ("YouTube Music").
+    /// Only radio answers set it; never stored.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? SuggestedBy { get; set; }
+
+    /// <summary>A shallow copy, for a response that must change a song another response shares.</summary>
+    public Song Copy() => (Song)MemberwiseClone();
+
     /// <summary>
     /// MusicBrainz recording id of a fingerprint-confirmed download. Written as
     /// MUSICBRAINZ_TRACKID (UFID on ID3), which is where Picard and Navidrome both keep the

@@ -59,8 +59,40 @@ public sealed class SimilarSongsSeedTests
 
         var songs = await RadioIds(client, "teardrop");
 
-        Assert.Equal(["ext-Portishead-Glory Box", "ext-Morcheeba-Trigger Hippie"], songs);
+        // A full answer for the song itself: Last.fm's order, and the library is not asked.
+        Assert.Equal(["ext-Portishead-Glory Box", "ext-Morcheeba-Trigger Hippie"], songs.Take(2));
+        Assert.Equal(20, songs.Count);
         Assert.DoesNotContain(fixture.Handler.Calls, call => call.Contains("rest/getAlbum", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ASongTheListenerRatedOneStar_StaysOffTheirRadio()
+    {
+        await using var fixture = new Factory();
+        fixture.Services.GetRequiredService<LastFmRadioStateStore>()
+            .SetRadioBan("alice", "glory-box", "Portishead", "Glory Box", true);
+        using var client = fixture.CreateClient();
+
+        var songs = await RadioIds(client, "teardrop");
+
+        Assert.DoesNotContain("ext-Portishead-Glory Box", songs);
+        Assert.Contains("ext-Morcheeba-Trigger Hippie", songs);
+    }
+
+    [Fact]
+    public async Task AThinExactAnswer_IsFilledFromTheLibrary()
+    {
+        await using var fixture = new Factory();
+        using var client = fixture.CreateClient();
+
+        var songs = await RadioIds(client, "roads");
+
+        // Last.fm knows the song but has two songs like it: too few to be the radio alone.
+        Assert.Contains("ext-Massive Attack-Angel", songs);
+        Assert.Contains("ext-Massive Attack-Unfinished Sympathy", songs);
+        Assert.Contains("dummy-2", songs);
+        Assert.Contains(fixture.Handler.Calls, call => call.Contains("rest/getAlbum", StringComparison.Ordinal)
+            && call.Contains("id=al-dummy", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -99,7 +131,7 @@ public sealed class SimilarSongsSeedTests
 
         var songs = await RadioIds(client, "album-trip");
 
-        Assert.Equal(["ext-Portishead-Glory Box", "ext-Morcheeba-Trigger Hippie"], songs);
+        Assert.Equal(["ext-Portishead-Glory Box", "ext-Morcheeba-Trigger Hippie"], songs.Take(2));
     }
 
     [Fact]
@@ -135,7 +167,7 @@ public sealed class SimilarSongsSeedTests
     [InlineData("", null)]
     [InlineData(null, null)]
     public void PrimaryGenre_IsTheFirstRealOne(string? genre, string? expected) =>
-        Assert.Equal(expected, SubsonicController.PrimaryGenre(genre));
+        Assert.Equal(expected, Octo.Services.Radio.RadioBlend.PrimaryGenre(genre));
 
     [Fact]
     public void Interleave_TakesOneFromEachInTurn() =>
@@ -165,6 +197,7 @@ public sealed class SimilarSongsSeedTests
         {
             ["spooky"] = Song("spooky", "SPOOKY", "Missigno", "PHONK", "al-phonk", "Phonk"),
             ["teardrop"] = Song("teardrop", "Teardrop", "Massive Attack", "Mezzanine", "al-mezz", "Trip-Hop"),
+            ["roads"] = Song("roads", "Roads", "Portishead", "Dummy", "al-dummy", "Trip-Hop"),
             ["brand-new"] = Song("brand-new", "Brand New", "Drake", "Brand New", "al-brand-new", "Hip-Hop"),
             ["faded-nightcore"] = Song("faded-nightcore", "Alan Walker - Faded (Nightcore)", "Nightcore Galaxy",
                 "Nightcore", "al-nightcore", ""),
@@ -188,6 +221,8 @@ public sealed class SimilarSongsSeedTests
                     "al-phonk" => Album("al-phonk", "PHONK", "Missigno", LibrarySongs["spooky"], Song("pl-2", "DRIFT", "Missigno", "PHONK", "al-phonk", "Phonk"), Song("pl-3", "NIGHT RIDE", "Missigno", "PHONK", "al-phonk", "Phonk")),
                     "al-nightcore" => Album("al-nightcore", "Nightcore", "Nightcore Galaxy", LibrarySongs["faded-nightcore"], Song("pl-9", "Alone (Nightcore)", "Nightcore Galaxy", "Nightcore", "al-nightcore", "")),
                     "album-trip" => Album("album-trip", "Mezzanine", "Massive Attack", LibrarySongs["teardrop"]),
+                    "al-dummy" => Album("al-dummy", "Dummy", "Portishead", LibrarySongs["roads"],
+                        Song("dummy-2", "Sour Times", "Portishead", "Dummy", "al-dummy", "Trip-Hop")),
                     _ => null,
                 },
                 _ when path.EndsWith("/rest/getArtist") => id == "artist-massive"
@@ -213,7 +248,10 @@ public sealed class SimilarSongsSeedTests
             {
                 "track.getsimilar" => (artist, track) switch
                 {
-                    ("Massive Attack", "Teardrop") => """{"similartracks":{"track":[{"name":"Glory Box","artist":{"name":"Portishead"},"match":0.9},{"name":"Trigger Hippie","artist":{"name":"Morcheeba"},"match":0.8}]}}""",
+                    // A full answer: Last.fm knows this song well.
+                    ("Massive Attack", "Teardrop") => """{"similartracks":{"track":[{"name":"Glory Box","artist":{"name":"Portishead"},"match":0.9},{"name":"Trigger Hippie","artist":{"name":"Morcheeba"},"match":0.8},{"name":"Song 1","artist":{"name":"Artist 1"},"match":0.69},{"name":"Song 2","artist":{"name":"Artist 2"},"match":0.68},{"name":"Song 3","artist":{"name":"Artist 3"},"match":0.67},{"name":"Song 4","artist":{"name":"Artist 4"},"match":0.66},{"name":"Song 5","artist":{"name":"Artist 5"},"match":0.65},{"name":"Song 6","artist":{"name":"Artist 6"},"match":0.64},{"name":"Song 7","artist":{"name":"Artist 7"},"match":0.63},{"name":"Song 8","artist":{"name":"Artist 8"},"match":0.62},{"name":"Song 9","artist":{"name":"Artist 9"},"match":0.61},{"name":"Song 10","artist":{"name":"Artist 10"},"match":0.60},{"name":"Song 11","artist":{"name":"Artist 11"},"match":0.59},{"name":"Song 12","artist":{"name":"Artist 12"},"match":0.58},{"name":"Song 13","artist":{"name":"Artist 13"},"match":0.57},{"name":"Song 14","artist":{"name":"Artist 14"},"match":0.56},{"name":"Song 15","artist":{"name":"Artist 15"},"match":0.55},{"name":"Song 16","artist":{"name":"Artist 16"},"match":0.54},{"name":"Song 17","artist":{"name":"Artist 17"},"match":0.53},{"name":"Song 18","artist":{"name":"Artist 18"},"match":0.52},{"name":"Song 19","artist":{"name":"Artist 19"},"match":0.51},{"name":"Song 20","artist":{"name":"Artist 20"},"match":0.50},{"name":"Song 21","artist":{"name":"Artist 21"},"match":0.49},{"name":"Song 22","artist":{"name":"Artist 22"},"match":0.48},{"name":"Song 23","artist":{"name":"Artist 23"},"match":0.47}]}}""",
+                    // A thin one: two songs like it.
+                    ("Portishead", "Roads") => """{"similartracks":{"track":[{"name":"Angel","artist":{"name":"Massive Attack"},"match":0.9},{"name":"Unfinished Sympathy","artist":{"name":"Massive Attack"},"match":0.8}]}}""",
                     ("Alan Walker", "Faded") => """{"similartracks":{"track":[{"name":"Wake Me Up","artist":{"name":"Avicii"},"match":0.9}]}}""",
                     _ => """{"similartracks":{"track":[]}}""",
                 },

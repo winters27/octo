@@ -38,7 +38,10 @@ public partial class LastFmService
     }
 
     /// <param name="Listeners">How many people Last.fm counts for the row, where the call says.</param>
-    public record SimilarTrack(string Artist, string Title, double Match, int? Duration = null, long? Listeners = null);
+    /// <param name="YouTubeId">The video a source already knows plays this song.</param>
+    /// <param name="Provider">The <see cref="Octo.Services.Radio.RadioProvider"/> that suggested it.</param>
+    public record SimilarTrack(string Artist, string Title, double Match, int? Duration = null, long? Listeners = null,
+        string? YouTubeId = null, string? Provider = null);
 
     /// <summary>How a list of songs like a seed was found.</summary>
     public enum SimilarSource
