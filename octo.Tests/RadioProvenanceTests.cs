@@ -47,6 +47,27 @@ public sealed class RadioProvenanceTests
     }
 
     [Fact]
+    public async Task AStationSongThatSoundedAlike_ButIsNoLongerInTheLibrary_IsLeftOut()
+    {
+        await using var fixture = new RadioWebFactory();
+        fixture.InstallStation();
+        var station = fixture.State.FindStation("alice", fixture.StationId)!;
+        station.Tracks.Add(new() { Artist = "Gone Artist", Title = "Gone Song", Duration = 200,
+            Source = RadioProvider.SoundsAlike, ResolvedId = "ext-gone" });
+        station.Tracks.Add(new() { Artist = "Online Artist", Title = "Online Song", Duration = 200,
+            Source = RadioProvider.YouTubeMusic, ResolvedId = "ext-online" });
+        fixture.State.ReplaceStations("alice", [station]);
+        using var client = fixture.CreateClient();
+
+        var body = await client.GetStringAsync($"/rest/getPlaylist?id={fixture.StationId}&u=alice&t=token&s=salt&f=json");
+
+        // Neither is in the fake library, so both resolve as outside songs: the one found online
+        // plays from outside, the one that only sounded alike does not.
+        Assert.DoesNotContain("Gone Song", body);
+        Assert.Contains("Online Song", body);
+    }
+
+    [Fact]
     public async Task AStationSong_SaysTheSourceItsStationWasBuiltWith()
     {
         await using var fixture = new RadioWebFactory();

@@ -3,6 +3,8 @@ using System.Text;
 using Microsoft.Extensions.Options;
 using Octo.Models.Radio;
 using Octo.Models.Settings;
+using Octo.Models.Domain;
+using Octo.Services.Radio;
 
 namespace Octo.Services.LastFm;
 
@@ -96,15 +98,22 @@ public sealed class LastFmRadioRecommendationService
     private readonly IOptionsMonitor<LastFmSettings> _settings;
     private readonly ILogger<LastFmRadioRecommendationService> _logger;
 
+    /// <param name="sources">Every radio source; null keeps stations on Last.fm alone.</param>
     public LastFmRadioRecommendationService(LastFmService lastFm, LastFmRadioStateStore state,
         IOptionsMonitor<LastFmSettings> settings,
-        ILogger<LastFmRadioRecommendationService> logger)
+        ILogger<LastFmRadioRecommendationService> logger, RadioSourceSet? sources = null)
     {
         _lastFm = lastFm;
         _state = state;
         _settings = settings;
         _logger = logger;
+        _sources = sources;
     }
+
+    private readonly RadioSourceSet? _sources;
+    private static readonly IReadOnlyDictionary<string, string> EmptyAuth = new Dictionary<string, string>();
+    /// <summary>Seeds asked at once when several sources answer: the sources' own gates still pace them.</summary>
+    internal const int SeedsAtOnce = 3;
 
     public async Task<IReadOnlyList<LastFmRadioStation>> BuildAsync(string username,
         CancellationToken cancellationToken = default)
@@ -157,7 +166,7 @@ public sealed class LastFmRadioRecommendationService
             var mixKey = learned ? "your-mix" : "starter";
             if (settings.EnableYourMix)
             {
-                var mixCandidates = await TracksFromSeeds(trackSeeds.Take(6), 12, ct);
+                var mixCandidates = await TracksFromSeeds(username, trackSeeds.Take(6), 12, ct);
                 var familiar = plays.Select(ToCandidate).ToList();
                 // The familiar share of the mix is a quota the walk enforces, so both halves
                 // are drawn over their whole pools rather than the top of each list.
@@ -181,7 +190,7 @@ public sealed class LastFmRadioRecommendationService
                     .Select(pair => pair.Key).Take(3).ToList();
                 if (settings.EnableDiscoveryMix && topTags.Count > 0)
                 {
-                    var discovery = await TracksFromTags(topTags, candidateTarget, ct);
+                    var discovery = await TracksFromTags(username, topTags, candidateTarget, ct);
                     if (discovery.Count >= 5)
                         stations.Add(Create(username, "discovery", "Discovery Mix",
                             LastFmRadioStationKind.Discovery, true, topTags,
@@ -192,7 +201,7 @@ public sealed class LastFmRadioRecommendationService
 
                 foreach (var artist in artistScores.Take(settings.EffectiveArtistStationCount).Select(pair => pair.Key))
                 {
-                    var candidates = await TracksFromArtist(artist, candidateTarget, ct);
+                    var candidates = await TracksFromArtist(username, artist, candidateTarget, ct);
                     var stationKey = "artist-" + Key(artist);
                     if (candidates.Count >= 5)
                         stations.Add(Create(username, stationKey, $"{artist} Radio",
@@ -205,7 +214,7 @@ public sealed class LastFmRadioRecommendationService
                 foreach (var tag in tags.OrderByDescending(pair => pair.Value).Select(pair => pair.Key)
                              .Take(settings.EffectiveGenreStationCount))
                 {
-                    var candidates = await TracksFromTags([tag], candidateTarget, ct);
+                    var candidates = await TracksFromTags(username, [tag], candidateTarget, ct);
                     var stationKey = "genre-" + Key(tag);
                     if (candidates.Select(item => item.Track.Artist).Distinct(StringComparer.OrdinalIgnoreCase).Count() >= 4)
                         stations.Add(Create(username, stationKey, Title(tag) + " Radio",
@@ -221,7 +230,7 @@ public sealed class LastFmRadioRecommendationService
         {
             foreach (var definition in settings.EffectiveDiscoveryStations().Where(item => item.Enabled))
             {
-                var candidates = await TracksFromTags(definition.Tags, candidateTarget, ct);
+                var candidates = await TracksFromTags(username, definition.Tags, candidateTarget, ct);
                 if (candidates.Count == 0)
                     candidates.AddRange(plays.Where(play => definition.Tags.Any(tag =>
                             (play.Genre ?? "").Contains(tag, StringComparison.OrdinalIgnoreCase)))
@@ -247,35 +256,83 @@ public sealed class LastFmRadioRecommendationService
     /// <summary>
     /// Tracks similar to each seed, the seed's own weight riding along: the newest seed
     /// leads, each older one contributes <see cref="SeedRecencyDecay"/> of the previous,
-    /// and a hearted seed counts half again. Last.fm's match score stays as the
-    /// per-track signal inside a seed's list.
+    /// and a hearted seed counts half again. With Last.fm alone, its match score stays the
+    /// per-track signal; with several sources, each source's list is ranked by position and
+    /// weighted by its provider (see <see cref="RadioSourceSet.Weights"/>), and seeds are asked
+    /// <see cref="SeedsAtOnce"/> at a time so a slow source costs one timeout per three seeds.
     /// </summary>
-    private async Task<List<Candidate>> TracksFromSeeds(
+    private async Task<List<Candidate>> TracksFromSeeds(string? username,
         IEnumerable<LastFmRadioPlay> seeds, int each, CancellationToken ct)
     {
-        var result = new List<Candidate>();
-        var position = 0;
-        foreach (var seed in seeds)
+        var ordered = seeds.Select((seed, position) => (Seed: seed,
+            Affinity: Math.Pow(SeedRecencyDecay, position) * (seed.Hearted ? HeartedSeedAffinity : 1d))).ToList();
+        if (_sources is null)
         {
-            var affinity = Math.Pow(SeedRecencyDecay, position++) * (seed.Hearted ? HeartedSeedAffinity : 1d);
-            var source = LastFmRadioSeedNormalizer.TrackKey(seed.Artist, seed.Title);
+            var result = new List<Candidate>();
+            foreach (var (seed, affinity) in ordered)
+            {
+                var source = LastFmRadioSeedNormalizer.TrackKey(seed.Artist, seed.Title);
+                try { result.AddRange(Ranked(await _lastFm.GetSimilarTracksAsync(seed.Artist, seed.Title, each, ct), source, affinity)); }
+                catch (OperationCanceledException) { break; }
+            }
+            return result;
+        }
+
+        var weights = _sources.Weights(username);
+        using var gate = new SemaphoreSlim(SeedsAtOnce);
+        var lists = await Task.WhenAll(ordered.Select(async item =>
+        {
+            try { await gate.WaitAsync(ct); }
+            catch (OperationCanceledException) { return new List<Candidate>(); }
             try
             {
-                result.AddRange(Ranked(
-                    await _lastFm.GetSimilarTracksAsync(seed.Artist, seed.Title, each, ct), source, affinity));
+                var (seed, affinity) = item;
+                var source = LastFmRadioSeedNormalizer.TrackKey(seed.Artist, seed.Title);
+                var radioSeed = new RadioSeed(seed.Artist, seed.Title, seed.Duration,
+                    seed.IsLocal && seed.SongId.Length > 0
+                        ? new Song { Id = seed.SongId, Title = seed.Title, Artist = seed.Artist, IsLocal = true }
+                        : null);
+                var found = new List<Candidate>();
+                foreach (var answer in await _sources.AskAllAsync(radioSeed, each, EmptyAuth, ct))
+                {
+                    var factor = RadioBlend.StationFactor(answer.Match) * RadioBlend.Thin(answer)
+                        * weights.GetValueOrDefault(answer.Provider, 1.0);
+                    if (factor <= 0) continue;
+                    // Sources score on different scales (Last.fm's match, a flat 1 from YouTube Music),
+                    // so with several sources each list is ranked by position alone, as song radio
+                    // does, and the provider weights say how much each list counts.
+                    var tracks = answer.LibrarySongs.Select(song => new LastFmService.SimilarTrack(song.Artist,
+                            song.Title, 1.0, song.Duration, Provider: answer.Provider))
+                        .Concat(answer.Tracks.Select(track => track with { Match = 1.0 }));
+                    found.AddRange(Ranked(tracks, answer.Provider + ":" + source, affinity * factor));
+                }
+                return found;
             }
-            catch (OperationCanceledException) { break; }
-        }
-        return result;
+            catch (OperationCanceledException) { return new List<Candidate>(); }
+            finally { gate.Release(); }
+        }));
+        return lists.SelectMany(list => list).ToList();
     }
 
-    private async Task<List<Candidate>> TracksFromTags(IEnumerable<string> tags,
+    private async Task<List<Candidate>> TracksFromTags(string? username, IEnumerable<string> tags,
         int each, CancellationToken ct)
     {
         var result = new List<Candidate>();
         foreach (var tag in tags.Take(5))
         {
-            try { result.AddRange(Ranked(await _lastFm.GetTagTopTracksAsync(tag, each, ct), "tag:" + tag)); }
+            try
+            {
+                result.AddRange(Ranked(await _lastFm.GetTagTopTracksAsync(tag, each, ct), "tag:" + tag));
+                // Last.fm's tag chart is the line above; the other sources' answers for the tag
+                // (LB Radio, with a ListenBrainz token) join it, each list weighted by its provider.
+                if (_sources is not null)
+                {
+                    var weights = _sources.Weights(username);
+                    foreach (var answer in (await _sources.TagAllAsync(tag, each, ct)).Where(a => a.Provider != RadioProvider.LastFm))
+                        result.AddRange(Ranked(answer.Tracks, answer.Provider + ":tag:" + tag,
+                            weights.GetValueOrDefault(answer.Provider, 1.0)));
+                }
+            }
             catch (OperationCanceledException) { break; }
         }
         return result;
@@ -283,7 +340,7 @@ public sealed class LastFmRadioRecommendationService
 
     /// <summary>The seed artist's own top tracks lead; similar artists' top tracks ride at
     /// <see cref="NeighbourArtistAffinity"/> so the station stays about who it is named for.</summary>
-    private async Task<List<Candidate>> TracksFromArtist(string artist,
+    private async Task<List<Candidate>> TracksFromArtist(string? username, string artist,
         int candidateTarget, CancellationToken ct)
     {
         var result = Ranked(await _lastFm.GetArtistTopTracksAsync(artist,
@@ -292,6 +349,16 @@ public sealed class LastFmRadioRecommendationService
             result.AddRange(Ranked(await _lastFm.GetArtistTopTracksAsync(similar.Name,
                 Math.Min(20, Math.Max(6, candidateTarget / 5)), ct), "artist:" + similar.Name,
                 NeighbourArtistAffinity));
+        // The other sources' radio for the artist (YouTube Music's, LB Radio's), beside the
+        // similar artists' songs.
+        if (_sources is not null)
+        {
+            var weights = _sources.Weights(username);
+            foreach (var answer in await _sources.AskAllAsync(new RadioSeed(artist, "", null, null), candidateTarget, EmptyAuth, ct))
+                if (answer.Provider != RadioProvider.LastFm)
+                    result.AddRange(Ranked(answer.Tracks, answer.Provider + ":artist:" + artist,
+                        NeighbourArtistAffinity * weights.GetValueOrDefault(answer.Provider, 1.0)));
+        }
         return result;
     }
 
@@ -385,7 +452,10 @@ public sealed class LastFmRadioRecommendationService
             {
                 Artist = LastFmRadioSeedNormalizer.Artist(track.Artist) ?? track.Artist,
                 Title = LastFmRadioSeedNormalizer.Title(track.Title) ?? track.Title,
-                Duration = track.Duration, Score = track.Match, Source = "lastfm"
+                Duration = track.Duration, Score = track.Match, YouTubeId = track.YouTubeId,
+                // Which source suggested it, shown in the apps; a familiar song was the
+                // listener's own pick.
+                Source = track.Provider ?? (isFamiliar ? RadioProvider.History : RadioProvider.LastFm)
             });
             outputArtists.Add(artist);
             outputTitles.Add(title);
