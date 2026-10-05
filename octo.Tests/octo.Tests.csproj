@@ -30,6 +30,7 @@
     <None Include="..\docs\song-identity-cases.json" Link="song-identity-cases.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- The cover design reference's golden samples, copied from the Octo app's tools/cover-art/golden. -->
     <None Include="CoverGolden\samples.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Fixtures\listenbrainz\*.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

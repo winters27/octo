@@ -93,6 +93,13 @@ builder.Services.Configure<UpdateSettings>(
 builder.Services.AddHttpClient(Octo.Services.ListenBrainz.ListenBrainzService.ClientName,
     c => c.Timeout = TimeSpan.FromSeconds(10));
 builder.Services.AddSingleton<Octo.Services.ListenBrainz.ListenBrainzService>();
+// ListenBrainz's listening data for radio (labs datasets, and LB Radio with a token).
+builder.Services.AddHttpClient(Octo.Services.ListenBrainz.ListenBrainzRadioClient.ClientName, c =>
+{
+    c.Timeout = TimeSpan.FromSeconds(10);
+    c.DefaultRequestHeaders.UserAgent.ParseAdd(Octo.Services.Common.OctoUserAgent.Value);
+});
+builder.Services.AddSingleton<Octo.Services.ListenBrainz.ListenBrainzRadioClient>();
 // Scrobbles of outside songs go out in the background, never inside a client's request, but a
 // hung call would still hold up every play queued behind it.
 builder.Services.AddHttpClient(LastFmScrobbleService.ClientName, c => c.Timeout = TimeSpan.FromSeconds(10));
@@ -444,6 +451,7 @@ builder.Services.AddSingleton<LastFmService>();
 // Radio's suggestion sources, asked together and blended (multi-source radio).
 builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.LastFmRadioSource>();
 builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.YouTubeMusicRadioSource>();
+builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.ListenBrainzRadioSource>();
 builder.Services.AddSingleton<Octo.Services.Radio.RadioSourceSet>();
 builder.Services.AddScoped<Octo.Services.Radio.SongRadioService>();
 
