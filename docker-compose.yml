@@ -12,9 +12,10 @@ services:
       ASPNETCORE_ENVIRONMENT: Production
 
       # ----- Subsonic / Navidrome upstream -----
-      # Required. Your Navidrome server, reachable from THIS container (a LAN IP
-      # or service name, not localhost). Left blank on purpose so a missing value
-      # is detected and reported clearly instead of silently failing.
+      # Your Navidrome server, reachable from THIS container (a LAN IP or service
+      # name, not localhost). With the navidrome profile below (the starter stack)
+      # this is http://navidrome:4533. Left blank, Octo looks for a server on the
+      # network at first start and reports clearly if it finds none.
       Subsonic__Url: ${SUBSONIC_URL:-}
       # Optional Navidrome admin login. Lets Octo detect the music folder and run
       # authenticated rescans on its own. Leave blank to have Octo learn an admin
@@ -374,6 +375,33 @@ services:
       - ${DOWNLOAD_PATH:-./downloads}:/music
       # The same library again, read-only, for sharing.
       - ${DOWNLOAD_PATH:-./downloads}:/share:ro
+
+  # The starter stack's music server, for anyone without a Navidrome of their own.
+  # Off unless the navidrome profile is on: install.sh turns it on by writing
+  # COMPOSE_PROFILES=navidrome to .env, or run `docker compose --profile navidrome up -d`.
+  # It reads the same music folder Octo writes to, so a kept song shows up in the
+  # library as soon as Octo asks for a scan.
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    restart: unless-stopped
+    profiles: ["navidrome"]
+    ports:
+      # Navidrome's own pages: add the people who listen, change passwords, and
+      # its web player. Music apps go to Octo on 5274, never here.
+      - "${NAVIDROME_PORT:-4533}:4533"
+    environment:
+      ND_MUSICFOLDER: /music
+      ND_DATAFOLDER: /data
+      ND_LOGLEVEL: info
+      # Creates the user "admin" with this password the first time Navidrome
+      # starts, so there is no setup page to click through. Navidrome runs this
+      # only once, on an empty data folder, and never changes an existing
+      # password. Octo signs in with the same login (SUBSONIC_ADMIN_* above).
+      ND_DEVAUTOCREATEADMINPASSWORD: ${NAVIDROME_ADMIN_PASSWORD:-}
+    volumes:
+      - ${DOWNLOAD_PATH:-./downloads}:/music
+      - ${NAVIDROME_DATA_DIR:-./navidrome-data}:/data
 
 volumes:
   ytdlp-cache:

@@ -1,11 +1,11 @@
 <div align="center">
 
-<img src="octo/Assets/octo_logo.png" alt="Octo, self-hosted music discovery for Navidrome" width="280" />
+<img src="octo/Assets/octo_logo.png" alt="Octo" width="280" />
 
 # Octo
 
-**Self-hosted music discovery for Navidrome.**
-Play songs you don't own yet, and keep the ones you like as FLAC.
+**A self-hosted music service.**
+Search any song and play it right away. Keep the ones you love as lossless files on your own server.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPL_v3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![.NET 9](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
@@ -16,11 +16,66 @@ Play songs you don't own yet, and keep the ones you like as FLAC.
 
 ---
 
-## Octo's own apps
+Octo gives a home server what a streaming app has: search that reaches past your own library, songs that play the moment you pick them, and radio that learns what you like. When a song is worth keeping, Octo finds a lossless copy, tags it and files it in your library, where it stays with no subscription.
 
-Octo is a proxy, so it works with your Navidrome server and the Subsonic apps you already use. If you'd like players made to go with it, there are Octo apps for desktop and Android. In them, the music Octo finds sits beside your library, and keeping a song is just **Add to library**.
+It runs on [Navidrome](https://www.navidrome.org/), the open-source music server. If you already run Navidrome, Octo sits in front of it and your library stays as it is. If you don't, the installer starts one for you.
 
 ![Home in the Octo desktop app](docs/images/players/desktop-home.webp)
+
+## What you get
+
+- **Search everything.** Your own music comes first, then the songs and albums you don't have yet. Any of it plays straight away, previewed from YouTube.
+- **Radio that learns.** Your Mix, discovery, artist and genre stations grow from what you play, plus optional genre and decade mixes from your own library.
+- **Keep what you love.** Press **+** or heart a song and Octo downloads a lossless copy from Soulseek or your own Lidarr, checks that it really is lossless, tags it, adds the cover and lyrics, and files it in your library. Whole albums work too.
+- **Bring your Spotify.** Import your liked songs and playlists, see what you already have, and let Octo fetch the rest a few songs an hour. See [Spotify import](#spotify-import).
+- **Apps for every device.** [Octo's own apps](#octos-own-apps) for Windows, Linux and Android, and [any Subsonic app](#compatible-apps) on iPhone, Mac and everywhere else.
+- **Yours to run.** The files are on your disk, everyone in the house gets their own login and their own stations, and there is nothing to pay each month.
+
+> If you pay for Qobuz, Deezer or Yandex Music and want that catalog in your library, [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta) fits better, since it downloads from those services directly. Octo needs no paid streaming account.
+
+## Get started
+
+You need a computer that stays on, such as a home server, a NAS or a Raspberry Pi, with [Docker](https://docs.docker.com/engine/install/) installed.
+
+```bash
+git clone https://github.com/winters27/octo.git
+cd octo
+./install.sh
+```
+
+The installer asks a few questions, starts everything, and prints where to go next:
+
+- **Do you already run Navidrome?** Answer **no** and Octo starts its own Navidrome beside it, with an admin login made for you. Answer **yes** and give its address (a LAN IP, not `localhost`), and Octo sits in front of your server.
+- **A free [Last.fm API key](https://www.last.fm/api/account/create)** powers radio and discovery. It's optional, but without it search only finds your own music.
+- **A free [Soulseek account](https://www.slsknet.org/news/node/1)** lets Octo download lossless copies. Also optional; an existing [Lidarr](https://github.com/Lidarr/Lidarr) with working indexers can do the downloading instead.
+
+When it finishes:
+
+- Point your music apps at `http://<your-host>:5274` and sign in with your Navidrome login. Not Navidrome's own address: an app pointed there gets your library and nothing from Octo.
+- Open the dashboard at **`http://<your-host>:5274/admin`** to manage every setting from the browser, signed in with a Navidrome admin account. See [Admin dashboard](#admin-dashboard).
+- On the starter stack, add the people who listen in Navidrome's own pages at `http://<your-host>:4533`.
+- If an app says the server is unreachable, Octo is telling you setup isn't finished, and its answer says what to fix (usually the Navidrome address).
+
+<details>
+<summary><b>How the pieces fit</b></summary>
+
+```text
+   Music apps             Octo                Navidrome
+ (Octo, Feishin, ...) ─▶  :5274  ───────────▶  your library
+                            ├─▶ yt-dlp shim    instant previews
+                            ├─▶ slskd          lossless downloads
+                            └─▶ your Lidarr    optional download source
+```
+
+Your apps talk to Octo. Octo adds search, radio and previews, and passes everything else to Navidrome, so any Subsonic app works unchanged. Downloads land in the music folder Navidrome reads, and Octo asks it to rescan.
+
+On the starter stack Navidrome runs from the same `docker-compose.yml`, turned on by `COMPOSE_PROFILES=navidrome` in `.env`. To set it up by hand instead of with the installer, copy `.env.example` to `.env`, fill in its starter stack section, and run `docker compose up -d`.
+
+</details>
+
+## Octo's own apps
+
+Any Subsonic app works with Octo. Its own apps for desktop and Android are made for it: the music Octo finds sits beside your library, and keeping a song is just **Add to library**.
 
 - **Add songs to your library.** Press **+** on a song, an album or a search result and it joins your library.
 - **One search for everything.** Your music comes first, then what Octo found, and all of it plays straight away.
@@ -40,63 +95,6 @@ Octo is a proxy, so it works with your Navidrome server and the Subsonic apps yo
 </table>
 
 The desktop app runs on Windows and Linux, and the Android app on Android 10 and newer. They need Octo 2026.09.29 or newer, and they work as regular players with Navidrome too. Download them from [Octo for Windows and Linux](https://github.com/winters27/octo/releases/tag/desktop-v1.3.2) and [Octo for Android](https://github.com/winters27/octo/releases/tag/android-v1.2.4), or add [Octo's F-Droid repository](https://winters27.github.io/octo/fdroid/) so the Android app updates through F-Droid, Droid-ify or Neo Store. The source is at [winters27/octo-player](https://github.com/winters27/octo-player).
-
-## What Octo does
-
-Octo sits in front of Navidrome and adds what a streaming service gives you: search past your own library, radio, and stations that learn from what you play. Previews stream from YouTube, and the songs you keep arrive from Soulseek, or your own Lidarr, as tagged files in your library.
-
-- **Search finds music you don't own**, and any of it plays right away as a preview.
-- **Radio and stations grow from your listening:** Your Mix, discovery, artist and genre stations, plus optional genre and decade mixes from your own library.
-- **Keep what you like.** Octo downloads it, tags it, files it under the right album and tells Navidrome to rescan. Whole albums work too.
-- **Downloads are checked.** A "lossless" file made from an MP3 is caught, and optional Review and Duplicates playlists show what Octo couldn't confirm and what you have twice.
-- **Lyrics** land beside downloads, and come in live for songs that have none.
-
-Any Subsonic app works: point it at Octo instead of Navidrome and nothing else changes.
-
-> If you pay for Qobuz, Deezer or Yandex Music and want that catalog in your library, [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta) fits better, since it downloads from those services directly. Octo needs no paid streaming account.
-
-## Get started
-
-Octo sits **in front of** your existing Navidrome. Your Subsonic app talks to Octo; Octo adds discovery and previews, then proxies everything else through to Navidrome:
-
-```
-   Subsonic app          Octo               Navidrome
-  (Feishin, Arpeggi) ──▶  :5274  ──────────▶  (your library)
-                           ├─▶ yt-dlp shim   (instant previews)
-                           ├─▶ slskd         (downloads on star)
-                           └─▶ your Lidarr   (optional heart source)
-```
-
-So setup is two steps: **tell Octo where Navidrome is**, and **point your app at Octo**.
-
-**Required**
-
-- A box with [Docker](https://docs.docker.com/engine/install/) installed.
-- An existing [Navidrome](https://www.navidrome.org/) server, reachable from the Octo host by LAN IP or service name (not `localhost`).
-
-**Optional** (Octo runs fine without these):
-
-- A free [Last.fm API key](https://www.last.fm/api/account/create) enables radio and discovery.
-- A free [Soulseek account](https://www.slsknet.org/news/node/1) enables lossless FLAC downloads when you star a song.
-- An existing [Lidarr](https://github.com/Lidarr/Lidarr) server: an alternative heart source once it has working indexers and a download client.
-
-Then:
-
-```bash
-git clone https://github.com/winters27/octo.git
-cd octo
-./install.sh
-```
-
-The installer asks for your Navidrome URL (and, optionally, Last.fm and Soulseek), brings the stack up, and prints the address.
-
-**When it's done:**
-
-- Point your Subsonic apps at `http://<your-host>:5274`, **not** Navidrome's own address.
-- Octo checks your Navidrome sign-in before it plays or fetches a song from outside your library; while it cannot reach Navidrome, those songs are refused.
-- Open the admin dashboard at **`http://<your-host>:5274/admin`** to manage every setting from the browser, with no config files to edit by hand.
-  Sign in with a Navidrome admin account. See [Admin dashboard](#admin-dashboard).
-- If a client reports the server is unreachable, that is Octo telling you setup is not finished: its ping response spells out exactly what to fix (usually the Navidrome URL).
 
 ## Compatible apps
 
@@ -271,11 +269,11 @@ tell you a starred track landed, or quietly settled for a lossy copy.
 
 ### Is Octo a self-hosted Spotify alternative?
 
-It's the discovery half. Octo doesn't replace your music *server* (that's still Navidrome), but it adds the search-and-listen-to-anything experience that streaming services do well. With Octo plugged in, your Subsonic app behaves more like Spotify or Apple Music: search returns recommendations, radio works on any song, and you can preview tracks you don't own. The difference is that "I want to keep this" downloads it as a real FLAC into your library, instead of renting it.
+Yes, that's what it's for. Octo adds the parts of Spotify that a library player lacks: search across music you don't own, songs that play the moment you pick them, and radio that learns your taste. Navidrome stores and serves your library underneath, and the installer can set it up for you. The difference from Spotify is what happens when you like a song: Octo downloads it as a real lossless file into your library instead of renting it.
 
 ### Does this work with Plex / Plexamp?
 
-No. Octo speaks the Subsonic API, not the Plex API. If you're a Plex user looking for self-hosted alternatives with discovery, the move is Navidrome + Octo + a Subsonic client like Feishin or Arpeggi.
+No. Octo speaks the Subsonic API, not the Plex API. If you're a Plex user looking for a self-hosted service with discovery, the move is Octo with Navidrome (the installer sets up both) and a Subsonic app such as Octo's own, Feishin or Arpeggi.
 
 ### How is this different from Navidrome's built-in radio?
 
