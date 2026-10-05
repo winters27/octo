@@ -92,6 +92,81 @@ public sealed class DownloadMatchingTests : IDisposable
         Assert.Same(single, Assert.Single(ranked));
     }
 
+    // ---- Mash-ups never pass as the song, nor as its radio edit ------------------------------
+
+    private const string LuckyRadioEdit = "Get Lucky (Radio Edit - feat. Pharrell Williams and Nile Rodgers)";
+
+    private static SoulseekFileHit Lucky(string file, int seconds, string extension = "flac") => new()
+    {
+        Username = "peer", Filename = file, Size = 30_000_000, Length = seconds, Extension = extension,
+    };
+
+    [Fact]
+    public void AMashUpNamedAfterTheSongIsNotTakenForItsRadioEdit()
+    {
+        // The live miss: 4:13 against the edit's 4:08, kept as fitting.
+        var mashUp = Lucky(@"Music\dk darkly\Bootlegs 2013\04 Get Lucky x Alakazam!.flac", 253);
+        var single = Lucky(@"Music\Daft Punk - Get Lucky (2013) [FLAC]\01. Get Lucky.flac", 247);
+
+        var ranked = SoulseekDownloadService.Rank([mashUp, single],
+            new SoulseekDownloadService.CandidateWant(LuckyRadioEdit, 248, Album: "Get Lucky", Artist: "Daft Punk"), "flac", 0, _ => true);
+
+        Assert.Same(single, Assert.Single(ranked));
+        Assert.Equal("A mash-up or medley of this song with another",
+            SoulseekCandidates.WhyNot(mashUp, LuckyRadioEdit, "Get Lucky", 248, new SoulseekSettings(), null, false, "Daft Punk"));
+    }
+
+    [Theory]
+    [InlineData(@"Music\Mashups\Daft Punk VS Michael Jackson - Get Lucky-Billie Jean.mp3")]
+    [InlineData(@"Music\dk darkly\04 Get Lucky x Alakazam!.flac")]
+    [InlineData(@"Music\Mashups\Get Lucky vs. Blurred Lines.flac")]
+    [InlineData(@"Music\Mashups\Get Lucky versus Lose Yourself to Dance.flac")]
+    [InlineData(@"Music\Mashups\Daft Punk - Get Lucky (Mashup).flac")]
+    [InlineData(@"Music\Mashups\Daft Punk - Get Lucky (Mash-Up with Uptown Funk).flac")]
+    [InlineData(@"Music\Pentatonix\Daft Punk Medley.flac")]
+    [InlineData(@"Music\Mixes\2013 Summer Megamix\05 - Get Lucky.flac")]
+    [InlineData(@"Music\Blends\Get Lucky (Blend).flac")]
+    [InlineData(@"Music\Bootlegs\Get Lucky (Alakazam Bootleg).flac")]
+    public void AMashUpIsAnotherVersion(string file)
+    {
+        var title = file.Contains("Medley") ? "Daft Punk" : "Get Lucky";
+        Assert.True(SoulseekDownloadService.AddsVersion(file, title, "Daft Punk")
+            || SoulseekDownloadService.FromVersionFolder(file, title, "Random Access Memories", "Daft Punk"));
+        if (file.EndsWith(".mp3"))
+            Assert.Equal("A mash-up or medley of this song with another",
+                SoulseekCandidates.WhyNot(Lucky(file, 248, "mp3"), title, "Random Access Memories", 248, new SoulseekSettings(), null, false, "Daft Punk"));
+    }
+
+    [Theory]
+    [InlineData(@"Music\Skrillex x Diplo\Skrillex and Diplo Present Jack U\Skrillex x Diplo - Where Are U Now (with Justin Bieber).flac", "Where Are Ü Now", "Jack Ü")]
+    [InlineData(@"Music\Jack U\05 - Skrillex vs Diplo - Where Are U Now.flac", "Where Are Ü Now", "Jack Ü")]
+    [InlineData(@"Music\Silk Sonic\An Evening With Silk Sonic\Bruno Mars x Anderson .Paak - Leave the Door Open.flac", "Leave the Door Open", "Silk Sonic")]
+    [InlineData(@"Music\Daft Punk\RAM\08 - Get Lucky x Pharrell Williams.flac", "Get Lucky (feat. Pharrell Williams)", "Daft Punk")]
+    [InlineData(@"Music\Next\Singles\09 Next-Too Close-radio edit.flac", "Too Close (Radio Edit)", "Next")]
+    [InlineData(@"Music\Soundtracks\Alien vs. Predator - Main Title.flac", "Alien vs. Predator - Main Title", "Harald Kloser")]
+    public void ACollabCreditOrATitleWithTheWordIsNoMashUp(string file, string title, string artist) =>
+        Assert.False(VersionVariant.MashUp(file, title, artist));
+
+    [Theory]
+    [InlineData(@"Music\Daft Punk - Get Lucky (2013) [FLAC]\01. Get Lucky.flac")]
+    [InlineData(@"Music\Daft Punk\Singles\Daft Punk - Get Lucky.flac")]
+    [InlineData(@"Music\Daft Punk\Singles\Daft Punk feat. Pharrell Williams - Get Lucky.flac")]
+    [InlineData(@"Music\Daft Punk\Singles\01 - Daft Punk - Get Lucky (feat. Pharrell Williams & Nile Rodgers) [16-44].flac")]
+    [InlineData(@"Music\Daft Punk\Singles\Get_Lucky_(2013).flac")]
+    public void ThePlainSingleIsStillTakenForTheRadioEdit(string file) =>
+        Assert.False(VersionVariant.CutNotPlain(file, LuckyRadioEdit, "Daft Punk"));
+
+    [Theory]
+    [InlineData(@"Music\Covers\04 Get Lucky Piano Tribute.flac")]
+    [InlineData(@"Music\Daft Punk\Live\Get Lucky - Grammys Performance.flac")]
+    [InlineData(@"Music\Various\01 - Get Lucky (Ultra Music Festival 2014 Intro).flac")]
+    public void ANameWithMoreThanTheTitleIsNotTakenForTheRadioEdit(string file)
+    {
+        Assert.True(VersionVariant.CutNotPlain(file, LuckyRadioEdit, "Daft Punk"));
+        // Asked for the song itself, not an edit, that rule does not apply.
+        Assert.False(VersionVariant.CutNotPlain(file, "Get Lucky", "Daft Punk"));
+    }
+
     // ---- An edition that changes what is played is a version ---------------------------------
 
     [Theory]

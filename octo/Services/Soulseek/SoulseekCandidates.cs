@@ -93,6 +93,8 @@ internal static class SoulseekCandidates
             return (hit.Length is { } seconds && duration is { } expected
                 ? $"{LengthText(seconds)} long; the song is {LengthText(expected)}"
                 : "A different length from the song", 2);
+        if (VersionVariant.MashUp(hit.Filename, title, artist))
+            return ("A mash-up or medley of this song with another", 2);
         if (SoulseekDownloadService.AddsVersion(hit.Filename, title, artist))
             return ("Another version: a remix, an edit or a live take", 2);
         if (SoulseekDownloadService.FromLiveFolder(hit.Filename, title, album, artist))
@@ -101,6 +103,8 @@ internal static class SoulseekCandidates
             return ("From a record of other versions: remixes, edits or a single's radio edit", 2);
         if (VersionVariant.LacksRequested(hit.Filename, title, artist))
             return ("Not the version asked for: the file is the plain song", 2);
+        if (VersionVariant.CutNotPlain(hit.Filename, title, artist))
+            return ("Its name has more than the song's title, so it is not taken for the edit asked for", 2);
         var wanted = SoulseekClient.NormalizeExtension(settings.PreferredExtension, "");
         if (!string.Equals(Extension(hit), wanted, StringComparison.OrdinalIgnoreCase))
             return ($"Not {wanted.ToUpperInvariant()}, which Octo looks for first", 1);

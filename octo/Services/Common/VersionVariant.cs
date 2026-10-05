@@ -32,6 +32,9 @@ internal static class VersionVariant
         (Rx(@"\b(?:a\s*cappellas?|acapellas?)\b"), "acapella"),
         (Rx(@"\bkaraoke\b"), "karaoke"),
         (Rx(@"\bdrumless\b"), "drumless"),
+        (Rx(@"\bmash[\s-]?ups?\b"), "mashup"),
+        (Rx(@"\bmedley\b"), "medley"),
+        (Rx(@"\bmega[\s-]?mix\b"), "megamix"),
         (Rx(@"\b8d\s+audio\b"), "8d"),
         (Rx(@"\b(?:dj|continuous|non-?stop)\s+mix(?:es)?\b|\bmixed\s+by\b"), "dj mix"),
     ];
@@ -177,4 +180,96 @@ internal static class VersionVariant
     /// </summary>
     public static bool LacksRequested(string filename, string? title, string? artist = null) =>
         Missing(filename, title, artist).Any(version => !Cuts.Contains(version));
+
+    // ---- A shortened cut named plainly, and songs joined into one ----------------------------
+
+    /// <summary>
+    /// Whether the request asks for a shortened cut ("(Radio Edit)") the file does not name, and
+    /// the file's name is more than the song's title. A plainly named file is taken for the cut
+    /// only when it is named as just the song: "01. Get Lucky", "Daft Punk - Get Lucky (feat.
+    /// Pharrell Williams)". "Get Lucky x Alakazam!" of the same length is another record.
+    /// </summary>
+    public static bool CutNotPlain(string filename, string? title, string? artist = null) =>
+        Missing(filename, title, artist).Any(Cuts.Contains) && !JustTheTitle(filename, title, artist);
+
+    /// <summary>A format or quality a peer puts beside a song's name: "[FLAC]", "(16-44)", "320".</summary>
+    private static readonly Regex FormatTag = Rx(@"^(?:flac|mp3|wav|alac|aiff?|ape|lossless|hires|web|cd|vinyl|bit|khz|kbps|\d+)+$");
+
+    /// <summary>
+    /// Whether the file's own name is the song's title and nothing else: a track number, the
+    /// artist (with a guest credit), a guest credit, a year or a format tag may stand beside it,
+    /// split by the usual " - ".
+    /// </summary>
+    internal static bool JustTheTitle(string filename, string? title, string? artist)
+    {
+        var wanted = SongIdentity.Key(SongIdentity.ParseTitle(title).Core);
+        if (wanted.Length == 0) return true;
+        var artists = string.IsNullOrWhiteSpace(artist) ? new HashSet<string>()
+            : SongIdentity.ParseArtists(artist).Names.Append(artist).Select(SongIdentity.Key).Where(key => key.Length > 0)
+                .ToHashSet(StringComparer.Ordinal);
+        var parts = Regex.Split(SongIdentity.Fold(LeafTitle(filename)), @"\s+[-\u2013]\s+")
+            .Where(part => SongIdentity.Key(part).Length > 0).ToList();
+        var titled = false;
+        foreach (var part in parts)
+        {
+            var read = SongIdentity.ParseTitle(part);
+            if (!titled && SongIdentity.Key(read.Core) == wanted && read.Extras.All(extra => FormatTag.IsMatch(extra)))
+            {
+                titled = true;
+                continue;
+            }
+            if (Regex.IsMatch(part.Trim(), @"^\d{1,3}\.?$")) continue;
+            if (artists.Contains(SongIdentity.Key(SongIdentity.StripFeatures(part)))) continue;
+            return false;
+        }
+        return titled;
+    }
+
+    /// <summary>The versions that put two songs or more in one file.</summary>
+    private static readonly HashSet<string> Joined = new(StringComparer.Ordinal) { "mashup", "medley", "megamix", "blend" };
+
+    /// <summary>A word that joins another song onto this one's title: "Get Lucky x Alakazam!",
+    /// "Get Lucky vs Billie Jean".</summary>
+    private static readonly Regex JoinWord = Rx(@"^\s*(?:x|vs\.?|versus)\s+(\S.*)$");
+
+    /// <summary>A song run straight on after the title: "Get Lucky-Billie Jean".</summary>
+    private static readonly Regex RunOn = Rx(@"^-(?=\S)(.+)$");
+
+    /// <summary>
+    /// Whether the file is a mash-up, medley, megamix or blend of the song with others, which the
+    /// request did not ask for. Read from the words after the title, never before it, where " x "
+    /// and "vs" are as likely an artist's credit ("Skrillex x Diplo - ..."), and never when the
+    /// title itself has the word.
+    /// </summary>
+    public static bool MashUp(string filename, string? title, string? artist = null)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return false;
+        var wanted = Requested(title, null);
+        if (Carried(filename, artist).Any(version => Joined.Contains(version) && !wanted.Contains(version))) return true;
+
+        var name = SongIdentity.Plain(Octo.Services.Soulseek.SoulseekDownloadService.NameTitle(title)).Trim();
+        if (name.Length == 0 || Regex.IsMatch(name, @"(?<![\p{L}\p{N}])(?:x|vs\.?|versus)(?![\p{L}\p{N}])")) return false;
+        var leaf = SongIdentity.Plain(WithoutArtist(LeafTitle(filename), artist));
+        var found = Regex.Match(leaf, $@"(?<![\p{{L}}\p{{N}}]){Regex.Escape(name)}(?![\p{{L}}\p{{N}}])");
+        if (!found.Success) return false;
+        var tail = leaf[(found.Index + found.Length)..];
+        var bracket = tail.IndexOfAny(['(', '[', '{']);
+        if (bracket >= 0) tail = tail[..bracket];
+        tail = tail.TrimEnd();
+
+        // Whoever the title credits may follow it: "Get Lucky x Pharrell Williams" is not two songs.
+        var credited = SongIdentity.ParseTitle(title).Featured
+            .Concat(string.IsNullOrWhiteSpace(artist) ? [] : SongIdentity.ParseArtists(artist).Names)
+            .Select(SongIdentity.Key).ToHashSet(StringComparer.Ordinal);
+        bool AnotherSong(string words)
+        {
+            var read = SongIdentity.ParseTitle($"x ({words.Trim()})");
+            return read.Versions.Count == 0 && read.Featured.Count == 0 && read.Extras.Count > 0
+                   && !credited.Contains(SongIdentity.Key(words));
+        }
+        var joined = JoinWord.Match(tail);
+        if (joined.Success) return AnotherSong(joined.Groups[1].Value);
+        var runOn = RunOn.Match(tail);
+        return runOn.Success && AnotherSong(runOn.Groups[1].Value);
+    }
 }

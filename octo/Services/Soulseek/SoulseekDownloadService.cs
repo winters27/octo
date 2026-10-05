@@ -1343,7 +1343,8 @@ public class SoulseekDownloadService : BaseDownloadService
     /// </summary>
     internal static bool AddsVersion(string filename, string title, string? artist = null) =>
         SongIdentity.AddedVersions(title, LeafTitle(filename)).Count > 0
-        || VersionVariant.UnrequestedInName(filename, title, artist).Count > 0;
+        || VersionVariant.UnrequestedInName(filename, title, artist).Count > 0
+        || VersionVariant.MashUp(filename, title, artist);
 
     /// <summary>How many peers' folders are looked in when a search finds only lossy copies.</summary>
     internal const int PeerFoldersToBrowse = 3;
@@ -1460,6 +1461,8 @@ public class SoulseekDownloadService : BaseDownloadService
             // "Song (Acoustic)" is never answered by the plain studio file. A radio edit may be
             // named plainly, so that one is only ranked, below.
             .Where(h => !VersionVariant.LacksRequested(h.Filename, title, want.Artist))
+            // A radio edit may be named plainly, but only as just the song: never a name with more in it.
+            .Where(h => !VersionVariant.CutNotPlain(h.Filename, title, want.Artist))
             // The copy that says it is the version asked for goes first: "Too Close (Radio Edit)"
             // takes "Too Close [Radio Edit].flac" before a plain "Too Close.flac".
             .OrderBy(h => VersionVariant.Missing(h.Filename, title, want.Artist).Count)

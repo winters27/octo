@@ -391,6 +391,11 @@ public static class SongIdentity
         new(Rx(@"\b(?:orchestral|symphonic)(?:\s+(?:version|edition|mix))?\b"), "orchestral"),
         new(Rx(@"\blo-?fi(?:\s+(?:version|edit|mix))?\b"), "lofi"),
         new(Rx(@"\bbass\s*boost(?:ed)?\b"), "bass boosted"),
+        // Two songs or more in one: never the song asked for. Ahead of "mix", so a megamix is not a mix.
+        new(Rx(@"\bmash[\s-]?ups?\b"), "mashup"),
+        new(Rx(@"\bmedley\b"), "medley"),
+        new(Rx(@"\bmega[\s-]?mix\b"), "megamix"),
+        new(Rx(@"\bblend\b"), "blend"),
         new(Rx(@"^(.*?)\s*\b(?:re-?mix(?:ed)?|rmx)\b"), "remix", Credited: true),
         new(Rx(@"\bvip(?:\s+mix)?\b"), "vip"),
         new(Rx(@"\bbootleg\b"), "bootleg"),
