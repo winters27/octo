@@ -1608,24 +1608,25 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   .radio-status-toolbar select, .radio-status-toolbar .btn, .radio-reset-row .btn { width: 100%; min-height: 44px; }
 }
 
-/* ── Fetched songs (download log) ── */
-.dl-list { overflow: hidden; }
+/* ── Fetched songs (download log): covers first, each row lifts under the pointer ── */
+.dl-list { overflow: hidden; padding: var(--s-m); }
 .dl-empty { padding: var(--s-wide) var(--s-2xl); text-align: center; color: var(--text-muted); font-size: var(--t-table); }
 .dl-item {
-  display: flex; align-items: center; gap: 14px;
-  padding: 10px var(--s-xl);
+  display: flex; align-items: center; gap: var(--s-xl);
+  padding: 10px var(--s-l);
+  border-radius: 16px;
   transition: background var(--t-hover) var(--ease);
 }
 .dl-item:hover { background: var(--hover); }
-.dl-item + .dl-item { border-top: 1px solid var(--hairline); }
 .dl-art {
-  width: 44px; height: 44px; border-radius: var(--r-row); flex-shrink: 0;
+  width: 56px; height: 56px; border-radius: 12px; flex-shrink: 0;
   object-fit: cover; background: var(--surface);
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.10), inset 0 0 0 1px var(--ink-5);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35), inset 0 0 0 1px rgba(255, 255, 255, 0.10);
 }
 .dl-art-ph { background: radial-gradient(circle at 35% 30%, rgb(var(--accent-rgb) / 0.22), transparent 70%), var(--surface); }
 .dl-main { min-width: 0; flex: 1; }
-.dl-title { font-size: var(--t-table); font-weight: 500; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dl-title { font-size: var(--t-body); font-weight: 600; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dl-by { margin-top: 2px; font-size: var(--t-meta); color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dl-dash { color: var(--text-faint); }
 .dl-path {
   font-family: var(--mono);
@@ -1636,18 +1637,19 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .dl-side { flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
 .dl-tags { display: flex; align-items: center; gap: var(--s-m); }
 .dl-badge {
-  font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em;
-  height: 18px; line-height: 18px; padding: 0 7px; border-radius: var(--r-pill); text-transform: uppercase;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em;
+  height: 20px; line-height: 20px; padding: 0 9px; border-radius: var(--r-pill); text-transform: uppercase;
+  white-space: nowrap;
 }
 .dl-badge.flac { background: var(--good-wash); color: var(--good); }
-.dl-badge.mp3  { background: var(--accent-wash); color: var(--accent-hover); }
+.dl-badge.mp3  { background: rgba(255, 255, 255, 0.10); color: var(--ink-1); }
 .dl-source { font-size: var(--t-label); color: var(--text-secondary); }
 .dl-sub { font-size: var(--t-label); color: var(--text-muted); font-variant-numeric: tabular-nums; }
 /* A username is not a number, so it opts out of the tabular figures around it. */
 .dl-asker { font-variant-numeric: normal; }
 
 /* How a download was tagged: folded under its row, and under "Try it on a song". */
-.dl-tagging { padding: 0 var(--s-xl) 10px; }
+.dl-tagging { padding: 0 var(--s-l) 10px calc(var(--s-l) + 56px + var(--s-xl)); }
 .dl-tagging > summary { font-size: var(--t-label); color: var(--text-muted); cursor: pointer; padding: 4px 0; }
 .dl-tagging > summary:hover { color: var(--ink-1); }
 .tag-report { display: flex; flex-direction: column; gap: var(--s-m); padding-top: 6px; }
@@ -1663,14 +1665,52 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .tags-preview-fields > #tags-preview-path { grid-column: 1 / -1; }
 #tags-preview-out .tag-report { padding: 10px 14px; border-radius: var(--r-control); background: rgba(0, 0, 0, 0.1); }
 
-/* Hearted downloads still running, above the log. */
+/* Hearted downloads still running, above the log: a card each, set into one glass panel. */
 .acq-wrap { margin-bottom: var(--s-page); }
-.acq-wrap .dl-list { margin-top: 0; }
-.dl-badge.state { background: var(--accent-wash); color: var(--accent-hover); }
+.acq-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: var(--s-l);
+  padding: var(--s-l);
+  background: var(--glass-sheen), var(--glass);
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--r-panel);
+  box-shadow: var(--glass-rim), var(--glass-drop);
+}
+.acq-card {
+  display: flex; align-items: center; gap: var(--s-l);
+  padding: var(--s-l);
+  border-radius: 16px;
+  background: var(--nest);
+  box-shadow: var(--nest-rim);
+  min-width: 0;
+}
+.acq-art {
+  width: 56px; height: 56px; flex-shrink: 0;
+  display: grid; place-items: center;
+  border-radius: 12px;
+  color: var(--accent);
+  background: linear-gradient(135deg, rgb(var(--accent-rgb) / 0.22), rgb(var(--accent-rgb) / 0.06));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.10);
+}
+.acq-art .icon { width: 24px; height: 24px; }
+.acq-card.failed .acq-art { color: var(--warn); background: var(--warn-wash); }
+/* The title keeps the card's whole width; the state sits under it, and the details wrap
+ * rather than cut off. */
+.acq-head { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
+.acq-head .dl-title { max-width: 100%; }
+.acq-card .dl-sub { margin-top: 6px; line-height: 1.45; overflow-wrap: anywhere; }
+.dl-badge.state { background: rgb(var(--accent-rgb) / 0.16); color: var(--accent); }
 .dl-badge.failed { background: var(--bad-wash); color: #ff7b72; }
-.acq-error { font-size: var(--t-label); color: #ff7b72; margin-top: 3px; }
-.acq-bar { height: 3px; margin-top: 7px; border-radius: 2px; background: var(--accent-wash); overflow: hidden; }
-.acq-bar > span { display: block; height: 100%; background: var(--accent); transition: width var(--t-card) var(--ease); }
+.acq-error { font-size: var(--t-label); color: #ff9a8f; margin-top: 6px; }
+.acq-bar { height: 6px; margin-top: 10px; border-radius: var(--r-pill); background: rgba(255, 255, 255, 0.10); overflow: hidden; }
+.acq-bar > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, rgb(var(--accent-rgb) / 0.75), var(--accent)); transition: width var(--t-card) var(--ease); }
+@media (max-width: 760px) {
+  .dl-item { flex-wrap: wrap; }
+  .dl-side { flex-direction: row; align-items: center; margin-left: calc(56px + var(--s-xl)); }
+  .dl-tagging { padding-left: var(--s-l); }
+  .acq-list { grid-template-columns: minmax(0, 1fr); }
+}
 
 /* ── Server detection and the folder browser ── */
 .field-inline { display: flex; gap: var(--s-m); align-items: stretch; }

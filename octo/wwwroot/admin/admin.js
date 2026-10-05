@@ -3077,9 +3077,11 @@ async function loadAcquisitions() {
     const askers = Array.isArray(a.requestedBy) ? a.requestedBy.filter(Boolean) : [];
     const size = fmtSize(a.bytesTotal);
     const sub = [
+      a.artist ? escapeHtml(a.artist) : '',
+      a.source ? escapeHtml(a.source) : '',
+      askers.length ? `asked by <span class="dl-asker">${escapeHtml(askers.join(', '))}</span>` : '',
       escapeHtml(relTime(a.startedAt)),
       size,
-      askers.length ? `<span class="dl-asker">${escapeHtml(askers.join(', '))}</span>` : '',
     ].filter(Boolean).join(' · ');
     const detail = failed && a.error
       ? `<div class="acq-error">${escapeHtml(a.error)}</div>`
@@ -3088,15 +3090,17 @@ async function loadAcquisitions() {
         : a.note
           ? `<div class="dl-sub">${escapeHtml(a.note)}</div>`
           : '';
-    return `<div class="dl-item">
-      <div class="dl-art dl-art-ph"></div>
+    // No cover yet for a song still on its way: its state's glyph on a tile instead.
+    const glyph = failed ? 'i-warning' : a.state === 'queued' ? 'i-clock' : 'i-tray-arrow-down';
+    return `<div class="acq-card${failed ? ' failed' : ''}">
+      <div class="acq-art"><svg class="icon" aria-hidden="true"><use href="#${glyph}"/></svg></div>
       <div class="dl-main">
-        <div class="dl-title">${escapeHtml(a.artist || '?')} <span class="dl-dash">·</span> ${escapeHtml(a.title || '?')}</div>
-        ${detail}
-      </div>
-      <div class="dl-side">
-        <div class="dl-tags"><span class="dl-badge ${failed ? 'failed' : 'state'}">${escapeHtml(label)}</span>${a.source ? `<span class="dl-source">${escapeHtml(a.source)}</span>` : ''}</div>
+        <div class="acq-head">
+          <div class="dl-title">${escapeHtml(a.title || '?')}</div>
+          <span class="dl-badge ${failed ? 'failed' : 'state'}">${escapeHtml(label)}</span>
+        </div>
         <div class="dl-sub">${sub}</div>
+        ${detail}
       </div>
     </div>`;
   }).join('');
@@ -3132,10 +3136,12 @@ async function loadFetched({ withAcquisitions = true } = {}) {
       const who = askers.length
         ? `<span class="dl-asker">${escapeHtml(askers.join(', '))}</span>`
         : '';
+      const by = [d.artist, d.album].filter(Boolean).map(escapeHtml).join(' <span class="dl-dash">·</span> ');
       return `<div class="dl-item">
         ${art}
         <div class="dl-main">
-          <div class="dl-title">${escapeHtml(d.artist)} <span class="dl-dash">·</span> ${escapeHtml(d.title)}</div>
+          <div class="dl-title">${escapeHtml(d.title)}</div>
+          <div class="dl-by">${by}</div>
           <div class="dl-path" title="${escapeHtml(d.path)}">${escapeHtml(d.path)}</div>
         </div>
         <div class="dl-side">
