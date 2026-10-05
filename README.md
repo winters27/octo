@@ -71,7 +71,7 @@ When it finishes:
 
 Your apps talk to Octo. Octo adds search, radio and previews, and passes everything else to Navidrome, so any Subsonic app works unchanged. Downloads land in the music folder Navidrome reads, and Octo asks it to rescan.
 
-On the starter stack Navidrome runs from the same `docker-compose.yml`, turned on by adding `navidrome` to `COMPOSE_PROFILES` in `.env` (`COMPOSE_PROFILES=sonic,navidrome`; `sonic` is Sounds alike's octo-sonic). To set it up by hand instead of with the installer, copy `.env.example` to `.env`, fill in its starter stack section, and run `docker compose up -d`.
+On the starter stack Navidrome runs from the same `docker-compose.yml`, turned on by `COMPOSE_PROFILES=navidrome` in `.env`. To set it up by hand instead of with the installer, copy `.env.example` to `.env`, fill in its starter stack section, and run `docker compose up -d`.
 
 </details>
 
@@ -349,7 +349,7 @@ Octo is a full refactor of [octo-radiostarr](https://github.com/winters27/octo-r
 
 ### Architecture
 
-Three Docker containers in one `docker compose` stack:
+Four Docker containers in one `docker compose` stack (the diagram leaves out octo-sonic, the Sounds alike reader beside octo):
 
 ```
 ┌──────────────────────────┐         ┌──────────────────┐
@@ -365,6 +365,7 @@ Three Docker containers in one `docker compose` stack:
 
 - **`octo`** (port 5274): the proxy + admin UI. Personalized Radio, its state store, recommendation queue, and refresh worker all run in this process. Octo hijacks the Subsonic endpoints that need enrichment and passes everything else through to Navidrome.
 - **`yt-dlp-shim`** (internal): wraps `yt-dlp` behind two HTTP endpoints. Process-isolation keeps yt-dlp's frequent extractor breakage from affecting the rest of the stack.
+- **`octo-sonic`** (internal): reads each song once and says how it sounds, for Sounds alike radio. `RADIO_SOUNDS_ALIKE=false` leaves it idle.
 - **`slskd`** (port 5030 for its web page, 50300 for other Soulseek users): Soulseek client with REST API. Octo authenticates and queues downloads, and slskd shares your library back, read-only (see [Sharing back on Soulseek](#sharing-back-on-soulseek)).
 
 Navidrome is **not** part of the stack. Octo just talks to whatever Navidrome you already have.
@@ -427,11 +428,12 @@ with `RADIO_SONIC_PAUSE_SECONDS` between, only while nothing downloads, then kee
 and changed songs; a damaged file costs only that file. On a network mount the first pass takes
 a while, and the dashboard shows how far it is, with Pause and Start over. `SONIC_CPUS` (default
 1) caps the CPUs it may use; never set it above the machine's count, or Docker will not start it.
-The first `docker compose build` compiles it, which takes several minutes. It runs under the
-`sonic` compose profile, which `.env` turns on with `sonic` in `COMPOSE_PROFILES` (install.sh and
-`.env.example` set it, beside `navidrome` on the starter stack); without it Octo runs as before and the dashboard says octo-sonic is not
-answering. It reads the music as `nobody` (`SONIC_USER`, e.g. `1000:1000` for a folder only its
-owner can read), on a read-only filesystem with a 2 GB memory limit.
+It starts with the rest of the stack, so an update brings it without any change to `.env`; the
+first `docker compose build` (and the first update that has it) compiles it, which takes several
+minutes. `RADIO_SOUNDS_ALIKE=false` turns Sounds alike off: Octo stops asking, and octo-sonic
+waits without reading anything. It reads the music as `nobody` (`SONIC_USER`, e.g. `1000:1000`
+for a folder only its owner can read), on a read-only filesystem with a 2 GB memory limit. An
+older `.env` with `COMPOSE_PROFILES=sonic` keeps working; the profile is no longer needed.
 
 `GENRE_NORMALIZE` collapses the genres downloads arrive with into a list you can browse.
 Rules are a pattern-to-genre table applied **in order, first match wins**, edited in the

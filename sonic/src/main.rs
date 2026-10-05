@@ -22,6 +22,9 @@ struct App {
     root: PathBuf,
     slots: Arc<Semaphore>,
     program: PathBuf,
+    /// False when Sounds alike is turned off (SONIC_ENABLED, from RADIO_SOUNDS_ALIKE): the
+    /// server still answers, so Octo can say it is off, but reads nothing.
+    enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +34,11 @@ struct Analyse {
 
 fn version() -> u16 {
     u16::from(FeaturesVersion::LATEST)
+}
+
+/// SONIC_ENABLED as compose passes RADIO_SOUNDS_ALIKE: on unless it says false, 0, off or no.
+fn enabled(value: Option<&str>) -> bool {
+    !matches!(value.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("false" | "0" | "off" | "no"))
 }
 
 #[tokio::main]
@@ -44,7 +52,11 @@ async fn main() {
     let root = std::fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(root));
     let slots = std::env::var("ANALYSE_CONCURRENCY").ok().and_then(|v| v.parse().ok()).unwrap_or(1usize).max(1);
     let program = std::env::current_exe().expect("own path");
-    let app = router(App { root, slots: Arc::new(Semaphore::new(slots)), program });
+    let enabled = enabled(std::env::var("SONIC_ENABLED").ok().as_deref());
+    if !enabled {
+        tracing::info!("Sounds alike is off (RADIO_SOUNDS_ALIKE=false): answering, reading nothing");
+    }
+    let app = router(App { root, slots: Arc::new(Semaphore::new(slots)), program, enabled });
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.expect("port 8080");
     axum::serve(listener, app)
         .with_graceful_shutdown(stopped())
@@ -89,6 +101,12 @@ fn router(app: App) -> Router {
 /// Healthy only when the music folder is there and has something in it: a mount that failed
 /// leaves an empty folder, and every song would then look missing.
 async fn health(State(app): State<App>) -> impl IntoResponse {
+    if !app.enabled {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+            "ok": false, "off": true, "featuresVersion": version(),
+            "error": "Sounds alike is off (RADIO_SOUNDS_ALIKE=false)",
+        })));
+    }
     let root = app.root.clone();
     let sees = tokio::task::spawn_blocking(move || {
         std::fs::read_dir(root).map(|mut entries| entries.next().is_some()).unwrap_or(false)
@@ -106,6 +124,9 @@ async fn health(State(app): State<App>) -> impl IntoResponse {
 }
 
 async fn analyse(State(app): State<App>, Json(body): Json<Analyse>) -> impl IntoResponse {
+    if !app.enabled {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "Sounds alike is off" })));
+    }
     let path = match inside(&app.root, Path::new(&body.path)) {
         Ok(path) => path,
         Err(Refused::Missing) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "no such file" }))),
@@ -170,10 +191,15 @@ mod tests {
     /// The test binary is not octo-sonic, so the child reader is exercised by the Docker smoke
     /// test (Step 8.4); these cover the server's own checks.
     fn app(root: &Path) -> Router {
+        app_with(root, true)
+    }
+
+    fn app_with(root: &Path, enabled: bool) -> Router {
         router(App {
             root: std::fs::canonicalize(root).unwrap(),
             slots: Arc::new(Semaphore::new(1)),
             program: PathBuf::from("/nonexistent/octo-sonic"),
+            enabled,
         })
     }
 
@@ -198,6 +224,29 @@ mod tests {
         let (status, value) = health(app(&root)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(value["featuresVersion"], json!(2));
+    }
+
+    #[test]
+    fn only_a_clear_no_turns_it_off() {
+        for off in ["false", "FALSE", " 0 ", "off", "no"] {
+            assert!(!enabled(Some(off)), "{off}");
+        }
+        for on in ["true", "1", "", "yes"] {
+            assert!(enabled(Some(on)), "{on}");
+        }
+        assert!(enabled(None));
+    }
+
+    #[tokio::test]
+    async fn turned_off_it_says_so_and_reads_nothing() {
+        let root = std::env::temp_dir().join("octo-sonic-off");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("song.flac"), b"x").unwrap();
+        let (status, value) = health(app_with(&root, false)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(value["off"], json!(true));
+        assert_eq!(value["featuresVersion"], json!(2));
+        assert_eq!(post(app_with(&root, false), &root.join("song.flac")).await, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

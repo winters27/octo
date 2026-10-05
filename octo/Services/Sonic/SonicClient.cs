@@ -9,8 +9,9 @@ namespace Octo.Services.Sonic;
 public sealed record SonicFeatures(float[] Values, int Version);
 
 /// <summary>octo-sonic is up and writes this feature version; <paramref name="Problem"/> when it
-/// cannot see the music folder, so nothing it is sent could be read.</summary>
-public sealed record SonicHealth(int Version, string? Problem);
+/// cannot see the music folder, so nothing it is sent could be read; <paramref name="Off"/> when
+/// Sounds alike is turned off in .env (RADIO_SOUNDS_ALIKE=false), so it reads nothing on purpose.</summary>
+public sealed record SonicHealth(int Version, string? Problem, bool Off = false);
 
 /// <summary>What octo-sonic said of one song: its features, or why not, and the HTTP status
 /// (403 and 404 are octo-sonic's view of the music folder, not the song).</summary>
@@ -35,6 +36,8 @@ public sealed class SonicClient(IHttpClientFactory http, IOptionsMonitor<RadioSo
             using var doc = JsonDocument.Parse(body.Length > 0 ? body : "{}");
             if (!doc.RootElement.TryGetProperty("featuresVersion", out var v) || !v.TryGetInt32(out var version)) return null;
             if (response.IsSuccessStatusCode) return new SonicHealth(version, null);
+            if (doc.RootElement.TryGetProperty("off", out var off) && off.ValueKind == JsonValueKind.True)
+                return new SonicHealth(version, null, Off: true);
             return (int)response.StatusCode == 503
                 ? new SonicHealth(version, doc.RootElement.TryGetProperty("error", out var e) && e.ValueKind == JsonValueKind.String
                     ? e.GetString() : "cannot see the music folder")

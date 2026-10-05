@@ -2469,8 +2469,19 @@ public class AdminController : ControllerBase
             var http = _httpFactory.CreateClient();
             http.Timeout = TimeSpan.FromSeconds(5);
             using var resp = await http.GetAsync($"{radio.SonicUrl.TrimEnd('/')}/health", ct);
-            return new ServiceProbe(resp.IsSuccessStatusCode, resp.IsSuccessStatusCode ? "reachable"
-                : (int)resp.StatusCode == 503 ? "cannot see the music folder" : $"HTTP {(int)resp.StatusCode}");
+            if (resp.IsSuccessStatusCode) return new ServiceProbe(true, "reachable");
+            // Turned off in .env (RADIO_SOUNDS_ALIKE=false): off, like the switch, not a fault.
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            var off = false;
+            try
+            {
+                using var doc = JsonDocument.Parse(body.Length > 0 ? body : "{}");
+                off = doc.RootElement.ValueKind == JsonValueKind.Object
+                    && doc.RootElement.TryGetProperty("off", out var o) && o.ValueKind == JsonValueKind.True;
+            }
+            catch (JsonException) { }
+            if (off) return new ServiceProbe(true, "Sounds alike is off in .env", Configured: false);
+            return new ServiceProbe(false, (int)resp.StatusCode == 503 ? "cannot see the music folder" : $"HTTP {(int)resp.StatusCode}");
         }
         catch (Exception ex) { return new ServiceProbe(false, ex.Message); }
     }
