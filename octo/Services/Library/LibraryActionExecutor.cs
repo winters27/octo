@@ -252,7 +252,8 @@ public sealed class LibraryActionExecutor
         string? quarantinePath = null;
         if (request.Action == LibraryAction.Delete)
         {
-            var moved = _quarantine.Move(resolved, musicRoot, request.Action, request.Username);
+            // The song's own lyrics go with it, so nothing of it stays behind in the library.
+            var moved = _quarantine.Move(resolved, musicRoot, request.Action, request.Username, withSidecars: true);
             if (!moved.Moved)
             {
                 _journal.Complete(key, LibraryActionState.Failed, moved.Error);

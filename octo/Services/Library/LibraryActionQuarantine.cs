@@ -6,9 +6,14 @@ namespace Octo.Services.Library;
 
 public sealed record QuarantineResult(bool Moved, string? QuarantinePath, string? Error);
 
-/// <summary>What is written next to a quarantined file so a restore works without the journal.</summary>
+/// <summary>A file of the song's own that went to the trash with it: where it was, and where it waits.</summary>
+public sealed record QuarantinedSidecar(string OriginalPath, string QuarantinePath);
+
+/// <summary>What is written next to a quarantined file so a restore works without the journal.
+/// Sidecars are the song's own files that went with it (its lyrics), put back with it.</summary>
 public sealed record QuarantineManifest(
-    string OriginalPath, string NavidromeId, string Action, string Username, DateTime AtUtc);
+    string OriginalPath, string NavidromeId, string Action, string Username, DateTime AtUtc,
+    IReadOnlyList<QuarantinedSidecar>? Sidecars = null);
 
 /// <summary>
 /// Moves a verified file out of the library instead of deleting it.
@@ -45,15 +50,54 @@ public sealed class LibraryActionQuarantine
         Path.Combine(musicRoot, _settings.CurrentValue.EffectiveQuarantineDirectory);
 
     /// <summary>
-    /// Move a verified file into quarantine, preserving its layout underneath so a restore is a
-    /// straight copy back.
+    /// Files beside a song that belong to it alone, by its name: the lyrics Octo writes (.lrc,
+    /// .txt) and the other lyrics files players read. Never a folder's cover, which the album shares.
     /// </summary>
-    public QuarantineResult Move(ResolvedSongFile file, string musicRoot, LibraryAction action, string username)
+    internal static readonly string[] SidecarExtensions = [".lrc", ".txt", ".ttml", ".elrc", ".srt", ".yaml", ".yml"];
+
+    private static readonly HashSet<string> AudioExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".aiff", ".aif", ".ape", ".wv", ".alac",
+        ".wma", ".mp4", ".dsf", ".dff", ".mka",
+    };
+
+    private static StringComparison NameComparison =>
+        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    /// <summary>
+    /// The song's own sidecars: files with its name and a lyrics extension. None while another
+    /// audio file of the same name stays beside it (a second copy in another format), since the
+    /// lyrics are that copy's too.
+    /// </summary>
+    internal static IReadOnlyList<string> SidecarsOf(string audioPath)
+    {
+        var folder = Path.GetDirectoryName(audioPath);
+        if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder)) return [];
+        var stem = Path.GetFileNameWithoutExtension(audioPath);
+        var named = Directory.EnumerateFiles(folder)
+            .Where(path => string.Equals(Path.GetFileNameWithoutExtension(path), stem, NameComparison))
+            .ToList();
+        if (named.Any(path => !string.Equals(path, audioPath, NameComparison) && AudioExtensions.Contains(Path.GetExtension(path))))
+            return [];
+        return named
+            .Where(path => SidecarExtensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Move a verified file into quarantine, preserving its layout underneath so a restore is a
+    /// straight copy back. With <paramref name="withSidecars"/>, the song's own lyrics files go
+    /// with it, named after its place in the trash; one that cannot move stays, and is logged.
+    /// </summary>
+    public QuarantineResult Move(ResolvedSongFile file, string musicRoot, LibraryAction action, string username,
+        bool withSidecars = false)
     {
         try
         {
             if (Outside(file.AbsolutePath, musicRoot) is { } refused) return new QuarantineResult(false, null, refused);
             var relative = Path.GetRelativePath(musicRoot, file.AbsolutePath);
+            // Read before the song moves: with it gone, nothing would tell its lyrics from another copy's.
+            var sidecars = withSidecars ? SidecarsOf(file.AbsolutePath) : [];
 
             var destination = Path.Combine(RootFor(musicRoot),
                 DateTime.UtcNow.ToString("yyyy-MM-dd"), relative);
@@ -77,8 +121,17 @@ public sealed class LibraryActionQuarantine
                 File.Delete(file.AbsolutePath);
             }
 
+            var moved = new List<QuarantinedSidecar>();
+            foreach (var sidecar in sidecars)
+            {
+                var target = Path.Combine(Path.GetDirectoryName(destination)!,
+                    Path.GetFileNameWithoutExtension(destination) + Path.GetExtension(sidecar));
+                if (MoveSidecar(sidecar, target, musicRoot)) moved.Add(new QuarantinedSidecar(sidecar, target));
+            }
+
             WriteManifest(destination, new QuarantineManifest(
-                file.AbsolutePath, file.NavidromeId, action.ToString(), username, DateTime.UtcNow));
+                file.AbsolutePath, file.NavidromeId, action.ToString(), username, DateTime.UtcNow,
+                moved.Count == 0 ? null : moved));
 
             _logger.LogInformation("Library action {Action} by {User}: quarantined {From} -> {To}",
                 action, username, file.AbsolutePath, destination);
@@ -130,6 +183,15 @@ public sealed class LibraryActionQuarantine
                 return new QuarantineResult(false, null, "something already exists at the original path");
 
             File.Move(quarantinePath, manifest.OriginalPath);
+            foreach (var sidecar in manifest.Sidecars ?? [])
+            {
+                // Each one meets the same rule as the song: back only into the music folder.
+                if (musicRoot is not null && !NavidromeSongPathResolver.IsInside(Path.GetFullPath(sidecar.OriginalPath), musicRoot))
+                    continue;
+                if (!File.Exists(sidecar.QuarantinePath) || File.Exists(sidecar.OriginalPath)) continue;
+                try { File.Move(sidecar.QuarantinePath, sidecar.OriginalPath); }
+                catch (Exception ex) { _logger.LogWarning("Library action could not put back {Path}: {M}", sidecar.OriginalPath, ex.Message); }
+            }
             TryDelete(quarantinePath + ManifestSuffix);
 
             _logger.LogInformation("Library action restored {Path}", manifest.OriginalPath);
@@ -178,6 +240,42 @@ public sealed class LibraryActionQuarantine
             _logger.LogWarning("Library action quarantine sweep failed: {M}", ex.Message);
         }
         return removed;
+    }
+
+    /// <summary>One sidecar into the trash beside its song. False, and left where it is, when it
+    /// is outside the music folder, a link, or anything is in the way.</summary>
+    private bool MoveSidecar(string from, string to, string musicRoot)
+    {
+        try
+        {
+            if (Outside(from, musicRoot) is { } refused)
+            {
+                _logger.LogInformation("Library action left {Path} where it is: {Why}", from, refused);
+                return false;
+            }
+            if (File.Exists(to)) return false;
+            try
+            {
+                File.Move(from, to);
+            }
+            catch (IOException)
+            {
+                var length = new FileInfo(from).Length;
+                File.Copy(from, to, overwrite: false);
+                if (new FileInfo(to).Length != length)
+                {
+                    TryDelete(to);
+                    return false;
+                }
+                File.Delete(from);
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Library action could not move {Path} with its song: {M}", from, ex.Message);
+            return false;
+        }
     }
 
     private void WriteManifest(string quarantinePath, QuarantineManifest manifest)

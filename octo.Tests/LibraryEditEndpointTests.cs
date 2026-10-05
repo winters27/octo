@@ -240,6 +240,52 @@ public sealed class LibraryEditEndpointTests
     }
 
     [Fact]
+    public async Task Remove_TakesTheSongsLyricsWithIt_AndPutBackReturnsThem_LeavingTheAlbumsCover()
+    {
+        await using var factory = new Factory();
+        var path = factory.Song("s1", "Daft Punk/Discovery/03 - Digital Love.flac", "Digital Love", "Daft Punk", "Discovery");
+        var folder = Path.GetDirectoryName(path)!;
+        var lyrics = Path.Combine(folder, "03 - Digital Love.lrc");
+        var plain = Path.Combine(folder, "03 - Digital Love.txt");
+        var cover = Path.Combine(folder, "cover.jpg");
+        var other = Path.Combine(folder, "04 - Harder Better Faster Stronger.lrc");
+        foreach (var file in new[] { lyrics, plain, cover, other }) await File.WriteAllTextAsync(file, Path.GetFileName(file));
+        using var client = factory.CreateClient();
+
+        Assert.Equal("applied", State(await Call(client, "id=s1&action=remove")));
+
+        Assert.False(File.Exists(lyrics));
+        Assert.False(File.Exists(plain));
+        Assert.True(File.Exists(cover));
+        Assert.True(File.Exists(other));
+        var trashed = factory.Journal.Recent().Single().QuarantinePath!;
+        Assert.True(File.Exists(Path.ChangeExtension(trashed, ".lrc")));
+        Assert.Contains("03 - Digital Love.lrc", await File.ReadAllTextAsync(trashed + ".octo-action.json"));
+
+        Assert.Equal("applied", State(await Call(client, "id=s1&action=restore")));
+
+        Assert.Equal("03 - Digital Love.lrc", await File.ReadAllTextAsync(lyrics));
+        Assert.Equal("03 - Digital Love.txt", await File.ReadAllTextAsync(plain));
+        Assert.False(File.Exists(Path.ChangeExtension(trashed, ".lrc")));
+    }
+
+    [Fact]
+    public async Task RemovingOneFormatOfASong_LeavesTheLyricsTheOtherCopyShares()
+    {
+        await using var factory = new Factory();
+        var flac = factory.Song("s1", "Daft Punk/Discovery/03 - Digital Love.flac", "Digital Love", "Daft Punk", "Discovery");
+        var folder = Path.GetDirectoryName(flac)!;
+        await File.WriteAllTextAsync(Path.Combine(folder, "03 - Digital Love.mp3"), "the other copy");
+        var lyrics = Path.Combine(folder, "03 - Digital Love.lrc");
+        await File.WriteAllTextAsync(lyrics, "shared");
+        using var client = factory.CreateClient();
+
+        Assert.Equal("applied", State(await Call(client, "id=s1&action=remove&copy=true")));
+
+        Assert.True(File.Exists(lyrics));
+    }
+
+    [Fact]
     public async Task RemovingASecondCopy_LeavesTheSongWanted_ButDeletingTheSongDoesNot()
     {
         await using var factory = new Factory();
