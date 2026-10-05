@@ -132,6 +132,58 @@ public sealed class SimilarSongsSeedTests
                 song.TryGetProperty("octoSuggestedBy", out var by) ? by.GetString() : null)).ToList();
     }
 
+    /// <summary>23 numbers with the second one placing the song along a line: songs close on the
+    /// line sound alike.</summary>
+    private static Octo.Services.Sonic.SonicSong Sound(float at, string title)
+    {
+        var f = new float[23];
+        f[1] = at;
+        return new Octo.Services.Sonic.SonicSong { Stamp = "1:1", Title = title, Artist = "Artist", Version = 2, F = f };
+    }
+
+    [Fact]
+    public async Task SoundsAlike_AddsLibrarySongsThatSoundLikeIt_ReadAgainWithTheListenersSignIn()
+    {
+        await using var fixture = new Factory(new() { ["RadioSources:SoundsAlike"] = "true" });
+        fixture.Services.GetRequiredService<Octo.Services.Sonic.SonicStore>().Write(s =>
+        {
+            s.Songs["teardrop"] = Sound(0, "Teardrop");
+            s.Songs["roads"] = Sound(0.1f, "Roads");
+            // In the store but not in this listener's Navidrome: never sent.
+            s.Songs["elsewhere"] = Sound(0.05f, "Elsewhere");
+        });
+        using var client = fixture.CreateClient();
+
+        var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=teardrop&u=alice&t=token&s=salt&f=json&count=50"));
+
+        Assert.Contains(songs, song => song.Id == "roads" && song.By == "Sounds alike");
+        Assert.DoesNotContain(songs, song => song.Id == "elsewhere");
+        Assert.Contains(fixture.Handler.Calls, call => call.Contains("rest/getSong", StringComparison.Ordinal)
+            && call.Contains("id=roads", StringComparison.Ordinal) && call.Contains("u=alice", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task TheSoundCheck_PutsALibrarySongThatSoundsCloseAboveOneThatSoundsFar()
+    {
+        await using var fixture = new Factory(new() { ["RadioSources:SoundsAlike"] = "true" });
+        fixture.Services.GetRequiredService<Octo.Services.Sonic.SonicStore>().Write(s =>
+        {
+            s.Songs["spooky"] = Sound(0, "SPOOKY");
+            s.Songs["pl-3"] = Sound(0.05f, "NIGHT RIDE");
+            s.Songs["genre-1"] = Sound(0.5f, "GHOST");
+            s.Songs["pl-2"] = Sound(0.95f, "DRIFT");
+            // The rest of the library, for the seed's spread.
+            for (var i = 0; i < 10; i++) s.Songs[$"other-{i}"] = Sound(0.1f * i, $"Other {i}");
+        });
+        using var client = fixture.CreateClient();
+
+        var songs = Songs(await client.GetStringAsync("/rest/getSimilarSongs2?id=spooky&u=alice&t=token&s=salt&f=json&count=20"))
+            .Select(song => song.Id).ToList();
+
+        // The playlist's two songs come back in either order from the album; the sound decides.
+        Assert.True(songs.IndexOf("pl-3") < songs.IndexOf("pl-2"), string.Join(", ", songs));
+    }
+
     [Fact]
     public async Task ASongTheListenerRatedOneStar_StaysOffTheirRadio()
     {

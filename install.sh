@@ -419,6 +419,7 @@ check_svc() {
 check_svc "Navidrome"  "navidrome"
 check_svc "Last.fm"    "lastfm"
 check_svc "yt-dlp shim" "ytDlpShim"
+check_svc "octo-sonic" "sonic"
 check_svc "slskd"      "slskd"
 if [ "${DOWNLOAD_SOURCE,,}" = "lidarr" ]; then
   check_svc "Lidarr" "lidarr"

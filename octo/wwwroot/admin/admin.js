@@ -53,6 +53,7 @@ function activateTab(name, { focus = false } = {}) {
   if (name === 'raw' && typeof loadRawConfig === 'function') loadRawConfig();
   if (name === 'sources' && typeof loadConfigSources === 'function') loadConfigSources();
   if (name === 'lastfm' && typeof loadRadioStatus === 'function') loadRadioStatus();
+  if (name === 'lastfm' && typeof loadSonic === 'function') loadSonic();
   if (name === 'lastfm' && typeof loadLastFmScrobbling === 'function') loadLastFmScrobbling();
   if (name === 'lastfm' && typeof loadLastFmAccount === 'function') loadLastFmAccount();
   if (name === 'about' && typeof loadUpdate === 'function') loadUpdate();
@@ -1910,6 +1911,58 @@ document.getElementById('review-sweep-reset')?.addEventListener('click', async (
 });
 loadReviewSweep();
 setInterval(() => { if (document.visibilityState === 'visible') loadReviewSweep(); }, 30000);
+
+// Sounds alike: octo-sonic's analysis of every song, on the Last.fm radio page.
+const sonicStates = { Off: 'Off', Paused: 'Paused', Waiting: 'Waiting', Running: 'Analysing', Done: 'Up to date' };
+
+async function loadSonic() {
+  const status = document.getElementById('sonic-status');
+  if (!status) return;
+  try {
+    const response = await api('/api/admin/sonic');
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const s = await response.json();
+    const parts = [`${sonicStates[s.state] || s.state}.`];
+    if (s.total > 0) parts.push(`${s.analysed} of ${s.total} songs analysed (pass ${s.pass}).`);
+    if (s.failed > 0) parts.push(`${s.failed} could not be read.`);
+    if (s.reason) parts.push(s.reason);
+    status.textContent = parts.join(' ');
+    const toggle = document.getElementById('sonic-toggle');
+    toggle.dataset.paused = s.paused ? 'true' : 'false';
+    toggle.querySelector('span').textContent = s.paused ? 'Start' : 'Pause';
+  } catch (error) {
+    status.textContent = `Could not read the analysis: ${error.message}`;
+  }
+}
+
+async function sonicPost(button, path, message) {
+  button.disabled = true;
+  try {
+    const response = await api(path, { method: 'POST' });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    note(button, message);
+  } catch (error) {
+    note(button, error.message, 'error');
+  } finally {
+    button.disabled = false;
+    await loadSonic();
+  }
+}
+
+document.getElementById('sonic-toggle')?.addEventListener('click', (event) => {
+  const button = event.currentTarget;
+  const start = button.dataset.paused === 'true';
+  sonicPost(button, `/api/admin/sonic/${start ? 'start' : 'pause'}`, start ? 'Carrying on.' : 'Paused.');
+});
+document.getElementById('sonic-reset')?.addEventListener('click', async (event) => {
+  // Taken before the question: once it is awaited the event no longer says which button it was.
+  const button = event.currentTarget;
+  if (!(await askConfirm('Analyse every song again?', 'Octo forgets what every song sounds like and reads them all again, one at a time.', 'Start over'))) return;
+  sonicPost(button, '/api/admin/sonic/reset', 'Starting over.');
+});
+loadSonic();
+setInterval(() => { if (document.visibilityState === 'visible') loadSonic(); }, 30000);
 
 const upgradeOutcomes = { Applied: 'upgraded', Failed: 'no better copy found', Rehearsed: 'dry run',
   Skipped: 'skipped', Unresolved: 'file not found', Nothing: 'nothing left to try' };

@@ -2183,6 +2183,7 @@ public class AdminController : ControllerBase
             ["slskd"] = ProbeSlskdAsync(ct),
             ["lidarr"] = ProbeLidarrAsync(ct),
             ["ytDlpShim"] = ProbeYouTubeShimAsync(ct),
+            ["sonic"] = ProbeSonicAsync(ct),
             ["lastfm"] = ProbeLastFmAsync(ct),
         };
         await Task.WhenAll(probeTasks.Values);
@@ -2303,6 +2304,21 @@ public class AdminController : ControllerBase
         {
             var ok = await _lidarr.IsReachableAsync(ct);
             return new ServiceProbe(ok, ok ? "reachable" : "unreachable / API key invalid");
+        }
+        catch (Exception ex) { return new ServiceProbe(false, ex.Message); }
+    }
+
+    /// <summary>octo-sonic, the Sounds alike reader; off when Sounds alike is switched off.</summary>
+    private async Task<ServiceProbe> ProbeSonicAsync(CancellationToken ct)
+    {
+        var radio = _radioSourceOpts.CurrentValue;
+        if (!radio.SoundsAlike) return new ServiceProbe(true, "Sounds alike is off", Configured: false);
+        try
+        {
+            var http = _httpFactory.CreateClient();
+            http.Timeout = TimeSpan.FromSeconds(5);
+            using var resp = await http.GetAsync($"{radio.SonicUrl.TrimEnd('/')}/health", ct);
+            return new ServiceProbe(resp.IsSuccessStatusCode, $"HTTP {(int)resp.StatusCode}");
         }
         catch (Exception ex) { return new ServiceProbe(false, ex.Message); }
     }

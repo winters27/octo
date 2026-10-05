@@ -452,6 +452,20 @@ builder.Services.AddSingleton<LastFmService>();
 builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.LastFmRadioSource>();
 builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.YouTubeMusicRadioSource>();
 builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.ListenBrainzRadioSource>();
+// Sounds alike (multi-source radio): what every library song sounds like, from octo-sonic.
+// Where its state files go: tests point it at their own folder, since SettingsFilePath is a
+// fixed /app/config path (C:\app\config on a developer's Windows machine).
+var radioStateDirectory = builder.Configuration["Octo:StateDirectory"] is { Length: > 0 } stateDir
+    ? stateDir : System.IO.Path.GetDirectoryName(SettingsFilePath)!;
+builder.Services.AddHttpClient(Octo.Services.Sonic.SonicClient.ClientName, c => c.Timeout = TimeSpan.FromMinutes(11));
+builder.Services.AddSingleton<Octo.Services.Sonic.SonicClient>();
+builder.Services.AddSingleton(sp => new Octo.Services.Sonic.SonicStore(
+    System.IO.Path.Combine(radioStateDirectory, "sonic-features.json"),
+    sp.GetRequiredService<ILogger<Octo.Services.Sonic.SonicStore>>()));
+builder.Services.AddSingleton<Octo.Services.Sonic.ISonicLibrary, Octo.Services.Sonic.NavidromeSonicLibrary>();
+builder.Services.AddSingleton<Octo.Services.Sonic.SonicAnalysisWorker>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<Octo.Services.Sonic.SonicAnalysisWorker>());
+builder.Services.AddSingleton<Octo.Services.Radio.IRadioSource, Octo.Services.Radio.SoundsAlikeRadioSource>();
 builder.Services.AddSingleton<Octo.Services.Radio.RadioSourceSet>();
 builder.Services.AddScoped<Octo.Services.Radio.SongRadioService>();
 

@@ -7,12 +7,12 @@ namespace Octo.Services.Radio;
 public sealed class RadioSourceSet(IEnumerable<IRadioSource> sources,
     IOptionsMonitor<RadioSourceSettings> settings, ILogger<RadioSourceSet> logger)
 {
-    internal static TimeSpan SourceTimeout { get; set; } = TimeSpan.FromSeconds(8);
+    internal TimeSpan SourceTimeout { get; set; } = TimeSpan.FromSeconds(8);
     /// <summary>Failures or timeouts in a row before a source is rested, and for how long. A
     /// source that hangs would otherwise cost every radio its full timeout, and a station build
     /// one timeout per seed.</summary>
     internal const int FailuresBeforeRest = 3;
-    internal static TimeSpan Rest { get; set; } = TimeSpan.FromMinutes(5);
+    internal TimeSpan Rest { get; set; } = TimeSpan.FromMinutes(5);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (int Failures, DateTime RestUntil)> _health = new();
     internal const double LowestWeight = 0.3;
     internal const double HighestWeight = 1.5;

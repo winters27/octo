@@ -10,9 +10,9 @@ namespace Octo.Services.Radio;
 /// answers blended, resolved local first, and each song marked with the source it came from.
 /// </summary>
 public sealed class SongRadioService(RadioSourceSet sources, LastFmRadioTrackResolver resolver,
-    IOptionsMonitor<LastFmSettings> lastFmSettings,
+    IOptionsMonitor<LastFmSettings> lastFmSettings, IOptionsMonitor<RadioSourceSettings> radioSettings,
     IOptionsMonitor<SubsonicSettings> subsonicSettings,
-    ILogger<SongRadioService> logger)
+    ILogger<SongRadioService> logger, Octo.Services.Sonic.SonicStore? sonic = null)
 {
     /// <summary>Picks resolved beyond the count asked for, so the sound check has some to drop.</summary>
     internal const double PickHeadroom = 1.5;
@@ -80,6 +80,16 @@ public sealed class SongRadioService(RadioSourceSet sources, LastFmRadioTrackRes
         var scored = picks.Zip(resolved, (pick, song) => (Song: song, pick.Score))
             .Where(item => item.Song is not null && item.Song.Id != seed.LibrarySong?.Id)
             .Select(item => (Song: item.Song!, item.Score)).DistinctBy(item => item.Song.Id).ToList();
+        // Sound check: a library pick that sounds far from the seed slips down, one that sounds
+        // close moves up. It catches a catalog's wrong-mood pick that the other sources missed.
+        // Only songs Octo has analysed have a sound, so outside songs keep their score.
+        if (sonic is not null && radioSettings.CurrentValue.SoundsAlike && seed.LibrarySong is { Id.Length: > 0 } seedSong)
+        {
+            var fit = sonic.FitFactors(seedSong.Id, scored.Where(item => item.Song.IsLocal).Select(item => item.Song.Id));
+            if (fit.Count > 0)
+                scored = scored.Select(item => (item.Song, Score: item.Score * fit.GetValueOrDefault(item.Song.Id, 1.0)))
+                    .OrderByDescending(item => item.Score).ToList();
+        }
         // The admin's explicit filter, as stations apply it: with outside songs from every source,
         // radio is where most unknown lyrics now come from.
         var filter = subsonicSettings.CurrentValue.ExplicitFilter;

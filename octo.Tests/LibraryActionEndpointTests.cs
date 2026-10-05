@@ -124,6 +124,7 @@ public sealed class LibraryActionEndpointTests
                 ["Soulseek:BaseUrl"] = "http://127.0.0.1:1",
                 ["YouTube:ShimUrl"] = "http://127.0.0.1:1",
                 ["Library:DownloadPath"] = _directory,
+                ["Octo:StateDirectory"] = _directory,
                 ["LibraryActions:Enabled"] = "true",
                 ["LibraryActions:DryRun"] = "false",
                 ["LibraryActions:AllowedUsers:0"] = "alice",

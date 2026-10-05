@@ -95,6 +95,7 @@ public class RadioBanEndpointTests
                     ["Subsonic:Url"] = "http://navidrome.test",
                     ["Subsonic:AutoDetectDownloadPath"] = "false",
                     ["Library:DownloadPath"] = _directory,
+                    ["Octo:StateDirectory"] = _directory,
                 }));
             builder.ConfigureServices(services =>
             {

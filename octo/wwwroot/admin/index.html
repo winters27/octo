@@ -261,6 +261,15 @@
             <div class="status-card-body">Checking…</div>
             <div class="status-card-foot">Previews from YouTube</div>
           </article>
+          <article class="status-card" data-svc="sonic">
+            <div class="status-card-head">
+              <svg class="icon" aria-hidden="true"><use href="#i-pulse"/></svg>
+              <span class="status-card-title">octo-sonic</span>
+              <span class="status-dot pending"></span>
+            </div>
+            <div class="status-card-body">Checking…</div>
+            <div class="status-card-foot">Sounds alike radio</div>
+          </article>
           <article class="status-card" data-svc="lastfm">
             <div class="status-card-head">
               <svg class="icon brand" aria-hidden="true"><use href="#b-lastfm"/></svg>
@@ -843,6 +852,11 @@
             <div class="set-row">
               <div class="set-info"><div class="set-info-t">Sounds alike</div><div class="set-info-d">Library songs that sound like it. Octo reads every song once to learn how it sounds, one song at a time and only while nothing is downloading.</div></div>
               <label class="switch"><input type="checkbox" name="RadioSources.SoundsAlike" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Sounds alike analysis</div><div class="set-info-d" id="sonic-status">Not loaded yet.</div></div>
+              <button class="btn btn-ghost" type="button" id="sonic-toggle"><span>Pause</span></button>
+              <button class="btn btn-ghost" type="button" id="sonic-reset"><svg class="icon" aria-hidden="true"><use href="#i-arrow-counter-clockwise"/></svg><span>Start over</span></button>
             </div>
             <details class="radio-advanced">
               <summary>How much each source counts</summary>

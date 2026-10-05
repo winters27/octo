@@ -60,9 +60,6 @@ public sealed class RadioSourceSetTests
     [Fact]
     public async Task ASlowSource_IsLeftOutOfOneRadio_TheOthersStillAnswer()
     {
-        var saved = RadioSourceSet.SourceTimeout;
-        RadioSourceSet.SourceTimeout = TimeSpan.FromMilliseconds(100);
-        try
         {
             var slow = new FakeSource(RadioProvider.YouTubeMusic, async ct =>
             {
@@ -71,22 +68,21 @@ public sealed class RadioSourceSetTests
             });
             var quick = new FakeSource(RadioProvider.LastFm, _ => Task.FromResult(
                 new RadioAnswer(RadioProvider.LastFm, RadioMatch.Song, [new("Portishead", "Roads", 1)], [])));
-            var answers = await Set(new RadioSourceSettings(), slow, quick).AskAllAsync(Seed, 10, new Dictionary<string, string>(), CancellationToken.None);
+            var set = Set(new RadioSourceSettings(), slow, quick);
+            set.SourceTimeout = TimeSpan.FromMilliseconds(100);
+            var answers = await set.AskAllAsync(Seed, 10, new Dictionary<string, string>(), CancellationToken.None);
             Assert.Equal(RadioMatch.None, answers.Single(answer => answer.Provider == RadioProvider.YouTubeMusic).Match);
             Assert.Single(answers.Single(answer => answer.Provider == RadioProvider.LastFm).Tracks);
         }
-        finally { RadioSourceSet.SourceTimeout = saved; }
     }
 
     [Fact]
     public async Task ASourceThatKeepsFailing_IsRested_ThenComesBack()
     {
-        var savedRest = RadioSourceSet.Rest;
-        RadioSourceSet.Rest = TimeSpan.FromMilliseconds(300);
-        try
         {
             var failing = new FakeSource(RadioProvider.ListenBrainz, _ => throw new HttpRequestException("down"));
             var set = Set(new RadioSourceSettings(), failing);
+            set.Rest = TimeSpan.FromMilliseconds(300);
             for (var i = 0; i < RadioSourceSet.FailuresBeforeRest; i++)
                 await set.AskAllAsync(Seed, 10, new Dictionary<string, string>(), CancellationToken.None);
             Assert.Empty(set.Available);
@@ -96,7 +92,6 @@ public sealed class RadioSourceSetTests
             await Task.Delay(400);
             Assert.Single(set.Available);
         }
-        finally { RadioSourceSet.Rest = savedRest; }
     }
 
     [Fact]

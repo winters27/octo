@@ -541,6 +541,7 @@ internal sealed class LengthWebFactory : WebApplicationFactory<Program>
                 ["Subsonic:Url"] = "http://navidrome.test",
                 ["Subsonic:AutoDetectDownloadPath"] = "false",
                 ["Library:DownloadPath"] = _directory,
+                ["Octo:StateDirectory"] = _directory,
                 ["LastFm:ApiKey"] = "key",
                 ["LastFm:EnableRadio"] = "true",
                 ["LastFm:EnablePersonalizedStations"] = "true",
