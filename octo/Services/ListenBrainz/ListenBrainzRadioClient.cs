@@ -20,8 +20,12 @@ public sealed class ListenBrainzRadioClient(IHttpClientFactory http, IOptionsMon
     internal const string LabsUrl = "https://labs.api.listenbrainz.org";
     internal const string ApiUrl = "https://api.listenbrainz.org";
     internal static TimeSpan MinimumGap { get; set; } = TimeSpan.FromSeconds(1);
-    private readonly SemaphoreSlim _gate = new(1, 1);
-    private DateTime _last = DateTime.MinValue;
+    /// <summary>Longest a call waits for its one-a-second slot. Past that it gives up with nothing,
+    /// which is not a failure: a station build's calls queued ahead are not the source going wrong,
+    /// and song radio must not wait out its whole timeout behind them.</summary>
+    internal static TimeSpan MaxQueueWait { get; set; } = TimeSpan.FromSeconds(3);
+    private readonly object _slotLock = new();
+    private DateTime _next = DateTime.MinValue;
     private readonly MemoryCache _cache = new(new MemoryCacheOptions { SizeLimit = 4000 });
 
     public bool HasToken => !string.IsNullOrWhiteSpace(listenBrainz.CurrentValue.Token);
@@ -32,8 +36,10 @@ public sealed class ListenBrainzRadioClient(IHttpClientFactory http, IOptionsMon
         var key = $"acr|{artist}|{title}".ToLowerInvariant();
         if (_cache.TryGetValue(key, out string? cached)) return cached;
         var rows = await LabsAsync($"/acr-lookup/json?artist_credit_name={Uri.EscapeDataString(artist)}&recording_name={Uri.EscapeDataString(title)}", ct);
-        var mbid = rows.Select(row => Text(row, "recording_mbid")).FirstOrDefault(value => value is not null);
-        _cache.Set(key, mbid, new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromDays(7) });
+        var mbid = rows?.Select(row => Text(row, "recording_mbid")).FirstOrDefault(value => value is not null);
+        // Only a real answer is kept: a failed or skipped call says nothing about the song.
+        if (rows is not null)
+            _cache.Set(key, mbid, new MemoryCacheEntryOptions { Size = 1, AbsoluteExpirationRelativeToNow = TimeSpan.FromDays(7) });
         return mbid;
     }
 
@@ -44,8 +50,9 @@ public sealed class ListenBrainzRadioClient(IHttpClientFactory http, IOptionsMon
         if (!_cache.TryGetValue(key, out IReadOnlyList<ListenBrainzTrack>? tracks) || tracks is null)
         {
             var rows = await LabsAsync($"/similar-recordings/json?recording_mbids={Uri.EscapeDataString(recordingMbid)}&algorithm={Uri.EscapeDataString(algorithm)}", ct);
+            if (rows is null) return [];
             var parsed = rows.Select(row => (Artist: Text(row, "artist_credit_name"), Title: Text(row, "recording_name"),
-                    Score: row.TryGetProperty("score", out var s) && s.TryGetDouble(out var value) ? value : 0))
+                    Score: Number(row, "score") ?? 0))
                 .Where(row => row.Artist is not null && row.Title is not null).ToList();
             // ListenBrainz's score is a count of shared listening sessions (216, 149, ...), so it
             // is scaled to the answer's best, 0 to 1, like every other source's match.
@@ -70,8 +77,9 @@ public sealed class ListenBrainzRadioClient(IHttpClientFactory http, IOptionsMon
             $"{ApiUrl}/1/explore/lb-radio?prompt={Uri.EscapeDataString(prompt)}&mode=easy");
         request.Headers.Authorization = new AuthenticationHeaderValue("Token", token.Trim());
         using var doc = await SendAsync(request, ct);
+        if (doc is null) return [];
         var tracks = new List<ListenBrainzTrack>();
-        if (doc is not null && doc.RootElement.TryGetProperty("payload", out var payload)
+        if (doc.RootElement.TryGetProperty("payload", out var payload)
             && payload.TryGetProperty("jspf", out var jspf) && jspf.TryGetProperty("playlist", out var playlist)
             && playlist.TryGetProperty("track", out var list) && list.ValueKind == JsonValueKind.Array)
         {
@@ -79,8 +87,7 @@ public sealed class ListenBrainzRadioClient(IHttpClientFactory http, IOptionsMon
             {
                 var title = Text(track, "title");
                 var artist = Text(track, "creator");
-                int? seconds = track.TryGetProperty("duration", out var d) && d.TryGetInt64(out var ms) && ms > 1000
-                    ? (int)(ms / 1000) : null;
+                int? seconds = Number(track, "duration") is { } ms && ms > 1000 ? (int)(ms / 1000) : null;
                 if (title is not null && artist is not null)
                     tracks.Add(new ListenBrainzTrack(artist, title, 1.0, seconds));
             }
@@ -90,11 +97,12 @@ public sealed class ListenBrainzRadioClient(IHttpClientFactory http, IOptionsMon
         return tracks.Take(count).ToList();
     }
 
-    private async Task<IReadOnlyList<JsonElement>> LabsAsync(string pathAndQuery, CancellationToken ct)
+    /// <summary>The rows of a labs answer; null when there was no answer to read (failed or skipped).</summary>
+    private async Task<IReadOnlyList<JsonElement>?> LabsAsync(string pathAndQuery, CancellationToken ct)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, LabsUrl + pathAndQuery);
         using var doc = await SendAsync(request, ct);
-        return doc is null ? [] : Rows(doc.RootElement).Select(row => row.Clone()).ToList();
+        return doc is null ? null : Rows(doc.RootElement).Select(row => row.Clone()).ToList();
     }
 
     /// <summary>Rows as the labs datasets give them: an array of rows, or blocks holding a "data" array of rows.</summary>
@@ -112,19 +120,40 @@ public sealed class ListenBrainzRadioClient(IHttpClientFactory http, IOptionsMon
         }
     }
 
+    /// <summary>The wait for this call's one-a-second slot, the slot taken; null when it is more
+    /// than <see cref="MaxQueueWait"/> away. Only the slot is under the lock, never the call.</summary>
+    private TimeSpan? ReserveSlot()
+    {
+        lock (_slotLock)
+        {
+            var now = DateTime.UtcNow;
+            var slot = _next > now ? _next : now;
+            if (slot - now > MaxQueueWait) return null;
+            _next = slot + MinimumGap;
+            return slot - now;
+        }
+    }
+
+    /// <summary>An answer, or null when the call failed, was refused or was skipped as too far back in the queue.</summary>
     private async Task<JsonDocument?> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
-        await _gate.WaitAsync(ct);
+        if (ReserveSlot() is not { } wait)
+        {
+            logger.LogDebug("ListenBrainz is busy; {Path} skipped", request.RequestUri?.AbsolutePath);
+            return null;
+        }
+        if (wait > TimeSpan.Zero) await Task.Delay(wait, ct);
         try
         {
-            var wait = _last + MinimumGap - DateTime.UtcNow;
-            if (wait > TimeSpan.Zero) await Task.Delay(wait, ct);
-            _last = DateTime.UtcNow;
             using var response = await http.CreateClient(ClientName).SendAsync(request, ct);
             if ((int)response.StatusCode == 429)
             {
                 logger.LogWarning("ListenBrainz asked Octo to slow down ({Path})", request.RequestUri?.AbsolutePath);
-                _last = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+                lock (_slotLock)
+                {
+                    var later = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+                    if (later > _next) _next = later;
+                }
                 return null;
             }
             if (!response.IsSuccessStatusCode) return null;
@@ -135,12 +164,16 @@ public sealed class ListenBrainzRadioClient(IHttpClientFactory http, IOptionsMon
             logger.LogDebug(ex, "ListenBrainz {Path} failed", request.RequestUri?.AbsolutePath);
             return null;
         }
-        finally { _gate.Release(); }
     }
+
+    /// <summary>A number, or null for a missing, null or text value: one odd row never fails the answer.</summary>
+    private static double? Number(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number
+            && value.TryGetDouble(out var number) ? number : null;
 
     private static string? Text(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
             && value.GetString() is { Length: > 0 } text ? text : null;
 
-    public void Dispose() { _cache.Dispose(); _gate.Dispose(); }
+    public void Dispose() => _cache.Dispose();
 }

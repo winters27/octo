@@ -110,4 +110,36 @@ public sealed class RadioSourceSetTests
         await set.AskAllAsync(Seed, 10, new Dictionary<string, string>(), CancellationToken.None);
         Assert.Single(set.Available);
     }
+
+    [Fact]
+    public async Task AnAnswerToACallFromBeforeTheRest_DoesNotEndTheRest()
+    {
+        var slow = new TaskCompletionSource<RadioAnswer>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var source = new FakeSource(RadioProvider.ListenBrainz, _ => Interlocked.Increment(ref calls) == 1
+            ? slow.Task
+            : throw new HttpRequestException("down"));
+        var set = Set(new RadioSourceSettings(), source);
+        set.SourceTimeout = TimeSpan.FromSeconds(30);
+        var early = set.AskAllAsync(Seed, 10, new Dictionary<string, string>(), CancellationToken.None);
+        for (var i = 0; i < RadioSourceSet.FailuresBeforeRest; i++)
+            await set.AskAllAsync(Seed, 10, new Dictionary<string, string>(), CancellationToken.None);
+        Assert.Empty(set.Available);
+
+        slow.SetResult(RadioAnswer.Nothing(RadioProvider.ListenBrainz));
+        await early;
+        Assert.Empty(set.Available);
+    }
+
+    [Fact]
+    public async Task OnlyTheSourcesAskedFor_AreAsked()
+    {
+        var lastFm = new FakeSource(RadioProvider.LastFm, _ => Task.FromResult(RadioAnswer.Nothing(RadioProvider.LastFm)));
+        var ytm = new FakeSource(RadioProvider.YouTubeMusic, _ => Task.FromResult(RadioAnswer.Nothing(RadioProvider.YouTubeMusic)));
+        var set = Set(new RadioSourceSettings { YouTubeMusic = true }, lastFm, ytm);
+        var answers = await set.AskAllAsync(Seed, 10, new Dictionary<string, string>(), CancellationToken.None,
+            only: source => source.Provider != RadioProvider.LastFm);
+        Assert.Equal([RadioProvider.YouTubeMusic], answers.Select(answer => answer.Provider));
+        Assert.Equal(0, lastFm.Calls);
+    }
 }

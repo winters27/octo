@@ -25,11 +25,15 @@ public sealed class YouTubeMusicRadioSourceTests
         public Dictionary<string, object[]> Search { get; } = new();
         public Dictionary<string, object[]> Radio { get; } = new();
         public (string? Artist, object[] Rows) Artist { get; set; } = (null, []);
+        /// <summary>Searches answer 503, as the shim does with its gate full.</summary>
+        public bool Busy { get; set; }
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             var uri = request.RequestUri!;
             Calls.Enqueue(uri.PathAndQuery);
+            if (Busy && uri.AbsolutePath == "/ytm/search")
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.ServiceUnavailable));
             var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
             object body = uri.AbsolutePath switch
             {
@@ -129,6 +133,22 @@ public sealed class YouTubeMusicRadioSourceTests
         await source.SongsLikeAsync(seed, 20, NoAuth, default);
 
         Assert.Single(shim.Calls, call => call.StartsWith("/ytm/search", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ABusyShim_IsAskedAgainNextTime_NotRememberedAsNothingFound()
+    {
+        var (source, shim) = Source();
+        shim.Search["songs|Portishead Roads"] = [Row("r", "Roads", "Portishead", 305)];
+        shim.Radio["r"] = [Row("g", "Glory Box", "Portishead", 305)];
+        var seed = new RadioSeed("Portishead", "Roads", 305, null);
+
+        shim.Busy = true;
+        Assert.Empty((await source.SongsLikeAsync(seed, 20, NoAuth, default)).Tracks);
+        Assert.Single(shim.Calls, call => call.StartsWith("/ytm/search", StringComparison.Ordinal));
+
+        shim.Busy = false;
+        Assert.Single((await source.SongsLikeAsync(seed, 20, NoAuth, default)).Tracks);
     }
 
     [Fact]

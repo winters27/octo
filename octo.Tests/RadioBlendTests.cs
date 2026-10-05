@@ -131,4 +131,25 @@ public sealed class RadioBlendTests
     [InlineData(null, null)]
     public void PrimaryGenre_IsTheFirstRealOne(string? genre, string? expected) =>
         Assert.Equal(expected, RadioBlend.PrimaryGenre(genre));
+
+    [Fact]
+    public void AnAnswerWithAllTheSongsAsked_IsFull_HoweverShort()
+    {
+        var eight = new RadioAnswer(RadioProvider.LastFm, RadioMatch.Song,
+            Enumerable.Range(1, 8).Select(i => Track("A", $"Song {i}")).ToList(), []);
+        Assert.Equal(1.0, RadioBlend.Thin(eight, wanted: 8));
+        Assert.Equal(0.4, RadioBlend.Thin(eight, wanted: 50), 6);
+        Assert.False(RadioBlend.LibraryLed([eight], wanted: 8));
+        Assert.True(RadioBlend.LibraryLed([eight], wanted: 50));
+    }
+
+    [Fact]
+    public void TheSameSongFromASourceThatKnowsItsVideo_KeepsTheVideo()
+    {
+        var lastFm = Catalog(RadioProvider.LastFm, RadioMatch.Song, ("Portishead", "Roads"));
+        var ytm = new RadioAnswer(RadioProvider.YouTubeMusic, RadioMatch.Song,
+            [new LastFmService.SimilarTrack("Portishead", "Roads", 1.0, 305, YouTubeId: "vid")], []);
+        var pick = Assert.Single(RadioBlend.Blend([lastFm, ytm], Even, 10, "seed", null));
+        Assert.Equal("vid", pick.Track!.YouTubeId);
+    }
 }

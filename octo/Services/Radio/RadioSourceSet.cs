@@ -48,9 +48,11 @@ public sealed class RadioSourceSet(IEnumerable<IRadioSource> sources,
         };
     }
 
+    /// <param name="only">The sources to ask; all available ones when null. An artist station
+    /// that has already asked Last.fm itself leaves Last.fm out.</param>
     public Task<RadioAnswer[]> AskAllAsync(RadioSeed seed, int count,
-        IReadOnlyDictionary<string, string> auth, CancellationToken ct) =>
-        Task.WhenAll(Available.Select(source => AskAsync(source, ct,
+        IReadOnlyDictionary<string, string> auth, CancellationToken ct, Func<IRadioSource, bool>? only = null) =>
+        Task.WhenAll(Available.Where(source => only?.Invoke(source) ?? true).Select(source => AskAsync(source, ct,
             token => source.SongsLikeAsync(seed, count, auth, token))));
 
     public Task<RadioAnswer[]> TagAllAsync(string tag, int count, CancellationToken ct) =>
@@ -64,7 +66,9 @@ public sealed class RadioSourceSet(IEnumerable<IRadioSource> sources,
         try
         {
             var answer = await ask(timeout.Token);
-            _health.TryRemove(source.Provider, out _);
+            // A success clears the count of failures in a row, but never cuts a rest short: an
+            // answer to a call made before the rest began says nothing about the source now.
+            _health.AddOrUpdate(source.Provider, _ => (0, DateTime.MinValue), (_, old) => (0, old.RestUntil));
             return answer;
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)

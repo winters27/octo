@@ -712,7 +712,12 @@ def _open_upstream(url: str, headers: dict, video_id: str):
 # Search and radio through ytmusicapi, no sign-in. These are plain HTTP calls to YouTube
 # Music, not yt-dlp processes, so they have their own small gate instead of TieredGate.
 _YTM_GATE = threading.BoundedSemaphore(int(os.environ.get("YTM_MAX_CONCURRENT", "3")))
-_YTM_CACHE: "OrderedDict[tuple, tuple[float, object]]" = OrderedDict()
+# Octo gives a radio source 8 s; a request still queued past this has no one waiting for it, and
+# would only hold a gunicorn thread that playback needs.
+_YTM_GATE_WAIT = float(os.environ.get("YTM_GATE_WAIT_SEC", "5"))
+# One cache per kind, so a burst of radios never pushes the searches out.
+_YTM_CACHE: "dict[str, OrderedDict]" = {"search": OrderedDict(), "radio": OrderedDict(), "artist": OrderedDict()}
+_YTM_LIMIT = {"search": 2000, "radio": 500, "artist": 500}
 _YTM_LOCK = threading.Lock()
 _YTM_TTL = {"search": 24 * 3600, "radio": 3600, "artist": 3600}
 
@@ -724,24 +729,24 @@ def _arg_int(name, default, low, high):
         return default
 
 
-def _ytm_cached(kind, key, load, limit=2000):
+def _ytm_cached(kind, key, load):
     """A cached answer, else load() under the gate; None when the gate stays full."""
-    now = time.time()
+    cache = _YTM_CACHE[kind]
     with _YTM_LOCK:
-        hit = _YTM_CACHE.get((kind, key))
-        if hit and now - hit[0] < _YTM_TTL[kind]:
-            _YTM_CACHE.move_to_end((kind, key))
+        hit = cache.get(key)
+        if hit and time.time() - hit[0] < _YTM_TTL[kind]:
+            cache.move_to_end(key)
             return hit[1]
-    if not _YTM_GATE.acquire(timeout=20):
+    if not _YTM_GATE.acquire(timeout=_YTM_GATE_WAIT):
         return None
     try:
         value = load()
     finally:
         _YTM_GATE.release()
     with _YTM_LOCK:
-        _YTM_CACHE[(kind, key)] = (now, value)
-        while len(_YTM_CACHE) > limit:
-            _YTM_CACHE.popitem(last=False)
+        cache[key] = (time.time(), value)
+        while len(cache) > _YTM_LIMIT[kind]:
+            cache.popitem(last=False)
     return value
 
 
@@ -771,7 +776,7 @@ def ytm_radio():
         abort(400, "missing videoId")
     limit = _arg_int("limit", 50, 1, 100)
     try:
-        rows = _ytm_cached("radio", (video_id, limit), lambda: ytm.radio(video_id, limit), limit=500)
+        rows = _ytm_cached("radio", (video_id, limit), lambda: ytm.radio(video_id, limit))
     except Exception as e:
         log.warning("ytm radio failed for %s: %s", video_id, e)
         return jsonify(error="ytm_failed"), 502
@@ -787,7 +792,7 @@ def ytm_artist_radio():
         abort(400, "missing q")
     limit = _arg_int("limit", 50, 1, 100)
     try:
-        found = _ytm_cached("artist", (q.lower(), limit), lambda: ytm.artist_radio(q, limit), limit=500)
+        found = _ytm_cached("artist", (q.lower(), limit), lambda: ytm.artist_radio(q, limit))
     except Exception as e:
         log.warning("ytm artist radio failed for %r: %s", q, e)
         return jsonify(error="ytm_failed"), 502

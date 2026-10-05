@@ -69,8 +69,11 @@ public sealed class LastFmRadioTrackResolver
         try
         {
             var parameters = authenticatedParameters.ToDictionary(kv => kv.Key, kv => kv.Value);
-            parameters["query"] = $"{artist} {title}";
-            parameters["songCount"] = "3";
+            // Navidrome wants every word it is given, so a joined credit ("Kordhell, Scarlxrd")
+            // or a video title ("... (Official Video)") would find nothing: the main artist and the
+            // core title find the candidates, and IsSameRecording still decides the version.
+            parameters["query"] = Octo.Services.Common.TopSongsService.LibraryQuery(new Song { Artist = artist, Title = title });
+            parameters["songCount"] = "5";
             parameters["albumCount"] = "0";
             parameters["artistCount"] = "0";
             parameters["f"] = "json";
@@ -103,15 +106,15 @@ public sealed class LastFmRadioTrackResolver
         return null;
     }
 
+    /// <summary>One library song as this listener's Navidrome describes it; null when they cannot see it.</summary>
+    public async Task<Song?> ReadLibrarySongAsync(string id, IReadOnlyDictionary<string, string> authenticatedParameters) =>
+        await ReadAsync("rest/getSong", id, authenticatedParameters, "song") is { } song ? LibrarySong(song) : null;
+
     /// <summary>
     /// What a radio was started from in the library. Subsonic's getSimilarSongs takes a song, an
     /// album or an artist id; an album is read as its first song, an artist as the name alone.
     /// Null when Navidrome knows none of them for this listener.
     /// </summary>
-    /// <summary>One library song as this listener's Navidrome describes it; null when they cannot see it.</summary>
-    public async Task<Song?> ReadLibrarySongAsync(string id, IReadOnlyDictionary<string, string> authenticatedParameters) =>
-        await ReadAsync("rest/getSong", id, authenticatedParameters, "song") is { } song ? LibrarySong(song) : null;
-
     public async Task<LibrarySeed?> ReadSeedAsync(string id,
         IReadOnlyDictionary<string, string> authenticatedParameters)
     {

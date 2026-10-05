@@ -36,7 +36,7 @@ public sealed class SongRadioService(RadioSourceSet sources, LastFmRadioTrackRes
 
         // When no catalog has songs like this very song, the seed's own tags know its style better
         // than a guess from its artist's name, which for a YouTube upload is only the channel's (#78).
-        var libraryLed = seed.LibrarySong is not null && !seed.IsArtist && RadioBlend.LibraryLed(answers);
+        var libraryLed = seed.LibrarySong is not null && !seed.IsArtist && RadioBlend.LibraryLed(answers, count);
         if (libraryLed)
         {
             answers.Add(new RadioAnswer(RadioProvider.Library, RadioMatch.Song, [],
@@ -48,7 +48,7 @@ public sealed class SongRadioService(RadioSourceSet sources, LastFmRadioTrackRes
         answers = answers.Select(answer => RadioBlend.WithoutFillerOrBans(answer, bans)).ToList();
         var weights = sources.Weights(listener, libraryLed);
         var picks = RadioBlend.Blend(answers, weights, (int)Math.Ceiling(count * PickHeadroom),
-            LastFmRadioSeedNormalizer.TrackKey(seed.Artist, seed.Title), seed.LibrarySong?.Id);
+            LastFmRadioSeedNormalizer.TrackKey(seed.Artist, seed.Title), seed.LibrarySong?.Id, wanted: count);
         logger.LogInformation("Radio for '{Artist} - {Title}': {Answers}; weights {Weights}; {Picks} picked{Led}",
             seed.Artist, seed.Title,
             string.Join(", ", answers.Select(answer => $"{answer.Provider} {answer.Match} {answer.Count}")),

@@ -36,8 +36,12 @@ public static class RadioBlend
 
     /// <summary>A catalog answer of five songs is a weaker sign than one of fifty. Library answers
     /// (an album of three, say) are what they are and count in full.</summary>
-    public static double Thin(RadioAnswer answer) =>
-        RadioProvider.IsCatalog(answer.Provider) ? Math.Min(1.0, answer.Count / (double)FullAnswer) : 1.0;
+    /// <param name="wanted">How many songs the radio asked for: an answer that has them all is
+    /// full however short, so a radio of eight songs is not thin for having eight.</param>
+    public static double Thin(RadioAnswer answer, int wanted = FullAnswer) =>
+        RadioProvider.IsCatalog(answer.Provider)
+            ? Math.Min(1.0, answer.Count / (double)Math.Clamp(wanted, 1, FullAnswer))
+            : 1.0;
 
     /// <summary>Stations always had similar artists to fall back on, guesses included, so they keep them at a discount.</summary>
     public static double StationFactor(RadioMatch match) =>
@@ -49,9 +53,9 @@ public static class RadioBlend
     /// exact answer counts as none: three YouTube Music rows must not push a playlist's own songs
     /// out of the radio.
     /// </summary>
-    public static bool LibraryLed(IEnumerable<RadioAnswer> answers) =>
+    public static bool LibraryLed(IEnumerable<RadioAnswer> answers, int wanted = FullAnswer) =>
         answers.Where(answer => RadioProvider.IsCatalog(answer.Provider) && answer.Match == RadioMatch.Song)
-            .Sum(answer => answer.Count) < FullAnswer;
+            .Sum(answer => answer.Count) < Math.Clamp(wanted, 1, FullAnswer);
 
     /// <summary>Filler (intros, skits, interviews, extreme lengths) and the listener's one-star songs, out.</summary>
     public static RadioAnswer WithoutFillerOrBans(RadioAnswer answer, IReadOnlySet<string> bans) => answer with
@@ -62,11 +66,13 @@ public static class RadioBlend
             && !bans.Contains(LastFmRadioSeedNormalizer.TrackKey(song.Artist, song.Title))).ToList(),
     };
 
+    /// <param name="wanted">How many songs the radio is for (<see cref="Thin"/>).</param>
     public static List<RadioPick> Blend(IReadOnlyList<RadioAnswer> answers,
-        IReadOnlyDictionary<string, double> weights, int count, string seedKey, string? seedId)
+        IReadOnlyDictionary<string, double> weights, int count, string seedKey, string? seedId,
+        int wanted = FullAnswer)
     {
-        var picks = Score(answers, weights, seedKey, seedId, guesses: false);
-        if (picks.Count == 0) picks = Score(answers, weights, seedKey, seedId, guesses: true);
+        var picks = Score(answers, weights, seedKey, seedId, guesses: false, wanted);
+        if (picks.Count == 0) picks = Score(answers, weights, seedKey, seedId, guesses: true, wanted);
         return picks.Take(count).ToList();
     }
 
@@ -82,13 +88,13 @@ public static class RadioBlend
     }
 
     private static List<RadioPick> Score(IReadOnlyList<RadioAnswer> answers,
-        IReadOnlyDictionary<string, double> weights, string seedKey, string? seedId, bool guesses)
+        IReadOnlyDictionary<string, double> weights, string seedKey, string? seedId, bool guesses, int wanted)
     {
         var byKey = new Dictionary<string, Entry>(StringComparer.Ordinal);
         foreach (var answer in answers)
         {
             var match = guesses && answer.Match == RadioMatch.ArtistsGuessed ? GuessFactor : MatchFactor(answer.Match);
-            var factor = match * Thin(answer) * weights.GetValueOrDefault(answer.Provider, 1.0);
+            var factor = match * Thin(answer, wanted) * weights.GetValueOrDefault(answer.Provider, 1.0);
             if (factor <= 0) continue;
             var rank = 0;
             foreach (var (artist, title, song, track) in answer.Items())
@@ -106,7 +112,11 @@ public static class RadioBlend
                     entry.Song = song;
                     entry.SongComplete = answer.LibrarySongsComplete;
                 }
-                entry.Track ??= track;
+                if (entry.Track is null) entry.Track = track;
+                // The same song from a source that knows its video (YouTube Music) keeps the video,
+                // whichever source answered first, so it plays what that source named.
+                else if (track is not null && entry.Track.YouTubeId is null && track.YouTubeId is not null)
+                    entry.Track = entry.Track with { YouTubeId = track.YouTubeId, Duration = entry.Track.Duration ?? track.Duration };
             }
         }
         return byKey.Values.OrderByDescending(entry => entry.Score).ThenBy(entry => entry.Order)

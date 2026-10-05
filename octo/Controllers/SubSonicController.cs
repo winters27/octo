@@ -3020,19 +3020,39 @@ public partial class SubsonicController : ControllerBase
             return _responseBuilder.CreateResponse(format, responseKey, new { });
         }
 
-        // One-star songs count only when Navidrome has just answered getSong with the listener's
-        // own credentials, so nobody can read another listener's choices by comparing answers.
-        var bans = !isExternal && _radioStateStore is not null
-            && parameters.GetValueOrDefault("u") is { Length: > 0 } banner
-            ? _radioStateStore.RadioBanKeys(banner)
+        // Who the radio is for, once Navidrome has accepted their sign-in: a library seed was just
+        // read with it, an outside one is checked with a ping, as setRating does. Unchecked, the
+        // radio applies no one-star bans, uses the base weights and teaches nothing, so nobody can
+        // read or steer another listener's radio by naming them. Named as scrobbles name them.
+        var verified = !isExternal;
+        if (isExternal)
+        {
+            var auth = parameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+            auth.Remove("id");
+            var check = await _proxyService.RelaySafeAsync("rest/ping", auth);
+            verified = check.Success && check.Body is not null && IsSuccessfulSubsonicResponse(check.Body, format);
+        }
+        var listener = verified
+            ? await _requestIdentity.UsernameAsync(parameters, _proxyService, HttpContext.RequestAborted)
+            : null;
+        var bans = listener is not null && _radioStateStore is not null
+            ? _radioStateStore.RadioBanKeys(listener)
             : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        // Named as scrobbles name them, so what this listener plays teaches their own radio.
-        var listener = await _requestIdentity.UsernameAsync(parameters, _proxyService, HttpContext.RequestAborted);
         var resolvedSongs = await _songRadio.BuildAsync(
             new Octo.Services.Radio.RadioSeed(artistName, trackTitle, librarySeed?.Duration, librarySeed, seedVideo),
             count, listener, parameters, bans, HttpContext.RequestAborted);
         if (resolvedSongs.Count == 0)
+        {
+            // Nothing from Octo's sources (no Last.fm key, say, and an artist none of the others
+            // knows): Navidrome's own agents may still answer, as they did before Octo's radio.
+            if (!isExternal)
+            {
+                var upstream = await _proxyService.RelaySafeAsync(Request.Path.Value ?? "rest/getSimilarSongs", parameters);
+                if (upstream.Success && upstream.Body is { Length: > 0 })
+                    return File(upstream.Body, upstream.ContentType ?? $"application/{format}");
+            }
             return _responseBuilder.CreateResponse(format, responseKey, new { });
+        }
 
         var localCount = resolvedSongs.Count(s => s.IsLocal);
         var externalCount = resolvedSongs.Count - localCount;

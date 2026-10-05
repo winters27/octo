@@ -57,8 +57,31 @@ def test_each_thread_has_its_own_client(monkeypatch):
 @pytest.fixture
 def client(monkeypatch):
     with app._YTM_LOCK:
-        app._YTM_CACHE.clear()
+        for cache in app._YTM_CACHE.values():
+            cache.clear()
     return app.app.test_client()
+
+
+def test_a_burst_of_radios_never_pushes_the_searches_out(client, monkeypatch):
+    monkeypatch.setattr(ytm, "search", lambda q, f, n: [{"videoId": "s", "title": q}])
+    monkeypatch.setattr(ytm, "radio", lambda v, n: [])
+    monkeypatch.setitem(app._YTM_LIMIT, "radio", 3)
+    client.get("/ytm/search?q=kept")
+    for i in range(10):
+        client.get(f"/ytm/radio?videoId=v{i}")
+    assert len(app._YTM_CACHE["radio"]) == 3
+    assert len(app._YTM_CACHE["search"]) == 1
+
+
+def test_a_full_gate_answers_busy_quickly(client, monkeypatch):
+    monkeypatch.setattr(app, "_YTM_GATE_WAIT", 0.05)
+    held = [app._YTM_GATE.acquire(timeout=1) for _ in range(3)]
+    try:
+        assert client.get("/ytm/radio?videoId=v").status_code == 503
+    finally:
+        for got in held:
+            if got:
+                app._YTM_GATE.release()
 
 
 def test_search_needs_a_query_and_a_known_filter(client):

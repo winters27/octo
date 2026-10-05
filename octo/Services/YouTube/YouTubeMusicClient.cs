@@ -26,11 +26,12 @@ public sealed class YouTubeMusicClient
     public bool Configured => !string.IsNullOrEmpty(_shimUrl);
 
     /// <param name="filter">"songs" for releases, "videos" for uploads.</param>
-    public Task<IReadOnlyList<YtmRow>> SearchAsync(string query, string filter, CancellationToken ct) =>
+    /// <returns>The rows; null when the shim could not answer, so a caller never keeps that as "nothing found".</returns>
+    public Task<IReadOnlyList<YtmRow>?> SearchAsync(string query, string filter, CancellationToken ct) =>
         GetRowsAsync($"/ytm/search?q={Uri.EscapeDataString(query)}&filter={filter}&limit=10", ct);
 
-    public Task<IReadOnlyList<YtmRow>> RadioAsync(string videoId, int limit, CancellationToken ct) =>
-        GetRowsAsync($"/ytm/radio?videoId={Uri.EscapeDataString(videoId)}&limit={limit}", ct);
+    public async Task<IReadOnlyList<YtmRow>> RadioAsync(string videoId, int limit, CancellationToken ct) =>
+        await GetRowsAsync($"/ytm/radio?videoId={Uri.EscapeDataString(videoId)}&limit={limit}", ct) ?? [];
 
     /// <summary>The radio YouTube Music offers for an artist, found by name, and the name it found.</summary>
     public async Task<(string? Artist, IReadOnlyList<YtmRow> Rows)> ArtistRadioAsync(string artist, int limit, CancellationToken ct)
@@ -38,19 +39,19 @@ public sealed class YouTubeMusicClient
         string? found = null;
         var rows = await GetRowsAsync($"/ytm/artist-radio?q={Uri.EscapeDataString(artist)}&limit={limit}", ct,
             root => found = root.TryGetProperty("artist", out var a) && a.ValueKind == JsonValueKind.String ? a.GetString() : null);
-        return (found, rows);
+        return (found, rows ?? []);
     }
 
-    private async Task<IReadOnlyList<YtmRow>> GetRowsAsync(string pathAndQuery, CancellationToken ct,
+    private async Task<IReadOnlyList<YtmRow>?> GetRowsAsync(string pathAndQuery, CancellationToken ct,
         Action<JsonElement>? read = null)
     {
-        if (!Configured) return [];
+        if (!Configured) return null;
         var client = _http.CreateClient("yt-dlp-shim-search");
         using var response = await client.GetAsync(_shimUrl + pathAndQuery, ct);
         if (!response.IsSuccessStatusCode)
         {
             _logger.LogDebug("YouTube Music {Path} answered {Status}", pathAndQuery.Split('?')[0], (int)response.StatusCode);
-            return [];
+            return null;
         }
         using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
         read?.Invoke(doc.RootElement);

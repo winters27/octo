@@ -127,4 +127,26 @@ public sealed class ListenBrainzRadioSourceTests
         Assert.Equal(2, ListenBrainzRadioClient.Rows(flat.RootElement).Count());
         Assert.Equal("C", ListenBrainzRadioClient.Rows(blocks.RootElement).Last().GetProperty("recording_name").GetString());
     }
+
+    [Fact]
+    public async Task AFailedLookup_IsAskedAgain_NotRememberedAsUnknown()
+    {
+        var down = true;
+        var (source, labs) = Source(answer: request => down ? (HttpStatusCode.BadGateway, "{}") : Live(request));
+        var seed = new RadioSeed("Kordhell", "Murder In My Mind", 145, null);
+        Assert.Equal(RadioMatch.None, (await source.SongsLikeAsync(seed, 50, NoAuth, default)).Match);
+
+        down = false;
+        Assert.Equal(RadioMatch.Song, (await source.SongsLikeAsync(seed, 50, NoAuth, default)).Match);
+    }
+
+    [Fact]
+    public async Task AnOddScore_LeavesTheRestOfTheAnswer()
+    {
+        var (source, _) = Source(answer: request => request.RequestUri!.AbsolutePath == "/similar-recordings/json"
+            ? (HttpStatusCode.OK, """[{"recording_name":"RAVE","artist_credit_name":"Dxrk","score":"lots"},{"recording_name":"Close Eyes","artist_credit_name":"DVRST","score":40}]""")
+            : Live(request));
+        var answer = await source.SongsLikeAsync(new RadioSeed("Kordhell", "Murder In My Mind", 145, null), 50, NoAuth, default);
+        Assert.Contains(answer.Tracks, track => track.Title == "Close Eyes");
+    }
 }

@@ -61,8 +61,16 @@ public sealed class YouTubeMusicRadioSource(YouTubeMusicClient ytm, IOptionsMoni
         var key = LastFmRadioSeedNormalizer.TrackKey(seed.Artist, seed.Title);
         if (_seeds.TryGetValue(key, out SeedVideo? cached)) return cached;
         var query = $"{seed.Artist} {seed.Title}";
-        var found = Pick(seed, await ytm.SearchAsync(query, "songs", ct))
-            ?? Pick(seed, await ytm.SearchAsync(query, "videos", ct));
+        var songs = await ytm.SearchAsync(query, "songs", ct);
+        var found = songs is null ? null : Pick(seed, songs);
+        IReadOnlyList<YtmRow>? videos = null;
+        if (found is null && songs is not null)
+        {
+            videos = await ytm.SearchAsync(query, "videos", ct);
+            found = videos is null ? null : Pick(seed, videos);
+        }
+        // A miss is kept only when YouTube Music really answered; a shim that failed is asked again next time.
+        if (found is null && (songs is null || videos is null)) return null;
         _seeds.Set(key, found, new MemoryCacheEntryOptions
         {
             Size = 1,
