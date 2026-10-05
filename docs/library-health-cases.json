@@ -1,0 +1,5124 @@
+{
+ "about": "Library health cases, shared by Octo's server (octo.Tests/LibraryHealthCasesTests.cs) and the Octo app (shared/core health tests). Songs and albums are written as Subsonic answers them, so each side reads them with its own song type. 'facts' gives each album id a release, release group, barcode or record label; 'places' puts songs in another place; 'seen' limits the tags the reader keeps. An expectation left out is not checked. Duplicates and split albums are listed in the order the report gives them.",
+ "cases": [
+  {
+   "name": "Two copies of one song are a set with the lossless one first",
+   "songs": [
+    {
+     "id": "mp3",
+     "title": "Holocene",
+     "artist": "Bon Iver",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 337,
+     "suffix": "mp3",
+     "samplingRate": 44100,
+     "bitRate": 320,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Bon Iver",
+     "albumArtists": [
+      {
+       "name": "Bon Iver"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "flac",
+     "title": "Holocene",
+     "artist": "Bon Iver",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 336,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Bon Iver",
+     "albumArtists": [
+      {
+       "name": "Bon Iver"
+      }
+     ],
+     "coverArt": "mf-2"
+    },
+    {
+     "id": "towers",
+     "title": "Towers",
+     "artist": "Bon Iver",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 188,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Bon Iver",
+     "albumArtists": [
+      {
+       "name": "Bon Iver"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "copies": [
+       "flac",
+       "mp3"
+      ],
+      "basis": "TitleAndLength",
+      "best": "Sound"
+     }
+    ]
+   }
+  },
+  {
+   "name": "Lengths may differ by three seconds",
+   "songs": [
+    {
+     "id": "a",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "b",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 203,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "copies": [
+       "a",
+       "b"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "Lengths four seconds apart are two recordings",
+   "songs": [
+    {
+     "id": "a",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "b",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 204,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "duplicates": []
+   }
+  },
+  {
+   "name": "Another version is not a copy",
+   "songs": [
+    {
+     "id": "studio",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "live",
+     "title": "Song (Live)",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 201,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    },
+    {
+     "id": "acoustic",
+     "title": "Song - Acoustic",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-3"
+    },
+    {
+     "id": "interlude",
+     "title": "Song (Interlude)",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 4,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-4"
+    },
+    {
+     "id": "cover",
+     "title": "Song",
+     "artist": "Someone Else",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 5,
+     "displayAlbumArtist": "Someone Else",
+     "albumArtists": [
+      {
+       "name": "Someone Else"
+      }
+     ],
+     "coverArt": "mf-5"
+    }
+   ],
+   "expect": {
+    "duplicates": []
+   }
+  },
+  {
+   "name": "A remaster, a guest or a track number in the title is still the same recording",
+   "songs": [
+    {
+     "id": "plain",
+     "title": "Pain 1993",
+     "artist": "Drake",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 149,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Drake",
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "feat",
+     "title": "Pain 1993 (featuring Playboi Carti)",
+     "artist": "Drake",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 149,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Drake",
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "coverArt": "mf-2"
+    },
+    {
+     "id": "remaster",
+     "title": "10 - Pain 1993 - Remastered 2021",
+     "artist": "Drake",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 150,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Drake",
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "size": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "A shared ISRC is one recording whatever the title says",
+   "songs": [
+    {
+     "id": "jp",
+     "title": "紅蓮華",
+     "artist": "LiSA",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 240,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "isrc": [
+      "JPU901901234"
+     ],
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "LiSA",
+     "albumArtists": [
+      {
+       "name": "LiSA"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "en",
+     "title": "Gurenge",
+     "artist": "LiSA",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 241,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "isrc": [
+      "JP-U90-19-01234"
+     ],
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "LiSA",
+     "albumArtists": [
+      {
+       "name": "LiSA"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "size": 2,
+      "basis": "Tags"
+     }
+    ]
+   }
+  },
+  {
+   "name": "A shared MusicBrainz recording is one recording",
+   "songs": [
+    {
+     "id": "a",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "musicBrainzId": "F200A9A9-0000-0000-0000-000000000001",
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Massive Attack",
+     "albumArtists": [
+      {
+       "name": "Massive Attack"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "b",
+     "title": "Tear Drop (Album Version)",
+     "artist": "Massive Attack",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 331,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "musicBrainzId": "f200a9a9-0000-0000-0000-000000000001",
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Massive Attack",
+     "albumArtists": [
+      {
+       "name": "Massive Attack"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "size": 2,
+      "basis": "Tags"
+     }
+    ]
+   }
+  },
+  {
+   "name": "One ISRC on a whole album of different lengths is a tagging mistake, not a copy",
+   "songs": [
+    {
+     "id": "1",
+     "title": "One",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 180,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "isrc": [
+      "USRC17607839"
+     ],
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "2",
+     "title": "Two",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 240,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "isrc": [
+      "USRC17607839"
+     ],
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    },
+    {
+     "id": "3",
+     "title": "Three",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 305,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "isrc": [
+      "USRC17607839"
+     ],
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "duplicates": []
+   }
+  },
+  {
+   "name": "Different ISRCs still fall back to the title and length",
+   "songs": [
+    {
+     "id": "a",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "isrc": [
+      "GBAAA0100001"
+     ],
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "b",
+     "title": "Song (Remastered 2011)",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 201,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "isrc": [
+      "GBAAA1100002"
+     ],
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "size": 2,
+      "basis": "TitleAndLength"
+     }
+    ]
+   }
+  },
+  {
+   "name": "Copies chain into one set",
+   "songs": [
+    {
+     "id": "a",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "b",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 203,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    },
+    {
+     "id": "c",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 206,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "size": 3
+     }
+    ]
+   }
+  },
+  {
+   "name": "The best copy has more bits, then a higher rate",
+   "songs": [
+    {
+     "id": "cd",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 1650,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "hires48",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 24,
+     "samplingRate": 48000,
+     "bitRate": 1500,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    },
+    {
+     "id": "hires96",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 24,
+     "samplingRate": 96000,
+     "bitRate": 2800,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-3"
+    },
+    {
+     "id": "mp3",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "mp3",
+     "samplingRate": 44100,
+     "bitRate": 320,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 4,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-4"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "copies": [
+       "hires96",
+       "hires48",
+       "cd",
+       "mp3"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "The bit rate settles lossy copies",
+   "songs": [
+    {
+     "id": "low",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "mp3",
+     "samplingRate": 44100,
+     "bitRate": 192,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "high",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "mp3",
+     "samplingRate": 44100,
+     "bitRate": 320,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "copies": [
+       "high",
+       "low"
+      ],
+      "best": "Sound"
+     }
+    ]
+   }
+  },
+  {
+   "name": "Copies that sound alike keep the one with fuller tags",
+   "songs": [
+    {
+     "id": "bare",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "tagged",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "copies": [
+       "tagged",
+       "bare"
+      ],
+      "best": "Tags"
+     }
+    ]
+   }
+  },
+  {
+   "name": "Identical copies say nothing sets them apart",
+   "songs": [
+    {
+     "id": "b",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "a",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "copies": [
+       "a",
+       "b"
+      ],
+      "best": "None"
+     }
+    ]
+   }
+  },
+  {
+   "name": "Copies in two places are not duplicates",
+   "songs": [
+    {
+     "id": "p1",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s1",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "places": {
+    "p1": "phone",
+    "s1": "server"
+   },
+   "expect": {
+    "duplicates": []
+   }
+  },
+  {
+   "name": "An album under two ids is split and says what differs",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "One",
+     "artist": "SueCo",
+     "album": "It Was Fun While It Lasted",
+     "albumId": "a",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "SueCo",
+     "albumArtists": [
+      {
+       "name": "SueCo"
+      }
+     ],
+     "coverArt": "mf-0"
+    },
+    {
+     "id": "s1",
+     "title": "Two",
+     "artist": "SueCo",
+     "album": "It Was Fun While It Lasted",
+     "albumId": "a",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "SueCo",
+     "albumArtists": [
+      {
+       "name": "SueCo"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s2",
+     "title": "Three",
+     "artist": "Sueco",
+     "album": "It Was Fun While It Lasted",
+     "albumId": "b",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Sueco",
+     "albumArtists": [
+      {
+       "name": "Sueco"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "splitAlbums": [
+     {
+      "parts": [
+       "a",
+       "b"
+      ],
+      "artist": "SueCo",
+      "differences": [
+       {
+        "kind": "AlbumArtist",
+        "values": [
+         "SueCo",
+         "Sueco"
+        ]
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "A missing year splits an album and is named",
+   "songs": [
+    {
+     "id": "s1",
+     "title": "One",
+     "artist": "Artist",
+     "album": "Currents",
+     "albumId": "a",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2015,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s3",
+     "title": "Two",
+     "artist": "Artist",
+     "album": "Currents",
+     "albumId": "b",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "splitAlbums": [
+     {
+      "differences": [
+       {
+        "kind": "Year",
+        "values": [
+         "2015",
+         ""
+        ]
+       }
+      ],
+      "summary": "The year differs: 2015, none."
+     }
+    ]
+   }
+  },
+  {
+   "name": "A stray space is named, since it cannot be seen",
+   "songs": [
+    {
+     "id": "s1",
+     "title": "One",
+     "artist": "Disturbed",
+     "album": "The Sickness ",
+     "albumId": "a",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Disturbed",
+     "albumArtists": [
+      {
+       "name": "Disturbed"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s3",
+     "title": "Two",
+     "artist": "Disturbed",
+     "album": "The Sickness",
+     "albumId": "b",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Disturbed",
+     "albumArtists": [
+      {
+       "name": "Disturbed"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "splitAlbums": [
+     {
+      "heading": "The Sickness by Disturbed, shown as 2 albums",
+      "summary": "The album title has a stray space on some songs."
+     }
+    ]
+   }
+  },
+  {
+   "name": "Two albums of one name from different years are two albums",
+   "songs": [
+    {
+     "id": "s1",
+     "title": "My Name Is Jonas",
+     "artist": "Weezer",
+     "album": "Weezer",
+     "albumId": "blue",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 1994,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Weezer",
+     "albumArtists": [
+      {
+       "name": "Weezer"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s3",
+     "title": "Hash Pipe",
+     "artist": "Weezer",
+     "album": "Weezer",
+     "albumId": "green",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2001,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Weezer",
+     "albumArtists": [
+      {
+       "name": "Weezer"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "Albums of one name by different artists are not split",
+   "songs": [
+    {
+     "id": "s1",
+     "title": "A",
+     "artist": "One",
+     "album": "Greatest Hits",
+     "albumId": "x",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "One",
+     "albumArtists": [
+      {
+       "name": "One"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s3",
+     "title": "B",
+     "artist": "Two",
+     "album": "Greatest Hits",
+     "albumId": "y",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Two",
+     "albumArtists": [
+      {
+       "name": "Two"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "When nothing visible differs, the report says something else does",
+   "songs": [
+    {
+     "id": "s1",
+     "title": "One",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "a",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s3",
+     "title": "Two",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "b",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "splitAlbums": [
+     {
+      "differences": [
+       {
+        "kind": "Other",
+        "values": []
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "Each missing tag lists its songs",
+   "songs": [
+    {
+     "id": "s1",
+     "title": "Tidy",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "x",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s3",
+     "title": "No genre",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "x",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "track": 3,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-3"
+    },
+    {
+     "id": "s5",
+     "title": "No year",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "x",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 0,
+     "genre": "Rock",
+     "track": 5,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-5"
+    },
+    {
+     "id": "s6",
+     "title": "No track",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "x",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-6"
+    },
+    {
+     "id": "s8",
+     "title": "No album artist",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "x",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 8,
+     "coverArt": "mf-8"
+    },
+    {
+     "id": "s10",
+     "title": "No cover",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "x",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 10,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "missing": {
+     "Genre": [
+      "No genre"
+     ],
+     "Year": [
+      "No year"
+     ],
+     "TrackNumber": [
+      "No track"
+     ],
+     "AlbumArtist": [
+      "No album artist"
+     ],
+     "Cover": [
+      "No cover"
+     ]
+    },
+    "counts": {
+     "NoGenre": 1
+    }
+   }
+  },
+  {
+   "name": "A single needs no track number or album artist",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Single",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "one",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "coverArt": "mf-0"
+    }
+   ],
+   "expect": {
+    "missingAbsent": [
+     "TrackNumber",
+     "AlbumArtist"
+    ]
+   }
+  },
+  {
+   "name": "A tag the reader never keeps is never missing",
+   "songs": [
+    {
+     "id": "s1",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ]
+    }
+   ],
+   "seen": [
+    "Genre"
+   ],
+   "expect": {
+    "missingKeys": [
+     "Genre"
+    ]
+   }
+  },
+  {
+   "name": "Songs missing a tag come by artist, then album order",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "B2",
+     "artist": "Beta",
+     "album": "B",
+     "albumId": "b",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "track": 2,
+     "displayAlbumArtist": "Beta",
+     "albumArtists": [
+      {
+       "name": "Beta"
+      }
+     ],
+     "coverArt": "mf-0"
+    },
+    {
+     "id": "s1",
+     "title": "A1",
+     "artist": "Alpha",
+     "album": "A",
+     "albumId": "a",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "track": 1,
+     "displayAlbumArtist": "Alpha",
+     "albumArtists": [
+      {
+       "name": "Alpha"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s2",
+     "title": "B1",
+     "artist": "Beta",
+     "album": "B",
+     "albumId": "b",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "track": 1,
+     "displayAlbumArtist": "Beta",
+     "albumArtists": [
+      {
+       "name": "Beta"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "songsOf": {
+     "NoGenre": [
+      "A1",
+      "B1",
+      "B2"
+     ]
+    }
+   }
+  },
+  {
+   "name": "A song with no length is found",
+   "songs": [
+    {
+     "id": "s1",
+     "title": "Broken",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 0,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s3",
+     "title": "Fine",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 180,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "noLength": [
+     "Broken"
+    ]
+   }
+  },
+  {
+   "name": "A tidy library is clean",
+   "songs": [
+    {
+     "id": "s1",
+     "title": "One",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "a",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "s3",
+     "title": "Two",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "a",
+     "duration": 180,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "findings": [],
+    "overview": "Checked 2 songs."
+   }
+  },
+  {
+   "name": "Findings come in their order with counts",
+   "songs": [
+    {
+     "id": "a",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "b",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    },
+    {
+     "id": "s3",
+     "title": "Other",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 0,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 3,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-3"
+    }
+   ],
+   "expect": {
+    "findings": [
+     "Duplicates",
+     "NoLength",
+     "NoGenre"
+    ],
+    "counts": {
+     "Duplicates": 1
+    },
+    "overview": "Checked 3 songs. 3 things could be better."
+   }
+  },
+  {
+   "name": "Removed songs leave the report",
+   "songs": [
+    {
+     "id": "a",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "b",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2020,
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "without": {
+     "ids": [
+      "b"
+     ],
+     "duplicates": 0,
+     "songsOf": {
+      "NoGenre": [
+       "a"
+      ]
+     }
+    }
+   }
+  },
+  {
+   "name": "A set of copies says which to keep",
+   "songs": [
+    {
+     "id": "a",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "flac",
+     "bitDepth": 24,
+     "samplingRate": 96000,
+     "bitRate": 900,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 1,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-1"
+    },
+    {
+     "id": "b",
+     "title": "Song",
+     "artist": "Artist",
+     "album": "Album",
+     "albumId": "al-Album",
+     "duration": 200,
+     "suffix": "mp3",
+     "samplingRate": 44100,
+     "bitRate": 320,
+     "year": 2020,
+     "genre": "Rock",
+     "track": 2,
+     "displayAlbumArtist": "Artist",
+     "albumArtists": [
+      {
+       "name": "Artist"
+      }
+     ],
+     "coverArt": "mf-2"
+    }
+   ],
+   "expect": {
+    "duplicates": [
+     {
+      "heading": "Song by Artist",
+      "summary": "2 copies. Same title, artist and length. Keep the first, FLAC, 24-bit, 96 kHz."
+     }
+    ]
+   }
+  },
+  {
+   "name": "A collaboration album filed under each artist is one album",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "CELIBACY",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "CN TOWER",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "DEEPER",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s3",
+     "title": "DIE TRYING",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s4",
+     "title": "GLORIOUS",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s5",
+     "title": "GREEDY",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s6",
+     "title": "LASERS",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s7",
+     "title": "MEET YOUR PADRE",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s8",
+     "title": "MOTH BALLS",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s9",
+     "title": "OMW",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s10",
+     "title": "SOMEBODY LOVES ME",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s11",
+     "title": "SOMETHING ABOUT YOU",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s12",
+     "title": "SPIDER-MAN SUPERMAN",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s13",
+     "title": "WHEN HE'S GONE",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "nokia",
+     "title": "NOKIA",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "track": 14,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s14",
+     "title": "BRIAN STEEL",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "3jmLzEVlwtrlq8XfVjei9k",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s15",
+     "title": "CRYING IN CHANEL",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "3jmLzEVlwtrlq8XfVjei9k",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s16",
+     "title": "GIMME A HUG",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "3jmLzEVlwtrlq8XfVjei9k",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s17",
+     "title": "RAINING IN HOUSTON",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "3jmLzEVlwtrlq8XfVjei9k",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s18",
+     "title": "SMALL TOWN FAME",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "3jmLzEVlwtrlq8XfVjei9k",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s19",
+     "title": "PIMMIE'S DILEMMA",
+     "artist": "Pimmie",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "5SHl4krFWPwjViGmMeA0TB",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Pimmie",
+     "artists": [
+      {
+       "name": "Pimmie"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Pimmie"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "splitAlbums": [
+     {
+      "parts": [
+       "08qrDbXNlx9NTxtgugKes1",
+       "3jmLzEVlwtrlq8XfVjei9k"
+      ],
+      "sizes": [
+       15,
+       5
+      ],
+      "artist": "PARTYNEXTDOOR",
+      "reasons": [
+       {
+        "basis": "SharedArtist",
+        "artist": "Drake",
+        "other": "PARTYNEXTDOOR",
+        "song": "NOKIA"
+       }
+      ],
+      "heading": "$ome $exy $ongs 4 U by PARTYNEXTDOOR, shown as 2 albums",
+      "summary": "One album filed under two artists: the part by PARTYNEXTDOOR has NOKIA by Drake. The album artist differs: PARTYNEXTDOOR, Drake. The year differs: 2025, none."
+     }
+    ]
+   }
+  },
+  {
+   "name": "Joining it gives Drake's songs the larger part's album artist",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "CELIBACY",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "CN TOWER",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "DEEPER",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s3",
+     "title": "DIE TRYING",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s4",
+     "title": "GLORIOUS",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s5",
+     "title": "GREEDY",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s6",
+     "title": "LASERS",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s7",
+     "title": "MEET YOUR PADRE",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s8",
+     "title": "MOTH BALLS",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s9",
+     "title": "OMW",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s10",
+     "title": "SOMEBODY LOVES ME",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s11",
+     "title": "SOMETHING ABOUT YOU",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s12",
+     "title": "SPIDER-MAN SUPERMAN",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s13",
+     "title": "WHEN HE'S GONE",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "nokia",
+     "title": "NOKIA",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "track": 14,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s14",
+     "title": "BRIAN STEEL",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "3jmLzEVlwtrlq8XfVjei9k",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s15",
+     "title": "CRYING IN CHANEL",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "3jmLzEVlwtrlq8XfVjei9k",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s16",
+     "title": "GIMME A HUG",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "3jmLzEVlwtrlq8XfVjei9k",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s17",
+     "title": "RAINING IN HOUSTON",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "3jmLzEVlwtrlq8XfVjei9k",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s18",
+     "title": "SMALL TOWN FAME",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "3jmLzEVlwtrlq8XfVjei9k",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "splitAlbums": [
+     {
+      "joinMoving": [
+       "s14",
+       "s15",
+       "s16",
+       "s17",
+       "s18"
+      ],
+      "joinLeadAlbum": "08qrDbXNlx9NTxtgugKes1",
+      "joinWords": "Moves 5 songs onto $ome $exy $ongs 4 U, the part with 15 songs. Their album artist becomes PARTYNEXTDOOR."
+     }
+    ]
+   }
+  },
+  {
+   "name": "A part with nothing tying it to the others is left alone",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "CELIBACY",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "CN TOWER",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "DEEPER",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s3",
+     "title": "DIE TRYING",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s4",
+     "title": "GLORIOUS",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s5",
+     "title": "GREEDY",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s6",
+     "title": "LASERS",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s7",
+     "title": "MEET YOUR PADRE",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s8",
+     "title": "MOTH BALLS",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s9",
+     "title": "OMW",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s10",
+     "title": "SOMEBODY LOVES ME",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s11",
+     "title": "SOMETHING ABOUT YOU",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s12",
+     "title": "SPIDER-MAN SUPERMAN",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s13",
+     "title": "WHEN HE'S GONE",
+     "artist": "PARTYNEXTDOOR",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "nokia",
+     "title": "NOKIA",
+     "artist": "Drake",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "08qrDbXNlx9NTxtgugKes1",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2025,
+     "track": 14,
+     "displayAlbumArtist": "PARTYNEXTDOOR",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "PARTYNEXTDOOR"
+      }
+     ]
+    },
+    {
+     "id": "s19",
+     "title": "PIMMIE'S DILEMMA",
+     "artist": "Pimmie",
+     "album": "$ome $exy $ongs 4 U",
+     "albumId": "5SHl4krFWPwjViGmMeA0TB",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Pimmie",
+     "artists": [
+      {
+       "name": "Pimmie"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Pimmie"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "A credit naming both artists leads the join",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Big Rings",
+     "artist": "Drake & Future",
+     "album": "What a Time to Be Alive",
+     "albumId": "both",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2015,
+     "displayAlbumArtist": "Drake & Future",
+     "artists": [
+      {
+       "name": "Drake"
+      },
+      {
+       "name": "Future"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake & Future"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Diamonds Dancing",
+     "artist": "Drake & Future",
+     "album": "What a Time to Be Alive",
+     "albumId": "both",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2015,
+     "displayAlbumArtist": "Drake & Future",
+     "artists": [
+      {
+       "name": "Drake"
+      },
+      {
+       "name": "Future"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake & Future"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Digital Dash",
+     "artist": "Future",
+     "album": "What a Time to Be Alive",
+     "albumId": "future",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2015,
+     "displayAlbumArtist": "Future",
+     "artists": [
+      {
+       "name": "Future"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Future"
+      }
+     ]
+    },
+    {
+     "id": "s3",
+     "title": "Live From the Gutter",
+     "artist": "Future",
+     "album": "What a Time to Be Alive",
+     "albumId": "future",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2015,
+     "displayAlbumArtist": "Future",
+     "artists": [
+      {
+       "name": "Future"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Future"
+      }
+     ]
+    },
+    {
+     "id": "s4",
+     "title": "Jumpman",
+     "artist": "Future",
+     "album": "What a Time to Be Alive",
+     "albumId": "future",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2015,
+     "displayAlbumArtist": "Future",
+     "artists": [
+      {
+       "name": "Future"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Future"
+      }
+     ]
+    },
+    {
+     "id": "s5",
+     "title": "Scholarships",
+     "artist": "Future",
+     "album": "What a Time to Be Alive",
+     "albumId": "future",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2015,
+     "displayAlbumArtist": "Future",
+     "artists": [
+      {
+       "name": "Future"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Future"
+      }
+     ]
+    },
+    {
+     "id": "s6",
+     "title": "30 for 30 Freestyle",
+     "artist": "Future",
+     "album": "What a Time to Be Alive",
+     "albumId": "future",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2015,
+     "displayAlbumArtist": "Future",
+     "artists": [
+      {
+       "name": "Future"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Future"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "splitAlbums": [
+     {
+      "parts": [
+       "both",
+       "future"
+      ],
+      "reasons": [
+       {
+        "basis": "SharedArtist",
+        "artist": "Future",
+        "other": "Drake & Future",
+        "song": ""
+       }
+      ],
+      "reasonWords": [
+       "One album filed under two artists: the part by Drake & Future names Future too."
+      ],
+      "joinWords": "Moves 5 songs onto What a Time to Be Alive, the part with 2 songs, since its album artist names every part's artist. Their album artist becomes Drake & Future."
+     }
+    ]
+   }
+  },
+  {
+   "name": "A title many artists use is never joined on a credit alone",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Bohemian Rhapsody",
+     "artist": "Queen",
+     "album": "Greatest Hits",
+     "albumId": "queen",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Queen",
+     "artists": [
+      {
+       "name": "Queen"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Queen"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Under Pressure",
+     "artist": "Queen & David Bowie",
+     "album": "Greatest Hits",
+     "albumId": "queen",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Queen",
+     "artists": [
+      {
+       "name": "Queen"
+      },
+      {
+       "name": "David Bowie"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Queen"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Heroes",
+     "artist": "David Bowie",
+     "album": "Greatest Hits",
+     "albumId": "bowie",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "David Bowie",
+     "artists": [
+      {
+       "name": "David Bowie"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "David Bowie"
+      }
+     ]
+    },
+    {
+     "id": "s3",
+     "title": "Under Pressure",
+     "artist": "Queen & David Bowie",
+     "album": "Greatest Hits",
+     "albumId": "bowie",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "David Bowie",
+     "artists": [
+      {
+       "name": "Queen"
+      },
+      {
+       "name": "David Bowie"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "David Bowie"
+      }
+     ]
+    },
+    {
+     "id": "s4",
+     "title": "One More Time",
+     "artist": "Daft Punk",
+     "album": "Live",
+     "albumId": "daft",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Daft Punk",
+     "artists": [
+      {
+       "name": "Daft Punk"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Daft Punk"
+      }
+     ]
+    },
+    {
+     "id": "s5",
+     "title": "Harder Better Faster Stronger",
+     "artist": "Daft Punk",
+     "album": "Live",
+     "albumId": "daft",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Daft Punk",
+     "artists": [
+      {
+       "name": "Daft Punk"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Daft Punk"
+      }
+     ]
+    },
+    {
+     "id": "s6",
+     "title": "Get Lucky",
+     "artist": "Daft Punk feat. Pharrell Williams",
+     "album": "Live",
+     "albumId": "pharrell",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Pharrell Williams",
+     "artists": [
+      {
+       "name": "Daft Punk"
+      },
+      {
+       "name": "Pharrell Williams"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Pharrell Williams"
+      }
+     ]
+    },
+    {
+     "id": "s7",
+     "title": "Untitled 01",
+     "artist": "Kendrick Lamar",
+     "album": "Untitled",
+     "albumId": "kendrick",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Kendrick Lamar",
+     "artists": [
+      {
+       "name": "Kendrick Lamar"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Kendrick Lamar"
+      }
+     ]
+    },
+    {
+     "id": "s8",
+     "title": "Untitled 02",
+     "artist": "Kendrick Lamar & SZA",
+     "album": "Untitled",
+     "albumId": "sza",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "SZA",
+     "artists": [
+      {
+       "name": "Kendrick Lamar"
+      },
+      {
+       "name": "SZA"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "SZA"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "An album named after its artist is never joined on a credit alone",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Enter Sandman",
+     "artist": "Metallica",
+     "album": "Metallica",
+     "albumId": "black",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Metallica",
+     "artists": [
+      {
+       "name": "Metallica"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Metallica"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Nothing Else Matters",
+     "artist": "Metallica",
+     "album": "Metallica",
+     "albumId": "black",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Metallica",
+     "artists": [
+      {
+       "name": "Metallica"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Metallica"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Nothing Else Matters",
+     "artist": "Apocalyptica & Metallica",
+     "album": "Metallica",
+     "albumId": "tribute",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Apocalyptica",
+     "artists": [
+      {
+       "name": "Apocalyptica"
+      },
+      {
+       "name": "Metallica"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Apocalyptica"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "A credit does not join albums of one name from different years",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "A Case of You",
+     "artist": "Joni Mitchell",
+     "album": "Blue",
+     "albumId": "joni",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 1971,
+     "displayAlbumArtist": "Joni Mitchell",
+     "artists": [
+      {
+       "name": "Joni Mitchell"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Joni Mitchell"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "River",
+     "artist": "Joni Mitchell",
+     "album": "Blue",
+     "albumId": "joni",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 1971,
+     "displayAlbumArtist": "Joni Mitchell",
+     "artists": [
+      {
+       "name": "Joni Mitchell"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Joni Mitchell"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Blue",
+     "artist": "LeAnn Rimes",
+     "album": "Blue",
+     "albumId": "leann",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 1996,
+     "displayAlbumArtist": "LeAnn Rimes",
+     "artists": [
+      {
+       "name": "LeAnn Rimes"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "LeAnn Rimes"
+      }
+     ]
+    },
+    {
+     "id": "s3",
+     "title": "River",
+     "artist": "LeAnn Rimes & Joni Mitchell",
+     "album": "Blue",
+     "albumId": "leann",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 1996,
+     "displayAlbumArtist": "LeAnn Rimes",
+     "artists": [
+      {
+       "name": "LeAnn Rimes"
+      },
+      {
+       "name": "Joni Mitchell"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "LeAnn Rimes"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "Albums of one name by artists with nothing in common stay apart",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "A Case of You",
+     "artist": "Joni Mitchell",
+     "album": "Blue",
+     "albumId": "joni",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Joni Mitchell",
+     "artists": [
+      {
+       "name": "Joni Mitchell"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Joni Mitchell"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Semi-Charmed Life",
+     "artist": "Third Eye Blind",
+     "album": "Blue",
+     "albumId": "third-eye-blind",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Third Eye Blind",
+     "artists": [
+      {
+       "name": "Third Eye Blind"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Third Eye Blind"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Blue",
+     "artist": "LeAnn Rimes",
+     "album": "Blue",
+     "albumId": "leann",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "LeAnn Rimes",
+     "artists": [
+      {
+       "name": "LeAnn Rimes"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "LeAnn Rimes"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "A deluxe edition by another credit is another album",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "God's Plan",
+     "artist": "Drake",
+     "album": "Scorpion",
+     "albumId": "standard",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2018,
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Nonstop",
+     "artist": "Drake",
+     "album": "Scorpion",
+     "albumId": "standard",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2018,
+     "displayAlbumArtist": "Drake",
+     "artists": [
+      {
+       "name": "Drake"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Drake"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "In My Feelings",
+     "artist": "Drake & City Girls",
+     "album": "Scorpion (Deluxe)",
+     "albumId": "deluxe",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2018,
+     "displayAlbumArtist": "City Girls",
+     "artists": [
+      {
+       "name": "Drake"
+      },
+      {
+       "name": "City Girls"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "City Girls"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "The same release joins parts",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Time",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Dream Is Collapsing",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Old Souls",
+     "artist": "Lorne Balfe",
+     "album": "Inception",
+     "albumId": "balfe",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Lorne Balfe",
+     "artists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ]
+    }
+   ],
+   "facts": {
+    "releases": {
+     "zimmer": "A1B2C3D4-0000-4000-8000-000000000001",
+     "balfe": "a1b2c3d4-0000-4000-8000-000000000001"
+    }
+   },
+   "expect": {
+    "splitAlbums": [
+     {
+      "parts": [
+       "zimmer",
+       "balfe"
+      ],
+      "reasonWords": [
+       "The parts are tagged as the same MusicBrainz release."
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "The same release group joins parts",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Time",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Dream Is Collapsing",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Old Souls",
+     "artist": "Lorne Balfe",
+     "album": "Inception",
+     "albumId": "balfe",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Lorne Balfe",
+     "artists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ]
+    }
+   ],
+   "facts": {
+    "releaseGroups": {
+     "zimmer": "5b5f2a1e-1111-4111-8111-111111111111",
+     "balfe": "5b5f2a1e-1111-4111-8111-111111111111"
+    }
+   },
+   "expect": {
+    "splitAlbums": [
+     {
+      "reasonWords": [
+       "The parts are tagged as the same MusicBrainz release group."
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "A barcode written as UPC or EAN joins parts",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Time",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Dream Is Collapsing",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Old Souls",
+     "artist": "Lorne Balfe",
+     "album": "Inception",
+     "albumId": "balfe",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Lorne Balfe",
+     "artists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ]
+    }
+   ],
+   "facts": {
+    "barcodes": {
+     "zimmer": "093624966126",
+     "balfe": "0093624966126"
+    }
+   },
+   "expect": {
+    "splitAlbums": [
+     {
+      "reasonWords": [
+       "The parts carry the same barcode, 93624966126."
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "The same label joins parts in the same year",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Time",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Dream Is Collapsing",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Old Souls",
+     "artist": "Lorne Balfe",
+     "album": "Inception",
+     "albumId": "balfe",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Lorne Balfe",
+     "artists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ]
+    }
+   ],
+   "facts": {
+    "labels": {
+     "zimmer": "Reprise Records",
+     "balfe": "Reprise Records"
+    }
+   },
+   "expect": {
+    "splitAlbums": [
+     {
+      "reasonWords": [
+       "The parts came out on the same label in the same year: Reprise Records, 2010."
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "The same label with a year unknown on one side does not join",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Time",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Dream Is Collapsing",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Old Souls",
+     "artist": "Lorne Balfe",
+     "album": "Inception",
+     "albumId": "balfe",
+     "duration": 200,
+     "suffix": "flac",
+     "displayAlbumArtist": "Lorne Balfe",
+     "artists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ]
+    }
+   ],
+   "facts": {
+    "labels": {
+     "zimmer": "Reprise Records",
+     "balfe": "Reprise Records"
+    }
+   },
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "Different labels do not join",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Time",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Dream Is Collapsing",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Old Souls",
+     "artist": "Lorne Balfe",
+     "album": "Inception",
+     "albumId": "balfe",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Lorne Balfe",
+     "artists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ]
+    }
+   ],
+   "facts": {
+    "labels": {
+     "zimmer": "Reprise Records",
+     "balfe": "WaterTower Music"
+    }
+   },
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "A code never joins parts from different years",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Time",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Dream Is Collapsing",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Old Souls",
+     "artist": "Lorne Balfe",
+     "album": "Inception",
+     "albumId": "balfe",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2020,
+     "displayAlbumArtist": "Lorne Balfe",
+     "artists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ]
+    }
+   ],
+   "facts": {
+    "releaseGroups": {
+     "zimmer": "g",
+     "balfe": "g"
+    }
+   },
+   "expect": {
+    "splitAlbums": []
+   }
+  },
+  {
+   "name": "The server's album list gives the release and label",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Time",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Dream Is Collapsing",
+     "artist": "Hans Zimmer",
+     "album": "Inception",
+     "albumId": "zimmer",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Hans Zimmer",
+     "artists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Hans Zimmer"
+      }
+     ]
+    },
+    {
+     "id": "s2",
+     "title": "Old Souls",
+     "artist": "Lorne Balfe",
+     "album": "Inception",
+     "albumId": "balfe",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 2010,
+     "displayAlbumArtist": "Lorne Balfe",
+     "artists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Lorne Balfe"
+      }
+     ]
+    }
+   ],
+   "albums": [
+    {
+     "id": "zimmer",
+     "name": "Inception",
+     "musicBrainzId": "r1",
+     "recordLabels": [
+      {
+       "name": "Reprise Records"
+      }
+     ]
+    },
+    {
+     "id": "balfe",
+     "name": "Inception",
+     "musicBrainzId": "r1"
+    }
+   ],
+   "expect": {
+    "splitAlbums": [
+     {
+      "reasons": [
+       {
+        "basis": "SameRelease"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "Parts by one album artist need no reason",
+   "songs": [
+    {
+     "id": "s0",
+     "title": "Angel",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "a",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 1998,
+     "displayAlbumArtist": "Massive Attack",
+     "artists": [
+      {
+       "name": "Massive Attack"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Massive Attack"
+      }
+     ]
+    },
+    {
+     "id": "s1",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "b",
+     "duration": 200,
+     "suffix": "flac",
+     "year": 1998,
+     "displayAlbumArtist": "Massive Attack",
+     "artists": [
+      {
+       "name": "Massive Attack"
+      }
+     ],
+     "albumArtists": [
+      {
+       "name": "Massive Attack"
+      }
+     ]
+    }
+   ],
+   "expect": {
+    "splitAlbums": [
+     {
+      "reasons": [],
+      "summary": "Something else in the tags differs, often a release date or an album id on only some songs."
+     }
+    ]
+   }
+  },
+  {
+   "name": "The best copy is kept, the others go, and its blank tags are filled from them",
+   "songs": [
+    {
+     "id": "mp3",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "mp3",
+     "samplingRate": 44100,
+     "bitRate": 320,
+     "isrc": [
+      "GBAAA9800003"
+     ],
+     "year": 1998,
+     "genre": "Trip Hop",
+     "track": 3,
+     "displayAlbumArtist": "Massive Attack",
+     "albumArtists": [
+      {
+       "name": "Massive Attack"
+      }
+     ],
+     "coverArt": "mf-mp3"
+    },
+    {
+     "id": "flac",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "coverArt": "mf-flac"
+    }
+   ],
+   "expect": {
+    "fix": {
+     "keep": "flac",
+     "remove": [
+      "mp3"
+     ],
+     "why": "Keeps the FLAC, 16-bit, 44.1 kHz copy, because it sounds best.",
+     "fills": {
+      "albumArtist": "Massive Attack",
+      "track": "3",
+      "year": "1998",
+      "genre": "Trip Hop",
+      "isrc": "GBAAA9800003"
+     },
+     "fillsFrom": "mp3",
+     "note": null
+    }
+   }
+  },
+  {
+   "name": "A track number is not taken from a copy on another album, but the genre is",
+   "songs": [
+    {
+     "id": "single",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "album": "Teardrop (Single)",
+     "albumId": "al-Teardrop (Single)",
+     "duration": 330,
+     "suffix": "mp3",
+     "samplingRate": 44100,
+     "bitRate": 320,
+     "year": 1998,
+     "genre": "Trip Hop",
+     "track": 1,
+     "coverArt": "mf-single"
+    },
+    {
+     "id": "keep",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "coverArt": "mf-keep"
+    }
+   ],
+   "expect": {
+    "fix": {
+     "fills": {
+      "genre": "Trip Hop"
+     },
+     "note": "Teardrop (MP3, 320 kbps) is on Teardrop (Single), so that album will no longer have this song."
+    }
+   }
+  },
+  {
+   "name": "A copy with no album takes a whole album from one copy",
+   "songs": [
+    {
+     "id": "tagged",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "mp3",
+     "samplingRate": 44100,
+     "bitRate": 320,
+     "track": 3,
+     "displayAlbumArtist": "Massive Attack",
+     "albumArtists": [
+      {
+       "name": "Massive Attack"
+      }
+     ],
+     "coverArt": "mf-tagged"
+    },
+    {
+     "id": "loose",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "albumId": "",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "coverArt": "mf-loose"
+    }
+   ],
+   "expect": {
+    "fix": {
+     "keep": "loose",
+     "fills": {
+      "album": "Mezzanine",
+      "albumArtist": "Massive Attack",
+      "track": "3"
+     }
+    }
+   }
+  },
+  {
+   "name": "A person can keep another copy, and tags the copies say differently are for them to pick",
+   "songs": [
+    {
+     "id": "mp3",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "mp3",
+     "samplingRate": 44100,
+     "bitRate": 320,
+     "year": 1997,
+     "coverArt": "mf-mp3"
+    },
+    {
+     "id": "flac",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 1998,
+     "coverArt": "mf-flac"
+    }
+   ],
+   "expect": {
+    "fix": {
+     "pick": "mp3",
+     "keep": "mp3",
+     "remove": [
+      "flac"
+     ],
+     "why": "You picked this copy (MP3, 320 kbps) to keep.",
+     "differs": [
+      {
+       "tag": "year",
+       "values": [
+        [
+         "mp3",
+         "1997"
+        ],
+        [
+         "flac",
+         "1998"
+        ]
+       ]
+      }
+     ],
+     "fills": {}
+    }
+   }
+  },
+  {
+   "name": "A split album moves the smaller parts onto the largest",
+   "songs": [
+    {
+     "id": "a1",
+     "title": "Angel",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "big",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 1998,
+     "displayAlbumArtist": "Massive Attack",
+     "albumArtists": [
+      {
+       "name": "Massive Attack"
+      }
+     ],
+     "coverArt": "mf-a1"
+    },
+    {
+     "id": "a2",
+     "title": "Risingson",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "big",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 1998,
+     "displayAlbumArtist": "Massive Attack",
+     "albumArtists": [
+      {
+       "name": "Massive Attack"
+      }
+     ],
+     "coverArt": "mf-a2"
+    },
+    {
+     "id": "b1",
+     "title": "Teardrop",
+     "artist": "Massive Attack",
+     "album": "Mezzanine ",
+     "albumId": "small",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 1998,
+     "displayAlbumArtist": "Massive Attack",
+     "albumArtists": [
+      {
+       "name": "Massive Attack"
+      }
+     ],
+     "coverArt": "mf-b1"
+    }
+   ],
+   "expect": {
+    "splitAlbums": [
+     {
+      "joinMoving": [
+       "b1"
+      ],
+      "joinLeadAlbum": "big",
+      "joinWords": "Moves 1 song onto Mezzanine, the part with 2 songs."
+     }
+    ]
+   }
+  },
+  {
+   "name": "A year the rest of the album agrees on is filled in, but not when it disagrees",
+   "songs": [
+    {
+     "id": "a1",
+     "title": "One",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 1998,
+     "coverArt": "mf-a1"
+    },
+    {
+     "id": "a2",
+     "title": "Two",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 1998,
+     "coverArt": "mf-a2"
+    },
+    {
+     "id": "a3",
+     "title": "Three",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "coverArt": "mf-a3"
+    },
+    {
+     "id": "b1",
+     "title": "Four",
+     "artist": "Massive Attack",
+     "album": "Other",
+     "albumId": "al-Other",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2001,
+     "coverArt": "mf-b1"
+    },
+    {
+     "id": "b2",
+     "title": "Five",
+     "artist": "Massive Attack",
+     "album": "Other",
+     "albumId": "al-Other",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "year": 2003,
+     "coverArt": "mf-b2"
+    },
+    {
+     "id": "b3",
+     "title": "Six",
+     "artist": "Massive Attack",
+     "album": "Other",
+     "albumId": "al-Other",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "coverArt": "mf-b3"
+    }
+   ],
+   "expect": {
+    "fillsFromAlbum": {
+     "tag": "Year",
+     "fills": [
+      [
+       "a3",
+       "year",
+       "1998"
+      ]
+     ]
+    }
+   }
+  },
+  {
+   "name": "An album artist comes from the artist when every song is by one",
+   "songs": [
+    {
+     "id": "a1",
+     "title": "One",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "coverArt": "mf-a1"
+    },
+    {
+     "id": "a2",
+     "title": "Two",
+     "artist": "Massive Attack",
+     "album": "Mezzanine",
+     "albumId": "al-Mezzanine",
+     "duration": 330,
+     "suffix": "flac",
+     "bitDepth": 16,
+     "samplingRate": 44100,
+     "bitRate": 900,
+     "coverArt": "mf-a2"
+    }
+   ],
+   "expect": {
+    "fillsFromAlbum": {
+     "tag": "AlbumArtist",
+     "missing": [
+      "a1",
+      "a2"
+     ],
+     "fills": [
+      [
+       "a1",
+       "albumArtist",
+       "Massive Attack"
+      ],
+      [
+       "a2",
+       "albumArtist",
+       "Massive Attack"
+      ]
+     ]
+    }
+   }
+  }
+ ]
+}

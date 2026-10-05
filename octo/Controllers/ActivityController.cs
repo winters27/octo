@@ -57,6 +57,7 @@ public class ActivityController(IServiceProvider services, BrowseSessionStore se
             if (user is not null && services.GetService<ImportService>() is { } imports) items.AddRange(Imports(imports.Overview(user), now));
             if (sessions.NavidromeUserOf(browse) is { } admin && services.GetService<SongFinder>() is { } finder
                 && Find(finder.ForUser(admin), now) is { } f) items.Add(f);
+            if (services.GetService<Octo.Services.Health.LibraryHealthService>() is { } health) items.AddRange(Health(health.Run, health.CheckingSince, now));
         }
         if (services.GetService<AcquisitionTracker>() is { } acquisitions && Downloads(acquisitions.All(), now) is { } d) items.Add(d);
         if (services.GetService<DuplicateScanWorker>() is { } duplicates && Duplicates(duplicates, now) is { } dup) items.Add(dup);
@@ -261,6 +262,29 @@ public class ActivityController(IServiceProvider services, BrowseSessionStore se
         if (trickle.Downloading > 0)
             yield return new ActivityItem("imports:trickle", "imports", "imports", "Fetching songs from your lists", "running",
                 Detail: $"{trickle.Done:N0} done, {trickle.Queued:N0} to go");
+    }
+
+    /// <summary>Library health: a check of the library while one runs, and a run of fixes or lookups.</summary>
+    internal static IEnumerable<ActivityItem> Health(Octo.Services.Health.HealthRun? run, DateTime? checking, DateTime now)
+    {
+        if (checking is { } since)
+            yield return new ActivityItem("health:check", "health", "health", "Checking your library", "running",
+                Detail: "Reading every song from Navidrome", StartedUtc: since);
+        if (run is null) yield break;
+        var unit = run.Kind == "lookup" ? "songs" : "changes";
+        if (run.State == "running")
+        {
+            yield return new ActivityItem($"health:{run.Id}", "health", "health", run.Label, "running", run.Done, run.Total, unit,
+                Detail: run.Current, StartedUtc: run.StartedUtc);
+            yield break;
+        }
+        if (!Recent(run.FinishedUtc, now)) yield break;
+        var found = run.LookupsNow().Count(lookup => lookup.State == "found");
+        var detail = run.State == "failed" ? run.Error
+            : run.Kind == "lookup" ? $"Found tags for {found:N0} of {run.Done:N0} songs"
+            : run.Outcome?.Summary();
+        yield return new ActivityItem($"health:{run.Id}", "health", "health", run.Label, run.State, run.Done, run.Total, unit,
+            Detail: detail, StartedUtc: run.StartedUtc, FinishedUtc: run.FinishedUtc, Error: run.State == "failed" ? run.Error : null);
     }
 
     internal static ActivityItem? Duplicates(DuplicateScanWorker worker, DateTime now)

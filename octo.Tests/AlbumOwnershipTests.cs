@@ -368,7 +368,8 @@ public sealed class LibrarySnapshotTests
         Assert.Same(first, await snapshot.CurrentAsync());
         Assert.Same(first, await snapshot.CurrentAsync());
         pages.Hold.SetResult();
-        await Task.Delay(100);
+        // The read finishes in the background; a loaded machine can take a while.
+        for (var i = 0; i < 500 && ReferenceEquals(first, await snapshot.CurrentAsync()); i++) await Task.Delay(10);
         Assert.Equal(2, pages.Reads);
         Assert.NotSame(first, await snapshot.CurrentAsync());
     }

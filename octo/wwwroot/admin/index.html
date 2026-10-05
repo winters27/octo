@@ -116,6 +116,10 @@
             <svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg>
             <span>Better quality</span>
           </button>
+          <button class="sidebar-nav-item" data-tab="health">
+            <svg class="icon" aria-hidden="true"><use href="#i-check-circle"/></svg>
+            <span>Library health</span>
+          </button>
         </div>
 
         <div class="sidebar-nav-section">
@@ -2123,6 +2127,37 @@
             </details>
           </div>
         </div>
+      </section>
+
+      <!-- ─── LIBRARY HEALTH: the Octo app's checks and fixes, for every admin ─── -->
+      <section data-pane="health">
+        <header class="page-header">
+          <div>
+            <h1>Library health</h1>
+            <p id="health-overview">Second copies, albums split apart and missing tags, found the way the Octo app finds them. Every fix shows what it changes before anything is written.</p>
+          </div>
+          <button class="btn btn-ghost btn-icon" type="button" id="health-refresh" aria-label="Check again" title="Check again">
+            <svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg>
+          </button>
+        </header>
+
+        <div class="notice notice-warn" id="health-gate" hidden></div>
+        <div class="notice notice-update app-banner" id="health-result" role="status" hidden>
+          <span id="health-result-text"></span>
+          <span class="update-banner-actions">
+            <button type="button" class="btn btn-ghost" id="health-undo" hidden>Undo</button>
+            <button type="button" class="btn btn-ghost" id="health-result-close">Close</button>
+          </span>
+        </div>
+        <div class="acq-wrap" id="health-run-wrap" hidden>
+          <div class="acq-list" id="health-run" aria-live="polite"></div>
+        </div>
+
+        <div id="health-body">
+          <div class="state state-loading"><svg class="icon" aria-hidden="true"><use href="#i-circle-notch"/></svg><span>Checking your library…</span></div>
+        </div>
+
+        <p class="set-desc health-foot">Copies a fix removes wait in the server's trash, where they can be put back from <button type="button" class="link-button" id="health-trash-link">Recently removed</button> under Library actions.</p>
       </section>
 
       <section data-pane="libraryactions">

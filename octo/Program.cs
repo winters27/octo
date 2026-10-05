@@ -339,6 +339,8 @@ builder.Services.AddSingleton<Octo.Services.Imports.SpotifyWebApi>();
 builder.Services.AddSingleton<Octo.Services.Imports.SpotifyLinkReader>();
 builder.Services.AddSingleton<Octo.Services.Imports.ImportMatcher>();
 builder.Services.AddSingleton<Octo.Services.Library.LibrarySnapshot>();
+// Library health for the dashboard: the app's checks and fixes, run on the server.
+builder.Services.AddSingleton<Octo.Services.Health.LibraryHealthService>();
 builder.Services.AddSingleton<Octo.Services.Library.AlbumOwnership>();
 builder.Services.AddSingleton<Octo.Services.Imports.ImportPlaylists>();
 builder.Services.AddSingleton<Octo.Services.Imports.TrickleWorker>();

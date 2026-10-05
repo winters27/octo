@@ -420,9 +420,49 @@ public sealed class LibraryRescan
         _logger = logger;
     }
 
+    // While held (a run of fixes from the dashboard), a change only marks a scan as wanted; the
+    // last release asks for that one scan.
+    private int _holds;
+    private int _heldAsks;
+
+    /// <summary>Counted for tests: scans actually asked for, held asks folded into one.</summary>
+    internal int Scheduled;
+
+    /// <summary>Holds scans back until the returned handle is disposed, then asks for one if any
+    /// change came in meanwhile: a run of a hundred fixes is one scan at its end.</summary>
+    public IDisposable Hold()
+    {
+        Interlocked.Increment(ref _holds);
+        return new Release(this);
+    }
+
+    private sealed class Release(LibraryRescan rescan) : IDisposable
+    {
+        private int _done;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _done, 1) == 1) return;
+            if (Interlocked.Decrement(ref rescan._holds) == 0 && Interlocked.Exchange(ref rescan._heldAsks, 0) == 1)
+                rescan.Schedule();
+        }
+    }
+
     public void Soon()
     {
         Interlocked.Increment(ref Asked);
+        if (Volatile.Read(ref _holds) > 0)
+        {
+            Interlocked.Exchange(ref _heldAsks, 1);
+            // The hold may have ended in between; then nobody else will ask.
+            if (Volatile.Read(ref _holds) > 0 || Interlocked.Exchange(ref _heldAsks, 0) == 0) return;
+        }
+        Schedule();
+    }
+
+    private void Schedule()
+    {
+        Interlocked.Increment(ref Scheduled);
         if (_scopes is null || Interlocked.Exchange(ref _pending, 1) == 1) return;
         using (ExecutionContext.SuppressFlow())
             _ = Task.Run(async () =>

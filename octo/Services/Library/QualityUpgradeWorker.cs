@@ -9,7 +9,32 @@ namespace Octo.Services.Library;
 
 public sealed record LibrarySongRow(string Id, string Path, string? LibraryPath, long Size, string Suffix,
     int BitRate, string Title, string Artist, int? Duration, string? Album = null, string? AlbumId = null,
-    string? AlbumArtist = null, IReadOnlyList<string>? Isrcs = null);
+    string? AlbumArtist = null, IReadOnlyList<string>? Isrcs = null)
+{
+    // What Library health reads besides, all from the same row of Navidrome's own song list.
+
+    /// <summary>The length as Navidrome keeps it, in seconds with a fraction (301.37).</summary>
+    public double? Seconds { get; init; }
+    public IReadOnlyList<string> Genres { get; init; } = [];
+    public int? Year { get; init; }
+    public int? Track { get; init; }
+    public int? Disc { get; init; }
+    public int? BitDepth { get; init; }
+    public int? SampleRate { get; init; }
+    /// <summary>A picture inside the file itself.</summary>
+    public bool HasCover { get; init; } = true;
+    /// <summary>MusicBrainz recording, release (album) and release group ids.</summary>
+    public string? RecordingId { get; init; }
+    public string? ReleaseId { get; init; }
+    public string? ReleaseGroupId { get; init; }
+    public string? Barcode { get; init; }
+    public IReadOnlyList<string> Labels { get; init; } = [];
+    /// <summary>Every artist the song credits, and every album artist, as Navidrome lists them.</summary>
+    public IReadOnlyList<string> Artists { get; init; } = [];
+    public IReadOnlyList<string> AlbumArtists { get; init; } = [];
+    /// <summary>When Navidrome first saw the file: the order its Subsonic song list (search3) gives.</summary>
+    public DateTime? AddedUtc { get; init; }
+}
 
 public sealed record QualityUpgradeAttempt(DateTime AtUtc, string Outcome, string? Detail);
 
@@ -270,21 +295,79 @@ public sealed class QualityUpgradeWorker : BackgroundService
             var id = Str(song, "id");
             var path = Str(song, "path");
             if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(path)) continue;
+            // A float in Navidrome's native API, unlike Subsonic's whole seconds.
+            double? seconds = song.TryGetProperty("duration", out var d) && d.ValueKind == JsonValueKind.Number
+                ? d.GetDouble() : null;
             rows.Add(new LibrarySongRow(id, path, Str(song, "libraryPath"),
                 song.TryGetProperty("size", out var sz) && sz.TryGetInt64(out var bytes) ? bytes : 0,
                 Str(song, "suffix") ?? "",
-                song.TryGetProperty("bitRate", out var br) && br.TryGetInt32(out var rate) ? rate : 0,
+                Int(song, "bitRate") ?? 0,
                 Str(song, "title") ?? "", Str(song, "artist") ?? "",
-                // A float in Navidrome's native API, unlike Subsonic's whole seconds.
-                song.TryGetProperty("duration", out var d) && d.ValueKind == JsonValueKind.Number
-                    ? (int)Math.Round(d.GetDouble()) : null,
-                Str(song, "album"), Str(song, "albumId"), Str(song, "albumArtist"), IsrcsOf(song)));
+                seconds is { } length ? (int)Math.Round(length) : null,
+                Str(song, "album"), Str(song, "albumId"), Str(song, "albumArtist"), IsrcsOf(song))
+            {
+                Seconds = seconds,
+                Genres = GenresOf(song),
+                Year = Int(song, "year"),
+                Track = Int(song, "trackNumber"),
+                Disc = Int(song, "discNumber"),
+                BitDepth = Int(song, "bitDepth"),
+                SampleRate = Int(song, "sampleRate"),
+                // Older Navidrome leaves it out; a song is then taken to have one, as before.
+                HasCover = !song.TryGetProperty("hasCoverArt", out var cover) || cover.ValueKind != JsonValueKind.False,
+                RecordingId = Str(song, "mbzRecordingID") ?? Str(song, "mbzRecordingId"),
+                ReleaseId = Str(song, "mbzAlbumId"),
+                ReleaseGroupId = Str(song, "mbzReleaseGroupId"),
+                Barcode = TagValues(song, "barcode").FirstOrDefault(),
+                Labels = TagValues(song, "recordlabel"),
+                Artists = Participants(song, "artist"),
+                AlbumArtists = Participants(song, "albumartist"),
+                AddedUtc = Str(song, "createdAt") is { } created && DateTime.TryParse(created, System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out var added)
+                    ? added : null,
+            });
         }
         return (rows, count);
     }
 
     private static string? Str(JsonElement e, string name) =>
         e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+    private static int? Int(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var n) ? n : null;
+
+    /// <summary>A song's genres: the list when Navidrome gives one, else its one genre.</summary>
+    private static IReadOnlyList<string> GenresOf(JsonElement song)
+    {
+        var found = new List<string>();
+        if (song.TryGetProperty("genres", out var genres) && genres.ValueKind == JsonValueKind.Array)
+            foreach (var genre in genres.EnumerateArray())
+                if (Str(genre, "name") is { Length: > 0 } name) found.Add(name);
+        if (found.Count == 0 && Str(song, "genre") is { } one && !string.IsNullOrWhiteSpace(one)) found.Add(one);
+        return found;
+    }
+
+    /// <summary>The values of one of the song's tags, as Navidrome files them.</summary>
+    private static IReadOnlyList<string> TagValues(JsonElement song, string tag)
+    {
+        var found = new List<string>();
+        if (song.TryGetProperty("tags", out var tags) && tags.ValueKind == JsonValueKind.Object
+            && tags.TryGetProperty(tag, out var values) && values.ValueKind == JsonValueKind.Array)
+            foreach (var value in values.EnumerateArray())
+                if (value.ValueKind == JsonValueKind.String && value.GetString() is { Length: > 0 } text) found.Add(text);
+        return found;
+    }
+
+    /// <summary>The names in one of the song's roles ("artist", "albumartist").</summary>
+    private static IReadOnlyList<string> Participants(JsonElement song, string role)
+    {
+        var found = new List<string>();
+        if (song.TryGetProperty("participants", out var all) && all.ValueKind == JsonValueKind.Object
+            && all.TryGetProperty(role, out var people) && people.ValueKind == JsonValueKind.Array)
+            foreach (var person in people.EnumerateArray())
+                if (Str(person, "name") is { Length: > 0 } name) found.Add(name);
+        return found;
+    }
 
     /// <summary>A song's ISRCs: Navidrome files them among its tags, as a list; one written as
     /// a single string is read as a list of one.</summary>

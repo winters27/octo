@@ -33,31 +33,48 @@ public class DuplicateScanTests
         Assert.Equal(["a", "b"], group.Tracks.Select(track => track.Id));
     }
 
-    [Fact]
-    public void FindGroups_SameRecordingDifferentVersion_IsNotAGroup()
-        => Assert.Empty(DuplicateScanWorker.FindGroups([Track("a"), Track("b", title: "Teardrop (Live)")]));
+    // Since 2026-10-05 a copy is what Library health calls one (LibraryHealth.FindDuplicates, the
+    // Octo app's rule): tags that name one recording, or the same title, artist and version with
+    // lengths within 3 seconds. Before, only a shared recording id in the same version counted.
 
     [Fact]
-    public void FindGroups_DifferentArtist_IsNotAGroup()
-        => Assert.Empty(DuplicateScanWorker.FindGroups([Track("a"), Track("b", artist: "Elbow")]));
+    public void FindGroups_AnotherVersionWithoutASharedCode_IsNotAGroup()
+        => Assert.Empty(DuplicateScanWorker.FindGroups([Track("a", recording: ""), Track("b", title: "Teardrop (Live)", recording: "")]));
+
+    /// <summary>The tags say it is one recording, so it is, whatever the title says: the app's rule.</summary>
+    [Fact]
+    public void FindGroups_ASharedRecordingIdAtACloseLength_IsAGroupWhateverTheTitle()
+        => Assert.Single(DuplicateScanWorker.FindGroups([Track("a"), Track("b", title: "Tear Drop (Album Version)", duration: 331)]));
 
     [Fact]
-    public void FindGroups_DifferentRecordings_AreNotAGroup()
-        => Assert.Empty(DuplicateScanWorker.FindGroups([Track("a"), Track("b", recording: "rec-2")]));
+    public void FindGroups_ASharedRecordingIdAtAFarLength_IsATaggingMistake()
+        => Assert.Empty(DuplicateScanWorker.FindGroups([Track("a"), Track("b", title: "Angel", duration: 379)]));
 
-    /// <summary>A guess about which files are the same song is a guess someone would act on.</summary>
     [Fact]
-    public void FindGroups_NoRecordingId_IsNeverGrouped()
-        => Assert.Empty(DuplicateScanWorker.FindGroups([Track("a", recording: ""), Track("b", recording: "")]));
+    public void FindGroups_DifferentArtistWithoutASharedCode_IsNotAGroup()
+        => Assert.Empty(DuplicateScanWorker.FindGroups([Track("a", recording: ""), Track("b", artist: "Elbow", recording: "")]));
+
+    [Fact]
+    public void FindGroups_NoRecordingId_SameTitleArtistAndLength_IsAGroup()
+        => Assert.Equal("dup|a,b", Assert.Single(DuplicateScanWorker.FindGroups([Track("a", recording: ""), Track("b", recording: "", duration: 333)])).Key);
+
+    [Fact]
+    public void FindGroups_NoRecordingId_LengthsFourSecondsApart_IsNotAGroup()
+        => Assert.Empty(DuplicateScanWorker.FindGroups([Track("a", recording: ""), Track("b", recording: "", duration: 334)]));
+
+    [Fact]
+    public void FindGroups_ASharedIsrc_IsAGroup()
+        => Assert.Single(DuplicateScanWorker.FindGroups(
+            [Track("a", recording: "") with { Isrcs = ["GBAAA9800003"] }, Track("b", title: "Tear Drop", recording: "") with { Isrcs = ["GB-AAA-98-00003"] }]));
 
     [Fact]
     public void FindGroups_ThreeCopiesTwoVersions_GroupsOnlyTheMatchingPair()
     {
         var group = Assert.Single(DuplicateScanWorker.FindGroups(
         [
-            Track("a"),
-            Track("b", title: "Teardrop (Mad Professor mix)"),
-            Track("c", title: "Teardrop - Remastered 2011", suffix: "mp3", bitRate: 320),
+            Track("a", recording: ""),
+            Track("b", title: "Teardrop (Mad Professor mix)", recording: ""),
+            Track("c", title: "Teardrop - Remastered 2011", suffix: "mp3", bitRate: 320, recording: ""),
         ]));
 
         Assert.Equal(["a", "c"], group.Tracks.Select(track => track.Id));
@@ -160,19 +177,22 @@ public class DuplicateScanTests
     }
 
     [Fact]
-    public void ParsePage_CountsEveryRowButKeepsOnlyTracksWithARecordingId()
+    public void ParsePage_KeepsEveryLibraryTrack_WithItsCodes()
     {
         var tracks = new List<LibraryTrack>();
         var root = JsonDocument.Parse("""
             {"subsonic-response":{"status":"ok","searchResult3":{"song":[
-              {"id":"a","title":"Teardrop","artist":"Massive Attack","album":"Mezzanine","musicBrainzId":"rec-1","suffix":"flac","bitRate":1011,"duration":330},
-              {"id":"b","title":"Angel","artist":"Massive Attack","suffix":"mp3","bitRate":320,"duration":379}
+              {"id":"a","title":"Teardrop","artist":"Massive Attack","album":"Mezzanine","musicBrainzId":"rec-1","suffix":"flac","bitRate":1011,"duration":330,"isrc":["GBAAA9800003"]},
+              {"id":"b","title":"Angel","artist":"Massive Attack","suffix":"mp3","bitRate":320,"duration":379},
+              {"id":"x","title":"Outside","artist":"Someone","isExternal":true}
             ]}}}
             """).RootElement;
 
-        Assert.Equal(2, DuplicateScanWorker.ParsePage(root, tracks));
-        var track = Assert.Single(tracks);
-        Assert.Equal(new LibraryTrack("a", "Teardrop", "Massive Attack", "Mezzanine", "rec-1", "flac", 1011, 330), track);
+        Assert.Equal(3, DuplicateScanWorker.ParsePage(root, tracks));
+        Assert.Equal(["a", "b"], tracks.Select(track => track.Id));
+        Assert.Equal(new LibraryTrack("a", "Teardrop", "Massive Attack", "Mezzanine", "rec-1", "flac", 1011, 330) { Isrcs = tracks[0].Isrcs }, tracks[0]);
+        Assert.Equal(["GBAAA9800003"], tracks[0].Isrcs);
+        Assert.Equal("", tracks[1].RecordingId);
     }
 
     [Theory]

@@ -28,6 +28,8 @@
   <ItemGroup>
     <!-- The song identity cases the Octo app runs too. -->
     <None Include="..\docs\song-identity-cases.json" Link="song-identity-cases.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The Library health cases, written to be run by the Octo app too. -->
+    <None Include="..\docs\library-health-cases.json" Link="library-health-cases.json" CopyToOutputDirectory="PreserveNewest" />
     <!-- The cover design reference's golden samples, copied from the Octo app's tools/cover-art/golden. -->
     <None Include="CoverGolden\samples.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
