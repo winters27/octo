@@ -81,6 +81,27 @@ public class AmbientPaletteTests
         Assert.Null(CoverPalette.FromSwatches(null));
     }
 
+    /// <summary>
+    /// A night sky that is nearly black but teal (Drake's NOKIA cover, read live) is grey to the
+    /// station covers, yet still lights the page: quietly, in its own teal.
+    /// </summary>
+    [Fact]
+    public void Palette_FaintlyTintedCover_IsMutedInItsOwnHue()
+    {
+        var swatches = new[]
+        {
+            S("#0b1f1e", 0.17f), S("#e4efef", 0.17f), S("#0a1515", 0.14f), S("#2d322a", 0.12f), S("#010709", 0.12f),
+        };
+        Assert.Null(CoverMusic.FromCovers([swatches]));
+        var palette = CoverPalette.FromSwatches(swatches)!;
+        var lead = CoverColours.ToLch(CoverColours.Hex(palette.Colors[0]));
+        Assert.True(CoverColours.HueDistance(lead.H, 191) < 12, $"hue {lead.H}");
+        Assert.InRange(lead.C, 0.03, 0.065);
+        Assert.Equal(3, palette.Colors.Distinct().Count());
+        var accent = CoverColours.Hex(palette.Accent);
+        Assert.True(CoverColours.ContrastRatio(accent, CoverColours.Hex("#14080e")) >= 7);
+    }
+
     /// <summary>The accent carries dark words on it and reads as words on the dark page.</summary>
     [Theory]
     [InlineData("#d9552b")]

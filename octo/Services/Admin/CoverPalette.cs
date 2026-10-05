@@ -11,6 +11,10 @@ namespace Octo.Services.Admin;
 /// light and the accent are the colour <see cref="CoverMusic.FromCovers"/> would call the
 /// music's: so the dashboard, a station's cover and the apps agree on what colour an album is.
 /// Only the lightness and chroma are the dashboard's, chosen for dark glass and dark words.
+///
+/// Where the station covers would call a cover grey, the dashboard still takes a faint lean
+/// (a teal night, a sepia photo) as quiet light in that hue, so every chosen song changes the
+/// page; only a truly black, white or grey cover leaves the dashboard's own colours.
 /// </summary>
 public static class CoverPalette
 {
@@ -34,14 +38,14 @@ public static class CoverPalette
     public static Palette? FromSwatches(IReadOnlyList<Swatch>? swatches)
     {
         if (swatches is not { Count: > 0 }) return null;
-        var ranked = swatches
-            .Select(s => (Lch: CoverColours.ToLch(s.Argb), s.Share))
+        var seen = swatches.Select(s => (Lch: CoverColours.ToLch(s.Argb), s.Share)).ToList();
+        var ranked = seen
             .Where(s => s.Lch.C >= Colourless && s.Lch.L is >= 0.15 and <= 0.97)
             // CoverMusic's measure of the strongest colour: how much of the cover, how vivid.
             .OrderByDescending(s => Math.Sqrt(s.Share) * (0.3 + s.Lch.C * 5))
             .Select(s => s.Lch)
             .ToList();
-        if (ranked.Count == 0) return null;
+        if (ranked.Count == 0) return Muted(seen);
 
         var picks = new List<Lch>();
         foreach (var lch in ranked)
@@ -59,6 +63,29 @@ public static class CoverPalette
             .ToList();
         var accent = Hex(new Lch(AccentL, Math.Clamp(first.C, AccentCMin, AccentCMax), first.H));
         return new Palette(colors, accent);
+    }
+
+    // Under CoverMusic's line a cover can still lean one way: a night sky that is nearly black but
+    // teal. Such a cover lights the page quietly in that hue, so choosing it still changes the
+    // page. Below this it is truly black, white or grey, and the dashboard keeps its own colours.
+    private const double Tinted = 0.012;
+    private const double MutedL = 0.55, MutedCMin = 0.035, MutedCMax = 0.06;
+    private const double MutedAccentC = 0.06;
+
+    /// <summary>A grey cover's quiet palette from its own lean, or null for a cover with none.</summary>
+    private static Palette? Muted(IReadOnlyList<(Lch Lch, float Share)> seen)
+    {
+        var lean = seen
+            .Where(s => s.Lch.C >= Tinted && s.Lch.L is >= 0.08 and <= 0.97)
+            .OrderByDescending(s => Math.Sqrt(s.Share) * s.Lch.C)
+            .Select(s => (Lch?)s.Lch)
+            .FirstOrDefault();
+        if (lean is not { } first) return null;
+        var c = Math.Clamp(first.C * 1.6, MutedCMin, MutedCMax);
+        var colors = new[] { 0.0, NeighbourTurn, -NeighbourTurn }
+            .Select(turn => Hex(new Lch(MutedL, c, (first.H + turn + 360) % 360)))
+            .ToList();
+        return new Palette(colors, Hex(new Lch(AccentL, MutedAccentC, first.H)));
     }
 
     private static string Hex(Lch lch)

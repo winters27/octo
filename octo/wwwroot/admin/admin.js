@@ -3153,8 +3153,8 @@ document.getElementById('fetched-refresh')?.addEventListener('click', loadFetche
 // ── Afterglow: the page takes its light from a fetched song's cover ─────────────────────────
 // Octo reads each cover with the station covers' colour rules (GET /api/admin/ambient): three
 // lights behind the glass and an accent. The song chosen under Recently added is remembered in
-// this browser; with none chosen, the newest song lights the page, and with no colour to go on,
-// Octo's own blue-greys stay. The last palette is kept too, so a reload starts in its colour.
+// this browser; with none chosen, the newest song lights the page. A cover with no colour at
+// all leaves Octo's own blue-greys. The last palette is kept too, so a reload starts in it.
 const AMBIENT_PICK_KEY = 'octo.ambient.pick';
 const AMBIENT_LAST_KEY = 'octo.ambient.last';
 let ambientSongs = [];
@@ -3186,10 +3186,9 @@ try {
 
 function chosenAmbientSong() {
   const picked = ambientStoreGet(AMBIENT_PICK_KEY);
-  return ambientSongs.find(s => ambientKey(s) === picked)
-    || ambientSongs.find(s => s.colors)
-    || ambientSongs[0]
-    || null;
+  // The chosen song, else the newest: never some other song that happens to have colour, or
+  // choosing the newest would show a different one.
+  return ambientSongs.find(s => ambientKey(s) === picked) || ambientSongs[0] || null;
 }
 
 function renderLatestFetched() {
