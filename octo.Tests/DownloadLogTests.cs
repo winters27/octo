@@ -122,6 +122,18 @@ public class DownloadLogTests
     }
 
     [Fact]
+    public void ASharedRowsLogNamesNobody()
+    {
+        var tracker = NewTracker();
+        tracker.Begin("soulseek", "abc", "abc", "alice", "Daft Punk", "Da Funk", "Homework");
+        tracker.Begin("soulseek", "abc", "abc", "bob", "Daft Punk", "Da Funk", "Homework");
+
+        var lines = Log(tracker, "bob");
+
+        Assert.DoesNotContain(lines, line => (line.Text + line.Detail).Contains("alice", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void ClearingTakesFinishedRowsOffOnePersonsList()
     {
         var tracker = NewTracker();

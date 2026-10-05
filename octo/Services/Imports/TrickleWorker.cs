@@ -173,7 +173,7 @@ public sealed class TrickleWorker : BackgroundService
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning("Trickle for '{Artist} - {Title}' ({Owner}) failed: {Message}", job.Artist, job.Title, job.Owner, ex.Message);
-            Finish(job, ImportTrackStates.NotFound, ex.Message, null);
+            Finish(job, ImportTrackStates.NotFound, AcquisitionTracker.UserSafe(ex.Message) ?? "Could not get it.", null);
         }
         finally { _current = null; }
     }

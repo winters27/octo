@@ -21,6 +21,8 @@ public sealed class ImportServiceTests
         public readonly List<string> Calls = [];
         public string TokenError = "";
         public int Refreshes;
+        /// <summary>Thrown when the liked songs are read, as a fault inside Octo would be.</summary>
+        public Exception? Fault;
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
@@ -34,6 +36,7 @@ public sealed class ImportServiceTests
                 return ImportSourceTests.Json("""{"access_token":"at","refresh_token":"rt2","expires_in":3600}""");
             }
             var path = request.RequestUri.AbsolutePath;
+            if (Fault is not null && path == "/v1/me/tracks") throw Fault;
             return path switch
             {
                 "/v1/me" => ImportSourceTests.Json("""{"id":"me","display_name":"Alice on Spotify"}"""),
@@ -218,6 +221,21 @@ public sealed class ImportServiceTests
         Assert.False(overview.Spotify.Connected);
         Assert.Contains("Connect again", overview.Spotify.Problem);
         Assert.Contains("Connect again", overview.Reading.Error);
+    }
+
+    [Fact]
+    public async Task AFaultWhileReadingIsShownWithNoServerPath()
+    {
+        var rig = new Rig();
+        await rig.ConnectAndRead();
+        rig.Web.Fault = new IOException("Could not find file '/data/config/imports.json'.\n   at Octo.Services.Imports.ImportStore.Save()");
+
+        await rig.Service.ReadSpotifyAsync("alice", CancellationToken.None);
+
+        var error = rig.Service.Overview("alice").Reading.Error!;
+        Assert.StartsWith("Reading Spotify failed:", error);
+        Assert.DoesNotContain("/data/config", error);
+        Assert.DoesNotContain("ImportStore", error);
     }
 
     [Fact]

@@ -288,12 +288,14 @@ public sealed class AcquisitionTracker
                 if (fresh || kind != AcquisitionKinds.Download) entry.Kind = kind;
                 AddOwner(entry.Owners, requestedBy);
                 Name(entry, artist, title, album);
+                // No name on the line: a row is shared by everyone who asked for the song, and each
+                // of them reads the same log.
                 if (fresh) Add(entry, AcquisitionEventKinds.Queued, kind switch
                 {
                     AcquisitionKinds.Upgrade => "Asked for a higher quality copy",
                     AcquisitionKinds.Pick => "Asked for the copy you picked",
                     _ => "Asked for",
-                }, string.IsNullOrWhiteSpace(requestedBy) ? null : $"By {requestedBy.Trim()}");
+                });
                 Prune();
             }
         });

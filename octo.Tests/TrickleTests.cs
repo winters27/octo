@@ -185,6 +185,21 @@ public sealed class TrickleTests : IDisposable
     }
 
     [Fact]
+    public async Task ASongThatThrowsSaysWhyInPlainWords_WithNoServerPath()
+    {
+        var rig = new Rig();
+        rig.Worker.Start = _ => throw new IOException("Could not find file '/data/config/octo/history.json'. See the inner exception.\n   at Octo.Something()");
+        rig.Queue.Add("alice", [Song("a")]);
+
+        await rig.Tick();
+
+        var job = rig.Queue.Get("alice", "a")!;
+        Assert.Equal(ImportTrackStates.NotFound, job.State);
+        Assert.DoesNotContain("/data/config", job.Detail);
+        Assert.DoesNotContain("Octo.Something", job.Detail);
+    }
+
+    [Fact]
     public async Task ASongAlreadyInTheLibraryIsNeverDownloaded()
     {
         var rig = new Rig { Owned = _ => "nd-owned" };

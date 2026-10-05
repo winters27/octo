@@ -366,7 +366,8 @@ public sealed class ImportService : BackgroundService
         catch (Exception ex)
         {
             _logger.LogWarning("Reading Spotify for {User} failed: {Message}", user, ex.Message);
-            _reading[user] = new ReadView(false, null, ex is SpotifyException ? ex.Message : $"Reading Spotify failed: {ex.Message}", Clock());
+            _reading[user] = new ReadView(false, null, ex is SpotifyException ? ex.Message
+                : $"Reading Spotify failed: {AcquisitionTracker.UserSafe(ex.Message) ?? "something went wrong"}.", Clock());
         }
         finally { gate.Release(); }
     }
@@ -431,7 +432,8 @@ public sealed class ImportService : BackgroundService
         try { lists = ImportFileReader.Read(fileName, content); }
         catch (Exception ex) when (ex is FormatException or System.Text.Json.JsonException or InvalidDataException)
         {
-            return new(false, $"Octo could not read that file: {ex.Message}");
+            // Octo's own words for a file it refuses; a parser's are cut to their first plain sentence.
+            return new(false, $"Octo could not read that file: {(ex is FormatException ? ex.Message : (AcquisitionTracker.UserSafe(ex.Message) ?? "it is not a file Octo knows") + ".")}");
         }
         if (lists.Count == 0) return new(false, "That file held no songs Octo could read. It needs a title and an artist for each song.");
         var gate = Gate(user);
