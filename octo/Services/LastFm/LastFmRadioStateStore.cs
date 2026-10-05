@@ -18,6 +18,7 @@ public sealed class LastFmRadioStateStore
     private const int MaxPlaysPerUser = 2_000;
     private const int MaxUsers = 100;
     private const int MaxUnavailableTracksPerUser = 500;
+    private const int MaxRadioBansPerUser = 1_000;
     private static readonly TimeSpan UnavailableTrackCooldown = TimeSpan.FromHours(24);
     private static readonly TimeSpan DuplicateWindow = TimeSpan.FromMinutes(5);
 
@@ -166,6 +167,52 @@ public sealed class LastFmRadioStateStore
         }
     }
 
+    /// <summary>A song rated one star never plays on this user's radio again and leaves the
+    /// stations it is on now; any other rating lifts that. Returns whether anything changed.</summary>
+    public bool SetRadioBan(string username, string songId, string artist, string title, bool banned)
+    {
+        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(artist)
+            || string.IsNullOrWhiteSpace(title)) return false;
+        lock (_lock)
+        {
+            var state = LoadLocked();
+            if (!banned && !state.Users.ContainsKey(UserKey(username))) return false;
+            var user = GetOrCreateLocked(state, username);
+            var key = LastFmRadioSeedNormalizer.TrackKey(artist, title);
+            user.RadioBans ??= [];
+            var had = user.RadioBans.RemoveAll(ban => ban.Key == key
+                || (songId.Length > 0 && ban.SongId == songId)) > 0;
+            if (banned)
+            {
+                var now = DateTime.UtcNow;
+                user.RadioBans.Insert(0, new LastFmRadioBan
+                    { Key = key, SongId = songId, Artist = artist, Title = title, BannedAtUtc = now });
+                foreach (var station in user.Stations)
+                {
+                    var before = station.Tracks.Count;
+                    station.Tracks = station.Tracks.Where(track =>
+                        LastFmRadioSeedNormalizer.TrackKey(track.Artist, track.Title) != key).ToList();
+                    if (before != station.Tracks.Count) station.ChangedUtc = now;
+                }
+            }
+            else if (!had) return false;
+            SaveLocked(state);
+            return true;
+        }
+    }
+
+    /// <summary>The keys of the songs this user rated one star, without copying the rest of
+    /// their state.</summary>
+    public IReadOnlySet<string> RadioBanKeys(string username)
+    {
+        lock (_lock)
+        {
+            return LoadLocked().Users.TryGetValue(UserKey(username), out var user)
+                ? (user.RadioBans ?? []).Select(ban => ban.Key).ToHashSet(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
     public void ReplaceStations(string username, IReadOnlyCollection<LastFmRadioStation> stations)
     {
         lock (_lock)
@@ -289,6 +336,9 @@ public sealed class LastFmRadioStateStore
                 .Where(track => track.RetryAfterUtc > DateTime.UtcNow)
                 .OrderByDescending(track => track.FailedAtUtc)
                 .Take(MaxUnavailableTracksPerUser).ToList();
+            user.RadioBans = (user.RadioBans ?? [])
+                .OrderByDescending(ban => ban.BannedAtUtc)
+                .Take(MaxRadioBansPerUser).ToList();
         }
 
         foreach (var key in state.Users.OrderByDescending(pair => pair.Value.LastSeenUtc)

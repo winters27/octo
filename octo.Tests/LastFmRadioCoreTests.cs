@@ -825,6 +825,81 @@ public class LastFmRadioRecommendationTests
     }
 
     [Fact]
+    public async Task OneStar_KeepsASongOffEveryStationAndAnyOtherRatingLiftsIt()
+    {
+        var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "octo-radio-ban-" + Guid.NewGuid());
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var settings = TestOptions.Monitor(new LastFmSettings { ApiKey = "key", MinimumPlays = 3, RadioTrackCount = 10 });
+            var state = new LastFmRadioStateStore(System.IO.Path.Combine(directory, "state.json"), settings,
+                new ExternalIdRegistry(), new Mock<ILogger<LastFmRadioStateStore>>().Object);
+            for (var index = 0; index < 3; index++) state.RecordPlay("alice", new LastFmRadioPlay
+            {
+                Artist = "Fresh", Title = "Fresh Seed " + index, Genre = "Electronica",
+                PlayedAtUtc = DateTime.UtcNow.AddDays(-20).AddHours(-index)
+            });
+            Assert.True(state.SetRadioBan("alice", "id-0", "Similar Artist 0", "similar-0", banned: true));
+            Assert.Contains(LastFmRadioSeedNormalizer.TrackKey("Similar Artist 0", "similar-0"), state.RadioBanKeys("alice"));
+            var service = RecommendationService(settings, state, new RecommendationHandler());
+            var stations = await service.BuildAsync("alice");
+            Assert.NotEmpty(stations.SelectMany(station => station.Tracks));
+            Assert.DoesNotContain(stations.SelectMany(station => station.Tracks),
+                track => track.Title == "similar-0" && track.Artist == "Similar Artist 0");
+
+            Assert.True(state.SetRadioBan("alice", "id-0", "Similar Artist 0", "similar-0", banned: false));
+            Assert.Empty(state.GetUser("alice").RadioBans);
+            Assert.False(state.SetRadioBan("alice", "id-0", "Similar Artist 0", "similar-0", banned: false));
+        }
+        finally { try { Directory.Delete(directory, true); } catch { } }
+    }
+
+    [Fact]
+    public void OneStar_PullsTheSongFromTheStationsItIsOnNow()
+    {
+        var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "octo-radio-ban-now-" + Guid.NewGuid());
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var settings = TestOptions.Monitor(new LastFmSettings { ApiKey = "key" });
+            var state = new LastFmRadioStateStore(System.IO.Path.Combine(directory, "state.json"), settings,
+                new ExternalIdRegistry(), new Mock<ILogger<LastFmRadioStateStore>>().Object);
+            state.ReplaceStations("alice", [new LastFmRadioStation
+            {
+                Id = "s1", Key = "your-mix", Name = "Your Mix", Owner = "alice",
+                Tracks = [new() { Artist = "A", Title = "Keep" }, new() { Artist = "B", Title = "Gone" }],
+            }]);
+            Assert.True(state.SetRadioBan("alice", "id-b", "B", "Gone", banned: true));
+            Assert.Equal(["Keep"], Assert.Single(state.GetUser("alice").Stations).Tracks.Select(track => track.Title));
+        }
+        finally { try { Directory.Delete(directory, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task ArtistStation_SpreadsItsArtistsAcrossTheFirstFiveSongs()
+    {
+        var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "octo-radio-gap-" + Guid.NewGuid());
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var settings = TestOptions.Monitor(new LastFmSettings { ApiKey = "key", MinimumPlays = 3, RadioTrackCount = 10 });
+            var state = new LastFmRadioStateStore(System.IO.Path.Combine(directory, "state.json"), settings,
+                new ExternalIdRegistry(), new Mock<ILogger<LastFmRadioStateStore>>().Object);
+            for (var index = 0; index < 3; index++) state.RecordPlay("alice", new LastFmRadioPlay
+            {
+                Artist = "Fresh", Title = "Fresh Seed " + index, Genre = "Electronica",
+                PlayedAtUtc = DateTime.UtcNow.AddDays(-20).AddHours(-index)
+            });
+            var service = RecommendationService(settings, state, new RecommendationHandler());
+            var stations = await service.BuildAsync("alice");
+            var fresh = Assert.Single(stations, station =>
+                station.Kind == LastFmRadioStationKind.Artist && station.Name == "Fresh Radio");
+            Assert.Equal(5, fresh.Tracks.Take(5).Select(track => track.Artist.ToLowerInvariant()).Distinct().Count());
+        }
+        finally { try { Directory.Delete(directory, true); } catch { } }
+    }
+
+    [Fact]
     public async Task Refresh_DrawsADifferentSnapshotAndRotatesAwayFromThePreviousOne()
     {
         var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "octo-radio-rot-" + Guid.NewGuid());

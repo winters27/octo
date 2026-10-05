@@ -19,7 +19,9 @@ public partial class LastFmService
     // every miss. A plain Dictionary written from two threads at once does not merely lose
     // an entry: a resize racing with an insert can corrupt the bucket chain and leave a
     // later read spinning forever inside the lookup.
-    private readonly ConcurrentDictionary<string, (DateTime Expiry, List<SimilarTrack> Tracks, SimilarSource Source)> _cache = new();
+    // Each entry keeps how many tracks were asked for, so a short answer cached for a station
+    // refresh is not handed to a later request that wants more.
+    private readonly ConcurrentDictionary<string, (DateTime Expiry, int Asked, List<SimilarTrack> Tracks, SimilarSource Source)> _cache = new();
     private readonly ConcurrentDictionary<string, (DateTime Expiry, object Value)> _radioCache = new();
     private readonly SemaphoreSlim _providerGate = new(4, 4);
 
@@ -79,8 +81,10 @@ public partial class LastFmService
         {
             List<SimilarTrack> tracks;
             SimilarSource source;
-            // Check cache
-            if (_cache.TryGetValue(cacheKey, out var cached) && cached.Expiry > DateTime.UtcNow)
+            // Check cache. A list shorter than what was asked for is everything Last.fm has, so it
+            // answers any size.
+            if (_cache.TryGetValue(cacheKey, out var cached) && cached.Expiry > DateTime.UtcNow
+                && (cached.Asked >= limit || cached.Tracks.Count < cached.Asked))
             {
                 _logger.LogDebug("Returning {Count} cached similar tracks for {Artist} - {Title}",
                     cached.Tracks.Count, artist, title);
@@ -91,7 +95,7 @@ public partial class LastFmService
                 _logger.LogInformation("Fetching similar tracks from Last.fm for {Artist} - {Title}", artist, title);
                 (tracks, source) = await FetchSimilarForSpellingsAsync(artist, title, limit, cancellationToken);
                 _logger.LogInformation("Found {Count} similar tracks from Last.fm", tracks.Count);
-                _cache[cacheKey] = (DateTime.UtcNow.AddHours(_settings.EffectiveRadioCacheDurationHours), tracks, source);
+                _cache[cacheKey] = (DateTime.UtcNow.AddHours(_settings.EffectiveRadioCacheDurationHours), limit, tracks, source);
             }
 
             if (tracks.Count > 0) return new SimilarAnswer(tracks.Take(limit).ToList(), source, ArtistTrusted: true);

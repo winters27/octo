@@ -2827,7 +2827,20 @@ public partial class SubsonicController : ControllerBase
 
         // An external id is not a Navidrome song, and relaying one errors "data not found".
         if (!string.IsNullOrEmpty(itemId) && _localLibraryService.ParseSongId(itemId).isExternal)
+        {
+            // Nothing to relay, so a ping is the auth check before the listener's radio changes.
+            if (_radioStateStore is not null && int.TryParse(ratingText, out var externalStars)
+                && parameters.GetValueOrDefault("u") is { Length: > 0 } externalRater)
+            {
+                var auth = parameters.ToDictionary(pair => pair.Key, pair => pair.Value);
+                auth.Remove("id");
+                auth.Remove("rating");
+                var check = await _proxyService.RelaySafeAsync("rest/ping", auth);
+                if (check.Success && check.Body is not null && IsSuccessfulSubsonicResponse(check.Body, format))
+                    await RecordRadioBanAsync(externalRater, itemId, externalStars, parameters);
+            }
             return _responseBuilder.CreateResponse(format, "setRating", new { });
+        }
 
         byte[] body;
         string? contentType;
@@ -2840,6 +2853,10 @@ public partial class SubsonicController : ControllerBase
         {
             return _responseBuilder.CreateError(format, 0, $"Error connecting to Subsonic server: {ex.Message}");
         }
+
+        if (IsSuccessfulSubsonicResponse(body, format) && int.TryParse(ratingText, out var stars)
+            && parameters.GetValueOrDefault("u") is { Length: > 0 } rater && !string.IsNullOrEmpty(itemId))
+            await RecordRadioBanAsync(rater, itemId, stars, parameters);
 
         if (_ratingActions is not null
             && IsSuccessfulSubsonicResponse(body, format)
@@ -2868,6 +2885,26 @@ public partial class SubsonicController : ControllerBase
     private bool RatingInScope(string username, string itemId) =>
         _libraryActionSettings.CurrentValue.EffectiveRatingsScope == LibraryRatingScope.Global
         || (_noticeQueue?.IsQueued(username, itemId) ?? false);
+
+    /// <summary>
+    /// One star keeps a song off this listener's radio; any other rating lifts that. Never
+    /// fails the rating itself: the radio is a side effect of it.
+    /// </summary>
+    private async Task RecordRadioBanAsync(string username, string itemId, int stars,
+        IReadOnlyDictionary<string, string> parameters)
+    {
+        if (_radioStateStore is null) return;
+        try
+        {
+            var rated = await _radioTrackResolver.ResolveScrobbleAsync(itemId, parameters);
+            if (rated is not null)
+                _radioStateStore.SetRadioBan(username, itemId, rated.Artist, rated.Title, stars == 1);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "radio ban for rating on {Id} failed", itemId);
+        }
+    }
 
     /// <summary>
     /// Gets similar songs for radio feature using Last.fm recommendations.
