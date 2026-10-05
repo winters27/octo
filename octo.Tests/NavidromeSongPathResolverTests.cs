@@ -168,4 +168,17 @@ public class NavidromeSongPathResolverTests : IDisposable
         var parsed = NavidromeSongPathResolver.FromJson(json.RootElement, "nd-1", PathSource.NativeApi, "libraryPath")!;
         Assert.Equal((true, "Massive Attack"), (parsed.Missing, parsed.AlbumArtist));
     }
+
+    [Theory]
+    [InlineData("""{"path":"a.flac","duration":301.37}""", 301)]
+    [InlineData("""{"path":"a.flac","duration":247.5}""", 248)]
+    [InlineData("""{"path":"a.flac","duration":330}""", 330)]
+    [InlineData("""{"path":"a.flac"}""", null)]
+    public void ASongsLengthIsReadWhetherNavidromeSendsAFractionOrWholeSeconds(string body, int? seconds)
+    {
+        // Navidrome's /api/song sends 301.37; Subsonic's getSong sends 301.
+        using var json = System.Text.Json.JsonDocument.Parse(body);
+
+        Assert.Equal(seconds, NavidromeSongPathResolver.FromJson(json.RootElement, "nd-1", PathSource.NativeApi, "libraryPath")!.Duration);
+    }
 }

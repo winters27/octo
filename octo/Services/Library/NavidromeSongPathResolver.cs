@@ -358,7 +358,10 @@ public sealed class NavidromeSongPathResolver
             Artist: Str(element, "artist") ?? "",
             Album: Str(element, "album") ?? "",
             Suffix: Str(element, "suffix") ?? "",
-            Duration: element.TryGetProperty("duration", out var d) && d.TryGetInt32(out var secs) ? secs : null,
+            // Navidrome's native API sends seconds with a fraction (301.37); Subsonic's getSong whole ones.
+            Duration: element.TryGetProperty("duration", out var d) && d.ValueKind == JsonValueKind.Number
+                      && d.TryGetDouble(out var secs) && secs > 0
+                ? (int)Math.Round(secs, MidpointRounding.AwayFromZero) : null,
             Source: source,
             Missing: element.TryGetProperty("missing", out var m) && m.ValueKind == JsonValueKind.True,
             AlbumArtist: Str(element, "albumArtist"));
