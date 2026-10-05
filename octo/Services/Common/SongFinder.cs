@@ -303,8 +303,20 @@ public sealed class SongFinder
             var (jobs, full) = queue!.Add([new UpgradeAsk(libraryId, target.Title, target.Artist, target.Album, target.OwnedFormat, Pick: copy.Pick)],
                 user, "find");
             if (jobs.Count == 0) return new(LibraryActionStates.Skipped, full ?? "The upgrade queue is full.");
-            if (jobs[0].Pick is null)
-                return new(LibraryActionStates.Skipped, "A higher quality copy of this song is already being looked for.");
+            if (!copy.Pick.SameAs(jobs[0].Pick))
+            {
+                // The song already waits in the queue. Picking again before it starts means the
+                // person changed their mind, so the newer pick takes the old one's place. Once it
+                // runs, or when it is someone else's, the copy it fetches is settled.
+                if (queue.ReplacePick(libraryId, user, copy.Pick) is null)
+                    return new(LibraryActionStates.Skipped, jobs[0].Pick is null
+                        ? "A higher quality copy of this song is already being looked for. Pick again once it ends."
+                        : "Another copy of this song is already on its way. Pick again once it ends.");
+                _logger.LogInformation("Find songs: {User} changed the pick for '{Artist} - {Title}' to {Copy}",
+                    user, target.Artist, target.Title, copy.Pick.Describe());
+                return new(LibraryActionStates.Queued,
+                    "Changed to the copy you picked. Your copy stays until the new one passes every check.");
+            }
             _logger.LogInformation("Find songs: {User} picked {Copy} to replace '{Artist} - {Title}'",
                 user, copy.Pick.Describe(), target.Artist, target.Title);
             return new(LibraryActionStates.Queued, "Getting the copy you picked. Your copy stays until the new one passes every check.");

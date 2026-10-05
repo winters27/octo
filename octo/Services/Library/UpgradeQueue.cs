@@ -150,6 +150,25 @@ public sealed class UpgradeQueue
         }
     }
 
+    /// <summary>
+    /// Puts another picked copy on a job that has not started, for the person who asked for it.
+    /// Answers the job as it now stands, or null when it has started or is someone else's: the
+    /// copy it fetches is settled then.
+    /// </summary>
+    public UpgradeJob? ReplacePick(string navidromeId, string requester, PickedCopy pick)
+    {
+        lock (_lock)
+        {
+            if (!_jobs.TryGetValue(navidromeId, out var job) || job.State is not (UpgradeStates.Queued or UpgradeStates.Waiting)
+                || !string.Equals(job.RequestedBy, requester.Trim(), StringComparison.OrdinalIgnoreCase))
+                return null;
+            job.Pick = pick;
+            job.UpdatedUtc = Clock();
+            Save();
+            return job.Copy();
+        }
+    }
+
     /// <summary>Every job, or only one person's, as copies.</summary>
     public IReadOnlyList<UpgradeJob> Snapshot(string? requester = null)
     {

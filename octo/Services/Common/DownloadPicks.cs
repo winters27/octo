@@ -47,6 +47,15 @@ public sealed class PickedCopy
             ? new Octo.Services.Lidarr.LidarrReleasePick(ReleaseGuid, indexer, ReleaseTitle)
             : null;
 
+    /// <summary>Whether this is the same copy: the same peer's same file, or the same release.</summary>
+    public bool SameAs(PickedCopy? other) =>
+        other is not null
+        && string.Equals(Source, other.Source, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(Peer, other.Peer, StringComparison.Ordinal)
+        && string.Equals(File, other.File, StringComparison.Ordinal)
+        && string.Equals(ReleaseGuid, other.ReleaseGuid, StringComparison.Ordinal)
+        && IndexerId == other.IndexerId;
+
     /// <summary>"FLAC 16-bit 44.1 kHz from someone", for the log and the upgrade queue.</summary>
     public string Describe()
     {
