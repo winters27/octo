@@ -33,10 +33,11 @@ public sealed class LibraryHealthController(LibraryHealthService health, BrowseS
 
     /// <summary>The findings, grouped, with counts, plain-words reasons, paths, and what can be fixed.</summary>
     [HttpGet]
-    public async Task<IActionResult> Get([FromQuery] bool fresh = false, CancellationToken ct = default)
+    public async Task<IActionResult> Get([FromQuery] string? fresh = null, CancellationToken ct = default)
     {
         if (NavidromeUser() is not { } user) return NotAdmin();
-        var found = await health.ReportAsync(fresh, ct);
+        // "Check again": read the library from Navidrome now. 1 or true.
+        var found = await health.ReportAsync(fresh is "1" or "true" or "True", ct);
         if (found is null)
             return StatusCode(503, new
             {
@@ -412,7 +413,7 @@ public sealed class LibraryHealthController(LibraryHealthService health, BrowseS
         var gone = HealthWords.CountText(fix.Remove.Count, "copy", "copies");
         var filled = !canFill || fix.Fills.Count == 0
             ? ""
-            : $" Fills in {string.Join(", ", fix.Fills.Select(change => HealthFixes.TagName(change.Tag).ToLowerInvariant()))}.";
+            : $" Fills in {string.Join(", ", fix.Fills.Select(change => change.Tag == SongTagFields.Isrc ? "ISRC" : HealthFixes.TagName(change.Tag).ToLowerInvariant()))}.";
         return $"Keeps {HealthFixes.CopyName(fix.Keep, fields)} and moves {gone} to the trash.{filled}";
     }
 
@@ -477,16 +478,10 @@ public sealed class LibraryHealthController(LibraryHealthService health, BrowseS
         title = song.Title,
         artist = song.Artist,
         album = song.Album,
-        albumId = song.AlbumId,
         albumArtist = fields.AlbumArtist(song),
         year = song.Year is > 0 ? song.Year : null,
-        genre = string.Join("; ", song.Genres),
-        track = song.Track is > 0 ? song.Track : null,
-        disc = song.Disc is > 0 ? song.Disc : null,
-        seconds = fields.Seconds(song),
         quality = HealthWords.QualityText(song, fields),
         lossless = fields.Lossless(song),
-        cover = song.HasCover,
         path = song.Path,
     };
 

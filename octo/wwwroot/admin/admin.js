@@ -142,6 +142,7 @@ function activateTab(name, { focus = false } = {}) {
   if (name === 'fetched' && typeof loadFetched === 'function') loadFetched();
   if ((name === 'status' || name === 'fetched') && typeof loadAmbient === 'function') loadAmbient();
   if (name === 'lossy' && typeof loadLossy === 'function') loadLossy();
+  if (name === 'health' && typeof loadHealth === 'function') loadHealth();
   if (name === 'imports' && typeof loadImports === 'function') loadImports();
   if (name === 'raw' && typeof loadRawConfig === 'function') loadRawConfig();
   if (name === 'sources' && typeof loadConfigSources === 'function') loadConfigSources();
@@ -209,6 +210,7 @@ const ACTIVITY_PAGE_REFRESH = {
   covers: () => typeof loadCoverUpgrade === 'function' && loadCoverUpgrade(),
   lyrics: () => typeof loadLyricsLibrary === 'function' && loadLyricsLibrary(),
   lossy: () => typeof loadUpgrades === 'function' && loadUpgrades(),
+  health: () => typeof loadHealth === 'function' && loadHealth(),
   fetched: () => typeof loadFetched === 'function' && loadFetched(),
   imports: () => typeof loadImports === 'function' && loadImports(),
   soulseek: () => typeof loadSharing === 'function' && loadSharing(),
@@ -5998,6 +6000,545 @@ impEl('imp-trickle-rows')?.addEventListener('click', async event => {
 
 // A saved Client ID or redirect URI changes what Connect can do, so the page reads itself again.
 impEl('imports-form')?.addEventListener('submit', () => setTimeout(loadImports, 800));
+
+// ────────────────────────────────────────────────────────────────
+// Library health: the Octo app's checks and fixes, worked out on the server
+// ────────────────────────────────────────────────────────────────
+// GET /api/admin/health is the report; every fix is previewed first (POST .../preview), then
+// run on the server one song at a time (POST .../apply, .../lookup) while this page follows
+// GET .../run. A finished run says what it did beside an Undo. Only a Navidrome admin gets an
+// answer; the fixes also need library actions on, with them on the allowed list.
+// How many sets of copies or split albums, and how many songs, a finding shows before Show more.
+const HEALTH_PAGE = 50;
+const HEALTH_GROUPS = 12;
+const healthPage = check => (check === 'duplicates' || check === 'splitAlbums' ? HEALTH_GROUPS : HEALTH_PAGE);
+let healthReport = null;
+let healthShown = {};
+let healthTimer = null;
+let healthHandledRun = null;
+let healthLoading = false;
+
+function healthPaneOpen() {
+  return document.querySelector('section[data-pane="health"]')?.classList.contains('active') ?? false;
+}
+
+async function healthCall(path, body = undefined) {
+  const options = body === undefined ? { cache: 'no-store' } : {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  };
+  try {
+    const r = await api(path, options);
+    const data = await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, data };
+  } catch {
+    return { ok: false, status: 0, data: { error: 'Octo did not answer.' } };
+  }
+}
+
+const healthPlural = (n, one, many = `${one}s`) => `${(n ?? 0).toLocaleString()} ${n === 1 ? one : many}`;
+const healthSong = id => healthReport?.songs?.[id] ?? { id, title: id };
+
+async function loadHealth({ fresh = false } = {}) {
+  const body = document.getElementById('health-body');
+  if (!body || healthLoading) return;
+  healthLoading = true;
+  const refresh = document.getElementById('health-refresh');
+  if (refresh) refresh.disabled = true;
+  if (!healthReport || fresh) body.innerHTML = stateBlock('loading', fresh ? 'Reading your library from Navidrome again…' : 'Checking your library…');
+  const { ok, data } = await healthCall(`/api/admin/health${fresh ? '?fresh=1' : ''}`);
+  healthLoading = false;
+  if (refresh) refresh.disabled = false;
+  if (!ok) {
+    healthReport = null;
+    body.innerHTML = stateBlock('error', data.error || 'Library health could not be read.');
+    return;
+  }
+  healthReport = data;
+  renderHealth();
+  followHealthRun(data.run, data.undoCount);
+}
+
+function renderHealth() {
+  const report = healthReport;
+  const body = document.getElementById('health-body');
+  if (!report || !body) return;
+  const read = report.readUtc ? ` Read from Navidrome ${relTime(report.readUtc)}.` : '';
+  document.getElementById('health-overview').textContent = report.overview + read;
+
+  const gate = document.getElementById('health-gate');
+  gate.hidden = !report.can?.why;
+  if (report.can?.why) {
+    gate.innerHTML = `<span>${esc(report.can.why)} The findings are listed either way. </span>`
+      + `<button type="button" class="link-button" data-open-tab="libraryactions">Open Library actions</button>`;
+  }
+
+  if (report.clean) {
+    body.innerHTML = stateBlock('empty', report.allClear);
+    return;
+  }
+  body.innerHTML = report.checks.map(healthSection).join('');
+  // A preview or a lookup's review open before stays open.
+  for (const [check, open] of Object.entries(healthPreviews)) {
+    if (open.lookupRun) renderHealthLookups(open.lookupRun);
+    else if (open.data) renderHealthPreview(check);
+  }
+}
+
+// What a check offers: its fix-all button, and a lookup for songs a fill cannot reach.
+function healthFixes(check) {
+  const can = healthReport.can || {};
+  const busy = healthReport.run?.state === 'running';
+  const songs = check.songs || [];
+  const batch = healthReport.lookupBatch || 25;
+  const lookUp = can.lookUp && songs.length && ['noTrackNumber', 'noYear', 'noGenre', 'noAlbumArtist'].includes(check.check)
+    ? `Look up ${songs.length > batch ? `the first ${batch}` : healthPlural(songs.length, 'song')}` : null;
+  let all = null;
+  if (check.check === 'duplicates' && can.remove) all = check.fixAllLabel;
+  if (check.check === 'splitAlbums' && can.joinAlbums) all = check.fixAllLabel;
+  if (check.check === 'noCover' && can.addCover) all = check.fixAllLabel;
+  if (check.check === 'noLength' && can.upgrade) all = check.fixAllLabel;
+  if (['noYear', 'noGenre', 'noAlbumArtist'].includes(check.check) && can.edit && check.fixAllLabel) all = check.fixAllLabel;
+  return { all, lookUp, busy };
+}
+
+// Why a check's fix is not offered when the server could otherwise fix things from here.
+function healthWhyNot(check, fixes) {
+  const can = healthReport.can || {};
+  if (can.why || fixes.all) return '';
+  if (check.check === 'duplicates' && !can.remove) return 'Removing a copy needs the Delete action, which is off. Turn it on under Library actions to fix these here.';
+  if (check.check === 'noLength' && !can.upgrade) return 'Finding a higher quality copy needs the Better quality action and Soulseek or Lidarr. Turn it on under Library actions.';
+  if (check.check === 'noCover' && !can.addCover) return 'This server cannot look covers up.';
+  if (['noYear', 'noGenre', 'noAlbumArtist'].includes(check.check) && can.edit && !check.fixAllLabel)
+    return 'No song here has an album that agrees on it, so they can only be looked up.';
+  return '';
+}
+
+function healthSection(check) {
+  const fixes = healthFixes(check);
+  const fixable = fixes.all || fixes.lookUp;
+  const whyNot = healthWhyNot(check, fixes);
+  const buttons = [
+    fixes.lookUp ? `<button class="btn btn-ghost" type="button" data-health-lookup-all="${check.check}"${fixes.busy ? ' disabled' : ''}>${icon('i-magnifying-glass')}<span>${esc(fixes.lookUp)}</span></button>` : '',
+    fixes.all ? `<button class="btn btn-primary" type="button" data-health-fix-all="${check.check}"${fixes.busy ? ' disabled' : ''}>${icon('i-check')}<span>${esc(fixes.all)}</span></button>` : '',
+  ].join('');
+  return `
+    <div class="set-section health-check" data-check="${check.check}">
+      <div class="set-head">
+        <h3 class="set-title">${esc(check.title)}</h3>
+        <p class="set-desc"><strong class="health-count">${esc(check.countLabel)}.</strong> ${esc(check.meaning)}</p>
+      </div>
+      <div class="set-card">
+        <div class="set-row">
+          <div class="set-info">
+            <div class="set-info-t">${fixable ? 'Fix them' : 'What to do'}</div>
+            <div class="set-info-d">${esc(fixable ? check.fixMeaning : check.advice)}</div>
+            ${whyNot ? `<div class="set-info-d">${esc(whyNot)}${whyNot.includes('Library actions') ? ' <button type="button" class="link-button" data-open-tab="libraryactions">Open Library actions</button>' : ''}</div>` : ''}
+            ${fixable ? '<div class="set-info-more">Every fix below shows what it changes first. The buttons on each item fix that one alone.</div>' : ''}
+          </div>
+          ${buttons ? `<div class="set-ctrl health-ctrl">${buttons}</div>` : ''}
+        </div>
+        <div class="set-row stack health-preview" id="health-preview-${check.check}" hidden></div>
+      </div>
+      ${healthItems(check)}
+    </div>`;
+}
+
+function healthMore(check, total) {
+  const shown = healthShown[check] ?? healthPage(check);
+  if (total <= shown) return '';
+  return `<div class="health-more"><button class="btn btn-ghost btn-sm" type="button" data-health-more="${check}">Show ${Math.min(healthPage(check), total - shown).toLocaleString()} more of ${(total - shown).toLocaleString()}</button></div>`;
+}
+
+function healthItems(check) {
+  const shown = healthShown[check.check] ?? healthPage(check.check);
+  const can = healthReport.can || {};
+  const busy = healthReport.run?.state === 'running';
+  const off = busy ? ' disabled' : '';
+  if (check.check === 'duplicates') {
+    const cards = check.sets.slice(0, shown).map(set => {
+      const copies = set.copies.map(id => {
+        const song = healthSong(id);
+        const kept = id === set.keep;
+        const side = kept
+          ? '<span class="dl-badge good">Kept</span>'
+          : can.remove ? `<button class="btn btn-ghost btn-sm" type="button" data-health-keep="${esc(set.key)}" data-id="${esc(id)}"${off}>Keep this one</button>` : '';
+        return healthRow(song, `<div class="dl-sub">${esc(song.quality)}</div>`, side);
+      }).join('');
+      const fix = can.remove ? `<div class="health-actions"><button class="btn btn-sm" type="button" data-health-fix-set="${esc(set.key)}"${off}>Fix these copies</button></div>` : '';
+      return `
+        <div class="health-group">
+          <div class="acq-head"><div class="dl-title">${esc(set.heading)}</div><span class="dl-badge state">${esc(set.basis)}</span></div>
+          <div class="dl-sub">${esc(set.summary)}</div>
+          <div class="health-copies">${copies}</div>
+          <div class="dl-sub">${esc(set.line)}${set.note ? ` ${esc(set.note)}` : ''}</div>
+          ${fix}
+        </div>`;
+    }).join('');
+    return `<div class="health-groups">${cards}</div>${healthMore(check.check, check.sets.length)}`;
+  }
+  if (check.check === 'splitAlbums') {
+    const cards = check.albums.slice(0, shown).map(album => {
+      const parts = album.parts.map((part, index) => {
+        const first = healthSong(part.songs[0]);
+        const titles = part.songs.map(id => healthSong(id).title).join(', ');
+        return `<div class="health-part">
+          <div class="dl-by">${index === 0 ? 'Joined onto: ' : ''}${esc(healthPlural(part.songs.length, 'song'))}, album artist ${esc(first.albumArtist || 'none')}${first.year ? `, ${first.year}` : ''}</div>
+          <div class="dl-sub">${esc(titles)}</div>
+        </div>`;
+      }).join('');
+      const join = can.joinAlbums ? `<div class="health-actions"><button class="btn btn-sm" type="button" data-health-join="${esc(album.key)}"${off}>Join this album</button></div>` : '';
+      return `
+        <div class="health-group">
+          <div class="acq-head"><div class="dl-title">${esc(album.heading)}</div></div>
+          <div class="dl-sub">${esc(album.summary)}</div>
+          <div class="health-copies">${parts}</div>
+          <div class="dl-sub">${esc(album.join.words)}</div>
+          ${join}
+        </div>`;
+    }).join('');
+    return `<div class="health-groups">${cards}</div>${healthMore(check.check, check.albums.length)}`;
+  }
+  const fills = new Map((check.fills || []).map(fill => [fill.id, fill]));
+  const rows = check.songs.slice(0, shown).map(id => {
+    const song = healthSong(id);
+    const fill = fills.get(id);
+    const buttons = [
+      fill && can.edit ? `<button class="btn btn-ghost btn-sm" type="button" data-health-fill="${check.check}" data-id="${esc(id)}"${off}>Fill in</button>` : '',
+      can.lookUp && check.check !== 'noLength' && check.check !== 'noCover' ? `<button class="btn btn-ghost btn-sm" type="button" data-health-lookup="${check.check}" data-id="${esc(id)}"${off}>Look up</button>` : '',
+      check.check === 'noCover' && can.addCover ? `<button class="btn btn-ghost btn-sm" type="button" data-health-cover="${esc(id)}"${off}>Find a cover</button>` : '',
+      check.check === 'noLength' && can.upgrade ? `<button class="btn btn-ghost btn-sm" type="button" data-health-upgrade="${esc(id)}"${off}>Find higher quality</button>` : '',
+    ].join('');
+    const extra = fill ? `<div class="dl-sub">From its album: ${esc(fill.words)}</div>` : '';
+    return healthRow(song, extra, buttons ? `<div class="health-actions">${buttons}</div>` : '');
+  }).join('');
+  return `<div class="dl-list health-songs">${rows}</div>${healthMore(check.check, check.songs.length)}`;
+}
+
+// A song row, as Fetched songs draws one: its title, who and where, then what can be done.
+function healthRow(song, extra, side) {
+  const by = [song.artist, song.album].filter(Boolean).map(esc).join(' <span class="dl-dash">·</span> ');
+  const badge = song.quality ? `<span class="dl-badge ${song.lossless ? 'flac' : 'mp3'}">${esc(String(song.quality).split(',')[0])}</span>` : '';
+  return `<div class="dl-item health-item">
+    <div class="dl-main">
+      <div class="dl-title">${esc(song.title)}</div>
+      ${by ? `<div class="dl-by">${by}</div>` : ''}
+      ${song.path ? `<div class="dl-path" title="${esc(song.path)}">${esc(song.path)}</div>` : ''}
+      ${extra}
+    </div>
+    <div class="dl-side">${badge ? `<div class="dl-tags">${badge}</div>` : ''}${side}</div>
+  </div>`;
+}
+
+// ── previews ─────────────────────────────────────────────────────
+// Each preview opens in its finding's card and asks the server what the fix would do. Cancel
+// closes it; the primary button runs exactly the steps shown.
+let healthPreviews = {};
+
+function healthPreviewHolder(check) {
+  return document.getElementById(`health-preview-${check}`);
+}
+
+function closeHealthPreview(check) {
+  const holder = healthPreviewHolder(check);
+  if (holder) { holder.hidden = true; holder.innerHTML = ''; }
+  delete healthPreviews[check];
+}
+
+async function openHealthPreview(check, request) {
+  const holder = healthPreviewHolder(check);
+  if (!holder) return;
+  holder.hidden = false;
+  holder.innerHTML = stateBlock('loading', 'Working out what this would change…');
+  holder.scrollIntoView({ block: 'nearest', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  const { ok, data } = await healthCall('/api/admin/health/preview', { check, ...request });
+  if (!ok) {
+    holder.innerHTML = `${stateBlock('error', data.error || 'The preview could not be made.')}${healthPreviewButtons(check, null)}`;
+    return;
+  }
+  healthPreviews[check] = { request, data };
+  renderHealthPreview(check);
+}
+
+function healthPreviewButtons(check, go, enabled = true) {
+  return `<div class="form-actions health-preview-actions">
+    <button class="btn btn-ghost" type="button" data-health-cancel="${check}">Cancel</button>
+    ${go ? `<button class="btn btn-primary" type="button" data-health-go="${check}"${enabled ? '' : ' disabled'}>${icon('i-check')}<span>${esc(go)}</span></button>` : ''}
+  </div>`;
+}
+
+function healthLines(lines, limit = 120) {
+  const shown = lines.slice(0, limit).join('');
+  return shown + (lines.length > limit ? `<p class="set-info-d">And ${(lines.length - limit).toLocaleString()} more.</p>` : '');
+}
+
+function renderHealthPreview(check) {
+  const holder = healthPreviewHolder(check);
+  const preview = healthPreviews[check];
+  if (!holder || !preview) return;
+  const data = preview.data;
+  let detail = '';
+  if (data.sets) {
+    const one = data.sets.length === 1;
+    detail = healthLines(data.sets.map(set => `<div class="health-plan">
+      <div class="set-info-t">${esc(set.heading)}</div>
+      <div class="set-info-d">${esc(one ? set.why : set.line)}${set.note ? ` ${esc(set.note)}` : ''}</div>
+      ${one ? healthDuplicateDetail(set, preview.request) : ''}
+    </div>`));
+  } else if (data.albums) {
+    detail = healthLines(data.albums.map(album => `<div class="health-plan">
+      <div class="set-info-t">${esc(album.heading)}</div>
+      <div class="set-info-d">${esc([...album.reasons, album.words].join(' '))}</div>
+      ${album.diff.map(part => `<div class="config-table health-diff" style="--cols: 2">
+        <div class="config-row config-row-head"><span>${esc(healthPlural(part.songs, 'song'))} moving</span><span>Now</span><span>After</span></div>
+        ${part.fields.map(field => `<div class="config-row${field.now !== field.after ? ' changes' : ''}"><span class="key">${esc(field.label)}</span><span class="value${field.now ? '' : ' empty'}">${esc(field.now ?? 'none')}</span><span class="value${field.after ? '' : ' empty'}">${esc(field.after ?? 'none')}</span></div>`).join('')}
+      </div>`).join('')}
+    </div>`));
+  } else if (data.lines) {
+    detail = `<div class="health-plan">${healthLines(data.lines.map(line => `<div class="set-info-d"><strong>${esc(line.title)}</strong>: ${esc(line.words)}</div>`))}</div>`;
+  }
+  const why = data.canFix === false && data.why ? `<div class="notice notice-warn">${esc(data.why)}</div>` : '';
+  const steps = (data.steps || []).length;
+  holder.innerHTML = `
+    <div class="set-info">
+      <div class="set-info-t">${esc(data.title)}</div>
+      <div class="set-info-d">${esc(data.meaning || '')}</div>
+    </div>
+    ${why}
+    <div class="health-plans">${detail}</div>
+    ${healthPreviewButtons(check, data.canFix === false ? null : data.go, steps > 0 || !!data.upgrade)}`;
+}
+
+// One set of copies: every tag of every copy side by side, what the kept copy ends with, the
+// blanks it can take from the others, and a pick where the copies disagree.
+function healthDuplicateDetail(set, request) {
+  const diff = set.diff;
+  if (!diff) return '';
+  const cols = diff.copies.length + 1;
+  const head = diff.copies.map(copy => `<span>${copy.kept ? 'Kept, ' : ''}${esc(copy.quality)}</span>`).join('');
+  const rows = diff.rows.map(row => `<div class="config-row${row.changes ? ' changes' : ''}">
+    <span class="key">${esc(row.label)}</span>
+    ${row.values.map(value => `<span class="value${value ? '' : ' empty'}">${esc(value ?? 'none')}</span>`).join('')}
+    <span class="value${row.after ? '' : ' empty'}">${esc(row.after ?? 'none')}</span>
+  </div>`).join('');
+  const picked = request.fills ?? set.fills.map(fill => fill.tag);
+  const fills = set.fills.length ? `<div class="health-picks">
+    <div class="set-info-t">Fill in from the other copies</div>
+    ${set.fills.map(fill => `<label class="lossy-check"><input type="checkbox" class="pick" data-health-fill-tag="${esc(fill.tag)}" data-key="${esc(set.key)}"${picked.includes(fill.tag) ? ' checked' : ''} /><span>${esc(fill.words)}</span></label>`).join('')}
+  </div>` : '';
+  const differs = set.differs.length ? `<div class="health-picks">
+    <div class="set-info-t">Where the copies disagree</div>
+    ${set.differs.map(choice => `<div class="health-choice" role="group" aria-label="${esc(choice.label)}">
+      <span class="set-info-d">${esc(choice.label)}</span>
+      ${[...new Set(choice.values.map(v => v.value))].map(value => `<button class="btn btn-ghost btn-sm" type="button" data-health-choose="${esc(choice.tag)}" data-key="${esc(set.key)}" data-value="${esc(value)}" aria-pressed="${choice.picked === value}">${esc(value)}</button>`).join('')}
+    </div>`).join('')}
+  </div>` : '';
+  return `<div class="config-table health-diff" style="--cols: ${cols}">
+      <div class="config-row config-row-head"><span>Tag</span>${head}<span>After</span></div>
+      ${rows}
+    </div>${fills}${differs}`;
+}
+
+async function runHealthPreview(check) {
+  const preview = healthPreviews[check];
+  if (!preview) return;
+  const data = preview.data;
+  const holder = healthPreviewHolder(check);
+  const go = holder?.querySelector('[data-health-go]');
+  if (data.upgrade) {
+    // Better quality's own queue takes these, with its own gates and progress.
+    if (go) go.disabled = true;
+    const { ok, data: answer } = await healthCall('/api/admin/upgrades', { songs: data.upgrade });
+    closeHealthPreview(check);
+    showHealthResult(ok
+      ? `Asked for a higher quality copy of ${healthPlural(answer.queued, 'song')}. Better quality shows how each one goes.`
+      : answer.error || 'Better quality did not take them.', false);
+    return;
+  }
+  await startHealthRun('/api/admin/health/apply', { label: data.label, check, steps: data.steps }, check);
+}
+
+async function startHealthRun(path, body, check) {
+  const holder = healthPreviewHolder(check);
+  const go = holder?.querySelector('[data-health-go]');
+  if (go) go.disabled = true;
+  const { ok, data } = await healthCall(path, body);
+  if (!ok) {
+    if (holder && !holder.hidden) note(holder.querySelector('.health-preview-actions') || holder, data.error || 'That did not start.', 'error');
+    else showHealthResult(data.error || 'That did not start.', false);
+    if (go) go.disabled = false;
+    return;
+  }
+  if (path.endsWith('/apply') || path.endsWith('/undo')) closeHealthPreview(check);
+  document.getElementById('health-result').hidden = true;
+  if (healthReport) healthReport.run = data.run;
+  renderHealth();
+  followHealthRun(data.run, 0);
+}
+
+// ── runs ─────────────────────────────────────────────────────────
+function renderHealthRun(run) {
+  const wrap = document.getElementById('health-run-wrap');
+  const list = document.getElementById('health-run');
+  if (!wrap || !list) return;
+  const running = run?.state === 'running';
+  wrap.hidden = !running;
+  if (!running) { list.innerHTML = ''; return; }
+  const pct = run.total ? Math.round((run.done / run.total) * 100) : 0;
+  const unit = run.kind === 'lookup' ? 'songs' : 'changes';
+  list.innerHTML = `<div class="acq-card">
+    <div class="acq-art">${icon(run.kind === 'lookup' ? 'i-magnifying-glass' : 'i-wrench')}</div>
+    <div class="dl-main">
+      <div class="acq-head">
+        <div class="dl-title">${esc(run.label)}</div>
+        <span class="dl-badge state">${run.done.toLocaleString()} of ${run.total.toLocaleString()} ${unit}</span>
+      </div>
+      ${run.current ? `<div class="dl-sub">Now: ${esc(run.current)}</div>` : ''}
+      <div class="acq-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><span style="width:${pct}%"></span></div>
+      <div class="health-actions"><button class="btn btn-ghost btn-sm" type="button" id="health-stop">Stop after this song</button></div>
+    </div>
+  </div>`;
+}
+
+function followHealthRun(run, undoCount) {
+  clearTimeout(healthTimer);
+  renderHealthRun(run);
+  if (!run) return;
+  if (run.state === 'running') {
+    if (healthPaneOpen()) healthTimer = setTimeout(pollHealthRun, 1200);
+    return;
+  }
+  if (healthHandledRun === run.id) return;
+  const fresh = !healthHandledRun;
+  healthHandledRun = run.id;
+  // A run that ended before this page was opened is not news; one that ended while it watched is.
+  if (fresh && run.finishedUtc && Date.now() - Date.parse(run.finishedUtc) > 120000) return;
+  if (run.kind === 'lookup') { renderHealthLookups(run); return; }
+  const text = run.state === 'failed' ? `${run.label} stopped: ${run.error || 'something went wrong'}.` : run.summary;
+  showHealthResult(text, run.kind === 'fix' && undoCount > 0);
+}
+
+async function pollHealthRun() {
+  const { ok, data } = await healthCall('/api/admin/health/run');
+  if (!ok) return;
+  const was = healthReport?.run;
+  if (healthReport) healthReport.run = data.run;
+  if (data.run?.state === 'running') { followHealthRun(data.run, data.undoCount); return; }
+  // Finished: the fixed songs leave their findings (the report is read again, which then says
+  // how it went), and the buttons come back.
+  if (was?.state === 'running' && data.run?.kind !== 'lookup') { loadHealth(); return; }
+  renderHealth();
+  followHealthRun(data.run, data.undoCount);
+}
+
+function showHealthResult(text, undo) {
+  const box = document.getElementById('health-result');
+  if (!box) return;
+  document.getElementById('health-result-text').textContent = text;
+  document.getElementById('health-undo').hidden = !undo;
+  box.hidden = false;
+}
+
+// What a lookup found, each change picked when it fills a blank or the match is sure; nothing
+// is written until the button below is pressed.
+function renderHealthLookups(run) {
+  const check = run.check || 'noTrackNumber';
+  let holder = healthPreviewHolder(check);
+  if (!holder) holder = healthPreviewHolder((healthReport?.checks || [])[0]?.check);
+  if (!holder) return;
+  const found = run.lookups.filter(lookup => lookup.state === 'found');
+  const misses = run.lookups.filter(lookup => lookup.state !== 'found');
+  const changes = found.reduce((sum, lookup) => sum + lookup.changes.length, 0);
+  const blocks = found.filter(lookup => lookup.changes.length).map(lookup => `<div class="health-plan">
+    <div class="set-info-t">${esc(lookup.title)}</div>
+    <div class="set-info-d">${esc(lookup.origin || '')}</div>
+    <div class="health-picks">${lookup.changes.map(change => `<label class="lossy-check"><input type="checkbox" class="pick" data-health-lookup-pick data-id="${esc(lookup.id)}" data-title="${esc(lookup.title)}" data-tag="${esc(change.tag)}" data-value="${esc(change.value)}"${change.pick ? ' checked' : ''} /><span>${esc(change.words)}</span></label>`).join('')}</div>
+  </div>`).join('');
+  const summary = !found.length
+    ? (misses[0]?.detail || 'Nothing was found.')
+    : !changes ? 'The tags already say what was found. Nothing to change.'
+      : `Found tags for ${healthPlural(found.length, 'song')}. Sure matches and blanks are picked; look over the rest.`;
+  holder.hidden = false;
+  healthPreviews[holder.id.replace('health-preview-', '')] = { lookupRun: run };
+  holder.innerHTML = `
+    <div class="set-info">
+      <div class="set-info-t">${esc(run.label)}</div>
+      <div class="set-info-d">${esc(summary)}${misses.length && found.length ? ` ${esc(healthPlural(misses.length, 'song'))} found nothing.` : ''}</div>
+    </div>
+    <div class="health-plans">${blocks}</div>
+    <div class="form-actions health-preview-actions">
+      <button class="btn btn-ghost" type="button" data-health-cancel="${holder.id.replace('health-preview-', '')}">Close</button>
+      ${changes ? `<button class="btn btn-primary" type="button" data-health-write="${esc(run.check || '')}">${icon('i-check')}<span>Write the picked changes</span></button>` : ''}
+    </div>`;
+}
+
+function healthWriteLookups(check, holder) {
+  const byId = new Map();
+  holder.querySelectorAll('[data-health-lookup-pick]:checked').forEach(box => {
+    const step = byId.get(box.dataset.id) || { action: 'retag', id: box.dataset.id, title: box.dataset.title, with: {} };
+    step.with[box.dataset.tag] = box.dataset.value;
+    byId.set(box.dataset.id, step);
+  });
+  const steps = [...byId.values()];
+  if (!steps.length) { note(holder.querySelector('.health-preview-actions'), 'Nothing is picked.', 'info'); return; }
+  startHealthRun('/api/admin/health/apply', { label: 'Writing tags', check: check || null, steps }, holder.id.replace('health-preview-', ''));
+}
+
+// ── wiring ───────────────────────────────────────────────────────
+document.getElementById('health-refresh')?.addEventListener('click', () => loadHealth({ fresh: true }));
+document.getElementById('health-result-close')?.addEventListener('click', () => { document.getElementById('health-result').hidden = true; });
+document.getElementById('health-undo')?.addEventListener('click', async event => {
+  event.currentTarget.disabled = true;
+  const { ok, data } = await healthCall('/api/admin/health/undo', {});
+  event.currentTarget.disabled = false;
+  if (!ok) { showHealthResult(data.error || 'Undo did not start.', false); return; }
+  document.getElementById('health-result').hidden = true;
+  if (healthReport) healthReport.run = data.run;
+  followHealthRun(data.run, 0);
+});
+document.getElementById('health-trash-link')?.addEventListener('click', () => {
+  openTab('libraryactions');
+  const trash = document.getElementById('trash-section');
+  if (trash) setTimeout(() => trash.scrollIntoView({ block: 'start' }), 0);
+});
+
+document.querySelector('section[data-pane="health"]')?.addEventListener('click', event => {
+  const target = event.target.closest('button, input');
+  if (!target || !healthReport) return;
+  const d = target.dataset;
+  const checkOf = name => healthReport.checks.find(check => check.check === name);
+  if (target.id === 'health-stop') { target.disabled = true; healthCall('/api/admin/health/stop', {}); return; }
+  if (d.healthMore) { healthShown[d.healthMore] = (healthShown[d.healthMore] ?? healthPage(d.healthMore)) + healthPage(d.healthMore); renderHealth(); return; }
+  if (d.healthCancel) { closeHealthPreview(d.healthCancel); return; }
+  if (d.healthGo) { runHealthPreview(d.healthGo); return; }
+  if (d.healthWrite !== undefined) { healthWriteLookups(d.healthWrite, target.closest('.health-preview')); return; }
+  if (d.healthFixAll) { openHealthPreview(d.healthFixAll, {}); return; }
+  if (d.healthLookupAll) {
+    const check = checkOf(d.healthLookupAll);
+    const ids = (check?.songs || []).slice(0, healthReport.lookupBatch || 25);
+    startHealthRun('/api/admin/health/lookup', { ids, check: d.healthLookupAll }, d.healthLookupAll);
+    return;
+  }
+  if (d.healthFixSet) { openHealthPreview('duplicates', { keys: [d.healthFixSet] }); return; }
+  if (d.healthKeep) { openHealthPreview('duplicates', { keys: [d.healthKeep], keep: d.id }); return; }
+  if (d.healthJoin) { openHealthPreview('splitAlbums', { keys: [d.healthJoin] }); return; }
+  if (d.healthFill) { openHealthPreview(d.healthFill, { keys: [d.id] }); return; }
+  if (d.healthCover) { openHealthPreview('noCover', { keys: [d.healthCover] }); return; }
+  if (d.healthUpgrade) { openHealthPreview('noLength', { keys: [d.healthUpgrade] }); return; }
+  if (d.healthLookup) { startHealthRun('/api/admin/health/lookup', { ids: [d.id], check: d.healthLookup }, d.healthLookup); return; }
+  // A pick in one set's preview asks again, so the diff shows what the kept copy ends with.
+  if (d.healthChoose || d.healthFillTag !== undefined) {
+    const preview = healthPreviews.duplicates;
+    if (!preview) return;
+    const request = { ...preview.request, keys: [d.key] };
+    if (d.healthChoose) request.choose = { ...(request.choose || {}), [d.healthChoose]: d.value };
+    if (d.healthFillTag !== undefined) {
+      request.fills = [...target.closest('.health-plan').querySelectorAll('[data-health-fill-tag]:checked')].map(box => box.dataset.healthFillTag);
+    }
+    openHealthPreview('duplicates', request);
+  }
+});
 
 // ────────────────────────────────────────────────────────────────
 // Boot

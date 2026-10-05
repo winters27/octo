@@ -145,6 +145,8 @@ public class AdminSignInTests
         // The fake Navidrome has no native song list, so the report says it could not read one.
         Assert.Equal(HttpStatusCode.ServiceUnavailable, report.StatusCode);
         Assert.Contains("could not read your library", (await Json(report)).GetProperty("error").GetString());
+        // Check again asks with ?fresh=1.
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, (await client.GetAsync("/api/admin/health?fresh=1")).StatusCode);
 
         using var apply = await PostJsonAsync(client, "/api/admin/health/apply",
             new { label = "Fixing copies", check = "duplicates", steps = new[] { new { action = "remove", id = "a", title = "A" } } });

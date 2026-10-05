@@ -1720,6 +1720,79 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .acq-error { font-size: var(--t-label); color: #ff9a8f; margin-top: 6px; }
 .acq-bar { height: 6px; margin-top: 10px; border-radius: var(--r-pill); background: rgba(255, 255, 255, 0.10); overflow: hidden; }
 .acq-bar > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, rgb(var(--accent-rgb) / 0.75), var(--accent)); transition: width var(--t-card) var(--ease); }
+
+/* ── Library health: findings in Afterglow's own parts ──
+ * A finding is a set-section; its fixes sit in a set-card, its sets of copies and split albums
+ * are nested cards in one glass panel (acq-card's look), and its songs are Fetched songs' rows. */
+.health-check .set-desc .health-count { color: var(--ink-1); font-weight: 600; }
+.health-ctrl { flex-wrap: wrap; justify-content: flex-end; }
+.health-groups {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  gap: var(--s-l);
+  padding: var(--s-l);
+  margin-top: var(--s-l);
+  background: var(--glass-sheen), var(--glass);
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--r-panel);
+  box-shadow: var(--glass-rim), var(--glass-drop);
+}
+.health-group {
+  display: flex; flex-direction: column; gap: var(--s-m);
+  padding: var(--s-l);
+  border-radius: 16px;
+  background: var(--nest);
+  box-shadow: var(--nest-rim);
+  min-width: 0;
+}
+.health-group .dl-sub { line-height: 1.45; overflow-wrap: anywhere; }
+/* Titles here wrap rather than cut off, as the in-progress cards do. */
+.health-group .dl-title, .health-item .dl-title { white-space: normal; overflow-wrap: anywhere; }
+/* The whole path, wrapped: Fetched songs' right-to-left cut garbles a path that starts with a number. */
+.health-group .dl-path, .health-item .dl-path { direction: ltr; white-space: normal; overflow-wrap: anywhere; }
+.health-group .dl-by, .health-item .dl-by { white-space: normal; overflow-wrap: anywhere; }
+/* Quality words keep their case ("kHz"), unlike the other tables' headings. */
+.health-diff .config-row-head { text-transform: none; letter-spacing: 0; }
+.health-copies { display: flex; flex-direction: column; gap: var(--s-xs); }
+.health-copies .dl-item { padding: var(--s-m) var(--s-m); border-radius: 12px; }
+.health-part { padding: var(--s-s) var(--s-m); border-radius: 12px; background: rgba(0, 0, 0, 0.12); }
+.health-part .dl-by { white-space: normal; }
+.health-actions { display: flex; flex-wrap: wrap; gap: var(--s-s); justify-content: flex-end; }
+.health-group > .health-actions { justify-content: flex-start; }
+.health-songs { margin-top: var(--s-l); }
+.health-item .dl-side { max-width: 50%; }
+.health-more { display: flex; justify-content: center; padding: var(--s-l) 0 0; }
+.health-preview { gap: var(--s-l); }
+.health-plans { display: flex; flex-direction: column; gap: var(--s-l); max-height: 560px; overflow-y: auto; }
+.health-plan { display: flex; flex-direction: column; gap: var(--s-s); }
+.health-diff .config-row { grid-template-columns: minmax(6.5rem, 0.8fr) repeat(var(--cols, 2), minmax(0, 1fr)); gap: var(--s-l); }
+.health-diff .config-row .key { font-family: inherit; color: var(--text-secondary); }
+.health-diff .config-row .value { font-family: inherit; word-break: normal; overflow-wrap: anywhere; }
+.health-diff .config-row.changes .value:last-child { color: var(--accent); font-weight: 600; }
+.health-picks { display: flex; flex-direction: column; gap: var(--s-s); }
+.health-choice { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-s); }
+.health-choice .btn[aria-pressed="true"] { background: rgb(var(--accent-rgb) / 0.16); color: var(--accent); }
+.health-preview-actions { margin: 0; padding: 0; border: 0; background: none; justify-content: flex-end; }
+.health-foot { margin-top: var(--s-section); }
+/* A narrow card puts a row's badges and buttons under its words, and a finding's buttons under
+ * what they do, so the words keep a readable width. */
+.health-group { container-type: inline-size; }
+@container (max-width: 420px) {
+  .health-copies .dl-item { flex-direction: column; align-items: stretch; gap: var(--s-s); }
+  .health-copies .dl-side { flex-direction: row; flex-wrap: wrap; align-items: center; max-width: none; }
+}
+@container (max-width: 480px) {
+  .health-check .set-card > .set-row:not(.stack) { flex-direction: column; align-items: stretch; gap: var(--s-l); }
+  .health-check .health-ctrl { justify-content: flex-start; }
+}
+@media (max-width: 760px) {
+  .health-groups { grid-template-columns: 1fr; padding: var(--s-m); }
+  .health-item { flex-direction: column; align-items: stretch; gap: var(--s-s); }
+  .health-item .dl-side { max-width: none; margin-left: 0; flex-direction: row; flex-wrap: wrap; align-items: center; }
+  .health-actions { justify-content: flex-start; }
+  .health-diff .config-row { grid-template-columns: repeat(var(--cols, 2), minmax(0, 1fr)); }
+  .health-diff .config-row .key { grid-column: 1 / -1; }
+}
 @media (max-width: 760px) {
   .dl-item { flex-wrap: wrap; }
   .dl-side { flex-direction: row; align-items: center; margin-left: calc(56px + var(--s-xl)); }
