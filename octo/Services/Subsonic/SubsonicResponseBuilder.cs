@@ -157,8 +157,9 @@ public partial class SubsonicResponseBuilder
     public Dictionary<string, object> GeneratedPlaylistFields(Octo.Services.Library.GeneratedPlaylist mix,
         Octo.Models.Settings.GeneratedPlaylistSettings settings)
     {
-        var songCount = Math.Min(settings.EffectiveTrackCount, mix.PoolSize);
         var forYou = Octo.Services.Library.ForYouLists.IsForYou(mix.Kind);
+        // A Made for you list is exactly what was stored; a mix draws its track count from a pool.
+        var songCount = forYou ? mix.PoolSize : Math.Min(settings.EffectiveTrackCount, mix.PoolSize);
         var fields = new Dictionary<string, object>
         {
             ["id"] = mix.Id, ["name"] = mix.Name, ["owner"] = mix.Owner,

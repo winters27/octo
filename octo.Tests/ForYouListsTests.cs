@@ -166,29 +166,49 @@ internal sealed class ForYouUpstream : HttpMessageHandler
 
     public List<string> Calls { get; } = [];
     public bool CatalogDown { get; set; }
+    /// <summary>While set, every catalog call waits for it.</summary>
+    public TaskCompletionSource? HoldCatalog { get; set; }
+    /// <summary>The artist has more than a page of releases, the newest single on the second.</summary>
+    public bool LongCareer { get; set; }
+    /// <summary>A library of more than a page whose second page Navidrome fails to send.</summary>
+    public bool WalkBreaks { get; set; }
 
-    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        var asked = request.RequestUri!;
+        lock (Calls) Calls.Add(asked.Host + "/" + asked.AbsolutePath.Trim('/'));
+        if (HoldCatalog is { } hold && asked.Host != "navidrome.test") await hold.Task;
+        return await Answer(request);
+    }
+
+    private Task<HttpResponseMessage> Answer(HttpRequestMessage request)
     {
         var uri = request.RequestUri!;
         var path = uri.AbsolutePath.Trim('/');
-        lock (Calls) Calls.Add(uri.Host + "/" + path);
         if (uri.Host != "navidrome.test" && CatalogDown)
             return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.TooManyRequests));
+        if (WalkBreaks && path == "rest/search3"
+            && System.Web.HttpUtility.ParseQueryString(uri.Query)["songOffset"] != "0")
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError));
         var body = (uri.Host, path) switch
         {
             ("navidrome.test", "rest/search3") => Navidrome(uri.Query),
             ("navidrome.test", "rest/ping" or "rest/ping.view") => Plain(uri.Query, ""),
             ("navidrome.test", "rest/getPlaylists" or "rest/getPlaylists.view") => Plain(uri.Query, "playlists"),
             (_, "search/artist") => """{"data":[{"id":7,"name":"Big Artist","nb_fan":900},{"id":8,"name":"Big Artist Tribute","nb_fan":5000}]}""",
+            (_, "artist/7/albums") when LongCareer && uri.Query.Contains("index=100", StringComparison.Ordinal) =>
+                "{\"data\":[" + Album(104, "Page Two Single", "single", Day(1), 1, "https://cdn.test/104.jpg") + "],\"total\":105}",
             (_, "artist/7/albums") => "{\"data\":["
                 + Album(100, "New Album", "album", Day(10), 4, "https://cdn.test/100.jpg") + ","
                 + Album(101, "New Single", "single", Day(3), 1, "https://cdn.test/101.jpg") + ","
                 + Album(102, "Old Album", "album", Day(400), 9, null) + ","
-                + Album(103, "Coming Soon", "album", Day(-30), 9, null) + "],\"total\":4}",
+                + Album(103, "Coming Soon", "album", Day(-30), 9, null) + "],\"total\":" + (LongCareer ? 105 : 4) + "}",
+            (_, "album/104") => """{"id":104,"title":"Page Two Single","record_type":"single","nb_tracks":1,"artist":{"name":"Big Artist"}}""",
+            (_, "album/104/tracks") => "{\"data\":[" + AlbumTrack("Page Two Song", 180, 1, 300) + "],\"total\":1}",
             (_, "album/100") => """{"id":100,"title":"New Album","record_type":"album","nb_tracks":4,"artist":{"name":"Big Artist"}}""",
             (_, "album/100/tracks") => "{\"data\":["
-                + AlbumTrack("Opener", 180, 1, 100) + "," + AlbumTrack("Hit", 200, 2, 900) + ","
-                + AlbumTrack("Owned Song", 210, 3, 800) + "," + AlbumTrack("Closer", 240, 4, 700) + "],\"total\":4}",
+                + AlbumTrack("Opener", 180, 1, 100) + "," + AlbumTrack("Hit", 200, 2, 900, explicitLyrics: 1) + ","
+                + AlbumTrack("Owned Song", 210, 3, 800, explicitLyrics: 1) + "," + AlbumTrack("Closer", 240, 4, 700) + "],\"total\":4}",
             (_, "album/101") => """{"id":101,"title":"New Single","record_type":"single","nb_tracks":1,"artist":{"name":"Big Artist"}}""",
             // The single is credited to a guest, as the catalog does with shared songs.
             (_, "album/101/tracks") => "{\"data\":[" + AlbumTrack("Single Song", 190, 1, 500, "Guest Star") + "],\"total\":1}",
@@ -211,16 +231,22 @@ internal sealed class ForYouUpstream : HttpMessageHandler
     private static string Album(int id, string title, string type, string date, int tracks, string? cover) =>
         $$"""{"id":{{id}},"title":"{{title}}","record_type":"{{type}}","release_date":"{{date}}","nb_tracks":{{tracks}}{{(cover is null ? "" : $",\"cover_xl\":\"{cover}\"")}}}""";
 
-    private static string AlbumTrack(string title, int duration, int position, int rank, string artist = "Big Artist") =>
+    private static string AlbumTrack(string title, int duration, int position, int rank, string artist = "Big Artist",
+        int explicitLyrics = 0) =>
         "{\"title\":\"" + title + "\",\"duration\":" + duration + ",\"track_position\":" + position
-        + ",\"disk_number\":1,\"rank\":" + rank + ",\"artist\":{\"name\":\"" + artist + "\"}}";
+        + ",\"disk_number\":1,\"rank\":" + rank + ",\"explicit_content_lyrics\":" + explicitLyrics
+        + ",\"artist\":{\"name\":\"" + artist + "\"}}";
 
-    private static string Navidrome(string query)
+    private string Navidrome(string query)
     {
         var offset = System.Web.HttpUtility.ParseQueryString(query)["songOffset"];
         if (offset != "0") return """{"subsonic-response":{"status":"ok","version":"1.16.1","searchResult3":{"song":[]}}}""";
         var old = DateTime.UtcNow.AddYears(-1).ToString("O");
         var songs = new List<string>();
+        // A full first page, so the walk asks for a second.
+        if (WalkBreaks)
+            for (var i = 0; i < 500; i++)
+                songs.Add($$"""{"id":"filler{{i}}","title":"Filler {{i}}","artist":"Filler","artistId":"arFiller","duration":200,"playCount":9}""");
         for (var i = 0; i < 12; i++)
             songs.Add($$"""{"id":"big{{i}}","title":"Big {{i}}","artist":"Big Artist","artistId":"arBig","duration":200,"playCount":{{(i < 6 ? 8 : 0)}},"played":"{{old}}"}""");
         songs.Add("""{"id":"owned","title":"Owned Song","artist":"Big Artist","artistId":"arBig","duration":210,"playCount":0}""");
@@ -266,6 +292,70 @@ public class NewReleasesBuilderTests
         Assert.DoesNotContain(upstream.Calls, call => call.Contains("artist/8/", StringComparison.Ordinal));
         Assert.DoesNotContain(upstream.Calls, call => call.Contains("album/102", StringComparison.Ordinal));
         Assert.DoesNotContain(upstream.Calls, call => call.Contains("album/103", StringComparison.Ordinal));
+        // The catalog's artist rides on a song credited to them; a guest's song names no catalog artist.
+        var hit = result.Entries.Single(entry => entry.Outside?.Title == "Hit");
+        Assert.Equal("7", registry.Lookup(hit.Outside!.ArtistId!)!.ExternalArtistId);
+        Assert.Equal(1, hit.Outside.ExplicitContentLyrics);
+    }
+
+    private static (NewReleasesBuilder Builder, ForYouUpstream Upstream) Make(Action<ForYouUpstream>? setUp = null)
+    {
+        var upstream = new ForYouUpstream();
+        setUp?.Invoke(upstream);
+        var deezer = new DeezerMetadataService(new ReviewFixtures.OneClientFactory(upstream),
+            TestOptions.Monitor(new MetadataSettings()), NullLogger<DeezerMetadataService>.Instance);
+        return (new NewReleasesBuilder(deezer, new ExternalIdRegistry(), NullLogger<NewReleasesBuilder>.Instance), upstream);
+    }
+
+    private static readonly ForYouLists.TopArtist BigArtist = new("arBig", "Big Artist", 50, 0, 13);
+
+    private static IReadOnlyList<string> Titles(NewReleasesBuilder.Result result) =>
+        result.Entries.Select(entry => entry.Outside?.Title ?? entry.Library!["title"]!.GetValue<string>()).ToList();
+
+    [Fact]
+    public async Task ACleanOnlyServer_LeavesOutExplicitOutsideSongs_ButNeverTheListenersOwn()
+    {
+        var (builder, _) = Make();
+        var library = new List<JsonObject>
+        {
+            JsonNode.Parse("""{"id":"owned","title":"Owned Song","artist":"Big Artist","playCount":0}""")!.AsObject(),
+        };
+
+        var clean = await builder.BuildAsync([BigArtist], library, DateOnly.FromDateTime(DateTime.UtcNow), 8,
+            CancellationToken.None, ExplicitFilter.CleanOnly);
+
+        Assert.Equal(["Single Song", "Owned Song", "Closer"], Titles(clean));
+    }
+
+    [Fact]
+    public async Task ALongCareer_IsReadPastItsFirstPage_SoTheNewestSingleIsFound()
+    {
+        var (builder, upstream) = Make(fake => fake.LongCareer = true);
+
+        var result = await builder.BuildAsync([BigArtist], [], DateOnly.FromDateTime(DateTime.UtcNow), 8, CancellationToken.None);
+
+        Assert.Equal("Page Two Song", Titles(result)[0]);
+        Assert.Contains(upstream.Calls, call => call.EndsWith("artist/7/albums", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ListenersBuildingTogether_TakeTheCatalogInTurn()
+    {
+        var (builder, upstream) = Make(fake => fake.HoldCatalog = new TaskCompletionSource());
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+
+        var first = builder.BuildAsync([BigArtist], [], today, 8, CancellationToken.None);
+        // Another listener, another artist: a search of its own, were it allowed to ask.
+        var second = builder.BuildAsync([new ForYouLists.TopArtist("arOther", "Other Artist", 9, 0, 3)], [], today, 8,
+            CancellationToken.None);
+        await Task.Delay(200);
+        // Only the first listener's walk is asking the catalog; the second waits its turn.
+        lock (upstream.Calls) Assert.Single(upstream.Calls, call => call.EndsWith("search/artist", StringComparison.Ordinal));
+        upstream.HoldCatalog!.SetResult();
+
+        Assert.NotEmpty((await first).Entries);
+        Assert.Empty((await second).Entries);
+        lock (upstream.Calls) Assert.Equal(2, upstream.Calls.Count(call => call.EndsWith("search/artist", StringComparison.Ordinal)));
     }
 }
 
@@ -281,11 +371,15 @@ public class ForYouServiceTests : IDisposable
 
     private static readonly Dictionary<string, string> Auth = new() { ["u"] = "alice", ["t"] = "token", ["s"] = "salt", ["v"] = "1.16.1", ["c"] = "test" };
 
-    private GeneratedPlaylistService Service(ForYouUpstream upstream, GeneratedPlaylistSettings settings)
+    private ServiceProvider? _services;
+
+    private GeneratedPlaylistService Service(ForYouUpstream upstream, GeneratedPlaylistSettings settings,
+        ExplicitFilter explicitFilter = ExplicitFilter.All)
     {
         var services = new ServiceCollection()
             .AddSingleton<IHttpClientFactory>(new ReviewFixtures.OneClientFactory(upstream))
-            .AddSingleton<IOptionsMonitor<SubsonicSettings>>(TestOptions.Monitor(new SubsonicSettings { Url = "http://navidrome.test" }))
+            .AddSingleton<IOptionsMonitor<SubsonicSettings>>(TestOptions.Monitor(
+                new SubsonicSettings { Url = "http://navidrome.test", ExplicitFilter = explicitFilter }))
             .AddSingleton<IOptionsMonitor<MetadataSettings>>(TestOptions.Monitor(new MetadataSettings()))
             .AddSingleton<IHttpContextAccessor>(new HttpContextAccessor())
             .AddSingleton(new ExternalIdRegistry())
@@ -296,6 +390,7 @@ public class ForYouServiceTests : IDisposable
                 sp.GetRequiredService<ExternalIdRegistry>(), NullLogger<NewReleasesBuilder>.Instance))
             .AddScoped<SubsonicProxyService>()
             .BuildServiceProvider();
+        _services = services;
         return new GeneratedPlaylistService(Path.Combine(_dir, "generated-playlists.json"),
             services.GetRequiredService<IServiceScopeFactory>(), TestOptions.Monitor(settings),
             TestOptions.Monitor(new GenreSettings()), NullLogger<GeneratedPlaylistService>.Instance);
@@ -383,6 +478,91 @@ public class ForYouServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task AnOutsideSongPushedOutOfOctosMemory_IsMadeAgain_WithTheSameId()
+    {
+        var service = Service(new ForYouUpstream(), new GeneratedPlaylistSettings());
+        var lists = await ListedAsync(service);
+        var registry = _services!.GetRequiredService<ExternalIdRegistry>();
+        var outside = (await service.MaterializeAsync("alice", lists[0], Auth, CancellationToken.None))
+            .Where(song => song["isExternal"]?.GetValue<bool>() == true)
+            .Select(song => song["id"]!.GetValue<string>())
+            .ToList();
+        Assert.NotEmpty(outside);
+
+        // A busy day of searches: more outside songs than Octo remembers.
+        for (var i = 0; i < 10_050; i++)
+            registry.Register(new SoulseekRouting { Kind = RoutingKind.Song, Artist = "Flood", Title = "Song " + i });
+        Assert.All(outside, id => Assert.Null(registry.Lookup(id)));
+
+        var served = await service.MaterializeAsync("alice", lists[0], Auth, CancellationToken.None);
+
+        Assert.All(outside, id => Assert.NotNull(registry.Lookup(id)));
+        Assert.All(served, song => Assert.Null(song["octoCatalog"]));
+    }
+
+    [Fact]
+    public async Task AWalkThatBreaksPartWay_LeavesTheListsAsTheyWere()
+    {
+        var upstream = new ForYouUpstream();
+        var first = await ListedAsync(Service(upstream, new GeneratedPlaylistSettings { RefreshHours = 1 }));
+        var deepCutsBefore = (await Service(upstream, new GeneratedPlaylistSettings { RefreshHours = 1 })
+            .MaterializeAsync("alice", first[2], Auth, CancellationToken.None)).Select(song => song["id"]!.GetValue<string>()).ToList();
+
+        upstream.WalkBreaks = true;
+        var again = Service(upstream, new GeneratedPlaylistSettings { RefreshHours = 1, NewReleaseWeeks = 9 });
+        await again.ListAsync("alice", Auth);
+        await Task.Delay(500);
+        var lists = await again.ListAsync("alice", Auth);
+
+        var deepCuts = lists.Single(list => list.Kind == ForYouLists.DeepCutsKind);
+        Assert.Equal(deepCutsBefore,
+            (await again.MaterializeAsync("alice", deepCuts, Auth, CancellationToken.None)).Select(song => song["id"]!.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task RediscoverAndDeepCuts_ShowWhileNewReleasesWaitsOnTheCatalog()
+    {
+        var upstream = new ForYouUpstream { HoldCatalog = new TaskCompletionSource() };
+        var service = Service(upstream, new GeneratedPlaylistSettings());
+
+        var early = await ListedAsync(service);
+        Assert.Equal(["rediscover", "deepCuts"], early.Select(list => list.Kind));
+
+        upstream.HoldCatalog.SetResult();
+        IReadOnlyList<GeneratedPlaylist> lists = early;
+        for (var i = 0; i < 100 && lists.Count < 3; i++)
+        {
+            await Task.Delay(100);
+            lists = await service.ListAsync("alice", Auth);
+        }
+        Assert.Equal(["newReleases", "rediscover", "deepCuts"], lists.Select(list => list.Kind));
+    }
+
+    [Fact]
+    public async Task TheExplicitFilter_IsObeyed_AndChangingItMakesNewReleasesAgain()
+    {
+        var upstream = new ForYouUpstream();
+        var all = await ListedAsync(Service(upstream, new GeneratedPlaylistSettings()));
+        var allService = Service(upstream, new GeneratedPlaylistSettings());
+        Assert.Contains(await allService.MaterializeAsync("alice", all[0], Auth, CancellationToken.None),
+            song => song["title"]!.GetValue<string>() == "Hit");
+
+        var clean = Service(upstream, new GeneratedPlaylistSettings(), ExplicitFilter.CleanOnly);
+        await clean.ListAsync("alice", Auth);
+        IReadOnlyList<JsonObject> songs = [];
+        for (var i = 0; i < 50; i++)
+        {
+            await Task.Delay(100);
+            var lists = await clean.ListAsync("alice", Auth);
+            songs = await clean.MaterializeAsync("alice", lists[0], Auth, CancellationToken.None);
+            if (songs.All(song => song["title"]!.GetValue<string>() != "Hit")) break;
+        }
+
+        Assert.DoesNotContain(songs, song => song["title"]!.GetValue<string>() == "Hit");
+        Assert.Contains(songs, song => song["title"]!.GetValue<string>() == "Owned Song");
+    }
+
+    [Fact]
     public async Task AllThreeOff_AndMixesOff_IsNothing()
         => Assert.Empty(await Service(new ForYouUpstream(),
             new GeneratedPlaylistSettings { NewReleases = false, Rediscover = false, DeepCuts = false }).ListAsync("alice", Auth));
@@ -392,8 +572,27 @@ public class ForYouResponseTests
 {
     private static SubsonicResponseBuilder Builder() => new(new ExternalIdRegistry(), Options.Create(new SubsonicSettings()));
 
-    private static GeneratedPlaylist List(string kind) =>
-        new("og" + new string('a', 20), "for:" + kind, kind, kind, kind, "alice", 10, DateTime.UtcNow, DateTime.UtcNow.AddDays(1));
+    private static GeneratedPlaylist List(string kind, int songs = 10) =>
+        new("og" + new string('a', 20), "for:" + kind, kind, kind, kind, "alice", songs, DateTime.UtcNow, DateTime.UtcNow.AddDays(1));
+
+    [Fact]
+    public void AMadeForYouList_CountsWhatItHolds_NotTheMixesTrackCount()
+    {
+        var settings = new GeneratedPlaylistSettings { TrackCount = 10 };
+
+        Assert.Equal(24, Builder().GeneratedPlaylistFields(List(ForYouLists.DeepCutsKind, 24), settings)["songCount"]);
+        Assert.Equal(10, Builder().GeneratedPlaylistFields(List("genre", 24), settings)["songCount"]);
+    }
+
+    [Theory]
+    [InlineData("https://cdn-images.dzcdn.net/images/cover/abc/1000x1000-000000-80-0-0.jpg", true)]
+    [InlineData("https://e-cdns-images.dzcdn.net/images/cover/abc/500x500.jpg", true)]
+    [InlineData("http://cdn-images.dzcdn.net/images/cover/abc.jpg", false)]
+    [InlineData("https://dzcdn.net.example.com/cover.jpg", false)]
+    [InlineData("https://192.168.1.10/cover.jpg", false)]
+    [InlineData("not a url", false)]
+    public void NewReleasesCovers_AreFetchedOnlyFromTheCatalogsImageHost(string url, bool fetched)
+        => Assert.Equal(fetched, Octo.Controllers.SubsonicController.IsCatalogImage(url));
 
     [Fact]
     public void AMadeForYouList_SaysWhichOne_AndAMixDoesNot()

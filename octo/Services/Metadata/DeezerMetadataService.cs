@@ -58,9 +58,10 @@ public partial class DeezerMetadataService : IDisposable
         string? CoverUrl, int? Year, int TrackCount, string? RecordType, string? ReleaseDate = null);
 
     /// <summary>One track of an album, with the real length and position. Rank is the catalog's
-    /// popularity score, which picks an album's best songs for New Releases.</summary>
+    /// popularity score, which picks an album's best songs for New Releases.
+    /// ExplicitContentLyrics is the catalog's own: 1 explicit, 0 clean, 3 a clean edit.</summary>
     public record AlbumTrack(string Title, string Artist, int? Duration,
-        int? TrackPosition, int? DiscNumber, string? Isrc, int? Rank = null);
+        int? TrackPosition, int? DiscNumber, string? Isrc, int? Rank = null, int? ExplicitContentLyrics = null);
 
     /// <summary>An album plus its full tracklist. RecordType is the catalog's own word for it:
     /// album, ep, single or compile.</summary>
@@ -596,11 +597,15 @@ public partial class DeezerMetadataService : IDisposable
     /// singles; grouped after the records, they no longer bury them. The artist's name is not
     /// on this listing, so every hit carries the one given.
     /// </summary>
+    /// <param name="pages">How many of the catalog's pages of 100 to read for a long career. The
+    /// catalog lists albums before singles, so a new single of an artist with more than a page of
+    /// releases is on a later page; New Releases reads up to three.</param>
     public async Task<List<AlbumHit>> GetArtistAlbumsAsync(string deezerArtistId, string artistName, CancellationToken ct = default,
-        bool background = false)
+        bool background = false, int pages = 1)
     {
         if (string.IsNullOrWhiteSpace(deezerArtistId)) return new List<AlbumHit>();
-        var key = $"ara|{deezerArtistId}".ToLowerInvariant();
+        pages = Math.Clamp(pages, 1, 5);
+        var key = (pages > 1 ? $"ara|{deezerArtistId}|p{pages}" : $"ara|{deezerArtistId}").ToLowerInvariant();
         if (TryGetCached<List<AlbumHit>>(key, out var cached)) return cached!;
 
         var releases = new List<AlbumHit>();
@@ -608,18 +613,29 @@ public partial class DeezerMetadataService : IDisposable
         var byTitle = new Dictionary<string, int>(StringComparer.Ordinal);
         int? total = null;
         var listed = 0;
+        var partial = false;
         try
         {
             var id = Uri.EscapeDataString(deezerArtistId);
-            using var r = await GetJsonAsync($"{Base}/artist/{id}/albums?limit={ArtistAlbumsLimit}", ct, background);
-            // Caching an empty list on a refusal would leave the artist's page empty for hours.
-            if (r.Transient) return new List<AlbumHit>();
-            if (r.Doc is not null
-                && r.Doc.RootElement.TryGetProperty("data", out var data)
-                && data.ValueKind == JsonValueKind.Array)
+            for (var page = 0; page < pages; page++)
             {
-                total = Int(r.Doc.RootElement, "total");
-                listed = data.GetArrayLength();
+                using var r = await GetJsonAsync($"{Base}/artist/{id}/albums?limit={ArtistAlbumsLimit}"
+                    + (page > 0 ? $"&index={page * ArtistAlbumsLimit}" : ""), ct, background);
+                // Caching an empty list on a refusal would leave the artist's page empty for hours.
+                // A later page refused keeps the first pages, briefly.
+                if (r.Transient)
+                {
+                    if (page == 0) return new List<AlbumHit>();
+                    partial = true;
+                    break;
+                }
+                if (r.Doc is null
+                    || !r.Doc.RootElement.TryGetProperty("data", out var data)
+                    || data.ValueKind != JsonValueKind.Array)
+                    break;
+                total ??= Int(r.Doc.RootElement, "total");
+                var count = data.GetArrayLength();
+                listed += count;
                 // Materialize everything before the JsonDocument is disposed.
                 foreach (var a in data.EnumerateArray())
                 {
@@ -646,6 +662,7 @@ public partial class DeezerMetadataService : IDisposable
                         releases[at] = hit;
                     }
                 }
+                if (count == 0 || total is not int knownTotal || listed >= knownTotal) break;
             }
         }
         catch (Exception ex)
@@ -663,7 +680,7 @@ public partial class DeezerMetadataService : IDisposable
             .OrderBy(h => ReleaseRank(h.RecordType))
             .ThenByDescending(h => h.Year ?? 0)
             .ToList();
-        Put(key, hits, hits.Count == 0 ? NegativeTtl : PositiveTtl);
+        Put(key, hits, partial ? PartialTtl : hits.Count == 0 ? NegativeTtl : PositiveTtl);
         return hits;
     }
 
@@ -701,6 +718,14 @@ public partial class DeezerMetadataService : IDisposable
         "compile" => 3,
         _ => 4,
     };
+
+    /// <summary>A track's explicit state as the catalog's number, from its yes or no when the
+    /// number is missing.</summary>
+    private static int? ExplicitOf(JsonElement track) =>
+        Int(track, "explicit_content_lyrics")
+        ?? (track.TryGetProperty("explicit_lyrics", out var said) && said.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? said.GetBoolean() ? 1 : 0
+            : null);
 
     /// <summary>A track count already known for an album, without asking the catalog.</summary>
     public bool TryKnownTrackCount(string deezerId, out int? count) => TryGetCached($"tc|{deezerId}", out count);
@@ -864,7 +889,8 @@ public partial class DeezerMetadataService : IDisposable
                         var tArtist = t.TryGetProperty("artist", out var ta) ? Str(ta, "name") : null;
                         tracks.Add(new AlbumTrack(
                             tTitle, tArtist ?? artist, Int(t, "duration"),
-                            Int(t, "track_position"), Int(t, "disk_number"), Str(t, "isrc"), Int(t, "rank")));
+                            Int(t, "track_position"), Int(t, "disk_number"), Str(t, "isrc"), Int(t, "rank"),
+                            ExplicitOf(t)));
                     }
 
                     var total = Int(tr.Doc.RootElement, "total");

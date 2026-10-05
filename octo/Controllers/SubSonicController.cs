@@ -2228,6 +2228,39 @@ public partial class SubsonicController : ControllerBase
             .ToList();
     }
 
+    private const int CatalogImageMaxBytes = 8 * 1024 * 1024;
+
+    /// <summary>A cover the catalog's own image host serves over https (cdn-images.dzcdn.net and its kin).</summary>
+    internal static bool IsCatalogImage(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        && uri.Scheme == Uri.UriSchemeHttps
+        && (uri.Host.Equals("dzcdn.net", StringComparison.OrdinalIgnoreCase)
+            || uri.Host.EndsWith(".dzcdn.net", StringComparison.OrdinalIgnoreCase));
+
+    private static async Task<byte[]?> CatalogImageAsync(IHttpClientFactory http, string url, CancellationToken ct)
+    {
+        try
+        {
+            using var response = await http.CreateClient(Octo.Services.Metadata.DeezerRateLimiter.ClientName)
+                .GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+            if (!response.IsSuccessStatusCode || response.Content.Headers.ContentLength > CatalogImageMaxBytes) return null;
+            await using var body = await response.Content.ReadAsStreamAsync(ct);
+            using var copy = new MemoryStream();
+            var buffer = new byte[81920];
+            int read;
+            while ((read = await body.ReadAsync(buffer, ct)) > 0)
+            {
+                if (copy.Length + read > CatalogImageMaxBytes) return null;
+                copy.Write(buffer, 0, read);
+            }
+            return copy.ToArray();
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>
     /// The songs whose covers colour a mix's cover: the first of this period's draw, one per
     /// album cover, four at most, read from Navidrome as the listener. A period's first draw is
@@ -2238,18 +2271,15 @@ public partial class SubsonicController : ControllerBase
     {
         if (_generatedPlaylists is null) return [];
         // New Releases is mostly albums Navidrome has never heard of: its covers come from the
-        // catalog's own image host, as the album pages of outside albums do.
+        // catalog's own image host, as the album pages of outside albums do. Only that host, over
+        // https, through the catalog's client (8 second limit), and no picture bigger than 8 MB.
         if (mix.Kind == Octo.Services.Library.ForYouLists.NewReleasesKind)
         {
             var http = HttpContext.RequestServices.GetService<IHttpClientFactory>();
             if (http is null) return [];
             return _generatedPlaylists.ForYouCovers(username)
-                .Where(url => Uri.TryCreate(url, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps)
-                .Select(url => new CoverSeed("catalog|" + url, async token =>
-                {
-                    try { return await http.CreateClient().GetByteArrayAsync(url, token); }
-                    catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException) { return null; }
-                }))
+                .Where(IsCatalogImage)
+                .Select(url => new CoverSeed("catalog|" + url, token => CatalogImageAsync(http, url, token)))
                 .ToList();
         }
         var auth = parameters.Where(pair => pair.Key is not ("id" or "size")).ToDictionary(pair => pair.Key, pair => pair.Value);

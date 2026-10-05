@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.Json.Nodes;
 using Octo.Models.Domain;
+using Octo.Models.Settings;
 using Octo.Services.Common;
 using Octo.Services.Metadata;
 using Octo.Services.Soulseek;
@@ -228,25 +229,73 @@ public sealed class NewReleasesBuilder(DeezerMetadataService deezer, ExternalIdR
     private static readonly TimeSpan Missed = TimeSpan.FromDays(1);
     private const int ArtistCandidates = 5;
     private const int ReleasesAtOnce = 4;
+    private const int ArtistAlbumPages = 3;
+
+    // One listener's catalog walk at a time. The catalog's background lane takes two calls a
+    // second and every call, its wait included, gives up after 8 seconds: listeners refreshing
+    // together would time each other out, and a timed-out artist looks like one with no releases.
+    private readonly SemaphoreSlim _oneAtATime = new(1, 1);
 
     // A catalog artist per library artist name, or none, for a while: names do not move.
     private readonly ConcurrentDictionary<string, (string? Id, DateTime Until)> _artists = new(StringComparer.Ordinal);
 
-    /// <summary>One entry of New Releases: a library song as Navidrome sent it, or an outside song.</summary>
-    public sealed record Entry(JsonObject? Library, Song? Outside, string? CoverUrl);
+    /// <summary>
+    /// What an outside song of New Releases is made from, kept with the list so the song can be
+    /// made again, with the same id, whenever the list is served: Octo remembers outside songs
+    /// only so long (<see cref="ExternalIdRegistry"/> keeps the most recent 10,000), and the list
+    /// outlives a busy day of searches.
+    /// </summary>
+    public sealed record CatalogSeed(string Title, string Artist, string? ArtistId, string? Album, string? AlbumId,
+        string? CoverUrl, int? Duration, int? Year, int? Track, int? ExplicitContentLyrics);
+
+    /// <summary>The outside song a seed makes, registered so it plays, opens its album and is added with "+".</summary>
+    public static Song Mint(ExternalIdRegistry registry, CatalogSeed seed)
+    {
+        var song = TopSongsService.CatalogSong(registry, new DeezerMetadataService.ChartTrack(
+            "", seed.Title, seed.Artist, seed.ArtistId, seed.Album, seed.AlbumId, seed.CoverUrl, seed.Duration, null));
+        song.Year = seed.Year;
+        song.Track = seed.Track;
+        song.ExplicitContentLyrics = seed.ExplicitContentLyrics;
+        return song;
+    }
+
+    /// <summary>Whether the server's explicit filter lets an outside song in, as search and radio apply it.</summary>
+    public static bool ExplicitAllowed(int? explicitContentLyrics, ExplicitFilter filter) => filter switch
+    {
+        ExplicitFilter.CleanOnly => explicitContentLyrics is not 1,
+        ExplicitFilter.ExplicitOnly => explicitContentLyrics is not 3,
+        _ => true,
+    };
+
+    /// <summary>One entry of New Releases: a library song as Navidrome sent it, or an outside song and its seed.</summary>
+    public sealed record Entry(JsonObject? Library, Song? Outside, string? CoverUrl, CatalogSeed? Seed = null);
 
     /// <summary>What a build came to, and whether the catalog answered for every artist asked.</summary>
     public sealed record Result(IReadOnlyList<Entry> Entries, bool Whole);
 
     public async Task<Result> BuildAsync(IReadOnlyList<ForYouLists.TopArtist> artists, IReadOnlyList<JsonObject> library,
-        DateOnly today, int weeks, CancellationToken ct)
+        DateOnly today, int weeks, CancellationToken ct, ExplicitFilter explicitFilter = ExplicitFilter.All)
+    {
+        await _oneAtATime.WaitAsync(ct);
+        try
+        {
+            return await BuildOneAsync(artists, library, today, weeks, explicitFilter, ct);
+        }
+        finally
+        {
+            _oneAtATime.Release();
+        }
+    }
+
+    private async Task<Result> BuildOneAsync(IReadOnlyList<ForYouLists.TopArtist> artists, IReadOnlyList<JsonObject> library,
+        DateOnly today, int weeks, ExplicitFilter explicitFilter, CancellationToken ct)
     {
         var owned = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
         foreach (var song in library)
             owned.TryAdd(SongIdentity.MatchKey(ForYouLists.Str(song, "artist"), ForYouLists.Str(song, "title")), song);
 
         var whole = true;
-        var releases = new List<(DeezerMetadataService.AlbumHit Release, DateOnly Date, string ArtistName)>();
+        var releases = new List<(DeezerMetadataService.AlbumHit Release, string ArtistName, string ArtistId)>();
         // The catalog answers a throttled or failed call with nothing, just as it answers a name it
         // does not know. Nothing at all, for every artist asked, is read as no answer, so a bad
         // moment never replaces yesterday's list with an empty one.
@@ -258,15 +307,16 @@ public sealed class NewReleasesBuilder(DeezerMetadataService deezer, ExternalIdR
             var id = await ResolveAsync(artist.Name, ct);
             if (id is null) continue;
             resolved++;
-            var albums = await deezer.GetArtistAlbumsAsync(id, artist.Name, ct, background: true);
+            var albums = await deezer.GetArtistAlbumsAsync(id, artist.Name, ct, background: true, pages: ArtistAlbumPages);
             if (albums.Count > 0) listedAny = true;
             foreach (var release in ForYouLists.RecentReleases(albums, today, weeks))
                 if (releases.All(known => known.Release.DeezerId != release.DeezerId))
-                    releases.Add((release, ForYouLists.ReleaseDate(release)!.Value, artist.Name));
+                    releases.Add((release, artist.Name, id));
         }
         if (artists.Count > 0 && (resolved == 0 || !listedAny)) whole = false;
 
-        var picked = new (DeezerMetadataService.AlbumHit Release, IReadOnlyList<DeezerMetadataService.AlbumTrack> Tracks, string ArtistName)?[releases.Count];
+        var picked = new (DeezerMetadataService.AlbumHit Release, IReadOnlyList<DeezerMetadataService.AlbumTrack> Tracks,
+            string ArtistName, string ArtistId)?[releases.Count];
         using var gate = new SemaphoreSlim(ReleasesAtOnce);
         await Task.WhenAll(releases.Select(async (item, index) =>
         {
@@ -275,7 +325,8 @@ public sealed class NewReleasesBuilder(DeezerMetadataService deezer, ExternalIdR
             {
                 var lookup = await deezer.LookUpAlbumDetailAsync(item.Release.DeezerId, ct, background: true);
                 if (lookup.Detail is { } detail)
-                    picked[index] = (item.Release, ForYouLists.PickTracks(detail.RecordType ?? item.Release.RecordType, detail.Tracks), item.ArtistName);
+                    picked[index] = (item.Release, ForYouLists.PickTracks(detail.RecordType ?? item.Release.RecordType, detail.Tracks),
+                        item.ArtistName, item.ArtistId);
                 else if (lookup.Answer == DeezerMetadataService.AlbumAnswer.Unavailable)
                     whole = false;
             }
@@ -287,7 +338,8 @@ public sealed class NewReleasesBuilder(DeezerMetadataService deezer, ExternalIdR
 
         var entries = new List<Entry>();
         var listed = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var (release, tracks, artistName) in picked.OfType<(DeezerMetadataService.AlbumHit, IReadOnlyList<DeezerMetadataService.AlbumTrack>, string)>()
+        foreach (var (release, tracks, artistName, artistId) in picked
+                     .OfType<(DeezerMetadataService.AlbumHit, IReadOnlyList<DeezerMetadataService.AlbumTrack>, string, string)>()
                      .OrderByDescending(item => ForYouLists.ReleaseDate(item.Item1)))
         {
             foreach (var track in tracks)
@@ -298,17 +350,24 @@ public sealed class NewReleasesBuilder(DeezerMetadataService deezer, ExternalIdR
                 // Langley's page credited to Miranda Lambert), while the library files it under the
                 // listener's artist who led here: the same title under that artist is theirs too.
                 var byTheirArtist = SongIdentity.MatchKey(artistName, track.Title);
-                if (!listed.Add(key) || !listed.Add(byTheirArtist) && byTheirArtist != key) continue;
-                if (owned.TryGetValue(key, out var mine) || owned.TryGetValue(byTheirArtist, out mine))
+                if (listed.Contains(key) || listed.Contains(byTheirArtist)) continue;
+                var isTheirs = owned.TryGetValue(key, out var mine) || owned.TryGetValue(byTheirArtist, out mine);
+                // The listener's own copy is theirs whatever the filter; an outside song obeys it.
+                if (!isTheirs && !ExplicitAllowed(track.ExplicitContentLyrics, explicitFilter)) continue;
+                listed.Add(key);
+                listed.Add(byTheirArtist);
+                if (isTheirs)
                 {
-                    entries.Add(new Entry(mine.DeepClone().AsObject(), null, release.CoverUrl));
+                    entries.Add(new Entry(mine!.DeepClone().AsObject(), null, release.CoverUrl));
                     continue;
                 }
-                var song = TopSongsService.CatalogSong(registry, new DeezerMetadataService.ChartTrack(
-                    "", track.Title, track.Artist, null, release.Title, release.DeezerId, release.CoverUrl, track.Duration, null));
-                song.Year = ForYouLists.ReleaseDate(release)?.Year;
-                song.Track = track.TrackPosition;
-                entries.Add(new Entry(null, song, release.CoverUrl));
+                // The catalog artist found for the listener's artist is this song's when it is
+                // credited to them, so its artist link opens the right page.
+                var seed = new CatalogSeed(track.Title, track.Artist,
+                    SongIdentity.Key(track.Artist) == SongIdentity.Key(artistName) ? artistId : null,
+                    release.Title, release.DeezerId, release.CoverUrl, track.Duration,
+                    ForYouLists.ReleaseDate(release)?.Year, track.TrackPosition, track.ExplicitContentLyrics);
+                entries.Add(new Entry(null, Mint(registry, seed), release.CoverUrl, seed));
             }
         }
         logger.LogInformation("New Releases: {Releases} releases from {Artists} artists, {Songs} songs",
