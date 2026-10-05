@@ -471,18 +471,23 @@ public sealed class SongFinder
         var settings = _services.GetService<IOptionsMonitor<SoulseekSettings>>()?.CurrentValue ?? new SoulseekSettings();
         var rejected = _services.GetService<RejectedPeerRegistry>();
         var remembers = _services.GetService<Octo.Services.Fingerprint.DownloadVerificationService>()?.RemembersRejections ?? false;
-        var (copies, fit) = SoulseekFound(found.Hits, found.Ranked, target, settings, rejected, remembers);
-        var text = SoulseekSummary(found.Hits, fit);
+        var (copies, fit, listed) = SoulseekFound(found.Hits, found.Ranked, target, settings, rejected, remembers);
+        var text = SoulseekSummary(found.Hits, fit, listed);
         return (copies, found.Queries, text);
     }
 
-    /// <summary>"998 files from 490 peers; 40 fit the song", with the same count of fitting copies
-    /// the list marks as Octo's choices or "Fits too".</summary>
-    internal static string SoulseekSummary(IReadOnlyList<SoulseekFileHit> hits, int fit)
+    /// <summary>
+    /// "998 files from 490 peers; 40 fit the song", counting the same files the list marks as
+    /// Octo's choices or "Fits too". When the list has no room for all of them, it says how many
+    /// it shows: "306 fit the song; the best 240 are listed". The whole count stays, since it is
+    /// what Soulseek really has.
+    /// </summary>
+    internal static string SoulseekSummary(IReadOnlyList<SoulseekFileHit> hits, int fit, int listed)
     {
         if (hits.Count == 0) return "Nothing found";
         var peers = hits.Select(h => h.Username).Distinct(StringComparer.OrdinalIgnoreCase).Count();
-        return $"{hits.Count} files from {peers} {(peers == 1 ? "peer" : "peers")}; {fit} {(fit == 1 ? "fits" : "fit")} the song";
+        var text = $"{hits.Count} files from {peers} {(peers == 1 ? "peer" : "peers")}; {fit} {(fit == 1 ? "fits" : "fit")} the song";
+        return listed < fit ? $"{text}; the best {listed} are listed" : text;
     }
 
     /// <summary>
@@ -500,12 +505,12 @@ public sealed class SongFinder
     internal const int SkippedRoom = 60;
 
     /// <summary>
-    /// The list, and how many files fit the song: every check the download makes passed, which is
+    /// The list, how many files fit the song, and how many of those are on it: every check the download makes passed, which is
     /// exactly the rows with no reason against them (Octo's choices and "Fits too"). Past
     /// <see cref="MaxCopies"/>, a few files of each reason a file was passed over stay on the list,
     /// and the fitting copies, best first, fill the rest.
     /// </summary>
-    internal static (IReadOnlyList<FoundCopy> Copies, int Fit) SoulseekFound(IReadOnlyList<SoulseekFileHit> hits,
+    internal static (IReadOnlyList<FoundCopy> Copies, int Fit, int Listed) SoulseekFound(IReadOnlyList<SoulseekFileHit> hits,
         IReadOnlyList<SoulseekFileHit> ranked, FindTarget target, SoulseekSettings settings, RejectedPeerRegistry? rejected, bool remembers)
     {
         var order = ranked.Select((hit, i) => (hit, i)).ToDictionary(pair => (pair.hit.Username, pair.hit.Filename), pair => pair.i + 1);
@@ -544,7 +549,7 @@ public sealed class SongFinder
                 SampleRate = row.hit.SampleRate, Length = row.hit.Length,
             }))
             .ToList();
-        return (copies, fit);
+        return (copies, fit, rows.Where((row, at) => row.tier == 0 && kept.Contains(at)).Count());
     }
 
     private async Task<(IReadOnlyList<FoundCopy>, IReadOnlyList<string>, string?)> SearchLidarrAsync(FindTarget target,

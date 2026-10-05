@@ -251,7 +251,7 @@ public class DownloadLogTests
         var others = Enumerable.Range(0, 10).Select(i => File($"other{i}", "07 - Lose Yourself to Dance")).ToList();
         var hits = fitting.Concat(mp3s).Concat(others).ToList();
 
-        var (copies, fit) = SongFinder.SoulseekFound(hits, fitting.Take(5).ToList(), target, new SoulseekSettings(), null, false);
+        var (copies, fit, listed) = SongFinder.SoulseekFound(hits, fitting.Take(5).ToList(), target, new SoulseekSettings(), null, false);
 
         Assert.Equal(SongFinder.MaxCopies, copies.Count);
         Assert.Equal(SongFinder.SkippedPerReason, copies.Count(c => c.Shown.Note == "Not FLAC, which Octo looks for first"));
@@ -261,7 +261,11 @@ public class DownloadLogTests
         Assert.Equal(400, fit);
         Assert.Equal(400, hits.Count(hit => SoulseekCandidates.Judge(hit, target.Title, target.Album, target.Duration,
             new SoulseekSettings(), null, false, target.Artist).Tier == 0));
-        Assert.Equal("420 files from 420 peers; 400 fit the song", SongFinder.SoulseekSummary(hits, fit));
+        // The list has room for 290 of the 400, beside 5 of each of the two reasons.
+        Assert.Equal(290, listed);
+        Assert.Equal(listed, copies.Count(c => c.Shown.Rank is not null || c.Shown.Note == "Fits too; a download tries the first few"));
+        Assert.Equal("420 files from 420 peers; 400 fit the song; the best 290 are listed", SongFinder.SoulseekSummary(hits, fit, listed));
+        Assert.Equal("12 files from 12 peers; 7 fit the song", SongFinder.SoulseekSummary(hits.Take(12).ToList(), 7, 7));
     }
 
     // ---------------------------------------------------------------------------------------
