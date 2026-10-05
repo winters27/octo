@@ -14,9 +14,12 @@ namespace Octo.Services.LastFm;
 /// row's own artist at the front of its title is always taken out. Moving a song to another
 /// artist needs two things: that artist has rows of their own, and the song as repaired is
 /// among them, so Radiohead's "Creep - Acoustic" stays Radiohead's even when a band called
-/// Creep answers the same search. What cannot be put right is left as it was, except a row
-/// with no artist at all. Rows that turn out to be one song then keep the place of the first
-/// and the spelling of the most listened.
+/// Creep answers the same search. A title split at spaces alone ("Kanye West   Stronger") needs
+/// the same evidence, even under the song's own artist. A row whose artist field is another
+/// artist and a dash ("Kanye West - Stronger" with title "!") is dropped when it has under one
+/// in a hundred of that artist's listeners. What cannot be put right is left as it was, except
+/// a row with no artist at all. Rows that turn out to be one song then keep the place of the
+/// first and the spelling of the most listened.
 /// </summary>
 public static class LastFmSearchCleanup
 {
@@ -25,8 +28,15 @@ public static class LastFmSearchCleanup
         "unknown", "unknownartist", "notavailable", "na",
     };
 
-    // A hyphen, en dash or em dash (U+2013, U+2014), with or without space around it: "A - T", "A-T".
-    private static readonly Regex Dash = new(@"\s*[-\u2013\u2014]\s*", RegexOptions.Compiled);
+    // A hyphen or any of the Unicode dashes (U+2010 to U+2015) or the minus sign (U+2212), with or
+    // without space around it: "A - T", "A-T".
+    private static readonly Regex Dash = new(
+        $@"\s*[-{(char)0x2010}-{(char)0x2015}{(char)0x2212}]\s*", RegexOptions.Compiled);
+
+    private static readonly Regex Spaces = new(@"\s+", RegexOptions.Compiled);
+
+    /// <summary>A row carrying fewer than one in this many of its artist's listeners is noise.</summary>
+    private const long NoiseRatio = 100;
 
     public static List<LastFmService.SimilarTrack> Clean(IReadOnlyList<LastFmService.SimilarTrack> tracks)
     {
@@ -81,10 +91,11 @@ public static class LastFmSearchCleanup
         // "Artist - Title" in the title: under the artist itself ("Kanye West - Stronger" by Kanye
         // West), under no artist, or under someone else the answer names on their own, as a label
         // uploading the song ("Kavinsky - Nightcall" by Record Makers).
-        if (SplitAtArtist(title, (candidate, rest) =>
-                SongIdentity.Key(candidate) == artistKey
-                || (known.ContainsKey(SongIdentity.Key(candidate)) && songs.Contains(SongIdentity.MatchKey(candidate, rest))))
-            is var (named, rest))
+        bool Evidenced(string candidate, string rest) =>
+            (SongIdentity.Key(candidate) == artistKey || known.ContainsKey(SongIdentity.Key(candidate)))
+            && songs.Contains(SongIdentity.MatchKey(candidate, rest));
+        if ((SplitAt(Dash, title, (candidate, rest) => SongIdentity.Key(candidate) == artistKey || Evidenced(candidate, rest))
+             ?? SplitAt(Spaces, title, Evidenced)) is var (named, rest))
         {
             var namedKey = SongIdentity.Key(named);
             return track with
@@ -96,6 +107,10 @@ public static class LastFmSearchCleanup
 
         if (IsPlaceholder(artist))
         {
+            if (SplitAt(Spaces, title, (candidate, rest) =>
+                    known.ContainsKey(SongIdentity.Key(candidate)) && songs.Contains(SongIdentity.MatchKey(candidate, rest)))
+                is var (spacedArtist, spacedTitle))
+                return track with { Artist = known[SongIdentity.Key(spacedArtist)].Name, Title = spacedTitle };
             // With no artist to go on, "A - T" still names one, at the first spaced dash.
             var spaced = title.IndexOf(" - ", StringComparison.Ordinal);
             return spaced > 0 && spaced + 3 < title.Length
@@ -114,18 +129,27 @@ public static class LastFmSearchCleanup
                 return track with { Artist = spelled.Name };
         }
 
+        // Another artist and a dash in the artist field, far less listened than that artist:
+        // "Kavinsky - Nightcall" with title "Drive", a file named after the film it was in.
+        if (track.Listeners is { } listeners
+            && SplitAt(Dash, artist, (candidate, _) =>
+                   SongIdentity.Key(candidate) != artistKey
+                   && known.TryGetValue(SongIdentity.Key(candidate), out var named)
+                   && named.Listeners > listeners * NoiseRatio) is not null)
+            return null;
+
         return track;
     }
 
-    /// <summary>The title split at the dash after an artist <paramref name="accept"/> takes, with
-    /// the rest as the title, trying each dash in turn so a name with a hyphen in it
-    /// ("Jay-Z - 99 Problems") is read whole.</summary>
-    private static (string Artist, string Title)? SplitAtArtist(string title, Func<string, string, bool> accept)
+    /// <summary>The text split at the first <paramref name="separator"/> whose two sides
+    /// <paramref name="accept"/> takes, trying each in turn so a name with a hyphen or a space in
+    /// it ("Jay-Z - 99 Problems") is read whole.</summary>
+    private static (string Artist, string Title)? SplitAt(Regex separator, string text, Func<string, string, bool> accept)
     {
-        foreach (Match dash in Dash.Matches(title))
+        foreach (Match match in separator.Matches(text))
         {
-            var before = title[..dash.Index].Trim();
-            var after = title[(dash.Index + dash.Length)..].Trim();
+            var before = text[..match.Index].Trim();
+            var after = text[(match.Index + match.Length)..].Trim();
             if (before.Length == 0 || after.Length == 0) continue;
             if (accept(before, after)) return (before, after);
         }

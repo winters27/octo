@@ -1524,7 +1524,9 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: inset 0 1px 
 
 /* Listener rows: state first, then what to do. */
 .lfm-user .set-info { gap: 3px; }
-.lfm-state { display: inline-flex; align-items: center; gap: 8px; }
+/* Two items only, the dot and the sentence, so the gap never lands inside the words. */
+.lfm-state { display: inline-flex; align-items: baseline; gap: 8px; }
+.lfm-state .status-dot { align-self: center; }
 .lfm-state .status-dot { width: 8px; height: 8px; flex: none; }
 .lfm-hint { color: var(--fg-mute); }
 .lfm-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }

@@ -44,6 +44,55 @@ public class LastFmSearchCleanupTests
     }
 
     [Fact]
+    public void KanyeWestStronger_TheRowsThatGotThroughAtFirst_AreGoneToo()
+    {
+        // More of Last.fm's answer for "Kanye West Stronger" on 2026-09-30.
+        var rows = Clean(
+            T("Kanye West", "Stronger", 2977765),
+            T("Jeanne29570", "Kanye West Stronger", 25),
+            T("Kanye West \u2013 Stronger", "!", 79),
+            T("Kanye West \u2013 Stronger", "Stronger", 56),
+            T("eleonoraalili", "Kanye West   Stronger", 47),
+            T("Kanye West", "Kanye West   Stronger", 48),
+            T("[unknown]", "Kanye West   Stronger", 30),
+            T("<Unknown>", "Kanye West \u2013 Stronger", 29));
+
+        Assert.Equal([("Kanye West", "Stronger")], rows);
+    }
+
+    [Fact]
+    public void AnArtistFieldNamingAnotherArtistAndADash_IsDropped_WhenFarLessListened()
+    {
+        var rows = Clean(
+            T("Kavinsky", "Nightcall", 1257699),
+            T("Kavinsky - Nightcall", "Drive", 202),
+            T("Kavinsky-Nightcall", "Instrumental-Drive", 32));
+
+        Assert.Equal([("Kavinsky", "Nightcall")], rows);
+    }
+
+    [Fact]
+    public void ANameWithAHyphen_IsNotDropped_WhenItIsTheBiggerArtist()
+    {
+        var rows = Clean(
+            T("Jay", "Some Song", 900),
+            T("Jay-Z", "99 Problems", 1500000));
+
+        Assert.Contains(("Jay-Z", "99 Problems"), rows);
+    }
+
+    [Fact]
+    public void ATitleStartingWithAnArtistsName_IsOnlySplitAtSpacesOnEvidence()
+    {
+        // "Queen Bitch" is David Bowie's even though Queen answers the same search.
+        var rows = Clean(
+            T("Queen", "Bohemian Rhapsody", 3000000),
+            T("David Bowie", "Queen Bitch", 400000));
+
+        Assert.Contains(("David Bowie", "Queen Bitch"), rows);
+    }
+
+    [Fact]
     public void AHyphenInTheArtist_IsReadWhole()
     {
         Assert.Equal([("Jay-Z", "99 Problems")], Clean(T("Jay-Z", "Jay-Z - 99 Problems", 10)));

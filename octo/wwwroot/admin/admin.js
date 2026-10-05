@@ -2610,10 +2610,10 @@ function lfmRow(u, ready) {
     const sent = u.lastSent
       ? `<span class="set-info-d">Last sent: ${escapeHtml(u.lastSent.title)} by ${escapeHtml(u.lastSent.artist)}, ${lfmAgo(u.lastSent.playedAtUtc)}.</span>`
       : '';
-    detail = `<span class="set-info-d lfm-state"><span class="status-dot ok"></span>Connected as <strong>${escapeHtml(u.lastFmUser || 'a Last.fm account')}</strong>.</span>${sent}`;
+    detail = `<span class="set-info-d lfm-state"><span class="status-dot ok"></span><span>Connected as <strong>${escapeHtml(u.lastFmUser || 'a Last.fm account')}</strong>.</span></span>${sent}`;
     actions = `<button class="btn btn-ghost" type="button" data-lfm-action="disconnect" data-user="${name}">Disconnect</button>`;
   } else if (waiting) {
-    detail = `<span class="set-info-d lfm-state"><span class="status-dot pending"></span>Waiting for Last.fm. Allow access in the tab that opened; this updates by itself.</span>
+    detail = `<span class="set-info-d lfm-state"><span class="status-dot pending"></span><span>Waiting for Last.fm. Allow access in the tab that opened; this updates by itself.</span></span>
       <span class="set-info-d lfm-hint">Signed in to Last.fm as someone else? Sign in as ${name} there first, or copy the link and send it to them.</span>`;
     actions = `<a class="btn btn-primary" href="${escapeHtml(u.approvalUrl)}" target="lastfm-${name}" rel="noopener">Open Last.fm</a>
       <button class="btn btn-ghost" type="button" data-lfm-action="copy" data-user="${name}">Copy link</button>
