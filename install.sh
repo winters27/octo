@@ -29,10 +29,10 @@ ask() {
 ask_secret() {
   local prompt="$1" default="${2-}" reply
   if [ -n "$default" ]; then
-    read -rsp "$prompt [keep existing]: " reply; echo
+    read -rsp "$prompt [keep existing]: " reply; echo >&2
     echo "${reply:-$default}"
   else
-    read -rsp "$prompt: " reply; echo
+    read -rsp "$prompt: " reply; echo >&2
     echo "$reply"
   fi
 }
@@ -138,15 +138,28 @@ probe_lastfm() {
 # ─────────────────────────────────────────────────────────────────
 # Load existing .env if present so re-runs preserve values
 # ─────────────────────────────────────────────────────────────────
-declare -A EXISTING
+# EXISTING holds each value with its quotes taken off, for the questions below.
+# OLD_LINE holds each line exactly as it was, so the rewrite can put it back.
+declare -A EXISTING OLD_LINE
+OLD_KEYS=()
 if [ -f .env ]; then
-  while IFS='=' read -r k v; do
-    [[ "$k" =~ ^[A-Z_]+$ ]] || continue
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
     v="${v%\"}"; v="${v#\"}"
+    [ -n "${OLD_LINE[$k]+set}" ] || OLD_KEYS+=("$k")
     EXISTING[$k]="$v"
+    OLD_LINE[$k]="$line"
   done < .env
 fi
-existing() { echo "${EXISTING[$1]-}"; }
+# The old value of a setting, or the default given when the old .env had none.
+existing() { local v="${EXISTING[$1]-}"; echo "${v:-${2-}}"; }
+# A whole .env line for a setting the installer does not ask about: the old line
+# when there was one, so a value changed by hand survives a re-run.
+setting() {
+  if [ -n "${OLD_LINE[$1]+set}" ]; then echo "${OLD_LINE[$1]}"; else echo "$1=$2"; fi
+}
 
 # ─────────────────────────────────────────────────────────────────
 # Run
@@ -174,7 +187,7 @@ echo
 # ─────────────────────────────────────────────────────────────────
 bold "─── Required ───────────────────────────────────────────────"
 while true; do
-  SUBSONIC_URL=$(ask "Navidrome URL" "$(existing SUBSONIC_URL || echo "http://192.168.1.10:4533")")
+  SUBSONIC_URL=$(ask "Navidrome URL" "$(existing SUBSONIC_URL "http://192.168.1.10:4533")")
   # localhost trap: containers can't reach the host's loopback by default
   if [[ "$SUBSONIC_URL" =~ ^https?://(localhost|127\.0\.0\.1) ]]; then
     yellow "  ⚠ 'localhost' inside the Octo container won't reach Navidrome on the host."
@@ -192,7 +205,7 @@ done
 echo
 
 DOWNLOAD_PATH_RAW=$(ask "Music directory on this host (where downloads will land)" \
-  "$(existing DOWNLOAD_PATH || echo "./downloads")")
+  "$(existing DOWNLOAD_PATH "./downloads")")
 DOWNLOAD_PATH=$(abs_path "$DOWNLOAD_PATH_RAW")
 if [ "$DOWNLOAD_PATH" != "$DOWNLOAD_PATH_RAW" ]; then
   dim "  resolved to absolute: $DOWNLOAD_PATH"
@@ -234,14 +247,14 @@ echo
 bold "─── Heart download source ──────────────────────────────────"
 echo "  Soulseek — individual lossless tracks (default)"
 echo "  Lidarr   — your existing Lidarr server; always fetches the full album"
-DOWNLOAD_SOURCE=$(ask "Heart download source" "$(existing DOWNLOAD_SOURCE || echo "Soulseek")")
+DOWNLOAD_SOURCE=$(ask "Heart download source" "$(existing DOWNLOAD_SOURCE "Soulseek")")
 LIDARR_URL="$(existing LIDARR_URL)"
 LIDARR_API_KEY="$(existing LIDARR_API_KEY)"
 LIDARR_ROOT_FOLDER_PATH="$(existing LIDARR_ROOT_FOLDER_PATH)"
-LIDARR_QUALITY_PROFILE_ID="$(existing LIDARR_QUALITY_PROFILE_ID || echo "0")"
-LIDARR_METADATA_PROFILE_ID="$(existing LIDARR_METADATA_PROFILE_ID || echo "0")"
-LIDARR_COMPLETION_MODE="$(existing LIDARR_COMPLETION_MODE || echo "Accepted")"
-LIDARR_IMPORT_TIMEOUT_SECONDS="$(existing LIDARR_IMPORT_TIMEOUT_SECONDS || echo "1800")"
+LIDARR_QUALITY_PROFILE_ID="$(existing LIDARR_QUALITY_PROFILE_ID "0")"
+LIDARR_METADATA_PROFILE_ID="$(existing LIDARR_METADATA_PROFILE_ID "0")"
+LIDARR_COMPLETION_MODE="$(existing LIDARR_COMPLETION_MODE "Accepted")"
+LIDARR_IMPORT_TIMEOUT_SECONDS="$(existing LIDARR_IMPORT_TIMEOUT_SECONDS "1800")"
 if [ "${DOWNLOAD_SOURCE,,}" = "lidarr" ]; then
   echo "  Lidarr must already have working indexers and a download client."
   LIDARR_URL=$(ask "Lidarr URL (reachable from the Octo container)" "$LIDARR_URL")
@@ -257,15 +270,15 @@ bold "─── Storage / layout ───────────────�
 echo "  Stream     — preview only; star a song to download (recommended)"
 echo "  Permanent  — download every song you play"
 echo "  Cache      — temporary, auto-cleanup"
-STORAGE_MODE=$(ask "Storage mode" "$(existing STORAGE_MODE || echo "Stream")")
+STORAGE_MODE=$(ask "Storage mode" "$(existing STORAGE_MODE "Stream")")
 echo
 echo "  Flat       — Artist - Title.flac (no subfolders, easier to browse)"
 echo "  Organized  — Artist/Title/file.flac"
-FOLDER_STRUCTURE=$(ask "Folder layout" "$(existing FOLDER_STRUCTURE || echo "Flat")")
+FOLDER_STRUCTURE=$(ask "Folder layout" "$(existing FOLDER_STRUCTURE "Flat")")
 echo
 
 # slskd web UI admin — auto-generate on first run, preserve on re-run
-SLSKD_USERNAME="$(existing SLSKD_USERNAME || echo "admin")"
+SLSKD_USERNAME="$(existing SLSKD_USERNAME "admin")"
 SLSKD_PASSWORD="$(existing SLSKD_PASSWORD)"
 if [ -z "$SLSKD_PASSWORD" ]; then
   SLSKD_PASSWORD="$(random_password)"
@@ -280,6 +293,7 @@ bold "─── Writing .env ─────────────────
 cat > .env <<EOF
 # Generated by install.sh — re-run the script to update values.
 # The admin UI at http://<host>:5274/admin/ can also edit settings live.
+# A re-run keeps every line here it does not ask about, including ones you add.
 
 # === Required ===
 SUBSONIC_URL=$SUBSONIC_URL
@@ -287,26 +301,26 @@ DOWNLOAD_PATH=$DOWNLOAD_PATH
 
 # === Last.fm ===
 LASTFM_API_KEY=$LASTFM_API_KEY
-LASTFM_ENABLE_RADIO=true
-LASTFM_RADIO_TRACK_COUNT=50
-LASTFM_RADIO_CACHE_HOURS=24
-LASTFM_ENABLE_PERSONALIZED_STATIONS=true
-LASTFM_ENABLE_DISCOVERY_STATIONS=true
-LASTFM_EXPOSE_AS_PLAYLISTS=true
-LASTFM_EXPOSE_AS_STREAMS=true
-LASTFM_RADIO_STREAM_BITRATE_KBPS=192
-LASTFM_HISTORY_RETENTION_DAYS=90
-LASTFM_DISCOVERY_PERCENT=35
-LASTFM_REFRESH_INTERVAL_HOURS=12
-LASTFM_MINIMUM_PLAYS=10
+$(setting LASTFM_ENABLE_RADIO true)
+$(setting LASTFM_RADIO_TRACK_COUNT 50)
+$(setting LASTFM_RADIO_CACHE_HOURS 24)
+$(setting LASTFM_ENABLE_PERSONALIZED_STATIONS true)
+$(setting LASTFM_ENABLE_DISCOVERY_STATIONS true)
+$(setting LASTFM_EXPOSE_AS_PLAYLISTS true)
+$(setting LASTFM_EXPOSE_AS_STREAMS true)
+$(setting LASTFM_RADIO_STREAM_BITRATE_KBPS 192)
+$(setting LASTFM_HISTORY_RETENTION_DAYS 90)
+$(setting LASTFM_DISCOVERY_PERCENT 35)
+$(setting LASTFM_REFRESH_INTERVAL_HOURS 12)
+$(setting LASTFM_MINIMUM_PLAYS 10)
 
 # === Soulseek (slskd) ===
 SLSKD_USERNAME=$SLSKD_USERNAME
 SLSKD_PASSWORD=$SLSKD_PASSWORD
-SLSKD_SEARCH_WAIT_SECONDS=6
-SLSKD_MIN_FILE_SIZE_BYTES=5242880
-SLSKD_PREFERRED_EXTENSION=flac
-SLSKD_DOWNLOAD_TIMEOUT_SECONDS=180
+$(setting SLSKD_SEARCH_WAIT_SECONDS 6)
+$(setting SLSKD_MIN_FILE_SIZE_BYTES 5242880)
+$(setting SLSKD_PREFERRED_EXTENSION flac)
+$(setting SLSKD_DOWNLOAD_TIMEOUT_SECONDS 180)
 SLSKD_SOULSEEK_USERNAME=$SLSKD_SOULSEEK_USERNAME
 SLSKD_SOULSEEK_PASSWORD="$SLSKD_SOULSEEK_PASSWORD"
 
@@ -321,35 +335,39 @@ LIDARR_IMPORT_TIMEOUT_SECONDS=$LIDARR_IMPORT_TIMEOUT_SECONDS
 
 # === Storage / layout ===
 STORAGE_MODE=$STORAGE_MODE
-DOWNLOAD_MODE=Track
+$(setting DOWNLOAD_MODE Track)
 DOWNLOAD_SOURCE=$DOWNLOAD_SOURCE
-DOWNLOAD_ON_STAR=true
-DOWNLOAD_ALBUM_ON_STAR=true
-WAIT_FOR_LOSSLESS_ON_PLAY=false
+$(setting DOWNLOAD_ON_STAR true)
+$(setting DOWNLOAD_ALBUM_ON_STAR true)
+$(setting WAIT_FOR_LOSSLESS_ON_PLAY false)
 FOLDER_STRUCTURE=$FOLDER_STRUCTURE
-USE_LOCAL_STAGING=false
-EXPLICIT_FILTER=All
-CACHE_DURATION_HOURS=1
-ENABLE_EXTERNAL_PLAYLISTS=false
+$(setting USE_LOCAL_STAGING false)
+$(setting EXPLICIT_FILTER All)
+$(setting CACHE_DURATION_HOURS 1)
+$(setting ENABLE_EXTERNAL_PLAYLISTS false)
 
 # === yt-dlp shim (defaults are fine) ===
-YTDLP_MAX_CONCURRENT=5
-YTDLP_SEARCH_CACHE_MAX=1024
-YTDLP_URL_CACHE_MAX=512
-YTDLP_URL_CACHE_TTL=3600
+$(setting YTDLP_MAX_CONCURRENT 5)
+$(setting YTDLP_SEARCH_CACHE_MAX 1024)
+$(setting YTDLP_URL_CACHE_MAX 512)
+$(setting YTDLP_URL_CACHE_TTL 3600)
 EOF
-# Kept from the old .env when they were set there: settings this installer never asks about.
-for key in OCTO_CONFIG_DIR SLSKD_STATE_DIR UPDATES_CHECK UPDATES_REPO; do
-  if [ -n "$(existing "$key")" ]; then
-    printf '%s=%s
-' "$key" "$(existing "$key")" >> .env
-  fi
+# Every other line the old .env had goes back in as it was: settings this installer
+# never writes (LASTFM_API_SECRET, OCTO_CONFIG_DIR, one added by a later release),
+# so a re-run never drops something the user set.
+kept=()
+for key in "${OLD_KEYS[@]}"; do
+  grep -q "^$key=" .env || kept+=("${OLD_LINE[$key]}")
 done
+if [ "${#kept[@]}" -gt 0 ]; then
+  printf '\n# === Kept from your earlier .env ===\n' >> .env
+  printf '%s\n' "${kept[@]}" >> .env
+fi
 chmod 600 .env
 green "✓ wrote .env (chmod 600)"
 
 # Make sure the bind-mount targets exist so docker doesn't create them root-owned.
-mkdir -p "$(existing OCTO_CONFIG_DIR | grep . || echo octo-config)" "$(existing SLSKD_STATE_DIR | grep . || echo slskd-state)"
+mkdir -p "$(existing OCTO_CONFIG_DIR octo-config)" "$(existing SLSKD_STATE_DIR slskd-state)"
 
 # ─────────────────────────────────────────────────────────────────
 # Build + start
