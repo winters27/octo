@@ -5,7 +5,7 @@
 # Octo
 
 **A self-hosted music service.**
-Search any song and play it right away. Keep the ones you love as lossless files on your own server.
+Search any song and play it right away. Keep the ones you love as files on your own server.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPL_v3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![.NET 9](https://img.shields.io/badge/.NET-9.0-512BD4)](https://dotnet.microsoft.com/)
@@ -16,7 +16,7 @@ Search any song and play it right away. Keep the ones you love as lossless files
 
 ---
 
-Octo gives a home server what a streaming app has: search that reaches past your own library, songs that play the moment you pick them, and radio that learns what you like. When a song is worth keeping, Octo finds a lossless copy, tags it and files it in your library, where it stays with no subscription.
+Octo gives a home server what a streaming app has: search that reaches past your own library, songs that play the moment you pick them, and radio that learns what you like. When a song is worth keeping, Octo downloads the best copy it can find, tags it and files it in your library, where it stays with no subscription.
 
 It runs on [Navidrome](https://www.navidrome.org/), the open-source music server. If you already run Navidrome, Octo sits in front of it and your library stays as it is. If you don't, the installer starts one for you.
 
@@ -26,7 +26,7 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 
 - **Search everything.** Your own music comes first, then the songs and albums you don't have yet. Any of it plays straight away, previewed from YouTube.
 - **Radio that learns.** Your Mix, discovery, artist and genre stations grow from what you play, plus optional genre and decade mixes from your own library.
-- **Keep what you love.** Press **+** or heart a song and Octo downloads a lossless copy from Soulseek or your own Lidarr, checks that it really is lossless, tags it, adds the cover and lyrics, and files it in your library. Whole albums work too.
+- **Keep what you love.** Press **+** or heart a song and Octo downloads the best copy it can find from Soulseek or your own Lidarr, FLAC first, catches a "lossless" file that was made from an MP3, tags it, adds the cover and lyrics, and files it in your library. Whole albums work too.
 - **Bring your Spotify.** Import your liked songs and playlists, see what you already have, and let Octo fetch the rest a few songs an hour. See [Spotify import](#spotify-import).
 - **Apps for every device.** [Octo's own apps](#octos-own-apps) for Windows, Linux and Android, and [any Subsonic app](#compatible-apps) on iPhone, Mac and everywhere else.
 - **Yours to run.** The files are on your disk, everyone in the house gets their own login and their own stations, and there is nothing to pay each month.
@@ -47,7 +47,7 @@ The installer asks a few questions, starts everything, and prints where to go ne
 
 - **Do you already run Navidrome?** Answer **no** and Octo starts its own Navidrome beside it, with an admin login made for you. Answer **yes** and give its address (a LAN IP, not `localhost`), and Octo sits in front of your server.
 - **A free [Last.fm API key](https://www.last.fm/api/account/create)** powers radio and discovery. It's optional, but without it search only finds your own music.
-- **A free [Soulseek account](https://www.slsknet.org/news/node/1)** lets Octo download lossless copies. Also optional; an existing [Lidarr](https://github.com/Lidarr/Lidarr) with working indexers can do the downloading instead.
+- **A free [Soulseek account](https://www.slsknet.org/news/node/1)** lets Octo download the songs you keep. Also optional; an existing [Lidarr](https://github.com/Lidarr/Lidarr) with working indexers can do the downloading instead.
 
 When it finishes:
 
@@ -63,7 +63,7 @@ When it finishes:
    Music apps             Octo                Navidrome
  (Octo, Feishin, ...) ─▶  :5274  ───────────▶  your library
                             ├─▶ yt-dlp shim    instant previews
-                            ├─▶ slskd          lossless downloads
+                            ├─▶ slskd          downloads
                             └─▶ your Lidarr    optional download source
 ```
 
@@ -269,7 +269,7 @@ tell you a starred track landed, or quietly settled for a lossy copy.
 
 ### Is Octo a self-hosted Spotify alternative?
 
-Yes, that's what it's for. Octo adds the parts of Spotify that a library player lacks: search across music you don't own, songs that play the moment you pick them, and radio that learns your taste. Navidrome stores and serves your library underneath, and the installer can set it up for you. The difference from Spotify is what happens when you like a song: Octo downloads it as a real lossless file into your library instead of renting it.
+Yes, that's what it's for. Octo adds the parts of Spotify that a library player lacks: search across music you don't own, songs that play the moment you pick them, and radio that learns your taste. Navidrome stores and serves your library underneath, and the installer can set it up for you. The difference from Spotify is what happens when you like a song: Octo downloads it as a real file into your library instead of renting it.
 
 ### Does this work with Plex / Plexamp?
 
