@@ -13,6 +13,8 @@
   <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
 </head>
 <body>
+  <!-- Afterglow: the lights behind the glass, coloured by the chosen fetched song's cover. -->
+  <div class="ambient" aria-hidden="true"><span class="ambient-light a1"></span><span class="ambient-light a2"></span><span class="ambient-light a3"></span></div>
   <div class="app">
     <!-- ══════════════════════════════════════════════════════════ -->
     <!--  SIDEBAR                                                    -->
@@ -178,6 +180,21 @@
           </button>
         </header>
 
+        <section class="now-card" id="latest-fetched" aria-labelledby="latest-title" hidden>
+          <img class="now-art" id="latest-art" alt="" hidden />
+          <div class="now-text">
+            <span class="now-kicker" id="latest-kicker">Latest fetched</span>
+            <h2 class="now-title" id="latest-title"></h2>
+            <span class="now-sub" id="latest-sub"></span>
+            <div class="now-chips" id="latest-chips"></div>
+          </div>
+          <div class="now-recent">
+            <span class="now-kicker quiet" id="latest-covers-label">Recently added</span>
+            <div class="now-covers" id="latest-covers" role="group" aria-labelledby="latest-covers-label"></div>
+            <a class="now-all" href="#fetched">All fetched songs</a>
+          </div>
+        </section>
+
         <details class="set-card setup-checklist" id="setup-checklist-wrap">
           <summary id="setup-summary">Checking setup…</summary>
           <div id="setup-checklist"></div>
@@ -218,7 +235,7 @@
         <div class="status-grid" id="status-grid">
           <article class="status-card" data-svc="octo">
             <div class="status-card-head">
-              <svg class="icon" aria-hidden="true"><use href="#i-pulse"/></svg>
+              <span class="status-card-mark"><svg class="icon" aria-hidden="true"><use href="#i-pulse"/></svg></span>
               <span class="status-card-title">Octo</span>
               <span class="status-dot pending"></span>
             </div>
@@ -227,7 +244,7 @@
           </article>
           <article class="status-card" data-svc="navidrome">
             <div class="status-card-head">
-              <svg class="icon brand" aria-hidden="true"><use href="#b-navidrome"/></svg>
+              <span class="status-card-mark"><svg class="icon brand" aria-hidden="true"><use href="#b-navidrome"/></svg></span>
               <span class="status-card-title">Navidrome</span>
               <span class="status-dot pending"></span>
             </div>
@@ -236,7 +253,7 @@
           </article>
           <article class="status-card" data-svc="slskd">
             <div class="status-card-head">
-              <svg class="icon brand" aria-hidden="true"><use href="#b-slskd"/></svg>
+              <span class="status-card-mark"><svg class="icon brand" aria-hidden="true"><use href="#b-slskd"/></svg></span>
               <span class="status-card-title">Soulseek</span>
               <span class="status-dot pending"></span>
             </div>
@@ -245,7 +262,7 @@
           </article>
           <article class="status-card" data-svc="lidarr">
             <div class="status-card-head">
-              <svg class="icon brand" aria-hidden="true"><use href="#b-lidarr"/></svg>
+              <span class="status-card-mark"><svg class="icon brand" aria-hidden="true"><use href="#b-lidarr"/></svg></span>
               <span class="status-card-title">Lidarr</span>
               <span class="status-dot pending"></span>
             </div>
@@ -254,7 +271,7 @@
           </article>
           <article class="status-card" data-svc="ytDlpShim">
             <div class="status-card-head">
-              <svg class="icon brand" aria-hidden="true"><use href="#b-youtube"/></svg>
+              <span class="status-card-mark"><svg class="icon brand" aria-hidden="true"><use href="#b-youtube"/></svg></span>
               <span class="status-card-title">yt-dlp shim</span>
               <span class="status-dot pending"></span>
             </div>
@@ -263,7 +280,7 @@
           </article>
           <article class="status-card" data-svc="lastfm">
             <div class="status-card-head">
-              <svg class="icon brand" aria-hidden="true"><use href="#b-lastfm"/></svg>
+              <span class="status-card-mark"><svg class="icon brand" aria-hidden="true"><use href="#b-lastfm"/></svg></span>
               <span class="status-card-title">Last.fm</span>
               <span class="status-dot pending"></span>
             </div>

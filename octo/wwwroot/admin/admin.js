@@ -48,6 +48,7 @@ function activateTab(name, { focus = false } = {}) {
   if (typeof syncSegments === 'function') syncSegments(false);
   // Panes that show live data reload whenever they are opened, so they are never stale.
   if (name === 'fetched' && typeof loadFetched === 'function') loadFetched();
+  if ((name === 'status' || name === 'fetched') && typeof loadAmbient === 'function') loadAmbient();
   if (name === 'lossy' && typeof loadLossy === 'function') loadLossy();
   if (name === 'imports' && typeof loadImports === 'function') loadImports();
   if (name === 'raw' && typeof loadRawConfig === 'function') loadRawConfig();
@@ -3149,6 +3150,120 @@ async function loadFetched({ withAcquisitions = true } = {}) {
 }
 document.getElementById('fetched-refresh')?.addEventListener('click', loadFetched);
 
+// ── Afterglow: the page takes its light from a fetched song's cover ─────────────────────────
+// Octo reads each cover with the station covers' colour rules (GET /api/admin/ambient): three
+// lights behind the glass and an accent. The song chosen under Recently added is remembered in
+// this browser; with none chosen, the newest song lights the page, and with no colour to go on,
+// Octo's own blue-greys stay. The last palette is kept too, so a reload starts in its colour.
+const AMBIENT_PICK_KEY = 'octo.ambient.pick';
+const AMBIENT_LAST_KEY = 'octo.ambient.last';
+let ambientSongs = [];
+
+function ambientStoreGet(key) { try { return localStorage.getItem(key); } catch { return null; } }
+function ambientStoreSet(key, value) {
+  try { if (value == null) localStorage.removeItem(key); else localStorage.setItem(key, value); } catch { /* storage off */ }
+}
+const ambientHex = v => typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v);
+const ambientKey = s => `${s.downloadedAt}|${s.artist}|${s.title}`;
+
+function applyAmbient(colors, accent) {
+  const style = document.documentElement.style;
+  if (!Array.isArray(colors) || colors.length < 3 || !colors.every(ambientHex) || !ambientHex(accent)) {
+    ['--amb-1', '--amb-2', '--amb-3', '--accent-rgb'].forEach(p => style.removeProperty(p));
+    return false;
+  }
+  colors.slice(0, 3).forEach((c, i) => style.setProperty(`--amb-${i + 1}`, c));
+  const n = parseInt(accent.slice(1), 16);
+  style.setProperty('--accent-rgb', `${(n >> 16) & 255} ${(n >> 8) & 255} ${n & 255}`);
+  return true;
+}
+
+// Start in the last colour before anything has loaded.
+try {
+  const last = JSON.parse(ambientStoreGet(AMBIENT_LAST_KEY) || 'null');
+  if (last) applyAmbient(last.colors, last.accent);
+} catch { /* nothing kept */ }
+
+function chosenAmbientSong() {
+  const picked = ambientStoreGet(AMBIENT_PICK_KEY);
+  return ambientSongs.find(s => ambientKey(s) === picked)
+    || ambientSongs.find(s => s.colors)
+    || ambientSongs[0]
+    || null;
+}
+
+function renderLatestFetched() {
+  const card = document.getElementById('latest-fetched');
+  if (!card) return;
+  const song = chosenAmbientSong();
+  if (applyAmbient(song?.colors, song?.accent)) {
+    ambientStoreSet(AMBIENT_LAST_KEY, JSON.stringify({ colors: song.colors, accent: song.accent }));
+  } else {
+    ambientStoreSet(AMBIENT_LAST_KEY, null);
+  }
+  card.hidden = !song;
+  if (!song) return;
+
+  const art = document.getElementById('latest-art');
+  if (song.coverArtUrl) {
+    art.hidden = false;
+    art.src = song.coverArtUrl;
+    art.onerror = () => { art.hidden = true; };
+  } else {
+    art.hidden = true;
+    art.removeAttribute('src');
+  }
+  document.getElementById('latest-kicker').textContent = song === ambientSongs[0] ? 'Latest fetched' : 'Lighting the page';
+  document.getElementById('latest-title').textContent = song.title;
+  document.getElementById('latest-sub').textContent = [song.artist, song.album].filter(Boolean).join(' · ');
+  const chips = [
+    `<span class="now-chip format">${escapeHtml((song.format || '?').toUpperCase())}</span>`,
+    song.source ? `<span class="now-chip">${escapeHtml(song.source)}</span>` : '',
+    fmtSize(song.sizeBytes) ? `<span class="now-chip">${escapeHtml(fmtSize(song.sizeBytes))}</span>` : '',
+    relTime(song.downloadedAt) ? `<span class="now-chip">${escapeHtml(relTime(song.downloadedAt))}</span>` : '',
+  ];
+  document.getElementById('latest-chips').innerHTML = chips.join('');
+
+  const covers = document.getElementById('latest-covers');
+  covers.innerHTML = ambientSongs.map((s, i) => {
+    const on = s === song;
+    const label = `Light the page with ${s.title} by ${s.artist}${s.colors ? '' : ' (no colour in this cover)'}`;
+    const img = s.coverArtUrl
+      ? `<img src="${escapeHtml(s.coverArtUrl)}" alt="" loading="lazy" onerror="this.remove()">`
+      : '';
+    return `<button type="button" class="now-cover" data-ambient="${i}" aria-pressed="${on}" aria-label="${escapeHtml(label)}" title="${escapeHtml(s.artist + ' · ' + s.title)}">${img}</button>`;
+  }).join('');
+}
+
+document.getElementById('latest-covers')?.addEventListener('click', e => {
+  const button = e.target.closest('[data-ambient]');
+  if (!button) return;
+  const song = ambientSongs[Number(button.dataset.ambient)];
+  if (!song) return;
+  // Choosing the newest song means "follow the newest", so a song fetched later takes over.
+  ambientStoreSet(AMBIENT_PICK_KEY, song === ambientSongs[0] ? null : ambientKey(song));
+  renderLatestFetched();
+  document.querySelector(`#latest-covers [data-ambient="${button.dataset.ambient}"]`)?.focus();
+});
+
+let ambientLoading = null;
+function loadAmbient() {
+  ambientLoading ??= (async () => {
+    try {
+      const r = await api('/api/admin/ambient', { cache: 'no-store' });
+      if (!r.ok) return;
+      const data = await r.json();
+      ambientSongs = Array.isArray(data.songs) ? data.songs : [];
+      renderLatestFetched();
+    } catch {
+      // The light is a nicety: the page keeps whatever colour it has.
+    } finally {
+      ambientLoading = null;
+    }
+  })();
+  return ambientLoading;
+}
+
 // ── How a download was tagged ───────────────────────────────────────────────
 // The same block under a Fetched songs row and under "Try it on a song": the release that won
 // and how sure Octo is, every candidate it weighed with its biggest penalties, what each field
@@ -5396,6 +5511,7 @@ impEl('imports-form')?.addEventListener('submit', () => setTimeout(loadImports, 
 // ────────────────────────────────────────────────────────────────
 if (location.hash) followHash();
 loadSettings();
+loadAmbient();
 loadSignedIn();
 loadUpdate();
 renderSlskdOpen();
