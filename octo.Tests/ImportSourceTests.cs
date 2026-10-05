@@ -385,4 +385,44 @@ public sealed class ImportSourceTests
     [InlineData("soon", false, null)]
     public void LengthsAreReadInEveryUsualForm(string value, bool ms, int? seconds) =>
         Assert.Equal(seconds, ImportFileReader.Seconds(value, ms));
+
+    // ---- Limits on what a file may hold ---------------------------------------------------------
+
+    [Fact]
+    public void AFileOfMoreThan50000SongsIsRefusedInPlainWords()
+    {
+        var csv = new StringBuilder("Track Name,Artist Name(s)\n");
+        for (var i = 0; i <= ImportFileReader.MaxSongs; i++) csv.Append("Song ").Append(i).Append(",Someone\n");
+
+        var refused = Assert.Throws<FormatException>(() => ImportFileReader.Read("Everything.csv", new MemoryStream(Encoding.UTF8.GetBytes(csv.ToString()))));
+
+        Assert.Equal("It holds more than 50,000 songs. Split it into smaller files.", refused.Message);
+    }
+
+    [Fact]
+    public void AZipOfTooManyFilesOrTooMuchUnpackedIsRefused()
+    {
+        static MemoryStream Zip(int files, Func<int, string> name, Func<int, string> text)
+        {
+            var bytes = new MemoryStream();
+            using (var zip = new ZipArchive(bytes, ZipArchiveMode.Create, leaveOpen: true))
+                for (var i = 0; i < files; i++)
+                {
+                    using var writer = new StreamWriter(zip.CreateEntry(name(i)).Open());
+                    writer.Write(text(i));
+                }
+            bytes.Position = 0;
+            return bytes;
+        }
+
+        var many = Assert.Throws<FormatException>(() => ImportFileReader.Read("export.zip",
+            Zip(ImportFileReader.MaxZipEntries + 1, i => $"junk{i}.txt", _ => "")));
+        Assert.Equal("The zip holds more than 200 files, more than any export Octo reads.", many.Message);
+
+        // Five CSVs of 60 MB of blank padding each: small packed, far too big unpacked.
+        var padding = new string(' ', 60 * 1024 * 1024);
+        var big = Assert.Throws<FormatException>(() => ImportFileReader.Read("export.zip",
+            Zip(5, i => $"Playlist{i}.csv", _ => "Track Name,Artist Name(s)\nTeardrop,Massive Attack" + padding)));
+        Assert.Equal("The zip unpacks to more than 256 MB, more than any export Octo reads.", big.Message);
+    }
 }

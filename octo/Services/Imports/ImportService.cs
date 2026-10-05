@@ -407,6 +407,7 @@ public sealed class ImportService : BackgroundService
         {
             var read = await _links.ReadAsync(link, ct);
             var listId = $"link-{kind}-{id}";
+            if (RoomFor(user, [(listId, read.Tracks.Count)]) is { } full) return new(false, full);
             _store.Save(new ImportList
             {
                 Id = listId, Owner = user, Name = read.Name, Source = ImportSources.Link,
@@ -437,6 +438,8 @@ public sealed class ImportService : BackgroundService
         await gate.WaitAsync(ct);
         try
         {
+            if (RoomFor(user, lists.Select(list => ($"file-{Hash(list.Name)}", list.Tracks.Count)).ToList()) is { } full)
+                return new(false, full);
             string? first = null;
             foreach (var list in lists)
             {
@@ -455,6 +458,25 @@ public sealed class ImportService : BackgroundService
                 ListId: first, Count: songs);
         }
         finally { gate.Release(); }
+    }
+
+    /// <summary>Lists one person may keep, from files and links.</summary>
+    internal const int MaxLists = 500;
+
+    /// <summary>Songs across one person's lists.</summary>
+    internal const int MaxSongs = 250_000;
+
+    /// <summary>Why these lists would not fit beside the person's others, or null. A list that
+    /// takes the place of one with the same id counts once.</summary>
+    private string? RoomFor(string user, IReadOnlyList<(string Id, int Songs)> incoming)
+    {
+        var ids = incoming.Select(list => list.Id).ToHashSet(StringComparer.Ordinal);
+        var kept = _store.ListsOf(user).Where(list => !ids.Contains(list.Id)).ToList();
+        if (kept.Count + ids.Count > MaxLists)
+            return $"That would make more than {MaxLists} lists, the most Octo keeps for one person. Remove some first.";
+        if (kept.Sum(list => list.Tracks.Count) + incoming.Sum(list => list.Songs) > MaxSongs)
+            return $"That would make more than 250,000 songs across your lists, the most Octo keeps for one person. Remove some first.";
+        return null;
     }
 
     private static string Hash(string text) =>

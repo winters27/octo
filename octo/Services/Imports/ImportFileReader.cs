@@ -24,7 +24,25 @@ public static class ImportFileReader
     /// <summary>Bigger than any real export, small enough that a wrong file cannot fill memory.</summary>
     public const long MaxBytes = 64L * 1024 * 1024;
 
+    /// <summary>Songs one file may hold, across its lists: far past any real library export.</summary>
+    public const int MaxSongs = 50_000;
+
+    /// <summary>Files a zip may hold. Spotify's data export is a few dozen.</summary>
+    public const int MaxZipEntries = 200;
+
+    /// <summary>What a zip's files may come to once unpacked, all together.</summary>
+    public const long MaxUnzippedBytes = 256L * 1024 * 1024;
+
+    internal static string TooManySongs => $"It holds more than 50,000 songs. Split it into smaller files.";
+
     public static IReadOnlyList<FileList> Read(string fileName, Stream content)
+    {
+        var lists = ReadAny(fileName, content);
+        if (lists.Sum(list => list.Tracks.Count) > MaxSongs) throw new FormatException(TooManySongs);
+        return lists;
+    }
+
+    private static IReadOnlyList<FileList> ReadAny(string fileName, Stream content)
     {
         var name = Path.GetFileName(fileName ?? "");
         var extension = Path.GetExtension(name).ToLowerInvariant();
@@ -40,6 +58,10 @@ public static class ImportFileReader
     {
         var lists = new List<FileList>();
         using var zip = new ZipArchive(content, ZipArchiveMode.Read);
+        if (zip.Entries.Count > MaxZipEntries)
+            throw new FormatException($"The zip holds more than {MaxZipEntries} files, more than any export Octo reads.");
+        // Counted as the files unpack, never from the sizes the zip claims for them.
+        var budget = new UnzipBudget();
         foreach (var entry in zip.Entries.OrderBy(entry => entry.FullName, StringComparer.Ordinal))
         {
             var file = Path.GetFileName(entry.FullName);
@@ -47,10 +69,45 @@ public static class ImportFileReader
                 || (file.StartsWith("Playlist", StringComparison.OrdinalIgnoreCase) && file.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
                 || file.EndsWith(".csv", StringComparison.OrdinalIgnoreCase);
             if (!wanted || entry.Length > MaxBytes) continue;
-            using var stream = entry.Open();
-            lists.AddRange(Read(file, stream));
+            using var stream = new CountedStream(entry.Open(), budget);
+            lists.AddRange(ReadAny(file, stream));
+            if (lists.Sum(list => list.Tracks.Count) > MaxSongs) throw new FormatException(TooManySongs);
         }
         return lists;
+    }
+
+    private sealed class UnzipBudget
+    {
+        public long Read;
+    }
+
+    /// <summary>A zip entry's stream that stops once the zip's files together pass <see cref="MaxUnzippedBytes"/>.</summary>
+    private sealed class CountedStream(Stream inner, UnzipBudget budget) : Stream
+    {
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var read = inner.Read(buffer, offset, count);
+            budget.Read += read;
+            if (budget.Read > MaxUnzippedBytes)
+                throw new FormatException($"The zip unpacks to more than {MaxUnzippedBytes / (1024 * 1024)} MB, more than any export Octo reads.");
+            return read;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) inner.Dispose();
+            base.Dispose(disposing);
+        }
     }
 
     // ---- Spotify's data export ----------------------------------------------------------------
@@ -100,8 +157,10 @@ public static class ImportFileReader
 
     internal static IReadOnlyList<FileList> ReadCsv(string name, string text)
     {
-        var rows = Rows(text).ToList();
+        // One row past the most a file may hold is enough to know it holds too many.
+        var rows = Rows(text).Take(MaxSongs + 2).ToList();
         if (rows.Count == 0) return [];
+        if (rows.Count > MaxSongs + 1) throw new FormatException(TooManySongs);
         var header = rows[0].Select(cell => cell.Trim().ToLowerInvariant()).ToList();
         int Column(string[] names) => names.Select(n => header.IndexOf(n)).FirstOrDefault(i => i >= 0, -1);
         var title = Column(TitleColumns);

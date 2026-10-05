@@ -317,6 +317,22 @@ public sealed class ImportServiceTests
     }
 
     [Fact]
+    public async Task OnePersonKeepsAtMost500Lists_AndAFileOfTheSameNameStillReplacesItsList()
+    {
+        var rig = new Rig();
+        rig.Settings.Set(new ImportSettings());
+        for (var i = 0; i < ImportService.MaxLists; i++)
+            rig.Store.Save(new ImportList { Id = $"file-{i}", Owner = "bob", Name = $"List {i}", Source = ImportSources.File });
+        var csv = "Track Name,Artist Name(s)\nTeardrop,Massive Attack\n";
+
+        var refused = await rig.Service.AddFileAsync("bob", "Gym.csv", new MemoryStream(Encoding.UTF8.GetBytes(csv)), CancellationToken.None);
+
+        Assert.False(refused.Ok);
+        Assert.Equal("That would make more than 500 lists, the most Octo keeps for one person. Remove some first.", refused.Message);
+        Assert.True((await rig.Service.AddFileAsync("alice", "Gym.csv", new MemoryStream(Encoding.UTF8.GetBytes(csv)), CancellationToken.None)).Ok);
+    }
+
+    [Fact]
     public void TheRedirectSaysWhetherOctoFinishesItself()
     {
         Assert.True(ImportService.OctoFinishes("https://octo.example.com/imports/spotify/callback"));
