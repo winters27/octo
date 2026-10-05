@@ -94,6 +94,28 @@ public class AmbientPaletteTests
         Assert.True(CoverColours.ContrastRatio(accent, CoverColours.Hex("#0a0a0f")) >= 7, "the accent on the page");
     }
 
+    /// <summary>An album fetched whole is one cover to choose from, and a song without a cover counts by its album.</summary>
+    [Fact]
+    public void NewestPerCover_OneEntryPerCover_NewestFirst()
+    {
+        static Octo.Models.Download.DownloadHistoryEntry E(string title, string? cover, string album = "A") =>
+            new() { Artist = "Drake", Title = title, Album = album, CoverArtUrl = cover };
+        var log = new[]
+        {
+            E("NOKIA", "https://x/nokia.jpg"),
+            E("Make Them Know", "https://x/iceman.jpg"),
+            E("Firm Friends", "https://x/iceman.jpg"),
+            E("Digital Love", "https://x/discovery.jpg"),
+            E("Don't Worry", "https://x/iceman.jpg"),
+            E("No Art 1", null, "Loose"),
+            E("No Art 2", null, "Loose"),
+            E("Old", "https://x/old.jpg"),
+        };
+        var picked = Octo.Controllers.AmbientController.NewestPerCover(log, 6).Select(e => e.Title).ToList();
+        Assert.Equal(["NOKIA", "Make Them Know", "Digital Love", "No Art 1", "Old"], picked);
+        Assert.Equal(["NOKIA", "Make Them Know"], Octo.Controllers.AmbientController.NewestPerCover(log, 2).Select(e => e.Title));
+    }
+
     /// <summary>End to end from a real picture, through the station covers' reading of it.</summary>
     [Fact]
     public void Palette_FromAPicture()
