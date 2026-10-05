@@ -174,4 +174,46 @@ public sealed class FindSongsPickTests
 
         Assert.False(picks.Has("ext1"));
     }
+
+    // ---- How many looks run at once --------------------------------------------------------------
+
+    [Fact]
+    public async Task OnePersonRunsTwoLooksAtOnce_AndAnotherPersonsLookIsNeverDroppedForRoom()
+    {
+        var slowSong = new FindTarget("Air", "Sexy Boy", "Moon Safari", 298, "ext1", ExternalId: "ext1");
+        var quickSong = slowSong with { Title = "Kelly Watch the Stars", ExternalId = "ext2" };
+        var server = Build(slowSong);
+        var slow = new TaskCompletionSource<(IReadOnlyList<FoundCopy>, IReadOnlyList<string>, string?)>();
+        // Looks for "slow" wait; every other one ends at once.
+        server.Finder.Resolve = (id, _) => Task.FromResult<FindTarget?>(id == "slow" ? slowSong : quickSong);
+        server.Finder.SearchSoulseek = (song, _) => song.Title == slowSong.Title ? slow.Task
+            : Task.FromResult<(IReadOnlyList<FoundCopy>, IReadOnlyList<string>, string?)>(([], [], "Nothing found"));
+
+        var bobs = (await server.Finder.StartAsync("slow", "bob"))!;
+        Assert.Equal(FindStates.Searching, (await server.Finder.StartAsync("slow", "alice"))!.State);
+        Assert.Equal(FindStates.Searching, (await server.Finder.StartAsync("slow", "alice"))!.State);
+        var third = (await server.Finder.StartAsync("slow", "alice"))!;
+
+        Assert.Equal(FindStates.Failed, third.State);
+        Assert.Equal("You already have 2 searches running. Search again once one of them ends.", third.Error);
+
+        // Many finished looks later, bob's look, still running, is still there to follow.
+        for (var i = 0; i < SongFinder.Capacity + 5; i++)
+            await server.Finder.WaitAsync((await server.Finder.StartAsync("quick", $"user{i}"))!.Id, TimeSpan.FromSeconds(10));
+
+        Assert.Equal(FindStates.Searching, server.Finder.Get(bobs.Id, "bob")!.State);
+        slow.SetResult(([], [], "Nothing found"));
+    }
+
+    [Fact]
+    public async Task ALibrarySongsLookIsOnlyForThePeopleWhoMayReplaceIt()
+    {
+        var server = Build(Owned);
+
+        var look = (await server.Finder.StartAsync("nd-1", "carol"))!;
+
+        Assert.Equal(FindStates.Failed, look.State);
+        Assert.Equal("carol is not on the library actions allowed list.", look.Error);
+        Assert.Equal(FindStates.Searching, (await server.Finder.StartAsync("nd-1", "alice"))!.State);
+    }
 }

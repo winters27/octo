@@ -58,6 +58,11 @@ public sealed class SongFinder
 
     internal static readonly TimeSpan Keep = TimeSpan.FromMinutes(30);
     internal const int Capacity = 40;
+    /// <summary>Looks one person may have running at once. Each one asks every peer on Soulseek.</summary>
+    internal const int RunningPerUser = 2;
+    /// <summary>Looks running at once across everyone, kept under <see cref="Capacity"/> so a
+    /// running look is never forgotten to make room.</summary>
+    internal const int RunningAtOnce = 20;
     internal const int MaxCopies = 300;
 
     private static readonly HashSet<string> LosslessFormats = new(StringComparer.OrdinalIgnoreCase)
@@ -79,6 +84,7 @@ public sealed class SongFinder
     }
 
     private readonly ConcurrentDictionary<string, Job> _jobs = new(StringComparer.Ordinal);
+    private readonly object _starting = new();
     private readonly IServiceProvider _services;
     private readonly ILogger<SongFinder> _logger;
     private readonly TimeProvider _time;
@@ -113,25 +119,53 @@ public sealed class SongFinder
     // ---------------------------------------------------------------------------------------
 
     /// <summary>Starts a look for a song by its id, and answers it at once, still searching. Null
-    /// when no song has this id.</summary>
+    /// when no song has this id. A look that may not run answers failed, with the words why.</summary>
     public async Task<FindSnapshot?> StartAsync(string id, string user, CancellationToken ct = default)
     {
         Prune();
         var target = await Resolve(id, ct);
         if (target is null) return null;
         var job = new Job { Id = Guid.NewGuid().ToString("N")[..12], User = user, Target = target, StartedAt = Now, UpdatedAt = Now };
-        var allowed = SourcesFor(target);
+        // A library song's look leads only to replacing its file, which only the people on the
+        // library actions allowed list may do: they hear why before a search is spent on it.
+        var refused = target.LibraryId is not null ? UpgradeRefusal(user) : null;
+        var allowed = refused is null ? SourcesFor(target) : new Dictionary<string, string?>();
         lock (job)
         {
             foreach (var (name, refusal) in allowed)
                 job.Sources.Add(new FindSource(name, refusal is null ? FindStates.Searching : FindStates.Off, refusal, []));
-            if (job.Sources.All(source => source.State == FindStates.Off))
+            if (refused is not null)
+            {
+                job.State = FindStates.Failed;
+                job.Error = refused;
+            }
+            else if (job.Sources.All(source => source.State == FindStates.Off))
             {
                 job.State = FindStates.Failed;
                 job.Error = "None of your download sources can search: Soulseek or Lidarr has to be set up and switched on for hearts.";
             }
         }
-        _jobs[job.Id] = job;
+        lock (_starting)
+        {
+            if (job.State == FindStates.Searching)
+            {
+                var running = _jobs.Values.Where(other => other.State == FindStates.Searching).ToList();
+                var busy = running.Count(other => SameUser(other, user)) >= RunningPerUser
+                    ? $"You already have {RunningPerUser} searches running. Search again once one of them ends."
+                    : running.Count >= RunningAtOnce ? "Octo is running a lot of searches right now. Try again in a minute."
+                    : null;
+                if (busy is not null)
+                    lock (job)
+                    {
+                        job.State = FindStates.Failed;
+                        job.Error = busy;
+                        for (var i = 0; i < job.Sources.Count; i++)
+                            if (job.Sources[i].State == FindStates.Searching)
+                                job.Sources[i] = job.Sources[i] with { State = FindStates.Off, Text = "Not searched" };
+                    }
+            }
+            _jobs[job.Id] = job;
+        }
         if (job.State == FindStates.Searching)
             using (ExecutionContext.SuppressFlow())
                 _ = Task.Run(() => RunAsync(job));
@@ -287,6 +321,16 @@ public sealed class SongFinder
             ? $"{why}, so it is not fetched again."
             : null;
 
+    /// <summary>Why this person may not have a library song replaced right now, or null.</summary>
+    private string? UpgradeRefusal(string user)
+    {
+        var settings = _services.GetService<IOptionsMonitor<LibraryActionSettings>>()?.CurrentValue;
+        var sources = _services.GetService<UpgradeSources>();
+        return UpgradeGate.Refusal(settings, user,
+            _services.GetService<UpgradeQueue>() is not null && _services.GetService<LibraryActionExecutor>() is not null,
+            sources?.Ready ?? false, sources?.Name ?? "Soulseek");
+    }
+
     private async Task<PickOutcome> FetchAsync(FindTarget target, FoundCopy copy, string user)
     {
         if (target.LibraryId is { } libraryId)
@@ -294,12 +338,8 @@ public sealed class SongFinder
             if (ReplaceRefusal(target, copy, _services.GetService<IOptionsMonitor<SoulseekSettings>>()?.CurrentValue,
                     _services.GetService<RejectedPeerRegistry>(), Remembers) is { } refused)
                 return new(LibraryActionStates.Skipped, refused);
-            var settings = _services.GetService<IOptionsMonitor<LibraryActionSettings>>()?.CurrentValue;
             var queue = _services.GetService<UpgradeQueue>();
-            var sources = _services.GetService<UpgradeSources>();
-            var gate = UpgradeGate.Refusal(settings, user, queue is not null && _services.GetService<LibraryActionExecutor>() is not null,
-                sources?.Ready ?? false, sources?.Name ?? "Soulseek");
-            if (gate is not null) return new(LibraryActionStates.Skipped, gate);
+            if (UpgradeRefusal(user) is { } gate) return new(LibraryActionStates.Skipped, gate);
             var (jobs, full) = queue!.Add([new UpgradeAsk(libraryId, target.Title, target.Artist, target.Album, target.OwnedFormat, Pick: copy.Pick)],
                 user, "find");
             if (jobs.Count == 0) return new(LibraryActionStates.Skipped, full ?? "The upgrade queue is full.");
@@ -543,7 +583,9 @@ public sealed class SongFinder
         foreach (var (id, job) in _jobs)
             if (now - job.UpdatedAt >= Keep && job.State != FindStates.Searching) _jobs.TryRemove(id, out _);
         if (_jobs.Count < Capacity) return;
-        foreach (var (id, _) in _jobs.OrderBy(pair => pair.Value.UpdatedAt).Take(_jobs.Count - Capacity + 1).ToList())
+        // The oldest finished looks make room; a running look is someone's, and is never dropped.
+        foreach (var (id, _) in _jobs.Where(pair => pair.Value.State != FindStates.Searching)
+                     .OrderBy(pair => pair.Value.UpdatedAt).Take(_jobs.Count - Capacity + 1).ToList())
             _jobs.TryRemove(id, out _);
     }
 }
