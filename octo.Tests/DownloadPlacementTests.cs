@@ -583,9 +583,117 @@ public sealed class DownloadPlacementTests : IDisposable
         Assert.Equal([1, 2, 3], File.ReadAllBytes(existing));
     }
 
+    // ---- The cover a download keeps ------------------------------------------------------
+
+    /// <summary>A service that judges covers against a catalog cover and logs to a tracker.</summary>
+    private (PlacementService Service, AcquisitionTracker Tracker) CoverService(byte[] catalog)
+    {
+        var handler = new Mock<HttpMessageHandler>();
+        Moq.Protected.ProtectedExtension.Protected(handler)
+            .Setup<Task<HttpResponseMessage>>("SendAsync", Moq.Protected.ItExpr.IsAny<HttpRequestMessage>(), Moq.Protected.ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage request, CancellationToken _) =>
+                request.RequestUri!.Host == "deezer.example"
+                    ? new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new ByteArrayContent(catalog) }
+                    : new HttpResponseMessage(System.Net.HttpStatusCode.NotFound));
+        var http = new Mock<IHttpClientFactory>();
+        http.Setup(f => f.CreateClient(It.IsAny<string>())).Returns(() => new HttpClient(handler.Object));
+        var metadata = TestOptions.Monitor(new MetadataSettings());
+        var tracker = new AcquisitionTracker(NullLogger<AcquisitionTracker>.Instance);
+        var services = new ServiceCollection()
+            .AddSingleton<Microsoft.Extensions.Options.IOptionsMonitor<SoulseekSettings>>(TestOptions.Monitor(new SoulseekSettings()))
+            .AddSingleton<Microsoft.Extensions.Options.IOptionsMonitor<MetadataSettings>>(metadata)
+            .AddSingleton(tracker)
+            .AddSingleton(new Octo.Services.CoverArt.DownloadCoverResolver(
+                new Octo.Services.CoverArt.CoverArtArchiveLookup(http.Object, NullLogger<Octo.Services.CoverArt.CoverArtArchiveLookup>.Instance),
+                new Octo.Services.CoverArt.CoverArtAggregator([], NullLogger<Octo.Services.CoverArt.CoverArtAggregator>.Instance),
+                http.Object, metadata, NullLogger<Octo.Services.CoverArt.DownloadCoverResolver>.Instance))
+            .BuildServiceProvider();
+        var library = new Mock<ILocalLibraryService>();
+        return (new PlacementService(_root, FolderStructure.Organized, library.Object, services), tracker);
+    }
+
+    private string FlacWithCover(string name, byte[]? cover)
+    {
+        Directory.CreateDirectory(_root);
+        var path = Path.Combine(_root, name);
+        File.WriteAllBytes(path, AudioFixtures.Flac());
+        if (cover is not null)
+        {
+            using var file = TagLib.File.Create(path);
+            file.Tag.Pictures = [new TagLib.Picture(new TagLib.ByteVector(cover)) { Type = TagLib.PictureType.FrontCover }];
+            file.Save();
+        }
+        return path;
+    }
+
+    private static byte[]? CoverOf(string path)
+    {
+        using var file = TagLib.File.Create(path);
+        return file.Tag.Pictures.FirstOrDefault()?.Data?.Data;
+    }
+
+    private static Song CoverSong() => new()
+    {
+        Artist = "Ella Langley", Title = "Choosin' Texas", Album = "Dandelion",
+        CoverArtUrlLarge = "https://deezer.example/cover.jpg", ExternalProvider = "test", ExternalId = "x",
+    };
+
+    [Fact]
+    public async Task WriteMetadata_AGoodCoverOfTheSameArtStaysByteForByte_AndTheTimelineSaysSo()
+    {
+        var (service, tracker) = CoverService(CoverKeepTests.Art(1, 1000));
+        var own = CoverKeepTests.Art(1, 1400);
+        var path = FlacWithCover("a.flac", own);
+        tracker.Begin("test", "x", "x", "alice");
+
+        await service.Write(path, CoverSong());
+
+        Assert.Equal(own, CoverOf(path));
+        var line = tracker.Detail("test:x", "alice")!.Events!.Single(e => e.Kind == AcquisitionEventKinds.Cover);
+        Assert.Equal("Kept the cover it came with", line.Text);
+        Assert.Matches(@"^1400 x 1400 px, \d+ KB, the same art$", line.Detail);
+    }
+
+    [Fact]
+    public async Task WriteMetadata_AnotherPictureIsReplacedByTheCatalogsCover_AndTheTimelineSaysWhy()
+    {
+        var catalog = CoverKeepTests.Art(1, 1000);
+        var (service, tracker) = CoverService(catalog);
+        var path = FlacWithCover("b.flac", CoverKeepTests.Art(2, 1400));
+        tracker.Begin("test", "x", "x", "alice");
+
+        await service.Write(path, CoverSong());
+
+        Assert.Equal(catalog, CoverOf(path));
+        var line = tracker.Detail("test:x", "alice")!.Events!.Single(e => e.Kind == AcquisitionEventKinds.Cover);
+        Assert.Equal("Replaced its 1400 px cover with a 1000 x 1000 px one from the catalog", line.Text);
+        Assert.Equal("It was a different picture from the album's cover. Now embedded in the song.", line.Detail);
+    }
+
+    /// <summary>Better quality: the new copy gets the old copy's cover, the picture the album
+    /// already shows, instead of the peer's.</summary>
+    [Fact]
+    public async Task WriteMetadata_AReplacementTakesTheOldCopysGoodCover()
+    {
+        var (service, tracker) = CoverService(CoverKeepTests.Art(1, 1000));
+        var oldCover = CoverKeepTests.Art(1, 1200);
+        var original = FlacWithCover("old.flac", oldCover);
+        var staged = FlacWithCover("new.flac", CoverKeepTests.Art(5, 300));
+        tracker.Begin("test", "x", "x", "alice");
+
+        BaseDownloadService.ActAsReplacementOf(original);
+        try { await service.Write(staged, CoverSong()); }
+        finally { BaseDownloadService.ActAsReplacementOf(null); }
+
+        Assert.Equal(oldCover, CoverOf(staged));
+        Assert.Equal("Kept your old copy's cover",
+            tracker.Detail("test:x", "alice")!.Events!.Single(e => e.Kind == AcquisitionEventKinds.Cover).Text);
+    }
+
     /// <summary>The download service with the transfer stubbed out, so placement and tagging can
     /// be driven against real files in a temp folder.</summary>
-    private sealed class PlacementService(string root, FolderStructure layout, ILocalLibraryService library)
+    private sealed class PlacementService(string root, FolderStructure layout, ILocalLibraryService library,
+        IServiceProvider? services = null)
         : BaseDownloadService(
             new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?> { ["Library:DownloadPath"] = root }).Build(),
             library,
@@ -597,7 +705,7 @@ public sealed class DownloadPlacementTests : IDisposable
                 Mock.Of<IHttpClientFactory>(), NullLogger<NavidromeIdentityService>.Instance),
             new DownloadHistoryService(Path.Combine(root, "history.json"), NullLogger<DownloadHistoryService>.Instance),
             new NotificationService([], TestOptions.Monitor(new NotificationSettings()), NullLogger<NotificationService>.Instance),
-            new ServiceCollection()
+            services ?? new ServiceCollection()
                 .AddSingleton<Microsoft.Extensions.Options.IOptionsMonitor<SoulseekSettings>>(TestOptions.Monitor(new SoulseekSettings()))
                 .BuildServiceProvider(),
             NullLogger.Instance)

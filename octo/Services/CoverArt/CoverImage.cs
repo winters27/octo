@@ -138,6 +138,35 @@ internal static class CoverImage
 
     public static bool LookAlike(ulong a, ulong b) => System.Numerics.BitOperations.PopCount(a ^ b) <= LikenessTolerance;
 
+    /// <summary>
+    /// How much fine detail the picture holds at <paramref name="side"/> px: the average change,
+    /// in grey levels, when it is shrunk to half that and grown back. A picture that was blown up
+    /// from a small one has nothing at that scale to lose, so it scores near nothing, while the
+    /// real artwork at the same size loses its edges and lettering. Only comparable between two
+    /// pictures of the same art measured at the same side. Null when it cannot be read.
+    /// </summary>
+    public static double? Detail(byte[] bytes, int side)
+    {
+        if (side < 16) return null;
+        try
+        {
+            using var image = Image.Load<SixLabors.ImageSharp.PixelFormats.L8>(bytes);
+            image.Mutate(ctx => ctx.Resize(side, side, KnownResamplers.Bicubic));
+            using var round = image.Clone(ctx => ctx
+                .Resize(side / 2, side / 2, KnownResamplers.Bicubic)
+                .Resize(side, side, KnownResamplers.Bicubic));
+            long total = 0;
+            for (var y = 0; y < side; y++)
+                for (var x = 0; x < side; x++)
+                    total += Math.Abs(image[x, y].PackedValue - round[x, y].PackedValue);
+            return total / (double)(side * side);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static readonly byte[] OctoMark = "Written by Octo"u8.ToArray();
 
     /// <summary>
