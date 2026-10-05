@@ -17,7 +17,8 @@ public partial class SubsonicResponseBuilder
 
     /// <summary>
     /// findSongs and getFoundSongs: the song, how each source's look went, and every copy found.
-    /// A copy's index is its place in the list, which pickFoundSong takes.
+    /// A copy's id names it on this look for good, and pickFoundSong takes it as copy; its index
+    /// is its place in the list, which older apps pick by once the search has ended.
     /// </summary>
     public IActionResult CreateFindSongsResponse(FindSnapshot found) => CreateJsonResponse(new Dictionary<string, object?>
     {
@@ -52,6 +53,7 @@ public partial class SubsonicResponseBuilder
             ["candidate"] = found.Copies.Select((copy, index) =>
             {
                 var json = CandidateJson(copy.Shown);
+                json["id"] = copy.Id;
                 json["index"] = index;
                 return json;
             }).ToList(),

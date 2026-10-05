@@ -311,6 +311,47 @@ public class DownloadLogTests
     }
 
     [Fact]
+    public async Task APickWaitsForTheSearchToEnd_AndACopyKeepsItsIdAndOrderWhenAnotherSourceAnswers()
+    {
+        var finder = NewFinder(new FindTarget("Air", "Sexy Boy", null, null, "id", ExternalId: "id"));
+        finder.SourcesFor = _ => new Dictionary<string, string?> { ["Soulseek"] = null, ["Lidarr"] = null };
+        var lidarr = new TaskCompletionSource<(IReadOnlyList<FoundCopy>, IReadOnlyList<string>, string?)>();
+        finder.SearchSoulseek = (_, _) => Task.FromResult(Copies(Copy("Soulseek", 2, "two.flac"), Copy("Soulseek", null, "other.flac")));
+        finder.SearchLidarr = (_, _) => lidarr.Task;
+        FoundCopy? fetched = null;
+        finder.Fetch = (_, copy, _) =>
+        {
+            fetched = copy;
+            return Task.FromResult(new PickOutcome("queued", "Getting it."));
+        };
+        var id = (await finder.StartAsync("id", "alice"))!.Id;
+        FindSnapshot early;
+        do
+        {
+            await Task.Delay(10);
+            early = finder.Get(id, "alice")!;
+        } while (early.Copies.Count < 2);
+
+        // Soulseek has answered and Lidarr has not: a pick now, by place or by id, waits.
+        Assert.Equal(FindStates.Searching, early.State);
+        Assert.Equal(["two.flac", "other.flac"], early.Copies.Select(c => c.Shown.File));
+        Assert.Equal(2, early.Copies.Select(c => c.Id).Distinct().Count());
+        Assert.Equal(SongFinder.StillSearchingText, (await finder.PickAsync(id, 0, "alice")).Detail);
+        Assert.Equal(SongFinder.StillSearchingText, (await finder.PickAsync(id, early.Copies[1].Id, "alice")).Detail);
+        Assert.Null(fetched);
+
+        lidarr.SetResult(Copies(Copy("Lidarr", 1, "Lidarr's choice")));
+        var done = (await finder.WaitAsync(id, TimeSpan.FromSeconds(10)))!;
+
+        // Lidarr's first choice goes in between; the copies already shown keep their ids and order.
+        Assert.Equal(["Lidarr's choice", "two.flac", "other.flac"], done.Copies.Select(c => c.Shown.File));
+        Assert.Equal(early.Copies.Select(c => c.Id), done.Copies.Skip(1).Select(c => c.Id));
+        Assert.Equal("queued", (await finder.PickAsync(id, early.Copies[1].Id, "alice")).State);
+        Assert.Equal("other.flac", fetched!.Shown.File);
+        Assert.Equal("That copy is not on the list.", (await finder.PickAsync(id, "c99", "alice")).Detail);
+    }
+
+    [Fact]
     public void OnlyALosslessCopyMayReplaceALossyLibrarySong()
     {
         var mp3Owned = new FindTarget("Air", "Sexy Boy", null, null, "nd-1", LibraryId: "nd-1", OwnedFormat: "mp3");

@@ -90,7 +90,10 @@ public partial class SubsonicController
             : _responseBuilder.CreateFindSongsResponse(found);
     }
 
-    /// <summary>Fetches exactly one copy a Find songs search listed, by its index there.</summary>
+    /// <summary>
+    /// Fetches exactly one copy a Find songs search listed, by its id there (copy). The copy's
+    /// place on the list (candidate) still works for older apps, once the search has ended.
+    /// </summary>
     [HttpGet, HttpPost]
     [Route("rest/pickFoundSong")]
     [Route("rest/pickFoundSong.view")]
@@ -100,14 +103,18 @@ public partial class SubsonicController
         var parameters = await ExtractAllParameters();
         if (await CheckCallerAsync(parameters) is { } refused) return refused;
         var search = parameters.GetValueOrDefault("search", "").Trim();
-        if (search.Length == 0 || !int.TryParse(parameters.GetValueOrDefault("candidate"), out var index))
-            return _responseBuilder.CreateError(format, 10, "Required parameter is missing: search and candidate");
+        var copy = parameters.GetValueOrDefault("copy", "").Trim();
+        var index = -1;
+        if (search.Length == 0 || (copy.Length == 0 && !int.TryParse(parameters.GetValueOrDefault("candidate"), out index)))
+            return _responseBuilder.CreateError(format, 10, "Required parameter is missing: search and copy");
         var username = await SignedInUserAsync(parameters);
         if (string.IsNullOrWhiteSpace(username))
             return _responseBuilder.CreateError(format, 50, "Sign in with a username to pick a song");
         if (HttpContext.RequestServices.GetService<SongFinder>() is not { } finder)
             return _responseBuilder.CreateError(format, 0, "Find songs is not available on this server");
-        var outcome = await finder.PickAsync(search, index, username);
+        var outcome = copy.Length > 0
+            ? await finder.PickAsync(search, copy, username)
+            : await finder.PickAsync(search, index, username);
         return _responseBuilder.CreatePickResponse(outcome);
     }
 }

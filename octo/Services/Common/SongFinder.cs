@@ -28,8 +28,9 @@ public static class FindStates
 /// <summary>How one source's look went: searching, done, failed or off, in words, and what was asked.</summary>
 public sealed record FindSource(string Name, string State, string? Text, IReadOnlyList<string> Queries);
 
-/// <summary>One copy on the list: what the apps show, and what picking it fetches.</summary>
-public sealed record FoundCopy(AcquisitionCandidate Shown, PickedCopy Pick);
+/// <summary>One copy on the list: what the apps show, what picking it fetches, and its id on the
+/// list, given when it is added and never reused within one look, which pickFoundSong takes.</summary>
+public sealed record FoundCopy(AcquisitionCandidate Shown, PickedCopy Pick, string Id = "");
 
 /// <summary>A look as it stands, copied out so it never changes under a reader.</summary>
 public sealed record FindSnapshot(string Id, string State, FindTarget Target, IReadOnlyList<FindSource> Sources,
@@ -70,6 +71,8 @@ public sealed class SongFinder
         public string State { get; set; } = FindStates.Searching;
         public List<FindSource> Sources { get; } = [];
         public List<FoundCopy> Copies { get; } = [];
+        /// <summary>The last copy id given out on this look.</summary>
+        public int LastCopy { get; set; }
         public DateTime StartedAt { get; init; }
         public DateTime UpdatedAt { get; set; }
         public string? Error { get; set; }
@@ -160,13 +163,6 @@ public sealed class SongFinder
         await Task.WhenAll(searches);
         lock (job)
         {
-            // Ordered across sources: each source's own first choices, then the rest.
-            var ordered = job.Copies
-                .OrderBy(copy => copy.Shown.Rank ?? int.MaxValue)
-                .ThenBy(copy => copy.Shown.Source == SoulseekSource ? 0 : 1)
-                .ToList();
-            job.Copies.Clear();
-            job.Copies.AddRange(ordered.Take(MaxCopies));
             job.State = job.Sources.Any(s => s.State == FindStates.Done) ? FindStates.Done : FindStates.Failed;
             if (job.State == FindStates.Failed)
                 job.Error ??= job.Sources.Select(s => s.Text).FirstOrDefault(text => text is not null) ?? "No source could search.";
@@ -184,7 +180,7 @@ public sealed class SongFinder
                 ? await SearchSoulseek(job.Target, limit.Token)
                 : await SearchLidarr(job.Target, limit.Token);
             result = new FindSource(source, FindStates.Done, text, queries);
-            lock (job) job.Copies.AddRange(copies);
+            lock (job) Merge(job, copies);
         }
         catch (Exception ex)
         {
@@ -201,21 +197,54 @@ public sealed class SongFinder
         }
     }
 
+    /// <summary>Where a copy goes on the list: each source's own first choices, then the rest,
+    /// Soulseek before Lidarr where they tie.</summary>
+    private static (int Rank, int Source) Place(FoundCopy copy) =>
+        (copy.Shown.Rank ?? int.MaxValue, copy.Shown.Source == SoulseekSource ? 0 : 1);
+
+    /// <summary>
+    /// Adds one source's copies to the list, each with an id of its own, in their place. The
+    /// copies already listed keep their order and their ids: a source that answers later only
+    /// adds rows between them, so nothing a person is looking at moves past another. Caller
+    /// holds the job's lock. Each source caps its own list.
+    /// </summary>
+    private static void Merge(Job job, IReadOnlyList<FoundCopy> copies)
+    {
+        foreach (var copy in copies.OrderBy(Place).Select(copy => copy with { Id = $"c{++job.LastCopy}" }))
+        {
+            var place = Place(copy);
+            var at = job.Copies.FindLastIndex(listed => Place(listed).CompareTo(place) <= 0) + 1;
+            job.Copies.Insert(at, copy);
+        }
+    }
+
     // ---------------------------------------------------------------------------------------
     // Picking
     // ---------------------------------------------------------------------------------------
 
-    /// <summary>Fetches exactly the copy at this place on the look's list.</summary>
-    public async Task<PickOutcome> PickAsync(string id, int index, string user)
+    internal const string StillSearchingText = "Octo is still searching. Pick a copy once the search ends.";
+
+    /// <summary>Fetches exactly the copy with this id on the look's list.</summary>
+    public Task<PickOutcome> PickAsync(string id, string copyId, string user) =>
+        PickAsync(id, user, copies => copies.FirstOrDefault(copy => copy.Id == copyId.Trim()));
+
+    /// <summary>Fetches the copy at this place on the look's list. Kept for apps that pick by
+    /// place; it is only safe once the search has ended, so a pick while it runs is refused.</summary>
+    public Task<PickOutcome> PickAsync(string id, int index, string user) =>
+        PickAsync(id, user, copies => index >= 0 && index < copies.Count ? copies[index] : null);
+
+    private async Task<PickOutcome> PickAsync(string id, string user, Func<List<FoundCopy>, FoundCopy?> find)
     {
         if (!_jobs.TryGetValue(id, out var job) || !SameUser(job, user))
             return new(LibraryActionStates.Skipped, "This search is gone. Search again.");
-        FoundCopy copy;
+        FoundCopy? copy;
         lock (job)
         {
-            if (index < 0 || index >= job.Copies.Count) return new(LibraryActionStates.Skipped, "That copy is not on the list.");
-            copy = job.Copies[index];
+            // A source that answers later adds copies to the list, so a pick waits for the end.
+            if (job.State == FindStates.Searching) return new(LibraryActionStates.Skipped, StillSearchingText);
+            copy = find(job.Copies);
         }
+        if (copy is null) return new(LibraryActionStates.Skipped, "That copy is not on the list.");
         try
         {
             return await Fetch(job.Target, copy, user);

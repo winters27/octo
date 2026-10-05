@@ -435,13 +435,15 @@ public sealed class AcquisitionEndpointTests
         Assert.Equal("off", sources["Lidarr"]);
         var copy = Assert.Single(found.GetProperty("candidate").EnumerateArray());
         Assert.Equal(0, copy.GetProperty("index").GetInt32());
+        var copyId = copy.GetProperty("id").GetString()!;
+        Assert.False(string.IsNullOrEmpty(copyId));
         Assert.Equal("Mezzanine", copy.GetProperty("album").GetString());
 
         // Bob cannot read or pick alice's look.
         using var bobs = JsonDocument.Parse(await client.GetStringAsync($"/rest/getFoundSongs.view?{Auth("bob")}&search={search}"));
         Assert.Equal("failed", bobs.RootElement.GetProperty("subsonic-response").GetProperty("status").GetString());
 
-        using var picked = JsonDocument.Parse(await client.GetStringAsync($"/rest/pickFoundSong.view?{Auth("alice")}&search={search}&candidate=0"));
+        using var picked = JsonDocument.Parse(await client.GetStringAsync($"/rest/pickFoundSong.view?{Auth("alice")}&search={search}&copy={copyId}"));
         var pick = picked.RootElement.GetProperty("subsonic-response").GetProperty("pick");
         Assert.Equal("queued", pick.GetProperty("state").GetString());
         Assert.Equal($"soulseek:{id}", pick.GetProperty("key").GetString());
