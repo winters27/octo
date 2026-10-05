@@ -49,6 +49,50 @@ public static class CoverColours
         return new Lch(lightness, Math.Sqrt(a * a + bb * bb), hue);
     }
 
+    /// <summary>
+    /// The sRGB colour of an OKLCH one, opaque. A colour outside what a screen can show keeps its
+    /// lightness and hue and loses chroma until it fits, so it stays the colour it was meant to be,
+    /// only quieter.
+    /// </summary>
+    public static int FromLch(Lch lch)
+    {
+        var (lo, hi) = (0.0, lch.C);
+        var (r, g, b) = LinearRgb(lch.L, hi, lch.H);
+        if (!InGamut(r, g, b))
+        {
+            for (var i = 0; i < 24; i++)
+            {
+                var mid = (lo + hi) / 2;
+                var (mr, mg, mb) = LinearRgb(lch.L, mid, lch.H);
+                if (InGamut(mr, mg, mb)) lo = mid; else hi = mid;
+            }
+            (r, g, b) = LinearRgb(lch.L, lo, lch.H);
+        }
+        return unchecked((int)0xFF000000) | (Encode(r) << 16) | (Encode(g) << 8) | Encode(b);
+    }
+
+    private static (double R, double G, double B) LinearRgb(double lightness, double chroma, double hue)
+    {
+        var a = chroma * Math.Cos(hue * Math.PI / 180);
+        var bb = chroma * Math.Sin(hue * Math.PI / 180);
+        var l = Math.Pow(lightness + 0.3963377774 * a + 0.2158037573 * bb, 3);
+        var m = Math.Pow(lightness - 0.1055613458 * a - 0.0638541728 * bb, 3);
+        var s = Math.Pow(lightness - 0.0894841775 * a - 1.2914855480 * bb, 3);
+        return (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+            -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+            -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
+    }
+
+    private static bool InGamut(double r, double g, double b) =>
+        r is >= -1e-6 and <= 1 + 1e-6 && g is >= -1e-6 and <= 1 + 1e-6 && b is >= -1e-6 and <= 1 + 1e-6;
+
+    private static int Encode(double linear)
+    {
+        var c = Math.Clamp(linear, 0, 1);
+        var srgb = c <= 0.0031308 ? c * 12.92 : 1.055 * Math.Pow(c, 1 / 2.4) - 0.055;
+        return Math.Clamp(Round(srgb * 255), 0, 255);
+    }
+
     /// <summary>How far apart two hues are around the circle, 0 to 180 degrees.</summary>
     public static double HueDistance(double a, double b)
     {
