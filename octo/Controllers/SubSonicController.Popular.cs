@@ -45,7 +45,7 @@ public partial class SubsonicController
     }
 
     /// <summary>
-    /// The songs whose covers colour "Popular right now"'s cover: its first songs, one per album,
+    /// The songs whose covers color "Popular right now"'s cover: its first songs, one per album,
     /// four at most. A library song's cover is read from Navidrome as the listener, an outside
     /// song's is looked up as a station song's is. Only what is already made: drawing the cover
     /// never makes the list.
