@@ -88,6 +88,13 @@ public sealed class DuplicateScanWorker : BackgroundService
 
     public DuplicateScanResult? LastResult { get; private set; }
 
+    /// <summary>A scan walking the library right now, and when it began.</summary>
+    public bool IsScanning => ScanStartedUtc is not null;
+    public DateTime? ScanStartedUtc { get; private set; }
+
+    /// <summary>"Scan now" pressed and not yet picked up.</summary>
+    public bool IsRequested => _requested.CurrentCount > 0;
+
     /// <summary>The dashboard's "Scan now". A scan already waiting to run absorbs a second request.</summary>
     public void RequestScan()
     {
@@ -113,10 +120,18 @@ public sealed class DuplicateScanWorker : BackgroundService
 
             // Per-scan catch is mandatory: BackgroundServiceExceptionBehavior defaults to
             // StopHost, so one unhandled exception here would take Octo down.
-            try { await ScanAsync(settings, stoppingToken); }
+            try
+            {
+                ScanStartedUtc = DateTime.UtcNow;
+                await ScanAsync(settings, stoppingToken);
+            }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception ex) { _logger.LogError(ex, "Duplicate scan failed"); }
-            finally { _lastScanUtc = DateTime.UtcNow; }
+            finally
+            {
+                _lastScanUtc = DateTime.UtcNow;
+                ScanStartedUtc = null;
+            }
         }
     }
 

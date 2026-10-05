@@ -1653,6 +1653,7 @@ public class AdminController : ControllerBase
         {
             run.RunId,
             status = run.Status.ToString(),
+            pending = _genreBackfill.IsPending,
             scope = run.Scope.ToString(),
             run.DryRun,
             run.StartedUtc,
