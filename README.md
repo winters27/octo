@@ -609,6 +609,21 @@ DejaVu or Symbola from the image. No cover carries an Octo mark. A picture in
 `/app/config/covers` named after a mix or station (`Rock Mix.jpg`), or after its genre or
 decade (`Rock.png`), replaces its cover, and replacing the picture shows without a restart.
 
+### Popular right now
+
+Every listener also gets **Popular right now**, a read-only playlist of the chart of the moment
+in every app: Deezer's 50 most played songs for the country Octo's server is in (Last.fm's
+chart when Deezer does not answer), the same chart the Octo apps show in search before anything
+is typed. Songs the listener has are their own library copies; the rest play right away and are
+added with a heart, like any outside song. It is made with the listener's own sign-in the next
+time their app lists playlists and holds still for 6 hours, so every app shows the same songs.
+A chart or library that does not answer keeps the last list rather than emptying it. Outside
+songs are left out while `ENABLE_SEARCH_DISCOVERY` is off and follow `EXPLICIT_FILTER`, as the
+stations do. Its cover is drawn like a mix's, from its first songs' covers. It is on by
+default, whether or not the mixes are; `POPULAR_NOW=false` or the dashboard's Mixes page turns
+it off. Apps that copy the library to the device (Symfonium) get its outside songs in their
+sync catalog, so the playlist finds them there.
+
 ### Spotify import
 
 The dashboard's **Spotify import** page, and the same view in the Octo apps, shows what your
@@ -717,7 +732,7 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 |---|---|
 | `search3` | merge local + Last.fm-driven external songs and Deezer-driven external albums; later pages carry on through the outside songs page one started; an outside album the library holds whole (by its songs, under any album name) or by its very name is listed as the library's album, and one held in part carries `ownedCount` beside `songCount` |
 | `getSimilarSongs2` | radio queue with local-first preference |
-| `getPlaylists`, `getPlaylist` | append authenticated per-user read-only Radio snapshots and materialize tracks local-first |
+| `getPlaylists`, `getPlaylist` | append authenticated per-user read-only Radio snapshots, mixes and Popular right now, and materialize tracks local-first |
 | `createPlaylist`, `updatePlaylist`, `deletePlaylist` | protect reserved Radio IDs while relaying ordinary mutations |
 | `getInternetRadioStations` | append startup-warmed authenticated Octo stations immediately, with a one-starter same-request fallback, while preserving ordinary internet radio |
 | `createInternetRadioStation`, `updateInternetRadioStation`, `deleteInternetRadioStation` | protect Octo stations while relaying ordinary internet-radio mutations |

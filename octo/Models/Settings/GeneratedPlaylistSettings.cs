@@ -78,4 +78,12 @@ public class GeneratedPlaylistSettings
         }
         return $"{label} Mix";
     }
+
+    /// <summary>
+    /// "Popular right now": the chart of the moment as a read-only playlist for every listener,
+    /// in every app, on whether or not the mixes are. Songs a listener has are their library's
+    /// own; the rest play right away and are added with a heart. Made again every few hours.
+    /// Environment variable: POPULAR_NOW
+    /// </summary>
+    public bool PopularNow { get; set; } = true;
 }

@@ -334,9 +334,13 @@ public sealed class SyncCatalogService
             if (owned.Owns(track.Artist, track.Title)) continue;
 
             // The same call, with the same duration, that the station playlist makes, so the
-            // placeholder id here is the id the playlist lists.
-            var hit = (await _metadata.SearchSongsByArtistTitleAsync(track.Artist, track.Title, 1, track.Duration))
-                .FirstOrDefault();
+            // placeholder id here is the id the playlist lists. "Popular right now" lists its
+            // songs by ids it already holds, so those are taken as they are.
+            var hit = track.Source == Octo.Services.Library.PopularPlaylistService.TrackSource
+                      && track.ResolvedId is { Length: > 0 } listed
+                ? await _metadata.GetSongAsync(SoulseekMetadataService.ProviderName, listed)
+                : (await _metadata.SearchSongsByArtistTitleAsync(track.Artist, track.Title, 1, track.Duration))
+                    .FirstOrDefault();
             if (hit is null || hit.Id.Length == 0 || !seenIds.Add(hit.Id)) continue;
             if (settings.ExplicitFilter == ExplicitFilter.CleanOnly && hit.ExplicitContentLyrics is 1) continue;
             if (settings.ExplicitFilter == ExplicitFilter.ExplicitOnly && hit.ExplicitContentLyrics is 3) continue;

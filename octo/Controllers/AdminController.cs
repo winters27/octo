@@ -972,6 +972,7 @@ public class AdminController : ControllerBase
             },
             ["GeneratedPlaylists"] = new Dictionary<string, object>
             {
+                ["PopularNow"] = mixes.PopularNow,
                 ["Enabled"] = mixes.Enabled,
                 ["Genres"] = mixes.Genres,
                 ["Decades"] = mixes.Decades,
@@ -1990,6 +1991,7 @@ public class AdminController : ControllerBase
             },
             ["GeneratedPlaylists"] = new JsonObject
             {
+                ["PopularNow"] = mixes.PopularNow,
                 ["Enabled"] = mixes.Enabled,
                 ["Genres"] = mixes.Genres,
                 ["Decades"] = mixes.Decades,
@@ -2179,6 +2181,7 @@ public class AdminController : ControllerBase
             "Metadata:PreferOriginalAlbum", "Metadata:YearFromOriginalRelease", "Metadata:PreferredCountries",
             "Metadata:ReleaseDetailsLookup", "Metadata:ReplayGain", "Metadata:ReplayGainTimeoutSeconds",
             "Metadata:TagRehearsal",
+            "GeneratedPlaylists:PopularNow",
             "GeneratedPlaylists:Enabled", "GeneratedPlaylists:Genres", "GeneratedPlaylists:Decades",
             "GeneratedPlaylists:TrackCount", "GeneratedPlaylists:MaxPerArtist", "GeneratedPlaylists:CreateAt",
             "GeneratedPlaylists:RemoveBelow", "GeneratedPlaylists:MaxPlaylists", "GeneratedPlaylists:RefreshHours",

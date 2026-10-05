@@ -15,6 +15,7 @@ using Octo.Models.Domain;
 using Octo.Models.Settings;
 using Octo.Services.Common;
 using Octo.Services.CoverArt;
+using Octo.Services.Library;
 using Octo.Services.Soulseek;
 using Octo.Services.Subsonic;
 
@@ -175,6 +176,7 @@ internal sealed class ChartWebFactory(bool discovery = true, bool popularNow = t
 {
     private readonly string _directory = Path.Combine(Path.GetTempPath(), "octo-chart-" + Guid.NewGuid());
     public ChartUpstream Upstream { get; } = new();
+    public PopularPlaylistService Popular => Services.GetRequiredService<PopularPlaylistService>();
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
