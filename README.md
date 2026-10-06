@@ -98,7 +98,7 @@ Any Subsonic app works with Octo. Its own apps for desktop and Android are made 
 <tr><td width="33%"><img src="docs/images/players/phone-search.webp" alt="Search in the Octo Android app"></td><td width="33%"><img src="docs/images/players/phone-album.webp" alt="An album in the Octo Android app"></td><td width="33%"><img src="docs/images/players/phone-player.webp" alt="The player in the Octo Android app"></td></tr>
 </table>
 
-The desktop app runs on Windows and Linux, and the Android app on Android 10 and newer. They need Octo 2026.09.29 or newer, and they work as regular players with Navidrome too. Download them from [Octo for Windows and Linux](https://github.com/winters27/octo/releases/tag/desktop-v1.3.2) and [Octo for Android](https://github.com/winters27/octo/releases/tag/android-v1.2.4), or add [Octo's F-Droid repository](https://winters27.github.io/octo/fdroid/) so the Android app updates through F-Droid, Droid-ify or Neo Store. The source is at [winters27/octo-player](https://github.com/winters27/octo-player).
+The desktop app runs on Windows and Linux, and the Android app on Android 10 and newer. They need Octo 2026.09.29 or newer, and they work as regular players with Navidrome too. Download them from [Octo for Windows and Linux](https://github.com/winters27/octo/releases/tag/desktop-v1.5.0) and [Octo for Android](https://github.com/winters27/octo/releases/tag/android-v1.5.0), or add [Octo's F-Droid repository](https://winters27.github.io/octo/fdroid/) so the Android app updates through F-Droid, Droid-ify or Neo Store. The source is at [winters27/octo-player](https://github.com/winters27/octo-player).
 
 ## Compatible apps
 
