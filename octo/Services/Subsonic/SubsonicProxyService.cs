@@ -92,11 +92,13 @@ public class SubsonicProxyService
     // no header, Feishin's Albums, Artists and Tracks pages have nothing to size against
     // and render empty, while Home and Search, which do not paginate, look perfectly fine
     // (issue #34). The body was always correct, which is why it read as a client bug.
+    // Content-Disposition carries a download's file name; without it rest/download saved
+    // the song with no name.
     private static readonly string[] ForwardResponseHeaders =
     {
         "X-Nd-Authorization", "ETag", "Last-Modified", "Cache-Control",
         "Content-Range", "Accept-Ranges", "Vary",
-        "X-Total-Count", "Access-Control-Expose-Headers",
+        "X-Total-Count", "Access-Control-Expose-Headers", "Content-Disposition",
     };
 
     public async Task<RawRelayResult> RelayRawAsync(

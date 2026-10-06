@@ -78,6 +78,8 @@ public sealed class StreamLengthTests
                 {
                     var headers = new List<string> { "Content-Type: audio/mpeg", "Accept-Ranges: none" };
                     if (query["estimateContentLength"] == "true") headers.Add($"Content-Length: {Estimate}");
+                    if (path.EndsWith("/rest/download", StringComparison.Ordinal))
+                        headers.Add("Content-Disposition: attachment; filename=\"Daft Punk - Digital Love.mp3\"");
                     await WriteAsync(stream, "200 OK", headers, Song);
                     return;
                 }
@@ -253,6 +255,8 @@ public sealed class StreamLengthTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal("audio/mpeg", response.Content.Headers.ContentType?.MediaType);
         Assert.Equal(SocketNavidrome.Song, body);
+        // The file keeps the name Navidrome gave it, not a nameless download.
+        Assert.Equal("\"Daft Punk - Digital Love.mp3\"", response.Content.Headers.ContentDisposition?.FileName);
         Assert.Empty(factory.Log.Failures);
     }
 
