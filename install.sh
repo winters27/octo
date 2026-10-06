@@ -195,7 +195,6 @@ if [ -n "$(existing SUBSONIC_URL)" ] && [ "$(existing SUBSONIC_URL)" != "http://
   HAVE_NAVIDROME_DEFAULT="y"
 fi
 STARTER=false
-COMPOSE_PROFILES=""
 NAVIDROME_ADMIN_PASSWORD=""
 SUBSONIC_ADMIN_USERNAME="$(existing SUBSONIC_ADMIN_USERNAME)"
 SUBSONIC_ADMIN_PASSWORD="$(existing SUBSONIC_ADMIN_PASSWORD)"
@@ -208,7 +207,6 @@ echo
 
 if [ "$STARTER" = true ]; then
   SUBSONIC_URL="http://navidrome:4533"
-  COMPOSE_PROFILES="navidrome"
   # Creates Navidrome's "admin" user on its first start; kept on re-runs so it
   # always matches what Navidrome already has.
   NAVIDROME_ADMIN_PASSWORD="$(existing NAVIDROME_ADMIN_PASSWORD)"
@@ -237,6 +235,16 @@ while true; do
   echo
 done
 fi
+# The answer above decides only the navidrome profile; any other profile the old .env named
+# stays (an old sonic is harmless: octo-sonic needs no profile any more).
+profiles=()
+IFS=',' read -r -a old_profiles <<< "$(existing COMPOSE_PROFILES)"
+for p in "${old_profiles[@]}"; do
+  p="${p// /}"
+  if [ -n "$p" ] && [ "$p" != navidrome ]; then profiles+=("$p"); fi
+done
+[ "$STARTER" = true ] && profiles+=(navidrome)
+COMPOSE_PROFILES="$(IFS=,; echo "${profiles[*]}")"
 echo
 
 DOWNLOAD_PATH_RAW=$(ask "Music directory on this host (where downloads will land)" \
@@ -430,12 +438,43 @@ if [ "$STARTER" = true ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────────
-# Build + start
+# Images + start
 # ─────────────────────────────────────────────────────────────────
+# The yt-dlp shim and octo-sonic are published with every release (amd64 and arm64), so they
+# are pulled, not built: octo-sonic is Rust and FFmpeg, minutes of compiling and more memory
+# than a small machine has. True when pulling gives what a build of this folder would: the
+# folder's copy of the sidecar is the one its release published. On main or a branch past the
+# release it may have changed since, so it is built. OCTO_IMAGE_TAG in .env is the user's
+# own choice of image, and outside a git checkout there is nothing to compare, so both pull.
+published_copy_matches() { # the sidecar's folder
+  local release
+  [ -z "$(existing OCTO_IMAGE_TAG)" ] || return 0
+  release="$(sed -n 's:.*<InformationalVersion>\(.*\)</InformationalVersion>.*:\1:p' octo/octo.csproj 2>/dev/null | head -n 1)"
+  [ -n "$release" ] && git rev-parse -q --verify "refs/tags/$release^{commit}" > /dev/null 2>&1 || return 0
+  git diff --quiet "refs/tags/$release" -- "$1" 2> /dev/null
+}
+
 echo
-bold "─── Building images ────────────────────────────────────────"
-dim "  This is the slowest step — 2-3 minutes the first time, ~10 seconds on re-runs."
-docker compose build
+bold "─── Getting images ─────────────────────────────────────────"
+build=(octo)
+for sidecar in yt-dlp-shim:yt-dlp-shim octo-sonic:sonic; do
+  service="${sidecar%%:*}"
+  if ! published_copy_matches "${sidecar#*:}"; then
+    dim "  $service changed since its release, so it is built from this folder"
+    build+=("$service-source")
+  elif docker compose pull "$service"; then
+    green "  ✓ pulled $service"
+  else
+    # No network to ghcr.io, or the image is not published: build it, as before.
+    yellow "  ⚠ could not pull $service, so it is built from this folder instead"
+    build+=("$service-source")
+  fi
+done
+case " ${build[*]} " in
+  *" octo-sonic-source "*) dim "  Building Octo and octo-sonic: octo-sonic takes several minutes the first time." ;;
+  *) dim "  Building Octo: 2-3 minutes the first time, ~10 seconds on re-runs." ;;
+esac
+docker compose build "${build[@]}"
 
 echo
 bold "─── Starting stack ─────────────────────────────────────────"

@@ -11,9 +11,17 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin" "$work/music"
 failures=0
 
-# docker only logs. curl answers 200 to every status code probe and a Last.fm track to the key
-# check, so each question takes the default and Octo looks healthy straight away.
-printf '#!/usr/bin/env bash\necho "docker $*" >> "%s/docker.log"\n' "$work" > "$work/bin/docker"
+# docker only logs, and fails the pull of any service FAKE_NO_IMAGE names (no network to
+# ghcr.io). curl answers 200 to every status code probe and a Last.fm track to the key check,
+# so each question takes the default and Octo looks healthy straight away.
+cat > "$work/bin/docker" <<EOF
+#!/usr/bin/env bash
+echo "docker \$*" >> "$work/docker.log"
+if [ "\$2" = pull ]; then
+  for service in \${FAKE_NO_IMAGE:-}; do [ "\$3" = "\$service" ] && exit 1; done
+fi
+exit 0
+EOF
 cat > "$work/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 for arg in "$@"; do
@@ -39,7 +47,16 @@ fresh() { # a copy of the installer with no .env yet
 }
 printf '\n%.0s' $(seq 1 50) > "$work/answers"
 run() { # answers every question with Enter
+  : > "$work/docker.log"
   bash "$work/octo/install.sh" < "$work/answers" > "$work/out.log" 2>&1
+}
+# What the run pulled and built, as "pull a b | build c d".
+images() {
+  printf '%s | %s' "$(sed -n 's/^docker compose pull //p' "$work/docker.log" | paste -sd ' ' -)" \
+    "$(sed -n 's/^docker compose build //p' "$work/docker.log")"
+}
+expect_images() { # name, wanted images line
+  [ "$(images)" = "$2" ] && pass "$1" || fail "$1: $(images) (want $2)"
 }
 # A setting's value as Compose reads it: the last line wins, surrounding quotes come off.
 value_of() {
@@ -118,10 +135,10 @@ run
 cmp -s "$work/first.env" "$work/octo/.env" \
   && pass "running it again changes nothing" || { fail "a second run changed .env:"; diff "$work/first.env" "$work/octo/.env"; }
 
-# A first install takes the defaults the questions show.
+# A first install takes the defaults the questions show: no Navidrome yet, so the starter stack.
 fresh
 run
-for want in SUBSONIC_URL=http://192.168.1.10:4533 "DOWNLOAD_PATH=$work/octo/downloads" \
+for want in SUBSONIC_URL=http://navidrome:4533 COMPOSE_PROFILES=navidrome SUBSONIC_ADMIN_USERNAME=admin "DOWNLOAD_PATH=$work/octo/downloads" \
     DOWNLOAD_SOURCE=Soulseek STORAGE_MODE=Stream FOLDER_STRUCTURE=Flat SLSKD_USERNAME=admin \
     LIDARR_QUALITY_PROFILE_ID=0 LIDARR_COMPLETION_MODE=Accepted EXPLICIT_FILTER=All; do
   grep -qx "$want" "$work/octo/.env" && pass "a first install writes $want" || fail "a first install did not write $want"
@@ -138,6 +155,43 @@ printf 'SUBSONIC_URL=http://192.168.1.20:4533\nDOWNLOAD_PATH=%s\nLIDARR_COMPLETI
 run
 grep -qx 'LIDARR_COMPLETION_MODE=Accepted' "$work/octo/.env" && grep -qx 'SLSKD_USERNAME=admin' "$work/octo/.env" \
   && pass "settings an older installer left empty get their defaults" || fail "empty settings stayed empty"
+
+# The sidecars are pulled and only Octo is built; one that will not pull is built instead.
+fresh
+run
+expect_images "the sidecars are pulled and only Octo is built" "yt-dlp-shim octo-sonic | octo"
+grep -q 'compose up -d' "$work/docker.log" && pass "the stack is started" || fail "the stack was not started"
+FAKE_NO_IMAGE=octo-sonic run
+expect_images "a sidecar that will not pull is built from the folder" "yt-dlp-shim octo-sonic | octo octo-sonic-source"
+FAKE_NO_IMAGE="yt-dlp-shim octo-sonic" run && pass "without ghcr.io the installer still finishes" || fail "without ghcr.io the installer stopped"
+expect_images "without ghcr.io everything is built, as before" "yt-dlp-shim octo-sonic | octo yt-dlp-shim-source octo-sonic-source"
+
+# In a git checkout, a sidecar changed since the release the folder names is built, because
+# its published image is not what the folder holds. One the user pinned with OCTO_IMAGE_TAG
+# is pulled anyway.
+fresh
+(
+  cd "$work/octo" || exit 1
+  mkdir -p octo yt-dlp-shim sonic
+  printf '<InformationalVersion>2026.10.05</InformationalVersion>\n' > octo/octo.csproj
+  echo one > yt-dlp-shim/app.py && echo one > sonic/main.rs
+  git init -q . && git config core.autocrlf false && git add -A && git -c user.email=t@example.com -c user.name=t commit -qm release && git tag 2026.10.05
+) || fail "could not make the test checkout"
+run
+expect_images "a checkout of the release pulls both" "yt-dlp-shim octo-sonic | octo"
+echo two > "$work/octo/yt-dlp-shim/app.py"
+run
+expect_images "a shim changed since the release is built" "octo-sonic | octo yt-dlp-shim-source"
+echo "OCTO_IMAGE_TAG=latest" >> "$work/octo/.env"
+run
+expect_images "a tag the user chose is pulled" "yt-dlp-shim octo-sonic | octo"
+
+# The installer's answer decides only the navidrome profile; any other profile stays.
+fresh
+printf 'SUBSONIC_URL=http://navidrome:4533\nDOWNLOAD_PATH=%s\nCOMPOSE_PROFILES=sonic,navidrome\n' "$work/music" > "$work/octo/.env"
+run
+grep -qx 'COMPOSE_PROFILES=sonic,navidrome' "$work/octo/.env" \
+  && pass "a starter stack keeps its profiles" || fail "starter profiles: $(grep COMPOSE_PROFILES "$work/octo/.env")"
 
 echo
 [ "$failures" = 0 ] && echo "All installer tests passed." || echo "$failures installer test(s) failed."

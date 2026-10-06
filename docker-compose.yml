@@ -296,14 +296,13 @@ services:
   # in its own container prevents .NET process-management quirks from wedging
   # the parent (see Brain/projects/Flaccy.md, 2026-04-29 LXC wedge note).
   #
-  # Published with every Octo release, so it can be pulled as well as built. A build
-  # tags itself with this name, so the update helper's build still works as before.
+  # Pulled, not built: it is published with every Octo release, for amd64 and arm64.
   # The default tag is this release's own number (bumped with octo/octo.csproj; CI
   # checks it); OCTO_IMAGE_TAG picks another, such as latest on an install that pulls
-  # Octo's images instead of building them.
+  # Octo's images instead of building them. Without access to ghcr.io, build it from
+  # this folder with yt-dlp-shim-source (below).
   yt-dlp-shim:
-    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.04}
-    build: ./yt-dlp-shim
+    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.05}
     container_name: yt-dlp-shim
     restart: unless-stopped
     environment:
@@ -351,8 +350,10 @@ services:
   # Always started, so an update brings it with no change to .env. RADIO_SOUNDS_ALIKE=false
   # turns Sounds alike off: Octo stops asking, and octo-sonic waits without reading anything.
   # An older .env with COMPOSE_PROFILES=sonic still works; the profile is simply not needed.
+  # Pulled, not built, like the shim: compiling it (Rust and FFmpeg) takes minutes and more
+  # memory than a small machine has. octo-sonic-source (below) builds it from this folder.
   octo-sonic:
-    build: ./sonic
+    image: ghcr.io/winters27/octo-octo-sonic:${OCTO_IMAGE_TAG:-2026.10.05}
     container_name: octo-sonic
     restart: unless-stopped
     # Passes docker stop's SIGTERM on and reaps the reader processes.
@@ -472,6 +473,22 @@ services:
     volumes:
       - ${DOWNLOAD_PATH:-./downloads}:/music
       - ${NAVIDROME_DATA_DIR:-./navidrome-data}:/data
+
+  # The sidecars built from this folder instead of pulled: for a machine that cannot reach
+  # ghcr.io, or a sidecar changed since its release. They never run; a build gives the image
+  # the name the service above runs, so `docker compose up -d` then uses it:
+  #   docker compose build yt-dlp-shim-source octo-sonic-source && docker compose up -d
+  # The update helper and install.sh do this by themselves when a pull fails. In a profile so
+  # a plain `docker compose build` builds Octo alone, which is what an older update helper
+  # runs; that keeps even the update to this release from compiling octo-sonic.
+  yt-dlp-shim-source:
+    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.05}
+    build: ./yt-dlp-shim
+    profiles: ["source"]
+  octo-sonic-source:
+    image: ghcr.io/winters27/octo-octo-sonic:${OCTO_IMAGE_TAG:-2026.10.05}
+    build: ./sonic
+    profiles: ["source"]
 
 volumes:
   ytdlp-cache:

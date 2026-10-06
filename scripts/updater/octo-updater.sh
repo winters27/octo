@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Octo's update helper. Runs on the host, started by octo-updater.path when the
 # dashboard writes an update request into Octo's config folder (update/request).
-# It runs fixed steps: fetch the release, check it, build it, restart Octo, and
-# writes its progress back (update/status, update/log) for the dashboard to show.
+# It runs fixed steps (fetch the release, check it, pull its sidecars, build Octo,
+# restart it) and writes its progress back (update/status, update/log) for the
+# dashboard to show.
 #
 # Octo never gets the Docker socket. All it can do is ask, by writing a file, and
 # the request names only a release; nothing in it is ever run as a command. The
@@ -121,6 +122,26 @@ published_services() {
     }'
 }
 
+# The sidecars Octo publishes with every release. A built install pulls them rather than
+# compiling them: octo-sonic is Rust and FFmpeg, minutes of building and more memory than a
+# small machine has. Each has a <name>-source service in docker-compose.yml that builds it
+# from the folder instead, for when the pull fails. A sidecar a later release adds and this
+# list lacks is still pulled, by `up -d`, because its image is missing.
+SIDECARS=(yt-dlp-shim octo-sonic)
+
+# Pulls each sidecar the checked out release runs, and prints the -source service to build
+# for every one that could not be pulled (no network to ghcr.io, or not published yet).
+pull_sidecars() {
+  local services service
+  services=" $({ docker compose config --services 2>/dev/null || true; } | tr '\n' ' ') "
+  for service in "${SIDECARS[@]}"; do
+    [[ "$services" == *" $service "* ]] || continue
+    run docker compose pull "$service" && continue
+    log "$service could not be pulled, so it is built here instead"
+    echo "$service-source"
+  done
+}
+
 # The release this folder holds, from octo.csproj.
 folder_version() {
   sed -n '/<InformationalVersion>/{s:.*<InformationalVersion>\(.*\)</InformationalVersion>.*:\1:p;q}' "$OCTO_DIR/octo/octo.csproj" 2>/dev/null || true
@@ -229,7 +250,7 @@ fi
 
 if [ "$DRYRUN" = 1 ]; then
   write_status building "Dry run: would build $tag"
-  log "Dry run: would check out $tag, build, and restart"
+  log "Dry run: would check out $tag, pull ${SIDECARS[*]} (building any that will not pull), build octo, and restart"
   write_status "done" "Dry run: nothing was changed"
   exit 0
 fi
@@ -238,9 +259,12 @@ fi
 previous="$(git_in_clone symbolic-ref -q --short HEAD || git_in_clone rev-parse HEAD)"
 run git_in_clone checkout --quiet --detach "$tag" || fail "git could not check out $tag. The log has the details." "Fetching $tag from GitHub"
 
-# Built before anything stops, so a failed build leaves the running Octo alone.
+# Pulled and built before anything stops, so a failure leaves the running Octo alone. Only
+# Octo is built, and a sidecar only when its image could not be pulled.
+write_status building "Pulling the sidecars for $tag"
+read -r -a fallback <<< "$(pull_sidecars | tr '\n' ' ')"
 write_status building "Building Octo $tag"
-if ! run docker compose build; then
+if ! run docker compose build octo "${fallback[@]}"; then
   run git_in_clone checkout --quiet "$previous" || log "Could not check out $previous again"
   fail "The build failed, so nothing was restarted and Octo still runs ${from:-the old version}. The log has the details." "Building Octo $tag"
 fi
