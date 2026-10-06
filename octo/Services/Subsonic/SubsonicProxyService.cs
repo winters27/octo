@@ -3,6 +3,7 @@ using Microsoft.Extensions.Primitives;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.WebUtilities;
 using Octo.Models.Settings;
+using System.Net;
 using System.Text;
 
 namespace Octo.Services.Subsonic;
@@ -21,15 +22,18 @@ public class SubsonicProxyService
     private readonly IOptionsMonitor<SubsonicSettings> subsonicSettingsOptions;
     private SubsonicSettings _subsonicSettings => subsonicSettingsOptions.CurrentValue;
     private readonly IHttpContextAccessor _httpContextAccessor;
+    private readonly ILogger<SubsonicProxyService>? _logger;
 
     public SubsonicProxyService(
         IHttpClientFactory httpClientFactory,
         IOptionsMonitor<SubsonicSettings> subsonicSettings,
-        IHttpContextAccessor httpContextAccessor)
+        IHttpContextAccessor httpContextAccessor,
+        ILogger<SubsonicProxyService>? logger = null)
     {
         _httpClient = httpClientFactory.CreateClient();
         subsonicSettingsOptions = subsonicSettings;
         _httpContextAccessor = httpContextAccessor;
+        _logger = logger;
     }
 
     /// <summary>
@@ -88,11 +92,13 @@ public class SubsonicProxyService
     // no header, Feishin's Albums, Artists and Tracks pages have nothing to size against
     // and render empty, while Home and Search, which do not paginate, look perfectly fine
     // (issue #34). The body was always correct, which is why it read as a client bug.
+    // Content-Disposition carries a download's file name; without it rest/download saved
+    // the song with no name.
     private static readonly string[] ForwardResponseHeaders =
     {
         "X-Nd-Authorization", "ETag", "Last-Modified", "Cache-Control",
         "Content-Range", "Accept-Ranges", "Vary",
-        "X-Total-Count", "Access-Control-Expose-Headers",
+        "X-Total-Count", "Access-Control-Expose-Headers", "Content-Disposition",
     };
 
     public async Task<RawRelayResult> RelayRawAsync(
@@ -135,8 +141,25 @@ public class SubsonicProxyService
                     req.Headers.TryAddWithoutValidation(h, vals.ToArray());
         }
 
-        using var response = await _httpClient.SendAsync(req);
-        var body = await response.Content.ReadAsByteArrayAsync();
+        // Headers first, so the body can be read knowing whether its length is Navidrome's
+        // estimate (rest/download with a format and estimateContentLength). The timeout
+        // still covers the whole body, as it did when SendAsync read it.
+        using var timeout = new CancellationTokenSource(_httpClient.Timeout);
+        using var response = await _httpClient.SendAsync(req,
+            HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+        byte[] body;
+        if (LengthMayBeEstimate(response, parameters))
+        {
+            await using var upstream = TolerateEarlyEnd(
+                await response.Content.ReadAsStreamAsync(timeout.Token), response, endpoint);
+            using var buffer = new MemoryStream();
+            await upstream.CopyToAsync(buffer, timeout.Token);
+            body = buffer.ToArray();
+        }
+        else
+        {
+            body = await response.Content.ReadAsByteArrayAsync(timeout.Token);
+        }
 
         var respHeaders = new List<KeyValuePair<string, string>>();
         foreach (var h in ForwardResponseHeaders)
@@ -261,6 +284,41 @@ public class SubsonicProxyService
     };
 
     /// <summary>
+    /// True when the upstream Content-Length may be Navidrome's estimate of a transcode
+    /// rather than the size of the body it will send. Navidrome serves a file, or a
+    /// transcode it has finished and cached, with Accept-Ranges: bytes and an exact
+    /// length, and a 206 carries an exact Content-Range. A transcode still being made
+    /// says Accept-Ranges: none, and then has a length only because the client asked
+    /// for an estimate (Verified 2026-10-05: announced 4,067,983, sent 3,974,093).
+    /// With neither mark, the request decides: an estimate or a transcode was asked for.
+    /// </summary>
+    internal static bool LengthMayBeEstimate(HttpResponseMessage response,
+        IEnumerable<KeyValuePair<string, string>> parameters)
+    {
+        if (response.StatusCode == HttpStatusCode.PartialContent) return false;
+        var acceptRanges = response.Headers.AcceptRanges;
+        if (acceptRanges.Contains("bytes", StringComparer.OrdinalIgnoreCase)) return false;
+        if (acceptRanges.Contains("none", StringComparer.OrdinalIgnoreCase)) return true;
+
+        string? Value(string key) => parameters
+            .FirstOrDefault(pair => string.Equals(pair.Key, key, StringComparison.OrdinalIgnoreCase)).Value;
+        if (string.Equals(Value("estimateContentLength"), "true", StringComparison.OrdinalIgnoreCase))
+            return true;
+        var format = Value("format");
+        if (!string.IsNullOrEmpty(format) && !string.Equals(format, "raw", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return int.TryParse(Value("maxBitRate"), out var maxBitRate) && maxBitRate > 0;
+    }
+
+    private Stream TolerateEarlyEnd(Stream upstream, HttpResponseMessage response, string endpoint)
+    {
+        var announced = response.Content.Headers.ContentLength;
+        return new EstimatedLengthStream(upstream, sent => _logger?.LogDebug(
+            "{Endpoint}: the transcode ended at {Sent} bytes, short of the estimated {Announced}",
+            endpoint, sent, announced));
+    }
+
+    /// <summary>
     /// Relays a stream request to the Subsonic server with range processing support.
     /// </summary>
     public async Task<IActionResult> RelayStreamAsync(
@@ -305,15 +363,32 @@ public class SubsonicProxyService
             
             if (!response.IsSuccessStatusCode)
             {
-                return new StatusCodeResult((int)response.StatusCode);
+                // A 416 names the real size ("bytes */N"). A player that asked past the end
+                // of a transcode, usually because it believed an estimate, learns where the
+                // end is; ExoPlayer reads that as the end of the song.
+                if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable
+                    && response.Content.Headers.TryGetValues("Content-Range", out var size))
+                {
+                    outgoingResponse.Headers["Content-Range"] = size.ToArray();
+                }
+                var status = (int)response.StatusCode;
+                response.Dispose();
+                return new StatusCodeResult(status);
             }
 
             // Forward HTTP status code (e.g., 206 Partial Content for range requests)
             outgoingResponse.StatusCode = (int)response.StatusCode;
 
+            // A live transcode's Content-Length is Navidrome's guess, and the real output
+            // usually comes out 2 to 3% smaller. Promising the guess to the client meant
+            // the copy failed after the last real byte and the connection was cut, so
+            // that length is left out and the body goes chunked.
+            var estimate = LengthMayBeEstimate(response, parameters);
+
             // Forward streaming-required headers from upstream response
             foreach (var header in StreamingRequiredHeaders)
             {
+                if (estimate && header == "Content-Length") continue;
                 if (response.Headers.TryGetValues(header, out var values) ||
                     response.Content.Headers.TryGetValues(header, out values))
                 {
@@ -322,6 +397,7 @@ public class SubsonicProxyService
             }
 
             var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            if (estimate) stream = TolerateEarlyEnd(stream, response, "rest/stream");
             var contentType = response.Content.Headers.ContentType?.ToString() ?? "audio/mpeg";
             
             return new FileStreamResult(stream, contentType)
@@ -389,6 +465,81 @@ public class SubsonicProxyService
         public override async ValueTask DisposeAsync()
         {
             await inner.DisposeAsync(); owner.Dispose(); GC.SuppressFinalize(this);
+        }
+    }
+
+    /// <summary>
+    /// A transcode whose Content-Length was an estimate. HttpClient holds the body to the
+    /// length announced and throws when it ends sooner, which here only means the real
+    /// output was smaller than the guess, so that early end reads as the end of the song.
+    /// Any other failure still throws.
+    /// </summary>
+    private sealed class EstimatedLengthStream(Stream inner, Action<long> endedShort) : Stream
+    {
+        private long _read;
+        private bool _ended;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => _read;
+            set => throw new NotSupportedException();
+        }
+        public override void Flush() { }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_ended) return 0;
+            try { return Counted(inner.Read(buffer, offset, count)); }
+            catch (HttpIOException ex) when (ex.HttpRequestError == HttpRequestError.ResponseEnded)
+            {
+                return EndedShort();
+            }
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count,
+            CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (_ended) return 0;
+            try { return Counted(await inner.ReadAsync(buffer, cancellationToken)); }
+            catch (HttpIOException ex) when (ex.HttpRequestError == HttpRequestError.ResponseEnded)
+            {
+                return EndedShort();
+            }
+        }
+
+        private int Counted(int read)
+        {
+            _read += read;
+            return read;
+        }
+
+        private int EndedShort()
+        {
+            _ended = true;
+            endedShort(_read);
+            return 0;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) inner.Dispose();
+            base.Dispose(disposing);
+        }
+        public override async ValueTask DisposeAsync()
+        {
+            await inner.DisposeAsync();
+            GC.SuppressFinalize(this);
         }
     }
 }
