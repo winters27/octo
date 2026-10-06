@@ -184,7 +184,8 @@ jobs:
       - name: Upload the digest
         uses: actions/upload-artifact@v7
         with:
-          name: digests-${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          # Platform first, image name last: "digests-*-octo" must not also match octo-sonic.
+          name: digests-${{ matrix.platform.arch }}-${{ matrix.image.name }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -215,7 +216,7 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digests-${{ matrix.image.name }}-*
+          pattern: digests-*-${{ matrix.image.name }}
           merge-multiple: true
 
       - name: Set up Docker Buildx
