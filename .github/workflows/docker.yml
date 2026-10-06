@@ -12,7 +12,9 @@ name: Docker Build & Push
 #   2. Push the tag. This workflow builds and publishes every image of it.
 #   3. Once all of them are published, the release job below publishes the draft and marks
 #      it Latest. If there was no draft, it publishes nothing and says so; publish the
-#      release by hand then, after this workflow is green.
+#      release by hand then, after this workflow is green. It also refuses while any image
+#      cannot be pulled without signing in: a new package on ghcr.io starts private, so the
+#      first time, make it public on GitHub and re-run the release job.
 # Never publish the release before this workflow is green: an install that updates first
 # would find no sidecar images for it (it then builds them, slowly, or fails without ghcr.io).
 
@@ -280,6 +282,22 @@ jobs:
       published: ${{ steps.publish.outputs.published }}
 
     steps:
+      # Installs pull without signing in, and a new package on ghcr.io starts private. One
+      # that is still private would fail every update to this release, so the release waits.
+      - name: Every image can be pulled without signing in
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          private=()
+          for suffix in "" -yt-dlp-shim -octo-sonic; do
+            docker manifest inspect "$IMAGE$suffix:$TAG" > /dev/null 2>&1 || private+=("$IMAGE$suffix")
+          done
+          if [ "${#private[@]}" -gt 0 ]; then
+            echo "::error::Not public yet: ${private[*]}. Make each package public (the package's settings on GitHub, Change visibility), then re-run this job."
+            exit 1
+          fi
+
       - name: Publish the draft release
         id: publish
         env:
