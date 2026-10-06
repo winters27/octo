@@ -127,7 +127,7 @@ jobs:
           # The Sounds alike reader (Rust).
           - name: octo-sonic
             context: ./sonic
-            suffix: -octo-sonic
+            suffix: -sonic
         platform:
           - arch: amd64
             runner: ubuntu-24.04
@@ -205,7 +205,7 @@ jobs:
           - name: yt-dlp-shim
             suffix: -yt-dlp-shim
           - name: octo-sonic
-            suffix: -octo-sonic
+            suffix: -sonic
 
     permissions:
       contents: read
@@ -291,7 +291,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           private=()
-          for suffix in "" -yt-dlp-shim -octo-sonic; do
+          for suffix in "" -yt-dlp-shim -sonic; do
             docker manifest inspect "$IMAGE$suffix:$TAG" > /dev/null 2>&1 || private+=("$IMAGE$suffix")
           done
           if [ "${#private[@]}" -gt 0 ]; then

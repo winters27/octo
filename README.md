@@ -206,7 +206,7 @@ Every release publishes three images on GitHub's container registry, each for am
 | --- | --- |
 | `ghcr.io/winters27/octo` | Octo itself |
 | `ghcr.io/winters27/octo-yt-dlp-shim` | the yt-dlp shim beside it |
-| `ghcr.io/winters27/octo-octo-sonic` | octo-sonic, the Sounds alike reader |
+| `ghcr.io/winters27/octo-sonic` | octo-sonic, the Sounds alike reader |
 
 `docker-compose.yml` pulls the shim and octo-sonic, tagged with the release the folder holds, so no install compiles them. `OCTO_IMAGE_TAG` in `.env` picks another tag for both. To build them from the folder instead (no network to `ghcr.io`, or a sidecar you changed), build their `-source` services; the build takes the name the running service pulls, so `up -d` then uses it:
 

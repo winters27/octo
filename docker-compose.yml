@@ -353,7 +353,7 @@ services:
   # Pulled, not built, like the shim: compiling it (Rust and FFmpeg) takes minutes and more
   # memory than a small machine has. octo-sonic-source (below) builds it from this folder.
   octo-sonic:
-    image: ghcr.io/winters27/octo-octo-sonic:${OCTO_IMAGE_TAG:-2026.10.05}
+    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.05}
     container_name: octo-sonic
     restart: unless-stopped
     # Passes docker stop's SIGTERM on and reaps the reader processes.
@@ -486,7 +486,7 @@ services:
     build: ./yt-dlp-shim
     profiles: ["source"]
   octo-sonic-source:
-    image: ghcr.io/winters27/octo-octo-sonic:${OCTO_IMAGE_TAG:-2026.10.05}
+    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.05}
     build: ./sonic
     profiles: ["source"]
 

@@ -32,7 +32,7 @@ if [ "$1" = compose ]; then
         r="${FAKE_REGISTRY:-ghcr.io/winters27}"
         printf 'name: octo\nservices:\n'
         printf '  octo:\n    image: %s/octo:latest\n    depends_on:\n      slskd:\n        condition: service_started\n' "$r"
-        printf '  octo-sonic:\n    image: "%s/octo-octo-sonic:latest"\n' "$r"
+        printf '  octo-sonic:\n    image: "%s/octo-sonic:latest"\n' "$r"
         printf '  slskd:\n    image: slskd/slskd:latest\n'
         printf '  unrelated:\n    image: %s/octopus:1\n' "$r"
         printf '  yt-dlp-shim:\n    image: %s/octo-yt-dlp-shim:latest\n' "$r"
