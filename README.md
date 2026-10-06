@@ -159,6 +159,7 @@ On Linux with systemd, the installer offers a small update helper. With it, **Ab
 - Octo itself never gets access to Docker. It can only ask, by writing a file in its config folder, and only for the newest published release.
 - The helper builds the new release before it stops anything, so a failed build leaves Octo running as it was. If the new release will not stay up, the helper goes back to the old one.
 - It leaves the folder alone when Octo's own files have local changes. Your `.env`, `docker-compose.override.yml` and config are not Octo's files, so they never block it.
+- On an install that pulls Octo's images instead of building them (see [Published images](#published-images)), the helper pulls and restarts Octo and every sidecar Octo publishes, so the yt-dlp shim moves with Octo. Other images, such as slskd, are left alone.
 
 To add the helper to an existing install, or take it off again:
 
@@ -178,7 +179,7 @@ Without the helper, **About** shows the command for the new release. From the Oc
 git fetch --tags && git checkout --detach 2026.10.05 && docker compose build && docker compose up -d
 ```
 
-Octo builds from source, so this is what actually updates it. `docker compose pull` only refreshes slskd. Re-running `./install.sh` also works and keeps your existing answers.
+Octo builds from source, so this is what actually updates it. `docker compose pull` refreshes slskd and fetches the yt-dlp shim published for the release you have checked out, but never Octo itself. Re-running `./install.sh` also works and keeps your existing answers.
 
 If you track `main` instead of releases, `git checkout main && git pull && ./install.sh` still works.
 
@@ -194,7 +195,27 @@ To pin to a release instead of tracking `main`:
 git checkout 2026.07.29 && ./install.sh
 ```
 
-Prebuilt multi-arch images are also published to `ghcr.io/winters27/octo`, tagged `latest`, the release date, and the commit sha.
+### Published images
+
+Every push to `main` and every release publishes multi-arch images (amd64 and arm64), tagged `latest`, the release date, and the commit sha:
+
+| Image | What it is |
+| --- | --- |
+| `ghcr.io/winters27/octo` | Octo itself |
+| `ghcr.io/winters27/octo-yt-dlp-shim` | the yt-dlp shim beside it |
+
+`docker-compose.yml` names the shim's image as well as its build, tagged with the release the folder holds, so a pull and a build both work. `OCTO_IMAGE_TAG` in `.env` picks another tag for it.
+
+To pull Octo instead of building it, for example on a small machine, put this in `docker-compose.override.yml`:
+
+```yaml
+services:
+  octo:
+    build: !reset null
+    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-latest}
+```
+
+Then set `OCTO_IMAGE_TAG=latest` in `.env`, so the shim follows the same tag, and start it with `docker compose pull && docker compose up -d`. The update helper sees there is nothing to build and pulls instead. `!reset` needs Docker Compose 2.24 or newer.
 
 ## Admin dashboard
 

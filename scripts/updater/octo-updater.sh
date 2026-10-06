@@ -96,6 +96,31 @@ compose_mode() {
     END { print (built ? "build" : "image") }'
 }
 
+# The services that run one of Octo's own published images, on one line: octo, and
+# every service whose image is named after Octo's (ghcr.io/winters27/octo-yt-dlp-shim
+# beside ghcr.io/winters27/octo). Others, such as slskd, are not Octo's to update.
+# A service whose profile is off is not in the config, so it is never started here.
+published_services() {
+  { docker compose config 2>/dev/null || true; } | awk '
+    function repo(image) {
+      gsub(/["\047]/, "", image)
+      sub(/@.*/, "", image)
+      if (match(image, /:[^\/]*$/)) image = substr(image, 1, RSTART - 1)
+      return image
+    }
+    /^services:/ { in_services = 1; next }
+    in_services && /^[^ ]/ { in_services = 0 }
+    in_services && /^  [^ ]/ { name = $1; sub(/:$/, "", name); order[++count] = name }
+    in_services && /^    image:/ { image[name] = repo($2) }
+    END {
+      octo = image["octo"]
+      line = "octo"
+      for (i = 1; octo != "" && i <= count; i++)
+        if (order[i] != "octo" && index(image[order[i]], octo "-") == 1) line = line " " order[i]
+      print line
+    }'
+}
+
 # The release this folder holds, from octo.csproj.
 folder_version() {
   sed -n '/<InformationalVersion>/{s:.*<InformationalVersion>\(.*\)</InformationalVersion>.*:\1:p;q}' "$OCTO_DIR/octo/octo.csproj" 2>/dev/null || true
@@ -167,16 +192,18 @@ describe "$mode"
 write_status accepted "Starting the update to $tag"
 
 if [ "$mode" = image ]; then
-  write_status fetching "Pulling the new Octo image"
+  # Octo and its sidecars move together, so the yt-dlp shim never stays on an old release.
+  read -r -a services <<< "$(published_services)"
+  write_status fetching "Pulling the new Octo images"
   if [ "$DRYRUN" = 1 ]; then
-    log "Dry run: would pull and restart octo"
+    log "Dry run: would pull and restart ${services[*]}"
   else
-    run docker compose pull octo || fail "docker compose pull failed. The log has the details." "Pulling the new Octo image"
+    run docker compose pull "${services[@]}" || fail "docker compose pull failed. The log has the details." "Pulling the new Octo images"
     write_status restarting "Restarting Octo"
-    run docker compose up -d octo || fail "docker compose up failed. The log has the details." "Restarting Octo"
+    run docker compose up -d "${services[@]}" || fail "docker compose up failed. The log has the details." "Restarting Octo"
     wait_until_running || fail "Octo was started but did not stay running. 'docker compose logs octo' says why." "Restarting Octo"
   fi
-  write_status "done" "$([ "$DRYRUN" = 1 ] && echo "Dry run: nothing was changed" || echo "Octo restarted on the new image")"
+  write_status "done" "$([ "$DRYRUN" = 1 ] && echo "Dry run: nothing was changed" || echo "Octo restarted on the new images")"
   exit 0
 fi
 

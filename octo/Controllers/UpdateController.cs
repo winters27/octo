@@ -76,7 +76,7 @@ public class UpdateController(ReleaseCheck releases, UpdateHost host, BrowseSess
             run,
             // What to run by hand, from the Octo folder: the built-from-source install, and the image one.
             command = $"git fetch --tags && git checkout --detach {tag} && docker compose build && docker compose up -d",
-            imageCommand = "docker compose pull octo && docker compose up -d octo",
+            imageCommand = "docker compose pull octo yt-dlp-shim && docker compose up -d octo yt-dlp-shim",
         };
     }
 

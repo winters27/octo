@@ -10,8 +10,9 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin" "$work/origin-src/octo"
 failures=0
 
-# docker logs what it was asked. FAKE_MODE picks a built or a pulled Octo, DOCKER_FAIL makes
-# one compose verb fail, and FAKE_BAD_VERSION is a release whose container never stays up.
+# docker logs what it was asked. FAKE_MODE picks a built or a pulled Octo (FAKE_REGISTRY is
+# where a pulled one comes from), DOCKER_FAIL makes one compose verb fail, and
+# FAKE_BAD_VERSION is a release whose container never stays up.
 cat > "$work/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 echo "docker $*" >> "$FAKE_LOG"
@@ -21,7 +22,15 @@ if [ "$1" = compose ]; then
       if [ "${FAKE_MODE:-build}" = build ]; then
         printf 'name: octo\nservices:\n  octo:\n    build:\n      context: .\n  slskd:\n    image: slskd/slskd\n'
       else
-        printf 'name: octo\nservices:\n  octo:\n    image: ghcr.io/winters27/octo:latest\n'
+        # Shaped like docker compose config prints it: services in name order, the shim
+        # both built and published, slskd someone else's image, a volume list after.
+        r="${FAKE_REGISTRY:-ghcr.io/winters27}"
+        printf 'name: octo\nservices:\n'
+        printf '  octo:\n    image: %s/octo:latest\n    depends_on:\n      slskd:\n        condition: service_started\n' "$r"
+        printf '  slskd:\n    image: slskd/slskd:latest\n'
+        printf '  unrelated:\n    image: %s/octopus:1\n' "$r"
+        printf '  yt-dlp-shim:\n    build:\n      context: /srv/octo/yt-dlp-shim\n    image: "%s/octo-yt-dlp-shim:latest"\n' "$r"
+        printf 'volumes:\n  ytdlp-bin:\n    name: octo_ytdlp-bin\n'
       fi ;;
     ps) echo cid ;;
     *) if [ "${DOCKER_FAIL:-}" = "$2" ]; then echo "boom: $2 failed"; exit 1; fi ;;
@@ -115,7 +124,21 @@ grep -q 'compose build' "$FAKE_LOG" && { echo "FAIL  the dry run built"; failure
 
 fresh; request 2026.10.04
 FAKE_MODE=image check "an image install pulls instead" "done" 2026.10.01 ""
-grep -q 'compose pull octo' "$FAKE_LOG" && echo "ok    pulled the image" || { echo "FAIL  no pull"; failures=$((failures + 1)); }
+grep -qx 'docker compose pull octo yt-dlp-shim' "$FAKE_LOG" && echo "ok    pulled Octo and the shim, not slskd" || { echo "FAIL  pulled: $(grep 'compose pull' "$FAKE_LOG")"; failures=$((failures + 1)); }
+grep -qx 'docker compose up -d octo yt-dlp-shim' "$FAKE_LOG" && echo "ok    restarted Octo and the shim" || { echo "FAIL  restarted: $(grep 'compose up' "$FAKE_LOG")"; failures=$((failures + 1)); }
+grep -q 'compose build' "$FAKE_LOG" && { echo "FAIL  an image install built"; failures=$((failures + 1)); } || echo "ok    an image install never builds"
+
+fresh; request 2026.10.04
+FAKE_MODE=image FAKE_REGISTRY=localhost:5000/me check "a registry with a port" "done" 2026.10.01 ""
+grep -qx 'docker compose pull octo yt-dlp-shim' "$FAKE_LOG" && echo "ok    the port is not taken for a tag" || { echo "FAIL  pulled: $(grep 'compose pull' "$FAKE_LOG")"; failures=$((failures + 1)); }
+
+fresh; request 2026.10.04
+FAKE_MODE=image DOCKER_FAIL=pull check "a failed pull restarts nothing" failed 2026.10.01 "docker compose pull failed"
+grep -q 'compose up' "$FAKE_LOG" && { echo "FAIL  restarted after a failed pull"; failures=$((failures + 1)); } || echo "ok    nothing restarted"
+
+fresh; request 2026.10.04
+FAKE_MODE=image OCTO_UPDATER_DRYRUN=1 check "an image install's dry run changes nothing" "done" 2026.10.01 ""
+grep -Eq 'compose (pull|up)' "$FAKE_LOG" && { echo "FAIL  the dry run pulled or restarted"; failures=$((failures + 1)); } || echo "ok    the image dry run never pulls"
 
 fresh
 OCTO_DIR="$work/octo" OCTO_UPDATE_DIR="$work/config/update" bash "$script" > /dev/null 2>&1
