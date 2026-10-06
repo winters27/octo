@@ -1,0 +1,261 @@
+{
+  "repo": {
+    "name": {
+      "en-US": "Octo"
+    },
+    "description": {
+      "en-US": "The Octo music player for Android, for your Octo or Navidrome server. Releases come from https://github.com/winters27/octo/releases."
+    },
+    "icon": {
+      "en-US": {
+        "name": "/icons/octo.png",
+        "sha256": "1eba2812ef50cfc285178c5a207606818d3324d5c6553bab3e424f4ff8dde029",
+        "size": 119511
+      }
+    },
+    "address": "https://winters27.github.io/octo/fdroid/repo",
+    "timestamp": 1791266843000,
+    "categories": {
+      "Multimedia": {
+        "name": {
+          "en-US": "Multimedia"
+        }
+      }
+    }
+  },
+  "packages": {
+    "app.winters.octo": {
+      "metadata": {
+        "added": 1791266837000,
+        "categories": [
+          "Multimedia"
+        ],
+        "changelog": "https://github.com/winters27/octo/releases",
+        "issueTracker": "https://github.com/winters27/octo/issues",
+        "lastUpdated": 1791266841000,
+        "license": "GPL-3.0-or-later",
+        "webSite": "https://github.com/winters27/octo",
+        "authorName": "winters27",
+        "name": {
+          "en-US": "Octo"
+        },
+        "summary": {
+          "en-US": "Music player for your Octo or Navidrome server"
+        },
+        "description": {
+          "en-US": "Octo plays the music on your own server. It is made for Octo, a proxy that adds discovery to a Navidrome server, and it works with any Subsonic server too.\n\nWith Octo:\n\n* Add songs, albums and search results you find to your library with one press.\n* One search for everything: your music first, then what Octo found, all playable at once.\n* Whole albums, with the songs you have marked and the rest one press away.\n* Stations on Home, and radio that reaches past your library.\n\nWith any Subsonic server, it is a full player for the music you have: browse by artist, album, song, genre or folder, with favorites, ratings and playlists; synced lyrics, gapless playback, an equalizer with presets, ReplayGain and a sleep timer; and a queue that follows you between your phone and computer."
+        },
+        "preferredSigner": "93838bbbc34af54ff5b812d8bef10170570dccbb4ce7a849d46b33458b7cd3be"
+      },
+      "versions": {
+        "6354d68ef6a22c07297c188a70ad3bc0f9c07914a578983773fffe5e1ea81148": {
+          "added": 1791266837000,
+          "file": {
+            "name": "/Octo-1.5.0-android.apk",
+            "sha256": "6354d68ef6a22c07297c188a70ad3bc0f9c07914a578983773fffe5e1ea81148",
+            "size": 62515765
+          },
+          "manifest": {
+            "nativecode": [
+              "arm64-v8a",
+              "armeabi-v7a",
+              "x86",
+              "x86_64"
+            ],
+            "versionName": "1.5.0",
+            "versionCode": 768,
+            "usesSdk": {
+              "minSdkVersion": 29,
+              "targetSdkVersion": 36
+            },
+            "signer": {
+              "sha256": [
+                "93838bbbc34af54ff5b812d8bef10170570dccbb4ce7a849d46b33458b7cd3be"
+              ]
+            },
+            "usesPermission": [
+              {
+                "name": "android.permission.INTERNET"
+              },
+              {
+                "name": "android.permission.ACCESS_NETWORK_STATE"
+              },
+              {
+                "name": "android.permission.READ_MEDIA_AUDIO"
+              },
+              {
+                "name": "android.permission.READ_EXTERNAL_STORAGE",
+                "maxSdkVersion": 32
+              },
+              {
+                "name": "android.permission.FOREGROUND_SERVICE"
+              },
+              {
+                "name": "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+              },
+              {
+                "name": "android.permission.WAKE_LOCK"
+              },
+              {
+                "name": "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+              },
+              {
+                "name": "android.permission.ACCESS_WIFI_STATE"
+              },
+              {
+                "name": "android.permission.WRITE_SETTINGS"
+              },
+              {
+                "name": "android.permission.REQUEST_INSTALL_PACKAGES"
+              },
+              {
+                "name": "android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION"
+              },
+              {
+                "name": "app.winters.octo.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+              }
+            ]
+          }
+        },
+        "27dade914ddb77ae07e3467a104653328b9e9b0872ba64363b2a581815e8c3cd": {
+          "added": 1791266839000,
+          "file": {
+            "name": "/Octo-1.4.1-android.apk",
+            "sha256": "27dade914ddb77ae07e3467a104653328b9e9b0872ba64363b2a581815e8c3cd",
+            "size": 61270577
+          },
+          "manifest": {
+            "nativecode": [
+              "arm64-v8a",
+              "armeabi-v7a",
+              "x86",
+              "x86_64"
+            ],
+            "versionName": "1.4.1",
+            "versionCode": 667,
+            "usesSdk": {
+              "minSdkVersion": 29,
+              "targetSdkVersion": 36
+            },
+            "signer": {
+              "sha256": [
+                "93838bbbc34af54ff5b812d8bef10170570dccbb4ce7a849d46b33458b7cd3be"
+              ]
+            },
+            "usesPermission": [
+              {
+                "name": "android.permission.INTERNET"
+              },
+              {
+                "name": "android.permission.ACCESS_NETWORK_STATE"
+              },
+              {
+                "name": "android.permission.READ_MEDIA_AUDIO"
+              },
+              {
+                "name": "android.permission.READ_EXTERNAL_STORAGE",
+                "maxSdkVersion": 32
+              },
+              {
+                "name": "android.permission.FOREGROUND_SERVICE"
+              },
+              {
+                "name": "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+              },
+              {
+                "name": "android.permission.WAKE_LOCK"
+              },
+              {
+                "name": "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+              },
+              {
+                "name": "android.permission.ACCESS_WIFI_STATE"
+              },
+              {
+                "name": "android.permission.WRITE_SETTINGS"
+              },
+              {
+                "name": "android.permission.REQUEST_INSTALL_PACKAGES"
+              },
+              {
+                "name": "android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION"
+              },
+              {
+                "name": "app.winters.octo.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+              }
+            ]
+          }
+        },
+        "dd27859c7eab5b134e5141efe1c2d47b15905cb4bb2f3b9d9afca6bf7f860028": {
+          "added": 1791266841000,
+          "file": {
+            "name": "/Octo-1.4.0-android.apk",
+            "sha256": "dd27859c7eab5b134e5141efe1c2d47b15905cb4bb2f3b9d9afca6bf7f860028",
+            "size": 61270581
+          },
+          "manifest": {
+            "nativecode": [
+              "arm64-v8a",
+              "armeabi-v7a",
+              "x86",
+              "x86_64"
+            ],
+            "versionName": "1.4.0",
+            "versionCode": 666,
+            "usesSdk": {
+              "minSdkVersion": 29,
+              "targetSdkVersion": 36
+            },
+            "signer": {
+              "sha256": [
+                "93838bbbc34af54ff5b812d8bef10170570dccbb4ce7a849d46b33458b7cd3be"
+              ]
+            },
+            "usesPermission": [
+              {
+                "name": "android.permission.INTERNET"
+              },
+              {
+                "name": "android.permission.ACCESS_NETWORK_STATE"
+              },
+              {
+                "name": "android.permission.READ_MEDIA_AUDIO"
+              },
+              {
+                "name": "android.permission.READ_EXTERNAL_STORAGE",
+                "maxSdkVersion": 32
+              },
+              {
+                "name": "android.permission.FOREGROUND_SERVICE"
+              },
+              {
+                "name": "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+              },
+              {
+                "name": "android.permission.WAKE_LOCK"
+              },
+              {
+                "name": "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+              },
+              {
+                "name": "android.permission.ACCESS_WIFI_STATE"
+              },
+              {
+                "name": "android.permission.WRITE_SETTINGS"
+              },
+              {
+                "name": "android.permission.REQUEST_INSTALL_PACKAGES"
+              },
+              {
+                "name": "android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION"
+              },
+              {
+                "name": "app.winters.octo.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
