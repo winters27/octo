@@ -1,5 +1,23 @@
 name: Docker Build & Push
 
+# Publishes Octo's three images (Octo, the yt-dlp shim, octo-sonic) for amd64 and arm64:
+# on every push to main (tagged main and the commit), and on every release tag (tagged with
+# the release, and latest for a dated release). Installs pull the sidecars at their own
+# release's tag, and the update helper pulls them on Update now, so they must be on ghcr.io
+# before anyone can see the release.
+#
+# Octo's update check reads GitHub releases, not tags. So, to cut a release:
+#   1. Make the release on GitHub as a draft (gh release create <tag> --draft ...). A draft
+#      is invisible to the update check.
+#   2. Push the tag. This workflow builds and publishes every image of it.
+#   3. Once all of them are published, the release job below publishes the draft and marks
+#      it Latest. If there was no draft, it publishes nothing and says so; publish the
+#      release by hand then, after this workflow is green. It also refuses while any image
+#      cannot be pulled without signing in: a new package on ghcr.io starts private, so the
+#      first time, make it public on GitHub and re-run the release job.
+# Never publish the release before this workflow is green: an install that updates first
+# would find no sidecar images for it (it then builds them, slowly, or fails without ghcr.io).
+
 on:
   workflow_dispatch:
   push:
@@ -53,6 +71,19 @@ jobs:
             exit 1
           fi
 
+      # docker-compose.yml pulls the sidecar images at Octo's own version unless
+      # OCTO_IMAGE_TAG says otherwise, so a release bump that missed it would leave
+      # installs pulling the last release's sidecars. Checked on main too, so a
+      # missed bump shows up before anyone tags it.
+      - name: Compose pulls this version's images
+        run: |
+          version="$(sed -n 's:.*<InformationalVersion>\(.*\)</InformationalVersion>.*:\1:p' octo/octo.csproj | head -n 1)"
+          stale="$(grep -o 'OCTO_IMAGE_TAG:-[^}]*' docker-compose.yml | sed 's/^OCTO_IMAGE_TAG:-//' | grep -Fvx "$version" | paste -sd ' ' || true)"
+          if [ -n "$stale" ]; then
+            echo "::error::docker-compose.yml pulls images tagged $stale, but octo/octo.csproj says $version. Bump the OCTO_IMAGE_TAG defaults with it."
+            exit 1
+          fi
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v6
         with:
@@ -72,12 +103,36 @@ jobs:
       - name: Test
         run: dotnet test --configuration Release --no-build --verbosity normal
 
-  docker:
+  # Each image for each platform, built on a runner of that platform: arm64 on GitHub's own
+  # arm64 runners (free for public repositories) rather than under QEMU, where compiling
+  # octo-sonic (Rust and FFmpeg) took many times longer. Each pushes its image by digest
+  # only; the merge job below puts the two platforms under the real tags.
+  build:
     needs: build-and-test
-    runs-on: ubuntu-latest
-    # No `if` needed: the only triggers left are push and workflow_dispatch, both of
-    # which should publish. The old condition also allowed merged pull_request events,
-    # which no longer reach this workflow.
+    runs-on: ${{ matrix.platform.runner }}
+
+    strategy:
+      # One image failing must not cancel another halfway through its push. A failure still
+      # stops every tag from moving: merge waits for all of these.
+      fail-fast: false
+      matrix:
+        # Each image is ghcr.io/<owner>/<repo> plus its suffix.
+        image:
+          - name: octo
+            context: .
+            suffix: ""
+          - name: yt-dlp-shim
+            context: ./yt-dlp-shim
+            suffix: -yt-dlp-shim
+          # The Sounds alike reader (Rust).
+          - name: octo-sonic
+            context: ./sonic
+            suffix: -octo-sonic
+        platform:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
 
     permissions:
       contents: read
@@ -86,9 +141,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -104,7 +156,86 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }}
+          # Every image would otherwise be titled after the repo.
+          labels: |
+            org.opencontainers.image.title=octo${{ matrix.image.suffix }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.image.context }}
+          platforms: linux/${{ matrix.platform.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }},push-by-digest=true,name-canonical=true,push=true
+          # A scope per image and platform, so the builds running side by side never fight
+          # over the same cache entries.
+          cache-from: type=gha,scope=${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}-${{ matrix.platform.arch }}
+
+      - name: Keep the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.image.name }}-${{ matrix.platform.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Puts both platforms of each image under its tags. Runs only once every build above
+  # succeeded, so a tag never points at one image of a release and not another.
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - name: octo
+            suffix: ""
+          - name: yt-dlp-shim
+            suffix: -yt-dlp-shim
+          - name: octo-sonic
+            suffix: -octo-sonic
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download the digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.image.name }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }}
+          # latest is set below, for dated releases only; never guessed from the tag.
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=branch
             # Tags the image with the release name verbatim, e.g. 2026.07.29. The semver
@@ -115,17 +246,90 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            # Was gated on refs/heads/dev, a branch this repo does not have, so `latest`
-            # was never published at all and `docker pull ...:latest` failed for everyone.
-            type=raw,value=latest,enable={{is_default_branch}}
+            # latest is the newest release, the same thing Update now installs, so an
+            # install that pulls latest never runs a main that was not released.
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !startsWith(github.ref_name, 'v') }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Publish the tags for both platforms
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }}
+        run: |
+          refs=()
+          for digest in *; do refs+=("$IMAGE@sha256:$digest"); done
+          if [ "${#refs[@]}" != 2 ]; then
+            echo "::error::Expected an amd64 and an arm64 image of $IMAGE, found ${#refs[@]}."
+            exit 1
+          fi
+          mapfile -t tags < <(jq -r '.tags[] | "-t", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+
+      - name: Inspect
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+  # Publishes the release's draft once all three images of the tag are on ghcr.io (see the
+  # order at the top). Only for dated releases, the ones Octo's update check offers.
+  release:
+    needs: merge
+    if: github.ref_type == 'tag' && !startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
+
+    steps:
+      # Installs pull without signing in, and a new package on ghcr.io starts private. One
+      # that is still private would fail every update to this release, so the release waits.
+      - name: Every image can be pulled without signing in
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          private=()
+          for suffix in "" -yt-dlp-shim -octo-sonic; do
+            docker manifest inspect "$IMAGE$suffix:$TAG" > /dev/null 2>&1 || private+=("$IMAGE$suffix")
+          done
+          if [ "${#private[@]}" -gt 0 ]; then
+            echo "::error::Not public yet: ${private[*]}. Make each package public (the package's settings on GitHub, Change visibility), then re-run this job."
+            exit 1
+          fi
+
+      - name: Publish the draft release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          published=false
+          if ! [[ "$TAG" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]{1,4})?$ ]]; then
+            echo "::notice::$TAG is not a dated release, so no release is published."
+          else
+            # The tag endpoint never returns a draft, so look through the list; drafts come first.
+            found="$(gh api "repos/$GH_REPO/releases?per_page=100" \
+              --jq "[.[] | select(.tag_name == \"$TAG\")][0] // empty | \"\(.id) \(.draft)\"")"
+            read -r id draft <<< "$found"
+            if [ -z "$id" ]; then
+              echo "::warning::The images for $TAG are on ghcr.io, but there is no release for it. Publish it now; a draft made before the tag is published here by itself."
+            elif [ "$draft" = true ]; then
+              gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false -f make_latest=true > /dev/null
+              published=true
+              echo "::notice::Published the release $TAG, now that its images are on ghcr.io."
+            else
+              echo "::notice::The release $TAG was already published."
+            fi
+          fi
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+
+  # A release published with this workflow's own token starts no other workflow, so the app
+  # links that release-links.yml adds on "published" are added from here.
+  links:
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-links.yml

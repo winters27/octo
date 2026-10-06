@@ -52,9 +52,10 @@ jobs:
           # only widens the CI cliff; a genuine hang still fails the job.
           DOTNET_HOST_FACTORY_RESOLVER_DEFAULT_TIMEOUT_IN_SECONDS: "600"
 
-  # The shim is Python and its image is only ever built on the deploy host, so
-  # before this job a syntax error in app.py passed CI and was discovered when
-  # the container failed to restart in production. compileall alone justifies
+  # The shim is Python and its image is built only after a merge (docker.yml
+  # publishes it) or on the deploy host, so before this job a syntax error in
+  # app.py passed CI and was discovered when the container failed to restart in
+  # production. compileall alone justifies
   # the two minutes; the gate tests cover the concurrency logic that decides
   # whether a play queues behind background prewarm.
   shim:
@@ -111,7 +112,8 @@ jobs:
   # The update helper runs as root on people's servers and is never built into
   # an image, so a mistake in it would surface only when someone presses Update
   # now. shellcheck catches the shell's traps; the test runs it against a
-  # throwaway git origin with Docker faked.
+  # throwaway git origin with Docker faked. The installer rewrites people's .env
+  # on every re-run, so its test checks a re-run keeps everything they set.
   update-helper:
     runs-on: ubuntu-latest
 
@@ -120,7 +122,10 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Shellcheck
-        run: shellcheck -S warning scripts/updater/*.sh
+        run: shellcheck -S warning install.sh scripts/*.sh scripts/updater/*.sh
 
       - name: Update helper tests
         run: bash scripts/updater/test-updater.sh
+
+      - name: Installer tests
+        run: bash scripts/test-install.sh

@@ -154,11 +154,13 @@ Octo checks GitHub every 6 hours for a newer release. When one is out, the dashb
 
 ### From the dashboard
 
-On Linux with systemd, the installer offers a small update helper. With it, **About → Update now** installs the new release: the helper fetches it, builds it, and restarts Octo, and the dashboard shows each step.
+On Linux with systemd, the installer offers a small update helper. With it, **About → Update now** installs the new release: the helper fetches it, pulls the yt-dlp shim and octo-sonic images published for it, builds Octo, and restarts it, and the dashboard shows each step.
 
 - Octo itself never gets access to Docker. It can only ask, by writing a file in its config folder, and only for the newest published release.
-- The helper builds the new release before it stops anything, so a failed build leaves Octo running as it was. If the new release will not stay up, the helper goes back to the old one.
+- The helper pulls and builds the new release before it stops anything, so a failed build leaves Octo running as it was. If the new release will not stay up, the helper goes back to the old one.
+- A sidecar whose image cannot be pulled (no network to `ghcr.io`) is built from the folder instead, as before.
 - It leaves the folder alone when Octo's own files have local changes. Your `.env`, `docker-compose.override.yml` and config are not Octo's files, so they never block it.
+- On an install that pulls Octo's images instead of building them (see [Published images](#published-images)), the helper pulls and restarts Octo and every sidecar Octo publishes, so the yt-dlp shim and octo-sonic move with Octo. Other images, such as slskd, are left alone.
 
 To add the helper to an existing install, or take it off again:
 
@@ -175,10 +177,12 @@ scripts/updater/install-updater.sh --remove
 Without the helper, **About** shows the command for the new release. From the Octo folder:
 
 ```bash
-git fetch --tags && git checkout --detach 2026.10.05 && docker compose build && docker compose up -d
+git fetch --tags && git checkout --detach 2026.10.05
+docker compose pull yt-dlp-shim octo-sonic || docker compose build yt-dlp-shim-source octo-sonic-source
+docker compose build octo && docker compose up -d
 ```
 
-Octo builds from source, so this is what actually updates it. `docker compose pull` only refreshes slskd. Re-running `./install.sh` also works and keeps your existing answers.
+The yt-dlp shim and octo-sonic are pulled, already built, for the release you have checked out; the second line builds them from the folder only when the pull fails, for example with no network to `ghcr.io`. Octo itself builds from source, so the last line is what actually updates it. Re-running `./install.sh` also works: it does the same, and keeps your answers and every other line in `.env`, including ones you added or changed by hand.
 
 If you track `main` instead of releases, `git checkout main && git pull && ./install.sh` still works.
 
@@ -194,7 +198,34 @@ To pin to a release instead of tracking `main`:
 git checkout 2026.07.29 && ./install.sh
 ```
 
-Prebuilt multi-arch images are also published to `ghcr.io/winters27/octo`, tagged `latest`, the release date, and the commit sha.
+### Published images
+
+Every release publishes three images on GitHub's container registry, each for amd64 and arm64 (a Raspberry Pi 4 or 5 included), tagged with the release date and `latest`. Every push to `main` publishes them too, tagged `main` and the commit sha, never `latest`.
+
+| Image | What it is |
+| --- | --- |
+| `ghcr.io/winters27/octo` | Octo itself |
+| `ghcr.io/winters27/octo-yt-dlp-shim` | the yt-dlp shim beside it |
+| `ghcr.io/winters27/octo-octo-sonic` | octo-sonic, the Sounds alike reader |
+
+`docker-compose.yml` pulls the shim and octo-sonic, tagged with the release the folder holds, so no install compiles them. `OCTO_IMAGE_TAG` in `.env` picks another tag for both. To build them from the folder instead (no network to `ghcr.io`, or a sidecar you changed), build their `-source` services; the build takes the name the running service pulls, so `up -d` then uses it:
+
+```bash
+docker compose build yt-dlp-shim-source octo-sonic-source && docker compose up -d
+```
+
+The update helper and `install.sh` do this by themselves for a sidecar that will not pull, and `install.sh` also builds one whose folder changed since its release (on `main`, say).
+
+To pull Octo instead of building it, for example on a small machine, put this in `docker-compose.override.yml`:
+
+```yaml
+services:
+  octo:
+    build: !reset null
+    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-latest}
+```
+
+Then set `OCTO_IMAGE_TAG=latest` in `.env`, so the shim and octo-sonic follow the same tag, and start it with `docker compose pull && docker compose up -d`. The update helper sees there is nothing to build and pulls instead. `!reset` needs Docker Compose 2.24 or newer.
 
 ## Admin dashboard
 
@@ -293,7 +324,7 @@ Yes. Every download is identified before it is filed: the fingerprint service's 
 
 ### Can it run on a Raspberry Pi?
 
-Yes. Multi-arch images are published for amd64 and arm64. The yt-dlp sidecar does most of the CPU work; a Pi 4 or Pi 5 handles a single household's listening fine.
+Yes. Every image is published for amd64 and arm64, so a Pi pulls the yt-dlp shim and octo-sonic instead of compiling them; only Octo itself is built, unless you pull it too (see [Published images](#published-images)). The yt-dlp sidecar does most of the CPU work; a Pi 4 or Pi 5 handles a single household's listening fine.
 
 ---
 
@@ -428,9 +459,9 @@ with `RADIO_SONIC_PAUSE_SECONDS` between, only while nothing downloads, then kee
 and changed songs; a damaged file costs only that file. On a network mount the first pass takes
 a while, and the dashboard shows how far it is, with Pause and Start over. `SONIC_CPUS` (default
 1) caps the CPUs it may use; never set it above the machine's count, or Docker will not start it.
-It starts with the rest of the stack, so an update brings it without any change to `.env`; the
-first `docker compose build` (and the first update that has it) compiles it, which takes several
-minutes. `RADIO_SOUNDS_ALIKE=false` turns Sounds alike off: Octo stops asking, and octo-sonic
+It starts with the rest of the stack, so an update brings it without any change to `.env`. It is
+pulled already built, like the yt-dlp shim; only without access to `ghcr.io` is it compiled
+here, which takes several minutes and more memory than a small machine may have. `RADIO_SOUNDS_ALIKE=false` turns Sounds alike off: Octo stops asking, and octo-sonic
 waits without reading anything. It reads the music as `nobody` (`SONIC_USER`, e.g. `1000:1000`
 for a folder only its owner can read), on a read-only filesystem with a 2 GB memory limit. An
 older `.env` with `COMPOSE_PROFILES=sonic` keeps working; the profile is no longer needed.

@@ -7,9 +7,12 @@ name: Release app links
 #
 # The app releases are published with a personal token, so they do start this
 # workflow; its own edits use GITHUB_TOKEN and start nothing, so it cannot loop.
+# A server release that docker.yml publishes once its images are up starts nothing
+# either, so docker.yml calls this itself.
 on:
   release:
     types: [published]
+  workflow_call:
   workflow_dispatch:
 
 concurrency:
