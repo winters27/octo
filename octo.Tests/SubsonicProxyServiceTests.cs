@@ -456,4 +456,157 @@ public class SubsonicProxyServiceTests
         var objectResult = Assert.IsType<ObjectResult>(result);
         Assert.Equal(500, objectResult.StatusCode);
     }
+
+    /// <summary>A body that sends <paramref name="sent"/> bytes and then fails the way
+    /// HttpClient does when a response ends before its announced Content-Length.</summary>
+    private sealed class EndsEarlyStream(byte[] sent) : MemoryStream(sent)
+    {
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var read = base.Read(buffer, offset, count);
+            return read > 0 ? read : throw Ended();
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var read = await base.ReadAsync(buffer, cancellationToken);
+            return read > 0 ? read : throw Ended();
+        }
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        private static HttpIOException Ended() => new(HttpRequestError.ResponseEnded,
+            "The response ended prematurely, with at least 3 additional bytes expected. (ResponseEnded)");
+    }
+
+    private static HttpResponseMessage Upstream(HttpStatusCode status, byte[] sent, long announced, string? acceptRanges)
+    {
+        var response = new HttpResponseMessage(status) { Content = new StreamContent(new EndsEarlyStream(sent)) };
+        response.Content.Headers.ContentLength = announced;
+        response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("audio/mpeg");
+        if (acceptRanges is not null) response.Headers.AcceptRanges.Add(acceptRanges);
+        return response;
+    }
+
+    private (SubsonicProxyService Service, DefaultHttpContext Context) ServiceAnswering(HttpResponseMessage upstream)
+    {
+        _mockHttpMessageHandler.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync",
+                ItExpr.IsAny<HttpRequestMessage>(),
+                ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync(upstream);
+        var context = new DefaultHttpContext();
+        context.Request.Method = "GET";
+        var service = new SubsonicProxyService(_mockHttpClientFactory.Object,
+            TestOptions.Monitor(new SubsonicSettings { Url = "http://localhost:4533" }),
+            new HttpContextAccessor { HttpContext = context });
+        return (service, context);
+    }
+
+    private static readonly Dictionary<string, string> EstimatedTranscode = new()
+    {
+        { "id", "song123" }, { "format", "mp3" }, { "maxBitRate", "192" }, { "estimateContentLength", "true" },
+    };
+
+    [Fact]
+    public async Task RelayStreamAsync_EstimatedTranscode_LeavesTheLengthOut_AndEndsAtTheRealEnd()
+    {
+        var sent = Enumerable.Range(0, 97).Select(i => (byte)i).ToArray();
+        var (service, context) = ServiceAnswering(Upstream(HttpStatusCode.OK, sent, 100, "none"));
+
+        var result = await service.RelayStreamAsync(EstimatedTranscode, CancellationToken.None);
+
+        var file = Assert.IsType<FileStreamResult>(result);
+        Assert.False(context.Response.Headers.ContainsKey("Content-Length"));
+        Assert.Equal("none", context.Response.Headers.AcceptRanges.ToString());
+        using var received = new MemoryStream();
+        await file.FileStream.CopyToAsync(received);
+        Assert.Equal(sent, received.ToArray());
+        // Synchronous readers end cleanly too, and a read after the end stays at the end.
+        Assert.Equal(0, file.FileStream.Read(new byte[8], 0, 8));
+    }
+
+    [Fact]
+    public async Task RelayStreamAsync_CachedTranscode_KeepsItsExactLength()
+    {
+        // Navidrome serves a transcode it has finished from its cache, with ranges and the
+        // real size, even when the client asked for an estimate.
+        var sent = new byte[] { 1, 2, 3 };
+        var (service, context) = ServiceAnswering(Upstream(HttpStatusCode.OK, sent, 3, "bytes"));
+
+        var result = await service.RelayStreamAsync(EstimatedTranscode, CancellationToken.None);
+
+        Assert.IsType<FileStreamResult>(result);
+        Assert.Equal("3", context.Response.Headers.ContentLength?.ToString());
+    }
+
+    [Fact]
+    public async Task RelayStreamAsync_RawStreamThatEndsEarly_IsNotPassedOffAsWhole()
+    {
+        // An exact length that is not met is a real failure, and must not read as a clean end.
+        var (service, context) = ServiceAnswering(Upstream(HttpStatusCode.OK, [1, 2, 3], 6, "bytes"));
+
+        var result = await service.RelayStreamAsync(new Dictionary<string, string> { { "id", "song123" } },
+            CancellationToken.None);
+
+        var file = Assert.IsType<FileStreamResult>(result);
+        Assert.Equal("6", context.Response.Headers.ContentLength?.ToString());
+        await Assert.ThrowsAsync<HttpIOException>(() => file.FileStream.CopyToAsync(Stream.Null));
+    }
+
+    [Fact]
+    public async Task RelayStreamAsync_RangeNotSatisfiable_PassesTheRealSizeOn()
+    {
+        var upstream = new HttpResponseMessage(HttpStatusCode.RequestedRangeNotSatisfiable)
+        {
+            Content = new ByteArrayContent([]),
+        };
+        upstream.Content.Headers.ContentRange = new System.Net.Http.Headers.ContentRangeHeaderValue(3974093);
+        var (service, context) = ServiceAnswering(upstream);
+
+        var result = await service.RelayStreamAsync(EstimatedTranscode, CancellationToken.None);
+
+        Assert.Equal(416, Assert.IsType<StatusCodeResult>(result).StatusCode);
+        Assert.Equal("bytes */3974093", context.Response.Headers["Content-Range"].ToString());
+    }
+
+    [Fact]
+    public async Task RelayRawAsync_DownloadOfAnEstimatedTranscode_KeepsEveryByte()
+    {
+        var sent = Enumerable.Range(0, 97).Select(i => (byte)i).ToArray();
+        var (service, _) = ServiceAnswering(Upstream(HttpStatusCode.OK, sent, 100, "none"));
+
+        var result = await service.RelayRawAsync("rest/download", EstimatedTranscode);
+
+        Assert.Equal(200, result.Status);
+        Assert.Equal(sent, result.Body);
+    }
+
+    [Theory]
+    // Navidrome's own marks win: a live transcode says none, a file or cached transcode bytes.
+    [InlineData(200, "none", "", true)]
+    [InlineData(200, "bytes", "format=mp3&maxBitRate=192&estimateContentLength=true", false)]
+    [InlineData(200, "none", "format=mp3&maxBitRate=192&estimateContentLength=true", true)]
+    // A 206 carries an exact Content-Range.
+    [InlineData(206, null, "format=mp3&estimateContentLength=true", false)]
+    // With no mark, the request decides.
+    [InlineData(200, null, "estimateContentLength=true", true)]
+    [InlineData(200, null, "format=mp3", true)]
+    [InlineData(200, null, "maxBitRate=128", true)]
+    [InlineData(200, null, "format=raw", false)]
+    [InlineData(200, null, "maxBitRate=0", false)]
+    [InlineData(200, null, "estimateContentLength=false", false)]
+    [InlineData(200, null, "", false)]
+    public void LengthMayBeEstimate_FollowsNavidromeThenTheRequest(int status, string? acceptRanges, string query,
+        bool expected)
+    {
+        using var response = new HttpResponseMessage((HttpStatusCode)status);
+        if (acceptRanges is not null) response.Headers.AcceptRanges.Add(acceptRanges);
+        var parameters = query.Split('&', StringSplitOptions.RemoveEmptyEntries)
+            .Select(pair => pair.Split('='))
+            .ToDictionary(pair => pair[0], pair => pair[1]);
+
+        Assert.Equal(expected, SubsonicProxyService.LengthMayBeEstimate(response, parameters));
+    }
 }
