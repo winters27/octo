@@ -112,7 +112,8 @@ jobs:
   # The update helper runs as root on people's servers and is never built into
   # an image, so a mistake in it would surface only when someone presses Update
   # now. shellcheck catches the shell's traps; the test runs it against a
-  # throwaway git origin with Docker faked.
+  # throwaway git origin with Docker faked. The installer rewrites people's .env
+  # on every re-run, so its test checks a re-run keeps everything they set.
   update-helper:
     runs-on: ubuntu-latest
 
@@ -121,7 +122,10 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Shellcheck
-        run: shellcheck -S warning scripts/updater/*.sh
+        run: shellcheck -S warning install.sh scripts/*.sh scripts/updater/*.sh
 
       - name: Update helper tests
         run: bash scripts/updater/test-updater.sh
+
+      - name: Installer tests
+        run: bash scripts/test-install.sh

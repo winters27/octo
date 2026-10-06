@@ -179,7 +179,7 @@ Without the helper, **About** shows the command for the new release. From the Oc
 git fetch --tags && git checkout --detach 2026.10.05 && docker compose build && docker compose up -d
 ```
 
-Octo builds from source, so this is what actually updates it. `docker compose pull` refreshes slskd and fetches the yt-dlp shim published for the release you have checked out, but never Octo itself. Re-running `./install.sh` also works and keeps your existing answers.
+Octo builds from source, so this is what actually updates it. `docker compose pull` refreshes slskd and fetches the yt-dlp shim published for the release you have checked out, but never Octo itself. Re-running `./install.sh` also works: it keeps your answers and every other line in `.env`, including ones you added or changed by hand.
 
 If you track `main` instead of releases, `git checkout main && git pull && ./install.sh` still works.
 
