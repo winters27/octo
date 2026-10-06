@@ -8,8 +8,8 @@
         <!-- Dated releases. Version must be numeric for the assembly, so 07 loses its
              leading zero there; InformationalVersion carries the tag name verbatim and
              is what the dashboard shows. Bump both when tagging a release. -->
-        <Version>2026.10.4</Version>
-        <InformationalVersion>2026.10.04</InformationalVersion>
+        <Version>2026.10.5</Version>
+        <InformationalVersion>2026.10.05</InformationalVersion>
     </PropertyGroup>
 
     <ItemGroup>
