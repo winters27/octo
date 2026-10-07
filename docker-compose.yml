@@ -281,6 +281,12 @@ services:
       # that signs people in itself. ADMIN_PORT gives the dashboard a port of its own.
       Admin__SignIn: ${ADMIN_SIGN_IN:-required}
       Admin__Port: ${ADMIN_PORT:-0}
+      # ----- Logging -----
+      # ASP.NET's lines for every request and HttpClient's for every call Octo makes
+      # are left out (Warning), so the log holds Octo's own lines and costs less CPU.
+      # Information brings them back, for example to watch what an app asks for.
+      Logging__LogLevel__Microsoft.AspNetCore: ${LOG_LEVEL_ASPNETCORE:-Warning}
+      Logging__LogLevel__System.Net.Http.HttpClient: ${LOG_LEVEL_HTTPCLIENT:-Warning}
     volumes:
       - ${DOWNLOAD_PATH:-./downloads}:/music
       # Editable settings file: the admin UI writes here, ASP.NET hot-reloads on
