@@ -5738,7 +5738,7 @@ const UPDATE_RUNNING = ['accepted', 'fetching', 'building', 'restarting'];
 const UPDATE_STEPS = [
   ['accepted', 'Handed to the update helper'],
   ['fetching', 'Fetching the release'],
-  ['building', 'Building the new Octo'],
+  ['building', 'Pulling the new Octo'],
   ['restarting', 'Restarting Octo'],
 ];
 const UPDATE_LATER_KEY = 'octo.update.later';
@@ -5867,7 +5867,16 @@ function renderUpdate() {
   if (info.enabled && info.error) line = `${line} ${info.error}`.trim();
   byId('update-line').textContent = line;
 
-  byId('update-now').hidden = !(info.updateAvailable && helper && !active);
+  // A helper from before 2026.10.07 would restart the same Octo and call it an update, so it
+  // gets reinstalled first. An update reinstalls it as its last step; this shows when that failed.
+  const helperOld = !!helper && !!info.helper?.outdated;
+  byId('update-now').hidden = !(info.updateAvailable && helper && !helperOld && !active);
+  const old = byId('update-helper-old');
+  old.hidden = !helperOld || active;
+  if (!old.hidden) {
+    byId('update-helper-old-where').textContent = info.helper?.dir ? `in ${info.helper.dir}` : 'in your Octo folder';
+    byId('update-reinstall-command').textContent = info.reinstallCommand || 'scripts/updater/install-updater.sh';
+  }
   byId('update-notes').hidden = !latest;
   byId('update-check').hidden = !info.enabled;
   byId('update-check').disabled = active;
@@ -5903,13 +5912,15 @@ function renderUpdate() {
   // The command, when there is no helper or it did not answer.
   const manual = byId('update-manual');
   const unanswered = !!info.unanswered && info.unanswered === updateRequestId;
-  manual.hidden = !(info.updateAvailable && !active && (!helper || unanswered));
+  manual.hidden = !(info.updateAvailable && !active && (!helper || unanswered || helperOld));
   if (!manual.hidden) {
     const where = info.helper?.dir ? `in ${info.helper.dir}` : 'in your Octo folder';
+    const image = info.helper?.mode === 'image';
     byId('update-manual-where').textContent = unanswered
       ? `The update helper on this server's host did not answer, so nothing changed. To update by hand, run this ${where}:`
-      : `To update, run this ${where}:`;
-    const image = info.helper?.mode === 'image';
+      : helperOld ? `Or update by hand: run this ${where}:`
+        : image ? `To update, set OCTO_IMAGE_TAG=latest in .env if it is not set, then run this ${where}:`
+          : `To update, run this ${where}:`;
     byId('update-command').textContent = image ? info.imageCommand : info.command;
     byId('update-image-line').hidden = image;
     byId('update-image-command').textContent = info.imageCommand;
@@ -5976,6 +5987,8 @@ function pollUpdate() {
     if (run?.state === 'done' && before && updateInfo.running !== before) {
       toast(`Octo now runs ${updateInfo.running}.`, 'ok');
       await loadSettings();
+      // The helper reinstalls itself just after Octo is back, so its version is read again.
+      setTimeout(() => loadUpdate(), 15_000);
     } else if (run?.state === 'failed' && run.id === updateRequestId) {
       toast('The update failed. Octo still runs the old version.', 'error');
     } else if (updateRequestId && updateInfo.unanswered === updateRequestId) {
@@ -6019,11 +6032,13 @@ document.getElementById('update-banner-later')?.addEventListener('click', () => 
   try { localStorage.setItem(UPDATE_LATER_KEY, updateInfo?.latest?.tag ?? ''); } catch { /* the banner comes back next visit */ }
   document.getElementById('update-banner').hidden = true;
 });
-document.getElementById('update-copy')?.addEventListener('click', async () => {
-  const text = document.getElementById('update-command').textContent;
+async function copyCommand(id) {
+  const text = document.getElementById(id).textContent;
   try { await navigator.clipboard.writeText(text); toast('Command copied.', 'ok'); }
   catch { await askDialog({ title: 'Copy the command', confirm: 'Done', cancel: null, input: { value: text, readOnly: true } }); }
-});
+}
+document.getElementById('update-copy')?.addEventListener('click', () => copyCommand('update-command'));
+document.getElementById('update-reinstall-copy')?.addEventListener('click', () => copyCommand('update-reinstall-command'));
 
 // ────────────────────────────────────────────────────────────────
 // Soulseek: Open slskd, and the Sharing card

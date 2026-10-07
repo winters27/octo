@@ -23,6 +23,15 @@ public class UpdateController(ReleaseCheck releases, UpdateHost host, BrowseSess
     private const string Images = "octo yt-dlp-shim octo-sonic";
     private const string Sources = "octo-source yt-dlp-shim-source octo-sonic-source";
 
+    // Reinstalls the helper from the Octo folder, which holds the release now running.
+    private const string ReinstallCommand = "scripts/updater/install-updater.sh";
+
+    // An update reinstalls the helper as its last step. When that failed, the old helper stays,
+    // and it would pull the release its old compose file names, restart the same Octo and call
+    // the update done, so Update now is refused until it is reinstalled.
+    private const string HelperOutdated = "The update helper on this server's host is an old one that cannot move Octo to a new release. "
+        + "Reinstall it from the Octo folder (" + ReinstallCommand + "), then press Update now again.";
+
     [HttpGet]
     public IActionResult Get() => Ok(View(releases.View()));
 
@@ -41,8 +50,10 @@ public class UpdateController(ReleaseCheck releases, UpdateHost host, BrowseSess
             return Conflict(new { error = "There is no newer release to update to." });
         if (!string.Equals(request.Tag, view.Latest.Tag, StringComparison.Ordinal))
             return Conflict(new { error = $"Only the newest release, {view.Latest.Tag}, can be installed from here." });
-        if (host.Helper() is null)
+        if (host.Helper() is not { } helper)
             return Conflict(new { error = "The update helper is not installed on this server's host. Run the command shown instead." });
+        if (helper.Outdated)
+            return Conflict(new { error = HelperOutdated });
         if (host.Busy())
             return Conflict(new { error = "An update is already under way." });
 
@@ -74,7 +85,8 @@ public class UpdateController(ReleaseCheck releases, UpdateHost host, BrowseSess
             error = view.Error,
             helper = helper is null
                 ? (object)new { installed = false }
-                : new { installed = true, helper.Version, helper.Mode, helper.Dir, helper.InstalledUtc },
+                : new { installed = true, helper.Version, helper.Mode, helper.Dir, helper.InstalledUtc, helper.Outdated },
+            reinstallCommand = ReinstallCommand,
             pending = pending is not null,
             pendingId = pending,
             unanswered = host.Unanswered,

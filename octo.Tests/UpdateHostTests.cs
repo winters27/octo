@@ -137,6 +137,30 @@ public sealed class UpdateHostTests : IDisposable
     }
 
     [Fact]
+    public void AVersionTwoHelperInAGitCloneIsCurrent()
+    {
+        WriteFile("helper", "version=2", "mode=git", "dir=/opt/octo");
+        var helper = Host().Helper()!;
+
+        Assert.Equal("git", helper.Mode);
+        Assert.False(helper.Outdated);
+    }
+
+    [Theory]
+    [InlineData("version=1")]
+    [InlineData("version=")]
+    [InlineData("version=two")]
+    [InlineData("mode=build")]
+    public void AHelperFromBeforeVersionTwoIsOutdated(string line)
+    {
+        // Version 1 picked image mode once Octo was pulled, pulled the release its old compose
+        // file named, and reported the update done. A file without a version is version 1's.
+        WriteFile("helper", line, "dir=/opt/octo");
+
+        Assert.True(Host().Helper()!.Outdated);
+    }
+
+    [Fact]
     public void TheStatusReadsBackWithItsTimes()
     {
         WriteFile("status", "id=a", "tag=2026.10.04", "from=2026.10.01", "state=failed", "step=Building Octo 2026.10.04",
@@ -208,7 +232,8 @@ public sealed class UpdateEndpointTests : IDisposable
         return (factory, client);
     }
 
-    private void Helper() => File.WriteAllLines(Path.Combine(UpdateDir, "helper"), ["version=1", "mode=build", "dir=/opt/octo"]);
+    private void Helper(string version = "2", string mode = "git") =>
+        File.WriteAllLines(Path.Combine(UpdateDir, "helper"), [$"version={version}", $"mode={mode}", "dir=/opt/octo"]);
 
     private static async Task<JsonElement> Json(HttpResponseMessage response) =>
         JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
@@ -283,6 +308,37 @@ public sealed class UpdateEndpointTests : IDisposable
 
         var again = await client.PostAsJsonAsync("/api/admin/update", new { tag = "2026.10.02.1" });
         Assert.Equal(HttpStatusCode.Conflict, again.StatusCode);
+    }
+
+    [Fact]
+    public async Task AnOldHelperIsNotAskedAndTheCardSaysToReinstallIt()
+    {
+        var (factory, client) = await StartAsync();
+        using var _ = factory;
+        // The helper of 2026.10.05 and before, left in place when reinstalling it failed.
+        Helper(version: "1", mode: "build");
+
+        var response = await client.PostAsJsonAsync("/api/admin/update", new { tag = "2026.10.02.1" });
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains("scripts/updater/install-updater.sh", (await Json(response)).GetProperty("error").GetString());
+        Assert.False(File.Exists(Path.Combine(UpdateDir, "request")));
+        var view = await Json(await client.GetAsync("/api/admin/update"));
+        Assert.True(view.GetProperty("helper").GetProperty("outdated").GetBoolean());
+        Assert.Equal("scripts/updater/install-updater.sh", view.GetProperty("reinstallCommand").GetString());
+    }
+
+    [Fact]
+    public async Task TheCurrentHelperIsNotCalledOutdated()
+    {
+        var (factory, client) = await StartAsync();
+        using var _ = factory;
+        Helper();
+
+        var helper = (await Json(await client.GetAsync("/api/admin/update"))).GetProperty("helper");
+
+        Assert.False(helper.GetProperty("outdated").GetBoolean());
+        Assert.Equal("git", helper.GetProperty("mode").GetString());
     }
 
     [Fact]

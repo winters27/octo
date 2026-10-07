@@ -2258,6 +2258,9 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 }
 .update-command .btn { flex: 0 0 auto; }
 .info-card p.update-fine { font-size: var(--t-meta); color: var(--text-muted); }
+.info-card .update-helper-old { margin: var(--s-l) 0 0; }
+.info-card .update-helper-old p { font-size: var(--t-meta); color: var(--ink-1); margin-bottom: 0; }
+.update-helper-old .update-command { margin-bottom: 0; }
 .notes-modal { width: min(640px, calc(100vw - 32px)); }
 .notes-body {
   margin-top: var(--s-l); max-height: min(60vh, 560px); overflow: auto;

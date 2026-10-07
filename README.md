@@ -162,7 +162,9 @@ On Linux with systemd, the installer offers a small update helper. With it, **Ab
 - It leaves the folder alone when Octo's own files have local changes, so it never pulls the published Octo over changes of your own. Your `.env`, `docker-compose.override.yml` and config are not Octo's files, so they never block it.
 - In a folder that is not a git clone (`docker-compose.yml` copied by hand), the helper pulls and restarts Octo and every sidecar Octo publishes. Set `OCTO_IMAGE_TAG=latest` in `.env` there: the copied file names the release it came with, and the helper says so rather than pull that same release again. Other images, such as slskd, are left alone.
 
-To add the helper to an existing install, or take it off again:
+Each update reinstalls the helper from the new release as its last step. If **About** says the helper is out of date (that step failed, or it was installed before 2026.10.07), Update now stays off until you run the first command below in the Octo folder: an old helper would restart the same Octo and call it an update.
+
+To add the helper to an existing install, reinstall it, or take it off again:
 
 ```bash
 scripts/updater/install-updater.sh
