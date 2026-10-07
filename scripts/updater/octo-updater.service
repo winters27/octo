@@ -1,5 +1,5 @@
 # Installed by scripts/updater/install-updater.sh. Updates Octo to the release
-# the dashboard asked for: fetch, build, restart. See octo-updater.sh.
+# the dashboard asked for: fetch, pull, restart. See octo-updater.sh.
 [Unit]
 Description=Update Octo to the release asked for on the dashboard
 After=docker.service network-online.target

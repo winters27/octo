@@ -73,7 +73,8 @@ fi
 
 [ -f "$octo_dir/docker-compose.yml" ] || die "$octo_dir has no docker-compose.yml; run this from Octo's folder"
 command -v docker > /dev/null 2>&1 || die "docker is not installed"
-command -v git > /dev/null 2>&1 || die "git is not installed"
+# git only where the folder is a clone; a folder copied by hand is updated by pulling alone.
+[ ! -e "$octo_dir/.git" ] || command -v git > /dev/null 2>&1 || die "git is not installed"
 command -v flock > /dev/null 2>&1 || die "flock is not installed (util-linux)"
 
 # A refresh keeps the dry run setting it had, unless told otherwise.
