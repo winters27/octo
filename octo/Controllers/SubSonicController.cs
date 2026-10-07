@@ -1054,8 +1054,14 @@ public partial class SubsonicController : ControllerBase
         // local floor used to be a flat 20, which is also the spec default for
         // songCount, so the most common search in the wild left nothing for
         // discovery at all (#14).
-        var (localSongTarget, externalTarget) =
+        var (_, externalTarget) =
             SearchBudget.Compute(requestedSongs, _subsonicSettings.EnableSearchDiscovery);
+
+        // The library comes first, whole: Navidrome is asked for every row the page has room
+        // for, and outside songs only fill the places it leaves empty. The budget above used to
+        // cap the library at its share, so an artist with thirty songs in the library showed
+        // twelve of them, then outside songs, and the other eighteen after those.
+        var localSongTarget = SearchBudget.LibraryFirstTarget(requestedSongs);
 
         // A client that asked for a handful of songs is searching as the user types. The
         // song side already costs nothing there (the budget leaves no room for discovery),
@@ -1134,7 +1140,7 @@ public partial class SubsonicController : ControllerBase
         // discovery is the right answer there too, since the merge will show no locals.
         var built = await externalTask;
         var externalSlice = SearchSongOrder.PageOneExternalCount(
-            built.Count, localSongTarget, externalTarget, localParsed.Songs.Count);
+            built.Count, localSongTarget, 0, localParsed.Songs.Count);
         var externalSongs = built.Take(externalSlice).ToList();
 
         // Remember what this page showed so the next page can carry on from it. Only when
@@ -1146,7 +1152,7 @@ public partial class SubsonicController : ControllerBase
             && await SongOrderKeyAsync(parameters, searchEndpoint, cleanQuery) is { } orderKey)
         {
             _searchSongOrders.Set(orderKey,
-                SearchSongOrder.From(built, requestedSongs, localSongTarget, externalTarget, localParsed.Songs));
+                SearchSongOrder.From(built, requestedSongs, localSongTarget, 0, localParsed.Songs));
         }
 
         var playlistTask = _subsonicSettings.EnableExternalPlaylists && albumOffset <= 0
@@ -1232,8 +1238,9 @@ public partial class SubsonicController : ControllerBase
             // again as if page one had asked for this page's count. The build is shared with
             // any page one still running for the query, so a client that asks for two pages
             // at once gets one build.
-            var (localTarget, externalTarget) = SearchBudget.Compute(requestedSongs);
+            var (_, externalTarget) = SearchBudget.Compute(requestedSongs);
             if (externalTarget == 0) return null;
+            var localTarget = SearchBudget.LibraryFirstTarget(requestedSongs);
 
             var builtTask = _externalSearch.GetAsync(cleanQuery);
             var prefix = await _proxyService.RelaySafeAsync(searchEndpoint, new Dictionary<string, string>(parameters)
@@ -1246,7 +1253,7 @@ public partial class SubsonicController : ControllerBase
             if (!prefix.Success || prefix.Body is null) return null;
 
             var prefixSongs = _modelMapper.ParseSearchResponse(prefix.Body, prefix.ContentType).Songs;
-            order = SearchSongOrder.From(await builtTask, requestedSongs, localTarget, externalTarget, prefixSongs);
+            order = SearchSongOrder.From(await builtTask, requestedSongs, localTarget, 0, prefixSongs);
             if (key is not null) _searchSongOrders.Set(key, order);
             _logger.LogDebug("search '{Q}': page one's order was gone, rebuilt it for offset {Offset}",
                 cleanQuery, songOffset);

@@ -36,6 +36,16 @@ public static class SearchBudget
     public const int ExternalCeiling = Common.ExternalSearchService.BuildSize;
 
     /// <summary>
+    /// How many library rows page one of a search asks Navidrome for: the whole page. Outside
+    /// songs fill what the library leaves empty (<see cref="SearchSongOrder.PageOneExternalCount"/>
+    /// with no external share of its own), so a song you own is listed once, as your copy,
+    /// before any outside result, and outside results never push owned ones to a later page.
+    /// <see cref="Compute"/> still decides whether the request is big enough for discovery at
+    /// all (a type-ahead count is not).
+    /// </summary>
+    public static int LibraryFirstTarget(int requestedSongs) => Math.Max(0, requestedSongs);
+
+    /// <summary>
     /// Split <paramref name="requestedSongs"/> into a local target and an external target.
     /// Both are returned together so the two can never drift apart at a call site.
     /// </summary>
