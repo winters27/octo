@@ -1,8 +1,18 @@
+# Every container's log is capped: Docker keeps at most 3 files of 10 MB for each
+# (LOG_MAX_FILES and LOG_MAX_SIZE in .env change that), so a server that runs for months
+# never fills its disk with logs. `docker compose logs` reads them as before.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-10m}
+    max-file: "${LOG_MAX_FILES:-3}"
+
 services:
   octo:
     build: .
     container_name: octo
     restart: unless-stopped
+    logging: *logging
     ports:
       - "5274:8080"
       # The dashboard on a port of its own: set ADMIN_PORT=5275 in .env, then uncomment.
@@ -311,6 +321,7 @@ services:
     image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.05}
     container_name: yt-dlp-shim
     restart: unless-stopped
+    logging: *logging
     environment:
       MAX_CONCURRENT_YTDLP: ${YTDLP_MAX_CONCURRENT:-5}
       # Slots of the above that background work (prewarm, star-downloads) can
@@ -362,6 +373,7 @@ services:
     image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.05}
     container_name: octo-sonic
     restart: unless-stopped
+    logging: *logging
     # Passes docker stop's SIGTERM on and reaps the reader processes.
     init: true
     expose:
@@ -399,6 +411,7 @@ services:
     image: slskd/slskd:latest
     container_name: slskd
     restart: unless-stopped
+    logging: *logging
     ports:
       - "5030:5030"
       - "50300:50300"
@@ -459,6 +472,7 @@ services:
     image: deluan/navidrome:latest
     container_name: navidrome
     restart: unless-stopped
+    logging: *logging
     profiles: ["navidrome"]
     networks:
       default:
