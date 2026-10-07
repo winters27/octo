@@ -13,7 +13,9 @@ failures=0
 
 # docker only logs, and fails the pull of any service FAKE_NO_IMAGE names (no network to
 # ghcr.io). curl answers 200 to every status code probe and a Last.fm track to the key check,
-# so each question takes the default and Octo looks healthy straight away.
+# so each question takes the default and Octo looks healthy straight away; with
+# FAKE_SLOW_SLSKD=N, Octo's status says slskd is not ok for its first N answers, and with
+# FAKE_SONIC_DOWN it says octo-sonic is not ok (an empty music folder) every time.
 cat > "$work/bin/docker" <<EOF
 #!/usr/bin/env bash
 echo "docker \$*" >> "$work/docker.log"
@@ -29,13 +31,19 @@ for arg in "$@"; do
 done
 case "$*" in
   *audioscrobbler*) echo '{"track":{}}' ;;
+  */api/admin/status*)
+    calls="$(( $(cat "$FAKE_STATUS_CALLS" 2>/dev/null || echo 0) + 1 ))"
+    echo "$calls" > "$FAKE_STATUS_CALLS"
+    if [ "$calls" -le "${FAKE_SLOW_SLSKD:-0}" ]; then ok=false; else ok=true; fi
+    sonic=true; [ -z "${FAKE_SONIC_DOWN:-}" ] || sonic=false
+    echo "{\"services\":{\"slskd\":{\"ok\":$ok,\"configured\":true},\"sonic\":{\"ok\":$sonic,\"configured\":true}}}" ;;
   *) echo '{}' ;;
 esac
 EOF
 printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/clear"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/sleep"
 chmod +x "$work/bin/"*
-export PATH="$work/bin:$PATH"
+export PATH="$work/bin:$PATH" FAKE_STATUS_CALLS="$work/status-calls"
 
 fresh() { # a copy of the installer with no .env yet
   rm -rf "$work/octo"
@@ -48,6 +56,7 @@ fresh() { # a copy of the installer with no .env yet
 printf '\n%.0s' $(seq 1 50) > "$work/answers"
 run() { # answers every question with Enter
   : > "$work/docker.log"
+  rm -f "$FAKE_STATUS_CALLS"
   bash "$work/octo/install.sh" < "$work/answers" > "$work/out.log" 2>&1
 }
 # What the run pulled and built, as "pull a b | build c d".
@@ -199,6 +208,17 @@ expect_images "a changed Dockerfile builds Octo" "yt-dlp-shim octo-sonic | octo-
 echo "OCTO_IMAGE_TAG=latest" >> "$work/octo/.env"
 run
 expect_images "a tag the user chose is pulled" "octo yt-dlp-shim octo-sonic | "
+
+# Octo answers within seconds now that it is pulled; a service still starting is waited for.
+fresh
+FAKE_SLOW_SLSKD=2 run
+grep -q 'waiting for the other services to start' "$work/out.log" && grep -Eq 'slskd +.*ok' "$work/out.log"   && pass "a service still starting is waited for, then shown ok" || { fail "slskd still starting:"; grep -E 'waiting|slskd  ' "$work/out.log"; }
+fresh
+run
+grep -q 'waiting for the other services' "$work/out.log"   && fail "the installer waited with every service ok" || pass "with every service ok the installer does not wait"
+fresh
+FAKE_SONIC_DOWN=1 run
+grep -q 'waiting for the other services' "$work/out.log"   && fail "the installer waited for octo-sonic on an empty music folder" || pass "octo-sonic on an empty music folder is not waited for"
 
 # The installer's answer decides only the navidrome profile; any other profile stays.
 fresh

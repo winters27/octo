@@ -507,7 +507,20 @@ done
 
 echo
 bold "─── Service health ─────────────────────────────────────────"
-status_json=$(curl -sS -m 5 "http://localhost:5274/api/admin/status" 2>/dev/null || echo "{}")
+# Octo answers within seconds of starting, before Navidrome, slskd or the shim may be up, so
+# those get up to a minute (Octo's answer is fresh every 10 seconds). octo-sonic is not waited
+# for: it says it cannot see the music folder for as long as the folder is empty, as on a
+# fresh starter stack.
+waited=false
+for _ in $(seq 1 12); do
+  status_json=$(curl -sS -m 5 "http://localhost:5274/api/admin/status" 2>/dev/null || echo "{}")
+  echo "$status_json" | grep -Eq '"(navidrome|slskd|ytDlpShim)":\{"ok":false' || break
+  [ "$waited" = true ] || echo -n "  waiting for the other services to start "
+  waited=true
+  echo -n "."
+  sleep 5
+done
+if [ "$waited" = true ]; then echo; fi
 check_svc() {
   local name="$1" key="$2"
   if echo "$status_json" | grep -q "\"$key\":{\"ok\":true,\"configured\":false"; then
