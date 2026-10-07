@@ -1,16 +1,9 @@
 #!/usr/bin/env bash
 # Octo's update helper. Runs on the host, started by octo-updater.path when the
 # dashboard writes an update request into Octo's config folder (update/request).
-# It runs fixed steps and writes its progress back (update/status, update/log) for
-# the dashboard to show:
-#   - In a git clone of Octo with no changes to Octo's own files (the usual install),
-#     it fetches the release, checks it out, pulls the images that release names
-#     (Octo and its sidecars) and restarts. An image that will not pull is built
-#     from the folder instead, and the log and the dashboard say so.
-#   - Anywhere else (docker-compose.yml copied by hand), it pulls and restarts.
-# Version 1 chose by whether docker-compose.yml built Octo. Once Octo was pulled,
-# that read every clone as copied by hand, so it pulled the release its old compose
-# file named, again and again, and never moved; version 2 chooses by the folder.
+# It runs fixed steps (fetch the release, check it, pull its sidecars, build Octo,
+# restart it) and writes its progress back (update/status, update/log) for the
+# dashboard to show.
 #
 # Octo never gets the Docker socket. All it can do is ask, by writing a file, and
 # the request names only a release; nothing in it is ever run as a command. The
@@ -27,7 +20,7 @@
 set -Eeuo pipefail
 umask 022
 
-HELPER_VERSION=2
+HELPER_VERSION=1
 OCTO_DIR="${OCTO_DIR:?OCTO_DIR is not set}"
 UPDATE_DIR="${OCTO_UPDATE_DIR:?OCTO_UPDATE_DIR is not set}"
 DRYRUN="${OCTO_UPDATER_DRYRUN:-0}"
@@ -92,42 +85,16 @@ git_in_clone() {
   fi
 }
 
-# "git" when this folder is a clone of Octo's repository, so an update can fetch and check out
-# the release; "image" when it is not (docker-compose.yml copied by hand), so it can only pull.
-install_kind() {
-  local top
-  command -v git > /dev/null 2>&1 || { echo image; return; }
-  top="$(git_in_clone rev-parse --show-toplevel 2> /dev/null)" || { echo image; return; }
-  if [ "$top" = "$(pwd -P)" ] && git_in_clone remote get-url origin > /dev/null 2>&1; then
-    echo git
-  else
-    echo image
-  fi
-}
-
-# What docker-compose.yml, with any override, says about the octo service, in two words: "pull"
-# or "build" (an override that builds Octo from this folder), then the tag its image names.
-octo_service() {
-  { docker compose config 2>/dev/null || true; } | awk '
+# "build" when Compose builds Octo from this folder, "image" when it pulls a published image.
+compose_mode() {
+  local config
+  config="$(docker compose config 2>/dev/null)" || { echo build; return; }
+  printf '%s\n' "$config" | awk '
     /^services:/ { in_services = 1; next }
     in_services && /^[^ ]/ { in_services = 0 }
     in_services && /^  [^ ]/ { in_octo = ($0 ~ /^  octo:/) }
     in_services && in_octo && /^    build:/ { built = 1 }
-    in_services && in_octo && /^    image:/ { image = $2 }
-    END {
-      gsub(/["\047]/, "", image)
-      sub(/@.*/, "", image)
-      tag = "latest"
-      if (match(image, /:[^\/]*$/)) tag = substr(image, RSTART + 1)
-      print (built ? "build" : "pull"), tag
-    }'
-}
-
-# True when the octo service names a dated release older than the one asked for. Pulling it
-# would restart the same Octo and report success, so the run stops and says what to change.
-pinned_older() { # the tag octo's image names
-  [[ "$1" =~ $TAG_PATTERN ]] && [ "$1" != "$tag" ] \
-    && [ "$(printf '%s\n%s\n' "$1" "$tag" | sort -V | tail -n 1)" = "$tag" ]
+    END { print (built ? "build" : "image") }'
 }
 
 # The services that run one of Octo's own published images, on one line: octo, and
@@ -155,24 +122,22 @@ published_services() {
     }'
 }
 
-# The images Octo publishes with every release: Octo and its sidecars. A clone pulls them
-# rather than compiling them: octo-sonic is Rust and FFmpeg, minutes of building and more
-# memory than a small machine has. Each has a <name>-source service in docker-compose.yml that
-# builds it from the folder instead, for when the pull fails. An image a later release adds
-# and this list lacks is still pulled, by `up -d`, because it is missing.
-IMAGES=(octo yt-dlp-shim octo-sonic)
+# The sidecars Octo publishes with every release. A built install pulls them rather than
+# compiling them: octo-sonic is Rust and FFmpeg, minutes of building and more memory than a
+# small machine has. Each has a <name>-source service in docker-compose.yml that builds it
+# from the folder instead, for when the pull fails. A sidecar a later release adds and this
+# list lacks is still pulled, by `up -d`, because its image is missing.
+SIDECARS=(yt-dlp-shim octo-sonic)
 
-# Pulls each image the checked out release runs, and prints the -source service to build for
-# every one that could not be pulled (no network to ghcr.io, or not published yet). Octo is
-# skipped when an override builds it from the folder ($octo_builds); the caller builds it.
-pull_images() {
+# Pulls each sidecar the checked out release runs, and prints the -source service to build
+# for every one that could not be pulled (no network to ghcr.io, or not published yet).
+pull_sidecars() {
   local services service
   services=" $({ docker compose config --services 2>/dev/null || true; } | tr '\n' ' ') "
-  for service in "${IMAGES[@]}"; do
+  for service in "${SIDECARS[@]}"; do
     [[ "$services" == *" $service "* ]] || continue
-    [ "$service" = octo ] && [ "$octo_builds" = 1 ] && continue
     run docker compose pull "$service" && continue
-    log "$service could not be pulled, so it is built here from this folder instead"
+    log "$service could not be pulled, so it is built here instead"
     echo "$service-source"
   done
 }
@@ -219,7 +184,7 @@ mkdir -p "$UPDATE_DIR"
 cd "$OCTO_DIR"
 
 if [ "${1:-}" = "--describe" ]; then
-  describe "$(install_kind)"
+  describe "$(compose_mode)"
   exit 0
 fi
 
@@ -243,17 +208,11 @@ log "Update request $id for ${tag:-nothing}"
 [ "$id" != invalid ] || fail "The request had no valid id, so it was ignored."
 [[ "$tag" =~ $TAG_PATTERN ]] || { tag=""; fail "The request did not name a dated release, so it was ignored."; }
 
-mode="$(install_kind)"
+mode="$(compose_mode)"
 describe "$mode"
 write_status accepted "Starting the update to $tag"
 
 if [ "$mode" = image ]; then
-  # Not a clone, so there is no release to check out: the images are all it can move.
-  read -r octo_how octo_tag <<< "$(octo_service)"
-  [ "$octo_how" = pull ] || fail "Octo is built from $OCTO_DIR, which is not a git clone of Octo, so the helper cannot fetch $tag. Put $tag's files in the folder, then run docker compose build octo and docker compose up -d." "Pulling the new Octo images"
-  if pinned_older "$octo_tag"; then
-    fail "docker-compose.yml in $OCTO_DIR runs Octo $octo_tag by name, and the folder is not a git clone of Octo, so pulling would not reach $tag. Set OCTO_IMAGE_TAG=latest in .env (or use the docker-compose.yml of $tag), then press Update now again." "Pulling the new Octo images"
-  fi
   # Octo and its sidecars move together, so the yt-dlp shim never stays on an old release.
   read -r -a services <<< "$(published_services)"
   write_status fetching "Pulling the new Octo images"
@@ -290,48 +249,29 @@ if [[ "$from" =~ $TAG_PATTERN ]]; then
 fi
 
 if [ "$DRYRUN" = 1 ]; then
-  write_status building "Dry run: would pull $tag"
-  log "Dry run: would check out $tag, pull ${IMAGES[*]} (building any that will not pull), and restart"
+  write_status building "Dry run: would build $tag"
+  log "Dry run: would check out $tag, pull ${SIDECARS[*]} (building any that will not pull), build octo, and restart"
   write_status "done" "Dry run: nothing was changed"
   exit 0
 fi
 
-# Where to go back to if the update fails: the branch when there is one.
+# Where to go back to if the build fails: the branch when there is one.
 previous="$(git_in_clone symbolic-ref -q --short HEAD || git_in_clone rev-parse HEAD)"
 run git_in_clone checkout --quiet --detach "$tag" || fail "git could not check out $tag. The log has the details." "Fetching $tag from GitHub"
 
-read -r octo_how octo_tag <<< "$(octo_service)"
-if [ "$octo_how" = pull ] && pinned_older "$octo_tag"; then
+# Pulled and built before anything stops, so a failure leaves the running Octo alone. Only
+# Octo is built, and a sidecar only when its image could not be pulled.
+write_status building "Pulling the sidecars for $tag"
+read -r -a fallback <<< "$(pull_sidecars | tr '\n' ' ')"
+write_status building "Building Octo $tag"
+if ! run docker compose build octo "${fallback[@]}"; then
   run git_in_clone checkout --quiet "$previous" || log "Could not check out $previous again"
-  fail "OCTO_IMAGE_TAG in .env (or docker-compose.override.yml) asks for Octo $octo_tag by name, so the update would not reach $tag. Remove OCTO_IMAGE_TAG from .env, or set it to latest, then press Update now again." "Pulling Octo $tag"
-fi
-octo_builds=0
-if [ "$octo_how" = build ]; then octo_builds=1; fi
-
-# Pulled, and built where a pull failed, before anything stops, so a failure leaves the
-# running Octo alone.
-write_status building "Pulling Octo $tag"
-read -r -a build <<< "$(pull_images | tr '\n' ' ')"
-if [ "$octo_builds" = 1 ]; then
-  log "An override builds Octo from this folder, so it is built here"
-  build=(octo "${build[@]}")
-fi
-built=""
-if [ "${#build[@]}" -gt 0 ]; then
-  write_status building "Building ${build[*]} from this folder"
-  if ! run docker compose --profile source build "${build[@]}"; then
-    run git_in_clone checkout --quiet "$previous" || log "Could not check out $previous again"
-    fail "The build failed, so nothing was restarted and Octo still runs ${from:-the old version}. The log has the details." "Building ${build[*]} from this folder"
-  fi
-  if [[ " ${build[*]} " == *" octo-source "* ]]; then
-    built=", built on this server because its image could not be pulled"
-  fi
+  fail "The build failed, so nothing was restarted and Octo still runs ${from:-the old version}. The log has the details." "Building Octo $tag"
 fi
 
 write_status restarting "Restarting Octo"
 if ! run docker compose up -d || ! wait_until_running; then
-  # The new release will not run here, so the one that did goes back in: its images are still
-  # here, and a plain build builds only what that release built from the folder, if anything.
+  # The new release will not run here, so the one that did goes back in.
   log "Octo $tag did not stay running; going back to ${from:-$previous}"
   write_status restarting "Octo $tag did not stay running; going back to ${from:-the old version}"
   if run git_in_clone checkout --quiet "$previous" && run docker compose build && run docker compose up -d && wait_until_running; then
@@ -340,7 +280,7 @@ if ! run docker compose up -d || ! wait_until_running; then
   fail "Octo $tag did not stay running, and going back to ${from:-the old version} failed too. 'docker compose logs octo' on the host says why." "Restarting Octo"
 fi
 
-write_status "done" "Octo now runs $tag$built"
-log "Done: $from to $tag$built"
+write_status "done" "Octo now runs $tag"
+log "Done: $from to $tag"
 refresh_helper
 exit 0

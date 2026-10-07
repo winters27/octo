@@ -1,23 +1,8 @@
-# Every container's log is capped: Docker keeps at most 3 files of 10 MB for each
-# (LOG_MAX_FILES and LOG_MAX_SIZE in .env change that), so a server that runs for months
-# never fills its disk with logs. `docker compose logs` reads them as before.
-x-logging: &logging
-  driver: json-file
-  options:
-    max-size: ${LOG_MAX_SIZE:-10m}
-    max-file: "${LOG_MAX_FILES:-3}"
-
 services:
-  # Pulled, not built: Octo is published with every release, for amd64 and arm64, so no
-  # install compiles it. The default tag is this release's own number (bumped with
-  # octo/octo.csproj; CI checks it); OCTO_IMAGE_TAG in .env picks another, such as latest.
-  # To run Octo built from this folder instead (changes of your own, or no access to
-  # ghcr.io), build octo-source, at the end of this file.
   octo:
-    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.10.07}
+    build: .
     container_name: octo
     restart: unless-stopped
-    logging: *logging
     ports:
       - "5274:8080"
       # The dashboard on a port of its own: set ADMIN_PORT=5275 in .env, then uncomment.
@@ -296,12 +281,6 @@ services:
       # that signs people in itself. ADMIN_PORT gives the dashboard a port of its own.
       Admin__SignIn: ${ADMIN_SIGN_IN:-required}
       Admin__Port: ${ADMIN_PORT:-0}
-      # ----- Logging -----
-      # ASP.NET's lines for every request and HttpClient's for every call Octo makes
-      # are left out (Warning), so the log holds Octo's own lines and costs less CPU.
-      # Information brings them back, for example to watch what an app asks for.
-      Logging__LogLevel__Microsoft.AspNetCore: ${LOG_LEVEL_ASPNETCORE:-Warning}
-      Logging__LogLevel__System.Net.Http.HttpClient: ${LOG_LEVEL_HTTPCLIENT:-Warning}
     volumes:
       - ${DOWNLOAD_PATH:-./downloads}:/music
       # Editable settings file: the admin UI writes here, ASP.NET hot-reloads on
@@ -317,13 +296,15 @@ services:
   # in its own container prevents .NET process-management quirks from wedging
   # the parent (see Brain/projects/Flaccy.md, 2026-04-29 LXC wedge note).
   #
-  # Pulled, not built, like Octo, and at the same tag, so the two always match.
-  # Without access to ghcr.io, build it from this folder with yt-dlp-shim-source (below).
+  # Pulled, not built: it is published with every Octo release, for amd64 and arm64.
+  # The default tag is this release's own number (bumped with octo/octo.csproj; CI
+  # checks it); OCTO_IMAGE_TAG picks another, such as latest on an install that pulls
+  # Octo's images instead of building them. Without access to ghcr.io, build it from
+  # this folder with yt-dlp-shim-source (below).
   yt-dlp-shim:
-    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.07}
+    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.05}
     container_name: yt-dlp-shim
     restart: unless-stopped
-    logging: *logging
     environment:
       MAX_CONCURRENT_YTDLP: ${YTDLP_MAX_CONCURRENT:-5}
       # Slots of the above that background work (prewarm, star-downloads) can
@@ -372,10 +353,9 @@ services:
   # Pulled, not built, like the shim: compiling it (Rust and FFmpeg) takes minutes and more
   # memory than a small machine has. octo-sonic-source (below) builds it from this folder.
   octo-sonic:
-    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.07}
+    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.05}
     container_name: octo-sonic
     restart: unless-stopped
-    logging: *logging
     # Passes docker stop's SIGTERM on and reaps the reader processes.
     init: true
     expose:
@@ -413,7 +393,6 @@ services:
     image: slskd/slskd:latest
     container_name: slskd
     restart: unless-stopped
-    logging: *logging
     ports:
       - "5030:5030"
       - "50300:50300"
@@ -474,7 +453,6 @@ services:
     image: deluan/navidrome:latest
     container_name: navidrome
     restart: unless-stopped
-    logging: *logging
     profiles: ["navidrome"]
     networks:
       default:
@@ -496,25 +474,19 @@ services:
       - ${DOWNLOAD_PATH:-./downloads}:/music
       - ${NAVIDROME_DATA_DIR:-./navidrome-data}:/data
 
-  # Octo and the sidecars built from this folder instead of pulled: for changes of your own,
-  # or a machine that cannot reach ghcr.io. They never run; a build gives the image the name
-  # the service above runs, so `docker compose up -d` then uses it:
-  #   docker compose --profile source build octo-source && docker compose up -d
-  # A later `docker compose pull` puts the published image back. The update helper and
-  # install.sh build them by themselves when a pull fails, and install.sh also when the
-  # folder changed since its release. In a profile so a plain `docker compose build` builds
-  # nothing, which is what an older update helper runs; that keeps even the update to this
-  # release from compiling anything.
-  octo-source:
-    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.10.07}
-    build: .
-    profiles: ["source"]
+  # The sidecars built from this folder instead of pulled: for a machine that cannot reach
+  # ghcr.io, or a sidecar changed since its release. They never run; a build gives the image
+  # the name the service above runs, so `docker compose up -d` then uses it:
+  #   docker compose build yt-dlp-shim-source octo-sonic-source && docker compose up -d
+  # The update helper and install.sh do this by themselves when a pull fails. In a profile so
+  # a plain `docker compose build` builds Octo alone, which is what an older update helper
+  # runs; that keeps even the update to this release from compiling octo-sonic.
   yt-dlp-shim-source:
-    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.07}
+    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.10.05}
     build: ./yt-dlp-shim
     profiles: ["source"]
   octo-sonic-source:
-    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.07}
+    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.10.05}
     build: ./sonic
     profiles: ["source"]
 

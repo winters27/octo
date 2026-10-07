@@ -154,17 +154,15 @@ Octo checks GitHub every 6 hours for a newer release. When one is out, the dashb
 
 ### From the dashboard
 
-On Linux with systemd, the installer offers a small update helper. With it, **About → Update now** installs the new release: the helper fetches it, pulls the Octo, yt-dlp shim and octo-sonic images published for it, and restarts them, and the dashboard shows each step. Nothing is compiled.
+On Linux with systemd, the installer offers a small update helper. With it, **About → Update now** installs the new release: the helper fetches it, pulls the yt-dlp shim and octo-sonic images published for it, builds Octo, and restarts it, and the dashboard shows each step.
 
 - Octo itself never gets access to Docker. It can only ask, by writing a file in its config folder, and only for the newest published release.
-- The helper pulls the new release before it stops anything, so a failed pull leaves Octo running as it was. If the new release will not stay up, the helper goes back to the old one.
-- An image that cannot be pulled (no network to `ghcr.io`) is built from the folder instead, and the dashboard says so when it was Octo's.
-- It leaves the folder alone when Octo's own files have local changes, so it never pulls the published Octo over changes of your own. Your `.env`, `docker-compose.override.yml` and config are not Octo's files, so they never block it.
-- In a folder that is not a git clone (`docker-compose.yml` copied by hand), the helper pulls and restarts Octo and every sidecar Octo publishes. Set `OCTO_IMAGE_TAG=latest` in `.env` there: the copied file names the release it came with, and the helper says so rather than pull that same release again. Other images, such as slskd, are left alone.
+- The helper pulls and builds the new release before it stops anything, so a failed build leaves Octo running as it was. If the new release will not stay up, the helper goes back to the old one.
+- A sidecar whose image cannot be pulled (no network to `ghcr.io`) is built from the folder instead, as before.
+- It leaves the folder alone when Octo's own files have local changes. Your `.env`, `docker-compose.override.yml` and config are not Octo's files, so they never block it.
+- On an install that pulls Octo's images instead of building them (see [Published images](#published-images)), the helper pulls and restarts Octo and every sidecar Octo publishes, so the yt-dlp shim and octo-sonic move with Octo. Other images, such as slskd, are left alone.
 
-Each update reinstalls the helper from the new release as its last step. If **About** says the helper is out of date (that step failed, or it was installed before 2026.10.07), Update now stays off until you run the first command below in the Octo folder: an old helper would restart the same Octo and call it an update.
-
-To add the helper to an existing install, reinstall it, or take it off again:
+To add the helper to an existing install, or take it off again:
 
 ```bash
 scripts/updater/install-updater.sh
@@ -179,14 +177,12 @@ scripts/updater/install-updater.sh --remove
 Without the helper, **About** shows the command for the new release. From the Octo folder:
 
 ```bash
-git fetch --tags && git checkout --detach 2026.10.07
-docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source
-docker compose up -d
+git fetch --tags && git checkout --detach 2026.10.05
+docker compose pull yt-dlp-shim octo-sonic || docker compose build yt-dlp-shim-source octo-sonic-source
+docker compose build octo && docker compose up -d
 ```
 
-Octo, the yt-dlp shim and octo-sonic are pulled, already built, for the release you have checked out; the part after `||` builds them from the folder only when the pull fails, for example with no network to `ghcr.io`. Re-running `./install.sh` also works: it does the same, and keeps your answers and every other line in `.env`, including ones you added or changed by hand.
-
-Up to 2026.10.05 the last step was `docker compose build octo`. Octo is pulled now, so that builds nothing; if you changed Octo's own files and want them running, build it with `docker compose --profile source build octo-source && docker compose up -d` (see [Published images](#published-images)).
+The yt-dlp shim and octo-sonic are pulled, already built, for the release you have checked out; the second line builds them from the folder only when the pull fails, for example with no network to `ghcr.io`. Octo itself builds from source, so the last line is what actually updates it. Re-running `./install.sh` also works: it does the same, and keeps your answers and every other line in `.env`, including ones you added or changed by hand.
 
 If you track `main` instead of releases, `git checkout main && git pull && ./install.sh` still works.
 
@@ -212,17 +208,24 @@ Every release publishes three images on GitHub's container registry, each for am
 | `ghcr.io/winters27/octo-yt-dlp-shim` | the yt-dlp shim beside it |
 | `ghcr.io/winters27/octo-sonic` | octo-sonic, the Sounds alike reader |
 
-`docker-compose.yml` pulls all three, tagged with the release the folder holds, so no install compiles anything. `OCTO_IMAGE_TAG` in `.env` picks another tag for all three, such as `latest`.
-
-To build one from the folder instead (changes of your own, or no network to `ghcr.io`), build its `-source` service. The build takes the name the running service pulls, so `up -d` then uses it:
+`docker-compose.yml` pulls the shim and octo-sonic, tagged with the release the folder holds, so no install compiles them. `OCTO_IMAGE_TAG` in `.env` picks another tag for both. To build them from the folder instead (no network to `ghcr.io`, or a sidecar you changed), build their `-source` services; the build takes the name the running service pulls, so `up -d` then uses it:
 
 ```bash
-docker compose --profile source build octo-source && docker compose up -d
+docker compose build yt-dlp-shim-source octo-sonic-source && docker compose up -d
 ```
 
-`octo-source` is Octo itself; `yt-dlp-shim-source` and `octo-sonic-source` are the sidecars. A later `docker compose pull`, or Update now, puts the published image back. The update helper and `install.sh` build an image that will not pull by themselves, and `install.sh` also builds one whose folder changed since its release (on `main`, or with changes of your own), and says so.
+The update helper and `install.sh` do this by themselves for a sidecar that will not pull, and `install.sh` also builds one whose folder changed since its release (on `main`, say).
 
-An override from before 2026.10.07 that made Octo pulled (`build: !reset null` and `image:` under `octo` in `docker-compose.override.yml`) is no longer needed. It does no harm; delete it when you like.
+To pull Octo instead of building it, for example on a small machine, put this in `docker-compose.override.yml`:
+
+```yaml
+services:
+  octo:
+    build: !reset null
+    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-latest}
+```
+
+Then set `OCTO_IMAGE_TAG=latest` in `.env`, so the shim and octo-sonic follow the same tag, and start it with `docker compose pull && docker compose up -d`. The update helper sees there is nothing to build and pulls instead. `!reset` needs Docker Compose 2.24 or newer.
 
 ## Admin dashboard
 
@@ -321,7 +324,7 @@ Yes. Every download is identified before it is filed: the fingerprint service's 
 
 ### Can it run on a Raspberry Pi?
 
-Yes. Every image is published for amd64 and arm64, so a Pi pulls Octo, the yt-dlp shim and octo-sonic instead of compiling them (see [Published images](#published-images)). The yt-dlp sidecar does most of the CPU work; a Pi 4 or Pi 5 handles a single household's listening fine.
+Yes. Every image is published for amd64 and arm64, so a Pi pulls the yt-dlp shim and octo-sonic instead of compiling them; only Octo itself is built, unless you pull it too (see [Published images](#published-images)). The yt-dlp sidecar does most of the CPU work; a Pi 4 or Pi 5 handles a single household's listening fine.
 
 ---
 
@@ -924,12 +927,6 @@ Yes. Existing snapshots are served first; Starter and pinned stations can fall b
 dotnet restore
 dotnet build
 dotnet test
-```
-
-To run your changes in the stack, build Octo from the folder; `docker-compose.yml` otherwise pulls the published image:
-
-```bash
-docker compose --profile source build octo-source && docker compose up -d
 ```
 
 To build and preview the admin UI locally in an isolated Docker container:

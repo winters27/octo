@@ -3,19 +3,8 @@ using System.Text.RegularExpressions;
 
 namespace Octo.Services.Updates;
 
-/// <summary>The host helper, as it describes itself in config/update/helper. Mode is "git" (a
-/// clone: version 2 fetches, checks out and pulls), "image" (copied by hand: it only pulls), or
-/// "build" (version 1 in a clone that built Octo).</summary>
-public sealed record UpdateHelperInfo(string Version, string Mode, string? Dir, DateTime? InstalledUtc)
-{
-    /// <summary>The helper version this Octo needs. Version 1 chose what to do by whether
-    /// docker-compose.yml built Octo; now that Octo is pulled it would pull the release its
-    /// old compose file names, restart the same Octo and report the update done.</summary>
-    public const int Needed = 2;
-
-    /// <summary>True when the helper is older than <see cref="Needed"/>, or names no version.</summary>
-    public bool Outdated => !int.TryParse(Version, out var version) || version < Needed;
-}
+/// <summary>The host helper, as it describes itself in config/update/helper.</summary>
+public sealed record UpdateHelperInfo(string Version, string Mode, string? Dir, DateTime? InstalledUtc);
 
 /// <summary>One update run, as the host helper reports it in config/update/status.</summary>
 public sealed record UpdateRunStatus(
@@ -78,7 +67,7 @@ public sealed partial class UpdateHost
     {
         var values = Read(HelperPath);
         if (values is null) return null;
-        var mode = values.GetValueOrDefault("mode") switch { "image" => "image", "git" => "git", _ => "build" };
+        var mode = values.GetValueOrDefault("mode") is "image" ? "image" : "build";
         return new UpdateHelperInfo(values.GetValueOrDefault("version") ?? "1", mode,
             values.GetValueOrDefault("dir") is { Length: > 0 } dir ? dir : null, Time(values.GetValueOrDefault("installed")));
     }

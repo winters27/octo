@@ -18,19 +18,10 @@ public class UpdateController(ReleaseCheck releases, UpdateHost host, BrowseSess
 {
     public sealed record UpdateRequest(string? Tag);
 
-    // The images Octo publishes with every release, and the docker-compose.yml services that
+    // The sidecars Octo publishes with every release, and the docker-compose.yml services that
     // build them from the folder instead.
-    private const string Images = "octo yt-dlp-shim octo-sonic";
-    private const string Sources = "octo-source yt-dlp-shim-source octo-sonic-source";
-
-    // Reinstalls the helper from the Octo folder, which holds the release now running.
-    private const string ReinstallCommand = "scripts/updater/install-updater.sh";
-
-    // An update reinstalls the helper as its last step. When that failed, the old helper stays,
-    // and it would pull the release its old compose file names, restart the same Octo and call
-    // the update done, so Update now is refused until it is reinstalled.
-    private const string HelperOutdated = "The update helper on this server's host is an old one that cannot move Octo to a new release. "
-        + "Reinstall it from the Octo folder (" + ReinstallCommand + "), then press Update now again.";
+    private const string Sidecars = "yt-dlp-shim octo-sonic";
+    private const string SidecarSources = "yt-dlp-shim-source octo-sonic-source";
 
     [HttpGet]
     public IActionResult Get() => Ok(View(releases.View()));
@@ -50,10 +41,8 @@ public class UpdateController(ReleaseCheck releases, UpdateHost host, BrowseSess
             return Conflict(new { error = "There is no newer release to update to." });
         if (!string.Equals(request.Tag, view.Latest.Tag, StringComparison.Ordinal))
             return Conflict(new { error = $"Only the newest release, {view.Latest.Tag}, can be installed from here." });
-        if (host.Helper() is not { } helper)
+        if (host.Helper() is null)
             return Conflict(new { error = "The update helper is not installed on this server's host. Run the command shown instead." });
-        if (helper.Outdated)
-            return Conflict(new { error = HelperOutdated });
         if (host.Busy())
             return Conflict(new { error = "An update is already under way." });
 
@@ -85,17 +74,16 @@ public class UpdateController(ReleaseCheck releases, UpdateHost host, BrowseSess
             error = view.Error,
             helper = helper is null
                 ? (object)new { installed = false }
-                : new { installed = true, helper.Version, helper.Mode, helper.Dir, helper.InstalledUtc, helper.Outdated },
-            reinstallCommand = ReinstallCommand,
+                : new { installed = true, helper.Version, helper.Mode, helper.Dir, helper.InstalledUtc },
             pending = pending is not null,
             pendingId = pending,
             unanswered = host.Unanswered,
             run,
-            // What to run by hand, from the Octo folder: a git clone, and a folder copied by hand.
-            // A clone checks out the release and pulls the images it names; when they will not
-            // pull (no ghcr.io), they are built from the folder instead.
-            command = $"git fetch --tags && git checkout --detach {tag} && (docker compose pull {Images} || docker compose --profile source build {Sources}) && docker compose up -d",
-            imageCommand = $"docker compose pull {Images} && docker compose up -d {Images}",
+            // What to run by hand, from the Octo folder: the built-from-source install, and the image one.
+            // The built install pulls the sidecars and builds only Octo; a sidecar that will not pull
+            // (no ghcr.io) is built from the folder instead.
+            command = $"git fetch --tags && git checkout --detach {tag} && (docker compose pull {Sidecars} || docker compose build {SidecarSources}) && docker compose build octo && docker compose up -d",
+            imageCommand = $"docker compose pull octo {Sidecars} && docker compose up -d octo {Sidecars}",
         };
     }
 

@@ -80,9 +80,8 @@ public sealed class LogRedactionTests
         }
     }
 
-    /// <summary>Octo with the request log and HttpClient's lines turned up to Information, as a
-    /// deployment that wants to see its traffic runs it; the shipped appsettings keep
-    /// Microsoft.AspNetCore and System.Net.Http.HttpClient at Warning.</summary>
+    /// <summary>Octo with the request log turned up to Information, as a deployment that wants to
+    /// see its traffic runs it; the shipped appsettings keep Microsoft.AspNetCore at Warning.</summary>
     private sealed class LoggingWebFactory(bool everything = false) : WebApplicationFactory<Program>
     {
         private readonly string _directory = Path.Combine(Path.GetTempPath(), "octo-log-web-" + Guid.NewGuid());
@@ -95,7 +94,6 @@ public sealed class LogRedactionTests
             var settings = new Dictionary<string, string?>
             {
                 ["Logging:LogLevel:Microsoft.AspNetCore"] = "Information",
-                ["Logging:LogLevel:System.Net.Http.HttpClient"] = "Information",
                 ["Subsonic:Url"] = "http://navidrome.test",
                 ["Subsonic:AutoDetectDownloadPath"] = "false",
                 ["Soulseek:BaseUrl"] = "http://127.0.0.1:1",
@@ -109,7 +107,6 @@ public sealed class LogRedactionTests
                 settings["Logging:LogLevel:Default"] = "Trace";
                 settings["Logging:LogLevel:Octo"] = "Trace";
                 settings["Logging:LogLevel:System.Net.Http"] = "Trace";
-                settings["Logging:LogLevel:System.Net.Http.HttpClient"] = "Trace";
             }
             builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(settings));
             builder.ConfigureLogging(logging => logging.AddProvider(Log));

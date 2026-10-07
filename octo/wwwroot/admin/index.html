@@ -2618,13 +2618,6 @@
             <button type="button" class="btn btn-ghost" id="update-notes" hidden>What's new</button>
             <button type="button" class="btn btn-ghost" id="update-check"><svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg><span>Check now</span></button>
           </div>
-          <div class="notice notice-warn update-helper-old" id="update-helper-old" role="status" hidden>
-            <p><strong>The update helper on this server is out of date.</strong> It was installed before Octo 2026.10.07 and cannot move Octo to a new release: it would restart the same Octo and call that an update. Update now stays off until it is reinstalled. Run this <span id="update-helper-old-where">in your Octo folder</span>:</p>
-            <div class="update-command">
-              <code id="update-reinstall-command">scripts/updater/install-updater.sh</code>
-              <button type="button" class="btn btn-ghost" id="update-reinstall-copy"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg><span>Copy</span></button>
-            </div>
-          </div>
           <ol class="update-steps" id="update-steps" hidden></ol>
           <pre class="update-log" id="update-log" hidden></pre>
           <div class="update-manual" id="update-manual" hidden>
@@ -2633,7 +2626,7 @@
               <code id="update-command"></code>
               <button type="button" class="btn btn-ghost" id="update-copy"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg><span>Copy</span></button>
             </div>
-            <p class="update-fine" id="update-image-line">Not a git clone of Octo (docker-compose.yml copied by hand)? With <code>OCTO_IMAGE_TAG=latest</code> in <code>.env</code>: <code id="update-image-command"></code></p>
+            <p class="update-fine" id="update-image-line">Running the published image instead of building? <code id="update-image-command"></code></p>
             <p class="update-fine" id="update-helper-hint">On Linux with systemd, <code>scripts/updater/install-updater.sh</code> in the Octo folder installs a small helper, and then Update now does this for you.</p>
           </div>
         </div>
