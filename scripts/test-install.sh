@@ -53,7 +53,7 @@ run() { # answers every question with Enter
 # What the run pulled and built, as "pull a b | build c d".
 images() {
   printf '%s | %s' "$(sed -n 's/^docker compose pull //p' "$work/docker.log" | paste -sd ' ' -)" \
-    "$(sed -n 's/^docker compose build //p' "$work/docker.log")"
+    "$(sed -n 's/^docker compose \(--profile source \)\{0,1\}build //p' "$work/docker.log")"
 }
 expect_images() { # name, wanted images line
   [ "$(images)" = "$2" ] && pass "$1" || fail "$1: $(images) (want $2)"
@@ -156,35 +156,49 @@ run
 grep -qx 'LIDARR_COMPLETION_MODE=Accepted' "$work/octo/.env" && grep -qx 'SLSKD_USERNAME=admin' "$work/octo/.env" \
   && pass "settings an older installer left empty get their defaults" || fail "empty settings stayed empty"
 
-# The sidecars are pulled and only Octo is built; one that will not pull is built instead.
+# Octo and the sidecars are pulled and nothing is built; one that will not pull is built instead.
 fresh
 run
-expect_images "the sidecars are pulled and only Octo is built" "yt-dlp-shim octo-sonic | octo"
+expect_images "Octo and the sidecars are pulled, nothing is built" "octo yt-dlp-shim octo-sonic | "
 grep -q 'compose up -d' "$work/docker.log" && pass "the stack is started" || fail "the stack was not started"
+FAKE_NO_IMAGE=octo run
+expect_images "Octo that will not pull is built from the folder" "octo yt-dlp-shim octo-sonic | octo-source"
+grep -q 'could not pull octo, so it is built' "$work/out.log" && pass "the installer says Octo is built here" || fail "the installer did not say Octo is built here"
 FAKE_NO_IMAGE=octo-sonic run
-expect_images "a sidecar that will not pull is built from the folder" "yt-dlp-shim octo-sonic | octo octo-sonic-source"
-FAKE_NO_IMAGE="yt-dlp-shim octo-sonic" run && pass "without ghcr.io the installer still finishes" || fail "without ghcr.io the installer stopped"
-expect_images "without ghcr.io everything is built, as before" "yt-dlp-shim octo-sonic | octo yt-dlp-shim-source octo-sonic-source"
+expect_images "a sidecar that will not pull is built from the folder" "octo yt-dlp-shim octo-sonic | octo-sonic-source"
+FAKE_NO_IMAGE="octo yt-dlp-shim octo-sonic" run && pass "without ghcr.io the installer still finishes" || fail "without ghcr.io the installer stopped"
+expect_images "without ghcr.io everything is built" "octo yt-dlp-shim octo-sonic | octo-source yt-dlp-shim-source octo-sonic-source"
 
-# In a git checkout, a sidecar changed since the release the folder names is built, because
-# its published image is not what the folder holds. One the user pinned with OCTO_IMAGE_TAG
-# is pulled anyway.
+# In a git checkout, an image whose folder changed since the release the folder names is built,
+# because its published image is not what the folder holds: Octo's own code, its Dockerfile, or
+# a sidecar. One the user pinned with OCTO_IMAGE_TAG is pulled anyway.
 fresh
 (
   cd "$work/octo" || exit 1
   mkdir -p octo yt-dlp-shim sonic
   printf '<InformationalVersion>2026.10.05</InformationalVersion>\n' > octo/octo.csproj
+  echo one > octo/Program.cs && echo one > Dockerfile
   echo one > yt-dlp-shim/app.py && echo one > sonic/main.rs
   git init -q . && git config core.autocrlf false && git add -A && git -c user.email=t@example.com -c user.name=t commit -qm release && git tag 2026.10.05
 ) || fail "could not make the test checkout"
 run
-expect_images "a checkout of the release pulls both" "yt-dlp-shim octo-sonic | octo"
+expect_images "a checkout of the release pulls all three" "octo yt-dlp-shim octo-sonic | "
 echo two > "$work/octo/yt-dlp-shim/app.py"
 run
-expect_images "a shim changed since the release is built" "octo-sonic | octo yt-dlp-shim-source"
+expect_images "a shim changed since the release is built" "octo octo-sonic | yt-dlp-shim-source"
+git -C "$work/octo" checkout -q -- yt-dlp-shim
+echo two > "$work/octo/octo/Program.cs"
+run
+expect_images "Octo changed since the release is built, never pulled over" "yt-dlp-shim octo-sonic | octo-source"
+grep -q 'octo changed since its release, so it is built from this folder' "$work/out.log" \
+  && pass "the installer says why Octo is built" || fail "the installer did not say why Octo is built"
+git -C "$work/octo" checkout -q -- octo
+echo two > "$work/octo/Dockerfile"
+run
+expect_images "a changed Dockerfile builds Octo" "yt-dlp-shim octo-sonic | octo-source"
 echo "OCTO_IMAGE_TAG=latest" >> "$work/octo/.env"
 run
-expect_images "a tag the user chose is pulled" "yt-dlp-shim octo-sonic | octo"
+expect_images "a tag the user chose is pulled" "octo yt-dlp-shim octo-sonic | "
 
 # The installer's answer decides only the navidrome profile; any other profile stays.
 fresh

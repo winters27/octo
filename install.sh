@@ -440,41 +440,44 @@ fi
 # ─────────────────────────────────────────────────────────────────
 # Images + start
 # ─────────────────────────────────────────────────────────────────
-# The yt-dlp shim and octo-sonic are published with every release (amd64 and arm64), so they
-# are pulled, not built: octo-sonic is Rust and FFmpeg, minutes of compiling and more memory
-# than a small machine has. True when pulling gives what a build of this folder would: the
-# folder's copy of the sidecar is the one its release published. On main or a branch past the
-# release it may have changed since, so it is built. OCTO_IMAGE_TAG in .env is the user's
-# own choice of image, and outside a git checkout there is nothing to compare, so both pull.
-published_copy_matches() { # the sidecar's folder
+# Octo, the yt-dlp shim and octo-sonic are published with every release (amd64 and arm64), so
+# they are pulled, not built: nothing compiles on a small machine. True when pulling gives what
+# a build of this folder would: the folder's copy is the one its release published. On main,
+# a branch past the release, or with changes of your own it may differ, so it is built from
+# the folder instead, and the installer says so. OCTO_IMAGE_TAG in .env is the user's own
+# choice of image, and outside a git checkout there is nothing to compare, so both pull.
+published_copy_matches() { # the folders the image is built from
   local release
   [ -z "$(existing OCTO_IMAGE_TAG)" ] || return 0
   release="$(sed -n 's:.*<InformationalVersion>\(.*\)</InformationalVersion>.*:\1:p' octo/octo.csproj 2>/dev/null | head -n 1)"
   [ -n "$release" ] && git rev-parse -q --verify "refs/tags/$release^{commit}" > /dev/null 2>&1 || return 0
-  git diff --quiet "refs/tags/$release" -- "$1" 2> /dev/null
+  git diff --quiet "refs/tags/$release" -- "$@" 2> /dev/null
 }
 
 echo
 bold "─── Getting images ─────────────────────────────────────────"
-build=(octo)
-for sidecar in yt-dlp-shim:yt-dlp-shim octo-sonic:sonic; do
-  service="${sidecar%%:*}"
-  if ! published_copy_matches "${sidecar#*:}"; then
-    dim "  $service changed since its release, so it is built from this folder"
+build=()
+for image in octo:octo,Dockerfile yt-dlp-shim:yt-dlp-shim octo-sonic:sonic; do
+  service="${image%%:*}"
+  IFS=, read -r -a folders <<< "${image#*:}"
+  if ! published_copy_matches "${folders[@]}"; then
+    echo "  $service changed since its release, so it is built from this folder"
     build+=("$service-source")
   elif docker compose pull "$service"; then
     green "  ✓ pulled $service"
   else
-    # No network to ghcr.io, or the image is not published: build it, as before.
+    # No network to ghcr.io, or the image is not published: build it from the folder.
     yellow "  ⚠ could not pull $service, so it is built from this folder instead"
     build+=("$service-source")
   fi
 done
-case " ${build[*]} " in
-  *" octo-sonic-source "*) dim "  Building Octo and octo-sonic: octo-sonic takes several minutes the first time." ;;
-  *) dim "  Building Octo: 2-3 minutes the first time, ~10 seconds on re-runs." ;;
-esac
-docker compose build "${build[@]}"
+if [ "${#build[@]}" -gt 0 ]; then
+  case " ${build[*]} " in
+    *" octo-sonic-source "*) dim "  Building ${build[*]}: octo-sonic takes several minutes the first time." ;;
+    *) dim "  Building ${build[*]}: 2-3 minutes the first time, ~10 seconds on re-runs." ;;
+  esac
+  docker compose --profile source build "${build[@]}"
+fi
 
 echo
 bold "─── Starting stack ─────────────────────────────────────────"

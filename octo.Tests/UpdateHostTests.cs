@@ -228,8 +228,9 @@ public sealed class UpdateEndpointTests : IDisposable
         Assert.Equal(2, view.GetProperty("newer").GetArrayLength());
         Assert.False(view.GetProperty("helper").GetProperty("installed").GetBoolean());
         Assert.Equal("git fetch --tags && git checkout --detach 2026.10.02.1"
-            + " && (docker compose pull yt-dlp-shim octo-sonic || docker compose build yt-dlp-shim-source octo-sonic-source)"
-            + " && docker compose build octo && docker compose up -d",
+            + " && (docker compose pull octo yt-dlp-shim octo-sonic"
+            + " || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source)"
+            + " && docker compose up -d",
             view.GetProperty("command").GetString());
         Assert.Equal("docker compose pull octo yt-dlp-shim octo-sonic && docker compose up -d octo yt-dlp-shim octo-sonic",
             view.GetProperty("imageCommand").GetString());

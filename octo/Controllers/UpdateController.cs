@@ -18,10 +18,10 @@ public class UpdateController(ReleaseCheck releases, UpdateHost host, BrowseSess
 {
     public sealed record UpdateRequest(string? Tag);
 
-    // The sidecars Octo publishes with every release, and the docker-compose.yml services that
+    // The images Octo publishes with every release, and the docker-compose.yml services that
     // build them from the folder instead.
-    private const string Sidecars = "yt-dlp-shim octo-sonic";
-    private const string SidecarSources = "yt-dlp-shim-source octo-sonic-source";
+    private const string Images = "octo yt-dlp-shim octo-sonic";
+    private const string Sources = "octo-source yt-dlp-shim-source octo-sonic-source";
 
     [HttpGet]
     public IActionResult Get() => Ok(View(releases.View()));
@@ -79,11 +79,11 @@ public class UpdateController(ReleaseCheck releases, UpdateHost host, BrowseSess
             pendingId = pending,
             unanswered = host.Unanswered,
             run,
-            // What to run by hand, from the Octo folder: the built-from-source install, and the image one.
-            // The built install pulls the sidecars and builds only Octo; a sidecar that will not pull
-            // (no ghcr.io) is built from the folder instead.
-            command = $"git fetch --tags && git checkout --detach {tag} && (docker compose pull {Sidecars} || docker compose build {SidecarSources}) && docker compose build octo && docker compose up -d",
-            imageCommand = $"docker compose pull octo {Sidecars} && docker compose up -d octo {Sidecars}",
+            // What to run by hand, from the Octo folder: a git clone, and a folder copied by hand.
+            // A clone checks out the release and pulls the images it names; when they will not
+            // pull (no ghcr.io), they are built from the folder instead.
+            command = $"git fetch --tags && git checkout --detach {tag} && (docker compose pull {Images} || docker compose --profile source build {Sources}) && docker compose up -d",
+            imageCommand = $"docker compose pull {Images} && docker compose up -d {Images}",
         };
     }
 

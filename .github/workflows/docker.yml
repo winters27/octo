@@ -71,9 +71,9 @@ jobs:
             exit 1
           fi
 
-      # docker-compose.yml pulls the sidecar images at Octo's own version unless
+      # docker-compose.yml pulls Octo and its sidecars at Octo's own version unless
       # OCTO_IMAGE_TAG says otherwise, so a release bump that missed it would leave
-      # installs pulling the last release's sidecars. Checked on main too, so a
+      # installs pulling the last release, Octo included. Checked on main too, so a
       # missed bump shows up before anyone tags it.
       - name: Compose pulls this version's images
         run: |
@@ -83,6 +83,12 @@ jobs:
             echo "::error::docker-compose.yml pulls images tagged $stale, but octo/octo.csproj says $version. Bump the OCTO_IMAGE_TAG defaults with it."
             exit 1
           fi
+          for image in octo octo-yt-dlp-shim octo-sonic; do
+            if ! grep -Fq "image: ghcr.io/winters27/$image:\${OCTO_IMAGE_TAG:-$version}" docker-compose.yml; then
+              echo "::error::docker-compose.yml does not pull ghcr.io/winters27/$image at \${OCTO_IMAGE_TAG:-$version}."
+              exit 1
+            fi
+          done
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v6
