@@ -119,7 +119,7 @@ public sealed class ExternalSearchService
     /// <summary>
     /// Fans out to Last.fm, then fills in the metadata a client needs to render and play
     /// the rows. Order:
-    ///   1. track.search hits (best fuzzy matches for the query as typed)
+    ///   1. track.search hits for the query as typed, most listened first
     ///   2. canonical artist's top tracks (in case (1) was thin — common for
     ///      single-word artist queries)
     /// Deduped by SongIdentity.MatchKey, so the same track cannot appear twice however its
@@ -132,7 +132,11 @@ public sealed class ExternalSearchService
 
         // Last.fm's search carries rows from mislabelled scrobbles; put their names right first,
         // or they reach the results, the player and each listener's Last.fm as they are.
-        var tracks = LastFmSearchCleanup.Clean(await _lastFm!.SearchTracksAsync(query, Math.Min(50, BuildSize * 2)));
+        // Then ranked by listeners: track.search orders by fuzzy relevance, which puts a side
+        // project's song ahead of the hit everybody means. Foreign-script noise and repeated
+        // versions are dropped on the way (see LastFmSearchRanking).
+        var tracks = LastFmSearchRanking.Rank(query,
+            LastFmSearchCleanup.Clean(await _lastFm!.SearchTracksAsync(query, Math.Min(50, BuildSize * 2))));
         foreach (var t in tracks)
         {
             var key = SongIdentity.MatchKey(t.Artist, t.Title);

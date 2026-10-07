@@ -96,6 +96,46 @@ public class ExternalSearchServiceTests
         await prewarmed.Task.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
+    [Fact]
+    public async Task SearchRowsAreBuiltMostListenedFirst()
+    {
+        var handler = new Mock<HttpMessageHandler>();
+        handler.Protected()
+            .Setup<Task<HttpResponseMessage>>("SendAsync", ItExpr.IsAny<HttpRequestMessage>(), ItExpr.IsAny<CancellationToken>())
+            .ReturnsAsync((HttpRequestMessage request, CancellationToken _) =>
+            {
+                var rows = new[]
+                {
+                    Row("Skyfall", "Adele", 1430000),
+                    Row("Rolling in the Deep", "Adele", 2680000),
+                    Row("Rolling in the Deep (Live)", "Adele", 9000),
+                    Row("\u041f\u0440\u0438\u0432\u0435\u0442", "\u0410\u0434\u0435\u043b\u044c", 5000000),
+                    Row("Someone Like You", "Adele", 2200000),
+                };
+                var body = request.RequestUri!.ToString().Contains("method=track.search")
+                    ? """{"results":{"trackmatches":{"track":[""" + string.Join(",", rows) + "]}}}"
+                    : """{"toptracks":{"track":[]}}""";
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(body) };
+            });
+        var lastFm = new LastFmService(new HttpClient(handler.Object),
+            TestOptions.Monitor(new LastFmSettings { ApiKey = "key" }),
+            Options.Create(new MetadataSettings()),
+            NullLogger<LastFmService>.Instance);
+        var metadata = new Mock<IMusicMetadataService>();
+        metadata.Setup(m => m.SearchSongsByArtistTitleAsync(It.IsAny<string>(), It.IsAny<string>(), 1, null))
+            .ReturnsAsync((string artist, string title, int _, string? _) => [new Song { Artist = artist, Title = title }]);
+        var search = new ExternalSearchService(metadata.Object, NullLogger<ExternalSearchService>.Instance, lastFm,
+            TestOptions.Monitor(new SubsonicSettings { WaitForSearchDurations = false }));
+
+        var songs = await search.GetAsync("adele");
+
+        Assert.Equal(["Rolling in the Deep", "Someone Like You", "Skyfall"], songs.Select(s => s.Title));
+    }
+
+    // One track.search row; the \u escapes are JSON's, so the names stay readable here.
+    private static string Row(string name, string artist, long listeners) =>
+        $$"""{"name":"{{name}}","artist":"{{artist}}","listeners":"{{listeners}}"}""";
+
     private static LastFmService OneHitLastFm()
     {
         var handler = new Mock<HttpMessageHandler>();

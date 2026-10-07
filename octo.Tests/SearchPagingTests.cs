@@ -25,12 +25,13 @@ namespace Octo.Tests;
 public sealed class SearchPagingTests
 {
     // The library has 30 matches and Last.fm 25 outside songs, one of which (the third) is a
-    // song the library already listed on page one, so page one leaves it out. With a 20-row
-    // page the search is l0-l11, the other 24 outside songs, then l12-l29.
+    // song the library already listed on page one, so the search leaves it out. The library
+    // comes first and whole: with a 20-row page the search is l0-l19, the other 24 outside
+    // songs, then l20-l29.
     private static readonly List<string> WholeSearch =
-        SearchPagingWebFactory.Library.Take(12)
+        SearchPagingWebFactory.Library.Take(20)
             .Concat(SearchPagingWebFactory.Outside.Where((_, index) => index != 2).Select(title => "ph-" + title))
-            .Concat(SearchPagingWebFactory.Library.Skip(12))
+            .Concat(SearchPagingWebFactory.Library.Skip(20))
             .ToList();
 
     private static async Task<List<string>> PageAsync(HttpClient client, int offset, int count,
@@ -66,10 +67,11 @@ public sealed class SearchPagingTests
         var third = await PageAsync(client, 40, 20, endpoint, format);
         var past = await PageAsync(client, 60, 20, endpoint, format);
 
-        // Page one is unchanged: the library prefix, then the outside rows its budget allows,
-        // less the one the library already has.
-        Assert.Equal(WholeSearch.Take(19), first);
-        Assert.Equal(19 + 20 + 15, first.Count + second.Count + third.Count);
+        // Page one is the library's own 20 best matches: no outside song takes a place while
+        // the library has rows for it. The outside songs follow on the next pages, less the
+        // one the library already has.
+        Assert.Equal(WholeSearch.Take(20), first);
+        Assert.Equal(20 + 20 + 14, first.Count + second.Count + third.Count);
         var all = first.Concat(second).Concat(third).ToList();
         Assert.Equal(all.Count, all.Distinct().Count());
         Assert.Equal(WholeSearch, all);
@@ -77,8 +79,8 @@ public sealed class SearchPagingTests
 
         // The library rows after the prefix came from Navidrome at the right places.
         var asked = fixture.Upstream.SongPages(endpoint);
-        Assert.Contains((12, 3), asked);
-        Assert.Contains((15, 20), asked);
+        Assert.Contains((0, 20), asked);
+        Assert.Contains((20, 16), asked);
     }
 
     [Fact]
@@ -93,8 +95,7 @@ public sealed class SearchPagingTests
         var second = await PageAsync(client, 20, 20);
 
         Assert.Equal(calls, fixture.Upstream.LastFmCalls);
-        // Page one showed 19 rows in its 20 places (it left out the song the library has).
-        Assert.Equal(WholeSearch.Skip(19).Take(20), second);
+        Assert.Equal(WholeSearch.Skip(20).Take(20), second);
         Assert.Empty(first.Intersect(second));
     }
 
@@ -158,8 +159,8 @@ public sealed class SearchPagingTests
         var phoneNext = await PageAsync(client, 20, 15, app: "Phone");
         var desktopNext = await PageAsync(client, 15, 15, app: "Desktop");
 
-        Assert.Equal(WholeSearch.Take(19), phone);
-        Assert.Equal(WholeSearch.Skip(19).Take(15), phoneNext);
+        Assert.Equal(WholeSearch.Take(20), phone);
+        Assert.Equal(WholeSearch.Skip(20).Take(15), phoneNext);
         var desktopAll = desktop.Concat(desktopNext).ToList();
         Assert.Equal(desktopAll.Count, desktopAll.Distinct().Count());
         var cache = fixture.Services.GetRequiredService<Octo.Services.Subsonic.SearchSongOrderCache>();
@@ -236,13 +237,35 @@ public sealed class SearchPagingTests
         await PageAsync(client, 0, 20);
         fixture.Upstream.FailLaterSongPages = true;
         var failed = await client.GetStringAsync(
-            "/rest/search3.view?query=paging&songCount=20&songOffset=20&albumCount=0&artistCount=0" +
+            "/rest/search3.view?query=paging&songCount=20&songOffset=40&albumCount=0&artistCount=0" +
             "&u=alice&t=token&s=salt&v=1.16.1&c=Test&f=json");
         fixture.Upstream.FailLaterSongPages = false;
-        var second = await PageAsync(client, 20, 20);
+        var second = await PageAsync(client, 40, 20);
 
         Assert.DoesNotContain("ph-", failed);
-        Assert.Equal(WholeSearch.Skip(19).Take(20), second);
+        Assert.Equal(WholeSearch.Skip(40).Take(20), second);
+    }
+
+    /// <summary>
+    /// A song you own is listed once, as the library's copy, before any outside song, and the
+    /// library is not cut short to make room for outside results. A page with room to spare
+    /// fills the rest with outside songs, less the one already owned.
+    /// </summary>
+    [Theory]
+    [InlineData(20, 20, 0)]
+    [InlineData(40, 30, 9)]
+    public async Task PageOne_ListsTheLibraryFirst_AndAnOwnedSongOnlyOnce(int count, int locals, int outsiders)
+    {
+        await using var fixture = new SearchPagingWebFactory();
+        using var client = fixture.CreateClient();
+
+        var first = await PageAsync(client, 0, count);
+
+        Assert.Equal(SearchPagingWebFactory.Library.Take(locals), first.Take(locals));
+        Assert.Equal(outsiders, first.Skip(locals).Count());
+        Assert.All(first.Skip(locals), id => Assert.StartsWith("ph-", id));
+        Assert.DoesNotContain("ph-Library Song 3", first);
+        Assert.Equal(first.Count, first.Distinct().Count());
     }
 
     [Fact]
