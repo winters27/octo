@@ -8,8 +8,8 @@
         <!-- Dated releases. Version must be numeric for the assembly, so 07 loses its
              leading zero there; InformationalVersion carries the tag name verbatim and
              is what the dashboard shows. Bump both when tagging a release. -->
-        <Version>2026.10.5</Version>
-        <InformationalVersion>2026.10.05</InformationalVersion>
+        <Version>2026.10.7</Version>
+        <InformationalVersion>2026.10.07</InformationalVersion>
         <!-- Workstation GC, still concurrent: Octo serves a household, not a web farm. On the
              same load its memory peaked a third lower (237 MiB against 357) and idled 13 MiB
              lower, with no slower answers. DOTNET_gcServer=1 brings the server GC back. -->
