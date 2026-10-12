@@ -144,14 +144,16 @@ fn page_number(parameters: &Parameters, name: &str) -> Option<i32> {
     parameters.get(name).and_then(|text| int_try_parse(text))
 }
 
-/// The rows from `start` up to `end`, none when `end` is not past `start`.
+/// The rows from `start` up to `end`, the rest of the list when `end` is not past `start`:
+/// the Navidrome UI asks for every playlist with `_end=0` or `_end=-1`.
 fn page<T: Clone>(rows: &[T], start: i32, end: i32) -> Vec<T> {
-    let take = (i64::from(end) - i64::from(start)).max(0);
-    rows.iter()
-        .skip(usize::try_from(start).unwrap_or(0))
-        .take(usize::try_from(take).unwrap_or(0))
-        .cloned()
-        .collect()
+    let skip = usize::try_from(start).unwrap_or(0);
+    let take = if end > start {
+        usize::try_from(i64::from(end) - i64::from(start)).unwrap_or(0)
+    } else {
+        usize::MAX
+    };
+    rows.iter().skip(skip).take(take).cloned().collect()
 }
 
 /// `body` as `application/json`, with `X-Total-Count` set.
@@ -244,7 +246,13 @@ async fn try_serve_native_radio(
         let Ok(Node::Array(mut rows)) = Node::parse(text) else {
             return Ok(Some(unchanged()));
         };
-        rows.extend(stations.iter().map(native_station));
+        let writable_only = request
+            .parameters
+            .get("smart")
+            .is_some_and(|smart| smart.eq_ignore_ascii_case("false"));
+        if !writable_only {
+            rows.extend(stations.iter().map(native_station));
+        }
         let total = rows.len();
         let start = page_number(request.parameters, "_start").unwrap_or(0).max(0);
         let end = page_number(request.parameters, "_end").unwrap_or(total as i32);

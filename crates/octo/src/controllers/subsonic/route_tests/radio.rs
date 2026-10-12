@@ -1262,6 +1262,46 @@ async fn feishin_list_detail_and_paged_tracks_have_native_shape_headers_and_owne
 }
 
 #[tokio::test]
+async fn navidrome_ui_unbounded_playlist_lists_return_every_row() {
+    let fixture = RadioFixture::new(Options::default()).await;
+    fixture.install_station("");
+    fixture
+        .state
+        .navidrome_identity
+        .capture_login(br#"{"token":"native-token","username":"alice","isAdmin":false}"#);
+    let auth = [("X-Nd-Authorization", "Bearer native-token")];
+
+    for query in [
+        "_end=0&_sort=name&_start=-100",
+        "_end=-1&_order=ASC&_sort=name&_start=0",
+    ] {
+        let list = send(
+            &fixture.app,
+            Method::GET,
+            &format!("/api/playlist?{query}"),
+            &auth,
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(list.status, StatusCode::OK, "{}", list.body);
+        assert_eq!(list.json().as_array().unwrap().len(), 2, "{query}");
+    }
+
+    let writable = send(
+        &fixture.app,
+        Method::GET,
+        "/api/playlist?_end=-1&_order=ASC&_sort=name&_start=0&smart=false",
+        &auth,
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(writable.status, StatusCode::OK, "{}", writable.body);
+    let rows = writable.json();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["id"], "native-1");
+}
+
+#[tokio::test]
 async fn native_reserved_mutation_is_read_only_and_ordinary_detail_relays() {
     let fixture = RadioFixture::new(Options::default()).await;
     fixture.install_station("");
