@@ -867,3 +867,53 @@ fn length_may_be_estimate_follows_navidrome_then_the_request() {
         );
     }
 }
+
+#[tokio::test]
+async fn relay_events_passes_each_event_on_while_the_stream_stays_open() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request = vec![0u8; 4096];
+        let read = socket.read(&mut request).await.expect("read");
+        let _ = seen_tx.send(String::from_utf8_lossy(&request[..read]).to_string());
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+                  Transfer-Encoding: chunked\r\n\r\nd\r\ndata: hello\n\n\r\n",
+            )
+            .await
+            .expect("write");
+        std::future::pending::<()>().await;
+    });
+
+    let response = scoped(
+        &format!("http://{address}"),
+        &[("X-Nd-Authorization", "Bearer token")],
+    )
+    .relay_events("api/events", &params(&[("jwt", "token")]))
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/event-stream");
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+    let request = seen_rx.await.expect("the request reached Navidrome");
+    assert!(request.starts_with("GET /api/events?jwt=token "), "{request}");
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("x-nd-authorization: bearer token"),
+        "{request}"
+    );
+
+    let mut body = response.into_body();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+        .await
+        .expect("the first event arrives before the stream ends")
+        .expect("a frame")
+        .expect("no error");
+    assert_eq!(frame.into_data().expect("data").as_ref(), b"data: hello\n\n");
+}

@@ -7,6 +7,7 @@
 //!   get the ProblemDetails 404 and are never relayed;
 //! - native radio, the external-id safety net, the native catalog answers and the native
 //!   search injections are `controllers::subsonic::native`;
+//! - Navidrome's event stream (`api/events`) is streamed through as it arrives;
 //! - everything else is relayed faithfully to Navidrome.
 
 use std::sync::Arc;
@@ -50,6 +51,9 @@ pub async fn catch_all(State(state): State<AppState>, req: Request) -> Response 
 
     // Native radio, the external-id safety net, and the native answers.
     let relay = state.subsonic_proxy.with_request(Arc::clone(&incoming));
+    if endpoint.eq_ignore_ascii_case("api/events") {
+        return relay.relay_events(&endpoint, &parameters).await;
+    }
     let native_request = NativeRequest {
         endpoint: &endpoint,
         method: &parts.method,
