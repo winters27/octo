@@ -2687,6 +2687,10 @@
               <input class="set-input" name="LibraryActions.ReviewSweepAutoReplacePerDay" type="number" min="1" max="100" data-number="true" />
             </div>
             <div class="set-row">
+              <div class="set-info"><div class="set-info-t">Also replace a song that sounds nothing like its YouTube preview</div><div class="set-info-d">For a sound AcoustID has never heard. Octo fetches the right song through Wrong song instead of asking. Off by default.</div><div class="set-info-more"><p>Only when the preview has the song's title, artist and length and nothing in the file lines up with it. A song with no tags, an ISRC tag, a star or a rating, anything the preview cannot settle, and anything AcoustID does hear stays a question in Review.</p><p>Needs Wrong song on and dry run off, and counts toward the same limit a day as the replacing above. The new file is checked like any download, against the same preview, and Review keeps a note of what was replaced.</p></div></div>
+              <label class="switch"><input type="checkbox" name="LibraryActions.ReviewSweepAutoReplacePreview" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
               <div class="set-info"><div class="set-info-t">Library check</div><div class="set-info-d" id="review-sweep-status">Not loaded yet.</div></div>
               <button class="btn btn-ghost" type="button" id="review-sweep-toggle"><span>Pause</span></button>
               <button class="btn btn-ghost" type="button" id="review-sweep-reset"><svg class="icon" aria-hidden="true"><use href="#i-arrow-counter-clockwise"/></svg><span>Start over</span></button>

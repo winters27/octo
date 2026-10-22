@@ -423,6 +423,10 @@ impl NoticeQueue {
                             .unwrap_or(0)
                     )
                 ),
+                InconclusiveReason::DiffersFromYouTube => format!(
+                    "AcoustID has never heard this recording, and it sounds nothing like its YouTube preview ({})",
+                    verdict.evidence.as_deref().unwrap_or("not the same song")
+                ),
                 _ => "Octo could not check this download".to_string(),
             };
             let sweep = origin == NoticeOrigin::LibrarySweep;
@@ -492,6 +496,30 @@ impl NoticeQueue {
         navidrome_id: &str,
         needs: i32,
     ) -> bool {
+        self.add_replaced_because(
+            username,
+            local_path,
+            song,
+            verdict,
+            navidrome_id,
+            Self::replaced_reason(verdict, needs),
+            Some(needs),
+        )
+    }
+
+    /// [`Self::add_replaced`] with the note's own words. `threshold` is the score a heard
+    /// recording needed, None where no score decided it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_replaced_because(
+        &self,
+        username: &str,
+        local_path: &str,
+        song: &Song,
+        verdict: &VerificationResult,
+        navidrome_id: &str,
+        reason: String,
+        threshold: Option<i32>,
+    ) -> bool {
         let key = Self::review_key(username, local_path);
         {
             let mut entries = self.entries.lock();
@@ -511,7 +539,7 @@ impl NoticeQueue {
                     album: Some(song.album.clone()),
                     navidrome_id: Some(navidrome_id.to_string()),
                     state: NoticeState::Acted,
-                    reason: Self::replaced_reason(verdict, needs),
+                    reason,
                     cause: verdict.reason,
                     origin: NoticeOrigin::LibrarySweep,
                     duration_seconds: verdict.duration_seconds,
@@ -519,8 +547,8 @@ impl NoticeQueue {
                     next_lookup_utc: now,
                     created_utc: now,
                     resolved_utc: Some(now),
-                    acoust_id_score: Some(whole_percent(verdict.score)),
-                    threshold: Some(needs),
+                    acoust_id_score: threshold.map(|_| whole_percent(verdict.score)),
+                    threshold,
                     matched: verdict.matched_text(),
                     ..Default::default()
                 },

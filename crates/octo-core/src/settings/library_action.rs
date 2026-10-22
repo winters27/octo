@@ -263,6 +263,15 @@ pub struct LibraryActionSettings {
     /// after three replacements fail in a day, the rest of the day's matches are asked about.
     /// Environment variable: LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PER_DAY
     pub review_sweep_auto_replace_per_day: i32,
+
+    /// Let the sweep also replace a song AcoustID has never heard when its YouTube preview, one
+    /// with the song's title, artist and length, sounds nothing like the file, through Wrong song,
+    /// instead of asking. Off by default. The replacement is checked like any download, against
+    /// the same preview. Counts toward the same daily limit and breaker as the replacing above,
+    /// and needs the same: DryRun off, Wrong song on and the keeper on the allowlist. A song with
+    /// an ISRC tag, or that anyone starred or rated, is still asked about.
+    /// Environment variable: LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PREVIEW
+    pub review_sweep_auto_replace_preview: bool,
     /// How many library songs an hour have their tags checked against their audio: each is
     /// fingerprinted in AcoustID's spare lane, and what disagrees shows in Library health under
     /// "Tags that disagree with the audio". 0 is off. Only while nothing is downloading. Stray
@@ -335,6 +344,7 @@ impl Default for LibraryActionSettings {
             review_sweep_octo_downloads: false,
             review_sweep_auto_replace: false,
             review_sweep_auto_replace_per_day: 10,
+            review_sweep_auto_replace_preview: false,
             tag_check_per_hour: 60,
             duplicates_enabled: false,
             duplicates_playlist_name: "Duplicates".to_string(),

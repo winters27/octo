@@ -319,6 +319,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Subsonic:DownloadAlbumOnSongStar",
     "Metadata:AnimatedArt",
     "Subsonic:CoverBadge",
+    "LibraryActions:ReviewSweepAutoReplacePreview",
 ];
 
 /// Whether a config-sources key names a secret: a password, an API key, a secret, a token

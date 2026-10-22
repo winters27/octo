@@ -28,7 +28,7 @@ use octo_media::tags::tag_writer_extras::{self, TagFields};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::NavidromeSongPathResolver;
 use super::library_action_executor::{LibraryActionExecutor, LibraryActionOutcome, LibraryActionRequest};
@@ -41,6 +41,7 @@ use crate::services::common::IAcquisitionActivity;
 use crate::services::family::family_store::FamilyStore;
 use crate::services::family::{LibraryScope, NavidromeAdmin, ScopeResolver, ScopeView};
 use crate::services::fingerprint::AcoustIdRateLimiter;
+use crate::services::fingerprint::preview_check::{Heard, PreviewOutcome, PreviewRequest, PreviewSource};
 use crate::services::framework::DotnetDictionary;
 use crate::services::health::keep_marks::MemberMarks;
 use crate::services::library::library_walk;
@@ -58,6 +59,20 @@ pub trait IReviewSweepVerifier: Send + Sync {
     /// Some(true) when it does, Some(false) when it lists codes for those recordings and none is
     /// this one, None when that cannot be told.
     async fn isrc_agrees(&self, question: &VerificationResult, isrc: &str) -> Option<bool>;
+
+    /// Whether the file sounds like the song's YouTube preview, for a sound AcoustID has never
+    /// heard (the same question a new download is asked, [`preview_check`]). NotAsked where there
+    /// is no preview source to ask.
+    ///
+    /// [`preview_check`]: crate::services::fingerprint::preview_check
+    async fn hear_preview(
+        &self,
+        _path: &str,
+        _request: &PreviewRequest<'_>,
+        _question: &VerificationResult,
+    ) -> PreviewOutcome {
+        PreviewOutcome::NotAsked
+    }
 }
 
 /// What the sweep needs of `DownloadVerificationService`: whether a lookup can happen
@@ -73,6 +88,17 @@ pub trait SweepVerification: Send + Sync {
 
     /// See [`IReviewSweepVerifier::isrc_agrees`].
     async fn isrc_agrees(&self, question: &VerificationResult, isrc: &str) -> Option<bool>;
+
+    /// See [`IReviewSweepVerifier::hear_preview`]; `source` is where previews come from.
+    async fn hear_preview(
+        &self,
+        _source: &dyn PreviewSource,
+        _path: &str,
+        _request: &PreviewRequest<'_>,
+        _question: &VerificationResult,
+    ) -> PreviewOutcome {
+        PreviewOutcome::NotAsked
+    }
 }
 
 /// The real check, in AcoustID's background lane. Resolved late, because the workers are built
@@ -81,6 +107,8 @@ pub trait SweepVerification: Send + Sync {
 #[derive(Default)]
 pub struct FingerprintSweepVerifier {
     service: OnceLock<Arc<dyn SweepVerification>>,
+    /// Where a song's YouTube preview comes from, once the shim's client exists.
+    preview: OnceLock<Arc<dyn PreviewSource>>,
 }
 
 impl FingerprintSweepVerifier {
@@ -91,6 +119,12 @@ impl FingerprintSweepVerifier {
     /// The verification service, once built. A second call is ignored.
     pub fn set_service(&self, service: Arc<dyn SweepVerification>) {
         let _ = self.service.set(service);
+    }
+
+    /// Where previews come from. A second call is ignored; without one a sound AcoustID has
+    /// never heard is a question, as it always was.
+    pub fn set_preview(&self, source: Arc<dyn PreviewSource>) {
+        let _ = self.preview.set(source);
     }
 }
 
@@ -111,6 +145,20 @@ impl IReviewSweepVerifier for FingerprintSweepVerifier {
 
     async fn isrc_agrees(&self, question: &VerificationResult, isrc: &str) -> Option<bool> {
         self.service.get()?.isrc_agrees(question, isrc).await
+    }
+
+    async fn hear_preview(
+        &self,
+        path: &str,
+        request: &PreviewRequest<'_>,
+        question: &VerificationResult,
+    ) -> PreviewOutcome {
+        let (Some(service), Some(source)) = (self.service.get(), self.preview.get()) else {
+            return PreviewOutcome::NotAsked;
+        };
+        service
+            .hear_preview(source.as_ref(), path, request, question)
+            .await
     }
 }
 
@@ -622,6 +670,7 @@ pub struct ReviewSweepStatus {
     pub recheck: Option<RecheckStatus>,
     /// Whether replacing is switched on, the day's cap, and what today brought.
     pub auto_replace: bool,
+    pub auto_replace_preview: bool,
     pub auto_replace_per_day: i32,
     pub today: Today,
     /// `Soulseek:MinMatchScore` differs from the one the last re-check ran with (the default
@@ -1101,6 +1150,67 @@ impl LibraryReviewSweepWorker {
         }
 
         let (outcome, question) = Self::classify(verdict);
+        // A sound AcoustID has never heard is not left to a person while its song's YouTube
+        // preview can say: alike settles it, clearly another song is a better question, and
+        // anything else stays the question it was.
+        let mut waiting_for = "AcoustID";
+        let (outcome, question) = if outcome == Outcome::Ask
+            && question.reason == InconclusiveReason::NoEntry
+            && file.tagged
+        {
+            let seconds = TagFile::open(&path)
+                .ok()
+                .map(|tags| tags.duration_seconds())
+                .filter(|seconds| *seconds > 0);
+            let request = PreviewRequest {
+                artist: &song.artist,
+                title: &song.title,
+                seconds,
+                video_id: None,
+            };
+            let heard = self.verifier.hear_preview(&path, &request, &question).await;
+            if generation != self.generation.load(Ordering::SeqCst) {
+                return interval;
+            }
+            match heard {
+                PreviewOutcome::Compared {
+                    heard: Heard::Match, ..
+                } => {
+                    info!(
+                        "Library review sweep: '{} - {}' is a sound AcoustID has never heard, and it sounds like its YouTube preview",
+                        song.artist, song.title
+                    );
+                    (Outcome::Fine, question)
+                }
+                PreviewOutcome::Compared {
+                    heard: Heard::Mismatch,
+                    comparison,
+                    ..
+                } => (
+                    Outcome::Ask,
+                    VerificationResult {
+                        reason: InconclusiveReason::DiffersFromYouTube,
+                        evidence: Some(format!(
+                            "{}% of its bits differ",
+                            (comparison.bit_error * 100.0).round()
+                        )),
+                        ..question
+                    },
+                ),
+                // The shim did not answer: not an answer, so not a question either. Tried again.
+                PreviewOutcome::Unavailable(why) => {
+                    debug!(
+                        "Library review sweep: no preview answer for '{} - {}': {why}",
+                        song.artist, song.title
+                    );
+                    waiting_for = "The YouTube shim";
+                    (Outcome::LookupFailed, question)
+                }
+                _ => (outcome, question),
+            }
+        } else {
+            (outcome, question)
+        };
         match outcome {
             Outcome::LookupFailed
                 if self.lookup_failures.fetch_add(1, Ordering::SeqCst) + 1
@@ -1113,7 +1223,7 @@ impl LibraryReviewSweepWorker {
                 }
                 return self.hold(
                     "Waiting",
-                    Some("AcoustID did not answer; trying that song again."),
+                    Some(&format!("{waiting_for} did not answer; trying that song again.")),
                     interval,
                 );
             }
@@ -1247,13 +1357,21 @@ impl LibraryReviewSweepWorker {
                 return false;
             }
         }
-        let heard = question
-            .matched_text()
-            .unwrap_or_else(|| "another song".to_string());
-        let replacing = format!(
-            "Replacing '{} - {}', which AcoustID heard as {heard}.",
-            song.artist, song.title
-        );
+        let by_preview = question.reason == InconclusiveReason::DiffersFromYouTube;
+        let replacing = if by_preview {
+            format!(
+                "Replacing '{} - {}', which sounds nothing like its YouTube preview.",
+                song.artist, song.title
+            )
+        } else {
+            let heard = question
+                .matched_text()
+                .unwrap_or_else(|| "another song".to_string());
+            format!(
+                "Replacing '{} - {}', which AcoustID heard as {heard}.",
+                song.artist, song.title
+            )
+        };
         self.hold("Running", Some(&replacing), Duration::ZERO);
         let outcome = replacer
             .replace(LibraryActionRequest::new(
@@ -1267,9 +1385,21 @@ impl LibraryReviewSweepWorker {
             Ok(outcome) if outcome.state == LibraryActionState::Applied => {
                 self.count_today(now, true);
                 let needs = self.settings.current().soulseek.effective_min_match_score();
-                let note = Self::replaced_note(question, needs);
-                self.notices
-                    .add_replaced(keeper, path, song, question, &id, needs);
+                let note = if by_preview {
+                    format!(
+                        "Octo replaced this: it sounded nothing like its YouTube preview ({})",
+                        question.evidence.as_deref().unwrap_or("not the same song")
+                    )
+                } else {
+                    Self::replaced_note(question, needs)
+                };
+                if by_preview {
+                    self.notices
+                        .add_replaced_because(keeper, path, song, question, &id, note.clone(), None);
+                } else {
+                    self.notices
+                        .add_replaced(keeper, path, song, question, &id, needs);
+                }
                 info!(
                     "Library review sweep replaced '{} - {}' through Wrong song as {keeper}: {note}",
                     song.artist, song.title
@@ -1306,9 +1436,10 @@ impl LibraryReviewSweepWorker {
         self.store.flush();
     }
 
-    /// Whether a file the sweep would ask about is replaced through Wrong song instead: with
-    /// `ReviewSweepAutoReplace` on, no dry run, the keeper on the allowlist, Wrong song on, the
-    /// day's cap and breaker not reached, and AcoustID clearly hearing another song.
+    /// Whether a file the sweep would ask about is replaced through Wrong song instead: no dry
+    /// run, the keeper on the allowlist, Wrong song on, the day's cap and breaker not reached,
+    /// and either `ReviewSweepAutoReplace` on with AcoustID clearly hearing another song, or
+    /// `ReviewSweepAutoReplacePreview` on with the song's YouTube preview clearly not matching.
     pub fn decide(
         question: &VerificationResult,
         file: &SweptFile,
@@ -1321,13 +1452,17 @@ impl LibraryReviewSweepWorker {
             .effective_actions()
             .iter()
             .any(|entry| entry.action == LibraryAction::WrongSong && entry.enabled);
-        let may = actions.review_sweep_auto_replace
-            && !actions.dry_run
+        let may = !actions.dry_run
             && actions.is_allowed(Some(keeper))
             && wrong_song_on
             && today.replaced < actions.effective_review_sweep_auto_replace_per_day()
             && today.failed < Self::MAX_FAILED_REPLACEMENTS_PER_DAY;
-        if may && Self::clearly_another_song(question, file, &settings.soulseek) {
+        let by_acoustid = actions.review_sweep_auto_replace
+            && Self::clearly_another_song(question, file, &settings.soulseek);
+        let by_preview = actions.review_sweep_auto_replace_preview
+            && file.tagged
+            && question.reason == InconclusiveReason::DiffersFromYouTube;
+        if may && (by_acoustid || by_preview) {
             AutoReplace::Replace
         } else {
             AutoReplace::Ask
@@ -1740,6 +1875,7 @@ impl LibraryReviewSweepWorker {
                 finished_utc: recheck.finished_utc,
             }),
             auto_replace: settings.library_actions.review_sweep_auto_replace,
+            auto_replace_preview: settings.library_actions.review_sweep_auto_replace_preview,
             auto_replace_per_day: settings
                 .library_actions
                 .effective_review_sweep_auto_replace_per_day(),

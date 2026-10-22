@@ -301,6 +301,9 @@ services:
       # at most this many a day. Unsure matches and other takes are still asked about.
       LibraryActions__ReviewSweepAutoReplace: ${LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE:-false}
       LibraryActions__ReviewSweepAutoReplacePerDay: ${LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PER_DAY:-10}
+      # Also replace a song AcoustID has never heard when its YouTube preview clearly does not
+      # match it (same daily limit). Off by default.
+      LibraryActions__ReviewSweepAutoReplacePreview: ${LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PREVIEW:-false}
       # Check this many library songs an hour against their audio (0 is off). What disagrees
       # shows in Library health; only stray spaces are taken off by itself.
       LibraryActions__TagCheckPerHour: ${LIBRARY_ACTIONS_TAG_CHECK_PER_HOUR:-60}

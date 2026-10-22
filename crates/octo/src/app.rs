@@ -66,6 +66,7 @@ use crate::services::family::{
     NavidromeAdmin, NavidromeMemberStars, PersonalLibrary, PlayerCaps, PoolParts, RequestStore, SavedStore,
     ScopeResolver, family_service::FamilyService,
 };
+use crate::services::fingerprint::preview_check::PreviewSource;
 use crate::services::fingerprint::{
     AcoustIdClient, AcoustIdRateLimitHandler, AcoustIdRateLimiter, DownloadVerificationService,
     MusicBrainzClient,
@@ -3000,6 +3001,9 @@ impl AppState {
         library_jobs
             .fingerprint_sweep_verifier
             .set_service(tagging.download_verification.clone() as Arc<dyn SweepVerification>);
+        library_jobs
+            .fingerprint_sweep_verifier
+            .set_preview(stores.you_tube_resolver.clone() as Arc<dyn PreviewSource>);
         let library_snapshot = Arc::new(
             LibrarySnapshot::new(Arc::clone(&navidrome.navidrome_playlist_api))
                 .with_scope(navidrome.library_scope.clone()),
@@ -3488,6 +3492,9 @@ impl AppState {
         library_jobs
             .fingerprint_sweep_verifier
             .set_service(tagging.download_verification.clone() as Arc<dyn SweepVerification>);
+        library_jobs
+            .fingerprint_sweep_verifier
+            .set_preview(stores.you_tube_resolver.clone() as Arc<dyn PreviewSource>);
         let library_snapshot = overrides.library_snapshot.clone().unwrap_or_else(|| {
             Arc::new(
                 LibrarySnapshot::new(Arc::clone(&navidrome.navidrome_playlist_api))
