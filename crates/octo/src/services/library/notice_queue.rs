@@ -423,6 +423,10 @@ impl NoticeQueue {
                             .unwrap_or(0)
                     )
                 ),
+                InconclusiveReason::DiffersFromYouTube => format!(
+                    "AcoustID has never heard this recording, and it sounds nothing like its YouTube preview ({})",
+                    verdict.evidence.as_deref().unwrap_or("not the same song")
+                ),
                 _ => "Octo could not check this download".to_string(),
             };
             let sweep = origin == NoticeOrigin::LibrarySweep;

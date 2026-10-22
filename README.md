@@ -612,6 +612,16 @@ tags were never confirmed. Octo's own downloads are skipped, since each was chec
 arrived if verification was on at the time; `LIBRARY_ACTIONS_REVIEW_SWEEP_OCTO_DOWNLOADS` checks
 them too.
 
+A song AcoustID has never heard is not left to you while its song's YouTube preview can say, the
+same question a new download is asked. If the file sounds like the preview, it is counted as fine
+and nothing is asked. If it sounds nothing like a preview with the song's title, artist and length,
+Review gets a question that says so ("it sounds nothing like its YouTube preview, 47% of its bits
+differ"). Anything the preview cannot settle (another version, a preview that may not be the song,
+no preview) stays the question it was, so Review still decides those. When the YouTube shim does
+not answer, the song is looked at again later instead of becoming a question. Nothing is ever
+replaced because of the preview, not even with the sweep's replacing on. It needs the same things
+as the sweep and uses no setting of its own.
+
 `LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE` (off by default) lets the check replace a song that
 clearly is another one instead of asking: AcoustID names a different song, by another title, at
 least as sure as `SLSKD_MIN_MATCH_SCORE`. It goes through Wrong song as the library keeper, so

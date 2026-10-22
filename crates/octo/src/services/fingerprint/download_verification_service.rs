@@ -1374,6 +1374,18 @@ impl crate::services::library::library_review_sweep_worker::SweepVerification
         DownloadVerificationService::verify_in_background(self, path, artist, title).await
     }
 
+    /// The same question a new download is asked of a sound AcoustID has never heard.
+    async fn hear_preview(
+        &self,
+        source: &dyn PreviewSource,
+        path: &str,
+        request: &PreviewRequest<'_>,
+        question: &VerificationResult,
+    ) -> PreviewOutcome {
+        self.hear_against_preview(source, path, request, question, true)
+            .await
+    }
+
     /// The codes AcoustID's own answer carried for the recordings of its best result, else the
     /// ones MusicBrainz lists for them, the lookup a download with an ISRC is settled by.
     async fn isrc_agrees(&self, question: &VerificationResult, isrc: &str) -> Option<bool> {

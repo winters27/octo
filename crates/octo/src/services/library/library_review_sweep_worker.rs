@@ -28,7 +28,7 @@ use octo_media::tags::tag_writer_extras::{self, TagFields};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::NavidromeSongPathResolver;
 use super::library_action_executor::{LibraryActionExecutor, LibraryActionOutcome, LibraryActionRequest};
@@ -41,6 +41,7 @@ use crate::services::common::IAcquisitionActivity;
 use crate::services::family::family_store::FamilyStore;
 use crate::services::family::{LibraryScope, NavidromeAdmin, ScopeResolver, ScopeView};
 use crate::services::fingerprint::AcoustIdRateLimiter;
+use crate::services::fingerprint::preview_check::{Heard, PreviewOutcome, PreviewRequest, PreviewSource};
 use crate::services::framework::DotnetDictionary;
 use crate::services::health::keep_marks::MemberMarks;
 use crate::services::library::library_walk;
@@ -58,6 +59,20 @@ pub trait IReviewSweepVerifier: Send + Sync {
     /// Some(true) when it does, Some(false) when it lists codes for those recordings and none is
     /// this one, None when that cannot be told.
     async fn isrc_agrees(&self, question: &VerificationResult, isrc: &str) -> Option<bool>;
+
+    /// Whether the file sounds like the song's YouTube preview, for a sound AcoustID has never
+    /// heard (the same question a new download is asked, [`preview_check`]). NotAsked where there
+    /// is no preview source to ask.
+    ///
+    /// [`preview_check`]: crate::services::fingerprint::preview_check
+    async fn hear_preview(
+        &self,
+        _path: &str,
+        _request: &PreviewRequest<'_>,
+        _question: &VerificationResult,
+    ) -> PreviewOutcome {
+        PreviewOutcome::NotAsked
+    }
 }
 
 /// What the sweep needs of `DownloadVerificationService`: whether a lookup can happen
@@ -73,6 +88,17 @@ pub trait SweepVerification: Send + Sync {
 
     /// See [`IReviewSweepVerifier::isrc_agrees`].
     async fn isrc_agrees(&self, question: &VerificationResult, isrc: &str) -> Option<bool>;
+
+    /// See [`IReviewSweepVerifier::hear_preview`]; `source` is where previews come from.
+    async fn hear_preview(
+        &self,
+        _source: &dyn PreviewSource,
+        _path: &str,
+        _request: &PreviewRequest<'_>,
+        _question: &VerificationResult,
+    ) -> PreviewOutcome {
+        PreviewOutcome::NotAsked
+    }
 }
 
 /// The real check, in AcoustID's background lane. Resolved late, because the workers are built
@@ -81,6 +107,8 @@ pub trait SweepVerification: Send + Sync {
 #[derive(Default)]
 pub struct FingerprintSweepVerifier {
     service: OnceLock<Arc<dyn SweepVerification>>,
+    /// Where a song's YouTube preview comes from, once the shim's client exists.
+    preview: OnceLock<Arc<dyn PreviewSource>>,
 }
 
 impl FingerprintSweepVerifier {
@@ -91,6 +119,12 @@ impl FingerprintSweepVerifier {
     /// The verification service, once built. A second call is ignored.
     pub fn set_service(&self, service: Arc<dyn SweepVerification>) {
         let _ = self.service.set(service);
+    }
+
+    /// Where previews come from. A second call is ignored; without one a sound AcoustID has
+    /// never heard is a question, as it always was.
+    pub fn set_preview(&self, source: Arc<dyn PreviewSource>) {
+        let _ = self.preview.set(source);
     }
 }
 
@@ -111,6 +145,20 @@ impl IReviewSweepVerifier for FingerprintSweepVerifier {
 
     async fn isrc_agrees(&self, question: &VerificationResult, isrc: &str) -> Option<bool> {
         self.service.get()?.isrc_agrees(question, isrc).await
+    }
+
+    async fn hear_preview(
+        &self,
+        path: &str,
+        request: &PreviewRequest<'_>,
+        question: &VerificationResult,
+    ) -> PreviewOutcome {
+        let (Some(service), Some(source)) = (self.service.get(), self.preview.get()) else {
+            return PreviewOutcome::NotAsked;
+        };
+        service
+            .hear_preview(source.as_ref(), path, request, question)
+            .await
     }
 }
 
@@ -1101,6 +1149,67 @@ impl LibraryReviewSweepWorker {
         }
 
         let (outcome, question) = Self::classify(verdict);
+        // A sound AcoustID has never heard is not left to a person while its song's YouTube
+        // preview can say: alike settles it, clearly another song is a better question, and
+        // anything else stays the question it was.
+        let mut waiting_for = "AcoustID";
+        let (outcome, question) = if outcome == Outcome::Ask
+            && question.reason == InconclusiveReason::NoEntry
+            && file.tagged
+        {
+            let seconds = TagFile::open(&path)
+                .ok()
+                .map(|tags| tags.duration_seconds())
+                .filter(|seconds| *seconds > 0);
+            let request = PreviewRequest {
+                artist: &song.artist,
+                title: &song.title,
+                seconds,
+                video_id: None,
+            };
+            let heard = self.verifier.hear_preview(&path, &request, &question).await;
+            if generation != self.generation.load(Ordering::SeqCst) {
+                return interval;
+            }
+            match heard {
+                PreviewOutcome::Compared {
+                    heard: Heard::Match, ..
+                } => {
+                    info!(
+                        "Library review sweep: '{} - {}' is a sound AcoustID has never heard, and it sounds like its YouTube preview",
+                        song.artist, song.title
+                    );
+                    (Outcome::Fine, question)
+                }
+                PreviewOutcome::Compared {
+                    heard: Heard::Mismatch,
+                    comparison,
+                    ..
+                } => (
+                    Outcome::Ask,
+                    VerificationResult {
+                        reason: InconclusiveReason::DiffersFromYouTube,
+                        evidence: Some(format!(
+                            "{}% of its bits differ",
+                            (comparison.bit_error * 100.0).round()
+                        )),
+                        ..question
+                    },
+                ),
+                // The shim did not answer: not an answer, so not a question either. Tried again.
+                PreviewOutcome::Unavailable(why) => {
+                    debug!(
+                        "Library review sweep: no preview answer for '{} - {}': {why}",
+                        song.artist, song.title
+                    );
+                    waiting_for = "The YouTube shim";
+                    (Outcome::LookupFailed, question)
+                }
+                _ => (outcome, question),
+            }
+        } else {
+            (outcome, question)
+        };
         match outcome {
             Outcome::LookupFailed
                 if self.lookup_failures.fetch_add(1, Ordering::SeqCst) + 1
@@ -1113,7 +1222,7 @@ impl LibraryReviewSweepWorker {
                 }
                 return self.hold(
                     "Waiting",
-                    Some("AcoustID did not answer; trying that song again."),
+                    Some(&format!("{waiting_for} did not answer; trying that song again.")),
                     interval,
                 );
             }
