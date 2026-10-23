@@ -1864,3 +1864,47 @@ async fn with_soulseek_off_a_soulseek_download_says_so_without_asking_slskd() {
     let asked = walk._server.received_requests().await.expect("recording");
     assert!(!asked.iter().any(|r| r.url.path().starts_with("/api/")));
 }
+
+// ---- What a YouTube download does when AcoustID names another song --------------------------
+
+fn heard(verdict: VerificationVerdict, artist: &str, title: &str) -> VerificationResult {
+    VerificationResult {
+        verdict,
+        score: 0.97,
+        matched_artist: Some(artist.into()),
+        matched_title: Some(title.into()),
+        recording_id: Some("rec".into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn another_artists_song_of_another_title_is_another_song() {
+    // The video YouTube's search took for KILLY's song was Summer Cem's.
+    let summer_cem = heard(
+        VerificationVerdict::Mismatch,
+        "Summer Cem & BILLA JOE",
+        "KILLY MANJARO",
+    );
+    assert!(names_another_song(&summer_cem, "KILLY", "Killamonjaro"));
+}
+
+#[test]
+fn a_take_of_the_same_song_a_cover_and_an_unnamed_verdict_are_not() {
+    // Another take, or another artist's recording of the same title: kept and asked about.
+    let live = heard(VerificationVerdict::Mismatch, "KILLY", "Killamonjaro (Live)");
+    let cover = heard(VerificationVerdict::Mismatch, "Some Band", "Killamonjaro");
+    // The same artist's other song: also kept and asked about, as before.
+    let other_song = heard(VerificationVerdict::Mismatch, "KILLY", "Distance");
+    let nothing_named = VerificationResult {
+        verdict: VerificationVerdict::Mismatch,
+        ..Default::default()
+    };
+    let confirmed = heard(VerificationVerdict::Confirmed, "Summer Cem", "KILLY MANJARO");
+    for verdict in [live, cover, other_song, nothing_named, confirmed] {
+        assert!(
+            !names_another_song(&verdict, "KILLY", "Killamonjaro"),
+            "{verdict:?}"
+        );
+    }
+}

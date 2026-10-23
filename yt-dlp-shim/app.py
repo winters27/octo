@@ -38,6 +38,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import unicodedata
 from typing import Optional
 
 import requests
@@ -481,16 +482,32 @@ def _search_single(q: str, bg: bool = False) -> Optional[dict]:
 _LIVE = re.compile(r"\b(live|unplugged|in concert|concert|bootleg)\b", re.IGNORECASE)
 
 
+def _words(text: str) -> set:
+    """The words of a title or a query, in lower case, accents and punctuation gone."""
+    plain = unicodedata.normalize("NFKD", text or "")
+    plain = "".join(c for c in plain if not unicodedata.combining(c))
+    return set(re.findall(r"\w+", plain.casefold()))
+
+
 def _rank_by_length(candidates: list, q: str, duration_hint: int) -> list:
-    """Closest length first, but a live take never beats a studio one unless the query asks
-    for live itself. A live video of a song is usually within seconds of the studio length,
-    so length alone picked it as often as not. All of them live: the closest still plays."""
+    """The video whose title and channel name every word of the query first, then the closest
+    length, and a live take never beats a studio one unless the query asks for live itself.
+
+    Length alone let another artist's song win whenever it ran closer: "KILLY - Killamonjaro"
+    at the catalog's 179 s took "SUMMER CEM x BILLA JOE x DARDAN x EZHEL - KILLY MANJARO
+    EUROMIX" (171 s) over KILLY's own video (161 s). Words the videos all lack, such as a title
+    in another script, say nothing, and the length decides as before. A live video of a song is
+    usually within seconds of the studio length, so length alone picked it as often as not. All
+    of them live: the closest still plays."""
     wants_live = bool(_LIVE.search(q))
+    wanted = _words(q)
 
     def key(r: dict):
+        named = _words(r.get("title") or "") | _words(r.get("channel") or "")
+        missing = len(wanted - named)
         live = 0 if wants_live or not _LIVE.search(r.get("title") or "") else 1
         length = abs((r.get("duration") or 0) - duration_hint) if r.get("duration") else float("inf")
-        return (live, length)
+        return (missing, live, length)
 
     return sorted(candidates, key=key)
 
@@ -525,8 +542,9 @@ def _search_with_hint(q: str, duration_hint: int, bg: bool = False) -> Optional[
             pass
     if not candidates:
         return {}
-    # Closest duration wins, live takes last; candidates without a duration sort
-    # last so a hint never drags us onto an entry we can't length-match.
+    # The video that names the query's words wins, then the closest duration, live
+    # takes last; candidates without a duration sort last so a hint never drags us
+    # onto an entry we can't length-match.
     candidates = _rank_by_length(candidates, q, duration_hint)
     payload = _payload_from(candidates[0])
     if payload.get("video_id"):

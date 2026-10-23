@@ -21,7 +21,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::TryStreamExt;
 use octo_core::common::dotnet;
 use octo_core::fingerprint::recording_identity::RecordingKind;
-use octo_core::fingerprint::{InconclusiveReason, VerificationResult, VerificationVerdict};
+use octo_core::fingerprint::{
+    InconclusiveReason, TrackMatchComparer, VerificationResult, VerificationVerdict,
+};
 use octo_core::models::domain::{Album, Song};
 use octo_core::notifications::{NotificationEvent, NotificationEventType};
 use octo_core::settings::{DownloadSource, SoulseekSettings};
@@ -492,11 +494,16 @@ impl SoulseekDownloadService {
         let (artist, title) = names(&r);
         let mut video_id = r.you_tube_id.clone().filter(|v| !v.is_empty());
         if video_id.is_none() {
-            let hit = self
-                .youtube
-                .search(&format!("{artist} {title}"), r.duration, false)
-                .await
-                .filter(|h| !h.video_id.is_empty());
+            // YouTube Music's row for the song first, as a play picks: its title, artist and
+            // length are the song's. Else the shim's search.
+            let hit = match self.youtube.music_song(&artist, &title, r.duration).await {
+                Some(row) => Some(row),
+                None => self
+                    .youtube
+                    .search(&format!("{artist} {title}"), r.duration, false)
+                    .await
+                    .filter(|h| !h.video_id.is_empty()),
+            };
             if let Some(hit) = &hit {
                 self.id_registry.set_you_tube_id(&track_key, &hit.video_id);
                 self.id_registry
@@ -580,6 +587,27 @@ impl SoulseekDownloadService {
                     "YouTube delivered no decodable audio for '{artist} - {title}'"
                 ))
                 .into());
+            }
+            if names_another_song(&verdict, &artist, &title) {
+                // Another artist's song of another title is not a take of this one: kept, it would
+                // play under this song's name, and the video stays pinned for every later play.
+                warn!(
+                    "AcoustID says YouTube's video {video_id} for '{artist} - {title}' is {}; discarding it",
+                    verdict.describe()
+                );
+                base.log_step_heard(
+                    &track_key,
+                    acquisition_event_kinds::CHECK,
+                    &mismatch_text(&verdict),
+                    Some("Another song, not this one; thrown away"),
+                    verdict.heard(),
+                );
+                let _ = std::fs::remove_file(&path);
+                self.id_registry.unpin_video(&track_key, &video_id);
+                return Err(file_not_found(format!(
+                    "AcoustID identified YouTube's video for '{artist} - {title}' as {}",
+                    verdict.describe()
+                )));
             }
             warn!(
                 "AcoustID says the YouTube file for '{artist} - {title}' is {}; keeping it and asking about it",
@@ -3027,6 +3055,20 @@ fn sweep_incoming(incoming: &str) {
 // ---- small helpers -------------------------------------------------------------------------
 
 /// The routing's artist and title, for messages.
+/// Whether AcoustID named another artist's song of another title: neither the title nor the
+/// artist it heard is the one asked for. Another take of the song (a live or instrumental
+/// recording of the same title) is not, and neither is a verdict that names nothing.
+pub(crate) fn names_another_song(verdict: &VerificationResult, artist: &str, title: &str) -> bool {
+    let Some(heard_title) = verdict.matched_title.as_deref().filter(|t| !t.trim().is_empty()) else {
+        return false;
+    };
+    let heard_artist = verdict.matched_artist.as_deref().unwrap_or_default();
+    verdict.verdict == VerificationVerdict::Mismatch
+        && !heard_artist.trim().is_empty()
+        && !TrackMatchComparer::title_matches(title, heard_title)
+        && !TrackMatchComparer::artist_matches(artist, heard_artist, &[] as &[&str])
+}
+
 fn names(routing: &SoulseekRouting) -> (String, String) {
     (
         routing.artist.clone().unwrap_or_default(),

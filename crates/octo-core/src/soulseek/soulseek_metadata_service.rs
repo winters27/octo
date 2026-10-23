@@ -161,6 +161,23 @@ impl SoulseekRouting {
         true
     }
 
+    /// Forgets `video` as the song's video, and what was known of its stream. False when the
+    /// song plays another video, or none.
+    pub fn unpin_video(&mut self, video: &str) -> bool {
+        if self.you_tube_id.as_deref() != Some(video) {
+            return false;
+        }
+        self.you_tube_id = None;
+        self.stream_size = None;
+        self.stream_size_confirmed = false;
+        self.stream_itag = None;
+        self.stream_ext = None;
+        self.stream_bit_rate = None;
+        self.track_gain = None;
+        self.track_peak = None;
+        true
+    }
+
     pub fn has_artist_title(&self) -> bool {
         self.artist.as_deref().is_some_and(|a| !a.is_empty())
             && self.title.as_deref().is_some_and(|t| !t.is_empty())
@@ -262,6 +279,23 @@ impl Serialize for SoulseekRouting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpinning_the_songs_video_forgets_it_and_its_stream() {
+        let mut routing = SoulseekRouting {
+            you_tube_id: Some("wrong".into()),
+            stream_size: Some(2_366_424),
+            track_gain: Some(-11.0),
+            ..Default::default()
+        };
+
+        assert!(!routing.unpin_video("other"));
+        assert_eq!(routing.you_tube_id.as_deref(), Some("wrong"));
+
+        assert!(routing.unpin_video("wrong"));
+        assert_eq!(routing.you_tube_id, None);
+        assert_eq!((routing.stream_size, routing.track_gain), (None, None));
+    }
 
     #[test]
     fn the_computed_flags_are_written_and_ignored_on_read() {

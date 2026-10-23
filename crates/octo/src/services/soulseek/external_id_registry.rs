@@ -410,6 +410,22 @@ impl ExternalIdRegistry {
         true
     }
 
+    /// Forgets `video` as the song under `short_id`'s, so the next play or download looks again.
+    /// True when it was the song's video.
+    pub fn unpin_video(&self, short_id: &str, video: &str) -> bool {
+        if short_id.is_empty() || video.is_empty() {
+            return false;
+        }
+        let Some(routing) = self.lru.lock().by_id.get(short_id).map(|(r, _)| r.clone()) else {
+            return false;
+        };
+        let changed = routing.lock().unpin_video(video);
+        if changed {
+            self.dirty.store(true, Ordering::SeqCst);
+        }
+        changed
+    }
+
     /// Pins `video` on the song under `short_id`, replacing any other pin.
     pub fn set_you_tube_id(&self, short_id: &str, video: &str) -> bool {
         self.pin_video(short_id, video, true)

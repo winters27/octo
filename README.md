@@ -586,7 +586,9 @@ followed by one Navidrome scan a few seconds later (a normal scan, never a full 
 
 `LIBRARY_ACTIONS_REVIEW` gives each allowed user a Review playlist, where Octo asks about the
 downloads a person can settle by listening: AcoustID had never heard the recording, was not
-sure of it, or heard a different one in a YouTube download. A download is asked about in the
+sure of it, or heard another take of the song in a YouTube download. A YouTube download AcoustID
+hears as another artist's song of another title is not kept: the file is thrown away and the song
+fails to download, so it never plays under the wrong name. A download is asked about in the
 playlist of the person who requested it when they are on the allowlist, and of every allowed
 user otherwise. Answer by adding the track to an action playlist, by Keep (a fifth action that
 removes nothing, on five stars by default), or by removing it from Review, which means "fine,

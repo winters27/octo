@@ -555,3 +555,27 @@ fn a_re_pin_and_a_size_are_written_down_and_outlive_a_restart() {
     );
     assert_eq!(again.stream_facts(&id), None);
 }
+
+#[test]
+fn unpinning_a_video_forgets_it_and_only_that_one() {
+    let registry = ExternalIdRegistry::in_memory();
+    let id = registry.register(song("KILLY", "Killamonjaro"));
+    assert!(registry.set_you_tube_id(&id, "summer-cem"));
+
+    // Another video than the pinned one changes nothing.
+    assert!(!registry.unpin_video(&id, "killy"));
+    assert_eq!(
+        registry
+            .lookup(&id)
+            .expect("known")
+            .snapshot()
+            .you_tube_id
+            .as_deref(),
+        Some("summer-cem")
+    );
+
+    assert!(registry.unpin_video(&id, "summer-cem"));
+    assert_eq!(registry.lookup(&id).expect("known").snapshot().you_tube_id, None);
+    assert!(!registry.unpin_video(&id, "summer-cem"));
+    assert!(!registry.unpin_video("no-such-id", "summer-cem"));
+}
