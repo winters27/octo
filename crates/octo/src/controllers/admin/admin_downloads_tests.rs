@@ -260,6 +260,57 @@ async fn the_list_leaves_logs_out_and_the_log_route_reads_the_saved_one_or_the_l
 }
 
 #[tokio::test]
+async fn a_search_of_the_list_reaches_past_the_newest_200_and_keeps_the_tag_report() {
+    let dash = Dashboard::new();
+    let now = Utc::now();
+    let history = &dash.state.download_history;
+    history.record(DownloadHistoryEntry {
+        tagging: Some(octo_core::tagging::TagReport {
+            confidence: "Strong".into(),
+            distance: Some(0.042),
+            release_title: Some("Discovery".into()),
+            ..Default::default()
+        }),
+        ..entry(
+            "Harder Better Faster Stronger",
+            Some("soulseek:old"),
+            now - chrono::TimeDelta::days(9),
+        )
+    });
+    for i in 0..210 {
+        history.record(entry(&format!("Filler {i}"), None, now));
+    }
+    let token = dash.token(Some("admin"));
+    let token = token.as_deref();
+
+    let all = dash.get(token, "/api/admin/downloads").await.json();
+    assert_eq!(all["downloads"].as_array().map(Vec::len), Some(200));
+
+    let found = dash
+        .get(token, "/api/admin/downloads?q=harder%20STRONGER")
+        .await
+        .json();
+    let rows = found["downloads"].as_array().expect("downloads");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["title"], "Harder Better Faster Stronger");
+    assert_eq!(rows[0]["tagging"]["confidence"], "Strong");
+    assert_eq!(rows[0]["tagging"]["distance"], 0.042);
+    assert!(rows[0].get("log").is_none());
+
+    let none = dash
+        .get(token, "/api/admin/downloads?q=nothing%20like%20it")
+        .await
+        .json();
+    assert_eq!(none["downloads"].as_array().map(Vec::len), Some(0));
+    let blank = dash.get(token, "/api/admin/downloads?q=%20").await.json();
+    assert_eq!(
+        blank["downloads"].as_array().map(Vec::len),
+        Some(200),
+        "a blank search is the list"
+    );
+}
+
+#[tokio::test]
 async fn find_songs_runs_as_the_signed_in_admin_and_only_they_can_follow_or_pick_from_it() {
     let dash = Dashboard::new();
     let finder: Arc<SongFinder> = dash.state.song_finder.clone();

@@ -4414,6 +4414,36 @@ async function loadAcquisitions() {
   if (landed) loadFetched({ withAcquisitions: false });
 }
 
+// One Fetched songs row: the file, where it came from, how it was tagged and its saved log. Also
+// what a Library health lookup lists.
+function fetchedRow(d) {
+  const fmt = (d.format || '?').toUpperCase();
+  const badgeClass = fmt === 'FLAC' ? 'flac' : 'mp3';
+  const art = d.coverArtUrl
+    ? `<img class="dl-art" src="${escapeHtml(d.coverArtUrl)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'dl-art dl-art-ph'}))">`
+    : `<div class="dl-art dl-art-ph"></div>`;
+  const size = fmtSize(d.sizeBytes);
+  // Absent on entries written before attribution existed, and whenever the setting
+  // is off, so the row has to read the same with and without it.
+  const askers = Array.isArray(d.requestedBy) ? d.requestedBy.filter(Boolean) : [];
+  const who = askers.length
+    ? `<span class="dl-asker">${escapeHtml(askers.join(', '))}</span>`
+    : '';
+  const by = [d.artist, d.album].filter(Boolean).map(escapeHtml).join(' <span class="dl-dash">·</span> ');
+  return `<div class="dl-item">
+    ${art}
+    <div class="dl-main">
+      <div class="dl-title">${escapeHtml(d.title)}</div>
+      <div class="dl-by">${by}</div>
+      <div class="dl-path" title="${escapeHtml(d.path)}"><bdi>${escapeHtml(d.path)}</bdi></div>
+    </div>
+    <div class="dl-side">
+      <div class="dl-tags"><span class="dl-badge ${badgeClass}">${escapeHtml(fmt)}</span><span class="dl-source">${escapeHtml(d.source)}</span>${fetchedFindButton(d)}</div>
+      <div class="dl-sub">${escapeHtml(relTime(d.downloadedAt))}${size ? ' · ' + size : ''}${who ? ' · ' + who : ''}</div>
+    </div>
+  </div>${d.tagging ? `<details class="dl-tagging"><summary>How it was tagged</summary>${renderTagReport(d.tagging)}</details>` : ''}${fetchedLog(d)}`;
+}
+
 async function loadFetched({ withAcquisitions = true } = {}) {
   if (withAcquisitions) loadAcquisitions();
   const list = document.getElementById('fetched-list');
@@ -4427,33 +4457,7 @@ async function loadFetched({ withAcquisitions = true } = {}) {
       list.innerHTML = stateBlock('empty', 'Nothing fetched yet. Heart a song Octo found for you in your music app, and it shows up here once it is in your library.');
       return;
     }
-    list.innerHTML = items.map(d => {
-      const fmt = (d.format || '?').toUpperCase();
-      const badgeClass = fmt === 'FLAC' ? 'flac' : 'mp3';
-      const art = d.coverArtUrl
-        ? `<img class="dl-art" src="${escapeHtml(d.coverArtUrl)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'dl-art dl-art-ph'}))">`
-        : `<div class="dl-art dl-art-ph"></div>`;
-      const size = fmtSize(d.sizeBytes);
-      // Absent on entries written before attribution existed, and whenever the setting
-      // is off, so the row has to read the same with and without it.
-      const askers = Array.isArray(d.requestedBy) ? d.requestedBy.filter(Boolean) : [];
-      const who = askers.length
-        ? `<span class="dl-asker">${escapeHtml(askers.join(', '))}</span>`
-        : '';
-      const by = [d.artist, d.album].filter(Boolean).map(escapeHtml).join(' <span class="dl-dash">·</span> ');
-      return `<div class="dl-item">
-        ${art}
-        <div class="dl-main">
-          <div class="dl-title">${escapeHtml(d.title)}</div>
-          <div class="dl-by">${by}</div>
-          <div class="dl-path" title="${escapeHtml(d.path)}"><bdi>${escapeHtml(d.path)}</bdi></div>
-        </div>
-        <div class="dl-side">
-          <div class="dl-tags"><span class="dl-badge ${badgeClass}">${escapeHtml(fmt)}</span><span class="dl-source">${escapeHtml(d.source)}</span>${fetchedFindButton(d)}</div>
-          <div class="dl-sub">${escapeHtml(relTime(d.downloadedAt))}${size ? ' · ' + size : ''}${who ? ' · ' + who : ''}</div>
-        </div>
-      </div>${d.tagging ? `<details class="dl-tagging"><summary>How it was tagged</summary>${renderTagReport(d.tagging)}</details>` : ''}${fetchedLog(d)}`;
-    }).join('');
+    list.innerHTML = items.map(fetchedRow).join('');
   } catch (e) {
     list.innerHTML = stateBlock('error', `Couldn't load the log: ${e.message || 'error'}`);
   }
@@ -4907,7 +4911,7 @@ function fetchedFindButton(d) {
     : `data-find-q="${escapeHtml([d.artist, title].filter(Boolean).join(' '))}"`;
   return `<button type="button" class="btn btn-ghost btn-icon btn-sm dl-find" ${data} data-find-title="${escapeHtml(title)}" data-find-artist="${escapeHtml(d.artist || '')}" data-find-cover="${escapeHtml(d.coverArtUrl || '')}" aria-label="Find songs for ${escapeHtml(title)}" title="Find songs">${icon('i-magnifying-glass')}</button>`;
 }
-document.getElementById('fetched-list')?.addEventListener('toggle', event => {
+function fetchedLogToggle(event) {
   const details = event.target;
   if (!details.matches?.('details.dl-log')) return;
   const key = details.dataset.dlogKey;
@@ -4918,7 +4922,31 @@ document.getElementById('fetched-list')?.addEventListener('toggle', event => {
   const cached = dlog.cache.get(cacheKey);
   holder.innerHTML = dlogBody(cached);
   if (!cached || cached.error || cached.kept === 'live') dlogLoad(cacheKey, key, details.dataset.dlogAt, holder);
-}, true);
+}
+document.getElementById('fetched-list')?.addEventListener('toggle', fetchedLogToggle, true);
+document.getElementById('health-fetched-results')?.addEventListener('toggle', fetchedLogToggle, true);
+
+// Library health: look up one fetched song by name, however old, to see how it was tagged (the
+// release that won and its distance) and its download log. Searches every entry Octo kept.
+document.getElementById('health-fetched-form')?.addEventListener('submit', async event => {
+  event.preventDefault();
+  const out = document.getElementById('health-fetched-results');
+  const q = document.getElementById('health-fetched-q')?.value.trim() || '';
+  if (!out) return;
+  out.hidden = false;
+  if (!q) { out.innerHTML = stateBlock('empty', 'Type a title, an artist or both.'); return; }
+  out.innerHTML = stateBlock('loading', 'Looking through the fetched songs…');
+  try {
+    const r = await api(`/api/admin/downloads?q=${encodeURIComponent(q)}`, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const items = (await r.json()).downloads || [];
+    out.innerHTML = items.length
+      ? items.map(fetchedRow).join('')
+      : stateBlock('empty', 'No fetched song matches. Only songs Octo downloaded are listed, and only the newest 500 are kept.');
+  } catch (e) {
+    out.innerHTML = stateBlock('error', `Couldn't search the fetched songs: ${e.message || 'error'}`);
+  }
+});
 
 // ── Find songs ─────────────────────────────────────────────────────────────
 // The apps' Find songs: a song's search run again on the admin's own download sources, every
