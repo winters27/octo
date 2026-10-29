@@ -267,6 +267,11 @@ impl NoticeEntry {
     pub fn is_open(&self) -> bool {
         matches!(self.state, NoticeState::Waiting | NoticeState::Queued)
     }
+
+    /// Whether the question was put to `username`, the one person who may answer it.
+    pub fn is_for(&self, username: &str) -> bool {
+        same_user(&self.username, username)
+    }
 }
 
 /// The same user, ignoring case and the asker's surrounding spaces.
@@ -617,6 +622,15 @@ impl NoticeQueue {
         }
         self.mark_dirty();
         true
+    }
+
+    /// The open Review question filed under `key`, for answering it from the dashboard.
+    pub fn open_review(&self, key: &str) -> Option<NoticeEntry> {
+        self.entries
+            .lock()
+            .values()
+            .find(|entry| entry.key == key && entry.kind == NoticeKind::Review && entry.is_open())
+            .cloned()
     }
 
     /// Every file a Review question was ever about, open or answered, for anyone.

@@ -1,5 +1,5 @@
 //! The library actions, questions and checks: the action history and its Allow downloading again,
-//! the ratings not acted on, the notices, the duplicate scan, the library Review sweep, the weekly upgrade's status and the
+//! the ratings not acted on, the notices and Replace now on an open Review question, the duplicate scan, the library Review sweep, the weekly upgrade's status and the
 //! song path resolver.
 //!
 //! Session-gated, because these list filenames and usernames. Every /api/admin endpoint sits
@@ -14,16 +14,20 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{get, post};
+use octo_core::settings::LibraryAction;
 use serde_json::{Value, json};
+use tracing::{info, warn};
 
 use serde::Deserialize;
 
+use super::health::{navidrome_user_of, not_signed_in};
 use super::json_body::{FromBody, Shape, text_record};
 use super::request_binding::{
     bind_body, browse_user, error, ok, query, sign_in, split, status, utc, utc_opt,
 };
 use crate::app::AppState;
 use crate::http::routes::RouteSet;
+use crate::services::library::library_action_executor::LibraryActionRequest;
 use crate::services::library::library_action_journal::action_name;
 use crate::services::library::navidrome_song_path_resolver::PathSource;
 use crate::services::library::notice_queue::NamedEnum;
@@ -37,6 +41,7 @@ pub fn routes() -> RouteSet {
             get(get_ignored_ratings),
         )
         .route("/api/admin/notices", get(get_notices))
+        .route("/api/admin/library-actions/replace-now", post(replace_now))
         .route("/api/admin/duplicates/scan", post(scan_duplicates))
         .route("/api/admin/review-sweep", get(get_review_sweep))
         .route("/api/admin/review-sweep/start", post(start_review_sweep))
@@ -187,6 +192,116 @@ async fn allow_download(State(state): State<AppState>, request: Request) -> Resp
     browse.finish(ok(&json!({ "ok": true })))
 }
 
+/// The Replace now body: the Review question's `key`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ReplaceNowRequest {
+    key: Option<String>,
+}
+
+impl FromBody for ReplaceNowRequest {
+    const SHAPE: &'static Shape = text_record!("Octo.Controllers.AdminController+ReplaceNowRequest", "key");
+}
+
+/// Replace now on an open Review question: Wrong song for its file, as the signed-in Navidrome
+/// admin, the same action as adding the song to the Wrong song playlist and held to the same
+/// gates (library actions on, on the allowed list, Wrong song on, no dry run). Only a question put
+/// to the person signed in, as the playlist only answers one's own, and never a song anyone starred
+/// or rated, as the automatic replacing never touches one. The original is kept as the action's
+/// settings say. A replacement is a download, so it runs on after the answer and shows in
+/// Downloads; the question is answered once it is in.
+async fn replace_now(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, body) = split(request).await;
+    let request: ReplaceNowRequest = match bind_body(&parts, &body) {
+        Ok(r) => r,
+        Err(answer) => return *answer,
+    };
+    let Some(user) = navidrome_user_of(&state, &parts) else {
+        return not_signed_in();
+    };
+    let actions = state.settings.current().library_actions.clone();
+    let refusal = if !actions.enabled {
+        Some("Library actions are off. Turn them on to replace songs.".to_string())
+    } else if !actions.is_allowed(Some(&user)) {
+        Some(format!("{user} is not on the library actions allowlist."))
+    } else if !actions
+        .effective_actions()
+        .into_iter()
+        .any(|entry| entry.action == LibraryAction::WrongSong && entry.enabled)
+    {
+        Some("The Wrong song action is off under Library actions. Turn it on to replace songs.".to_string())
+    } else if actions.dry_run {
+        Some("Dry run is on, so nothing is replaced.".to_string())
+    } else {
+        None
+    };
+    if let Some(refusal) = refusal {
+        return error(StatusCode::BAD_REQUEST, &refusal);
+    }
+    let Some(entry) = request
+        .key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .and_then(|key| state.notice_queue.open_review(key))
+    else {
+        return error(StatusCode::BAD_REQUEST, "That question is not open in Review.");
+    };
+    if !entry.is_for(&user) {
+        return error(
+            StatusCode::FORBIDDEN,
+            format!(
+                "That question is for {}; only they can answer it, from their Review playlist.",
+                entry.username
+            ),
+        );
+    }
+    let Some(id) = entry.navidrome_id.clone().filter(|id| !id.is_empty()) else {
+        return error(
+            StatusCode::CONFLICT,
+            "Navidrome does not show this song yet. Try again after its next scan.",
+        );
+    };
+    match state.library_review_sweep_worker.song_marked(&id).await {
+        Some(false) => {}
+        Some(true) => {
+            return error(
+                StatusCode::CONFLICT,
+                "Someone starred or rated this song, so it stays a question. Take the star or rating off first to replace it.",
+            );
+        }
+        None => {
+            return error(
+                StatusCode::CONFLICT,
+                "The stars and ratings on this song could not be read, so it stays a question.",
+            );
+        }
+    }
+    let executor = state.library_action_executor.clone();
+    let (artist, title) = (entry.artist.clone(), entry.title.clone());
+    let asker = user;
+    tokio::spawn(async move {
+        match executor
+            .apply(LibraryActionRequest::new(
+                LibraryAction::WrongSong,
+                id,
+                asker.clone(),
+            ))
+            .await
+        {
+            Ok(outcome) => info!(
+                "Replace now: '{artist} - {title}' for {asker}: {:?}, {}",
+                outcome.state,
+                outcome.detail.as_deref().unwrap_or("")
+            ),
+            Err(e) => warn!("Replace now: '{artist} - {title}' for {asker} failed: {e}"),
+        }
+    });
+    accepted(&json!({
+        "ok": true,
+        "words": "Looking for the right song. It shows in Downloads; the old file goes to Recently removed.",
+    }))
+}
+
 /// What Octo has asked people about (#47, #53) and how they answered, newest first. Gated like
 /// the action history: it names files and people.
 async fn get_notices(State(state): State<AppState>, request: Request) -> Response {
@@ -195,12 +310,17 @@ async fn get_notices(State(state): State<AppState>, request: Request) -> Respons
     if !browse.signed_in() {
         return browse.finish(sign_in());
     }
+    // Who is looking: their own open questions may be answered from here (Replace now).
+    let me = navidrome_user_of(&state, &parts);
     let entries: Vec<Value> = state
         .notice_queue
         .recent(200)
         .iter()
         .map(|entry| {
             let mut json = json!({
+                "key": entry.key,
+                "open": entry.is_open(),
+                "mine": me.as_deref().is_some_and(|me| entry.is_for(me)),
                 "kind": entry.kind.name(),
                 "username": entry.username,
                 "artist": entry.artist,
@@ -226,6 +346,9 @@ async fn get_notices(State(state): State<AppState>, request: Request) -> Respons
                 }
                 if let Some(closest) = entry.closest.as_deref().filter(|c| !c.is_empty()) {
                     fields.insert("closest".into(), json!(closest));
+                }
+                if let Some(id) = entry.navidrome_id.as_deref().filter(|id| !id.is_empty()) {
+                    fields.insert("navidromeId".into(), json!(id));
                 }
             }
             json

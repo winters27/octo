@@ -1793,6 +1793,12 @@ impl LibraryReviewSweepWorker {
         NoticeQueue::replaced_reason(question, needs)
     }
 
+    /// Whether anyone starred or rated `song_id`, read as the sweep reads it before replacing.
+    /// None when the marks cannot be read, or there is nothing to read them with.
+    pub async fn song_marked(&self, song_id: &str) -> Option<bool> {
+        self.replacer.as_ref()?.marked(song_id).await
+    }
+
     /// Octo's own downloads inside the music folder, library-relative with `/`, in ordinal
     /// order. Hidden folders, the quarantine among them, are left out.
     async fn octo_downloads(&self, root: &str) -> Vec<String> {

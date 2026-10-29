@@ -2867,20 +2867,45 @@ function noticeScore(entry) {
   return parts.length ? ` (${parts.join('; ')})` : '';
 }
 
-document.getElementById('notices-refresh')?.addEventListener('click', () =>
-  showSessionTable(document.getElementById('notices-list'), '/api/admin/notices',
+function showNotices() {
+  return showSessionTable(document.getElementById('notices-list'), '/api/admin/notices',
     ['Track', 'Why', 'Who', 'Answer'], entry => `
             <span class="key">${esc(entry.artist)} - ${esc(entry.title)}</span>
             <span class="value">${esc(noticeKinds[entry.kind] || entry.kind)}: ${esc(entry.reason)}${esc(noticeScore(entry))}${entry.origin === 'LibrarySweep' ? ' (from the library)' : ''}</span>
             <span class="value">${esc(entry.username)}</span>
-            <span class="value">${esc(noticeStates[entry.state] || entry.state)}${entry.submitted ? ', sent to AcoustID' : ''}</span>`,
+            <span class="value">${esc(noticeStates[entry.state] || entry.state)}${entry.submitted ? ', sent to AcoustID' : ''}${entry.kind === 'Review' && entry.open && entry.mine && entry.navidromeId
+              ? ` <button type="button" class="btn btn-ghost btn-sm" data-replace-now="${esc(entry.key)}">Replace now</button>`
+              : ''}</span>`,
     body => {
       const scan = body.duplicateScan;
       if (!scan) return '';
       const when = new Date(scan.atUtc).toLocaleString();
       return `Last duplicate scan ${esc(when)}: ${scan.tracks} tracks with a recording id, ${scan.groups} group${scan.groups === 1 ? '' : 's'}`
         + (scan.complete ? '.' : ', but the walk did not finish, so nothing was settled.');
-    }));
+    });
+}
+
+document.getElementById('notices-refresh')?.addEventListener('click', showNotices);
+
+// Replace now: Wrong song for a song Review asks about, as you, instead of adding it to the playlist.
+document.getElementById('notices-list')?.addEventListener('click', async event => {
+  const button = event.target.closest('[data-replace-now]');
+  if (!button) return;
+  button.disabled = true;
+  try {
+    const response = await api('/api/admin/library-actions/replace-now', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: button.dataset.replaceNow }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    toast(body.words || 'Replacing it.');
+  } catch (error) {
+    button.disabled = false;
+    toast(error.message, 'err');
+  }
+});
 
 // A star rating that asked for an action and got none says why, with the setting to change.
 document.getElementById('ignored-ratings-refresh')?.addEventListener('click', () =>

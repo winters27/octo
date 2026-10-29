@@ -184,6 +184,10 @@ mod health_tags_tests;
 mod library_action_allow_download_tests;
 
 #[cfg(test)]
+#[path = "library_action_replace_now_tests.rs"]
+mod library_action_replace_now_tests;
+
+#[cfg(test)]
 #[path = "lastfm_admin_tests.rs"]
 mod lastfm_admin_tests;
 
