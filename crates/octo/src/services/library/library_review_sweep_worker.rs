@@ -716,7 +716,7 @@ pub enum Outcome {
 
 /// What came of replacing a file through Wrong song.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Replacing {
+pub enum Replacing {
     /// The replacement went in.
     Done,
     /// It did not, so the file stays a question.
@@ -1387,7 +1387,7 @@ impl LibraryReviewSweepWorker {
                 witness,
             ) == AutoReplace::Replace
         {
-            match self.replace(step.keeper, &path, &file, &question).await {
+            match self.replace(step.keeper, &path, &file, &question, true).await {
                 Replacing::Done => true,
                 Replacing::Declined => false,
                 // Soulseek is out: the song stays unchecked, no try or breaker count is spent, and
@@ -1461,6 +1461,7 @@ impl LibraryReviewSweepWorker {
         path: &str,
         file: &SweptFile,
         question: &VerificationResult,
+        announce: bool,
     ) -> Replacing {
         let Some(replacer) = self.replacer.clone() else {
             return Replacing::Declined;
@@ -1519,7 +1520,10 @@ impl LibraryReviewSweepWorker {
                 song.artist, song.title
             )
         };
-        self.hold("Running", Some(&replacing), Duration::ZERO);
+        // The YouTube check says what it is doing in its own status, not the sweep's.
+        if announce {
+            self.hold("Running", Some(&replacing), Duration::ZERO);
+        }
         // A replacement by the preview comes only from a source the preview checks, never the
         // YouTube fallback.
         let only_source = (by_preview
@@ -1587,6 +1591,46 @@ impl LibraryReviewSweepWorker {
         }
     }
 
+    /// Replaces a file the one-time YouTube check heard as another song, when
+    /// [`Self::decide_for_youtube_check`] says so, by the sweep's own steps: the ISRC, the stars
+    /// and ratings, the source a preview may replace from, the note in Review and the day's count.
+    /// `question` is AcoustID's, with the preview's finding as its evidence. A file someone was
+    /// already asked about stays theirs to answer, and one of Octo's own downloads is only ever
+    /// asked about, as the sweep's re-check of them does.
+    pub async fn replace_for_youtube_check(
+        &self,
+        keeper: &str,
+        path: &str,
+        file: &SweptFile,
+        question: &VerificationResult,
+        witness: PreviewWitness,
+    ) -> Replacing {
+        let today = self.store.read(|s| s.today(self.clock.now()));
+        if self.notices.reviewed_paths().contains(path)
+            || Self::decide_for_youtube_check(
+                question,
+                file,
+                &self.settings.current(),
+                keeper,
+                today,
+                witness,
+            ) != AutoReplace::Replace
+        {
+            return Replacing::Declined;
+        }
+        let full = get_full_path(path);
+        let octos = self
+            .library
+            .get_mappings()
+            .await
+            .into_iter()
+            .any(|mapping| !mapping.local_path.is_empty() && get_full_path(&mapping.local_path) == full);
+        if octos {
+            return Replacing::Declined;
+        }
+        self.replace(keeper, path, file, question, false).await
+    }
+
     /// Counts one replacement, or one that failed, and writes it at once: the day's cap and
     /// breaker must hold across a restart right after.
     fn count_today(&self, now: DateTime<Utc>, replaced: bool) {
@@ -1610,6 +1654,40 @@ impl LibraryReviewSweepWorker {
         witness: Option<PreviewWitness>,
     ) -> AutoReplace {
         let actions = &settings.library_actions;
+        let switches = (
+            actions.review_sweep_auto_replace,
+            actions.review_sweep_auto_replace_preview,
+        );
+        Self::decide_by(question, file, settings, keeper, today, witness, switches)
+    }
+
+    /// [`Self::decide`] for the one-time YouTube check: only by the preview, behind
+    /// `YoutubeCheckAutoReplace` instead of `ReviewSweepAutoReplacePreview`, by the same rule and
+    /// toward the same day's cap and breaker.
+    pub fn decide_for_youtube_check(
+        question: &VerificationResult,
+        file: &SweptFile,
+        settings: &AppSettings,
+        keeper: &str,
+        today: Today,
+        witness: PreviewWitness,
+    ) -> AutoReplace {
+        let switches = (false, settings.library_actions.youtube_check_auto_replace);
+        Self::decide_by(question, file, settings, keeper, today, Some(witness), switches)
+    }
+
+    /// The replacing rule behind [`Self::decide`], with `switches` saying whether replacing by
+    /// AcoustID and by the preview are on.
+    fn decide_by(
+        question: &VerificationResult,
+        file: &SweptFile,
+        settings: &AppSettings,
+        keeper: &str,
+        today: Today,
+        witness: Option<PreviewWitness>,
+        (by_acoustid_on, by_preview_on): (bool, bool),
+    ) -> AutoReplace {
+        let actions = &settings.library_actions;
         let wrong_song_on = actions
             .effective_actions()
             .iter()
@@ -1620,13 +1698,13 @@ impl LibraryReviewSweepWorker {
             && today.replaced < actions.effective_review_sweep_auto_replace_per_day()
             && today.failed < Self::MAX_FAILED_REPLACEMENTS_PER_DAY;
         // A replacement whose original is not kept could not be put back.
-        let by_acoustid = actions.review_sweep_auto_replace
+        let by_acoustid = by_acoustid_on
             && actions.keep_replaced_originals
             && Self::clearly_another_song(question, file, &settings.soulseek);
         // A YouTube download is the preview itself, so it cannot vouch for a replacement; every
         // other source is held to the preview. A replacement with no lossless source to fetch
         // from could only wait, and one whose original is not kept could not be put back.
-        let by_preview = actions.review_sweep_auto_replace_preview
+        let by_preview = by_preview_on
             && file.tagged
             && question.reason == InconclusiveReason::DiffersFromYouTube
             && witness.is_some_and(|witness| {

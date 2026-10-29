@@ -321,6 +321,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Subsonic:CoverBadge",
     "LibraryActions:YoutubeCheckPerHour",
     "LibraryActions:ReviewSweepAutoReplacePreview",
+    "LibraryActions:YoutubeCheckAutoReplace",
 ];
 
 /// Whether a config-sources key names a secret: a password, an API key, a secret, a token

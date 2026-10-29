@@ -309,6 +309,9 @@ services:
       LibraryActions__TagCheckPerHour: ${LIBRARY_ACTIONS_TAG_CHECK_PER_HOUR:-60}
       # Songs an hour the one-time YouTube check compares, once started from the dashboard. 0 is off.
       LibraryActions__YoutubeCheckPerHour: ${LIBRARY_ACTIONS_YOUTUBE_CHECK_PER_HOUR:-30}
+      # Let that check replace what it clearly hears as another song, by the sweep's preview rule
+      # and within the same daily limit. Off by default.
+      LibraryActions__YoutubeCheckAutoReplace: ${LIBRARY_ACTIONS_YOUTUBE_CHECK_AUTO_REPLACE:-false}
       # Recordings the library holds more than once, side by side, the copy worth keeping first.
       # Octo only points them out; nothing is removed unless you remove it.
       LibraryActions__DuplicatesEnabled: ${LIBRARY_ACTIONS_DUPLICATES:-false}

@@ -145,7 +145,11 @@ impl IAcquisitionActivity for FakeActivity {
 }
 
 fn heard(heard: Heard, bit_error: f64) -> Compared {
-    Compared::Heard { heard, bit_error }
+    Compared::Heard {
+        heard,
+        bit_error,
+        album_agrees: true,
+    }
 }
 
 fn settings_of(per_hour: i32) -> Arc<SettingsStore> {
@@ -1197,7 +1201,7 @@ async fn a_file_heard_against_its_own_sound_matches_and_a_shim_that_sends_nothin
     let same = OneVideo {
         audio: Some(file.clone()),
     };
-    let answer = hear(&same, &fingerprinter, &file, &request(), preview.clone(), 30).await;
+    let answer = hear(&same, &fingerprinter, &file, &request(), "", preview.clone(), 30).await;
     assert!(
         matches!(
             answer,
@@ -1210,7 +1214,7 @@ async fn a_file_heard_against_its_own_sound_matches_and_a_shim_that_sends_nothin
     );
 
     let down = OneVideo { audio: None };
-    let answer = hear(&down, &fingerprinter, &file, &request(), preview, 30).await;
+    let answer = hear(&down, &fingerprinter, &file, &request(), "", preview, 30).await;
     assert_eq!(answer, Compared::Unavailable);
 }
 
@@ -1226,6 +1230,7 @@ async fn a_file_fpcalc_cannot_read_has_no_preview_to_compare_with() {
         &AudioFingerprinter::new(),
         &broken,
         &request(),
+        "",
         OneVideo::default_facts(),
         30,
     )

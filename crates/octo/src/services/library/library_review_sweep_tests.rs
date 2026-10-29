@@ -1194,6 +1194,93 @@ fn decide_by_preview(change: impl FnOnce(&mut AppSettings)) -> AutoReplace {
     )
 }
 
+/// A song the one-time YouTube check clearly hears as another, against a YouTube Music row from
+/// the file's album: whether it is replaced, with the YouTube check's switch on and the sweep's
+/// own preview switch off, unless `change` says otherwise.
+fn decide_for_youtube_check(change: impl FnOnce(&mut AppSettings), witness: PreviewWitness) -> AutoReplace {
+    let mut settings = app_settings(LibraryActionSettings {
+        review_sweep_auto_replace_preview: false,
+        youtube_check_auto_replace: true,
+        ..replacing_by_preview(60)
+    });
+    settings.soulseek = SoulseekSettings {
+        enabled: true,
+        base_url: Some("http://slskd.test".into()),
+        ..Default::default()
+    };
+    change(&mut settings);
+    let question = VerificationResult {
+        verdict: VerificationVerdict::Inconclusive,
+        reason: InconclusiveReason::DiffersFromYouTube,
+        ..Default::default()
+    };
+    LibraryReviewSweepWorker::decide_for_youtube_check(
+        &question,
+        &file_titled("Teardrop"),
+        &settings,
+        "bob",
+        Today::default(),
+        witness,
+    )
+}
+
+const CLEARLY_ANOTHER: PreviewWitness = PreviewWitness {
+    bit_error: 0.5,
+    album_agrees: true,
+};
+
+#[test]
+fn the_youtube_check_replaces_by_the_preview_rule_behind_its_own_switch() {
+    assert_eq!(
+        decide_for_youtube_check(|_| {}, CLEARLY_ANOTHER),
+        AutoReplace::Replace
+    );
+    // The sweep's switches do not turn it on.
+    assert_eq!(
+        decide_for_youtube_check(
+            |s| {
+                s.library_actions.youtube_check_auto_replace = false;
+                s.library_actions.review_sweep_auto_replace = true;
+                s.library_actions.review_sweep_auto_replace_preview = true;
+            },
+            CLEARLY_ANOTHER
+        ),
+        AutoReplace::Ask
+    );
+    // The rest of the rule holds as it does for the sweep.
+    let another_album = PreviewWitness {
+        album_agrees: false,
+        ..CLEARLY_ANOTHER
+    };
+    assert_eq!(decide_for_youtube_check(|_| {}, another_album), AutoReplace::Ask);
+    let not_clear_enough = PreviewWitness {
+        bit_error: LibraryReviewSweepWorker::PREVIEW_REPLACE_FROM - 0.01,
+        ..CLEARLY_ANOTHER
+    };
+    assert_eq!(
+        decide_for_youtube_check(|_| {}, not_clear_enough),
+        AutoReplace::Ask
+    );
+    for close in [
+        (|s: &mut AppSettings| s.library_actions.dry_run = true) as fn(&mut AppSettings),
+        |s| s.library_actions.keep_replaced_originals = false,
+        |s| s.subsonic.download_source = DownloadSource::YouTube,
+    ] {
+        assert_eq!(decide_for_youtube_check(close, CLEARLY_ANOTHER), AutoReplace::Ask);
+    }
+}
+
+#[test]
+fn the_sweep_does_not_replace_by_the_youtube_check_s_switch() {
+    assert_eq!(
+        decide_by_preview(|s| {
+            s.library_actions.review_sweep_auto_replace_preview = false;
+            s.library_actions.youtube_check_auto_replace = true;
+        }),
+        AutoReplace::Ask
+    );
+}
+
 #[test]
 fn the_preview_replaces_only_with_a_source_it_checks_and_the_original_kept() {
     assert_eq!(decide_by_preview(|_| {}), AutoReplace::Replace);
@@ -2727,6 +2814,99 @@ async fn preview_says_wrong(
         worker.tick().await;
     }
     (sweep, worker, queue)
+}
+
+/// The YouTube check's replacing through the sweep's steps: `settings` and a Wrong song that
+/// applies, for a file tagged Teardrop that AcoustID never heard, one of Octo's own downloads when
+/// `octos`. What came of it, what was asked of Wrong song, and the Review entries.
+async fn youtube_check_replaces(
+    settings: LibraryActionSettings,
+    octos: bool,
+) -> (Replacing, Vec<(LibraryAction, String, String)>, Vec<NoticeEntry>) {
+    let sweep = Sweep::new();
+    let path = sweep.tagged("a.flac", "Massive Attack", "Teardrop", None);
+    let queue = Arc::new(NoticeQueue::new());
+    let replacer = FakeReplacer::ending(LibraryActionState::Applied);
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(None),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(settings),
+            replacer: Some(replacer.clone()),
+            octo_downloads: if octos { vec![path.clone()] } else { Vec::new() },
+            ..Default::default()
+        },
+    );
+    let question = VerificationResult {
+        verdict: VerificationVerdict::Inconclusive,
+        reason: InconclusiveReason::DiffersFromYouTube,
+        evidence: Some("50% of its bits differ".into()),
+        ..Default::default()
+    };
+    let file = SweptFile {
+        song: Song {
+            album: TAGGED_ALBUM.into(),
+            ..song_titled("Teardrop")
+        },
+        tagged: true,
+        isrc: None,
+    };
+    let replacing = worker
+        .replace_for_youtube_check("bob", &path, &file, &question, CLEARLY_ANOTHER)
+        .await;
+    (
+        replacing,
+        replacer.requests(),
+        queue.for_user("bob", NoticeKind::Review),
+    )
+}
+
+#[tokio::test]
+async fn the_youtube_check_replaces_through_wrong_song_and_leaves_a_note() {
+    let (replacing, requests, entries) = youtube_check_replaces(youtube_check_replacing(), false).await;
+
+    assert_eq!(replacing, Replacing::Done);
+    assert_eq!(
+        requests,
+        [(
+            LibraryAction::WrongSong,
+            "nd-a.flac".to_string(),
+            "bob".to_string()
+        )]
+    );
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].state, NoticeState::Acted);
+    assert!(
+        entries[0].reason.contains("YouTube preview"),
+        "{}",
+        entries[0].reason
+    );
+}
+
+#[tokio::test]
+async fn the_youtube_check_replaces_nothing_with_its_switch_off() {
+    let (replacing, requests, entries) = youtube_check_replaces(replacing_by_preview(60), false).await;
+
+    assert_eq!(replacing, Replacing::Declined);
+    assert!(requests.is_empty());
+    assert!(entries.is_empty());
+}
+
+#[tokio::test]
+async fn the_youtube_check_never_replaces_one_of_octo_s_own_downloads() {
+    let (replacing, requests, _) = youtube_check_replaces(youtube_check_replacing(), true).await;
+
+    assert_eq!(replacing, Replacing::Declined);
+    assert!(requests.is_empty());
+}
+
+/// Replacing switched on for the YouTube check only, not for the sweep.
+fn youtube_check_replacing() -> LibraryActionSettings {
+    LibraryActionSettings {
+        review_sweep_auto_replace_preview: false,
+        youtube_check_auto_replace: true,
+        ..replacing_by_preview(60)
+    }
 }
 
 #[tokio::test]

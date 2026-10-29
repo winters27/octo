@@ -289,6 +289,15 @@ pub struct LibraryActionSettings {
     /// nothing is ever changed or removed. 0 is off. Only while nothing is downloading.
     /// Environment variable: LIBRARY_ACTIONS_YOUTUBE_CHECK_PER_HOUR
     pub youtube_check_per_hour: i32,
+    /// Lets the one-time YouTube check replace a song AcoustID has never heard, whose YouTube Music
+    /// row with the song's title, artist and length from the file's own album clearly sounds
+    /// nothing like the file, through Wrong song, instead of asking. Off by default. The same rule
+    /// as ReviewSweepAutoReplacePreview, with the same needs (DryRun off, Wrong song on, the keeper
+    /// on the allowlist, KeepReplacedOriginals on, a download source other than YouTube alone), and
+    /// counted toward the same daily limit and breaker. A song with an ISRC tag, or that anyone
+    /// starred or rated, is still asked about.
+    /// Environment variable: LIBRARY_ACTIONS_YOUTUBE_CHECK_AUTO_REPLACE
+    pub youtube_check_auto_replace: bool,
 
     /// A "Duplicates" playlist per allowed user: recordings the library holds more than once,
     /// side by side, the copy worth keeping first. Octo only points them out; nothing is removed
@@ -357,6 +366,7 @@ impl Default for LibraryActionSettings {
             review_sweep_auto_replace_preview: false,
             tag_check_per_hour: 60,
             youtube_check_per_hour: 30,
+            youtube_check_auto_replace: false,
             duplicates_enabled: false,
             duplicates_playlist_name: "Duplicates".to_string(),
             duplicates_scan_hours: 24,

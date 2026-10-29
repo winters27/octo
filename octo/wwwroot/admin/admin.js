@@ -3004,10 +3004,10 @@ async function loadYoutubeCheck() {
     const parts = [];
     if (s.running) {
       parts.push(`${youtubeCheckStates[s.state] || s.state}.`);
-      parts.push(`Looked at ${s.position} of ${s.total} songs: AcoustID vouches for ${s.known}, ${s.asked} asked about, ${s.open} waiting for an answer.`);
+      parts.push(`Looked at ${s.position} of ${s.total} songs: AcoustID vouches for ${s.known}, ${s.asked} asked about${s.replaced ? `, ${s.replaced} replaced` : ''}, ${s.open} waiting for an answer.`);
       if (s.keeper) parts.push(`Asking ${s.keeper}.`);
     } else if (s.finishedUtc) {
-      parts.push(`Done: looked at ${s.done} songs. AcoustID vouches for ${s.known}; of the rest, ${s.asked} asked about, ${s.unsure} left alone as unclear, ${s.noCopy} with no preview to compare.`);
+      parts.push(`Done: looked at ${s.done} songs. AcoustID vouches for ${s.known}; of the rest, ${s.asked} asked about${s.replaced ? `, ${s.replaced} replaced` : ''}, ${s.unsure} left alone as unclear, ${s.noCopy} with no preview to compare.`);
     } else {
       parts.push('Compares the songs AcoustID cannot vouch for with their YouTube preview, once.');
     }

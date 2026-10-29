@@ -23,6 +23,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use octo_core::common::Clock;
+use octo_core::fingerprint::verification::{InconclusiveReason, VerificationResult};
 use octo_core::json::datetime;
 use octo_core::models::domain::Song;
 use octo_core::settings::SettingsStore;
@@ -36,7 +37,9 @@ use tracing::{error, info, warn};
 
 use super::IReviewSweepVerifier;
 use super::library_identity_sweep::{IdentitySweepStore, stamp_of};
-use super::library_review_sweep_worker::{LibraryReviewSweepWorker, Outcome};
+use super::library_review_sweep_worker::{
+    LibraryReviewSweepWorker, Outcome, PreviewWitness, Replacing, SweptFile,
+};
 use super::navidrome_song_path_resolver::get_full_path;
 use super::notice_queue::{NoticeOrigin, NoticeQueue};
 use super::quality_upgrade_worker::compare_ordinal;
@@ -51,7 +54,7 @@ use crate::services::you_tube::YouTubeResolver;
 use crate::services::you_tube::you_tube_resolver::Failure;
 
 /// What AcoustID says of one library file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum AcoustIdAnswer {
     /// It is the song its tags say: no second opinion needed. `stored` when the tag check said so.
     Confirmed { stored: bool },
@@ -59,8 +62,8 @@ enum AcoustIdAnswer {
     NoAnswer,
     /// fpcalc cannot read the file, so there is nothing to compare either.
     Unreadable,
-    /// AcoustID cannot vouch for it, or doubts it, or there is no AcoustID to ask.
-    Unsettled,
+    /// AcoustID cannot vouch for it, or doubts it, or there is no AcoustID to ask (None).
+    Unsettled(Option<VerificationResult>),
 }
 
 /// What the preview says of one library file.
@@ -76,8 +79,13 @@ pub enum Compared {
     Busy,
     /// fpcalc could not read the library file. Tried again a few times, then it has no copy.
     FileUnreadable,
-    /// The two were compared ([`preview_check::judge`]).
-    Heard { heard: Heard, bit_error: f64 },
+    /// The two were compared ([`preview_check::judge`]). `album_agrees` when the preview is a
+    /// YouTube Music row from the file's own album, the only kind that may replace it.
+    Heard {
+        heard: Heard,
+        bit_error: f64,
+        album_agrees: bool,
+    },
 }
 
 /// What the check asks of YouTube, behind a seam so tests need no shim and no fpcalc.
@@ -140,6 +148,7 @@ impl YoutubeChecker for AppYoutubeChecker {
             &self.fingerprinter,
             path,
             &request,
+            &song.album,
             preview,
             timeout,
         )
@@ -151,14 +160,15 @@ impl YoutubeChecker for AppYoutubeChecker {
     }
 }
 
-/// The file at `path` against `preview`, as [`preview_check::check`] compares a download, with a
-/// shim that did not send the preview told apart from there being nothing to compare. The preview
-/// is fetched in the shim's background lane, so a play never waits behind it.
+/// The file at `path`, tagged with `album`, against `preview`, as [`preview_check::check`] compares
+/// a download, with a shim that did not send the preview told apart from there being nothing to
+/// compare. The preview is fetched in the shim's background lane, so a play never waits behind it.
 pub async fn hear(
     source: &dyn PreviewSource,
     fingerprinter: &AudioFingerprinter,
     path: &Path,
     request: &PreviewRequest<'_>,
+    album: &str,
     mut preview: PreviewFacts,
     timeout_seconds: i32,
 ) -> Compared {
@@ -207,6 +217,7 @@ pub async fn hear(
     Compared::Heard {
         heard: verdict,
         bit_error: comparison.bit_error,
+        album_agrees: LibraryReviewSweepWorker::preview_album_agrees(preview.album.as_deref(), album),
     }
 }
 
@@ -229,6 +240,9 @@ pub struct YoutubeCheckState {
     /// Questions raised.
     #[serde(default)]
     pub asked: i32,
+    /// Songs replaced through Wrong song instead of asked about (`YoutubeCheckAutoReplace`).
+    #[serde(default)]
+    pub replaced: i32,
     /// Songs that sound like their preview.
     #[serde(default)]
     pub alike: i32,
@@ -358,6 +372,7 @@ pub struct YoutubeCheckStatus {
     pub total: i32,
     pub done: i32,
     pub asked: i32,
+    pub replaced: i32,
     pub alike: i32,
     pub unsure: i32,
     pub no_copy: i32,
@@ -387,6 +402,9 @@ pub struct LibraryYoutubeCheck {
     /// AcoustID, asked about a song the tag check has not confirmed. None, or not ready (no key,
     /// downloads not checked), compares every song with YouTube.
     acoustid: Option<Arc<dyn IReviewSweepVerifier>>,
+    /// The review sweep, whose rule and steps replace a song the check clearly hears as another
+    /// when `YoutubeCheckAutoReplace` is on. None only ever asks.
+    replacing: Option<Arc<LibraryReviewSweepWorker>>,
 
     files: Mutex<Option<Arc<Vec<String>>>>,
     /// Changes when a run starts, so work in flight for the last one drops its result.
@@ -447,6 +465,7 @@ impl LibraryYoutubeCheck {
             scope: None,
             identities: None,
             acoustid: None,
+            replacing: None,
             files: Mutex::new(None),
             generation: AtomicI32::new(0),
             unavailable_in_a_row: AtomicI32::new(0),
@@ -472,6 +491,12 @@ impl LibraryYoutubeCheck {
     ) -> Self {
         self.identities = Some(identities);
         self.acoustid = Some(acoustid);
+        self
+    }
+
+    /// Replacing by the review sweep's rule, behind `YoutubeCheckAutoReplace`.
+    pub fn with_replacing(mut self, sweep: Arc<LibraryReviewSweepWorker>) -> Self {
+        self.replacing = Some(sweep);
         self
     }
 
@@ -684,7 +709,9 @@ impl LibraryYoutubeCheck {
         else {
             return Self::IDLE_CHECK;
         };
-        let song = swept.song;
+        let song = swept.song.clone();
+        // What AcoustID asked about the file, which a replacement carries on with.
+        let mut acoustid_question = None;
         // A song with no artist and title tag has no names to look its preview up by.
         let answer = if !swept.tagged {
             Compared::NoCopy
@@ -707,7 +734,10 @@ impl LibraryYoutubeCheck {
                     self.lookup_misses.store(0, Ordering::SeqCst);
                     Compared::FileUnreadable
                 }
-                AcoustIdAnswer::NoAnswer | AcoustIdAnswer::Unsettled => {
+                answer @ (AcoustIdAnswer::NoAnswer | AcoustIdAnswer::Unsettled(_)) => {
+                    if let AcoustIdAnswer::Unsettled(question) = answer {
+                        acoustid_question = question;
+                    }
                     self.lookup_misses.store(0, Ordering::SeqCst);
                     let checked = self.checker.check(Path::new(&full), &song);
                     match tokio::time::timeout(Self::CHECK_TIMEOUT, checked).await {
@@ -791,16 +821,36 @@ impl LibraryYoutubeCheck {
             self.unavailable_in_a_row.store(0, Ordering::SeqCst);
         }
 
-        let mut asked = false;
+        let (mut asked, mut replaced) = (false, false);
         let (mut alike, mut unsure, mut no_copy) = (0, 0, 0);
         match answer {
-            Compared::Heard { heard, bit_error } => match heard {
+            Compared::Heard {
+                heard,
+                bit_error,
+                album_agrees,
+            } => match heard {
                 Heard::Mismatch => {
+                    match self
+                        .replace(keeper, &full, &swept, acoustid_question, bit_error, album_agrees)
+                        .await
+                    {
+                        Replacing::Done => replaced = true,
+                        Replacing::Declined => {}
+                        // Soulseek is out: the song is tried again, without counting it.
+                        Replacing::Waits => {
+                            return self.hold(
+                                "Waiting",
+                                Some("Soulseek is out; trying that song again."),
+                                interval,
+                            );
+                        }
+                    }
                     // An open question AcoustID could not settle about this file hears it first.
-                    asked = self.notices.add_finding(&full, Self::FINDING)
-                        || self
-                            .notices
-                            .add_library_question(keeper, &full, &song, Self::QUESTION);
+                    asked = !replaced
+                        && (self.notices.add_finding(&full, Self::FINDING)
+                            || self
+                                .notices
+                                .add_library_question(keeper, &full, &song, Self::QUESTION));
                     if asked {
                         info!(
                             "Asking {keeper} about '{} - {}' from the library: it sounds nothing like the song on YouTube ({bit_error:.3} of its bits differ)",
@@ -819,6 +869,7 @@ impl LibraryYoutubeCheck {
             s.cursor = target.to_string();
             s.done += 1;
             s.asked += i32::from(asked);
+            s.replaced += i32::from(replaced);
             s.alike += alike;
             s.unsure += unsure;
             s.no_copy += no_copy;
@@ -833,22 +884,54 @@ impl LibraryYoutubeCheck {
 
     /// What AcoustID says of the song: the tag check's answer when the file is unchanged since,
     /// else a lookup of its own, in AcoustID's background lane.
+    /// A song heard as another is replaced instead of asked about only with replacing set up,
+    /// and only one AcoustID has never heard: the review sweep's preview rule decides the rest
+    /// (`YoutubeCheckAutoReplace`, a YouTube Music row from the file's album, the day's cap).
+    async fn replace(
+        &self,
+        keeper: &str,
+        full: &str,
+        file: &SweptFile,
+        acoustid_question: Option<VerificationResult>,
+        bit_error: f64,
+        album_agrees: bool,
+    ) -> Replacing {
+        let (Some(sweep), Some(question)) = (self.replacing.as_ref(), acoustid_question) else {
+            return Replacing::Declined;
+        };
+        if question.reason != InconclusiveReason::NoEntry {
+            return Replacing::Declined;
+        }
+        let question = VerificationResult {
+            reason: InconclusiveReason::DiffersFromYouTube,
+            evidence: Some(format!("{}% of its bits differ", (bit_error * 100.0).round())),
+            ..question
+        };
+        let witness = PreviewWitness {
+            bit_error,
+            album_agrees,
+        };
+        sweep
+            .replace_for_youtube_check(keeper, full, file, &question, witness)
+            .await
+    }
+
     async fn acoustid_answer(&self, full: &str, song: &Song) -> AcoustIdAnswer {
         if self.confirmed_by_tag_check(full).await {
             return AcoustIdAnswer::Confirmed { stored: true };
         }
         let Some(verifier) = self.acoustid.as_ref().filter(|v| v.is_ready()) else {
-            return AcoustIdAnswer::Unsettled;
+            return AcoustIdAnswer::Unsettled(None);
         };
         let lookup = verifier.verify(full, Some(&song.artist), Some(&song.title));
         let Ok(verdict) = tokio::time::timeout(Self::CHECK_TIMEOUT, lookup).await else {
             return AcoustIdAnswer::NoAnswer;
         };
-        match LibraryReviewSweepWorker::classify(verdict).0 {
-            Outcome::Fine => AcoustIdAnswer::Confirmed { stored: false },
-            Outcome::LookupFailed => AcoustIdAnswer::NoAnswer,
-            Outcome::NotFingerprinted | Outcome::Undecodable => AcoustIdAnswer::Unreadable,
-            Outcome::Ask => AcoustIdAnswer::Unsettled,
+        match LibraryReviewSweepWorker::classify(verdict) {
+            (Outcome::Fine, _) => AcoustIdAnswer::Confirmed { stored: false },
+            (Outcome::LookupFailed, _) => AcoustIdAnswer::NoAnswer,
+            (Outcome::NotFingerprinted | Outcome::Undecodable, _) => AcoustIdAnswer::Unreadable,
+            (Outcome::Ask, question) => AcoustIdAnswer::Unsettled(Some(question)),
         }
     }
 
@@ -911,6 +994,7 @@ impl LibraryYoutubeCheck {
             total: s.total,
             done: s.done,
             asked: s.asked,
+            replaced: s.replaced,
             alike: s.alike,
             unsure: s.unsure,
             no_copy: s.no_copy,

@@ -679,7 +679,11 @@ AcoustID vouches for (by the tag check's last answer, or a lookup of its own) is
 quickly. A song that sounds nothing like a preview whose title, artist and length are the song's
 becomes a Review question, or is added to an open question AcoustID could not settle, whose
 fingerprint is then never sent to AcoustID; one that may be another version, or has no preview, is
-left alone. Nothing is changed or removed. It compares `LIBRARY_ACTIONS_YOUTUBE_CHECK_PER_HOUR`
+left alone. Nothing is changed or removed, unless `LIBRARY_ACTIONS_YOUTUBE_CHECK_AUTO_REPLACE` is
+on (off by default): then a song AcoustID has never heard whose YouTube Music row from the file's
+own album clearly sounds nothing like it is replaced through Wrong song by the rule, needs and
+daily limit of `LIBRARY_ACTIONS_REVIEW_SWEEP_AUTO_REPLACE_PREVIEW`, and Review keeps a note of what
+was replaced. It compares `LIBRARY_ACTIONS_YOUTUBE_CHECK_PER_HOUR`
 (default 30, 0 is off) songs an hour, one at a time and only while nothing is downloading, pauses while 50 library questions wait in Review,
 and rests an hour when the shim stops answering. It needs library actions and Review on and
 someone on the allowed list to ask. Where it is is kept in `youtube-check.json` beside the
