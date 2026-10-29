@@ -258,7 +258,7 @@ pub fn searched_artist_country(root: &Value, name: &str) -> String {
 /// Whether a release date ("2009", "2009-09" or "2009-09-08") is earlier than a known one.
 /// Only the part both dates have is compared, so "2009" is not earlier than "2009-09-08";
 /// when that part is the same, the more precise date wins.
-fn is_earlier_date(date: &str, known: &str) -> bool {
+pub(crate) fn is_earlier_date(date: &str, known: &str) -> bool {
     let (date, known) = (date.as_bytes(), known.as_bytes());
     let shared = date.len().min(known.len());
     match date[..shared].cmp(&known[..shared]) {

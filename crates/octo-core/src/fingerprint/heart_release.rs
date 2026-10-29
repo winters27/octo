@@ -1,17 +1,20 @@
 //! The release a heart downloads from, worked out without asking anything: the questions a heart
-//! asks MusicBrainz and Deezer, and their answers read into compact rows. The callers ask the
-//! questions and pass the rows in.
+//! asks MusicBrainz and Deezer, their answers read into compact rows, the recordings the person
+//! heard, the release they listened from, and the release groups Lidarr is asked for, in order.
+//! The callers ask the questions and pass the rows in.
 //!
 //! [`RecordedAnswers`] is the one part that reads files: answers recorded for tests.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use parking_lot::Mutex;
+use regex::Regex;
 use serde_json::Value;
 
 use crate::common::{SongIdentity, dotnet};
-use crate::fingerprint::music_brainz_client::is_mbid;
+use crate::fingerprint::music_brainz_client::{is_earlier_date, is_mbid};
 use crate::models::domain::explicit_status;
 
 /// The page size of the carriers question.
@@ -23,6 +26,25 @@ pub const CARRIERS_PAGE_AFTER_TIMEOUT: u32 = 25;
 /// How many album search results the catalog album is looked for among: the search asks for
 /// this many.
 pub const ALBUM_SEARCH_RESULTS: usize = 5;
+
+/// How many barcode search results, in search order, are looked up.
+pub const BARCODE_RESULTS_LOOKED_UP: usize = 4;
+
+/// The most recordings the heard recording set holds.
+pub const MOST_HEARD_RECORDINGS: usize = 6;
+
+/// The most release groups the walk takes after the listened-from one.
+pub const MOST_PICKS_AFTER_LISTENED: usize = 3;
+
+/// MusicBrainz's Various Artists: the credit of a compilation, never the heard artist.
+pub const VARIOUS_ARTISTS_ID: &str = "89ad4ac3-39f7-470e-963a-56509c546377";
+
+/// The countries whose artists count a release issued for all of Europe ("XE") as issued at home.
+const EUROPE: &[&str] = &[
+    "AD", "AL", "AT", "BA", "BE", "BG", "BY", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FO", "FR",
+    "GB", "GG", "GI", "GR", "HR", "HU", "IE", "IM", "IS", "IT", "JE", "LI", "LT", "LU", "LV", "MC", "MD",
+    "ME", "MK", "MT", "NL", "NO", "PL", "PT", "RO", "RS", "RU", "SE", "SI", "SK", "SM", "UA", "VA", "XK",
+];
 
 // ---- the questions --------------------------------------------------------------------------
 
@@ -577,6 +599,621 @@ impl RecordedAnswers {
             .filter(|line| !asked.contains(&line.question))
             .collect()
     }
+}
+
+// ---- the song -------------------------------------------------------------------------------
+
+/// What a heart knows of the song: the catalog row it was hearted from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeartSong {
+    pub artist: String,
+    pub title: String,
+    /// The album title, "" when the heart has none.
+    pub album: String,
+    pub disc: Option<u32>,
+    pub position: Option<u32>,
+    /// How many tracks the catalog album has, None when unknown.
+    pub total_tracks: Option<u32>,
+    /// The ISRC, "" when the routing has none.
+    pub isrc: String,
+    /// The length in seconds, 0 when unknown.
+    pub seconds: u32,
+    /// Whether its words are explicit, as `explicit_status::from_catalog` reads it.
+    pub explicit: Option<i32>,
+}
+
+impl HeartSong {
+    fn code(&self) -> Option<String> {
+        SongIdentity::normalize_isrc(&self.isrc)
+    }
+}
+
+// ---- the catalog album from its title -------------------------------------------------------
+
+/// The album search results the catalog album may be, in search order: the first
+/// [`ALBUM_SEARCH_RESULTS`], and of those an album another artist leads only when the song has
+/// an ISRC to prove it by.
+pub fn catalog_album_candidates<'a>(
+    song: &HeartSong,
+    hits: &'a [CatalogAlbumHit],
+) -> Vec<&'a CatalogAlbumHit> {
+    let has_code = song.code().is_some();
+    let artist = SongIdentity::key(&song.artist);
+    hits.iter()
+        .take(ALBUM_SEARCH_RESULTS)
+        .filter(|hit| has_code || SongIdentity::key(&hit.artist) == artist)
+        .collect()
+}
+
+/// Whether a searched album is the song's catalog album. When both track counts are known they
+/// are equal, and the track at the song's disc and position carries its ISRC; with no ISRC, that
+/// track has the song's title (tails and all), fits its length, and has its explicit value when
+/// both say one. `album` is None when the album itself could not be read.
+pub fn catalog_album_fits(song: &HeartSong, album: Option<&CatalogAlbum>, tracks: &[CatalogTrack]) -> bool {
+    if let (Some(total), Some(count)) = (song.total_tracks, album.and_then(|album| album.track_count))
+        && total != count
+    {
+        return false;
+    }
+    let (Some(disc), Some(position)) = (song.disc, song.position) else {
+        return false;
+    };
+    let code = song.code();
+    let title = SongIdentity::key(&song.title);
+    tracks
+        .iter()
+        .filter(|track| track.disc == Some(disc) && track.position == Some(position))
+        .any(|track| match &code {
+            Some(code) => track.isrc == *code,
+            None => {
+                let same_edit = match (song.explicit, track.explicit) {
+                    (Some(wanted), Some(said)) => wanted == said,
+                    _ => true,
+                };
+                same_edit
+                    && SongIdentity::key(&track.title) == title
+                    && fits(track.seconds.checked_mul(1000), song.seconds)
+            }
+        })
+}
+
+// ---- the release listened from --------------------------------------------------------------
+
+/// The releases of a barcode search worth looking up: of the first
+/// [`BARCODE_RESULTS_LOOKED_UP`] in search order, those whose barcode is the UPC as a number.
+pub fn releases_to_look_up(hits: &[BarcodeHit], upc: &str) -> Vec<String> {
+    let Some(wanted) = as_number(upc) else {
+        return Vec::new();
+    };
+    hits.iter()
+        .take(BARCODE_RESULTS_LOOKED_UP)
+        .filter(|hit| as_number(&hit.barcode) == Some(wanted))
+        .map(|hit| hit.id.clone())
+        .collect()
+}
+
+/// The release the person listened from, among the looked-up releases a barcode names: the one
+/// carrying a recording the code lookup lists, else the one whose track at the song's disc and
+/// position fits its length; then the earliest date; then the id.
+pub fn listened_release<'a>(
+    song: &HeartSong,
+    releases: &'a [BarcodeRelease],
+    code_recordings: &[CodeRecording],
+) -> Option<&'a BarcodeRelease> {
+    let code_ids: HashSet<&str> = code_recordings
+        .iter()
+        .map(|recording| recording.id.as_str())
+        .collect();
+    releases.iter().min_by_key(|release| {
+        let carries_code = release
+            .media
+            .iter()
+            .flat_map(|medium| &medium.tracks)
+            .any(|track| code_ids.contains(track.recording_id.as_str()));
+        let position_fits = track_at(release, song.disc, song.position)
+            .is_some_and(|track| fits(track.length_ms, song.seconds));
+        let date = if release.date.is_empty() {
+            "9999"
+        } else {
+            release.date.as_str()
+        };
+        (!carries_code, !position_fits, date, release.id.as_str())
+    })
+}
+
+// ---- the recordings the person heard --------------------------------------------------------
+
+/// The recordings the person heard and where they listened from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeardIdentity {
+    /// The recordings the person heard: the listened release's own track first, then the ISRC's;
+    /// at most [`MOST_HEARD_RECORDINGS`]. Empty when the song gives no identity.
+    pub recordings: Vec<String>,
+    /// The same recordings before the cap of [`MOST_HEARD_RECORDINGS`].
+    pub recordings_uncapped: Vec<String>,
+    /// The listened release's track at the song's disc and position, when it is the song.
+    pub heard_track: Option<String>,
+    /// The release the person listened from.
+    pub listened_release: Option<String>,
+    /// Its release group: the first pick, known without the carriers. None when the recordings
+    /// are not known.
+    pub listened_group: Option<String>,
+    /// The artist whose own releases come first, "" when none is known.
+    pub artist_id: String,
+    /// Every artist credited on the kept ISRC recordings and the heard track, in order.
+    pub artist_ids: Vec<String>,
+}
+
+/// The recordings the person heard. The code lookup's recordings of the song's ISRC that are
+/// credited to the heard artist (by name, or by an artist the listened release or its heard
+/// track credits, never Various Artists) and fit the song's length; all of them when the song or
+/// none of them has a length. Of several, none first released after the code's year (all when
+/// every one is). When their notes still differ the code names more than one mix: the heard
+/// track's recording when it is one of them, else those first released in the code's year, and
+/// when the notes still differ the code gives nothing. The heard track comes first.
+pub fn identify(
+    song: &HeartSong,
+    code_recordings: &[CodeRecording],
+    listened: Option<&BarcodeRelease>,
+) -> HeardIdentity {
+    let artist_key = SongIdentity::key(&song.artist);
+    let heard = listened.and_then(|release| heard_track(song, release));
+    let heard_id = heard
+        .map(|track| track.recording_id.clone())
+        .filter(|id| !id.is_empty());
+
+    let listened_artists: HashSet<&str> = listened
+        .into_iter()
+        .flat_map(|release| &release.credits)
+        .chain(heard.into_iter().flat_map(|track| &track.credits))
+        .map(|credit| credit.artist_id.as_str())
+        .filter(|id| !id.is_empty() && *id != VARIOUS_ARTISTS_ID)
+        .collect();
+    let credited: Vec<&CodeRecording> = code_recordings
+        .iter()
+        .filter(|recording| {
+            recording.credits.iter().any(|credit| {
+                names_artist(credit, &artist_key) || listened_artists.contains(credit.artist_id.as_str())
+            })
+        })
+        .collect();
+    let with_length: Vec<&CodeRecording> = credited
+        .iter()
+        .copied()
+        .filter(|recording| recording.length_ms.is_some())
+        .collect();
+    let mut kept: Vec<&CodeRecording> = if song.seconds > 0 && !with_length.is_empty() {
+        with_length
+            .into_iter()
+            .filter(|recording| fits(recording.length_ms, song.seconds))
+            .collect()
+    } else {
+        credited
+    };
+
+    let year = song.code().as_deref().and_then(code_year);
+    if kept.len() > 1
+        && let Some(year) = year
+    {
+        let before: Vec<&CodeRecording> = kept
+            .iter()
+            .copied()
+            .filter(|recording| year_of(&recording.first_release_date).is_none_or(|first| first <= year))
+            .collect();
+        if !before.is_empty() {
+            kept = before;
+        }
+    }
+    if kept.len() > 1 && notes_differ(&kept) {
+        if let Some(id) = &heard_id
+            && kept.iter().any(|recording| recording.id == *id)
+        {
+            kept.retain(|recording| recording.id == *id);
+        } else if let Some(year) = year {
+            let same_year: Vec<&CodeRecording> = kept
+                .iter()
+                .copied()
+                .filter(|recording| year_of(&recording.first_release_date) == Some(year))
+                .collect();
+            if !same_year.is_empty() {
+                kept = same_year;
+            }
+        }
+        if kept.len() > 1 && notes_differ(&kept) {
+            kept.clear();
+        }
+    }
+
+    let mut recordings_uncapped: Vec<String> = heard_id.iter().cloned().collect();
+    recordings_uncapped.extend(
+        kept.iter()
+            .filter(|recording| heard_id.as_ref() != Some(&recording.id))
+            .map(|recording| recording.id.clone()),
+    );
+    let recordings: Vec<String> = recordings_uncapped
+        .iter()
+        .take(MOST_HEARD_RECORDINGS)
+        .cloned()
+        .collect();
+
+    let mut artist_id = kept
+        .iter()
+        .flat_map(|recording| &recording.credits)
+        .chain(heard.into_iter().flat_map(|track| &track.credits))
+        .chain(listened.into_iter().flat_map(|release| &release.credits))
+        .filter(|credit| names_artist(credit, &artist_key))
+        .map(|credit| credit.artist_id.as_str())
+        .find(|id| !id.is_empty() && *id != VARIOUS_ARTISTS_ID)
+        .or_else(|| {
+            kept.first()
+                .and_then(|recording| recording.credits.first())
+                .map(|credit| credit.artist_id.as_str())
+        })
+        .unwrap_or_default()
+        .to_string();
+    if artist_id == VARIOUS_ARTISTS_ID {
+        artist_id.clear();
+    }
+
+    let mut artist_ids: Vec<String> = Vec::new();
+    for credit in kept
+        .iter()
+        .flat_map(|recording| &recording.credits)
+        .chain(heard.into_iter().flat_map(|track| &track.credits))
+    {
+        if !credit.artist_id.is_empty() && !artist_ids.contains(&credit.artist_id) {
+            artist_ids.push(credit.artist_id.clone());
+        }
+    }
+
+    let listened_group = listened
+        .filter(|_| !recordings.is_empty())
+        .map(|release| release.group.id.clone())
+        .filter(|id| !id.is_empty());
+    HeardIdentity {
+        recordings,
+        recordings_uncapped,
+        heard_track: heard_id,
+        listened_release: listened.map(|release| release.id.clone()),
+        listened_group,
+        artist_id,
+        artist_ids,
+    }
+}
+
+/// The listened release's track at the song's disc and position, when its title holds the
+/// song's core title and (both lengths known) its length fits, or when its length fits and both
+/// catalogs count the album's tracks alike.
+fn heard_track<'a>(song: &HeartSong, release: &'a BarcodeRelease) -> Option<&'a ReleaseTrack> {
+    let track = track_at(release, song.disc, song.position)?;
+    let length_ok = track.length_ms.is_none() || song.seconds == 0 || fits(track.length_ms, song.seconds);
+    let titled = SongIdentity::key(&track.title).contains(&core_key(&song.title));
+    let track_count: usize = release.media.iter().map(|medium| medium.tracks.len()).sum();
+    let same_count = song
+        .total_tracks
+        .is_some_and(|total| usize::try_from(total).is_ok_and(|total| total == track_count));
+    ((titled && length_ok) || (same_count && fits(track.length_ms, song.seconds))).then_some(track)
+}
+
+/// The track at a disc and position: the first medium at that position holding a track at it.
+fn track_at(release: &BarcodeRelease, disc: Option<u32>, position: Option<u32>) -> Option<&ReleaseTrack> {
+    let (disc, position) = (disc?, position?);
+    release
+        .media
+        .iter()
+        .filter(|medium| medium.position == Some(disc))
+        .flat_map(|medium| &medium.tracks)
+        .find(|track| track.position == Some(position))
+}
+
+fn names_artist(credit: &CreditedArtist, artist_key: &str) -> bool {
+    SongIdentity::key(&credit.name) == artist_key || SongIdentity::key(&credit.artist_name) == artist_key
+}
+
+fn notes_differ(recordings: &[&CodeRecording]) -> bool {
+    recordings
+        .iter()
+        .any(|recording| recording.note != recordings[0].note)
+}
+
+/// Whether a length in milliseconds is a song's length in seconds: within 7 s or 4%, whichever
+/// is more. False when either is unknown.
+fn fits(length_ms: Option<u32>, seconds: u32) -> bool {
+    let Some(ms) = length_ms.filter(|ms| *ms > 0) else {
+        return false;
+    };
+    if seconds == 0 {
+        return false;
+    }
+    let seconds = f64::from(seconds);
+    (f64::from(ms) / 1000.0 - seconds).abs() <= f64::max(7.0, seconds * 0.04)
+}
+
+/// The year an ISRC was assigned, from its characters 6 and 7 (40 and up are 19xx).
+fn code_year(code: &str) -> Option<i32> {
+    let digits: String = code.trim().chars().skip(5).take(2).collect();
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let short: i32 = digits.parse().ok()?;
+    Some(if short >= 40 { 1900 + short } else { 2000 + short })
+}
+
+/// The year a date starts with, None when it does not start with one.
+fn year_of(date: &str) -> Option<i32> {
+    let digits = year_prefix(date);
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn year_prefix(date: &str) -> &str {
+    date.char_indices().nth(4).map_or(date, |(end, _)| &date[..end])
+}
+
+/// A barcode as a number, so "0602547673503" and "602547673503" are one code.
+fn as_number(code: &str) -> Option<u128> {
+    code.trim().parse().ok()
+}
+
+static BRACKETED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s*[(\[][^)\]]*[)\]]").expect("the bracket pattern parses"));
+static DASH_TAIL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\s+-\s+.*$").expect("the dash tail pattern parses"));
+
+/// A title's core: without its bracketed parts or a " - " tail, as [`SongIdentity::key`].
+fn core_key(title: &str) -> String {
+    let plain = BRACKETED.replace_all(title, " ");
+    SongIdentity::key(&DASH_TAIL.replace(&plain, ""))
+}
+
+// ---- the order and the walk -----------------------------------------------------------------
+
+/// Every release group carrying the heard recordings, in the order a listener expects them:
+/// the listened-from group first; then own albums issued at home (Album with no secondary type,
+/// Soundtrack or Live), own singles and EPs named for the song issued at home, own albums first
+/// issued elsewhere, own singles and EPs named for the song first issued elsewhere, other own
+/// singles and EPs, own compilations, other own groups, and groups other artists lead. A group
+/// is issued at home when a release of it came out in the artist's country (or worldwide, or
+/// across Europe for a European artist) in the year the group first carried the recording.
+/// Within each kind, groups with a release in or after the ISRC's year come first, then the
+/// earliest release date (a more precise date of the same day, month or year first), then the
+/// group id. `home_country` is the artist's country, "" when unknown; `carriers` holds every
+/// official release carrying each recording of `identity.recordings` (others are passed over).
+pub fn order(
+    song: &HeartSong,
+    identity: &HeardIdentity,
+    home_country: &str,
+    carriers: &[Carriers],
+) -> Vec<String> {
+    let ranked = rank(song, identity, home_country, carriers);
+    ranked
+        .listened
+        .iter()
+        .cloned()
+        .chain(
+            ranked
+                .groups
+                .into_iter()
+                .filter(|(id, _)| ranked.listened.as_ref() != Some(id))
+                .map(|(id, _)| id),
+        )
+        .collect()
+}
+
+/// The release groups Lidarr is asked for, in order: the listened-from group, then at most
+/// [`MOST_PICKS_AFTER_LISTENED`] groups the artist leads; groups other artists lead only when
+/// the artist leads none but the listened-from one. Arguments as [`order`].
+pub fn walk(
+    song: &HeartSong,
+    identity: &HeardIdentity,
+    home_country: &str,
+    carriers: &[Carriers],
+) -> Vec<String> {
+    let ranked = rank(song, identity, home_country, carriers);
+    let rest: Vec<(String, bool)> = ranked
+        .groups
+        .into_iter()
+        .filter(|(id, _)| ranked.listened.as_ref() != Some(id))
+        .collect();
+    let any_own = rest.iter().any(|(_, own)| *own);
+    let mut picks: Vec<String> = ranked.listened.into_iter().collect();
+    picks.extend(
+        rest.into_iter()
+            .filter(|(_, own)| *own == any_own)
+            .take(MOST_PICKS_AFTER_LISTENED)
+            .map(|(id, _)| id),
+    );
+    picks
+}
+
+/// The listened-from group and every carrier group in order, each with whether the artist
+/// leads it.
+struct Ranked {
+    listened: Option<String>,
+    groups: Vec<(String, bool)>,
+}
+
+/// One release group as the carriers describe it.
+struct CarrierGroup<'a> {
+    facts: &'a GroupFacts,
+    own: bool,
+    /// The earliest release date, "" when none is known.
+    date: &'a str,
+    /// The latest release year, 0 when none is known.
+    latest_year: i32,
+    /// The years a release of the group came out at home.
+    home_years: HashSet<&'a str>,
+    release_titles: Vec<&'a str>,
+}
+
+fn rank(song: &HeartSong, identity: &HeardIdentity, home_country: &str, carriers: &[Carriers]) -> Ranked {
+    // Recordings in id order, so the release a group is first seen on does not depend on the
+    // order the caller passes them in.
+    let mut chosen: Vec<&Carriers> = carriers
+        .iter()
+        .filter(|carried| identity.recordings.contains(&carried.recording_id))
+        .collect();
+    chosen.sort_by_key(|carried| carried.recording_id.as_str());
+
+    let mut groups: Vec<CarrierGroup> = Vec::new();
+    let mut at: HashMap<&str, usize> = HashMap::new();
+    for release in chosen.iter().flat_map(|carried| &carried.releases) {
+        let index = *at.entry(release.group.id.as_str()).or_insert_with(|| {
+            groups.push(CarrierGroup {
+                facts: &release.group,
+                own: release.lead_artist_id == identity.artist_id,
+                date: "",
+                latest_year: 0,
+                home_years: HashSet::new(),
+                release_titles: Vec::new(),
+            });
+            groups.len() - 1
+        });
+        let group = &mut groups[index];
+        if let Some(year) = year_of(&release.date) {
+            group.latest_year = group.latest_year.max(year);
+        }
+        group.release_titles.push(release.title.as_str());
+        if !release.date.is_empty() {
+            if group.date.is_empty() || is_earlier_date(&release.date, group.date) {
+                group.date = release.date.as_str();
+            }
+            if at_home(&release.country, home_country) {
+                group.home_years.insert(year_prefix(&release.date));
+            }
+        }
+    }
+
+    let listened = identity
+        .listened_group
+        .clone()
+        .or_else(|| titled_group(song, identity, &groups));
+
+    let core = core_key(&song.title);
+    let year = song.code().as_deref().and_then(code_year);
+    let mut placed: Vec<Placed> = groups
+        .iter()
+        .map(|group| Placed {
+            first: u8::from(listened.as_deref() != Some(group.facts.id.as_str())),
+            kind: kind(group, &core) + u8::from(year.is_some_and(|year| group.latest_year < year)),
+            date: sort_date(group),
+            id: &group.facts.id,
+            own: group.own,
+        })
+        .collect();
+    placed.sort_by_key(|group| (group.first, group.kind, group.date, group.id));
+    // Dates of one kind compare by the part both have, the more precise date first, which text
+    // order does not give: each group moves ahead of the ones it is earlier than.
+    let mut ordered: Vec<Placed> = Vec::with_capacity(placed.len());
+    for group in placed {
+        let mut at = ordered.len();
+        while at > 0 && group.goes_ahead_of(&ordered[at - 1]) {
+            at -= 1;
+        }
+        ordered.insert(at, group);
+    }
+    Ranked {
+        listened,
+        groups: ordered
+            .into_iter()
+            .map(|group| (group.id.to_string(), group.own))
+            .collect(),
+    }
+}
+
+/// One carrier group's place in the order.
+struct Placed<'a> {
+    /// 0 for the listened-from group, 1 for every other.
+    first: u8,
+    kind: u8,
+    /// The earliest release date, "9999" when none is known.
+    date: &'a str,
+    id: &'a str,
+    own: bool,
+}
+
+impl Placed<'_> {
+    /// Whether this group goes ahead of `other`, which text order put first: the same kind, and
+    /// an earlier date by the part both have.
+    fn goes_ahead_of(&self, other: &Placed) -> bool {
+        (self.first, self.kind) == (other.first, other.kind) && is_earlier_date(self.date, other.date)
+    }
+}
+
+/// A group's earliest release date, "9999" when none is known, so undated groups sort last.
+fn sort_date<'a>(group: &CarrierGroup<'a>) -> &'a str {
+    if group.date.is_empty() { "9999" } else { group.date }
+}
+
+/// Without a listened-from release: the carrier group a release of which carries the album's
+/// title, brackets and " - " tails aside; the earliest, then the group id.
+fn titled_group(song: &HeartSong, identity: &HeardIdentity, groups: &[CarrierGroup]) -> Option<String> {
+    let wanted = core_key(&song.album);
+    if wanted.is_empty() || identity.recordings.is_empty() {
+        return None;
+    }
+    let mut named: Vec<&CarrierGroup> = groups
+        .iter()
+        .filter(|group| group.release_titles.iter().any(|title| core_key(title) == wanted))
+        .collect();
+    named.sort_by_key(|group| (sort_date(group), group.facts.id.as_str()));
+    let mut best: Option<&CarrierGroup> = None;
+    for group in named {
+        let better = match best {
+            None => true,
+            Some(known) => {
+                !group.date.is_empty() && (known.date.is_empty() || is_earlier_date(group.date, known.date))
+            }
+        };
+        if better {
+            best = Some(group);
+        }
+    }
+    best.map(|group| group.facts.id.clone())
+}
+
+/// A group's kind, four steps apart so the step for an older group fits between two kinds.
+fn kind(group: &CarrierGroup, core: &str) -> u8 {
+    let facts = group.facts;
+    let primary = facts.primary_type.as_str();
+    let plain = facts.secondary_types.is_empty();
+    let home = !group.date.is_empty() && group.home_years.contains(year_prefix(group.date));
+    if !group.own {
+        28
+    } else if primary == "Album"
+        && facts
+            .secondary_types
+            .iter()
+            .all(|secondary| secondary == "Soundtrack" || secondary == "Live")
+    {
+        if home { 4 } else { 12 }
+    } else if (primary == "Single" || primary == "EP")
+        && plain
+        && SongIdentity::key(&facts.title).contains(core)
+    {
+        if home { 8 } else { 16 }
+    } else if (primary == "Single" || primary == "EP") && plain {
+        20
+    } else if primary == "Album"
+        && facts
+            .secondary_types
+            .iter()
+            .any(|secondary| secondary == "Compilation")
+    {
+        24
+    } else {
+        26
+    }
+}
+
+/// Whether a release's country is the artist's home: the artist's own country, worldwide, or
+/// all of Europe for a European artist.
+fn at_home(country: &str, home: &str) -> bool {
+    !home.is_empty()
+        && !country.is_empty()
+        && (country == home || country == "XW" || (country == "XE" && EUROPE.contains(&home)))
 }
 
 #[cfg(test)]
