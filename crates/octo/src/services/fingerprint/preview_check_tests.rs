@@ -685,6 +685,8 @@ fn each_lookup_failure_maps_to_its_preview_outcome() {
     assert_eq!(outcome_of(Failure::Busy), PreviewOutcome::Busy);
     assert_eq!(outcome_of(Failure::Unreachable), PreviewOutcome::Unreachable);
     assert_eq!(outcome_of(Failure::Other), PreviewOutcome::Unreachable);
+    assert_eq!(outcome_of(Failure::Gone), PreviewOutcome::Unreachable);
+    assert_eq!(outcome_of(Failure::Refused), PreviewOutcome::Unreachable);
 }
 
 /// Both lookups answering with nothing is the one case that is "no video".

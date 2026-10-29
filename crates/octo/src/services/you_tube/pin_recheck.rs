@@ -175,11 +175,15 @@ impl PinRecheck {
                     Lookup::Found(hit) if !r.refuses_video(&hit.video_id) => Some(hit),
                     Lookup::Found(_) | Lookup::None => None,
                     Lookup::Failed(Failure::Other) => return Checks::Failed,
+                    // Only a fresh lookup answers gone or refused; here they fail the check as
+                    // any other answer it cannot use does.
+                    Lookup::Failed(Failure::Gone | Failure::Refused) => return Checks::Failed,
                     Lookup::Failed(Failure::Busy | Failure::Unreachable) => return Checks::Stop,
                 }
             }
             Lookup::Failed(Failure::Busy | Failure::Unreachable) => return Checks::Stop,
             Lookup::Failed(Failure::Other) => return Checks::Failed,
+            Lookup::Failed(Failure::Gone | Failure::Refused) => return Checks::Failed,
         };
 
         match hit {

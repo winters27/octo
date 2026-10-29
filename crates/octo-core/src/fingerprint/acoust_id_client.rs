@@ -195,6 +195,64 @@ impl AcoustIdLookup {
     }
 }
 
+/// One artist an answer credits on a recording, with its MusicBrainz id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnswerArtist {
+    pub id: Option<String>,
+    pub name: String,
+}
+
+/// One recording a result of AcoustID's whole answer links.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AnswerRecording {
+    pub id: String,
+    pub title: String,
+    pub artists: Vec<AnswerArtist>,
+    /// The recording's length in seconds.
+    pub duration_seconds: Option<f64>,
+    /// The ISRCs AcoustID copies from MusicBrainz for the recording, normalized.
+    pub isrcs: Vec<String>,
+    /// How many submissions tie the fingerprint to the recording.
+    pub sources: i64,
+}
+
+/// One result of AcoustID's whole answer: a fingerprint, its score and every recording it links.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AnswerResult {
+    /// AcoustID's own id for the fingerprint.
+    pub id: Option<String>,
+    pub score: f64,
+    pub recordings: Vec<AnswerRecording>,
+}
+
+/// AcoustID's whole lookup answer with `status: ok`: every result and every recording, with no cut.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AcoustIdAnswer {
+    pub results: Vec<AnswerResult>,
+}
+
+/// An answer whose status is not `ok`: AcoustID's error code and message.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnswerError {
+    pub code: Option<i64>,
+    pub message: Option<String>,
+}
+
+/// What one AcoustID lookup came to, as the heart gate reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AcoustIdOutcome {
+    /// AcoustID answered `status: ok`.
+    Answered(AcoustIdAnswer),
+    /// AcoustID has not answered yet: a 5xx, a 429, codes 5, 13 or 14, a timeout, a network error
+    /// or a body that cannot be read. Asked again later.
+    Busy,
+    /// AcoustID could not check this one fingerprint by its sound (codes 1, 2, 3, 7, 8, 9, 10, 11
+    /// and 19, any code it does not list, or none). Never sent again.
+    Unreadable { code: Option<i64> },
+    /// AcoustID is off: the `off` setting, or every key Octo has was rejected.
+    Off,
+}
+
 impl AcoustIdRelease {
     /// The release's core fields; everything else starts empty.
     pub fn new(

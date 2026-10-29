@@ -3,6 +3,7 @@
 
 pub mod acoust_id_client;
 pub mod check_line;
+pub mod heart_gate;
 pub mod music_brainz_client;
 pub mod recording_identity;
 pub mod speed_variant;

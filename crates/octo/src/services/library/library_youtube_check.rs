@@ -129,6 +129,7 @@ impl YoutubeChecker for AppYoutubeChecker {
             Err(Failure::Busy) => return Compared::Busy,
             // A lookup could not answer: not an answer, so the song is tried again.
             Err(Failure::Unreachable | Failure::Other) => return Compared::Unavailable,
+            Err(Failure::Gone | Failure::Refused) => return Compared::Unavailable,
         };
         let timeout = self
             .settings

@@ -18,6 +18,15 @@ use crate::services::library::ReplacementHandoff;
 /// The error is shared, so every waiter of one request sees the same error.
 pub type AcquisitionOutcome = Result<String, Arc<anyhow::Error>>;
 
+/// Why a play's acquisition resolved without a file it may serve, which a waiting play reads from
+/// its completion's error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PlayOutcome {
+    /// The gate refused the download, held it, or could not prove it is the version that played.
+    #[error("Octo could not prove this copy is the version that played")]
+    NotProven,
+}
+
 /// A one-shot completion: completed once, by the worker or by a drop, and awaited by everyone
 /// who joined the request. Waiters are woken as tasks of their own, so completing this never
 /// runs a waiting request's continuation (response headers, body writes, the client's whole

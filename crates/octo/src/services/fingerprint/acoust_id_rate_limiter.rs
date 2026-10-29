@@ -11,6 +11,22 @@ tokio::task_local! {
     static BACKGROUND_FLOW: bool;
 }
 
+/// Whose AcoustID call this is, which decides the key it uses and its place in the queue: earlier
+/// classes go first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum LookupClass {
+    /// A heart's or a play's gate, and the re-checks of what a heart kept or holds.
+    Heart,
+    /// A lookup a person starts with one click: the library editor's check, the tag preview, a
+    /// Find songs pick's file check.
+    Person,
+    /// A family member's request.
+    Family,
+    /// Work nobody waits on: imports, version checks, the upgrade queue, the Review sweep and the
+    /// finder's sort of library files by take.
+    Bulk,
+}
+
 /// Keeps Octo inside AcoustID's published budget of 3 requests per second.
 ///
 /// The same trap as Deezer, and it bites harder here: over-budget is not reliably a 429,

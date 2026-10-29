@@ -5,7 +5,7 @@
 use std::fmt;
 
 use crate::common::song_identity::SongIdentity;
-use crate::fingerprint::acoust_id_client::{AcoustIdLookup, AcoustIdRecording, AcoustIdResult};
+use crate::fingerprint::acoust_id_client::{AcoustIdLookup, AcoustIdRecording, AcoustIdResult, AnswerArtist};
 use crate::models::domain::song::Song;
 use crate::models::download::acquisition_event::AcquisitionHeard;
 
@@ -174,6 +174,10 @@ pub struct VerificationResult {
 
 /// How many of the other recordings AcoustID heard a check line keeps.
 pub const MAX_HEARD: usize = 3;
+
+/// A link this many submissions or more stand behind, summed over the recordings that agree,
+/// confirms a file on its own; fewer is one person's word.
+pub const MIN_SOURCES_TO_CONFIRM: i32 = 2;
 
 /// A score in 0..1 as a whole percent, rounded down so it never reads as more than it was.
 pub fn whole_percent(fraction: f64) -> i32 {
@@ -505,6 +509,109 @@ impl VerificationResult {
     }
 }
 
+/// How one AcoustID answer reads against R, the recording a person heard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Reading {
+    /// The dominant recording is R's, no recording of the same song outside R carries an ISRC of
+    /// its own, those without one hold under 1% together, and R's recordings carry at least
+    /// [`MIN_SOURCES_TO_CONFIRM`] submissions: the file is R by its sound alone.
+    Clear,
+    /// The same song, but AcoustID cannot tell which version the file is.
+    Ambiguous,
+    /// The dominant recording is another song, or R holds under 1% while the dominant recording is
+    /// not R's.
+    Another,
+    /// No result reaches the match score.
+    Empty,
+    /// No result at the match score links a recording, or a fingerprint AcoustID has not linked
+    /// scores above every linked one.
+    Unknown,
+}
+
+/// One recording an answer links, with its submissions summed over the results that reach the
+/// match score.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WeighedRecording {
+    pub id: String,
+    pub title: String,
+    pub artists: Vec<AnswerArtist>,
+    pub isrcs: Vec<String>,
+    /// The recording's length in seconds, as AcoustID lists it.
+    pub duration_seconds: Option<f64>,
+    /// Submissions tying the matched fingerprints to this recording, a negative count read as 0.
+    pub weight: i64,
+}
+
+impl WeighedRecording {
+    /// The recording's song name, as two songs are compared.
+    pub fn song(&self) -> SongName {
+        SongName {
+            title: self.title.clone(),
+            artists: self.artists.iter().map(|a| a.name.clone()).collect(),
+            artist_ids: self.artists.iter().filter_map(|a| a.id.clone()).collect(),
+        }
+    }
+}
+
+/// A song's name as two songs are compared: the title, and the artists by name and by
+/// MusicBrainz id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SongName {
+    pub title: String,
+    pub artists: Vec<String>,
+    pub artist_ids: Vec<String>,
+}
+
+/// One AcoustID answer read against R.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnswerReading {
+    pub reading: Reading,
+    /// Every recording the qualifying results link, each once, in the order the answer first lists
+    /// it.
+    pub recordings: Vec<WeighedRecording>,
+    /// The share of the total weight R's recordings hold, 0 to 1.
+    pub r_share: f64,
+}
+
+impl AnswerReading {
+    /// Every recording's weight together.
+    pub fn total_weight(&self) -> i64 {
+        self.recordings.iter().map(|r| r.weight).sum()
+    }
+
+    /// The dominant recording: the one with the most weight, the one listed first on a tie.
+    pub fn dominant(&self) -> Option<&WeighedRecording> {
+        let mut best: Option<&WeighedRecording> = None;
+        for recording in &self.recordings {
+            if best.is_none_or(|b| recording.weight > b.weight) {
+                best = Some(recording);
+            }
+        }
+        best
+    }
+}
+
+/// What the sound proved about which recording a file is, which decides whether its
+/// recording-level tags (MusicBrainz recording id, ISRC, disambiguation) are written.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum RecordingProof {
+    /// The shipped checks alone decided.
+    #[default]
+    Shipped,
+    /// A clear reading proved the recording.
+    Proven,
+    /// Kept as heard: the very audio or the very master that played, with no clear reading of
+    /// which catalog recording it is. Names come from the routing, marked unconfirmed.
+    AsHeard {
+        /// The video it played from, when it was a direct stream.
+        video_id: Option<String>,
+    },
+    /// A shipped check confirmed it, but its sound could not settle the version.
+    NotProven,
+    /// The person kept it anyway.
+    KeptByYou,
+}
+
 /// An artist and title compared the way song names are: case, accents and punctuation aside.
 fn heard_key(artist: &str, title: &str) -> String {
     format!("{}|{}", SongIdentity::key(artist), SongIdentity::key(title))
@@ -636,6 +743,39 @@ mod tests {
         .apply_tags_to(&mut song);
         assert_eq!(song.title, "peer title");
         assert_eq!(song.music_brainz_recording_id, None);
+    }
+
+    #[test]
+    fn the_dominant_recording_is_the_first_with_the_most_weight() {
+        let weighed = |id: &str, weight: i64| WeighedRecording {
+            id: id.into(),
+            weight,
+            ..Default::default()
+        };
+        let reading = AnswerReading {
+            reading: Reading::Ambiguous,
+            recordings: vec![weighed("a", 3), weighed("b", 5), weighed("c", 5)],
+            r_share: 0.0,
+        };
+        assert_eq!(reading.total_weight(), 13);
+        assert_eq!(reading.dominant().map(|r| r.id.as_str()), Some("b"));
+        let empty = AnswerReading {
+            reading: Reading::Empty,
+            recordings: Vec::new(),
+            r_share: 0.0,
+        };
+        assert_eq!(empty.dominant(), None);
+        let song = WeighedRecording {
+            title: "Help!".into(),
+            artists: vec![AnswerArtist {
+                id: Some("b10bbbfc".into()),
+                name: "The Beatles".into(),
+            }],
+            ..Default::default()
+        }
+        .song();
+        assert_eq!(song.artists, ["The Beatles"]);
+        assert_eq!(song.artist_ids, ["b10bbbfc"]);
     }
 
     #[test]

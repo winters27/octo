@@ -1163,6 +1163,7 @@ impl HeartAcquisitionCoordinator {
                 external_id: id.to_string(),
                 requested_by: requested_by.map(str::to_string),
                 held_since_utc: deadline - link.hold_limit(),
+                ..Default::default()
             })
         });
         if kind == HeldKind::Track

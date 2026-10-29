@@ -83,6 +83,14 @@ pub struct ShimRefused {
     pub busy: bool,
 }
 
+/// What a fresh `/facts` answered for one video: its stream's facts and the channel that uploaded
+/// it, as YouTube names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FreshFacts {
+    pub facts: StreamFacts,
+    pub channel: Option<String>,
+}
+
 /// Pure HTTP client for the yt-dlp-shim sidecar service. Octo never spawns
 /// yt-dlp itself: the shim wraps it behind /search and /stream endpoints
 /// in its own container, so any process-management quirks stay isolated.
@@ -119,6 +127,12 @@ pub enum Failure {
     Unreachable,
     /// Anything else (a timeout, another status, a non-JSON answer).
     Other,
+    /// A fresh resolve found the video removed (410 `video_unavailable`), or no longer served at
+    /// the format asked for (404 `itag_unavailable`).
+    Gone,
+    /// A fresh resolve was refused for good for this video (403 `video_refused`): an age gate, a
+    /// region block, a members-only video.
+    Refused,
 }
 
 /// How busy the shim is, from its `/health`.

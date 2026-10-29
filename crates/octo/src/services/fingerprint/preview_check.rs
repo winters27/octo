@@ -474,6 +474,7 @@ fn outcome_of(failure: Failure) -> PreviewOutcome {
     match failure {
         Failure::Busy => PreviewOutcome::Busy,
         Failure::Unreachable | Failure::Other => PreviewOutcome::Unreachable,
+        Failure::Gone | Failure::Refused => PreviewOutcome::Unreachable,
     }
 }
 

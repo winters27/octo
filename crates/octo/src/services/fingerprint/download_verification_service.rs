@@ -12,6 +12,7 @@ use octo_core::common::dotnet;
 use octo_core::common::song_versions::strip_versions;
 use octo_core::common::version_gap::{self, Against};
 use octo_core::fingerprint::recording_identity::{self, RecordingFacts, RecordingKind, Takes};
+use octo_core::fingerprint::verification::MIN_SOURCES_TO_CONFIRM;
 use octo_core::fingerprint::{
     AcoustIdLookup, AcoustIdRecording, AcoustIdResult, InconclusiveReason, TrackMatchComparer,
     VerificationResult, VerificationVerdict,
@@ -1382,10 +1383,6 @@ fn confirm(
         ..Default::default()
     }
 }
-
-/// A link that this many submissions or more stand behind confirms a file on its own; fewer is one
-/// person's word, which the song's YouTube preview has to back.
-const MIN_SOURCES_TO_CONFIRM: i32 = 2;
 
 /// How many submissions tie the fingerprint to these recordings, together.
 fn submissions<'a>(recordings: impl IntoIterator<Item = &'a AcoustIdRecording>) -> i32 {
