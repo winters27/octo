@@ -2594,16 +2594,15 @@ async fn believed_match_from(album: Option<&str>) -> (i32, Vec<InconclusiveReaso
 }
 
 #[tokio::test]
-async fn a_believed_match_from_another_album_is_asked_about() {
-    assert_eq!(
-        believed_match_from(Some("Collected")).await,
-        (0, vec![InconclusiveReason::NoEntry])
-    );
+async fn a_believed_match_from_another_album_a_single_or_no_album_settles_it() {
+    for album in [Some("Collected"), Some("Teardrop"), Some(""), None] {
+        assert_eq!(believed_match_from(album).await, (1, Vec::new()), "{album:?}");
+    }
 }
 
 #[tokio::test]
-async fn a_believed_match_from_a_row_with_no_album_or_a_live_one_is_asked_about() {
-    for album in [None, Some("Mezzanine (Live at the Roundhouse)")] {
+async fn a_believed_match_from_a_live_album_is_asked_about() {
+    for album in [Some("Mezzanine (Live at the Roundhouse)"), Some("Live in Paris")] {
         assert_eq!(
             believed_match_from(album).await,
             (0, vec![InconclusiveReason::NoEntry]),
@@ -2838,6 +2837,18 @@ async fn a_preview_from_another_album_is_asked_about_not_replaced() {
 #[tokio::test]
 async fn a_yt_dlp_preview_never_replaces() {
     assert_eq!(preview_from_album_says_wrong(None).await, (0, 1));
+}
+
+#[test]
+fn any_row_but_a_live_one_settles_and_a_live_file_is_never_settled() {
+    let settles = LibraryReviewSweepWorker::preview_album_settles;
+    assert!(settles(Some("Mezzanine"), "Mezzanine"));
+    assert!(settles(Some("Collected"), "Mezzanine"));
+    assert!(settles(None, "Mezzanine"));
+    assert!(settles(Some("Mezzanine"), ""));
+    assert!(settles(None, ""));
+    assert!(!settles(Some("Mezzanine (Live at the Roundhouse)"), "Mezzanine"));
+    assert!(!settles(Some("Mezzanine"), "Live in Paris"));
 }
 
 #[test]

@@ -619,8 +619,9 @@ them too.
 
 A sound AcoustID has never heard, or one only one person ever linked to the song in AcoustID, is
 not left to you while its song's YouTube preview can say, the same question a new download is
-asked. If the file sounds like a YouTube Music row with the song's title, artist and length from
-the file's own album, it is counted as fine and nothing is asked. If it sounds nothing like such a
+asked. If the file sounds like a YouTube Music row with the song's title, artist and length, it is
+counted as fine and nothing is asked, whatever album the row is filed under (a single, another
+release or none), unless the row or the file is from a live album. If it sounds nothing like such a
 preview, Review gets a question that says so ("it sounds nothing like its YouTube preview, 47% of
 its bits differ"). Anything the preview cannot settle (another version, a preview that may not be
 the song, no preview) stays the question it was, so Review still decides those. When the YouTube

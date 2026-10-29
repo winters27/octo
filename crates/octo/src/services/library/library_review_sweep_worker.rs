@@ -1203,9 +1203,10 @@ impl LibraryReviewSweepWorker {
         let acoustid_verdict = verdict.clone();
         let (outcome, question) = Self::classify(verdict);
         // A sound AcoustID has never heard is not left to a person while its song's YouTube
-        // preview can say: a YouTube Music row from the file's own album that sounds alike
-        // settles it, one that sounds nothing like it is a better question, and anything else
-        // stays the question it was. A link only one person's submissions make is put to the
+        // preview can say: a YouTube Music row that sounds alike settles it, whatever album it is
+        // filed under (a single, another release or none), unless one of the two is live; one
+        // that sounds nothing like it is a better question, and anything else stays the question
+        // it was. A link only one person's submissions make is put to the
         // preview the same way, but one that sounds nothing like it is only ever asked about.
         let mut waiting_for = "AcoustID";
         let mut witness: Option<PreviewWitness> = None;
@@ -1233,7 +1234,7 @@ impl LibraryReviewSweepWorker {
                     trusted: true,
                     preview: facts,
                     ..
-                } if Self::preview_album_agrees(facts.album.as_deref(), &song.album) => {
+                } if Self::preview_album_settles(facts.album.as_deref(), &song.album) => {
                     info!(
                         "Library review sweep: '{} - {}' is {}, and it sounds like its YouTube preview",
                         song.artist,
@@ -1775,6 +1776,15 @@ impl LibraryReviewSweepWorker {
         }
         let key = SongIdentity::key(row_album);
         !key.is_empty() && key == SongIdentity::key(file_album)
+    }
+
+    /// Whether a believed YouTube Music row that sounds like the file may settle it: any album, or
+    /// none, unless the row or the file is from a live album. The same recording is often filed
+    /// under its single, a compilation or no album at all, and the sound has already agreed; a
+    /// live take is another recording that can sound close. Replacing still needs
+    /// [`Self::preview_album_agrees`].
+    pub fn preview_album_settles(row_album: Option<&str>, file_album: &str) -> bool {
+        !live_version::mentions(row_album) && !live_version::mentions(Some(file_album))
     }
 
     /// The same song by title: the loose keys once guest credits are taken off, or the cores
