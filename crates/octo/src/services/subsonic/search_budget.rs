@@ -17,11 +17,12 @@ use crate::services::common::external_search_service;
 pub struct SearchBudget;
 
 impl SearchBudget {
-    /// How many local rows to reserve before discovery gets a share. Capped at the requested
-    /// count, so a client asking for fewer than this gets local-only results and no fan-out.
-    /// That is what keeps per-keystroke type-ahead cheap: a search for five rows costs one
-    /// relay, where generating discovery for it would cost a Last.fm fan-out plus a dozen
-    /// Deezer enrichment rows and eight yt-dlp lookups.
+    /// How many local rows to reserve before discovery gets a share, unless
+    /// `Subsonic:SearchLibraryOnlyUpTo` says otherwise. Capped at the requested count, so a
+    /// client asking for fewer than this gets local-only results and no fan-out. That is what
+    /// keeps per-keystroke type-ahead cheap: a search for five rows costs one relay, where
+    /// generating discovery for it would cost a Last.fm fan-out plus a dozen Deezer enrichment
+    /// rows and eight yt-dlp lookups.
     pub const LOCAL_SONG_FLOOR: i32 = 12;
 
     /// Ceiling on discovery rows handed to one response. Tied to the number actually built
@@ -49,8 +50,11 @@ impl SearchBudget {
     /// request to the local target and skips discovery entirely, which is what lets the call
     /// site skip its Last.fm/Deezer fan-out too instead of just discarding it.
     ///
+    /// `local_floor` is the effective `Subsonic:SearchLibraryOnlyUpTo` ([`Self::LOCAL_SONG_FLOOR`]
+    /// by default): a request for that many songs or fewer gets no discovery.
+    ///
     /// Returns (local, external); their sum never exceeds `requested_songs`.
-    pub fn compute(requested_songs: i32, discovery_enabled: bool) -> (i32, i32) {
+    pub fn compute(requested_songs: i32, discovery_enabled: bool, local_floor: i32) -> (i32, i32) {
         let requested = requested_songs.max(0);
 
         if !discovery_enabled {
@@ -60,7 +64,7 @@ impl SearchBudget {
         // Locals still scale with big requests through the quarter rule, which is what keeps
         // behavior identical for the large counts radio-style clients send. The floor only
         // decides small requests, and capping it at the request is the fix.
-        let local = Self::LOCAL_SONG_FLOOR.min(requested).max(requested / 4);
+        let local = local_floor.max(0).min(requested).max(requested / 4);
 
         let external = Self::EXTERNAL_CEILING.min((requested - local).max(0));
 
@@ -106,7 +110,7 @@ mod tests {
             (1000, 250, 60),
         ] {
             assert_eq!(
-                SearchBudget::compute(requested, true),
+                SearchBudget::compute(requested, true, SearchBudget::LOCAL_SONG_FLOOR),
                 (local, external),
                 "songCount={requested}"
             );
@@ -118,7 +122,11 @@ mod tests {
         // At 80 and above, requested/4 is at least 20, so the old flat floor was never the
         // binding term and the new capped floor resolves to the same number.
         for n in 80..=5000 {
-            assert_eq!(legacy(n).0, SearchBudget::compute(n, true).0, "songCount={n}");
+            assert_eq!(
+                legacy(n).0,
+                SearchBudget::compute(n, true, SearchBudget::LOCAL_SONG_FLOOR).0,
+                "songCount={n}"
+            );
         }
     }
 
@@ -130,7 +138,7 @@ mod tests {
         for n in 0..=5000 {
             let expected = SearchBudget::EXTERNAL_CEILING.min(legacy(n).1);
             assert!(
-                SearchBudget::compute(n, true).1 >= expected,
+                SearchBudget::compute(n, true, SearchBudget::LOCAL_SONG_FLOOR).1 >= expected,
                 "songCount={n} lost external rows beyond the ceiling"
             );
         }
@@ -142,20 +150,26 @@ mod tests {
         // only the count it asked for would never see an external row if the two targets
         // summed past it.
         for n in 0..=5000 {
-            let (local, external) = SearchBudget::compute(n, true);
+            let (local, external) = SearchBudget::compute(n, true, SearchBudget::LOCAL_SONG_FLOOR);
             assert!(local + external <= n, "songCount={n} produced {local}+{external}");
         }
     }
 
     #[test]
     fn compute_treats_negative_counts_as_zero() {
-        assert_eq!(SearchBudget::compute(-1, true), (0, 0));
-        assert_eq!(SearchBudget::compute(i32::MIN, true), (0, 0));
+        assert_eq!(
+            SearchBudget::compute(-1, true, SearchBudget::LOCAL_SONG_FLOOR),
+            (0, 0)
+        );
+        assert_eq!(
+            SearchBudget::compute(i32::MIN, true, SearchBudget::LOCAL_SONG_FLOOR),
+            (0, 0)
+        );
     }
 
     #[test]
     fn compute_does_not_overflow_on_absurd_counts() {
-        let (local, external) = SearchBudget::compute(i32::MAX, true);
+        let (local, external) = SearchBudget::compute(i32::MAX, true, SearchBudget::LOCAL_SONG_FLOOR);
 
         assert_eq!(local, i32::MAX / 4);
         assert_eq!(external, SearchBudget::EXTERNAL_CEILING);
@@ -167,7 +181,7 @@ mod tests {
         // regardless of size, so the call site's Last.fm/Deezer fan-out never fires.
         for (requested, local) in [(0, 0), (5, 5), (20, 20), (1000, 1000)] {
             assert_eq!(
-                SearchBudget::compute(requested, false),
+                SearchBudget::compute(requested, false, SearchBudget::LOCAL_SONG_FLOOR),
                 (local, 0),
                 "songCount={requested}"
             );
@@ -185,9 +199,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compute_with_a_lower_floor_gives_small_requests_discovery() {
+        // The Music Assistant app asks for 10 songs; with the default floor that is all library.
+        assert_eq!(
+            SearchBudget::compute(10, true, SearchBudget::LOCAL_SONG_FLOOR),
+            (10, 0)
+        );
+        assert_eq!(SearchBudget::compute(10, true, 9), (9, 1));
+        assert_eq!(SearchBudget::compute(10, true, 0), (2, 8));
+        assert_eq!(SearchBudget::compute(5, true, 0), (1, 4));
+        // A request at or below the floor stays library only, as before.
+        assert_eq!(SearchBudget::compute(5, true, 5), (5, 0));
+        // Large requests are decided by the quarter rule, whatever the floor.
+        assert_eq!(SearchBudget::compute(200, true, 0), (50, 60));
+        // A negative floor counts as 0.
+        assert_eq!(SearchBudget::compute(10, true, -3), (2, 8));
+    }
+
+    #[test]
+    fn compute_with_a_lower_floor_keeps_both_targets_inside_the_requested_count() {
+        for floor in [0, 1, 5, 12, 100] {
+            for n in 0..=500 {
+                let (local, external) = SearchBudget::compute(n, true, floor);
+                assert!(
+                    local + external <= n,
+                    "songCount={n} floor={floor} produced {local}+{external}"
+                );
+            }
+        }
+    }
+
     /// Callers always pass the discovery flag; the enabled split is the one pinned above.
     #[test]
     fn compute_discovery_defaults_to_enabled() {
-        assert_eq!(SearchBudget::compute(20, true), (12, 8));
+        assert_eq!(
+            SearchBudget::compute(20, true, SearchBudget::LOCAL_SONG_FLOOR),
+            (12, 8)
+        );
     }
 }

@@ -827,6 +827,14 @@
             </div>
             <div class="set-row">
               <div class="set-info">
+                <div class="set-info-t">Library only up to <span class="set-opt">songs</span></div>
+                <div class="set-info-d">A search asking for this many songs or fewer looks only in your library.</div>
+                <div class="set-info-more">Such a small search is usually an app searching as you type. Some apps ask for few songs on a finished search too, like the Music Assistant app with 10, and then never show songs you don't own: set it below their count, or to 0.</div>
+              </div>
+              <input class="set-input" id="f-search-library-only-up-to" name="Subsonic.SearchLibraryOnlyUpTo" type="number" min="0" max="100" />
+            </div>
+            <div class="set-row">
+              <div class="set-info">
                 <div class="set-info-t">Discovery for offline-search apps</div>
                 <div class="set-info-d">Adds your stations' songs you don't own yet to apps that search their own copy of your library.</div>
                 <div class="set-info-more">Apps like Symfonium copy your library to the phone and search only that copy, so their searches never reach Octo. With this on, the copy also holds your radio stations' songs you don't own yet: they show up in search, play as previews, and download when hearted. Run a full sync in the app to pick up changes.</div>

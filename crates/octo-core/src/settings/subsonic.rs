@@ -215,6 +215,18 @@ pub struct SubsonicSettings {
     /// kept, and the next search for the same words uses it.
     pub search_last_fm_wait_ms: i32,
 
+    /// A search that asks for this many songs or fewer looks only in the library (default: 12,
+    /// range 0-100).
+    /// Environment variable: SEARCH_LIBRARY_ONLY_UP_TO
+    ///
+    /// Such a small count is taken for an app searching as the user types, where asking Last.fm,
+    /// Deezer and YouTube on every keystroke would be wasted. Some apps send a small count for a
+    /// finished search too (the Music Assistant app asks for 10 songs in its overview) and then
+    /// never list a song from outside the library; a lower value gives them those songs, and 0
+    /// searches outside at any count. For Octo's apps it is also how many places of a small page
+    /// the library keeps for itself.
+    pub search_library_only_up_to: i32,
+
     /// Give clients that sync the library to the device a discovery catalog (default: true).
     /// Environment variable: ENABLE_SYNC_CATALOG
     ///
@@ -409,6 +421,7 @@ impl Default for SubsonicSettings {
             wait_for_search_durations: true,
             search_duration_wait_ms: 1000,
             search_last_fm_wait_ms: 1000,
+            search_library_only_up_to: 12,
             enable_sync_catalog: true,
             sync_catalog_clients: "Symfonium".to_string(),
             sync_catalog_max_songs: 1000,
@@ -453,6 +466,11 @@ impl SubsonicSettings {
     /// for Last.fm) at 0, else SearchLastFmWaitMs within 0 to 10 seconds.
     pub fn effective_search_last_fm_wait(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.search_last_fm_wait_ms.clamp(0, 10_000) as u64)
+    }
+
+    /// SearchLibraryOnlyUpTo within 0 to 100.
+    pub fn effective_search_library_only_up_to(&self) -> i32 {
+        self.search_library_only_up_to.clamp(0, 100)
     }
 
     pub fn effective_stream_size_warm_per_minute(&self) -> usize {

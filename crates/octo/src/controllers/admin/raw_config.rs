@@ -308,6 +308,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Subsonic:CoverCacheMb",
     "Subsonic:SearchDurationWaitMs",
     "Subsonic:SearchLastFmWaitMs",
+    "Subsonic:SearchLibraryOnlyUpTo",
     "Subsonic:SizeFlagClients",
     "GeneratedPlaylists:Years",
     "GeneratedPlaylists:MaxYearPlaylists",
