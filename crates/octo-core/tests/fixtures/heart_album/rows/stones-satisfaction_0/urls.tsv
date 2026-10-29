@@ -1,0 +1,6 @@
+barcode	release/?query=barcode%3A%280018771122029%20OR%20018771122029%29&fmt=json&limit=25
+carriers-57888c47-f976-4417-9577-f45f118b58ca-p0	release?recording=57888c47-f976-4417-9577-f45f118b58ca&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+carriers-57888c47-f976-4417-9577-f45f118b58ca-p1	release?recording=57888c47-f976-4417-9577-f45f118b58ca&inc=release-groups+artist-credits&status=official&limit=100&offset=100&fmt=json
+barcode-release-79e61808-662a-48cb-94c0-19441b3a496b	release/79e61808-662a-48cb-94c0-19441b3a496b?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+artist-b071f9fa-14b0-4217-8e97-eb41da73f598	artist/b071f9fa-14b0-4217-8e97-eb41da73f598?fmt=json
+isrc-lookup	isrc/USA176510160?inc=artist-credits&fmt=json

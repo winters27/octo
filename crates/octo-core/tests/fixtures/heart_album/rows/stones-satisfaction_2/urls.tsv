@@ -1,0 +1,2 @@
+barcode	release/?query=barcode%3A%280670211041842%20OR%20670211041842%29&fmt=json&limit=25
+isrc-lookup	isrc/GBCBR1900018?inc=artist-credits&fmt=json

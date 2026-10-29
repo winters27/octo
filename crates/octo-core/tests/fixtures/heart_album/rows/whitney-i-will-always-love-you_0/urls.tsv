@@ -1,0 +1,9 @@
+barcode	release/?query=barcode%3A%280884977725834%20OR%20884977725834%29&fmt=json&limit=25
+carriers-55b77af9-6ae1-448c-abee-f5d3739d22cd-p0	release?recording=55b77af9-6ae1-448c-abee-f5d3739d22cd&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+carriers-55b77af9-6ae1-448c-abee-f5d3739d22cd-p1	release?recording=55b77af9-6ae1-448c-abee-f5d3739d22cd&inc=release-groups+artist-credits&status=official&limit=100&offset=100&fmt=json
+carriers-55b77af9-6ae1-448c-abee-f5d3739d22cd-p2	release?recording=55b77af9-6ae1-448c-abee-f5d3739d22cd&inc=release-groups+artist-credits&status=official&limit=100&offset=200&fmt=json
+barcode-release-c48c1ca0-b7f9-43a6-88ad-dfe6d977058b	release/c48c1ca0-b7f9-43a6-88ad-dfe6d977058b?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-2ae48d7d-dbb2-4633-8b9d-3be409386e56	release/2ae48d7d-dbb2-4633-8b9d-3be409386e56?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+carriers-bfda60fd-98b4-4295-a461-6a257c203e07-p0	release?recording=bfda60fd-98b4-4295-a461-6a257c203e07&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+artist-0307edfc-437c-4b48-8700-80680e66a228	artist/0307edfc-437c-4b48-8700-80680e66a228?fmt=json
+isrc-lookup	isrc/USAR19200110?inc=artist-credits&fmt=json

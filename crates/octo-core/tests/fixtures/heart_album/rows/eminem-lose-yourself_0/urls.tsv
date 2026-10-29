@@ -1,0 +1,8 @@
+barcode	release/?query=barcode%3A%280602498878934%20OR%20602498878934%29&fmt=json&limit=25
+carriers-588a6833-7a02-4801-8de1-e3824fae5960-p0	release?recording=588a6833-7a02-4801-8de1-e3824fae5960&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+barcode-release-0019b35d-cd18-4788-b7dc-8a4f753d9c31	release/0019b35d-cd18-4788-b7dc-8a4f753d9c31?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-f27ad302-43c2-44e6-8e5d-c8f82abd6552	release/f27ad302-43c2-44e6-8e5d-c8f82abd6552?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-c736ebfa-8357-4c27-b111-8ca502b395ec	release/c736ebfa-8357-4c27-b111-8ca502b395ec?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-b04046a0-77f0-40d6-b003-164a96d9ecf8	release/b04046a0-77f0-40d6-b003-164a96d9ecf8?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+artist-b95ce3ff-3d05-4e87-9e01-c97b66af13d4	artist/b95ce3ff-3d05-4e87-9e01-c97b66af13d4?fmt=json
+isrc-lookup	isrc/USIR10211559?inc=artist-credits&fmt=json

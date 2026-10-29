@@ -1,0 +1,8 @@
+barcode	release/?query=barcode%3A%280843930001378%20OR%20843930001378%29&fmt=json&limit=25
+barcode-release-282b9b94-1295-4aed-8026-da870234f380	release/282b9b94-1295-4aed-8026-da870234f380?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-54de60aa-759a-469d-a594-ed9a0263ecf5	release/54de60aa-759a-469d-a594-ed9a0263ecf5?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-81c49807-a653-4342-a995-97a3a6c2cdab	release/81c49807-a653-4342-a995-97a3a6c2cdab?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-156671ad-34d7-41f6-b9d2-7e910019a3ef	release/156671ad-34d7-41f6-b9d2-7e910019a3ef?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+carriers-9086b742-358b-4f73-9a14-84cb1a9ce4ce-p0	release?recording=9086b742-358b-4f73-9a14-84cb1a9ce4ce&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+artist-20244d07-534f-4eff-b4d4-930878889970	artist/20244d07-534f-4eff-b4d4-930878889970?fmt=json
+isrc-lookup	isrc/USCJY0803275?inc=artist-credits&fmt=json

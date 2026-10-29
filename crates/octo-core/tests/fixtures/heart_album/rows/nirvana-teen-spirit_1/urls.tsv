@@ -1,0 +1,8 @@
+barcode	release/?query=barcode%3A%280602527203676%20OR%20602527203676%29&fmt=json&limit=25
+carriers-a8b173dd-311d-4a15-bf10-44f7dbc44055-p0	release?recording=a8b173dd-311d-4a15-bf10-44f7dbc44055&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+barcode-release-5c3257c8-6b2f-4860-9437-2410509443c7	release/5c3257c8-6b2f-4860-9437-2410509443c7?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-79856df3-eec1-419b-9251-6c7f02500e94	release/79856df3-eec1-419b-9251-6c7f02500e94?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-946226fe-a4b2-4398-9828-008cb7299bad	release/946226fe-a4b2-4398-9828-008cb7299bad?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-1241ec9a-5234-35c4-9793-9cee0eeca354	release/1241ec9a-5234-35c4-9793-9cee0eeca354?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+artist-5b11f4ce-a62d-471e-81fc-a69a8278c7da	artist/5b11f4ce-a62d-471e-81fc-a69a8278c7da?fmt=json
+isrc-lookup	isrc/USUM70995906?inc=artist-credits&fmt=json

@@ -1,0 +1,4 @@
+barcode	release/?query=barcode%3A%280196873763859%20OR%20196873763859%29&fmt=json&limit=25
+carriers-e6c259f8-25b3-4413-b3bb-e9d8dd55562e-p0	release?recording=e6c259f8-25b3-4413-b3bb-e9d8dd55562e&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+artist-0383dadf-2a4e-4d10-a46a-e9e041da8eb3	artist/0383dadf-2a4e-4d10-a46a-e9e041da8eb3?fmt=json
+isrc-lookup	isrc/GBUM72506881?inc=artist-credits&fmt=json

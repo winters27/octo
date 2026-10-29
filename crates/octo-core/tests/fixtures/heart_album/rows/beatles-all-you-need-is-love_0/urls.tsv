@@ -1,0 +1,7 @@
+barcode	release/?query=barcode%3A%280602547673503%20OR%20602547673503%29&fmt=json&limit=25
+carriers-f95c4156-a9d6-44bd-b72c-9ee6926f79ae-p0	release?recording=f95c4156-a9d6-44bd-b72c-9ee6926f79ae&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+barcode-release-c8f74705-2545-48d2-b0c8-7c899f595b20	release/c8f74705-2545-48d2-b0c8-7c899f595b20?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-0bd0edea-5616-4181-8aae-0aab89762e4b	release/0bd0edea-5616-4181-8aae-0aab89762e4b?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+carriers-4077bb5c-4b1c-43bc-b64d-68070fd5b21f-p0	release?recording=4077bb5c-4b1c-43bc-b64d-68070fd5b21f&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+artist-b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d	artist/b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d?fmt=json
+isrc-lookup	isrc/GBUM71505889?inc=artist-credits&fmt=json

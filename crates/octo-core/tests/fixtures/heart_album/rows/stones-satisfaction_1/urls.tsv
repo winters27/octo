@@ -1,0 +1,4 @@
+barcode	release/?query=barcode%3A%280602567170983%20OR%20602567170983%29&fmt=json&limit=25
+carriers-ac1f7f41-d73c-46bf-83bf-1862d3a4e4bc-p0	release?recording=ac1f7f41-d73c-46bf-83bf-1862d3a4e4bc&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+artist-b071f9fa-14b0-4217-8e97-eb41da73f598	artist/b071f9fa-14b0-4217-8e97-eb41da73f598?fmt=json
+isrc-lookup	isrc/USA171720020?inc=artist-credits&fmt=json

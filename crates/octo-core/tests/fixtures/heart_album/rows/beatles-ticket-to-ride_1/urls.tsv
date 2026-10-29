@@ -1,0 +1,5 @@
+barcode	release/?query=barcode%3A%280602557054989%20OR%20602557054989%29&fmt=json&limit=25
+carriers-0c20ef69-5f78-4c44-a6bf-f66dbcd13b92-p0	release?recording=0c20ef69-5f78-4c44-a6bf-f66dbcd13b92&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+barcode-release-92a26718-39cb-463f-a208-47f8976324be	release/92a26718-39cb-463f-a208-47f8976324be?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+artist-b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d	artist/b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d?fmt=json
+isrc-lookup	isrc/GBUM71603959?inc=artist-credits&fmt=json

@@ -1,0 +1,4 @@
+barcode	release/?query=barcode%3A%285057805725923%29&fmt=json&limit=25
+carriers-fa94d266-4262-4491-a890-a8751e113168-p0	release?recording=fa94d266-4262-4491-a890-a8751e113168&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+artist-401c3991-b76b-499d-8082-9f2df958ef78	artist/401c3991-b76b-499d-8082-9f2df958ef78?fmt=json
+isrc-lookup	isrc/UK6821836618?inc=artist-credits&fmt=json

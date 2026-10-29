@@ -1,0 +1,8 @@
+barcode	release/?query=barcode%3A%280602547673503%20OR%20602547673503%29&fmt=json&limit=25
+carriers-dc87225b-46bc-4a5d-837f-14e7eb8f2ca2-p0	release?recording=dc87225b-46bc-4a5d-837f-14e7eb8f2ca2&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+carriers-dc87225b-46bc-4a5d-837f-14e7eb8f2ca2-p1	release?recording=dc87225b-46bc-4a5d-837f-14e7eb8f2ca2&inc=release-groups+artist-credits&status=official&limit=100&offset=100&fmt=json
+barcode-release-0bd0edea-5616-4181-8aae-0aab89762e4b	release/0bd0edea-5616-4181-8aae-0aab89762e4b?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-c8f74705-2545-48d2-b0c8-7c899f595b20	release/c8f74705-2545-48d2-b0c8-7c899f595b20?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+carriers-83248164-a97b-40ee-8f98-39c6b5027254-p0	release?recording=83248164-a97b-40ee-8f98-39c6b5027254&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+artist-b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d	artist/b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d?fmt=json
+isrc-lookup	isrc/GBUM71505896?inc=artist-credits&fmt=json

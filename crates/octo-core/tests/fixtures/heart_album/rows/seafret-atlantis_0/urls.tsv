@@ -1,0 +1,4 @@
+barcode	release/?query=barcode%3A%280886445561425%20OR%20886445561425%29&fmt=json&limit=25
+carriers-6e98f2ee-653f-4341-aa1f-fb22289e07e0-p0	release?recording=6e98f2ee-653f-4341-aa1f-fb22289e07e0&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+artist-1802f74a-21e5-44f4-9da5-8ea3ac6ce34c	artist/1802f74a-21e5-44f4-9da5-8ea3ac6ce34c?fmt=json
+isrc-lookup	isrc/GBARL1500316?inc=artist-credits&fmt=json

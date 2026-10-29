@@ -1,0 +1,10 @@
+barcode	release/?query=barcode%3A%280828767598925%20OR%20828767598925%29&fmt=json&limit=25
+carriers-25da6d6f-5960-4176-b7c5-885b0b9edfcf-p0	release?recording=25da6d6f-5960-4176-b7c5-885b0b9edfcf&inc=release-groups+artist-credits&status=official&limit=100&offset=0&fmt=json
+carriers-25da6d6f-5960-4176-b7c5-885b0b9edfcf-p1	release?recording=25da6d6f-5960-4176-b7c5-885b0b9edfcf&inc=release-groups+artist-credits&status=official&limit=100&offset=100&fmt=json
+carriers-25da6d6f-5960-4176-b7c5-885b0b9edfcf-p2	release?recording=25da6d6f-5960-4176-b7c5-885b0b9edfcf&inc=release-groups+artist-credits&status=official&limit=100&offset=200&fmt=json
+carriers-25da6d6f-5960-4176-b7c5-885b0b9edfcf-p3	release?recording=25da6d6f-5960-4176-b7c5-885b0b9edfcf&inc=release-groups+artist-credits&status=official&limit=100&offset=300&fmt=json
+barcode-release-8d3ead8d-c7a1-4ae2-b50a-9d2211160639	release/8d3ead8d-c7a1-4ae2-b50a-9d2211160639?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-b78d1781-63f4-479c-aa81-4b0b420531cd	release/b78d1781-63f4-479c-aa81-4b0b420531cd?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+barcode-release-a885c1fb-3164-4880-b7c5-057e9b63bbdf	release/a885c1fb-3164-4880-b7c5-057e9b63bbdf?inc=recordings+release-groups+artist-credits+isrcs&fmt=json
+artist-55ef024a-6cc0-49ed-8ce2-2e12193c0f46	artist/55ef024a-6cc0-49ed-8ce2-2e12193c0f46?fmt=json
+isrc-lookup	isrc/USVR19600010?inc=artist-credits&fmt=json

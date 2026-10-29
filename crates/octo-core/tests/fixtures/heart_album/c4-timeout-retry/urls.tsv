@@ -1,0 +1,3 @@
+carriers-c05194a3-f6f0-4f52-b78a-13fb5580bc0f-o0-l25	release?recording=c05194a3-f6f0-4f52-b78a-13fb5580bc0f&inc=release-groups+artist-credits&status=official&limit=25&offset=0&fmt=json
+carriers-c05194a3-f6f0-4f52-b78a-13fb5580bc0f-o25-l25	release?recording=c05194a3-f6f0-4f52-b78a-13fb5580bc0f&inc=release-groups+artist-credits&status=official&limit=25&offset=25&fmt=json
+carriers-c05194a3-f6f0-4f52-b78a-13fb5580bc0f-o50-l25	release?recording=c05194a3-f6f0-4f52-b78a-13fb5580bc0f&inc=release-groups+artist-credits&status=official&limit=25&offset=50&fmt=json

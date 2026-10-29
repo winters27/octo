@@ -1,0 +1,2 @@
+barcode	release/?query=barcode%3A%280634479265105%20OR%20634479265105%29&fmt=json&limit=25
+isrc-lookup	isrc/USCGH0675308?inc=artist-credits&fmt=json
