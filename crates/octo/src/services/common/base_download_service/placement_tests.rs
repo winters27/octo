@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::FutureExt;
+use octo_core::fingerprint::verification::RecordingProof;
 use octo_core::fingerprint::{
     AcoustIdRecording, InconclusiveReason, VerificationResult, VerificationVerdict,
 };
@@ -407,6 +408,280 @@ async fn place_in_library_different_recording_id_keeps_both() {
     .await;
 
     assert_eq!(placement.path, root.text("A - Song (1).mp3"));
+}
+
+/// A path with forward slashes, as the layout writes it on every platform.
+fn slashed(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn proven_as(proof: RecordingProof) -> Option<Box<VerificationResult>> {
+    Some(Box::new(VerificationResult {
+        verdict: VerificationVerdict::Confirmed,
+        proof,
+        ..Default::default()
+    }))
+}
+
+fn octo_file(path: &str, artist: &str, title: &str) -> LocalSongMapping {
+    LocalSongMapping {
+        local_path: path.to_string(),
+        artist: artist.into(),
+        title: title.into(),
+        ..Default::default()
+    }
+}
+
+/// An import the shipped checks kept while its sound could not settle the version carries no
+/// recording id, and is still the same song as Octo's own file of that artist and title.
+#[tokio::test]
+async fn an_ambiguous_import_of_a_song_octo_downloaded_is_the_same_song() {
+    let root = Root::new();
+    let existing = root.text("A - Song.mp3");
+    tagged_with_recording(Path::new(&existing), "rec-1");
+    let harness = root.service(FolderStructure::Flat, vec![octo_file(&existing, "A", "Song")]);
+    let import = Song {
+        verification: proven_as(RecordingProof::NotProven),
+        ..song("A", "Song")
+    };
+
+    let placement = place(
+        &harness,
+        &import,
+        &requested("A", "Song", "", None),
+        &root.landed("new.mp3", &mp3()),
+    )
+    .await;
+
+    assert_eq!(slashed(&placement.path), slashed(&existing));
+    assert!(!root.join("A - Song (1).mp3").exists());
+}
+
+/// The same import beside a file kept as heard lands beside it: the kept file is the very audio a
+/// person heard, never the same song as another file by its name.
+#[tokio::test]
+async fn an_ambiguous_import_beside_a_file_kept_as_heard_lands_beside_it() {
+    let root = Root::new();
+    let existing = root.text("A - Song.mp3");
+    std::fs::write(&existing, mp3()).expect("written");
+    let before = std::fs::read(&existing).expect("read");
+    let kept = LocalSongMapping {
+        proof_mark: Some("as heard on YouTube".into()),
+        ..octo_file(&existing, "A", "Song")
+    };
+    let harness = root.service(FolderStructure::Flat, vec![kept]);
+    let import = Song {
+        verification: proven_as(RecordingProof::NotProven),
+        ..song("A", "Song")
+    };
+
+    let placement = place(
+        &harness,
+        &import,
+        &requested("A", "Song", "", None),
+        &root.landed("new.mp3", &mp3()),
+    )
+    .await;
+
+    assert_eq!(slashed(&placement.path), slashed(&root.text("A - Song (1).mp3")));
+    assert_eq!(std::fs::read(&existing).expect("read"), before);
+}
+
+/// A file a heart keeps as heard never replaces Octo's own file of the song, and a file the sound
+/// proved never replaces one whose recording is not known: each is another version.
+#[tokio::test]
+async fn a_file_kept_as_heard_or_proven_never_replaces_an_unproven_file_by_name() {
+    for proof in [
+        RecordingProof::AsHeard {
+            video_id: Some("v2015".into()),
+        },
+        RecordingProof::Proven,
+    ] {
+        let root = Root::new();
+        let existing = root.text("A - Song.mp3");
+        std::fs::write(&existing, mp3()).expect("written");
+        let harness = root.service(FolderStructure::Flat, vec![octo_file(&existing, "A", "Song")]);
+        let kept = Song {
+            verification: proven_as(proof.clone()),
+            music_brainz_recording_id: (proof == RecordingProof::Proven).then(|| "rec-2009".into()),
+            ..song("A", "Song")
+        };
+
+        let placement = place(
+            &harness,
+            &kept,
+            &requested("A", "Song", "", None),
+            &root.landed("new.mp3", &mp3()),
+        )
+        .await;
+
+        assert_eq!(
+            slashed(&placement.path),
+            slashed(&root.text("A - Song (1).mp3")),
+            "{proof:?}"
+        );
+        assert!(Path::new(&existing).is_file(), "{proof:?}");
+    }
+}
+
+/// A file a heart's gate passed remembers that heart: whose gate passed it, the R it was judged
+/// against, what they heard, whether it is kept as heard, and its own print for a later check.
+/// A file no gate judged remembers no heart.
+#[test]
+fn a_kept_file_remembers_the_heart_whose_gate_passed_it() {
+    use crate::services::common::{AcquisitionPlace, GateLedger, GateOutcome};
+    use octo_core::fingerprint::heart_gate::{
+        AcquisitionOrigin, HeardReading, HeardRecord, HeardRecording, HeardSource, HeartGate,
+    };
+
+    let heard = HeardRecord {
+        heard_at: chrono::Utc::now(),
+        source: HeardSource::Video {
+            id: "v2015".into(),
+            size: Some(1),
+            content_type: "audio/mp4".into(),
+            itag: None,
+        },
+        sample_id: Some("s".into()),
+    };
+    let r = HeardRecording {
+        ids: vec!["rec-2009".into()],
+        ..Default::default()
+    };
+    let gate = |user: &str| HeartGate {
+        user: user.into(),
+        origin: AcquisitionOrigin::Heart,
+        r: Some(r.clone()),
+        heard: Some(heard.clone()),
+        heard_seconds: Some(139),
+        reading: HeardReading::OnlyHeardOrMaster,
+        stand_in: None,
+    };
+    let ledger = GateLedger::default();
+    ledger.record("bo", AcquisitionOrigin::Heart, GateOutcome::Accepted);
+    ledger.record("cy", AcquisitionOrigin::Heart, GateOutcome::Undecided);
+    let place = AcquisitionPlace {
+        origin: Some(AcquisitionOrigin::Heart),
+        gates: vec![gate("cy"), gate("bo")],
+        ledger,
+        ..Default::default()
+    };
+    let song = Song {
+        verification: Some(Box::new(VerificationResult {
+            proof: RecordingProof::AsHeard {
+                video_id: Some("v2015".into()),
+            },
+            fingerprint: Some("AQAD".into()),
+            duration_seconds: 139,
+            ..Default::default()
+        })),
+        ..song("The Beatles", "Help!")
+    };
+
+    let kept = super::kept_heart(&place, &song).expect("a heart passed it");
+    assert_eq!(kept.users, ["bo"]);
+    assert_eq!(kept.recording, Some(r));
+    assert_eq!(kept.heard, Some(heard));
+    assert!(kept.as_heard);
+    assert_eq!(kept.print.as_deref(), Some("AQAD"));
+    assert_eq!(kept.seconds, Some(139));
+
+    assert_eq!(super::kept_heart(&AcquisitionPlace::default(), &song), None);
+}
+
+/// Two people kept two mixes of one song as they heard them: both files stay under the one album
+/// path, side by side, and each person's lookup of the song finds their own.
+#[tokio::test]
+async fn two_kept_as_heard_mixes_of_one_song_both_stay_and_each_person_finds_their_own() {
+    use crate::services::local::{ILocalLibraryService, KeptHeart, LocalLibraryService};
+    use octo_core::fingerprint::heart_gate::{HeardRecord, HeardSource};
+
+    let root = Root::new();
+    let store = Arc::new(octo_core::settings::SettingsStore::for_tests(
+        AppSettings::default(),
+    ));
+    store.set_raw("Library:DownloadPath", Some(&root.path().to_string_lossy()));
+    let http = reqwest::Client::new();
+    let library = Arc::new(LocalLibraryService::new(
+        store.clone(),
+        http.clone(),
+        Arc::new(crate::services::soulseek::ExternalIdRegistry::in_memory()),
+        crate::services::subsonic::NavidromeIdentityService::new(store, http),
+    ));
+    let harness = build(
+        root.path(),
+        AppSettings {
+            subsonic: SubsonicSettings {
+                folder_structure: FolderStructure::Organized,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Some(library.clone()),
+        None,
+        DownloadServices::default(),
+    );
+    let mix = |video: &str| Song {
+        external_provider: Some("soulseek".into()),
+        external_id: Some("help".into()),
+        verification: proven_as(RecordingProof::AsHeard {
+            video_id: Some(video.into()),
+        }),
+        ..song("The Beatles", "Help!")
+    };
+    let kept_for = |user: &str, video: &str| KeptHeart {
+        users: vec![user.into()],
+        heard: Some(HeardRecord {
+            heard_at: chrono::Utc::now(),
+            source: HeardSource::Video {
+                id: video.into(),
+                size: Some(1),
+                content_type: "audio/mp4".into(),
+                itag: Some(140),
+            },
+            sample_id: None,
+        }),
+        as_heard: true,
+        ..Default::default()
+    };
+    let asked = requested("The Beatles", "Help!", "Help!", Some(1));
+
+    let ana = place(&harness, &mix("v2009"), &asked, &root.landed("a.m4a", &mp3())).await;
+    library
+        .register_downloaded_song_as(&mix("v2009"), &ana.path, Some(kept_for("ana", "v2009")))
+        .await
+        .expect("registered");
+    let bo = place(&harness, &mix("v2015"), &asked, &root.landed("b.m4a", &mp3())).await;
+    library
+        .register_downloaded_song_as(&mix("v2015"), &bo.path, Some(kept_for("bo", "v2015")))
+        .await
+        .expect("registered");
+
+    assert_eq!(
+        slashed(&ana.path),
+        slashed(&root.text("The Beatles/Help!/01 - Help!.m4a"))
+    );
+    assert_eq!(
+        slashed(&bo.path),
+        slashed(&root.text("The Beatles/Help!/01 - Help! (1).m4a"))
+    );
+    assert!(Path::new(&ana.path).is_file() && Path::new(&bo.path).is_file());
+    let lookup = |user: Option<&'static str>| {
+        let library = library.clone();
+        async move {
+            library
+                .get_local_path_for_external_song_as(user, "soulseek", "help")
+                .await
+        }
+    };
+    assert_eq!(lookup(Some("ana")).await, Some(ana.path.clone()));
+    assert_eq!(lookup(Some("BO")).await, Some(bo.path.clone()));
+    assert_eq!(
+        lookup(None).await,
+        Some(bo.path.clone()),
+        "the most recently landed"
+    );
+    assert_eq!(library.get_mappings().await.len(), 2);
 }
 
 #[tokio::test]

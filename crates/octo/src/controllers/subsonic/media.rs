@@ -194,11 +194,8 @@ pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
     // what makes tracks silently refuse to start. With the default settings the
     // lossless copy is reached as its own library track after the rescan instead.
     if state.settings.current().subsonic.wait_for_lossless_on_play {
-        let mut local_path = state
-            .local_library
-            .get_local_path_for_external_song(&provider, &external_id)
-            .await
-            .filter(|path| Path::new(path).is_file());
+        let listener = signed_in_user(&state, &call).await.ok();
+        let mut local_path = own_version(&state, listener.as_deref(), &provider, &external_id).await;
         // A song fetched ahead is that lossless copy too, while getting songs ahead is on, for a
         // caller whose plays keep copies.
         let mut ahead = false;
@@ -386,6 +383,37 @@ fn sample_class(state: &AppState, provider: &str, external_id: &str, user: &str)
     }
 }
 
+/// The song's file here for `user`: the version kept for them, else the one kept for nobody in
+/// particular, else the most recently landed one, so a person with no version of their own still
+/// plays the song's file.
+async fn own_version(
+    state: &AppState,
+    user: Option<&str>,
+    provider: &str,
+    external_id: &str,
+) -> Option<String> {
+    let user = user.filter(|user| !user.trim().is_empty());
+    let mine = match user {
+        Some(user) => {
+            state
+                .local_library
+                .get_local_path_for_external_song_as(Some(user), provider, external_id)
+                .await
+        }
+        None => None,
+    };
+    let found = match mine {
+        Some(path) => Some(path),
+        None => {
+            state
+                .local_library
+                .get_local_path_for_external_song(provider, external_id)
+                .await
+        }
+    };
+    found.filter(|path| Path::new(path).is_file())
+}
+
 /// Keeps `source` as what `user` heard of the song now, with the played mark, and the id of its
 /// sample when its prints are already stored. Answers the record kept.
 fn keep_heard(
@@ -522,11 +550,7 @@ async fn play_in_octo_app(
         .map(|path| path.to_string_lossy().into_owned());
     let ready = match &ahead {
         Some(path) => Some(path.clone()),
-        None => state
-            .local_library
-            .get_local_path_for_external_song(play.provider, play.external_id)
-            .await
-            .filter(|path| Path::new(path).is_file()),
+        None => own_version(state, Some(play.who), play.provider, play.external_id).await,
     };
     let range = call.header("Range");
     let length = state

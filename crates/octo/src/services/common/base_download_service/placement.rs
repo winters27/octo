@@ -5,6 +5,7 @@ use std::path::Path;
 
 use octo_core::common::{PathHelper, SongIdentity, artist_credit, dotnet};
 use octo_core::fingerprint::VerificationVerdict;
+use octo_core::fingerprint::verification::RecordingProof;
 use octo_core::lyrics::lyrics_text::LyricsText;
 use octo_core::models::domain::Song;
 use octo_core::settings::FolderStructure;
@@ -356,26 +357,56 @@ impl BaseDownloadService {
     }
 
     /// Whether an occupied path holds this same song: both carry the same MusicBrainz recording,
-    /// or, lacking an id on either side, it is a file Octo itself downloaded for the same artist
-    /// and title. Anything short of that is somebody's other file and is never replaced.
+    /// or, for a file whose sound was not proven to be a recording (an import the shipped checks
+    /// kept), it is a file Octo itself downloaded for the same artist and title. A file kept as
+    /// heard or kept anyway is never the same song by name, on either side, and a file the sound
+    /// proved replaces only that same recording: a second version is placed beside the first.
+    /// Anything short of that is somebody's other file and is never replaced.
     async fn is_same_song(&self, target: &str, song: &Song) -> bool {
-        let (existing_id, _) = tag_writer_extras::read_identity(Path::new(target));
-        if let (Some(existing), Some(wanted)) = (
-            existing_id.filter(|id| !id.is_empty()),
-            song.music_brainz_recording_id
-                .as_deref()
-                .filter(|id| !id.is_empty()),
-        ) {
-            return dotnet::eq_ignore_case(&existing, wanted);
+        let proof = song
+            .verification
+            .as_deref()
+            .map(|verification| verification.proof.clone())
+            .unwrap_or_default();
+        if matches!(proof, RecordingProof::AsHeard { .. } | RecordingProof::KeptByYou) {
+            return false;
+        }
+        let full = get_full_path(target);
+        let existing = self
+            .local_library
+            .get_mappings()
+            .await
+            .into_iter()
+            .filter(|mapping| {
+                !mapping.local_path.is_empty()
+                    && dotnet::eq_ignore_case(&get_full_path(&mapping.local_path), &full)
+            })
+            .collect::<Vec<_>>();
+        if existing.iter().any(|mapping| mapping.kept_unproven()) {
+            return false;
+        }
+        let (tagged, _) = tag_writer_extras::read_identity(Path::new(target));
+        let existing_id = tagged.filter(|id| !id.is_empty()).or_else(|| {
+            existing
+                .iter()
+                .find_map(|mapping| mapping.music_brainz_recording_id.clone())
+                .filter(|id| !id.is_empty())
+        });
+        let wanted = song
+            .music_brainz_recording_id
+            .as_deref()
+            .filter(|id| !id.is_empty());
+        if let (Some(existing), Some(wanted)) = (&existing_id, wanted) {
+            return dotnet::eq_ignore_case(existing, wanted);
+        }
+        if proof == RecordingProof::Proven {
+            return false;
         }
 
-        let full = get_full_path(target);
         let key = SongIdentity::match_key(&song.artist, &song.title);
-        self.local_library.get_mappings().await.iter().any(|mapping| {
-            !mapping.local_path.is_empty()
-                && dotnet::eq_ignore_case(&get_full_path(&mapping.local_path), &full)
-                && SongIdentity::match_key(&mapping.artist, &mapping.title) == key
-        })
+        existing
+            .iter()
+            .any(|mapping| SongIdentity::match_key(&mapping.artist, &mapping.title) == key)
     }
 
     /// Which name a download is filed under. With NameFromMatch on and a confirmed match, the

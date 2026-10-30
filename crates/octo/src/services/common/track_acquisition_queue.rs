@@ -49,6 +49,9 @@ pub enum GateOutcome {
     Held(WaitingFor),
     /// The file is not provably what they heard: refused, or undecided, and why.
     NotAccepted(String),
+    /// AcoustID could not tell which version the file is, and it is not the master they heard: it
+    /// was not kept, and the heard audio is what this person keeps if nothing better is proven.
+    Undecided,
 }
 
 /// The gates' verdicts on the file one acquisition ended with, by person and origin. Shared by

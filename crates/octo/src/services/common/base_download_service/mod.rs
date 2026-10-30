@@ -86,7 +86,7 @@ use crate::services::library::{
     LibraryActionJournal, LibraryOwnership, OwnedCopy, OwnedDecision, ReplacementHandoff,
     ReplacementRejectedException, UpgradeAsk, UpgradeQueue, UpgradeSources,
 };
-use crate::services::local::{DownloadHistoryService, ILocalLibraryService};
+use crate::services::local::{DownloadHistoryService, ILocalLibraryService, KeptHeart};
 use crate::services::lyrics::LyricsSidecarWriter;
 use crate::services::metadata::DeezerMetadataService;
 use crate::services::notifications::NotificationService;
@@ -353,6 +353,44 @@ pub struct AheadBusy;
 /// Why a download that had to be a real FLAC copy failed: no FLAC came, or the one that came
 /// was made from lossy audio.
 pub const NO_REAL_FLAC: &str = "No real FLAC copy found";
+
+/// What a landed file was kept for: the people whose own gate passed it, the recording their gate
+/// judged it against and what they heard, and for a file kept as heard its own print. None when
+/// no gate judged it (the shipped checks kept it, as before).
+fn kept_heart(place: &AcquisitionPlace, song: &Song) -> Option<KeptHeart> {
+    let accepted: Vec<&HeartGate> = place
+        .gates
+        .iter()
+        .filter(|gate| place.ledger.accepted(&gate.user))
+        .collect();
+    let first = accepted.first()?;
+    let verification = song.verification.as_deref();
+    let as_heard = verification.is_some_and(|verification| {
+        matches!(
+            verification.proof,
+            octo_core::fingerprint::verification::RecordingProof::AsHeard { .. }
+        )
+    });
+    let mut users: Vec<String> = Vec::new();
+    for gate in &accepted {
+        let user = gate.user.trim();
+        if !user.is_empty() && !users.iter().any(|known| dotnet::eq_ignore_case(known, user)) {
+            users.push(user.to_string());
+        }
+    }
+    Some(KeptHeart {
+        users,
+        recording: first.r.clone(),
+        heard: first.heard.clone(),
+        as_heard,
+        print: verification
+            .and_then(|verification| verification.fingerprint.clone())
+            .filter(|print| !print.is_empty()),
+        seconds: verification
+            .map(|verification| verification.duration_seconds)
+            .filter(|seconds| *seconds > 0),
+    })
+}
 
 /// Whether a path names a FLAC file.
 fn is_flac_path(path: &str) -> bool {
@@ -702,6 +740,59 @@ impl BaseDownloadService {
         }
     }
 
+    /// The song's file already here for this download. A heart's counts only a file that is
+    /// theirs: one their own gate passed before, or the very library file one of them heard,
+    /// which is already theirs and is never downloaded again. Another person's version, or a file
+    /// nobody proved, is never theirs: their gate judges what is fetched instead. Every other
+    /// download, a play's among them (a play never downloads over a copy that is here), takes the
+    /// song's file as before.
+    async fn already_downloaded(
+        &self,
+        external_provider: &str,
+        external_id: &str,
+        place: &AcquisitionPlace,
+    ) -> Option<String> {
+        let personal = matches!(
+            place.origin,
+            Some(AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart)
+        ) && !place.gates.is_empty();
+        if !personal {
+            return self
+                .local_library
+                .get_local_path_for_external_song(external_provider, external_id)
+                .await;
+        }
+        let heard_file =
+            place
+                .gates
+                .iter()
+                .find_map(|gate| match gate.heard.as_ref().map(|heard| &heard.source) {
+                    Some(HeardSource::Library { path } | HeardSource::Acquired { path })
+                        if file_exists(path) =>
+                    {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                });
+        if heard_file.is_some() {
+            return heard_file;
+        }
+        self.local_library
+            .get_mappings()
+            .await
+            .into_iter()
+            .filter(|mapping| {
+                mapping.external_provider == external_provider
+                    && mapping.external_id == external_id
+                    && mapping
+                        .heart
+                        .as_ref()
+                        .is_some_and(|heart| place.gates.iter().any(|gate| heart.is_for(&gate.user)))
+            })
+            .map(|mapping| mapping.local_path)
+            .find(|path| file_exists(path))
+    }
+
     #[allow(clippy::too_many_arguments)] // the locked half of one download, with all its inputs
     async fn download_locked<'a>(
         &'a self,
@@ -732,8 +823,7 @@ impl BaseDownloadService {
         // A replacement is always a fresh file: an existing one is what is being replaced.
         if !is_cache && options.replacement.is_none() {
             let mut existing = self
-                .local_library
-                .get_local_path_for_external_song(external_provider, external_id)
+                .already_downloaded(external_provider, external_id, &options.place)
                 .await
                 .filter(|path| file_exists(path))
                 .filter(|path| {
@@ -1346,7 +1436,7 @@ impl BaseDownloadService {
         // Only register and scan if NOT in cache mode.
         if !is_cache {
             self.local_library
-                .register_downloaded_song(&song, &local_path)
+                .register_downloaded_song_as(&song, &local_path, kept_heart(&options.place, &song))
                 .await?;
             // A pool file is recorded and linked for every member who asked (their libraries
             // are scanned one by one); Navidrome shows it at the first member's link.

@@ -5,6 +5,7 @@ use octo_core::models::domain::Song;
 use octo_core::models::subsonic::ScanStatus;
 
 use super::LocalSongMapping;
+use super::local_library_service::KeptHeart;
 use super::scan_wait::ScanHold;
 use crate::services::subsonic::navidrome_version::ServerInfo;
 
@@ -26,9 +27,37 @@ pub trait ILocalLibraryService: Send + Sync {
         external_id: &str,
     ) -> Option<String>;
 
+    /// The local file of an outside song for one person: a version kept for them (their own gate
+    /// passed it, or it is the very audio they heard), else one kept for nobody in particular.
+    /// None when only other people's versions are here. With no person, the most recently landed
+    /// version. (By default, the song's one file.)
+    async fn get_local_path_for_external_song_as(
+        &self,
+        user: Option<&str>,
+        external_provider: &str,
+        external_id: &str,
+    ) -> Option<String> {
+        let _ = user;
+        self.get_local_path_for_external_song(external_provider, external_id)
+            .await
+    }
+
     /// Registers a downloaded song in the local library. `Err` when the mappings file could not
     /// be written.
     async fn register_downloaded_song(&self, song: &Song, local_path: &str) -> anyhow::Result<()>;
+
+    /// [`Self::register_downloaded_song`] for the hearts and plays whose own gate passed the file,
+    /// with what they heard, so each person finds their own version of the song. (By default, the
+    /// plain registration.)
+    async fn register_downloaded_song_as(
+        &self,
+        song: &Song,
+        local_path: &str,
+        heart: Option<KeptHeart>,
+    ) -> anyhow::Result<()> {
+        let _ = heart;
+        self.register_downloaded_song(song, local_path).await
+    }
 
     /// Gets the mapping between external ID and local ID
     async fn get_local_id_for_external_song(
