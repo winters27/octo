@@ -20,12 +20,24 @@ Endpoints:
       size in bytes, container and bit rate. /search carries the same fields
       for the video it found.
 
+  GET /facts?id=<videoId>&fresh=1
+      The same facts from a resolve run now for this request alone: no
+      cache is read or written, the answer names the uploading channel and
+      says "fresh": true, and a resolve that finds no URL says why (410
+      removed, 403 refused, 503 busy, 502 anything else).
+
   GET /stream?id=<videoId>
       Resolves the best-audio URL (cached), then proxies bytes from
       YouTube's CDN to the caller. Streaming chunks so this stays
       flat-memory regardless of song length, and so cancellation is
       honored immediately (the upstream connection closes when the
       caller disconnects).
+
+  GET /stream?id=<videoId>&fresh=1[&itag=<n>]
+      The same bytes from a URL resolved now for this request alone, at
+      the exact format itag names when given (404 itag_unavailable when
+      YouTube no longer serves it). Every fresh answer carries the header
+      X-Octo-Fresh: 1.
 """
 from __future__ import annotations
 
@@ -261,6 +273,9 @@ def _facts_get(video_id: str) -> dict:
 
 def _facts_put(video_id: str, learned: dict):
     """Keep what is known; a later answer fills gaps and a measured size replaces a printed one."""
+    if _in_fresh_request():
+        # A fresh stream can be another format than the plays get: what it learns is not theirs.
+        return
     if not video_id:
         return
     with _FACTS_LOCK:
@@ -821,6 +836,10 @@ def meta():
 
 
 def _resolve_url(video_id: str, bg: bool = False) -> Optional[str]:
+    # A fresh /stream resolves anew every time, past the cache and the single-flight below, on the
+    # lane its own request names.
+    if _in_fresh_request():
+        return _fresh_url(video_id)
     cached = _url_cache_get(video_id)
     if cached:
         return cached
@@ -1017,7 +1036,10 @@ def _measure_loudness(url: str) -> Optional[dict]:
 
 def _maybe_measure_loudness(video_id: str, url: str) -> bool:
     """Starts measuring a played video's loudness in the background. False when it is known,
-    a measurement is running, or the minute's cap is reached."""
+    a measurement is running, the minute's cap is reached, or the stream is a fresh one, which
+    nobody listens to."""
+    if _in_fresh_request():
+        return False
     if _LOUDNESS.get(video_id) is not None:
         return False
     if not _LOUDNESS.begin(video_id):
@@ -1092,8 +1114,8 @@ def _pieced_answer(video_id, url, upstream_headers, first, wanted, total, synthe
             _url_cache_evict_if(video_id, current["url"])
             try:
                 current["url"] = _resolve_url(video_id)
-            except GateFull:
-                # Mid-answer there is no way to say busy: the piece simply fails.
+            except (GateFull, FreshRefused):
+                # Mid-answer there is no way to say busy or gone: the piece simply fails.
                 current["url"] = None
             piece = _open_upstream(current["url"], headers, video_id) if current["url"] else None
         if piece is None or piece.status_code != 206:
@@ -1271,6 +1293,190 @@ def ytm_artist_radio():
     return jsonify(artist=artist, tracks=rows)
 
 
+# --- Fresh resolves ---------------------------------------------------------------
+# /facts and /stream with fresh=1 resolve the video for that one request. Octo asks them to prove
+# that yt-dlp works right now and to fetch the very audio a person heard, so the answer never
+# comes from a cache, never waits on another resolve of the same video, and a resolve at another
+# format than the plays get (itag=) never reaches them.
+
+# The endpoints that take fresh=1.
+_FRESH_ENDPOINTS = ("stream", "stream_facts")
+
+# What a fresh run's stderr says went wrong, read in this order: the first kind with a sign in the
+# text wins. yt-dlp joins YouTube's reason and subreason, so its rate limit reads "Video
+# unavailable. This content isn't available, try again later" and is read as busy before it could
+# read as removed. The text is read in lower case, YouTube's curly apostrophe as a plain one.
+_FRESH_TROUBLES = (
+    ("busy", (
+        "try again later",
+        "rate-limit",
+        "rate limit",
+        "captcha",
+        "sign in to confirm you're not a bot",
+        "http error 429",
+    )),
+    ("removed", (
+        "video unavailable",
+        "this video has been removed",
+        "this video is no longer available",
+        "private video",
+        "this video is not available",
+    )),
+    ("refused", (
+        "sign in to confirm your age",
+        "available in your country",
+        "from your location",
+        "playback on other websites has been disabled",
+        "members only",
+        "members-only",
+    )),
+    # Read only when a format was asked for by its itag.
+    ("format_gone", (
+        "requested format is not available",
+    )),
+)
+
+# A format id as itag= names it: digits only, so it can never be another format selector.
+_ITAG = re.compile(r"[0-9]{1,4}")
+
+
+def _in_fresh_request() -> bool:
+    """True while serving /facts or /stream asked with fresh=1."""
+    return (
+        has_request_context()
+        and request.endpoint in _FRESH_ENDPOINTS
+        and request.args.get("fresh") == "1"
+    )
+
+
+class FreshRefused(Exception):
+    """A fresh resolve gave no URL: the status and the error it is answered with."""
+
+    def __init__(self, status: int, error: str):
+        super().__init__(error)
+        self.status = status
+        self.error = error
+
+
+@app.errorhandler(FreshRefused)
+def _fresh_refused(refusal):
+    return jsonify(error=refusal.error, fresh=True), refusal.status
+
+
+@app.after_request
+def _mark_fresh(response):
+    """Every answer to a fresh request says so in a header. An older shim ignores fresh=1, answers
+    from its cache and never sends it."""
+    if _in_fresh_request():
+        response.headers["X-Octo-Fresh"] = "1"
+    return response
+
+
+def _fresh_trouble(stderr: Optional[str], itag_asked: bool) -> str:
+    """What one fresh run's stderr says went wrong: busy, removed, refused, format_gone (only when
+    a format was asked for by its itag) or other."""
+    text = (stderr or "").replace("’", "'").lower()
+    for trouble, signs in _FRESH_TROUBLES:
+        if trouble == "format_gone" and not itag_asked:
+            continue
+        if any(sign in text for sign in signs):
+            return trouble
+    return "other"
+
+
+def _fresh_failure(troubles: list) -> tuple:
+    """The status and error of a fresh resolve no run gave a URL for: busy when any run was busy,
+    the asked format gone when a run said so, removed when every run said so, refused when every
+    run was refused or removed, else a failure it cannot name."""
+    if "busy" in troubles:
+        return 503, "busy"
+    if "format_gone" in troubles:
+        return 404, "itag_unavailable"
+    if troubles and all(trouble == "removed" for trouble in troubles):
+        return 410, "video_unavailable"
+    if troubles and all(trouble in ("removed", "refused") for trouble in troubles):
+        return 403, "video_refused"
+    return 502, "no_audio_url"
+
+
+def _channel_of(lines: list) -> Optional[str]:
+    """The channel a run printed with %(.{channel})j, or None when it printed none."""
+    for line in lines:
+        if not line.startswith("{"):
+            continue
+        try:
+            channel = json.loads(line).get("channel")
+        except (ValueError, AttributeError):
+            return None
+        return (channel.strip() or None) if isinstance(channel, str) else None
+    return None
+
+
+def _fresh_resolve(video_id: str, itag: Optional[str] = None, with_channel: bool = False) -> tuple:
+    """Resolves `video_id` for this request alone: the player client's run, then yt-dlp's own
+    client's when that gives no URL, as `_run_with_client` runs them, with each run's stderr read
+    for why it found none. `itag` asks for that exact format instead of the plays' choice, and
+    `with_channel` prints the uploading channel too.
+
+    Returns (url, format line, channel), or raises FreshRefused with the answer. Only the URL's
+    ready time is kept, by the URL itself, which no other request holds; and the player client is
+    never set to rest from here, since a run at another format says nothing of the plays'."""
+    args = ["--print", "%(.{channel})j"] if with_channel else []
+    args += [
+        "-f", itag or _AUDIO_FORMAT,
+        "--print", stream_info.FORMAT_PRINT,
+        "--print", "%(urls)s",
+        f"https://www.youtube.com/watch?v={video_id}",
+    ]
+    client = _client_args()
+    runs = [([*client, *args], "fresh")]
+    if client:
+        runs.append((args, "fresh-default"))
+    troubles = []
+    for run_args, label in runs:
+        try:
+            cp = _run(run_args, timeout=15, label=label, bg=_is_bg(), capture=True)
+        except GateFull:
+            raise FreshRefused(503, "busy") from None
+        if cp is None:
+            # A timeout, or a binary that would not start: no process ran.
+            troubles.append("busy")
+            continue
+        rest, format_line, url = stream_info.split_run(cp.stdout)
+        if cp.returncode == 0 and url:
+            _url_ready_put(url, stream_info.available_at(format_line))
+            return url, format_line, _channel_of(rest)
+        troubles.append(_fresh_trouble(cp.stderr, itag is not None))
+    raise FreshRefused(*_fresh_failure(troubles))
+
+
+def _fresh_url(video_id: str) -> str:
+    """The URL a fresh /stream sends: resolved now, at the format itag= names when it names one.
+    A bad id or itag is refused before yt-dlp runs."""
+    itag = request.args.get("itag", "").strip()
+    if not stream_info.is_video_id(video_id):
+        abort(400, "not a video id")
+    if itag and not _ITAG.fullmatch(itag):
+        abort(400, "itag is not a format id")
+    return _fresh_resolve(video_id, itag or None)[0]
+
+
+def _fresh_facts(video_id: str):
+    """/facts?fresh=1: the facts of a resolve run now for this request alone, with the uploading
+    channel, and "fresh": true, which an older shim answering from its cache never says."""
+    url, format_line, channel = _fresh_resolve(video_id, with_channel=True)
+    known = stream_info.stream_facts(format_line, url)
+    return jsonify(
+        video_id=video_id,
+        itag=known["itag"],
+        size=known["size"],
+        ext=known["ext"],
+        abr=known["abr"],
+        channel=channel,
+        fresh=True,
+    )
+
+
 @app.get("/facts")
 def stream_facts():
     """What /stream would send for a video: {video_id, itag, size, ext, abr}, plus
@@ -1278,12 +1484,16 @@ def stream_facts():
 
     Resolves the URL the way /stream does (same format, same cache, same gate) when this video
     has not been resolved yet, so a later play of it is a cache hit.
+
+    With fresh=1 the video is resolved anew for this request alone instead: see `_fresh_facts`.
     """
     video_id = request.args.get("id", "").strip()
     if not video_id:
         abort(400, "missing id")
     if not stream_info.is_video_id(video_id):
         abort(400, "not a video id")
+    if _in_fresh_request():
+        return _fresh_facts(video_id)
     known = _facts_get(video_id)
     if known.get("size") is None:
         if not _resolve_url(video_id, _is_bg()):

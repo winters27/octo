@@ -42,6 +42,29 @@ pub struct ShimStream {
     pub content_range: Option<String>,
 }
 
+impl ShimStream {
+    /// An open `/stream` answer with the headers its caller reads.
+    fn from_response(response: reqwest::Response, status_code: u16) -> ShimStream {
+        let header = |name: reqwest::header::HeaderName| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let content_type = header(reqwest::header::CONTENT_TYPE).unwrap_or_else(|| "audio/mp4".to_string());
+        let content_range = header(reqwest::header::CONTENT_RANGE);
+        let content_length = response.content_length();
+        ShimStream {
+            response,
+            content_type,
+            content_length,
+            status_code,
+            content_range,
+        }
+    }
+}
+
 /// What a lookup came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lookup<T> {
@@ -74,6 +97,27 @@ fn is_busy_body(body: &str) -> bool {
     serde_json::from_str::<Value>(body)
         .ok()
         .is_some_and(|root| root.get("error").and_then(Value::as_str) == Some("busy"))
+}
+
+/// The header every answer to a fresh request carries. An older shim ignores `fresh=1` and never
+/// sends it.
+const FRESH_HEADER: &str = "x-octo-fresh";
+
+/// What a fresh `/facts` or `/stream` the shim did not fulfil came to, by its status, whether the
+/// answer said it is fresh, and the error its body names. Without the echo it proves nothing,
+/// whatever the status: an older shim, or something that is not the shim, answered.
+fn fresh_failure(status: u16, fresh: bool, error: Option<&str>) -> Failure {
+    if !fresh {
+        return Failure::Other;
+    }
+    match (status, error) {
+        // A full gate or a busy run (503), or a run that failed for no reason it could name
+        // (502): asked again later, never gone.
+        (502 | 503, _) => Failure::Busy,
+        (410, Some("video_unavailable")) | (404, Some("itag_unavailable")) => Failure::Gone,
+        (403, Some("video_refused")) => Failure::Refused,
+        _ => Failure::Other,
+    }
 }
 
 /// A `/stream` the shim did not open.
@@ -732,22 +776,116 @@ impl YouTubeResolver {
             let busy = status == 503 && is_busy_body(&resp.text().await.unwrap_or_default());
             return Err(ShimRefused { busy });
         }
-        let header = |name: reqwest::header::HeaderName| {
-            resp.headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
+        Ok(ShimStream::from_response(resp, status))
+    }
+
+    /// What a resolve the shim runs now for this request alone finds (`/facts` with `fresh=1`),
+    /// on its background lane (`bg=1`): the stream's facts and the channel that uploaded the
+    /// video. Only an answer that says `"fresh": true` counts: an older shim ignores `fresh=1`
+    /// and answers from its cache, which proves nothing and is [`Failure::Other`]. A removed
+    /// video (410 `video_unavailable`) is [`Failure::Gone`], a lasting refusal (403
+    /// `video_refused`) [`Failure::Refused`], a busy or failed resolve (503, 502)
+    /// [`Failure::Busy`], and a shim that cannot be reached [`Failure::Unreachable`]. Never
+    /// [`Lookup::None`]: a fresh resolve finds a stream or says why not.
+    pub async fn facts_fresh(&self, video_id: &str) -> Lookup<FreshFacts> {
+        if video_id.trim().is_empty() {
+            return Lookup::Failed(Failure::Other);
+        }
+        let url = format!("{}/facts?id={}&fresh=1&bg=1", self.base_url, escape(video_id));
+        let resp = match self.search_client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                debug!("shim fresh /facts failed for {video_id}: {e}");
+                return Lookup::Failed(if e.is_connect() {
+                    Failure::Unreachable
+                } else {
+                    Failure::Other
+                });
+            }
         };
-        let content_type = header(reqwest::header::CONTENT_TYPE).unwrap_or_else(|| "audio/mp4".to_string());
-        let content_range = header(reqwest::header::CONTENT_RANGE);
-        let content_length = resp.content_length();
-        Ok(ShimStream {
-            response: resp,
-            content_type,
-            content_length,
-            status_code: status,
-            content_range,
+        let status = resp.status().as_u16();
+        let root: Option<Value> = serde_json::from_str(&resp.text().await.unwrap_or_default()).ok();
+        let fresh = root
+            .as_ref()
+            .and_then(|root| root.get("fresh"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if status != 200 {
+            debug!("shim fresh /facts HTTP {status} for {video_id}");
+            let error = root
+                .as_ref()
+                .and_then(|root| root.get("error"))
+                .and_then(Value::as_str);
+            return Lookup::Failed(fresh_failure(status, fresh, error));
+        }
+        let Some(root) = root.as_ref().filter(|_| fresh) else {
+            debug!("shim /facts for {video_id} did not say it is fresh: the shim is older than Octo");
+            return Lookup::Failed(Failure::Other);
+        };
+        let channel = root
+            .get("channel")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|channel| !channel.is_empty())
+            .map(str::to_string);
+        Lookup::Found(FreshFacts {
+            facts: parse_stream(root),
+            channel,
         })
+    }
+
+    /// A `/stream` of `video_id` from a URL the shim resolves now for this request alone
+    /// (`fresh=1`), on its background lane (`bg=1`), at exactly the audio format `itag` when
+    /// given. `range_header` goes on as [`Self::open_stream`] passes it. Only an answer with
+    /// `X-Octo-Fresh: 1` counts: without it the shim is older and the stream proves nothing
+    /// ([`Failure::Other`]). A removed video (410), or the format no longer served (404
+    /// `itag_unavailable`), is [`Failure::Gone`]; a lasting refusal (403) [`Failure::Refused`]; a
+    /// busy or failed resolve (503, 502) [`Failure::Busy`]; a shim that cannot be reached
+    /// [`Failure::Unreachable`].
+    pub async fn open_stream_fresh(
+        &self,
+        video_id: &str,
+        range_header: Option<&str>,
+        itag: Option<u32>,
+    ) -> Result<ShimStream, Failure> {
+        if video_id.trim().is_empty() {
+            return Err(Failure::Other);
+        }
+        let mut url = format!("{}/stream?id={}&fresh=1&bg=1", self.base_url, escape(video_id));
+        if let Some(itag) = itag {
+            url.push_str(&format!("&itag={itag}"));
+        }
+        let mut request = self.stream_client.get(&url);
+        if let Some(range) = range_header.filter(|r| !r.is_empty()) {
+            request = request.header(reqwest::header::RANGE, range);
+        }
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                warn!("shim fresh /stream failed for {video_id}: {e}");
+                return Err(if e.is_connect() {
+                    Failure::Unreachable
+                } else {
+                    Failure::Other
+                });
+            }
+        };
+        let status = resp.status().as_u16();
+        let fresh = resp.headers().get(FRESH_HEADER).and_then(|v| v.to_str().ok()) == Some("1");
+        if !matches!(status, 200 | 206 | 416) {
+            warn!("shim fresh /stream HTTP {status} for {video_id}");
+            let root: Option<Value> = serde_json::from_str(&resp.text().await.unwrap_or_default()).ok();
+            let error = root
+                .as_ref()
+                .and_then(|root| root.get("error"))
+                .and_then(Value::as_str);
+            return Err(fresh_failure(status, fresh, error));
+        }
+        if !fresh {
+            debug!("shim /stream for {video_id} did not say it is fresh: the shim is older than Octo");
+            return Err(Failure::Other);
+        }
+        Ok(ShimStream::from_response(resp, status))
     }
 
     /// Downloads a YouTube video as MP3 to `{dest_without_ext}.mp3` via the shim's
@@ -1546,6 +1684,190 @@ mod tests {
         assert_eq!(
             resolver.music_song_lookup("Adele", "Hello", None, true).await,
             Lookup::Failed(Failure::Busy)
+        );
+    }
+
+    // ---- The fresh path ------------------------------------------------------------------
+
+    /// A fresh `/facts` asks the shim's background lane past its cache, and reads the stream's
+    /// facts and the uploading channel once the answer says it is fresh.
+    #[tokio::test]
+    async fn a_fresh_facts_reads_the_resolve_and_its_channel() {
+        let shim = MockServer::start().await;
+        Mock::given(path("/facts"))
+            .and(query_param("id", "abc"))
+            .and(query_param("fresh", "1"))
+            .and(query_param("bg", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"video_id":"abc","itag":"140","size":6755585,"ext":"m4a","abr":129.4,"channel":" The Beatles - Topic ","fresh":true}"#,
+            ))
+            .mount(&shim)
+            .await;
+        let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+        assert_eq!(
+            resolver.facts_fresh("abc").await,
+            Lookup::Found(FreshFacts {
+                facts: StreamFacts {
+                    size: Some(6_755_585),
+                    itag: Some("140".into()),
+                    ext: Some("m4a".into()),
+                    bit_rate: Some(129),
+                    ..Default::default()
+                },
+                channel: Some("The Beatles - Topic".into()),
+            })
+        );
+        assert_eq!(resolver.facts_fresh(" ").await, Lookup::Failed(Failure::Other));
+    }
+
+    /// An older shim ignores `fresh=1` and answers from its cache, with no echo: that proves
+    /// nothing, on `/facts` and on `/stream`.
+    #[tokio::test]
+    async fn a_fresh_answer_without_its_echo_proves_nothing() {
+        let shim = MockServer::start().await;
+        Mock::given(path("/facts"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"video_id":"abc","itag":"140","size":6755585,"ext":"m4a"}"#),
+            )
+            .mount(&shim)
+            .await;
+        Mock::given(path("/stream"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-1/1000")
+                    .set_body_raw(vec![1u8, 2], "audio/mp4"),
+            )
+            .mount(&shim)
+            .await;
+        let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+        assert_eq!(resolver.facts_fresh("abc").await, Lookup::Failed(Failure::Other));
+        assert_eq!(
+            resolver
+                .open_stream_fresh("abc", Some("bytes=0-1"), None)
+                .await
+                .err(),
+            Some(Failure::Other)
+        );
+    }
+
+    /// Each refusal of a fresh request reads as its failure: a busy or failed resolve waits, a
+    /// removed video or a format no longer served is gone, a lasting refusal is refused, and
+    /// anything else, or anything without the echo, proves nothing.
+    #[tokio::test]
+    async fn each_fresh_refusal_reads_as_its_failure() {
+        // (status, the body's error, whether the answer says it is fresh, the failure)
+        let cases: [(u16, &str, bool, Failure); 9] = [
+            (503, "busy", true, Failure::Busy),
+            (502, "no_audio_url", true, Failure::Busy),
+            (410, "video_unavailable", true, Failure::Gone),
+            (404, "itag_unavailable", true, Failure::Gone),
+            (403, "video_refused", true, Failure::Refused),
+            (404, "not_found", true, Failure::Other),
+            (400, "bad_request", true, Failure::Other),
+            (410, "video_unavailable", false, Failure::Other),
+            (503, "busy", false, Failure::Other),
+        ];
+        let shim = MockServer::start().await;
+        for (at, (status, error, echoed, _)) in cases.iter().enumerate() {
+            let id = format!("case{at}");
+            let answer = if *echoed {
+                ResponseTemplate::new(*status)
+                    .insert_header("x-octo-fresh", "1")
+                    .set_body_string(format!(r#"{{"error":"{error}","fresh":true}}"#))
+            } else {
+                ResponseTemplate::new(*status).set_body_string(format!(r#"{{"error":"{error}"}}"#))
+            };
+            Mock::given(path("/facts"))
+                .and(query_param("id", id.as_str()))
+                .respond_with(answer.clone())
+                .mount(&shim)
+                .await;
+            Mock::given(path("/stream"))
+                .and(query_param("id", id.as_str()))
+                .respond_with(answer)
+                .mount(&shim)
+                .await;
+        }
+        let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+        for (at, (status, _, _, expected)) in cases.iter().enumerate() {
+            let id = format!("case{at}");
+            assert_eq!(
+                resolver.facts_fresh(&id).await,
+                Lookup::Failed(*expected),
+                "/facts {status}, case {at}"
+            );
+            assert_eq!(
+                resolver.open_stream_fresh(&id, None, Some(251)).await.err(),
+                Some(*expected),
+                "/stream {status}, case {at}"
+            );
+        }
+    }
+
+    /// A shim that cannot be reached is unreachable, never gone.
+    #[tokio::test]
+    async fn a_fresh_request_to_a_shim_that_cannot_be_reached_is_unreachable() {
+        let closed = format!("http://{}", crate::services::test_support::refused_address());
+        let resolver = YouTubeResolver::with_base_url(Some(&closed));
+        assert_eq!(
+            resolver.facts_fresh("abc").await,
+            Lookup::Failed(Failure::Unreachable)
+        );
+        assert_eq!(
+            resolver.open_stream_fresh("abc", None, None).await.err(),
+            Some(Failure::Unreachable)
+        );
+    }
+
+    /// A fresh stream asks for the heard format on the background lane with the caller's range,
+    /// and hands back the shim's answer once it says it is fresh; without a format it names none.
+    #[tokio::test]
+    async fn a_fresh_stream_asks_for_the_format_and_hands_back_the_answer() {
+        let shim = MockServer::start().await;
+        Mock::given(path("/stream"))
+            .and(query_param("id", "abc"))
+            .and(query_param("fresh", "1"))
+            .and(query_param("bg", "1"))
+            .and(query_param("itag", "251"))
+            .and(header("range", "bytes=0-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("x-octo-fresh", "1")
+                    .insert_header("content-range", "bytes 0-3/4")
+                    .set_body_raw(b"opus".to_vec(), "audio/webm"),
+            )
+            .mount(&shim)
+            .await;
+        Mock::given(path("/stream"))
+            .and(query_param("id", "def"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-octo-fresh", "1")
+                    .set_body_raw(b"m4a".to_vec(), "audio/mp4"),
+            )
+            .mount(&shim)
+            .await;
+        let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+        let stream = resolver
+            .open_stream_fresh("abc", Some("bytes=0-"), Some(251))
+            .await
+            .expect("a fresh stream");
+        assert_eq!(stream.status_code, 206);
+        assert_eq!(stream.content_type, "audio/webm");
+        assert_eq!(stream.content_length, Some(4));
+        assert_eq!(stream.content_range.as_deref(), Some("bytes 0-3/4"));
+        assert_eq!(stream.response.bytes().await.expect("the body").as_ref(), b"opus");
+        let plain = resolver
+            .open_stream_fresh("def", None, None)
+            .await
+            .expect("a fresh stream");
+        assert_eq!(plain.status_code, 200);
+        let asked = queries(&shim).await;
+        assert!(asked.iter().any(|q| q == "id=def&fresh=1&bg=1"), "{asked:?}");
+        assert_eq!(
+            resolver.open_stream_fresh("", None, None).await.err(),
+            Some(Failure::Other)
         );
     }
 }
