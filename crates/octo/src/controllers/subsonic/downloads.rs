@@ -1,6 +1,6 @@
-//! octoAcquisitions version 3, the apps' downloads drawer. One download's whole log, clearing
-//! finished ones, and Find songs (a search run again by hand, every copy listed, one picked, and
-//! a library song replaced anyway once the person says so).
+//! octoAcquisitions version 4, the apps' downloads drawer. One download's whole log, clearing
+//! finished ones, Find songs (a search run again by hand, every copy listed, one picked, and a
+//! library song replaced anyway once the person says so), and keeping a held download anyway.
 //! Always JSON, and every call is checked with a ping to Navidrome as getAcquisitions is. Each
 //! person sees and picks only their own.
 
@@ -15,6 +15,7 @@ use super::caller_checks::{SubsonicCall, check_caller, signed_in_user};
 use crate::app::AppState;
 use crate::http::error::AppResult;
 use crate::http::routes::RouteSet;
+use crate::services::common::heart_acquisition_coordinator::KeepAnyway;
 use crate::services::common::song_finder::{PickOutcome, library_action_states};
 use crate::services::family::{WriteDecision, family_caller};
 use crate::services::subsonic::SubsonicResponseBuilderExt;
@@ -26,6 +27,10 @@ const FORMAT: &str = "json";
 pub fn routes() -> RouteSet {
     RouteSet::new()
         .subsonic("getAcquisition", get(get_acquisition).post(get_acquisition))
+        .subsonic(
+            "keepAcquisitionAnyway",
+            get(keep_acquisition_anyway).post(keep_acquisition_anyway),
+        )
         .subsonic(
             "clearAcquisitions",
             get(clear_acquisitions).post(clear_acquisitions),
@@ -60,13 +65,90 @@ pub async fn get_acquisition(State(state): State<AppState>, req: Request) -> App
     let row = if is_blank(&username) {
         None
     } else {
-        state.acquisition_tracker.detail(&key, Some(&username))
+        state
+            .acquisition_tracker
+            .detail(&key, Some(&username))
+            .map(|mut row| {
+                state
+                    .heart_acquisition_coordinator
+                    .keep_marks(&username)
+                    .mark(&mut row);
+                row
+            })
     };
     Ok(match row {
         Some(row) => builder.create_acquisition_response(&row).into_response(),
         None => builder
             .create_error(FORMAT, 70, "No such download")
             .into_response(),
+    })
+}
+
+/// What keepAcquisitionAnyway answers someone who may not keep the row.
+const KEEP_NOT_YOURS: &str = "Only someone who hearted this can keep it";
+/// What it answers the admin who names nobody.
+pub const NAME_THE_PERSON: &str = "Name the person whose copy to keep";
+/// What it answers when nothing of the row waits to be kept for that person.
+pub const NOTHING_WAITING: &str = "Nothing is waiting to be kept";
+
+/// octoAcquisitions version 4: keeps a held download anyway, by the key getAcquisitions lists:
+/// Keep anyway on a song's row, Keep these anyway on a hearted album's. It is resolved through the
+/// holds of that row, never the row itself: the caller must wait in one, and keeps their own. The
+/// admin keeps a holder's by naming them with `user` (error 10 without one). The request is saved
+/// before this answers a plain ok, then carried out; error 70 when nothing waits to be kept.
+pub async fn keep_acquisition_anyway(State(state): State<AppState>, req: Request) -> AppResult {
+    let call = match SubsonicCall::read(&state, req).await {
+        Ok(call) => call,
+        Err(response) => return Ok(response),
+    };
+    if let Some(refused) = check_caller(&state, &call).await {
+        return Ok(refused);
+    }
+    let builder = &state.subsonic_response_builder;
+    let key = trimmed(&call, "key");
+    if key.is_empty() {
+        return Ok(builder
+            .create_error(FORMAT, 10, "Required parameter is missing: key")
+            .into_response());
+    }
+    let username = signed_in_user(&state, &call).await?;
+    if is_blank(&username) {
+        return Ok(builder
+            .create_error(FORMAT, 50, "Sign in with a username to keep a download")
+            .into_response());
+    }
+    let named = trimmed(&call, "user");
+    let coordinator = &state.heart_acquisition_coordinator;
+    let refused = |code: i32, message: &str| builder.create_error(FORMAT, code, message).into_response();
+    let kept = || {
+        builder
+            .create_response(FORMAT, "keepAcquisitionAnyway")
+            .into_response()
+    };
+    // The admin keeps a holder's copy by naming them; anyone else keeps only their own.
+    if !named.is_empty() && !dotnet::eq_ignore_case(&named, username.trim()) {
+        if !super::extensions::is_caller_admin(&call, &username).await {
+            return Ok(refused(50, KEEP_NOT_YOURS));
+        }
+        return Ok(match coordinator.keep_anyway(&key, &named) {
+            KeepAnyway::Keeping => kept(),
+            _ => refused(70, NOTHING_WAITING),
+        });
+    }
+    let outcome = coordinator.keep_anyway(&key, &username);
+    if matches!(outcome, KeepAnyway::NotAHolder | KeepAnyway::NothingHeld)
+        && named.is_empty()
+        && super::extensions::is_caller_admin(&call, &username).await
+    {
+        return Ok(refused(10, NAME_THE_PERSON));
+    }
+    // A row listed for the caller whose holds no longer name them has nothing waiting for them.
+    let listed_for_them = || state.acquisition_tracker.detail(&key, Some(&username)).is_some();
+    Ok(match outcome {
+        KeepAnyway::Keeping => kept(),
+        KeepAnyway::NothingWaiting | KeepAnyway::NothingHeld => refused(70, NOTHING_WAITING),
+        KeepAnyway::NotAHolder if listed_for_them() => refused(70, NOTHING_WAITING),
+        KeepAnyway::NotAHolder => refused(50, KEEP_NOT_YOURS),
     })
 }
 

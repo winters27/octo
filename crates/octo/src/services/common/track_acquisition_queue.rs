@@ -305,6 +305,9 @@ pub struct AcquisitionPlace {
     pub ledger: GateLedger,
     /// What a replacement refuses by its original's sound.
     pub deny: Option<SoundDeny>,
+    /// The person keeps it anyway: the download lands a file its hold kept, as it is, or the very
+    /// audio they heard, marked "kept by you, version not proven", and searches for nothing.
+    pub keep_anyway: bool,
 }
 
 /// One queued request to fetch a permanent copy of a track.
@@ -356,6 +359,9 @@ pub struct AcquisitionRequest {
     joiners: Mutex<Vec<GatedJoiner>>,
     /// What a replacement refuses by its original's sound.
     pub deny: Option<SoundDeny>,
+    /// A person's keep: settable until the worker reads the place, so a keep that joins a request
+    /// still waiting makes it one.
+    keep_anyway: AtomicBool,
 
     pub completion: Completion,
 }
@@ -404,6 +410,7 @@ impl AcquisitionRequest {
             held_files: Mutex::new(Vec::new()),
             joiners: Mutex::new(Vec::new()),
             deny: None,
+            keep_anyway: AtomicBool::new(false),
             completion: Completion::default(),
         }
     }
@@ -538,6 +545,7 @@ impl AcquisitionRequest {
             held_files: self.held_files.lock().clone(),
             ledger: self.completion.ledger().clone(),
             deny: self.deny.clone(),
+            keep_anyway: self.keep_anyway.load(Ordering::SeqCst),
         }
     }
 
@@ -567,6 +575,10 @@ impl AcquisitionRequest {
 
     pub(crate) fn ask_for_upgrade_search(&self) {
         self.upgrade_search.store(true, Ordering::SeqCst);
+    }
+
+    fn ask_to_keep(&self) {
+        self.keep_anyway.store(true, Ordering::SeqCst);
     }
 
     /// Every user who asked for this track, not only the one who asked first.
@@ -973,6 +985,63 @@ impl TrackAcquisitionQueue {
             request = request.with_origin(origin);
         }
         request.deny = deny;
+        self.queue_request(
+            request,
+            gates,
+            held_files,
+            target,
+            requested_by,
+            upgrade_search,
+            false,
+        )
+        .0
+    }
+
+    /// A person's keep of what a hold kept for them: the download lands one of `held_files` as it
+    /// is, or else the very audio a gate's person heard, and searches for nothing. A request still
+    /// waiting for this song becomes a keep when this joins it. Answers the completion, and whether
+    /// it joined a request already in flight (one already running is not a keep).
+    #[allow(clippy::too_many_arguments)] // why it runs, whose it is, what it keeps and where from
+    pub fn enqueue_keeping(
+        &self,
+        origin: AcquisitionOrigin,
+        gates: Vec<HeartGate>,
+        held_files: Vec<String>,
+        target: &AcquisitionTarget,
+        provider: &str,
+        external_id: &str,
+        source_override: Option<DownloadSource>,
+        requested_by: Option<&str>,
+    ) -> (Completion, bool) {
+        let request = AcquisitionRequest::new(
+            provider,
+            external_id,
+            true,
+            false,
+            true,
+            source_override,
+            true,
+            None,
+        )
+        .with_origin(origin);
+        self.queue_request(request, gates, held_files, target, requested_by, false, true)
+    }
+
+    /// Queues `request` with its askers, or joins the one already in flight for its song. True
+    /// with the completion when it joined.
+    #[allow(clippy::too_many_arguments)] // the request and what each asker brings to it
+    fn queue_request(
+        &self,
+        request: AcquisitionRequest,
+        gates: Vec<HeartGate>,
+        held_files: Vec<String>,
+        target: &AcquisitionTarget,
+        requested_by: Option<&str>,
+        upgrade_search: bool,
+        keep: bool,
+    ) -> (Completion, bool) {
+        let (provider, external_id) = (request.provider.clone(), request.external_id.clone());
+        let (is_star, notify_on_failure) = (request.is_star, request.notify_on_failure);
         let request = Arc::new(request);
         request.add_requester(requested_by);
         request.add_target(target);
@@ -982,6 +1051,9 @@ impl TrackAcquisitionQueue {
         request.add_held_files(&held_files);
         if upgrade_search {
             request.ask_for_upgrade_search();
+        }
+        if keep {
+            request.ask_to_keep();
         }
 
         let existing = {
@@ -1016,7 +1088,10 @@ impl TrackAcquisitionQueue {
             if upgrade_search {
                 existing.ask_for_upgrade_search();
             }
-            return existing.completion.clone();
+            if keep {
+                existing.ask_to_keep();
+            }
+            return (existing.completion.clone(), true);
         }
 
         if is_star {
@@ -1040,14 +1115,14 @@ impl TrackAcquisitionQueue {
             );
             self.release(&request);
             request.completion.try_set_error(queue_full());
-            return request.completion.clone();
+            return (request.completion.clone(), false);
         }
 
         info!(
             "Queued {} acquisition for {provider}:{external_id}",
             if is_star { "star" } else { "play" }
         );
-        request.completion.clone()
+        (request.completion.clone(), false)
     }
 
     /// Queue a copy of a played track unless another played track is still waiting. Radio

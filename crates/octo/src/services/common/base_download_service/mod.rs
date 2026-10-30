@@ -54,6 +54,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt};
 use octo_core::common::{PathHelper, SongIdentity, dotnet};
 use octo_core::fingerprint::VerificationResult;
 use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeardSource, HeartGate};
+use octo_core::fingerprint::verification::RecordingProof;
 use octo_core::models::domain::{Album, Song};
 use octo_core::models::download::{AcquisitionHeard, DownloadHistoryEntry, DownloadInfo, DownloadStatus};
 use octo_core::notifications::{NotificationEvent, NotificationEventType};
@@ -172,6 +173,9 @@ pub struct TrackDownload {
     pub requested_by: Vec<String>,
     /// What a replacement refuses by its original's sound.
     pub deny: Option<SoundDeny>,
+    /// A person's keep: a file the hold kept lands as it is, or the very audio they heard, and
+    /// nothing is searched for.
+    pub keep_anyway: bool,
 }
 
 /// The source-specific parts of the download pipeline. Every call is handed the base, so a
@@ -375,11 +379,12 @@ fn kept_heart(place: &AcquisitionPlace, song: &Song) -> Option<KeptHeart> {
         .collect();
     let first = accepted.first()?;
     let verification = song.verification.as_deref();
-    let as_heard = verification.is_some_and(|verification| {
-        matches!(
-            verification.proof,
-            octo_core::fingerprint::verification::RecordingProof::AsHeard { .. }
-        )
+    // A file kept anyway is the heard audio itself when its person's gate heard something: the
+    // keep lands nothing else for them.
+    let as_heard = verification.is_some_and(|verification| match verification.proof {
+        RecordingProof::AsHeard { .. } => true,
+        RecordingProof::KeptByYou => first.heard.is_some(),
+        _ => false,
     });
     let mut users: Vec<String> = Vec::new();
     for gate in &accepted {
@@ -400,6 +405,35 @@ fn kept_heart(place: &AcquisitionPlace, song: &Song) -> Option<KeptHeart> {
             .map(|verification| verification.duration_seconds)
             .filter(|seconds| *seconds > 0),
     })
+}
+
+/// Whether a gate of this place heard a copy fetched ahead, which a person's keep may take as the
+/// very audio they heard.
+fn heard_an_ahead_copy(place: &AcquisitionPlace) -> bool {
+    place.gates.iter().any(|gate| {
+        matches!(
+            gate.heard.as_ref().map(|heard| &heard.source),
+            Some(HeardSource::Copy { .. })
+        )
+    })
+}
+
+/// A file the person kept anyway. What its own check proved by sound stays proven; anything less
+/// is marked "kept by you, version not proven", claims no recording, no ISRC and no match, and is
+/// named as the request names it.
+fn kept_by_you(song: &mut Song) {
+    let mut verification = song.verification.take().map(|kept| *kept).unwrap_or_default();
+    if verification.proof != RecordingProof::Proven {
+        verification.proof = RecordingProof::KeptByYou;
+        verification.verdict = octo_core::fingerprint::VerificationVerdict::Inconclusive;
+        verification.recording_id = None;
+        verification.candidate_recording_id = None;
+        verification.r#match = None;
+        verification.tags_authoritative = false;
+        song.isrc = None;
+        song.music_brainz_recording_id = None;
+    }
+    song.verification = Some(Box::new(verification));
 }
 
 /// Whether a path names a FLAC file.
@@ -1136,8 +1170,13 @@ impl BaseDownloadService {
         self.start_album_pick(&song, &requested);
 
         // A song fetched ahead earlier is taken from its folder instead of downloaded again, with
-        // what its download learned, and finalized exactly as a fresh download.
-        let promoted = if options.prefetch || options.replacement.is_some() || options.upgrade_search {
+        // what its download learned, and finalized exactly as a fresh download. A person's keep
+        // takes it only when it is the very copy they heard.
+        let promoted = if options.prefetch
+            || options.replacement.is_some()
+            || options.upgrade_search
+            || (options.place.keep_anyway && !heard_an_ahead_copy(&options.place))
+        {
             None
         } else {
             self.promote_ahead(external_provider, external_id, &mut song)
@@ -1161,6 +1200,7 @@ impl BaseDownloadService {
             ledger: options.place.ledger.clone(),
             requested_by: options.requested_by.clone().unwrap_or_default(),
             deny: options.place.deny.clone(),
+            keep_anyway: options.place.keep_anyway,
         };
         // A heart's or a play's gates judge a song fetched ahead before it is kept; one they pass
         // over is gone, and the download runs.
@@ -1234,6 +1274,9 @@ impl BaseDownloadService {
         }
         let mut landed_path = transferred?;
         Self::ensure_on_disk(Some(&landed_path))?;
+        if options.place.keep_anyway {
+            kept_by_you(&mut song);
+        }
         // Placing, tagging and registering touch the library and the mapping file, and those stay
         // one at a time.
         if permit.is_none() {

@@ -2812,6 +2812,16 @@ impl DownloadBackend for SoulseekDownloadService {
             ))
             .into());
         };
+        // A person's keep lands a file its hold kept, as it is, or else only the audio they heard
+        // (YouTube's own copy of it): nothing is searched for.
+        if download.keep_anyway {
+            if let Some(path) = self.keep_held_file(base, download).await {
+                return Ok(path);
+            }
+            if download.source_override != Some(DownloadSource::YouTube) {
+                anyhow::bail!("Nothing this download held is left to keep");
+            }
+        }
         // A resumed hold brings back the files it held: the first still there that passes the
         // checks is the download, before any source is asked.
         let held_track = download.origin

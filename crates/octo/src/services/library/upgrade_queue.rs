@@ -1125,8 +1125,8 @@ enum Recheckable {
     Held(String),
 }
 
-/// Files kept as heard, checked again on the events tied to work: a play or a heart of the song,
-/// a heart AcoustID's clear reading accepts, and the person's own Retry. Each check sends one
+/// Files kept as heard or kept anyway, checked again on the events tied to work: a play or a heart
+/// of the song, a heart AcoustID's clear reading accepts, and the person's own Retry. Each check sends one
 /// lookup of the print kept with the file (no `fpcalc`), reads it as what was heard is read, and
 /// only when a better copy could then be proven starts the search for one, whatever the weekly
 /// upgrade's settings and however recently it last tried. A check that finds nothing new fetches
@@ -1217,7 +1217,7 @@ impl KeptRechecks {
             .filter(|mapping| {
                 mapping.external_provider == provider
                     && mapping.external_id == external_id
-                    && mapping.heart.as_ref().is_some_and(|heart| heart.as_heard)
+                    && rechecked(mapping)
                     && Path::new(&mapping.local_path).is_file()
             })
             .collect()
@@ -1257,10 +1257,7 @@ impl KeptRechecks {
             .get_mappings()
             .await
             .into_iter()
-            .filter(|mapping| {
-                mapping.heart.as_ref().is_some_and(|heart| heart.as_heard)
-                    && Path::new(&mapping.local_path).is_file()
-            })
+            .filter(|mapping| rechecked(mapping) && Path::new(&mapping.local_path).is_file())
             .map(|mapping| {
                 (
                     checked.get(&kept_item(&mapping)).copied().unwrap_or(0),
@@ -1308,13 +1305,26 @@ impl KeptRechecks {
             self.another_song(&mapping, &heart);
             return read;
         }
-        if read.can_succeed()
+        if self.worth_a_search(&mapping, &heart, &read)
             && let Some(upgrade) = self.upgrade.get().cloned()
         {
             self.read.lock().insert(mapping.key(), read.clone());
             upgrade(mapping).await;
         }
         read
+    }
+
+    /// Whether a search for a better copy of a kept file could prove one: by its sound as it now
+    /// reads, or, for a file kept anyway that nobody heard, against what its person has heard of the
+    /// song since, whose master a copy may then be.
+    fn worth_a_search(&self, mapping: &LocalSongMapping, heart: &KeptHeart, read: &Reread) -> bool {
+        read.can_succeed()
+            || (!heart.as_heard
+                && matches!(read, Reread::OnlyHeardOrMaster | Reread::Unread)
+                && heart
+                    .users
+                    .first()
+                    .is_some_and(|user| self.registry.heard_by(&mapping.external_id, user).is_some()))
     }
 
     /// The kept file is another song than the one hearted: its video is refused for the song, as
@@ -1554,6 +1564,12 @@ impl KeptRechecks {
     }
 }
 
+/// Whether a library file is checked again on the events tied to work: one a heart kept with no
+/// proven recording, kept as heard or kept anyway.
+fn rechecked(mapping: &LocalSongMapping) -> bool {
+    mapping.heart.is_some() && mapping.kept_unproven()
+}
+
 /// A kept file's place in the order checks follow proofs in.
 fn kept_item(mapping: &LocalSongMapping) -> String {
     format!("kept|{}", mapping.key())
@@ -1593,3 +1609,7 @@ mod kept_proof_two_tests;
 #[cfg(test)]
 #[path = "kept_pool_tests.rs"]
 mod kept_pool_tests;
+
+#[cfg(test)]
+#[path = "kept_anyway_rechecks_tests.rs"]
+mod kept_anyway_rechecks_tests;

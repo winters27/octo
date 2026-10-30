@@ -1488,6 +1488,7 @@ impl HeartAcquisitionCoordinator {
         tokio::spawn(async move {
             coordinator.run_held(&record).await;
             coordinator.resuming.lock().remove(&key);
+            coordinator.keeps_after(&key, &record.keep_requested).await;
         });
     }
 
@@ -1503,6 +1504,7 @@ impl HeartAcquisitionCoordinator {
         self.checked_again(&record);
         self.run_held(&record).await;
         self.resuming.lock().remove(key);
+        self.keeps_after(key, &record.keep_requested).await;
     }
 
     /// Octo's start: each hold a person waits on ("not yet proven" hearts and held album tracks)
@@ -1672,6 +1674,11 @@ impl HeartAcquisitionCoordinator {
     }
 
     async fn run_held(&self, record: &HeldAcquisition) {
+        // The keeps its people asked for are carried out first; whoever else waits runs as before.
+        let Some(record) = self.keeps_first(record).await else {
+            return;
+        };
+        let record = &record;
         let Some(holds) = self.extras.holds.clone() else {
             return;
         };
@@ -3569,6 +3576,11 @@ fn to_direct_source(source: HeartDownloadSource) -> DownloadSource {
         _ => DownloadSource::Soulseek,
     }
 }
+
+#[path = "heart_keep_anyway.rs"]
+pub mod keep_anyway;
+
+pub use keep_anyway::{KEEP_WAITS_FOR_YOUTUBE, KeepAnyway, KeepMarks};
 
 #[cfg(test)]
 #[path = "heart_acquisition_coordinator_tests.rs"]

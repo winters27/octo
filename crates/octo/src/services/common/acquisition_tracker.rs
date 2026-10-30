@@ -115,8 +115,12 @@ pub struct AcquisitionSnapshot {
     pub log_lines: i32,
     /// The log itself, oldest first; only [`AcquisitionTracker::detail`] fills it in.
     pub events: Option<Vec<AcquisitionEvent>>,
-    /// The row waits in a hold whose heard audio the person may keep anyway.
+    /// The row waits in a hold whose heard audio the person may keep anyway. A person's list sets
+    /// it for them alone, from the holds they wait in.
     pub keep_anyway: bool,
+    /// How many held tracks a hearted album's row holds, filled in from the holds when a person's
+    /// list is read; None on every other row.
+    pub held_tracks: Option<i32>,
 }
 
 /// How a row ended. `library_id` is set only for a song Navidrome showed; `album_keys` are
@@ -1610,6 +1614,7 @@ fn snapshot(entry: &Entry, ahead: Option<i32>, with_events: bool) -> Acquisition
         log_lines: entry.events.len() as i32,
         events: with_events.then(|| entry.events.clone()),
         keep_anyway: entry.held && entry.keep_anyway,
+        held_tracks: None,
     }
 }
 

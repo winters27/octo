@@ -814,6 +814,14 @@ impl BaseDownloadService {
             if stray_recording_id(&mut file, song).is_some() {
                 tag_writer_extras::clear_recording_id(&mut file);
             }
+            // A file whose sound proved no recording keeps no ISRC its source tagged it with.
+            if song
+                .verification
+                .as_deref()
+                .is_some_and(|verification| !verification.proof.allows_recording_tags())
+            {
+                tag_writer_extras::set_or_clear_text(&mut file, octo_media::tags::TagFields::ISRC, None);
+            }
             write_song(&mut file, song, &genres, filed_elsewhere);
             if let Some(bytes) = embed {
                 let mime = cover_image::mime_type(&bytes);

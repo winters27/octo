@@ -60,8 +60,10 @@ pub const SUBSONIC_VERSION: &str = "1.16.1";
 /// adds each row's log (getAcquisition), clearing finished rows (clearAcquisitions) and Find
 /// songs (findSongs, getFoundSongs, pickFoundSong). Version 3: pickFoundSong takes `anyway` and
 /// may answer `confirm`, asking before a library song is replaced by a copy no better than it.
+/// Version 4: a held row carries `keepAnyway` for a caller who may keep it and an album row
+/// `heldTracks`, and keepAcquisitionAnyway keeps a held row's audio anyway.
 pub const ACQUISITIONS_EXTENSION: &str = "octoAcquisitions";
-pub const ACQUISITIONS_EXTENSION_VERSION: i32 = 3;
+pub const ACQUISITIONS_EXTENSION_VERSION: i32 = 4;
 
 /// getArtistTopSongs and getTopChart. Version 2: getTopChart takes `chart` (Best New Songs,
 /// Trending Songs, a genre) and getCharts lists the charts. Version 3: getCharts and getTopChart
@@ -75,7 +77,7 @@ pub const TOP_SONGS_EXTENSION_VERSION: i32 = 3;
 /// enhanced=true (version 2) with word cues; a Navidrome that lists fewer versions has them
 /// added, never removed.
 pub const OWN_EXTENSIONS: &[(&str, &[i32])] = &[
-    (ACQUISITIONS_EXTENSION, &[1, 2, ACQUISITIONS_EXTENSION_VERSION]),
+    (ACQUISITIONS_EXTENSION, &[1, 2, 3, ACQUISITIONS_EXTENSION_VERSION]),
     (LYRICS_EXTENSION, &[LYRICS_EXTENSION_VERSION]),
     (
         LIBRARY_ACTIONS_EXTENSION,

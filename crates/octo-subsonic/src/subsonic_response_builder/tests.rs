@@ -1423,7 +1423,7 @@ fn extensions_json_adds_octos_own_and_missing_versions() {
     assert_eq!(reply.content_type, "application/json");
     assert_eq!(
         reply.text(),
-        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","openSubsonic":true,"openSubsonicExtensions":[{"name":"songLyrics","versions":[1,2]},{"name":"octoLyrics","versions":[1]},{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]}]}}"#
+        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","openSubsonic":true,"openSubsonicExtensions":[{"name":"songLyrics","versions":[1,2]},{"name":"octoLyrics","versions":[1]},{"name":"octoAcquisitions","versions":[1,2,3,4]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]}]}}"#
     );
     // Lyrics choices off and library actions off leave those two out.
     let reply = builder().merge_open_subsonic_extensions(
@@ -1435,7 +1435,7 @@ fn extensions_json_adds_octos_own_and_missing_versions() {
     );
     assert_eq!(
         reply.text(),
-        r#"{"subsonic-response":{"status":"ok","openSubsonicExtensions":[{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"songLyrics","versions":[1,2]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]}]}}"#
+        r#"{"subsonic-response":{"status":"ok","openSubsonicExtensions":[{"name":"octoAcquisitions","versions":[1,2,3,4]},{"name":"songLyrics","versions":[1,2]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]}]}}"#
     );
     // A failed answer is written back as it was read.
     let failed = r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"isn't"}}}"#;
@@ -1470,6 +1470,7 @@ fn extensions_xml_adds_octos_own_and_reindents() {
             "    <versions>1</versions>\n",
             "    <versions>2</versions>\n",
             "    <versions>3</versions>\n",
+            "    <versions>4</versions>\n",
             "  </openSubsonicExtensions>\n",
             "  <openSubsonicExtensions name=\"octoImports\">\n",
             "    <versions>1</versions>\n",
@@ -1506,7 +1507,7 @@ fn the_places_extension_is_listed_last_only_with_place_data() {
     };
     assert_eq!(
         listed(true),
-        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","openSubsonic":true,"openSubsonicExtensions":[{"name":"songLyrics","versions":[1,2]},{"name":"octoLyrics","versions":[1]},{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]},{"name":"octoPlaces","versions":[1]}]}}"#
+        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","openSubsonic":true,"openSubsonicExtensions":[{"name":"songLyrics","versions":[1,2]},{"name":"octoLyrics","versions":[1]},{"name":"octoAcquisitions","versions":[1,2,3,4]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]},{"name":"octoPlaces","versions":[1]}]}}"#
     );
     assert!(!listed(false).contains("octoPlaces"));
     let own = builder()
@@ -1564,7 +1565,7 @@ fn extensions_without_an_answer_list_octos_own() {
         builder()
             .merge_open_subsonic_extensions("json", None, None, true, true)
             .text(),
-        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"octo","openSubsonicExtensions":[{"name":"octoAcquisitions","versions":[1,2,3]},{"name":"octoLyrics","versions":[1]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"songLyrics","versions":[1,2]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]}]}}"#
+        r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"octo","openSubsonicExtensions":[{"name":"octoAcquisitions","versions":[1,2,3,4]},{"name":"octoLyrics","versions":[1]},{"name":"octoLibraryActions","versions":[1,2,3]},{"name":"songLyrics","versions":[1,2]},{"name":"octoImports","versions":[1,2]},{"name":"octoLists","versions":[1,2]}]}}"#
     );
     assert_eq!(
         builder()
@@ -1576,6 +1577,7 @@ fn extensions_without_an_answer_list_octos_own() {
             "    <versions>1</versions>\n",
             "    <versions>2</versions>\n",
             "    <versions>3</versions>\n",
+            "    <versions>4</versions>\n",
             "  </openSubsonicExtensions>\n",
             "  <openSubsonicExtensions name=\"songLyrics\">\n",
             "    <versions>1</versions>\n",
