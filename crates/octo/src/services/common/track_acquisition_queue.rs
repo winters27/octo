@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
 use octo_core::common::dotnet::{self, compare_ordinal_ignore_case, eq_ignore_case};
+use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeartGate, WaitingFor};
 use octo_core::settings::DownloadSource;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
@@ -25,6 +26,18 @@ pub enum PlayOutcome {
     /// The gate refused the download, held it, or could not prove it is the version that played.
     #[error("Octo could not prove this copy is the version that played")]
     NotProven,
+}
+
+/// A download that holds instead of landing: what it waits for, the line its row shows, the
+/// files it keeps in the one hold path, and whose gates hold (empty for everyone who asked). A
+/// verify step resolves the request's completion with it, and the heart chain files the hold.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{line}")]
+pub struct AcquisitionHeld {
+    pub waiting_for: WaitingFor,
+    pub line: String,
+    pub files: Vec<String>,
+    pub users: Vec<String>,
 }
 
 /// A one-shot completion: completed once, by the worker or by a drop, and awaited by everyone
@@ -111,6 +124,10 @@ pub struct AcquisitionPlace {
     pub pool_members: Option<Vec<String>>,
     /// Only a real FLAC file will do: lossy files and FLAC made from lossy audio are refused.
     pub flac_only: bool,
+    /// Why the acquisition runs; None for a place built without one (the shipped checks).
+    pub origin: Option<AcquisitionOrigin>,
+    /// One gate per heart or play that asked, each judged on its own.
+    pub gates: Vec<HeartGate>,
 }
 
 /// One queued request to fetch a permanent copy of a track.
@@ -149,6 +166,13 @@ pub struct AcquisitionRequest {
     /// Only a real FLAC file will do.
     pub flac_only: bool,
 
+    /// Why the acquisition runs: set by [`Self::with_origin`] and read into its place. None keeps
+    /// the shipped checks.
+    pub origin: Option<AcquisitionOrigin>,
+    /// The gates of the hearts and plays that asked, one per person and origin, joiners'
+    /// included.
+    gates: Mutex<Vec<HeartGate>>,
+
     pub completion: Completion,
 }
 
@@ -180,6 +204,8 @@ impl AcquisitionRequest {
             shared_wanted: AtomicBool::new(false),
             pool_members: Mutex::new(Vec::new()),
             flac_only: false,
+            origin: None,
+            gates: Mutex::new(Vec::new()),
             completion: Completion::default(),
         }
     }
@@ -188,6 +214,31 @@ impl AcquisitionRequest {
     pub fn with_flac_only(mut self, flac_only: bool) -> Self {
         self.flac_only = flac_only;
         self
+    }
+
+    /// The same request, run for `origin`.
+    pub fn with_origin(mut self, origin: AcquisitionOrigin) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+
+    /// Adds the gate of one heart or play that asked: one per person and origin, a later one
+    /// replacing the earlier. Safe to call after the request is queued, so a joiner is gated on
+    /// its own.
+    pub fn add_gate(&self, gate: HeartGate) {
+        let mut gates = self.gates.lock();
+        match gates
+            .iter_mut()
+            .find(|known| known.origin == gate.origin && eq_ignore_case(known.user.trim(), gate.user.trim()))
+        {
+            Some(known) => *known = gate,
+            None => gates.push(gate),
+        }
+    }
+
+    /// Every gate of the request, the first asker's first.
+    pub fn gates(&self) -> Vec<HeartGate> {
+        self.gates.lock().clone()
     }
 
     /// Records whose library this is for. Safe to call after the request is queued: a member
@@ -230,6 +281,8 @@ impl AcquisitionRequest {
         AcquisitionPlace {
             pool_members: self.pool_destination(),
             flac_only: self.flac_only,
+            origin: self.origin,
+            gates: self.gates(),
         }
     }
 
@@ -509,21 +562,65 @@ impl TrackAcquisitionQueue {
         upgrade_search: bool,
         replacement: Option<Arc<ReplacementHandoff>>,
     ) -> Completion {
-        let request = Arc::new(
-            AcquisitionRequest::new(
-                provider,
-                external_id,
-                is_star,
-                trigger_album_download,
-                force_permanent,
-                source_override,
-                notify_on_failure,
-                replacement,
-            )
-            .with_flac_only(flac_only),
-        );
+        self.enqueue_as(
+            None,
+            Vec::new(),
+            target,
+            flac_only,
+            provider,
+            external_id,
+            is_star,
+            trigger_album_download,
+            force_permanent,
+            source_override,
+            notify_on_failure,
+            requested_by,
+            upgrade_search,
+            replacement,
+        )
+    }
+
+    /// [`Self::enqueue_for`] run for `origin`, with the gates of the hearts or plays that asked.
+    /// Joining a request already in flight adds these gates to it, so each joiner is judged on
+    /// its own.
+    #[allow(clippy::too_many_arguments)] // enqueue_for's arguments, why it runs and its gates
+    pub fn enqueue_as(
+        &self,
+        origin: Option<AcquisitionOrigin>,
+        gates: Vec<HeartGate>,
+        target: &AcquisitionTarget,
+        flac_only: bool,
+        provider: &str,
+        external_id: &str,
+        is_star: bool,
+        trigger_album_download: bool,
+        force_permanent: bool,
+        source_override: Option<DownloadSource>,
+        notify_on_failure: bool,
+        requested_by: Option<&str>,
+        upgrade_search: bool,
+        replacement: Option<Arc<ReplacementHandoff>>,
+    ) -> Completion {
+        let mut request = AcquisitionRequest::new(
+            provider,
+            external_id,
+            is_star,
+            trigger_album_download,
+            force_permanent,
+            source_override,
+            notify_on_failure,
+            replacement,
+        )
+        .with_flac_only(flac_only);
+        if let Some(origin) = origin {
+            request = request.with_origin(origin);
+        }
+        let request = Arc::new(request);
         request.add_requester(requested_by);
         request.add_target(target);
+        for gate in &gates {
+            request.add_gate(gate.clone());
+        }
         if upgrade_search {
             request.ask_for_upgrade_search();
         }
@@ -544,6 +641,9 @@ impl TrackAcquisitionQueue {
             // file is attributed to everyone who asked and not just to whoever was first.
             existing.add_requester(requested_by);
             existing.add_target(target);
+            for gate in gates {
+                existing.add_gate(gate);
+            }
             if upgrade_search {
                 existing.ask_for_upgrade_search();
             }
@@ -608,10 +708,13 @@ impl TrackAcquisitionQueue {
             source_override,
             requested_by,
             on_queued,
+            Vec::new(),
         )
     }
 
-    /// [`Self::try_enqueue_play`] for one library: the shared one, or a member's own.
+    /// [`Self::try_enqueue_play`] for one library: the shared one, or a member's own, with the
+    /// play's gate (added before the worker can see a new request, and to one it joins).
+    #[allow(clippy::too_many_arguments)] // the play's facts, whose library it is for and its gate
     pub(crate) fn try_enqueue_play_for(
         &self,
         target: &AcquisitionTarget,
@@ -620,24 +723,34 @@ impl TrackAcquisitionQueue {
         source_override: DownloadSource,
         requested_by: Option<&str>,
         on_queued: Option<&dyn Fn()>,
+        gates: Vec<HeartGate>,
     ) -> Option<Arc<AcquisitionRequest>> {
-        let request = Arc::new(AcquisitionRequest::new(
-            provider,
-            external_id,
-            false,
-            false,
-            true,
-            Some(source_override),
-            false,
-            None,
-        ));
+        let request = Arc::new(
+            AcquisitionRequest::new(
+                provider,
+                external_id,
+                false,
+                false,
+                true,
+                Some(source_override),
+                false,
+                None,
+            )
+            .with_origin(AcquisitionOrigin::Play),
+        );
         request.add_requester(requested_by);
         request.add_target(target);
+        for gate in &gates {
+            request.add_gate(gate.clone());
+        }
         // Already wanted: ride along, whatever is waiting.
         let known = self.in_flight.lock().get(&request.key()).cloned();
         if let Some(known) = known {
             known.add_requester(requested_by);
             known.add_target(target);
+            for gate in gates {
+                known.add_gate(gate);
+            }
             return Some(known);
         }
         // The waiting slot is taken BEFORE the key is claimed. Claiming first and letting go on a
@@ -674,6 +787,9 @@ impl TrackAcquisitionQueue {
             self.waiting_plays.fetch_sub(1, Ordering::SeqCst);
             existing.add_requester(requested_by);
             existing.add_target(target);
+            for gate in gates {
+                existing.add_gate(gate);
+            }
             return Some(existing);
         }
         if let Some(on_queued) = on_queued {

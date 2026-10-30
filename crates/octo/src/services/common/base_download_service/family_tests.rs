@@ -108,6 +108,7 @@ fn for_members(members: &[&str]) -> AcquisitionPlace {
     AcquisitionPlace {
         pool_members: Some(members.iter().map(|m| m.to_string()).collect()),
         flac_only: false,
+        ..Default::default()
     }
 }
 
@@ -209,6 +210,7 @@ async fn flac_request_rejects_mp3_and_fake_flac() {
     let flac_only = AcquisitionPlace {
         pool_members: Some(vec!["alex".into()]),
         flac_only: true,
+        ..Default::default()
     };
     family.lands("mp3", false);
     let mp3 = family.get("3", flac_only.clone()).await.expect_err("refused");
@@ -247,6 +249,7 @@ async fn a_flac_request_is_never_met_by_a_pool_flac_made_from_mp3() {
             AcquisitionPlace {
                 pool_members: Some(vec!["alex".into()]),
                 flac_only: true,
+                ..Default::default()
             },
         )
         .await
@@ -282,6 +285,7 @@ async fn a_flac_for_a_song_the_pool_has_as_mp3_replaces_it_for_everyone() {
             AcquisitionPlace {
                 pool_members: Some(vec!["alex".into()]),
                 flac_only: true,
+                ..Default::default()
             },
         )
         .await

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
+use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeartGate};
 use octo_core::models::domain::{Album, Artist, Song};
 use octo_core::models::download::DownloadInfo;
 use octo_core::models::search::SearchResult;
@@ -156,6 +157,8 @@ pub(crate) struct FakeLidarr {
     album: Mutex<LidarrAnswer>,
     pub track_calls: Mutex<Vec<LidarrCall>>,
     pub album_calls: Mutex<Vec<LidarrCall>>,
+    /// Why each call ran and how many gates it carried, track and album calls in order.
+    pub origins: Mutex<Vec<(AcquisitionOrigin, usize)>>,
 }
 
 impl Default for FakeLidarr {
@@ -165,6 +168,7 @@ impl Default for FakeLidarr {
             album: Mutex::new(Box::new(|_, _, _| Ok(false))),
             track_calls: Mutex::new(Vec::new()),
             album_calls: Mutex::new(Vec::new()),
+            origins: Mutex::new(Vec::new()),
         }
     }
 }
@@ -216,7 +220,10 @@ impl ILidarrHeartAcquisitionService for FakeLidarr {
         external_id: &str,
         notify_failure: bool,
         requested_by: Option<&str>,
+        origin: AcquisitionOrigin,
+        gates: &[HeartGate],
     ) -> anyhow::Result<bool> {
+        self.origins.lock().push((origin, gates.len()));
         self.track_calls.lock().push((
             provider.into(),
             external_id.into(),
@@ -232,7 +239,10 @@ impl ILidarrHeartAcquisitionService for FakeLidarr {
         external_id: &str,
         notify_failure: bool,
         requested_by: Option<&str>,
+        origin: AcquisitionOrigin,
+        gates: &[HeartGate],
     ) -> anyhow::Result<bool> {
+        self.origins.lock().push((origin, gates.len()));
         self.album_calls.lock().push((
             provider.into(),
             external_id.into(),

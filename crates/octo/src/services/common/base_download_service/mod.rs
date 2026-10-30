@@ -2447,6 +2447,7 @@ impl IDownloadService for BaseDownloadService {
                     place: AcquisitionPlace {
                         pool_members: None,
                         flac_only: true,
+                        ..Default::default()
                     },
                     prefetch: true,
                     ahead_folder: Some(folder.to_path_buf()),

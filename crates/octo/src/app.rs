@@ -1029,6 +1029,8 @@ impl Acquisition {
                 owned: Some(heart_ownership.clone()),
                 stars: Some(star_on_arrival.clone()),
                 ahead: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
+                gates: None,
+                music_brainz: Some(clients.music_brainz.clone()),
             },
         );
         heart_acquisition_coordinator.use_family(FamilyHooks {

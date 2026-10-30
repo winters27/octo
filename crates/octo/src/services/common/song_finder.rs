@@ -9,6 +9,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use octo_core::common::acquisition_tracker::user_safe;
 use octo_core::common::{Clock, dotnet};
+use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
 use octo_core::fingerprint::recording_identity::RecordingKind;
 use octo_core::lidarr::{LidarrRelease, LidarrTrackRequest};
 use octo_core::models::download::AcquisitionCandidate;
@@ -1406,7 +1407,9 @@ fn fetch(
         .get()
         .and_then(|gate| gate.decide(Some(user)).target())
         .unwrap_or(AcquisitionTarget::Shared);
-    let download = acquisitions.enqueue_for(
+    let download = acquisitions.enqueue_as(
+        Some(AcquisitionOrigin::SongFinderPick),
+        Vec::new(),
         &destination,
         false,
         provider,
@@ -1464,12 +1467,10 @@ async fn resolve(services: &SongFinderServices, id: &str, ct: &CancellationToken
         return None;
     }
 
-    let routing = services
-        .id_registry
-        .as_ref()
-        .and_then(|registry| registry.lookup(&raw))
-        .map(|shared| shared.snapshot())
-        .or_else(|| SoulseekMetadataService::try_decode_external_id(Some(&raw)));
+    let routing = match services.id_registry.as_ref() {
+        Some(registry) => registry.resolve_song(&raw, false).map(|shared| shared.snapshot()),
+        None => SoulseekMetadataService::try_decode_external_id(Some(&raw)),
+    };
     let resolver = services.resolver.as_ref();
     if let Some(routing) = routing.filter(|r| r.kind == RoutingKind::Song && r.has_artist_title()) {
         let artist = routing.artist.clone().unwrap_or_default();

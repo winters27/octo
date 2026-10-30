@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use chrono::TimeZone;
 use futures::FutureExt;
+use octo_core::fingerprint::heart_gate::WaitingFor;
 use octo_core::settings::{
     AppSettings, HeartDownloadSource, HeartDownloadStep, SettingsStore, SubsonicSettings,
 };
@@ -20,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::services::common::test_fakes::{FakeDownloads, FakeLidarr};
 use crate::services::common::{
-    AcquisitionRequest, HeartAcquisitionCoordinator, HeartCoordinatorExtras, TrackAcquisitionQueue,
+    AcquisitionRequest, HeartAcquisitionCoordinator, HeartCoordinatorExtras, HeldAcquisition,
+    TrackAcquisitionQueue,
 };
 
 /// A clock the test moves by hand.
@@ -519,6 +521,117 @@ fn the_cap_drops_finished_rows_first_then_the_oldest() {
     assert_eq!(ids.len(), AcquisitionTracker::CAPACITY);
     assert!(!ids.contains("run0"));
     assert!(ids.contains("newest"));
+}
+
+// --- Held rows ---------------------------------------------------------------------------
+
+fn held_record(id: &str, waiting: WaitingFor) -> HeldAcquisition {
+    HeldAcquisition {
+        provider: "soulseek".into(),
+        external_id: id.into(),
+        requested_by: Some("alice".into()),
+        waiting_for: Some(waiting),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_held_row_outlives_a_day_and_its_album_claim_stays_with_it() {
+    let clock = ManualClock::new();
+    let tracker = tracker_at(&clock);
+    tracker.begin_album("soulseek", "help-album", Some("alice"));
+    tracker.announce(
+        "soulseek",
+        Some("help-album"),
+        None,
+        &tracks(&[("held", "The Beatles", "Yesterday", "Help!")]),
+    );
+    tracker.hold_row(
+        "soulseek",
+        "held",
+        &["alice".to_string(), "bob".to_string()],
+        "Waiting for MusicBrainz",
+        false,
+    );
+    begin(&tracker, "plain", "alice");
+
+    clock.advance(TimeDelta::hours(25));
+    let rows = tracker.all();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].external_id, "held");
+    assert_eq!(rows[0].state, AcquisitionState::Searching);
+    assert_eq!(rows[0].note.as_deref(), Some("Waiting for MusicBrainz"));
+    assert_eq!(rows[0].requested_by, ["alice", "bob"]);
+    assert!(!rows[0].keep_anyway);
+    // The album the held track is listed under still lists it for whoever hearted it.
+    tracker.begin_album("soulseek", "help-album", Some("carol"));
+    tracker.announce(
+        "soulseek",
+        Some("help-album"),
+        None,
+        &tracks(&[("other", "The Beatles", "Help!", "Help!")]),
+    );
+    let other = tracker
+        .for_user("alice")
+        .into_iter()
+        .find(|row| row.external_id == "other")
+        .expect("listed for alice, whose album claim survived the day");
+    assert_eq!(other.state, AcquisitionState::Queued);
+}
+
+#[test]
+fn five_hundred_and_ten_rows_with_twenty_held_keep_every_held_one() {
+    let clock = ManualClock::new();
+    let tracker = tracker_at(&clock);
+    for i in 0..20 {
+        clock.advance(TimeDelta::seconds(1));
+        tracker.hold_row(
+            "soulseek",
+            &format!("held{i}"),
+            &["alice".to_string()],
+            "Waiting",
+            true,
+        );
+    }
+    for i in 0..490 {
+        clock.advance(TimeDelta::seconds(1));
+        begin(&tracker, &format!("run{i}"), "alice");
+    }
+    let rows = tracker.all();
+    assert_eq!(rows.len(), AcquisitionTracker::CAPACITY);
+    let held: Vec<&AcquisitionSnapshot> = rows.iter().filter(|row| row.keep_anyway).collect();
+    assert_eq!(held.len(), 20, "every held row kept");
+}
+
+#[test]
+fn a_held_row_is_let_go_only_once_no_hold_of_its_song_is_left() {
+    let clock = ManualClock::new();
+    let tracker = tracker_at(&clock);
+    let holds = SoulseekHoldStore::new(None::<std::path::PathBuf>);
+    let mb = holds.hold(held_record("song", WaitingFor::MusicBrainz));
+    holds.hold(held_record("song", WaitingFor::AcoustIdOff));
+    tracker.hold_row(
+        "soulseek",
+        "song",
+        &["alice".to_string()],
+        "AcoustID is off",
+        true,
+    );
+    assert!(only(&tracker, "alice").keep_anyway);
+
+    holds.release(&mb.key());
+    tracker.release_row("soulseek", "song", &holds);
+    assert!(
+        tracker.is_held("soulseek", "song"),
+        "the AcoustIdOff hold is still there"
+    );
+
+    holds.release(&held_record("song", WaitingFor::AcoustIdOff).key());
+    tracker.release_row("soulseek", "song", &holds);
+    assert!(!tracker.is_held("soulseek", "song"));
+    assert!(!only(&tracker, "alice").keep_anyway);
+    clock.advance(TimeDelta::hours(25));
+    assert!(tracker.all().is_empty(), "back to the usual rules");
 }
 
 // --- Seeing it in Navidrome ------------------------------------------------------------

@@ -190,6 +190,7 @@ async fn a_member_who_joins_while_it_runs_gets_a_link_too() {
         [Some(AcquisitionPlace {
             pool_members: Some(vec!["alex".into()]),
             flac_only: false,
+            ..Default::default()
         })]
     );
     for user in ["alex", "sam"] {

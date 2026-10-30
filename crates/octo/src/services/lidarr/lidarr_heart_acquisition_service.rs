@@ -12,6 +12,7 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use octo_core::common::SongIdentity;
 use octo_core::common::dotnet;
+use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeartGate};
 use octo_core::lidarr::lidarr_heart_acquisition_service::match_song;
 use octo_core::lidarr::lidarr_track_fetcher::is_lossless;
 use octo_core::lidarr::{LidarrAlbumCandidate, LidarrError, LidarrImportedTrack};
@@ -43,13 +44,16 @@ pub trait ILidarrHeartAcquisitionService: Send + Sync {
     /// True once the song is in the library: Lidarr brought it and it passed Octo's checks, or it
     /// was there already. False when Lidarr could not get it, so the heart's next source tries.
     /// Waits for Lidarr's import, up to Lidarr's import timeout. `Err` when the attempt itself
-    /// fails.
+    /// fails. `origin` says why it runs and `gates` are the gates of the hearts or plays that
+    /// asked, each judged on its own.
     async fn try_acquire_track(
         &self,
         provider: &str,
         external_id: &str,
         notify_failure: bool,
         requested_by: Option<&str>,
+        origin: AcquisitionOrigin,
+        gates: &[HeartGate],
     ) -> anyhow::Result<bool>;
 
     /// True once every song of the album is in the library; false leaves the rest to
@@ -60,6 +64,8 @@ pub trait ILidarrHeartAcquisitionService: Send + Sync {
         external_id: &str,
         notify_failure: bool,
         requested_by: Option<&str>,
+        origin: AcquisitionOrigin,
+        gates: &[HeartGate],
     ) -> anyhow::Result<bool>;
 
     /// Lidarr says it imported files of an album. A heart waiting on that album looks at once;
@@ -402,6 +408,8 @@ impl ILidarrHeartAcquisitionService for LidarrHeartAcquisitionService {
         external_id: &str,
         notify_failure: bool,
         requested_by: Option<&str>,
+        _origin: AcquisitionOrigin,
+        _gates: &[HeartGate],
     ) -> anyhow::Result<bool> {
         let work = self
             .inner
@@ -418,6 +426,8 @@ impl ILidarrHeartAcquisitionService for LidarrHeartAcquisitionService {
         external_id: &str,
         notify_failure: bool,
         requested_by: Option<&str>,
+        _origin: AcquisitionOrigin,
+        _gates: &[HeartGate],
     ) -> anyhow::Result<bool> {
         let work = self
             .inner

@@ -19,6 +19,7 @@ use octo_core::models::download::{AcquisitionCandidate, AcquisitionEvent, Acquis
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
+use super::SoulseekHoldStore;
 use crate::services::framework::DotnetDictionary;
 use crate::services::library::NavidromeSongPathResolver;
 use crate::services::local::ILocalLibraryService;
@@ -114,6 +115,8 @@ pub struct AcquisitionSnapshot {
     pub log_lines: i32,
     /// The log itself, oldest first; only [`AcquisitionTracker::detail`] fills it in.
     pub events: Option<Vec<AcquisitionEvent>>,
+    /// The row waits in a hold whose heard audio the person may keep anyway.
+    pub keep_anyway: bool,
 }
 
 /// How a row ended. `library_id` is set only for a song Navidrome showed; `album_keys` are
@@ -244,6 +247,13 @@ struct Entry {
 
     /// This run found the file already in the library rather than downloading it.
     already_there: bool,
+
+    /// A hold record of this acquisition is live: the row never expires and never falls to the
+    /// cap until [`AcquisitionTracker::release_row`] finds none left.
+    held: bool,
+
+    /// The hold offers to keep the heard audio anyway.
+    keep_anyway: bool,
 }
 
 impl Entry {
@@ -472,6 +482,76 @@ impl AcquisitionTracker {
             add(entry, now, acquisition_event_kinds::QUEUED, text, None, None);
         }
         prune(&mut state, now);
+    }
+
+    /// An acquisition entered the hold path: its row is opened (or reopened), set searching with
+    /// `note` as its line, given these owners, and held, so it never expires and never falls to
+    /// the cap while a hold record of it lives. `keep_anyway` offers to keep the heard audio.
+    pub fn hold_row(
+        &self,
+        provider: &str,
+        external_id: &str,
+        owners: &[String],
+        note: &str,
+        keep_anyway: bool,
+    ) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let now = self.now();
+        let mut state = self.state.lock();
+        let fresh = state
+            .entries
+            .get(&key_of(provider, external_id))
+            .is_none_or(Entry::finished);
+        let entry = open(&mut state, provider, external_id, true, now);
+        union_owners(&mut entry.owners, owners);
+        entry.state = AcquisitionState::Searching;
+        entry.progress = None;
+        entry.held = true;
+        entry.keep_anyway = keep_anyway;
+        let note = Some(note.trim().to_string()).filter(|n| !n.is_empty());
+        if fresh || entry.note != note {
+            add(
+                entry,
+                now,
+                acquisition_event_kinds::NOTE,
+                note.as_deref().unwrap_or("Waiting"),
+                None,
+                None,
+            );
+        }
+        entry.note = note;
+        entry.updated_at = now;
+        prune(&mut state, now);
+    }
+
+    /// Lets the row of an acquisition go back to the usual rules once `holds` keeps no record of
+    /// it, whatever it waited for; a record still there keeps it held.
+    pub fn release_row(&self, provider: &str, external_id: &str, holds: &SoulseekHoldStore) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let still_held = holds.snapshot().iter().any(|record| {
+            eq_ignore_case(record.provider.trim(), provider.trim()) && record.external_id == external_id
+        });
+        if still_held {
+            return;
+        }
+        let mut state = self.state.lock();
+        if let Some(entry) = state.entries.get_mut(&key_of(provider, external_id)) {
+            entry.held = false;
+            entry.keep_anyway = false;
+        }
+    }
+
+    /// Whether the row of this acquisition is held.
+    pub fn is_held(&self, provider: &str, external_id: &str) -> bool {
+        self.state
+            .lock()
+            .entries
+            .get(&key_of(provider, external_id))
+            .is_some_and(|entry| entry.held)
     }
 
     /// A star on an album was accepted. Its tracks are listed as the walk reaches them.
@@ -1302,6 +1382,8 @@ fn open<'a>(
         entry.events.clear();
         entry.path = None;
         entry.already_there = false;
+        entry.held = false;
+        entry.keep_anyway = false;
     } else {
         state.entries.set(
             key.clone(),
@@ -1332,6 +1414,8 @@ fn open<'a>(
                 logged_source: None,
                 path: None,
                 already_there: false,
+                held: false,
+                keep_anyway: false,
             },
         );
     }
@@ -1364,14 +1448,17 @@ fn end_of(state: &State, key: &str) -> Option<AcquisitionEnd> {
     })
 }
 
-/// Drop what has expired, then the oldest past the cap. Caller holds the lock.
+/// Drop what has expired, then the oldest past the cap. A held row, and the album claim it is
+/// listed under, never goes: it waits for work, not for time. Caller holds the lock.
 fn prune(state: &mut State, now: DateTime<Utc>) {
     let expired: Vec<String> = state
         .entries
         .iter()
         .filter(|(_, entry)| {
             let age = now - entry.updated_at;
-            if entry.finished() {
+            if entry.held {
+                false
+            } else if entry.finished() {
                 age >= AcquisitionTracker::FINISHED_RETENTION
             } else {
                 age >= AcquisitionTracker::STALLED_RETENTION
@@ -1382,10 +1469,17 @@ fn prune(state: &mut State, now: DateTime<Utc>) {
     for key in expired {
         state.entries.remove(&key);
     }
+    let held: std::collections::HashSet<&str> = state
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.held)
+        .map(|(key, _)| key.as_str())
+        .collect();
     let stale: Vec<String> = state
         .albums
         .iter()
         .filter(|(_, claim)| now - claim.updated_at >= AcquisitionTracker::STALLED_RETENTION)
+        .filter(|(_, claim)| !claim.track_keys.iter().any(|key| held.contains(key.as_str())))
         .map(|(key, _)| key.clone())
         .collect();
     for key in stale {
@@ -1399,6 +1493,7 @@ fn prune(state: &mut State, now: DateTime<Utc>) {
     let mut order: Vec<(bool, DateTime<Utc>, String)> = state
         .entries
         .iter()
+        .filter(|(_, entry)| !entry.held)
         .map(|(key, entry)| (!entry.finished(), entry.updated_at, key.clone()))
         .collect();
     order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -1471,6 +1566,7 @@ fn snapshot(entry: &Entry, ahead: Option<i32>, with_events: bool) -> Acquisition
         peer: entry.peer.clone(),
         log_lines: entry.events.len() as i32,
         events: with_events.then(|| entry.events.clone()),
+        keep_anyway: entry.held && entry.keep_anyway,
     }
 }
 

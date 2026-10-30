@@ -36,6 +36,7 @@ use octo_core::common::dotnet::eq_ignore_case;
 use octo_core::family::abilities::{AddToLibrary, Preset, RequestQuality};
 use octo_core::family::policy::{self, RequestDecision, storage_full};
 use octo_core::family::request::{FamilyRequest, RequestKind, RequestOutcome, RequestState};
+use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
 use octo_core::models::domain::{Album, Song};
 use octo_core::settings::{DownloadSource, SettingsStore};
 use octo_core::soulseek::soulseek_metadata_service::RoutingKind;
@@ -1484,22 +1485,36 @@ impl RequestFetcher for LiveRequestFetcher {
             RequestQuality::Best => {
                 return match self
                     .coordinator
-                    .acquire_track_outcome(provider, external_id, Some(user), None, &target)
+                    .acquire_track_outcome(
+                        provider,
+                        external_id,
+                        Some(user),
+                        None,
+                        &target,
+                        AcquisitionOrigin::Request,
+                    )
                     .await
                 {
-                    Ok(TrackOutcome::Landed(path)) => Fetched::Landed(path),
+                    Ok(TrackOutcome::Landed(path) | TrackOutcome::KeptAsHeard(path)) => Fetched::Landed(path),
                     Ok(TrackOutcome::AlreadyThere) => Fetched::AlreadyThere,
                     Ok(TrackOutcome::HandedToLidarr) => {
                         Fetched::Failed("Lidarr took the song for the shared library.".into())
                     }
                     Ok(TrackOutcome::Failed(reason)) => Fetched::Failed(reason),
+                    // A request never holds: what it would wait for is why it could not be got.
+                    Ok(TrackOutcome::Held(waiting)) => Fetched::Failed(
+                        crate::services::common::heart_acquisition_coordinator::waiting_line(waiting)
+                            .to_string(),
+                    ),
                     Err(e) => Fetched::Failed(e.to_string()),
                 };
             }
             RequestQuality::Flac => DownloadSource::Soulseek,
             RequestQuality::Mp3 => DownloadSource::YouTube,
         };
-        let completion = self.queue.enqueue_for(
+        let completion = self.queue.enqueue_as(
+            Some(AcquisitionOrigin::Request),
+            Vec::new(),
             &target,
             quality == RequestQuality::Flac,
             provider,
@@ -1526,7 +1541,14 @@ impl RequestFetcher for LiveRequestFetcher {
     async fn album(&self, user: &str, provider: &str, external_id: &str) -> Vec<String> {
         self.tracker.begin_album(provider, external_id, Some(user));
         self.coordinator
-            .acquire_album_for_member(provider, external_id, Some(user), user, false)
+            .acquire_album_for_member(
+                provider,
+                external_id,
+                Some(user),
+                user,
+                false,
+                AcquisitionOrigin::Request,
+            )
             .await
     }
 

@@ -891,7 +891,14 @@ async fn a_heart_on_a_song_downloaded_ahead_is_kept_at_once_without_the_source_c
     let running = coordinator.clone();
     let acquisition = tokio::spawn(async move {
         running
-            .acquire_track_outcome("soulseek", "track-id", None, None, &AcquisitionTarget::Shared)
+            .acquire_track_outcome(
+                "soulseek",
+                "track-id",
+                None,
+                None,
+                &AcquisitionTarget::Shared,
+                AcquisitionOrigin::Heart,
+            )
             .await
     });
     let request = tokio::time::timeout(Duration::from_secs(5), queue.dequeue(&CancellationToken::new()))

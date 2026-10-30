@@ -27,6 +27,7 @@ use super::caller_checks::{
 use crate::app::AppState;
 use crate::http::error::{AppError, AppResult};
 use crate::http::routes::RouteSet;
+use crate::services::common::heart_acquisition_coordinator::track_base_key;
 use crate::services::common::star_on_arrival::WaitingStar;
 use crate::services::common::{AcquisitionTarget, StarOnArrival};
 use crate::services::family::list_rules::{Edit, edit};
@@ -544,10 +545,11 @@ async fn star_outside_song(
             .hold_starred_song(&provider, &external_id, item_id, &credential, Some(who));
     }
     // Keyed by what the pipeline knows, labeled with the id the client starred so the
-    // app can find its row. Named from the routing, which is already in memory.
+    // app can find its row. Named from the routing, which a heart keeps in the registry (a
+    // decoded id is registered now, so what was heard of it is found).
     let routing = state
         .external_id_registry
-        .lookup(&external_id)
+        .resolve_song(&external_id, true)
         .map(|r| r.snapshot());
     state.acquisition_tracker.begin(
         &provider,
@@ -749,6 +751,39 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
         })
         .filter(|(provider, external_id)| state.star_on_arrival.holds_song(provider, external_id))
         .collect();
+    // Hearts held for an answer, a proof or the person, from every client: the caller leaves
+    // each hold of the song, and a hold nobody is left in ends.
+    let in_holds: Vec<(String, String)> = outside
+        .iter()
+        .filter(|(key, _)| *key == "id")
+        .filter_map(|(_, id)| {
+            let (_, provider, external_id) = state.local_library.parse_song_id(id);
+            Some((provider?, external_id?))
+        })
+        .filter(|(provider, external_id)| {
+            !state
+                .soulseek_holds
+                .records_for(&track_base_key(provider, external_id))
+                .is_empty()
+        })
+        .collect();
+    if !in_holds.is_empty() {
+        // Nothing here reaches Navidrome, so the sign-in is checked before a heart is dropped.
+        if member.is_none() {
+            match refuse_unless_signed_in(&state, &call, &format).await {
+                Ok(None) => {}
+                Ok(Some(refused)) => return refused,
+                Err(error) => return error.into_response(),
+            }
+        }
+        if let Ok(who) = signed_in_user(&state, &call).await {
+            for (provider, external_id) in &in_holds {
+                state
+                    .heart_acquisition_coordinator
+                    .leave_holds(provider, external_id, &who);
+            }
+        }
+    }
 
     if !mapped && (outside.is_empty() || (member.is_none() && library.is_empty() && held.is_empty())) {
         return match member {

@@ -177,6 +177,7 @@ async fn a_real_flac_heart_takes_the_file_too() {
                 place: AcquisitionPlace {
                     pool_members: None,
                     flac_only: true,
+                    ..Default::default()
                 },
                 ..Default::default()
             },

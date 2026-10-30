@@ -4,6 +4,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use futures::FutureExt;
+use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
 use octo_core::notifications::notification_event::{NotificationEvent, NotificationEventType};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -15,7 +16,7 @@ use crate::services::family::FamilyPlacement;
 use crate::services::i_download_service::IDownloadService;
 use crate::services::library::ReplacementRejectedException;
 use crate::services::notifications::NotificationService;
-use crate::services::soulseek::{ExternalIdRegistry, SoulseekMetadataService};
+use crate::services::soulseek::ExternalIdRegistry;
 
 /// Drains [`TrackAcquisitionQueue`].
 ///
@@ -201,11 +202,15 @@ impl AcquisitionWorker {
     /// (`notify` cannot fail). Metadata comes from the same routing pair the download path itself
     /// uses, so the names match what the user starred.
     fn notify_failed(&self, request: &AcquisitionRequest, error: &anyhow::Error) {
+        // A heart's or a play's song is kept in the registry; any other id is read unsaved.
+        let register = matches!(
+            request.origin,
+            Some(AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart | AcquisitionOrigin::Play)
+        );
         let routing = self
             .id_registry
-            .lookup(&request.external_id)
-            .map(|shared| shared.snapshot())
-            .or_else(|| SoulseekMetadataService::try_decode_external_id(Some(&request.external_id)));
+            .resolve_song(&request.external_id, register)
+            .map(|shared| shared.snapshot());
         let askers = request.requested_by();
         self.notifications.notify(NotificationEvent {
             artist: routing.as_ref().and_then(|r| r.artist.clone()),

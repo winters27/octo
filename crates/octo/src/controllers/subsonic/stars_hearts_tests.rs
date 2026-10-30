@@ -340,6 +340,71 @@ async fn an_unstar_before_the_song_lands_takes_it_off_the_lists() {
     assert_eq!(t.starred2_song_ids(&alice()).await, ["nd-7"]);
 }
 
+/// A held heart two people of Octo's own apps hearted: one taking theirs back leaves the other's
+/// hold, and the last one taking theirs back ends it.
+#[tokio::test]
+async fn an_unstar_by_one_of_two_octo_app_users_keeps_the_others_hold() {
+    use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, WaitingFor};
+
+    use crate::services::common::{HeldAcquisition, Holder, StarOnArrival};
+
+    let t = HeartApp::new().await;
+    let teardrop = t.register(RoutingKind::Song, "Teardrop");
+    let (_, provider, external_id) = t.state.local_library.parse_song_id(&teardrop);
+    let holder = |user: &str| Holder {
+        user: user.into(),
+        ..Default::default()
+    };
+    let record = t.state.soulseek_holds.hold(HeldAcquisition {
+        provider: provider.expect("an outside id"),
+        external_id: external_id.expect("an outside id"),
+        requested_by: Some("alice".into()),
+        origin: Some(AcquisitionOrigin::Heart),
+        waiting_for: Some(WaitingFor::MusicBrainz),
+        holders: vec![holder("alice"), holder("carol")],
+        ..Default::default()
+    });
+    let octo_app = StarOnArrival::OCTO_APP_CLIENT;
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/unstar.view?{}&f=json&id={teardrop}",
+            auth("carol", "good", octo_app)
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    let kept = t
+        .state
+        .soulseek_holds
+        .get(&record.key())
+        .expect("alice still holds it");
+    let users: Vec<&str> = kept.holders.iter().map(|h| h.user.as_str()).collect();
+    assert_eq!(users, ["alice"]);
+
+    // A wrong sign-in takes nobody off.
+    get(
+        &t.app,
+        &format!(
+            "/rest/unstar.view?{}&f=json&id={teardrop}",
+            auth("alice", "bad", octo_app)
+        ),
+    )
+    .await;
+    assert!(t.state.soulseek_holds.get(&record.key()).is_some());
+
+    get(
+        &t.app,
+        &format!(
+            "/rest/unstar.view?{}&f=json&id={teardrop}",
+            auth("alice", "good", octo_app)
+        ),
+    )
+    .await;
+    assert!(t.state.soulseek_holds.snapshot().is_empty(), "nobody is left");
+}
+
 /// Someone else cannot take back a heart by naming its owner without their sign-in.
 #[tokio::test]
 async fn an_unstar_with_a_wrong_sign_in_keeps_the_heart() {

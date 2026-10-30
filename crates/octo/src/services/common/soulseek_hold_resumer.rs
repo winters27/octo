@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
+use octo_core::fingerprint::heart_gate::WaitingFor;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::{HeartAcquisitionCoordinator, HeldKind, SoulseekHoldStore};
 
-/// Picks up the hearts a restart interrupted while they waited for Soulseek.
+/// Picks up the held acquisitions a restart interrupted, and resumes a held one when what it
+/// waits for arrives.
 pub struct SoulseekHoldResumer {
     store: Arc<SoulseekHoldStore>,
     hearts: Arc<HeartAcquisitionCoordinator>,
@@ -18,20 +20,40 @@ impl SoulseekHoldResumer {
         SoulseekHoldResumer { store, hearts }
     }
 
-    /// Starts every held chain again and finishes at once.
+    /// Runs the held acquisition `key` again now: one acquisition, each other holder joining
+    /// with their own gate.
+    pub fn resume(self: &Arc<Self>, key: &str) {
+        self.hearts.resume_held(key);
+    }
+
+    /// Runs again now every held acquisition that waits for `waiting_for`.
+    pub fn resume_waiting(self: &Arc<Self>, waiting_for: WaitingFor) {
+        for record in self
+            .store
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.waiting_for == Some(waiting_for))
+        {
+            self.hearts.resume_held(&record.key());
+        }
+    }
+
+    /// Starts every held chain again and finishes at once. A heart waiting out a Soulseek outage
+    /// keeps its saved start, so its deadline stays; every other hold gets its downloads row back
+    /// (held, with its line and its holders) and runs again.
     pub async fn run(self: Arc<Self>, _stopping: CancellationToken) -> anyhow::Result<()> {
         let held = self.store.snapshot();
         if !held.is_empty() {
-            info!(
-                "Resuming {} downloads that were waiting for Soulseek before the restart",
-                held.len()
-            );
+            info!("Resuming {} held downloads after the restart", held.len());
         }
         for entry in held {
-            if entry.kind == HeldKind::Album {
-                self.hearts.resume_album(entry);
-            } else {
-                self.hearts.resume_track(entry);
+            match (entry.waiting_for, entry.kind) {
+                (None, HeldKind::Album) => self.hearts.resume_album(entry),
+                (None, HeldKind::Track) => self.hearts.resume_track(entry),
+                (Some(_), _) => {
+                    self.hearts.hold_row_for(&entry);
+                    self.hearts.resume_held(&entry.key());
+                }
             }
         }
         Ok(())

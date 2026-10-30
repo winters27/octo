@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::http::{Method, StatusCode};
+use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeartGate};
 use octo_core::settings::{AppSettings, LidarrSettings};
 use parking_lot::Mutex;
 
@@ -38,11 +39,27 @@ struct Hearts {
 
 #[async_trait]
 impl ILidarrHeartAcquisitionService for Hearts {
-    async fn try_acquire_track(&self, _: &str, _: &str, _: bool, _: Option<&str>) -> anyhow::Result<bool> {
+    async fn try_acquire_track(
+        &self,
+        _: &str,
+        _: &str,
+        _: bool,
+        _: Option<&str>,
+        _: AcquisitionOrigin,
+        _: &[HeartGate],
+    ) -> anyhow::Result<bool> {
         Ok(false)
     }
 
-    async fn try_acquire_album(&self, _: &str, _: &str, _: bool, _: Option<&str>) -> anyhow::Result<bool> {
+    async fn try_acquire_album(
+        &self,
+        _: &str,
+        _: &str,
+        _: bool,
+        _: Option<&str>,
+        _: AcquisitionOrigin,
+        _: &[HeartGate],
+    ) -> anyhow::Result<bool> {
         Ok(false)
     }
 

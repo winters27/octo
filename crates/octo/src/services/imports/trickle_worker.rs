@@ -9,6 +9,7 @@ use futures::future::BoxFuture;
 use octo_core::common::Clock;
 use octo_core::common::acquisition_tracker::user_safe;
 use octo_core::common::dotnet::{eq_ignore_case, to_lower_invariant};
+use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
 use octo_core::settings::{HeartDownloadSource, SettingsStore};
 use octo_core::soulseek::soulseek_link::SoulseekLinkState;
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
@@ -51,7 +52,7 @@ const CHECKING: &str = "Checking against the music database";
 const READING_LIBRARY: &str = "Waiting to read your library";
 
 /// What a job says while MusicBrainz, which has to check its song, is not answering.
-const WAITING_FOR_ANSWER: &str = "Waiting for MusicBrainz to answer";
+pub(crate) const WAITING_FOR_ANSWER: &str = "Waiting for MusicBrainz to answer";
 
 /// What the trickle is doing, in a word the dashboard and the apps know, and when it starts its
 /// next song.
@@ -276,8 +277,17 @@ impl TrickleWorker {
                         Some(&job.title),
                         job.album.as_deref(),
                     );
+                    // An import whose identity MusicBrainz could not answer comes back as
+                    // TrickleCheckLater, and is put back for its next turn.
                     hearts
-                        .acquire_track_for(provider, &external_id, Some(&job.owner), None, &target)
+                        .acquire_track_for(
+                            provider,
+                            &external_id,
+                            Some(&job.owner),
+                            None,
+                            &target,
+                            AcquisitionOrigin::Import,
+                        )
                         .await?;
                     Ok(key)
                 })
