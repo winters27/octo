@@ -842,6 +842,8 @@ struct DownloadDeps<'a> {
     tagging: &'a Tagging,
     lyrics: &'a Arc<LyricsSidecarWriter>,
     soulseek_client: &'a SoulseekClient,
+    /// Whether hearts and plays are judged by the heart gate.
+    heart_gate: bool,
 }
 
 /// The acquisition pipeline, over the services it routes to. Two links would close a cycle, so
@@ -1028,19 +1030,21 @@ impl Acquisition {
         // The heart gate: what each person heard, the heard-master runner and the catalog's clip,
         // over the verification service every source's check point asks.
         let verification = downloads.tagging.download_verification.clone();
-        verification.use_heart(HeartParts {
-            registry: stores.external_id_registry.clone(),
-            samples: stores.heard_samples.clone(),
-            master: Arc::new(HeardMasterCheck::new(stores.heard_samples.clone())),
-            clip: Arc::new(CatalogClip::new(
-                clients.deezer_metadata.clone(),
-                stores.heard_samples.clone(),
-                stores.you_tube_resolver.clone(),
-            )),
-            catalog: clients.deezer_metadata.clone(),
-            holds: stores.soulseek_holds.clone(),
-            rejected: stores.rejected_peers.clone(),
-        });
+        if downloads.heart_gate {
+            verification.use_heart(HeartParts {
+                registry: stores.external_id_registry.clone(),
+                samples: stores.heard_samples.clone(),
+                master: Arc::new(HeardMasterCheck::new(stores.heard_samples.clone())),
+                clip: Arc::new(CatalogClip::new(
+                    clients.deezer_metadata.clone(),
+                    stores.heard_samples.clone(),
+                    stores.you_tube_resolver.clone(),
+                )),
+                catalog: clients.deezer_metadata.clone(),
+                holds: stores.soulseek_holds.clone(),
+                rejected: stores.rejected_peers.clone(),
+            });
+        }
         // A replacement's file that waits for AcoustID's bulk turn goes on once the lane gives
         // turns again.
         {
@@ -1060,7 +1064,9 @@ impl Acquisition {
                 owned: Some(heart_ownership.clone()),
                 stars: Some(star_on_arrival.clone()),
                 ahead: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
-                gates: Some(verification.clone() as Arc<dyn HeartGates>),
+                gates: downloads
+                    .heart_gate
+                    .then(|| verification.clone() as Arc<dyn HeartGates>),
                 music_brainz: Some(clients.music_brainz.clone()),
                 heard: Some(stores.heard_samples.clone()),
                 acoust_id_on: Some({
@@ -2551,6 +2557,9 @@ pub struct TestServices {
     /// Where Apple Music's pages are read from (a test's mock server). None in a handler test
     /// is an address that refuses at once, so no test reaches music.apple.com.
     pub apple_music_base_url: Option<String>,
+    /// The heart gate on hearts and plays. Off by default, so a test of what an endpoint does
+    /// never asks the real AcoustID, MusicBrainz or Deezer hosts; a test of the gate turns it on.
+    pub heart_gate: bool,
 }
 
 /// The queues and sweeps: the upgrade queue's worker, the weekly quality upgrade, the
@@ -3084,6 +3093,7 @@ impl AppState {
                 tagging: &tagging,
                 lyrics: &lyrics.sidecar_writer,
                 soulseek_client: &soulseek.client,
+                heart_gate: true,
             },
             None,
         );
@@ -3584,6 +3594,7 @@ impl AppState {
                 tagging: &tagging,
                 lyrics: &lyrics.sidecar_writer,
                 soulseek_client: &soulseek.client,
+                heart_gate: overrides.heart_gate,
             },
             overrides.download_service.clone(),
         );
