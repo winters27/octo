@@ -516,6 +516,64 @@ async fn a_folder_imports_webhook_with_a_guessed_id_of_octos_is_not_ours() {
     assert_eq!(service.lidarr_imported(own).await, LidarrImportOutcome::Woke);
 }
 
+/// Two people who heard different versions of Teardrop wait on one Lidarr import: it is judged by
+/// both their gates at once, and each is answered by their own: Alice's gate passed it, so it is
+/// hers; Bob's refused it, so his heart is not answered with her file and goes on once the follow
+/// ends.
+#[tokio::test]
+async fn two_people_on_one_import_each_get_only_what_their_own_gate_passed() {
+    let f = Fixture::new().await;
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    f.refused_users.lock().insert("bob".into());
+    let service = f.service(None, 30);
+    let alice = gated_heart(&f, &service, "alice", false);
+    watching(&f, "dl-1").await;
+    let bob = gated_heart(&f, &service, "bob", false);
+    until(|| {
+        service
+            .askers_of(ALBUM_ID)
+            .is_some_and(|askers| askers.len() == 2)
+    })
+    .await;
+
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
+
+    assert!(alice.await.expect("the task"), "hers by her own gate");
+    assert!(!bob.await.expect("the task"), "never his by hers");
+    assert_eq!(
+        asked_as_heart(&f),
+        [(
+            "03 - Teardrop".to_string(),
+            vec!["alice".to_string(), "bob".to_string()]
+        )]
+    );
+    over(&f).await;
+}
+
+/// After a restart, a hold folder no pending entry names is left from a pick that is over: it goes
+/// with what it holds. One a listed entry names stays.
+#[tokio::test]
+async fn a_restart_removes_a_hold_folder_no_entry_names() {
+    let f = Fixture::new().await;
+    let held = f.root.path().join(".octo-incoming/lidarr-held");
+    for (folder, file) in [("rg-gone", "01 - Gone.flac"), ("rg-listed", "01 - Kept.flac")] {
+        std::fs::create_dir_all(held.join(folder)).expect("made");
+        std::fs::write(held.join(folder).join(file), b"a held track").expect("written");
+    }
+    f.pending.remember(PendingAlbum {
+        foreign_album_id: "rg-listed".into(),
+        search_command: 3,
+        ..Default::default()
+    });
+
+    f.service(None, 30).put_back_after_restart().await;
+
+    assert!(!held.join("rg-gone").exists());
+    assert!(held.join("rg-listed/01 - Kept.flac").is_file());
+}
+
 // ---- Put back ------------------------------------------------------------------------------------
 
 /// Octo's grab fails and Lidarr queues its own new search of the album: nothing is put back while

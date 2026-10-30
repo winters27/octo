@@ -76,6 +76,8 @@ struct Pipeline {
     refused: Arc<Mutex<HashSet<String>>>,
     refused_for_hearts: Arc<Mutex<HashSet<String>>>,
     holding: Arc<Mutex<HashSet<String>>>,
+    /// People whose own gate refuses every file while another's passes it.
+    refused_users: Arc<Mutex<HashSet<String>>>,
     taken: Taken,
     asked: Arc<Mutex<Vec<Asked>>>,
     placed: Arc<Mutex<Vec<HeldPlacement>>>,
@@ -243,11 +245,19 @@ impl IDownloadService for Pipeline {
         }
         let landed = self.take_offered(id)?;
         for gate in &place.gates {
-            place.ledger.record_accepted(
-                &gate.user,
-                gate.origin,
-                octo_core::fingerprint::heart_gate::Acceptance::Sound,
-            );
+            if self.refused_users.lock().contains(&gate.user) {
+                place.ledger.record(
+                    &gate.user,
+                    gate.origin,
+                    crate::services::common::GateOutcome::NotAccepted("not the version heard".into()),
+                );
+            } else {
+                place.ledger.record_accepted(
+                    &gate.user,
+                    gate.origin,
+                    octo_core::fingerprint::heart_gate::Acceptance::Sound,
+                );
+            }
         }
         Ok(landed)
     }
@@ -316,6 +326,8 @@ struct Fixture {
     refused_for_hearts: Arc<Mutex<HashSet<String>>>,
     /// Titles whose file a hearted song's gates hold for AcoustID.
     holding: Arc<Mutex<HashSet<String>>>,
+    /// People whose own gate refuses every file while another's passes it.
+    refused_users: Arc<Mutex<HashSet<String>>>,
     taken: Taken,
     /// Every file the pipeline was asked to judge, in order.
     asked: Arc<Mutex<Vec<Asked>>>,
@@ -385,6 +397,7 @@ impl Fixture {
             refused: Arc::default(),
             refused_for_hearts: Arc::default(),
             holding: Arc::default(),
+            refused_users: Arc::default(),
             taken: Arc::default(),
             asked: Arc::default(),
             owned: Arc::default(),
@@ -510,6 +523,7 @@ impl Fixture {
             refused: self.refused.clone(),
             refused_for_hearts: self.refused_for_hearts.clone(),
             holding: self.holding.clone(),
+            refused_users: self.refused_users.clone(),
             taken: self.taken.clone(),
             asked: self.asked.clone(),
             placed: self.placed.clone(),
