@@ -784,9 +784,7 @@ impl HeartGate {
         let findings = label_findings(reading.as_ref(), facts, &r);
 
         let master_may_accept = heard && reading.as_ref().is_none_or(|f| f.reading != Reading::Another);
-        let names_other_song = findings
-            .iter()
-            .any(|finding| *finding == LabelCheck::NamesAnother { other_song: true });
+        let names_other_song = findings.contains(&LabelCheck::NamesAnother { other_song: true });
         if master_may_accept && !names_other_song {
             if let Some(waiting) = unsettled(&findings) {
                 return waiting;
