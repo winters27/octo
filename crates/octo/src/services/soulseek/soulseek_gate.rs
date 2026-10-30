@@ -104,6 +104,13 @@ fn verdict_words(verdict: &GateVerdict) -> (&'static str, &'static str) {
 /// Why a gate did not keep a file, as the rest of a sentence about it ("the file is not kept:
 /// it does not sound like what played").
 fn not_kept(detail: &str) -> String {
+    // A name keeps its own spelling.
+    if ["AcoustID", "MusicBrainz"]
+        .iter()
+        .any(|name| detail.starts_with(name))
+    {
+        return format!("is not kept: {detail}");
+    }
     let mut letters = detail.chars();
     match letters.next() {
         Some(first) => format!("is not kept: {}{}", first.to_lowercase(), letters.as_str()),
@@ -156,17 +163,42 @@ impl SoulseekDownloadService {
         identity: Option<HeardSource>,
         length_known: bool,
     ) -> FileJudged {
+        self.judge_file_labeled(
+            base,
+            routing,
+            download,
+            path,
+            identity,
+            length_known,
+            LabelSource::TheFile,
+        )
+        .await
+    }
+
+    /// [`Self::judge_file`] for a file whose own labels are read from `labels`: a Lidarr import's
+    /// are the download as delivered, or the file itself only when Lidarr writes no tags, or none.
+    #[allow(clippy::too_many_arguments)] // judge_file's inputs and where the file's labels are
+    pub(crate) async fn judge_file_labeled(
+        &self,
+        base: &BaseDownloadService,
+        routing: &SoulseekRouting,
+        download: &mut TrackDownload,
+        path: &str,
+        identity: Option<HeardSource>,
+        length_known: bool,
+        labels: LabelSource,
+    ) -> FileJudged {
         if gated(download) {
-            return self.judge_by_gates(base, download, path, identity).await;
+            return self.judge_by_gates(base, download, path, identity, labels).await;
         }
         let judged = self
-            .judge_shipped(base, routing, download, path, length_known)
+            .judge_shipped(base, routing, download, path, length_known, &labels)
             .await;
         if matches!(judged, FileJudged::Keep(_)) {
             // What the checks said of an earlier candidate they refused is not what they said of
             // the file kept: the kept file is everyone's who asked, as the shipped checks keep it.
             download.ledger.clear();
-            self.judge_joiners(download, path, identity).await;
+            self.judge_joiners(download, path, identity, labels).await;
         }
         judged
     }
@@ -179,6 +211,7 @@ impl SoulseekDownloadService {
         download: &TrackDownload,
         path: &str,
         identity: Option<HeardSource>,
+        labels: LabelSource,
     ) {
         let joiners: Vec<&HeartGate> = download.gates.iter().filter(|gate| personal(gate)).collect();
         if gated(download) || joiners.is_empty() {
@@ -199,7 +232,7 @@ impl SoulseekDownloadService {
             }
         }
         let candidate = HeartCandidate {
-            labels: LabelSource::TheFile,
+            labels,
             identity,
             acquisition_key: download.acquisition_key.clone(),
         };
@@ -236,10 +269,11 @@ impl SoulseekDownloadService {
         download: &mut TrackDownload,
         path: &str,
         identity: Option<HeardSource>,
+        labels: LabelSource,
     ) -> FileJudged {
         let track_key = download.song.external_id.clone().unwrap_or_default();
         let candidate = HeartCandidate {
-            labels: LabelSource::TheFile,
+            labels,
             identity,
             acquisition_key: download.acquisition_key.clone(),
         };
@@ -402,6 +436,7 @@ impl SoulseekDownloadService {
         download: &mut TrackDownload,
         path: &str,
         length_known: bool,
+        labels: &LabelSource,
     ) -> FileJudged {
         let (_, title) = names(routing);
         let track_key = download.song.external_id.clone().unwrap_or_default();
@@ -474,7 +509,7 @@ impl SoulseekDownloadService {
             };
         }
 
-        if self.import_refuses(base, download, path, &mut verdict) {
+        if self.import_refuses(base, download, path, &mut verdict, labels) {
             return FileJudged::Refuse {
                 reason: "is another recording by AcoustID's reading".to_string(),
                 shared: false,
@@ -506,15 +541,16 @@ impl SoulseekDownloadService {
     }
 
     /// The import rule, for an origin that keeps the shipped checks and whose gate carries R: true
-    /// when AcoustID's reading names another recording, or one of the file's own labels does, so
-    /// the file is refused whatever the shipped check said. A confirmed file the reading cannot
-    /// settle is marked "version not proven", and carries no recording tags.
+    /// when AcoustID's reading names another recording, or one of the file's own labels (read from
+    /// `labels`) does, so the file is refused whatever the shipped check said. A confirmed file
+    /// the reading cannot settle is marked "version not proven", and carries no recording tags.
     pub(crate) fn import_refuses(
         &self,
         base: &BaseDownloadService,
         download: &TrackDownload,
         path: &str,
         verdict: &mut VerificationResult,
+        labels: &LabelSource,
     ) -> bool {
         let track_key = download.song.external_id.clone().unwrap_or_default();
         let Some(r) = download
@@ -530,12 +566,17 @@ impl SoulseekDownloadService {
         };
         let min = base.current_soulseek_settings().effective_min_score_fraction();
         let reading = read_answer(&answer, &r, min);
-        let labels = {
-            let facts = octo_media::tags::tag_writer_extras::read_facts(path, true);
+        let read_labels = |from: &str| {
+            let facts = octo_media::tags::tag_writer_extras::read_facts(from, true);
             octo_core::fingerprint::heart_gate::FileLabels {
                 isrcs: facts.isrcs,
                 recording_id: facts.recording_id,
             }
+        };
+        let labels = match labels {
+            LabelSource::TheFile => read_labels(path),
+            LabelSource::Delivered(delivered) => read_labels(&delivered.to_string_lossy()),
+            LabelSource::None => octo_core::fingerprint::heart_gate::FileLabels::default(),
         };
         let facts = FileFacts::new(
             octo_core::fingerprint::acoust_id_client::AcoustIdOutcome::Answered(answer),

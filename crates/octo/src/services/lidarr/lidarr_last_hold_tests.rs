@@ -1,6 +1,8 @@
 //! With Lidarr last in a heart's chain, a walk MusicBrainz could not answer holds the heart,
 //! saved, until the re-asker gets the answer, and the heart then runs again; an import goes back on
-//! its trickle instead. With a source after Lidarr the chain just goes on.
+//! its trickle instead. With a source after Lidarr the chain just goes on. Lidarr's failing
+//! indexers hold the heart the same way, until they search again, the person hearts again, or Octo
+//! restarts.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,11 +22,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::services::common::test_fakes::{FakeDownloads, FakeLidarr, until};
 use crate::services::common::{
     AcquisitionRequest, AcquisitionTarget, AcquisitionTracker, HeartAcquisitionCoordinator,
-    HeartCoordinatorExtras, SoulseekHoldStore, TrackAcquisitionQueue, TrackOutcome,
+    HeartCoordinatorExtras, SoulseekHoldResumer, SoulseekHoldStore, TrackAcquisitionQueue, TrackOutcome,
 };
 use crate::services::fingerprint::MusicBrainzClient;
 use crate::services::fingerprint::music_brainz_client::HeartBusy;
 use crate::services::imports::trickle_worker::TrickleCheckLater;
+use crate::services::lidarr::LidarrWaits;
 
 /// The question the walk got no answer to.
 const QUESTION: &str = "recording/0d7b6ba8-6ff0-4a5c-a6f9-cc9c6b8c3c37?inc=releases&fmt=json";
@@ -74,7 +77,7 @@ async fn rig(steps: &[HeartDownloadSource]) -> Rig {
         *calls += 1;
         Ok(*calls > 1)
     }));
-    *lidarr.waits.lock() = Some(HeartBusy::MusicBrainz(QUESTION.into()));
+    *lidarr.waits.lock() = Some(LidarrWaits::Answer(HeartBusy::MusicBrainz(QUESTION.into())));
     let queue = Arc::new(TrackAcquisitionQueue::new());
     let holds = Arc::new(SoulseekHoldStore::new(None::<PathBuf>));
     let tracker = Arc::new(AcquisitionTracker::new(None, Clock::system()));
@@ -184,6 +187,86 @@ async fn with_a_source_after_lidarr_the_chain_goes_on() {
         "what a step with a source after it waited on is never asked"
     );
     stop.cancel();
+}
+
+/// A heart of Eye of the Tiger whose Lidarr step, run last, found Lidarr's indexers failing: held,
+/// saved, with its line.
+async fn held_for_indexers(rig: &Rig) {
+    *rig.lidarr.waits.lock() = Some(LidarrWaits::Indexers);
+    let outcome = rig
+        .coordinator
+        .acquire_track_outcome(
+            "soulseek",
+            "eye-of-the-tiger",
+            Some("brandon"),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::Heart,
+        )
+        .await
+        .expect("ran");
+    assert_eq!(outcome, TrackOutcome::Held(WaitingFor::LidarrIndexers));
+    let held = rig.holds.snapshot();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].waiting_for, Some(WaitingFor::LidarrIndexers));
+    assert!(rig.tracker.is_held("soulseek", "eye-of-the-tiger"));
+    assert_eq!(
+        rig.tracker.note_of("soulseek", "eye-of-the-tiger").as_deref(),
+        Some("Waiting for Lidarr's indexers")
+    );
+}
+
+/// With Lidarr last, its failing indexers hold the heart until they search again: then every heart
+/// waiting for them runs again, Lidarr takes it this time, and the hold ends.
+#[tokio::test]
+async fn with_lidarr_last_failing_indexers_hold_the_heart_until_they_search_again() {
+    let rig = rig(&[HeartDownloadSource::Lidarr]).await;
+    held_for_indexers(&rig).await;
+
+    rig.coordinator.resume_waiting(WaitingFor::LidarrIndexers);
+
+    until(|| rig.lidarr.track_calls.lock().len() == 2 && rig.holds.snapshot().is_empty()).await;
+    until(|| !rig.tracker.is_held("soulseek", "eye-of-the-tiger")).await;
+}
+
+/// The person's own heart, given again, asks Lidarr again at once.
+#[tokio::test]
+async fn hearting_again_asks_lidarr_again_while_its_indexers_held_the_heart() {
+    let rig = rig(&[HeartDownloadSource::Lidarr]).await;
+    held_for_indexers(&rig).await;
+
+    let again = rig
+        .coordinator
+        .acquire_track_outcome(
+            "soulseek",
+            "eye-of-the-tiger",
+            Some("brandon"),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::Heart,
+        )
+        .await
+        .expect("ran");
+
+    assert_eq!(again, TrackOutcome::Held(WaitingFor::LidarrIndexers));
+    until(|| rig.lidarr.track_calls.lock().len() == 2 && rig.holds.snapshot().is_empty()).await;
+}
+
+/// A restart runs a heart held for Lidarr's indexers again.
+#[tokio::test]
+async fn a_restart_runs_a_heart_held_for_lidarrs_indexers_again() {
+    let rig = rig(&[HeartDownloadSource::Lidarr]).await;
+    held_for_indexers(&rig).await;
+
+    Arc::new(SoulseekHoldResumer::new(
+        rig.holds.clone(),
+        rig.coordinator.clone(),
+    ))
+    .run(CancellationToken::new())
+    .await
+    .expect("ran");
+
+    until(|| rig.lidarr.track_calls.lock().len() == 2 && rig.holds.snapshot().is_empty()).await;
 }
 
 #[tokio::test]

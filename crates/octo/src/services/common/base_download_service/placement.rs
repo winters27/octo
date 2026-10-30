@@ -311,6 +311,70 @@ impl BaseDownloadService {
         Some(target)
     }
 
+    /// Drops a kept copy a Lidarr follow held back, once a proven copy of its song passed the gate
+    /// of every person the copy was kept for (`users`): its file, whatever was written beside it,
+    /// and the library's record of it go, so those people end with the proven copy alone. A copy
+    /// the library records for anyone else, or does not record at all, stays. Never while a
+    /// library job or a download is placing files.
+    pub async fn drop_held_copy(&self, held: &HeldPlacement, users: &[String]) -> bool {
+        let _share = match &self.services.write_gate {
+            Some(gate) => Some(gate.write().await),
+            None => None,
+        };
+        let Ok(_permit) = self.download_lock.acquire().await else {
+            return false;
+        };
+        let mapping = self
+            .local_library
+            .get_mappings()
+            .await
+            .into_iter()
+            .find(|mapping| mapping.local_path == held.held_path);
+        let only_theirs = mapping
+            .as_ref()
+            .and_then(|mapping| mapping.heart.as_ref())
+            .is_some_and(|heart| {
+                !heart.users.is_empty()
+                    && heart.users.iter().all(|kept_for| {
+                        users
+                            .iter()
+                            .any(|user| dotnet::eq_ignore_case(user.trim(), kept_for.trim()))
+                    })
+            });
+        if !only_theirs {
+            return false;
+        }
+        if let Err(e) = self.local_library.forget_mapping(&held.held_path).await {
+            warn!("Could not forget the library's record of {}: {e}", held.held_path);
+            return false;
+        }
+        if file_exists(&held.held_path)
+            && let Err(e) = std::fs::remove_file(&held.held_path)
+        {
+            warn!("Could not delete the kept copy {}: {e}", held.held_path);
+        }
+        if let Some(folder) = Path::new(&held.held_path).parent() {
+            let stem = Path::new(&held.held_path)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let Ok(beside) = std::fs::read_dir(folder) {
+                for file in beside.flatten() {
+                    let name = file.file_name().to_string_lossy().into_owned();
+                    if !stem.is_empty() && name.starts_with(&format!("{stem}.")) {
+                        let _ = std::fs::remove_file(file.path());
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(folder);
+        }
+        info!(
+            "Dropped the kept copy of {} for the proven copy: {}",
+            held.song, held.held_path
+        );
+        true
+    }
+
     /// A song fetched ahead, moved to `<folder>/<provider>_<id>.<ext>`, where no library scan
     /// looks. A copy of the song already there (and its facts) is replaced. Refused for a folder
     /// with other files in it that Octo did not make.

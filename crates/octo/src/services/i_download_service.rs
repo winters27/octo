@@ -164,6 +164,13 @@ pub trait IDownloadService: Send + Sync {
         None
     }
 
+    /// Drops a kept copy a Lidarr follow held back, its file and the library's record of it, once
+    /// a proven copy of its song passed the gate of everyone it was kept for (`users`). False, and
+    /// nothing changes, when the copy is anyone else's too. The default keeps it.
+    async fn drop_held(&self, _held: &HeldPlacement, _users: &[String]) -> bool {
+        false
+    }
+
     /// Gets the local path for a song if it has been downloaded already: the provider
     /// (deezer, qobuz, etc.) and the ID on the external provider. The local file path if it
     /// exists, `None` otherwise.

@@ -525,6 +525,26 @@ impl FakeLidarr {
         self.with(|state| state.catalog_albums.push(album));
     }
 
+    /// Another track of an album the metadata knows (id, title, number), recorded as
+    /// `recording`, which the album gets when Lidarr adds it.
+    pub fn catalog_track(&self, foreign_album_id: &str, track: (i32, &str, i32), recording: &str) {
+        self.with(|state| {
+            if let Some(album) = state
+                .catalog_albums
+                .iter_mut()
+                .find(|album| dotnet::eq_ignore_case(&album.foreign_id, foreign_album_id))
+            {
+                album.tracks.push((
+                    track.0,
+                    track.1.to_string(),
+                    track.2,
+                    330_000,
+                    recording.to_string(),
+                ));
+            }
+        });
+    }
+
     /// The user's Lidarr holds the fake album (and its artist), monitored or not, with its
     /// tracks. The name the shipped tests use.
     pub fn add_album(&self, monitored: bool) {

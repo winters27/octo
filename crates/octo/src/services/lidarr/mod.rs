@@ -18,13 +18,13 @@ mod lidarr_last_hold_tests;
 pub use lidarr_album_claims::LidarrAlbumClaims;
 pub use lidarr_client::LidarrClient;
 pub use lidarr_heart_acquisition_service::{
-    ILidarrHeartAcquisitionService, LidarrHeartAcquisitionService, LidarrHeartExtras, LidarrImportEvent,
-    LidarrImportOutcome, PauseRounds,
+    ILidarrHeartAcquisitionService, IndexersAwaited, IndexersBack, LidarrHeartAcquisitionService,
+    LidarrHeartExtras, LidarrImportEvent, LidarrImportOutcome, LidarrWaits, NO_INDEXER_SEARCHES, PauseRounds,
 };
 pub use lidarr_import_handoff::{LidarrImport, LidarrImportHandoff};
 pub use lidarr_pending_albums::{
-    FollowEnd, FollowedGrab, FollowedItem, HELD_FOR_LIDARR, HeldPlacement, LidarrPendingAlbums,
-    PROVEN_ELSEWHERE, PendingAdd, PendingAlbum, REPLACED_YOURS, STOP_WAITING, StopWaiting,
+    FollowEnd, FollowedGrab, FollowedItem, HELD_FOR_LIDARR, HeldPlacement, HeldTrack, LidarrPendingAlbums,
+    PROVEN_ELSEWHERE, PendingAdd, PendingAlbum, REPLACED_YOURS, STOP_WAITING, SongGate, StopWaiting,
 };
 pub use lidarr_pick::{ALREADY_LOOKING, ArtistMusic, LidarrArtistMusic};
 pub use lidarr_track_fetcher::{ILidarrTrackFetcher, LidarrTrackFetcher};

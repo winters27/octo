@@ -1337,7 +1337,7 @@ async fn a_busy_walk_with_lidarr_last_leaves_what_the_heart_waits_on() {
     );
     assert!(matches!(
         service.waits_on("soulseek", &id),
-        Some(HeartBusy::MusicBrainz(_))
+        Some(LidarrWaits::Answer(HeartBusy::MusicBrainz(_)))
     ));
     assert_eq!(service.waits_on("soulseek", &id), None, "read once");
     assert_ne!(

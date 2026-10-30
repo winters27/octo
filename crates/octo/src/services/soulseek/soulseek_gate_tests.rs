@@ -70,6 +70,8 @@ struct Options {
     album_gates: Option<Arc<crate::services::common::AlbumGates>>,
     /// The library landed files are registered in; a fake that keeps nothing by default.
     library: Option<Arc<dyn crate::services::local::ILocalLibraryService>>,
+    /// The files a Lidarr heart brought in, offered to the download by song id.
+    lidarr_imports: Option<Arc<LidarrImportHandoff>>,
 }
 
 /// A 180 s FLAC whose sound is named, with `isrc` as its own tag.
@@ -331,7 +333,7 @@ async fn gated_with(root: &Root, source: DownloadSource, peers: Vec<Peer>, optio
         youtube,
         id_registry: registry.clone(),
         soulseek_link: None,
-        lidarr_imports: None,
+        lidarr_imports: options.lidarr_imports.clone(),
         lidarr_fetcher: None,
         spotiflac: None,
         preview_copies: Some(rig.copies.clone()),
@@ -1225,3 +1227,6 @@ mod album;
 
 #[path = "soulseek_keep_anyway_tests.rs"]
 mod keep_anyway;
+
+#[path = "soulseek_lidarr_gate_tests.rs"]
+mod lidarr;

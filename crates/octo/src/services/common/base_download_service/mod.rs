@@ -2750,6 +2750,10 @@ impl IDownloadService for BaseDownloadService {
         self.place_held_file(held).await
     }
 
+    async fn drop_held(&self, held: &crate::services::lidarr::HeldPlacement, users: &[String]) -> bool {
+        self.drop_held_copy(held, users).await
+    }
+
     async fn get_local_path_if_exists(&self, external_provider: &str, external_id: &str) -> Option<String> {
         if external_provider != self.provider_name() {
             return None;

@@ -12,11 +12,14 @@ use crate::services::admin::SignInThrottle;
 use crate::services::lidarr::ILidarrHeartAcquisitionService;
 
 /// What Lidarr's Webhook connection posts after importing an album: the album is singular,
-/// the files are `trackFiles`, and a null download client is left out.
+/// the files are `trackFiles`, and the download and its client are named.
 const DOWNLOAD: &str = r#"{
   "eventType": "Download",
   "instanceName": "Lidarr",
   "applicationUrl": "",
+  "downloadClient": "qBittorrent",
+  "downloadClientType": "qBittorrent",
+  "downloadId": "ABC123",
   "artist": { "id": 5, "name": "Massive Attack", "path": "/data/music/Massive Attack", "mbId": "ma" },
   "album": { "id": 7, "mbId": "rg-mezzanine", "title": "Mezzanine", "albumType": "Album",
              "secondaryAlbumTypes": [], "releaseDate": "1998-04-20T00:00:00Z", "genres": [], "images": [] },
@@ -35,6 +38,8 @@ const SECRET: &str = "hush-1234";
 #[derive(Default)]
 struct Hearts {
     events: Mutex<Vec<LidarrImportEvent>>,
+    /// How often Lidarr's webhook said its health changed or it grabbed.
+    health_events: Mutex<usize>,
 }
 
 #[async_trait]
@@ -66,6 +71,10 @@ impl ILidarrHeartAcquisitionService for Hearts {
     async fn lidarr_imported(&self, event: LidarrImportEvent) -> LidarrImportOutcome {
         self.events.lock().push(event);
         LidarrImportOutcome::Woke
+    }
+
+    fn lidarr_health_event(&self) {
+        *self.health_events.lock() += 1;
     }
 }
 
@@ -187,8 +196,53 @@ async fn a_download_with_the_right_password_reaches_the_hearts() {
                 "/data/music/Massive Attack/Mezzanine/03 - Teardrop.flac".into(),
             ],
             is_upgrade: false,
+            download_id: Some("ABC123".into()),
+            download_client: Some("qBittorrent".into()),
         }]
     );
+}
+
+/// A folder import names no download client, whatever download id Lidarr guessed for it: the
+/// event says so, so the hearts never take it for one of Octo's own downloads.
+#[test]
+fn a_folder_imports_event_carries_its_guessed_id_and_no_client() {
+    let mut payload: Value = serde_json::from_str(DOWNLOAD).expect("JSON");
+    let fields = payload.as_object_mut().expect("an object");
+    fields.remove("downloadClient");
+    fields.remove("downloadClientType");
+    fields.insert("downloadId".into(), Value::from("dl-1"));
+
+    let event = import_event(&payload).expect("an album");
+
+    assert_eq!(event.download_id.as_deref(), Some("dl-1"));
+    assert_eq!(event.download_client, None);
+}
+
+/// Lidarr's `HealthRestored` and `Grab` events reach the hearts as news of Lidarr's health, so a
+/// heart waiting for its indexers looks at once.
+#[tokio::test]
+async fn health_restored_and_grab_events_reach_the_hearts() {
+    let (app, hearts) = with_secret(Some(SECRET));
+    let auth = basic("lidarr", SECRET);
+
+    for body in [
+        r#"{"eventType":"HealthRestored","level":"error","message":"Indexers are available again","type":"IndexerStatusCheck"}"#,
+        r#"{"eventType":"Grab","albums":[{"id":7,"mbId":"rg-mezzanine"}],"downloadId":"dl-2"}"#,
+    ] {
+        let reply = send(
+            &app,
+            Method::POST,
+            WEBHOOK_PATH,
+            &[("authorization", &auth)],
+            Some(body),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.json()["ok"], true);
+    }
+
+    assert_eq!(*hearts.health_events.lock(), 2);
+    assert!(hearts.events.lock().is_empty());
 }
 
 #[tokio::test]
@@ -204,12 +258,12 @@ async fn lidarrs_test_event_is_answered_and_other_events_are_ignored() {
         Some(r#"{"eventType":"Test","artist":{"id":1,"name":"Test Name"},"albums":[{"id":123,"title":"Test title"}]}"#),
     )
     .await;
-    let grab = send(
+    let rename = send(
         &app,
         Method::POST,
         WEBHOOK_PATH,
         &[("authorization", &auth)],
-        Some(r#"{"eventType":"Grab","albums":[{"id":7,"mbId":"rg-mezzanine"}]}"#),
+        Some(r#"{"eventType":"Rename","artist":{"id":5,"name":"Massive Attack"}}"#),
     )
     .await;
     let no_album = send(
@@ -231,8 +285,8 @@ async fn lidarrs_test_event_is_answered_and_other_events_are_ignored() {
 
     assert_eq!(test.status, StatusCode::OK);
     assert_eq!(test.json()["ok"], true);
-    assert_eq!(grab.status, StatusCode::OK);
-    assert_eq!(grab.json()["taken"], "ignored");
+    assert_eq!(rename.status, StatusCode::OK);
+    assert_eq!(rename.json()["taken"], "ignored");
     assert_eq!(no_album.json()["taken"], "ignored");
     assert_eq!(not_json.status, StatusCode::BAD_REQUEST);
     assert!(hearts.events.lock().is_empty());

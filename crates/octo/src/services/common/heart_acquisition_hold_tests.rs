@@ -621,7 +621,7 @@ async fn a_play_handed_to_lidarr_says_it_is_a_play_and_a_play_never_holds() {
     gates.hold("brandon", WaitingFor::MusicBrainz);
     let rig = rig(gates.clone(), None, memory_holds());
     rig.coordinator
-        .hand_play_to_lidarr("soulseek:played", "soulseek", "played", Some("brandon"))
+        .hand_play_to_lidarr("soulseek:played", "soulseek", "played", Some("brandon"), &[])
         .await;
     assert_eq!(
         rig.lidarr.origins.lock().as_slice(),
@@ -852,6 +852,11 @@ async fn with_acoust_id_off_a_play_that_heard_nothing_fetches_nothing_from_any_s
         Some(heard.clone()),
     );
     until(|| rig.queue.waiting_plays() == 1 && rig.lidarr.origins.lock().len() == 1).await;
+    // The play's album through Lidarr is judged by the play's own gate too.
+    assert_eq!(
+        rig.lidarr.origins.lock().as_slice(),
+        [(AcquisitionOrigin::Play, 1)]
+    );
     let request = tokio::time::timeout(
         Duration::from_secs(10),
         rig.queue.dequeue(&CancellationToken::new()),

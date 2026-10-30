@@ -5,7 +5,9 @@
 //! lacks unmonitored, waits for the add's refresh and rescan to end, reads the artist again, pins
 //! the album to a release that carries the heard recording, waits for the pin's rescan, reads
 //! once more, and only then searches. A pick skipped on the way is put back: the pin restored,
-//! and what Octo's add created deleted from Lidarr, never from disk.
+//! and what Octo's add created deleted from Lidarr, never from disk. A pick whose search ended
+//! without a gated import is put back the same way once Octo's own files are deleted (and looked
+//! for again after the restore's rescan); one whose import landed only gets its pin restored.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -294,6 +296,53 @@ pub async fn put_back_unsearched(
     entry: &PendingAlbum,
     poll: Duration,
 ) -> Result<(), LidarrError> {
+    restore_pin(client, entry, poll).await?;
+    remove_what_octo_added(client, pending, entry).await
+}
+
+/// Puts back a pick whose search ended without a gated import, once every download of Octo's
+/// is accounted for and no search of the album runs (the follow waits for both):
+/// - Octo's own files still in Lidarr (each by its own import row: one of Octo's downloads, from
+///   a download client) are deleted, Octo deleting each file from disk itself so a recycle bin
+///   never keeps it, then its record; nothing else of the artist is touched, a folder import of
+///   the user's (no client, whatever download id Lidarr guessed) and a file a disk scan adopted
+///   (no row) included;
+/// - the release choice goes back as [`put_back_unsearched`] puts it back, the rescan it queues
+///   waited out;
+/// - Octo's own files are looked for again, so one an import landed meanwhile goes too;
+/// - then what Octo's add created goes, as [`put_back_unsearched`] removes it, and the entry is
+///   forgotten last.
+pub async fn put_back_searched(
+    client: &LidarrClient,
+    pending: Option<&LidarrPendingAlbums>,
+    music: &LidarrArtistMusic,
+    entry: &PendingAlbum,
+    poll: Duration,
+) -> Result<(), LidarrError> {
+    delete_octos_files(client, pending, music, entry).await?;
+    restore_pin(client, entry, poll).await?;
+    delete_octos_files(client, pending, music, entry).await?;
+    remove_what_octo_added(client, pending, entry).await
+}
+
+/// After a gated import landed, once Octo moved its files out: the album's release choice goes
+/// back as it was (the rescan it queues waited out), and the entry is forgotten. The album and
+/// the artist stay in Lidarr.
+pub async fn restore_after_landing(
+    client: &LidarrClient,
+    pending: &LidarrPendingAlbums,
+    entry: &PendingAlbum,
+    poll: Duration,
+) -> Result<(), LidarrError> {
+    let restored = restore_pin(client, entry, poll).await;
+    pending.forget(&entry.foreign_album_id);
+    restored
+}
+
+/// Gives the album back exactly the release choice saved before Octo pinned it, when it is still
+/// exactly Octo's pin (a choice the user changed stays as the user set it), and waits out the
+/// rescan the change queues, so any file it links is seen by what comes after.
+async fn restore_pin(client: &LidarrClient, entry: &PendingAlbum, poll: Duration) -> Result<(), LidarrError> {
     let album = match entry.lidarr_album_id {
         id if id > 0 => client.album(id).await?,
         _ => None,
@@ -305,6 +354,74 @@ pub async fn put_back_unsearched(
         let path = client.artist(album.artist_id).await?.and_then(|a| a.path);
         wait_for_rescans(client, album.id, album.artist_id, path.as_deref(), poll).await?;
     }
+    Ok(())
+}
+
+/// Deletes every track file of the entry's artist whose own import row is of one of Octo's
+/// downloads and names a download client: from disk by Octo first (when Octo can reach it), then
+/// its record, a record Lidarr no longer has counting as deleted.
+async fn delete_octos_files(
+    client: &LidarrClient,
+    pending: Option<&LidarrPendingAlbums>,
+    music: &LidarrArtistMusic,
+    entry: &PendingAlbum,
+) -> Result<(), LidarrError> {
+    let artist_id = entry.lidarr_artist_id;
+    if artist_id <= 0 {
+        return Ok(());
+    }
+    let files = client.artist_track_files(artist_id).await?;
+    if files.is_empty() {
+        return Ok(());
+    }
+    let rows = client
+        .artist_history(artist_id, Some(LidarrHistoryEvent::TrackFileImported))
+        .await?;
+    for file in &files {
+        let octos = rows.iter().any(|row| {
+            row.file_id() == Some(file.id)
+                && row.download_client().is_some()
+                && (entry.owns_grab(row.download_id.as_deref().unwrap_or_default())
+                    || is_octos(pending, row.download_id.as_deref()))
+        });
+        if !octos {
+            continue;
+        }
+        let local = file.path.as_deref().and_then(|path| music.local(path));
+        match &local {
+            Some(local) if local.is_file() => {
+                if let Err(e) = std::fs::remove_file(local) {
+                    warn!("Could not delete {}: {e}", local.display());
+                    continue;
+                }
+                info!(
+                    "Deleted Octo's own import {} while putting the pick back",
+                    local.display()
+                );
+            }
+            Some(_) => {}
+            None => info!(
+                "Octo cannot reach Lidarr's {}; Lidarr deletes it",
+                file.path.as_deref().unwrap_or_default()
+            ),
+        }
+        if client.delete_track_file_record(file.id).await? == LidarrDeletion::Conflict {
+            warn!("Lidarr would not delete the record of track file {} now", file.id);
+        }
+    }
+    Ok(())
+}
+
+/// Removes what Octo's add created, then forgets the entry.
+async fn remove_what_octo_added(
+    client: &LidarrClient,
+    pending: Option<&LidarrPendingAlbums>,
+    entry: &PendingAlbum,
+) -> Result<(), LidarrError> {
+    let album = match entry.lidarr_album_id {
+        id if id > 0 => client.album(id).await?,
+        _ => None,
+    };
     let artist_id = album
         .as_ref()
         .map(|album| album.artist_id)

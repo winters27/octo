@@ -115,6 +115,12 @@ async fn lidarr_webhook(
             }
             plain(StatusCode::OK, json!({ "ok": true, "taken": taken }))
         }
+        // Lidarr's health came back, or it grabbed a release: a heart waiting for its indexers
+        // looks whether they search again.
+        "HealthRestored" | "Grab" => {
+            state.lidarr_hearts.lidarr_health_event();
+            plain(StatusCode::OK, json!({ "ok": true }))
+        }
         other => {
             if other.is_empty() {
                 warn!("Lidarr's webhook sent no eventType");
@@ -125,7 +131,8 @@ async fn lidarr_webhook(
 }
 
 /// The import a Download payload describes: the album (singular `album`, with `mbId`), the
-/// paths of `trackFiles`, `isUpgrade`. None without an album id.
+/// paths of `trackFiles`, `isUpgrade`, and the download it came from (`downloadId`) and its
+/// client (`downloadClient`, left out for a folder import). None without an album id.
 pub fn import_event(payload: &Value) -> Option<LidarrImportEvent> {
     let album = payload.get("album")?;
     let foreign_album_id = album
@@ -147,12 +154,15 @@ pub fn import_event(payload: &Value) -> Option<LidarrImportEvent> {
                 .collect()
         })
         .unwrap_or_default();
+    let present = |value: Option<&Value>| text(value).filter(|value| !value.trim().is_empty());
     Some(LidarrImportEvent {
         foreign_album_id,
         artist: text(payload.get("artist").and_then(|artist| artist.get("name"))),
         album: text(album.get("title")),
         paths,
         is_upgrade: payload.get("isUpgrade").and_then(Value::as_bool).unwrap_or(false),
+        download_id: present(payload.get("downloadId")),
+        download_client: present(payload.get("downloadClient")),
     })
 }
 

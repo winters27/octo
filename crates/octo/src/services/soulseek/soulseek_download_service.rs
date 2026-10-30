@@ -62,7 +62,7 @@ use crate::services::common::{
 use crate::services::fingerprint::DownloadVerificationService;
 use crate::services::fingerprint::acoust_id_rate_limiter::{AcoustIdRateLimiter, LookupClass};
 use crate::services::fingerprint::download_verification_service::YOUTUBE_PEER;
-use crate::services::fingerprint::download_verification_service::trustworthy;
+use crate::services::fingerprint::download_verification_service::{LabelSource, trustworthy};
 use crate::services::fingerprint::preview_check::{
     self, Heard, PreviewFacts, PreviewOutcome, PreviewRequest,
 };
@@ -277,9 +277,10 @@ impl SoulseekDownloadService {
     // =========================================================================
 
     /// A file a Lidarr heart brought in, taken into a job folder and held to the checks a Soulseek
-    /// download meets. AcoustID naming another recording, or a live take nobody asked for, throws
-    /// the file away: Lidarr has no second copy, so the heart's next source tries instead. A
-    /// FLAC made from an MP3 is kept and marked, as Soulseek keeps its last resort.
+    /// download meets (a heart's or a play's by each asker's own gate). A file they refuse is
+    /// thrown away, or given back to its album's hold folder when it waits there as a track of the
+    /// album: Lidarr has no second copy, so the heart's next source tries instead. A FLAC made
+    /// from an MP3 is kept and marked, as Soulseek keeps its last resort.
     async fn adopt_lidarr_import(
         &self,
         base: &BaseDownloadService,
@@ -315,82 +316,101 @@ impl SoulseekDownloadService {
             &base.download_path(),
         );
 
-        let song = &mut download.song;
-        let verdict = self.check_lidarr_file(base, routing, song, &local).await?;
-        verdict.apply_tags_to(song);
-        song.verification = Some(Box::new(verdict));
+        let refused_to = import.refused_to.clone();
+        let verdict = self
+            .check_lidarr_file(
+                base,
+                routing,
+                download,
+                &local,
+                import.labels,
+                refused_to.as_deref(),
+            )
+            .await?;
+        verdict.apply_tags_to(&mut download.song);
+        download.song.verification = Some(Box::new(verdict));
         info!("Took Lidarr's import of '{artist} - {title}' into the pipeline: {local}");
         Ok(local)
     }
 
     /// The checks every file Lidarr hands over meets, whether it was imported ahead of time or
-    /// fetched for this download: AcoustID, then the song's YouTube preview, then the lossless
-    /// spectrum check, which marks a transcode on the song. A file either check refuses is removed
-    /// and an `Err` returned; otherwise the verdict to keep comes back, for the caller to tag the
-    /// song with and record.
+    /// fetched for this download, the same as Soulseek's and Mornye's files: a heart's or a play's
+    /// file (and a replacement of a file a heart kept) is judged by each asker's own gate, never by
+    /// the shipped checks or the song's YouTube preview, each acceptance recorded for its person;
+    /// every other origin keeps the shipped checks, with the import rule's refusals when its R is
+    /// known, a Wrong song or Wrong version replacement refused by its original's sound, a Find
+    /// songs pick's own Busy line, and every joiner judged by their own gate. The file's labels are
+    /// read from `labels`, never from Lidarr's own matching. Then the lossless spectrum check,
+    /// which marks a transcode on the song. A file the checks refuse is removed (or moved back to
+    /// `refused_to`) and an `Err` returned; one that waits is in the one hold path and its hold is
+    /// the `Err`; otherwise the verdict to keep comes back, for the caller to tag the song with and
+    /// record.
     async fn check_lidarr_file(
         &self,
         base: &BaseDownloadService,
         routing: &SoulseekRouting,
-        song: &mut Song,
+        download: &mut TrackDownload,
         local: &str,
+        labels: LabelSource,
+        refused_to: Option<&str>,
     ) -> anyhow::Result<VerificationResult> {
         let (artist, title) = names(routing);
         if let (Some(provider), Some(id)) = (
-            song.external_provider.clone().filter(|p| !p.is_empty()),
-            song.external_id.clone().filter(|i| !i.is_empty()),
+            download.song.external_provider.clone().filter(|p| !p.is_empty()),
+            download.song.external_id.clone().filter(|i| !i.is_empty()),
         ) {
             base.track(|t| t.stage(&provider, &id, AcquisitionState::Verifying, Some("Lidarr"), None));
         }
-        let verdict = self
-            .verification
-            .verify(
-                local,
-                routing.artist.as_deref(),
-                routing.title.as_deref(),
-                song.isrc.as_deref().or(routing.isrc.as_deref()),
-                &self.verification.takes_for_routing(routing),
-            )
-            .await;
-        if verdict.verdict == VerificationVerdict::Mismatch {
-            warn!(
-                "Lidarr brought {} for '{artist} - {title}' (AcoustID score {}); discarding it",
-                verdict.describe(),
-                percent(verdict.score)
-            );
-            base.log_song_step_heard(
-                song,
-                acquisition_event_kinds::CHECK,
-                &mismatch_text(&verdict),
-                Some("Not the song asked for; thrown away"),
-                verdict.heard(),
-            );
-            // Swept with the job folders when it cannot be removed now.
-            let _ = std::fs::remove_file(local);
-            return Err(file_not_found(format!(
-                "AcoustID identified Lidarr's file as {}",
-                verdict.describe()
-            )));
-        }
         let length_known = routing.duration.is_some_and(|s| s > 0)
             && TagFile::open(local).is_ok_and(|file| file.duration_seconds() > 0);
-        let track_key = song.external_id.clone().unwrap_or_default();
-        let verdict = match self
-            .refused_by_preview(base, routing, &track_key, local, verdict, length_known)
-            .await
-        {
-            PreviewSays::Keep(kept) => kept,
-            PreviewSays::Refuse(reason) => {
-                // Swept with the job folders when it cannot be removed now.
+        let judged = self
+            .judge_file_labeled(base, routing, download, local, None, length_known, labels)
+            .await;
+        let verdict = match judged {
+            FileJudged::Keep(verdict) => verdict,
+            FileJudged::Hold(held) => {
+                info!("Lidarr's file for '{artist} - {title}' waits: {}", held.line);
+                return Err(held.into());
+            }
+            FileJudged::NotProven(why) => {
+                info!("Lidarr's file for the play of '{artist} - {title}' is not kept: {why}");
                 let _ = std::fs::remove_file(local);
+                return Err(not_proven());
+            }
+            FileJudged::Refuse {
+                reason,
+                shared,
+                verdict,
+            } => {
+                give_back_or_remove(local, refused_to);
+                if shared && verdict.verdict == VerificationVerdict::Mismatch {
+                    warn!(
+                        "Lidarr brought {} for '{artist} - {title}' (AcoustID score {}); discarding it",
+                        verdict.describe(),
+                        percent(verdict.score)
+                    );
+                    base.log_song_step_heard(
+                        &download.song,
+                        acquisition_event_kinds::CHECK,
+                        &mismatch_text(&verdict),
+                        Some("Not the song asked for; thrown away"),
+                        verdict.heard(),
+                    );
+                    return Err(file_not_found(format!(
+                        "AcoustID identified Lidarr's file as {}",
+                        verdict.describe()
+                    )));
+                }
                 return Err(file_not_found(format!(
                     "Lidarr's file for '{artist} - {title}' {reason}"
                 )));
             }
         };
-        if let Some(said) = verdict.acoust_id_text() {
+        if !gated(download)
+            && let Some(said) = verdict.acoust_id_text()
+        {
             base.log_song_step_heard(
-                song,
+                &download.song,
                 acquisition_event_kinds::CHECK,
                 "Checked the recording",
                 Some(&sentence(&said)),
@@ -406,7 +426,7 @@ impl SoulseekDownloadService {
                 "Lidarr's copy of '{artist} - {title}' is {}; keeping it, marked as a transcode",
                 spectrum.describe()
             );
-            song.transcoded_from = spectrum.estimate.clone();
+            download.song.transcoded_from = spectrum.estimate.clone();
         }
         Ok(verdict)
     }
@@ -483,10 +503,13 @@ impl SoulseekDownloadService {
             "Lidarr brought a copy",
             quality.as_deref(),
         );
-        let song = &mut download.song;
-        let verdict = self.check_lidarr_file(base, routing, song, &path).await?;
-        verdict.apply_tags_to(song);
-        song.verification = Some(Box::new(verdict));
+        // Lidarr's import is never a label, and whether Lidarr rewrote this file's tags is not
+        // known here: the fetched file's own tags are not read.
+        let verdict = self
+            .check_lidarr_file(base, routing, download, &path, LabelSource::None, None)
+            .await?;
+        verdict.apply_tags_to(&mut download.song);
+        download.song.verification = Some(Box::new(verdict));
         Ok(path)
     }
 
@@ -740,7 +763,7 @@ impl SoulseekDownloadService {
                 .into());
             }
             if verdict.verdict != VerificationVerdict::Mismatch
-                && self.import_refuses(base, download, &path, &mut verdict)
+                && self.import_refuses(base, download, &path, &mut verdict, &LabelSource::TheFile)
             {
                 let _ = std::fs::remove_file(&path);
                 last_refusal = Some(format!(
@@ -842,7 +865,8 @@ impl SoulseekDownloadService {
                 verdict.apply_tags_to(song);
             }
             song.verification = Some(Box::new(verdict));
-            self.judge_joiners(download, &path, None).await;
+            self.judge_joiners(download, &path, None, LabelSource::TheFile)
+                .await;
             return Ok(path);
         }
         Err(file_not_found(last_refusal.unwrap_or_else(|| {
@@ -858,23 +882,9 @@ impl SoulseekDownloadService {
     /// reason, for the deny list) when the file is thrown away, Keep(the verdict it is judged by)
     /// otherwise. A lone link a believed preview backs is kept as a confirmation.
     /// `length_known`: the file's length and the song's were both read, so the length check
-    /// before this one had something to compare.
-    pub(crate) async fn refused_by_preview(
-        &self,
-        base: &BaseDownloadService,
-        routing: &SoulseekRouting,
-        track_key: &str,
-        path: &str,
-        verdict: VerificationResult,
-        length_known: bool,
-    ) -> PreviewSays {
-        self.refused_by_preview_on(base, routing, track_key, path, verdict, length_known, false)
-            .await
-    }
-
-    /// [`Self::refused_by_preview`], fetching the preview in the shim's background lane for work
-    /// nobody waits on (an import's or a replacement's file), so it never goes ahead of a heart's
-    /// or a play's fetch.
+    /// before this one had something to compare. `background`: the preview is fetched in the
+    /// shim's background lane, for work nobody waits on (an import's or a replacement's file), so
+    /// it never goes ahead of a heart's or a play's fetch.
     #[allow(clippy::too_many_arguments)] // the preview check's inputs and its lane
     pub(crate) async fn refused_by_preview_on(
         &self,
@@ -2789,7 +2799,8 @@ impl DownloadBackend for SoulseekDownloadService {
     }
 
     async fn judge_ahead_joiners(&self, download: &TrackDownload, path: &str, identity: HeardSource) {
-        self.judge_joiners(download, path, Some(identity)).await;
+        self.judge_joiners(download, path, Some(identity), LabelSource::TheFile)
+            .await;
     }
 
     // =========================================================================
@@ -3469,6 +3480,25 @@ fn discard_rejected_download(path: &str, attempt_started_utc: DateTime<Utc>) {
         Ok(()) => info!("Deleted rejected download {path}"),
         Err(e) => warn!("Could not delete mismatched download {path}: {e}"),
     }
+}
+
+/// A refused file moved back to `back` (where it waits as a track of its album), else removed;
+/// swept with the job folders when neither can be done now.
+fn give_back_or_remove(path: &str, back: Option<&str>) {
+    if let Some(back) = back.filter(|back| !back.is_empty()) {
+        // Taking the file out may have left its folder empty, and so removed it.
+        if let Some(folder) = Path::new(back).parent() {
+            let _ = std::fs::create_dir_all(folder);
+        }
+        let moved = std::fs::rename(path, back).is_ok()
+            || (std::fs::copy(path, back).is_ok() && std::fs::remove_file(path).is_ok());
+        if moved {
+            info!("Gave the refused {path} back to {back}");
+            return;
+        }
+        warn!("Could not give the refused {path} back to {back}; deleting it");
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 /// Clear what a crash or a failed download left in the staging folder. A day old is long past

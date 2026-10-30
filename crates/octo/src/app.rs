@@ -1040,6 +1040,7 @@ impl Acquisition {
         // cut short is followed on.
         lidarr_heart_service.resume_after_restart();
         let lidarr_music = lidarr_heart_service.artist_music();
+        let lidarr_indexers = lidarr_heart_service.clone();
         let lidarr_hearts: Arc<dyn ILidarrHeartAcquisitionService> = Arc::new(lidarr_heart_service);
         let heart_ownership = Arc::new(HeartOwnership::new(
             library_ownership.clone(),
@@ -1188,6 +1189,23 @@ impl Acquisition {
                     });
                 }
             }));
+            // Lidarr's indexers searching again runs every heart waiting for them; their health is
+            // read only while one waits.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            let holds = stores.soulseek_holds.clone();
+            lidarr_indexers.on_indexers_back(
+                Arc::new(move || {
+                    if let Some(coordinator) = coordinator.upgrade() {
+                        coordinator.resume_waiting(WaitingFor::LidarrIndexers);
+                    }
+                }),
+                Some(Arc::new(move || {
+                    holds
+                        .snapshot()
+                        .iter()
+                        .any(|record| record.waiting_for == Some(WaitingFor::LidarrIndexers))
+                })),
+            );
             // A held song streamed again brings a new heard source to the holds that wait on one.
             let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
             stores.external_id_registry.on_heard(Arc::new(

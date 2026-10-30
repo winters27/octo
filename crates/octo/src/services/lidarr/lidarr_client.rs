@@ -33,6 +33,9 @@ use crate::services::http_client_factory;
 
 type JsonObject = Map<String, Value>;
 
+/// Told the path of each request Lidarr answered with a success.
+pub type LidarrAnswered = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Small, purpose-built client for the Lidarr v1 endpoints Octo needs.
 pub struct LidarrClient {
     http: reqwest::Client,
@@ -40,6 +43,8 @@ pub struct LidarrClient {
     settings: Arc<SettingsStore>,
     /// Milliseconds between looks while waiting for an album's track list.
     metadata_poll: AtomicU64,
+    /// Told of every request Lidarr answered: Lidarr answering is news of its health.
+    answered: parking_lot::Mutex<Option<LidarrAnswered>>,
 }
 
 /// What a look at an album's track list found.
@@ -68,7 +73,13 @@ impl LidarrClient {
             http,
             settings,
             metadata_poll: AtomicU64::new(2000),
+            answered: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Tells `hook` the path of every request Lidarr answers with a success from now on.
+    pub fn on_answer(&self, hook: LidarrAnswered) {
+        *self.answered.lock() = Some(hook);
     }
 
     pub async fn is_reachable(&self) -> bool {
@@ -1146,6 +1157,7 @@ impl LidarrClient {
                     .into(),
             )
         })?;
+        let path = url.path().to_string();
         let mut builder = self.http.request(request.method, url);
         if let Some(timeout) = request.timeout {
             builder = builder.timeout(timeout);
@@ -1159,7 +1171,14 @@ impl LidarrClient {
                 .header(reqwest::header::CONTENT_TYPE, "application/json; charset=utf-8")
                 .body(body);
         }
-        builder.send().await.map_err(failed)
+        let response = builder.send().await.map_err(failed)?;
+        if response.status().is_success() {
+            let hook = self.answered.lock().clone();
+            if let Some(hook) = hook {
+                hook(&path);
+            }
+        }
+        Ok(response)
     }
 
     /// A request whose 404 and 409 are answers: what a delete came to.

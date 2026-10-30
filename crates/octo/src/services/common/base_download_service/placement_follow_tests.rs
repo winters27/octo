@@ -353,3 +353,54 @@ async fn lidarrs_own_import_waits_and_never_ends_its_follow() {
     assert!(rig.pending.get("rg-mezzanine").expect("listed").following());
     assert_eq!(rig.pending.held().len(), 1);
 }
+
+/// A kept copy that waits for a follow gives way to a proven copy of its song only when that copy
+/// passed the gate of everyone it was kept for: its file, what was written beside it and its
+/// library record go. A copy kept for someone else too stays as it is.
+#[tokio::test]
+async fn a_kept_copy_is_dropped_for_a_proven_copy_only_for_everyone_it_was_kept_for() {
+    let rig = Rig::new();
+    rig.follow("rg-mezzanine", "Massive Attack", "Mezzanine", false);
+    let placement = rig
+        .place(&kept_teardrop(), &teardrop_request(), DownloadSource::YouTube)
+        .await;
+    let held = rig.pending.held().remove(0);
+    let lyrics = Path::new(&placement.path).with_extension("lrc");
+    std::fs::write(&lyrics, "[00:01.00] love, love is a verb").expect("written");
+    rig.library.by_tags.lock().push((
+        "Massive Attack".into(),
+        "Teardrop".into(),
+        Some("Mezzanine".into()),
+        crate::services::local::LocalSongMapping {
+            external_provider: "soulseek".into(),
+            external_id: "teardrop".into(),
+            local_path: placement.path.clone(),
+            heart: Some(crate::services::local::KeptHeart {
+                users: vec!["alice".into(), "bob".into()],
+                as_heard: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ));
+
+    assert!(
+        !rig.harness
+            .service
+            .drop_held_copy(&held, &["alice".to_string()])
+            .await,
+        "it is Bob's too"
+    );
+    assert!(Path::new(&placement.path).is_file());
+    assert_eq!(rig.library.by_tags.lock().len(), 1);
+
+    assert!(
+        rig.harness
+            .service
+            .drop_held_copy(&held, &["Alice".to_string(), "bob".to_string()])
+            .await
+    );
+    assert!(!Path::new(&placement.path).exists());
+    assert!(!lyrics.exists());
+    assert!(rig.library.by_tags.lock().is_empty(), "its record went");
+}

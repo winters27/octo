@@ -1,17 +1,20 @@
 //! `lidarr-pending.json`: the albums Octo asked Lidarr for, each with the follow of its search.
 //! An entry is saved before anything is sent to Lidarr and holds everything a restart needs: the
-//! put-back facts, every person's gate, Octo's own downloads on their watch list, and the files
-//! Octo holds back from the library while the follow is open. An album nobody listed here is the
-//! Lidarr owner's own and is left alone.
+//! put-back facts, every person's gate for each song, Octo's own downloads on their watch list,
+//! the album's tracks Octo holds in its hold folder until the hearted song passes, and the files
+//! Octo holds back from the library while the follow is open. An entry ends only on work: its
+//! follow or its put-back ends, never its age. An album nobody listed here is the Lidarr owner's
+//! own and is left alone.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use octo_core::common::dotnet;
-use octo_core::fingerprint::heart_gate::HeartGate;
+use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeartGate};
+use octo_core::lidarr::LidarrImportedTrack;
 use octo_core::lidarr::lidarr_client::LidarrReleaseChoice;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -20,10 +23,6 @@ use tracing::warn;
 
 use crate::services::library::navidrome_song_path_resolver::{get_full_path, is_inside};
 use crate::services::state_file;
-
-/// How long an album with nothing to put back and no gate stays listed after Octo asked for it.
-/// An entry holding a gate or anything to put back ends only on work.
-pub const KEPT_FOR: TimeDelta = TimeDelta::days(14);
 
 /// The downloads line of a file held back from the library while a follow is open.
 pub const HELD_FOR_LIDARR: &str =
@@ -87,8 +86,16 @@ pub struct PendingAlbum {
     /// The people whose heart is on the album: once every one of them took it back, the follow
     /// ends.
     pub holders: Vec<String>,
-    /// Each person's gate, one per person; a heart that joins later keeps the first one's.
-    pub gates: Vec<HeartGate>,
+    /// Each person's gate for each song, one per song and person; a heart that joins later keeps
+    /// the first one's.
+    pub gates: Vec<SongGate>,
+    /// The album's tracks of Octo's own import, moved into its hold folder and their Lidarr
+    /// records deleted, waiting until a hearted song passes its gate.
+    pub held_tracks: Vec<HeldTrack>,
+    /// The hearted songs whose file passed its gate, as `provider:id`.
+    pub passed: Vec<String>,
+    /// Whether Lidarr wrote its own tags into what it imported, read once for the follow.
+    pub writes_audio_tags: Option<bool>,
     /// The track files the follow handed to the download pipeline.
     pub files_handed: Vec<i32>,
     /// Octo's own downloads, each on the watch list until it is accounted for.
@@ -152,6 +159,9 @@ impl Default for PendingAlbum {
             songs: Vec::new(),
             holders: Vec::new(),
             gates: Vec::new(),
+            held_tracks: Vec::new(),
+            passed: Vec::new(),
+            writes_audio_tags: None,
             files_handed: Vec::new(),
             grabs: Vec::new(),
             research_commands: Vec::new(),
@@ -214,23 +224,21 @@ impl PendingAlbum {
             .find(|grab| dotnet::eq_ignore_case(&grab.download_id, download_id))
     }
 
-    /// Whether the entry must be kept until work ends it: it holds a gate, or something to put
-    /// back, or a search to follow.
-    fn holds_work(&self) -> bool {
-        !self.gates.is_empty()
-            || self.add.is_some()
-            || self.album_added
-            || self.artist_added > 0
-            || self.release_choice.is_some()
-            || self.searched()
-            || !self.grab_ids.is_empty()
+    /// The gates of one song, as `provider:id`, one per person.
+    pub fn gates_of(&self, song: &str) -> Vec<HeartGate> {
+        self.gates
+            .iter()
+            .filter(|gate| gate.song == song)
+            .map(|gate| gate.gate.clone())
+            .collect()
     }
 
     /// Takes in what another save of the same album says: the union of the people, their gates
-    /// (a person already listed keeps their first gate), the songs, the files and tracks Lidarr
-    /// had before, and every recorded download; the put-back facts as the earliest save had them,
-    /// filled in where it had none. So a second heart never makes Octo's album look like the
-    /// user's, and never drops the first heart's gate.
+    /// (a person already listed for a song keeps their first gate for it), the songs, the files
+    /// and tracks Lidarr had before, the tracks held and the songs passed, and every recorded
+    /// download; the put-back facts as the earliest save had them, filled in where it had none.
+    /// So a second heart never makes Octo's album look like the user's, and never drops the first
+    /// heart's gate.
     pub fn merge(&mut self, other: PendingAlbum) {
         fn union<T: PartialEq>(into: &mut Vec<T>, from: Vec<T>) {
             for item in from {
@@ -317,14 +325,21 @@ impl PendingAlbum {
         }
         union(&mut self.files_handed, other.files_handed);
         for gate in other.gates {
-            if !self
-                .gates
-                .iter()
-                .any(|known| dotnet::eq_ignore_case(known.user.trim(), gate.user.trim()))
-            {
+            if !self.gates.iter().any(|known| known.same_person(&gate)) {
                 self.gates.push(gate);
             }
         }
+        for track in other.held_tracks {
+            if !self
+                .held_tracks
+                .iter()
+                .any(|known| known.track_file_id == track.track_file_id)
+            {
+                self.held_tracks.push(track);
+            }
+        }
+        union(&mut self.passed, other.passed);
+        self.writes_audio_tags = self.writes_audio_tags.or(other.writes_audio_tags);
         union(&mut self.research_commands, other.research_commands);
         for item in other.pending_items {
             if !self
@@ -372,6 +387,80 @@ impl Default for PendingAdd {
             foreign_artist_id: String::new(),
             posted_at: Utc::now(),
             artists_before: Vec::new(),
+        }
+    }
+}
+
+/// One person's gate for one song of the album: every file Lidarr imports as that song is judged
+/// against it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SongGate {
+    /// The song, as `provider:id`.
+    pub song: String,
+    /// The song's catalog title and artist: which imported tracks may be it.
+    pub title: String,
+    pub artist: String,
+    pub gate: HeartGate,
+}
+
+impl SongGate {
+    /// Whether two gates are one person's for one song.
+    pub fn same_person(&self, other: &SongGate) -> bool {
+        self.song == other.song && dotnet::eq_ignore_case(self.gate.user.trim(), other.gate.user.trim())
+    }
+
+    /// Whether the gate is a heart's or a play's: such a song's file is proven by its own sound
+    /// before anything of the album lands.
+    pub fn personal(&self) -> bool {
+        matches!(
+            self.gate.origin,
+            AcquisitionOrigin::Heart | AcquisitionOrigin::Play
+        )
+    }
+}
+
+/// One track of Octo's own import, moved into the album's hold folder (its Lidarr record deleted)
+/// until a hearted song passes its gate: then it goes on to the library as one of the album's
+/// tracks, or is deleted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct HeldTrack {
+    pub track_file_id: i32,
+    pub track_id: i32,
+    /// The album Lidarr imported it into, which may be another album of the artist.
+    pub album_id: i32,
+    pub title: String,
+    pub artist: Option<String>,
+    pub number: Option<i32>,
+    pub seconds: Option<i32>,
+    pub quality: Option<String>,
+    /// The recording Lidarr matched it to: it only orders candidates, it never proves one.
+    pub recording: Option<String>,
+    /// Where it waits, in the hold folder.
+    pub path: String,
+    /// The download's own file as delivered, when Octo can read it: where its labels come from.
+    pub dropped: Option<String>,
+    /// The hearted songs whose gate refused it.
+    pub refused_for: Vec<String>,
+}
+
+impl HeldTrack {
+    /// The track as Lidarr listed it, at the path it waits at, with no track file record: Octo
+    /// deleted that record when it moved the file.
+    pub fn imported(&self) -> LidarrImportedTrack {
+        LidarrImportedTrack {
+            id: self.track_id,
+            title: self.title.clone(),
+            track_number: self.number,
+            duration_seconds: self.seconds,
+            has_file: true,
+            path: Some(self.path.clone()),
+            size_bytes: 0,
+            artist: self.artist.clone(),
+            track_file_id: 0,
+            quality: self.quality.clone(),
+            foreign_recording_id: self.recording.clone(),
         }
     }
 }
@@ -533,18 +622,13 @@ impl LidarrPendingAlbums {
                 listed.albums.insert(key(&album.foreign_album_id), album);
             }
         }
-        Self::drop_old(&mut listed.albums, Utc::now());
         self.save(&listed);
     }
 
-    /// The listed album, when it holds work or was asked for within [`KEPT_FOR`].
+    /// The listed album, however long ago it was asked for: an entry ends only when its follow or
+    /// its put-back forgets it.
     pub fn get(&self, foreign_album_id: &str) -> Option<PendingAlbum> {
-        let listed = self.listed.lock();
-        listed
-            .albums
-            .get(&key(foreign_album_id))
-            .filter(|album| album.holds_work() || Utc::now() - album.asked_at <= KEPT_FOR)
-            .cloned()
+        self.listed.lock().albums.get(&key(foreign_album_id)).cloned()
     }
 
     /// Changes the listed album in place and saves; false when it is not listed.
@@ -662,8 +746,10 @@ impl LidarrPendingAlbums {
         ended
     }
 
-    /// `user` took their heart on `song` back: they leave every open follow of it, and a follow
-    /// nobody's heart is on any more is asked to end. The follows asked to end.
+    /// `user` took their heart on `song` back: they leave every open follow of it (their gate for
+    /// that song goes, and they stop holding the album unless their gate for another of its songs
+    /// is still there), and a follow nobody's heart is on any more is asked to end. The follows
+    /// asked to end.
     pub fn unhearted(&self, song: &str, user: &str) -> Vec<String> {
         let ending: Vec<String> = {
             let mut listed = self.listed.lock();
@@ -673,12 +759,17 @@ impl LidarrPendingAlbums {
                     continue;
                 }
                 let before = album.holders.len();
-                album
-                    .holders
-                    .retain(|holder| !dotnet::eq_ignore_case(holder.trim(), user.trim()));
-                album
+                let theirs = |gate: &SongGate| dotnet::eq_ignore_case(gate.gate.user.trim(), user.trim());
+                album.gates.retain(|gate| !(gate.song == song && theirs(gate)));
+                if !album
                     .gates
-                    .retain(|gate| !dotnet::eq_ignore_case(gate.user.trim(), user.trim()));
+                    .iter()
+                    .any(|gate| theirs(gate) && gate.gate.origin == AcquisitionOrigin::Heart)
+                {
+                    album
+                        .holders
+                        .retain(|holder| !dotnet::eq_ignore_case(holder.trim(), user.trim()));
+                }
                 if before > 0 && album.holders.is_empty() {
                     album.ended = Some(FollowEnd::Unhearted);
                     ending.push(album.foreign_album_id.clone());
@@ -824,8 +915,12 @@ impl LidarrPendingAlbums {
         self.save(&listed);
     }
 
-    fn drop_old(albums: &mut IndexMap<String, PendingAlbum>, now: DateTime<Utc>) {
-        albums.retain(|_, album| album.holds_work() || now - album.asked_at <= KEPT_FOR);
+    /// Takes the file held at `held_path` off the list, without placing it: a proven copy of its
+    /// song replaced it.
+    pub fn unhold(&self, held_path: &str) {
+        let mut listed = self.listed.lock();
+        listed.held.retain(|known| known.held_path != held_path);
+        self.save(&listed);
     }
 
     fn save(&self, listed: &Listed) {
@@ -848,7 +943,8 @@ impl LidarrPendingAlbums {
 
 #[cfg(test)]
 mod tests {
-    use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeardReading};
+    use chrono::TimeDelta;
+    use octo_core::fingerprint::heart_gate::HeardReading;
 
     use super::*;
 
@@ -865,7 +961,7 @@ mod tests {
         }
     }
 
-    fn gate(user: &str) -> HeartGate {
+    fn heart_gate(user: &str) -> HeartGate {
         HeartGate {
             user: user.into(),
             origin: AcquisitionOrigin::Heart,
@@ -875,6 +971,19 @@ mod tests {
             reading: HeardReading::NotHeard,
             stand_in: None,
         }
+    }
+
+    fn song_gate(song: &str, user: &str) -> SongGate {
+        SongGate {
+            song: song.into(),
+            title: "Teardrop".into(),
+            artist: "Massive Attack".into(),
+            gate: heart_gate(user),
+        }
+    }
+
+    fn gate(user: &str) -> SongGate {
+        song_gate("soulseek:teardrop", user)
     }
 
     #[test]
@@ -893,21 +1002,15 @@ mod tests {
         assert!(LidarrPendingAlbums::new(Some(path)).get("rg-abc").is_none());
     }
 
-    #[test]
-    fn an_album_asked_for_too_long_ago_is_no_longer_pending() {
-        let pending = LidarrPendingAlbums::new(None);
-        pending.remember(album("old", Utc::now() - KEPT_FOR - TimeDelta::hours(1)));
-        pending.remember(album("new", Utc::now()));
-
-        assert!(pending.get("old").is_none());
-        assert!(pending.get("new").is_some());
-    }
-
-    /// An entry holding a gate, or anything to put back, ends only on work: never on its age.
+    /// An entry ends only on work, never on its age: one asked for 44 days ago, holding a gate,
+    /// put-back facts, a search or nothing at all, is listed across a restart until its follow or
+    /// its put-back forgets it.
     #[test]
     fn an_entry_holding_a_gate_or_put_back_facts_outlives_fourteen_days() {
-        let pending = LidarrPendingAlbums::new(None);
-        let old = Utc::now() - KEPT_FOR - TimeDelta::days(30);
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("lidarr-pending.json");
+        let pending = LidarrPendingAlbums::new(Some(path.clone()));
+        let old = Utc::now() - TimeDelta::days(44);
         pending.remember(PendingAlbum {
             gates: vec![gate("alice")],
             ..album("gated", old)
@@ -921,11 +1024,96 @@ mod tests {
             ..album("searched", old)
         });
         pending.remember(album("plain", old));
+        // Another save, which used to drop what was old, drops nothing.
+        pending.remember(album("new", Utc::now()));
 
-        assert!(pending.get("gated").is_some());
-        assert!(pending.get("added").is_some());
-        assert!(pending.get("searched").is_some());
-        assert!(pending.get("plain").is_none());
+        let reloaded = LidarrPendingAlbums::new(Some(path));
+        for id in ["gated", "added", "searched", "plain", "new"] {
+            assert!(reloaded.get(id).is_some(), "{id} is still listed");
+        }
+        reloaded.forget("plain");
+        assert!(reloaded.get("plain").is_none(), "work ends it");
+    }
+
+    /// One person hearting two songs of one album keeps a gate for each, and taking one heart
+    /// back leaves the other's gate and keeps them holding the album.
+    #[test]
+    fn one_person_keeps_a_gate_per_song_and_unhearting_one_keeps_the_other() {
+        let pending = LidarrPendingAlbums::new(None);
+        pending.remember(PendingAlbum {
+            search_command: 3,
+            songs: vec!["soulseek:teardrop".into(), "soulseek:angel".into()],
+            holders: vec!["alice".into()],
+            gates: vec![gate("alice")],
+            ..album("rg-abc", Utc::now())
+        });
+        pending.remember(PendingAlbum {
+            gates: vec![song_gate("soulseek:angel", "ALICE"), gate("alice")],
+            ..PendingAlbum {
+                foreign_album_id: "rg-abc".into(),
+                ..Default::default()
+            }
+        });
+        let entry = pending.get("rg-abc").expect("listed");
+        assert_eq!(entry.gates.len(), 2);
+        assert_eq!(entry.gates_of("soulseek:angel").len(), 1);
+
+        assert!(pending.unhearted("soulseek:teardrop", "alice").is_empty());
+        let entry = pending.get("rg-abc").expect("listed");
+        assert!(entry.gates_of("soulseek:teardrop").is_empty());
+        assert_eq!(entry.gates_of("soulseek:angel").len(), 1);
+        assert_eq!(entry.holders, ["alice"]);
+        assert!(entry.following());
+
+        assert_eq!(pending.unhearted("soulseek:angel", "alice"), ["rg-abc"]);
+        assert_eq!(
+            pending.get("rg-abc").expect("listed").ended,
+            Some(FollowEnd::Unhearted)
+        );
+    }
+
+    /// The tracks held for an album and the songs that passed survive a restart and merge.
+    #[test]
+    fn held_tracks_and_passed_songs_survive_a_restart_and_merge() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("lidarr-pending.json");
+        let pending = LidarrPendingAlbums::new(Some(path.clone()));
+        let held = |file: i32, title: &str| HeldTrack {
+            track_file_id: file,
+            title: title.into(),
+            path: format!("/music/.octo-incoming/lidarr-held/rg-abc/{title}.flac"),
+            ..Default::default()
+        };
+        pending.remember(PendingAlbum {
+            held_tracks: vec![held(100, "Angel")],
+            ..album("rg-abc", Utc::now())
+        });
+        pending.remember(PendingAlbum {
+            held_tracks: vec![held(100, "Angel"), held(101, "Teardrop")],
+            passed: vec!["soulseek:teardrop".into()],
+            writes_audio_tags: Some(false),
+            ..PendingAlbum {
+                foreign_album_id: "RG-ABC".into(),
+                ..Default::default()
+            }
+        });
+
+        let entry = LidarrPendingAlbums::new(Some(path))
+            .get("rg-abc")
+            .expect("listed");
+        assert_eq!(
+            entry
+                .held_tracks
+                .iter()
+                .map(|track| track.track_file_id)
+                .collect::<Vec<_>>(),
+            [100, 101]
+        );
+        assert_eq!(entry.passed, ["soulseek:teardrop"]);
+        assert_eq!(entry.writes_audio_tags, Some(false));
+        let teardrop = entry.held_tracks[1].imported();
+        assert_eq!(teardrop.path.as_deref(), Some(entry.held_tracks[1].path.as_str()));
+        assert_eq!(teardrop.track_file_id, 0, "its record went when it was moved");
     }
 
     /// Everything a pick saves before and around its add, its pin and its search survives a
@@ -1012,7 +1200,7 @@ mod tests {
         pending.remember(first);
 
         let mut alices_again = gate("alice");
-        alices_again.reading = HeardReading::AnotherSong;
+        alices_again.gate.reading = HeardReading::AnotherSong;
         pending.remember(PendingAlbum {
             songs: vec!["soulseek:angel".into(), "soulseek:teardrop".into()],
             gates: vec![alices_again, gate("bob")],
@@ -1031,7 +1219,7 @@ mod tests {
             merged
                 .gates
                 .iter()
-                .map(|gate| (gate.user.as_str(), gate.reading.clone()))
+                .map(|gate| (gate.gate.user.as_str(), gate.gate.reading.clone()))
                 .collect::<Vec<_>>(),
             [("alice", HeardReading::NotHeard), ("bob", HeardReading::NotHeard)]
         );

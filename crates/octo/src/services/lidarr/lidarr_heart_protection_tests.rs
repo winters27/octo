@@ -51,16 +51,76 @@ use crate::services::metadata::{DeezerRateLimitHandler, DeezerRateLimiter};
 /// One file the pipeline took: its id, its song's title, and whether it landed quietly.
 type Taken = Arc<Mutex<Vec<(String, String, bool)>>>;
 
+/// What the pipeline was asked to judge a file as: the song's title, the offered file's name
+/// without its extension, why the acquisition ran, whose gates judged it, and where the file's
+/// labels are read from.
+#[derive(Debug, Clone, PartialEq)]
+struct Asked {
+    title: String,
+    file: String,
+    origin: Option<AcquisitionOrigin>,
+    users: Vec<String>,
+    labels: Option<LabelSource>,
+}
+
 /// The pipeline as far as Lidarr's files go: take the offered file, or refuse it the way
-/// AcoustID refuses a wrong recording, which leaves it where Lidarr put it. A file a follow held
-/// back is placed at its target, and recorded.
+/// AcoustID refuses a wrong recording, which leaves it where Lidarr put it (or where Octo holds it).
+/// A file a hearted song's gates judge is accepted for each of them, refused when its title is in
+/// `refused_for_hearts`, and waits in the one hold path when its title is in `holding`. A file a
+/// follow held back is placed at its target, and recorded; a kept copy dropped for a proven one is
+/// deleted, and recorded.
 struct Pipeline {
     root: std::path::PathBuf,
     ids: Arc<ExternalIdRegistry>,
     imports: Arc<LidarrImportHandoff>,
     refused: Arc<Mutex<HashSet<String>>>,
+    refused_for_hearts: Arc<Mutex<HashSet<String>>>,
+    holding: Arc<Mutex<HashSet<String>>>,
     taken: Taken,
+    asked: Arc<Mutex<Vec<Asked>>>,
     placed: Arc<Mutex<Vec<HeldPlacement>>>,
+    dropped: Arc<Mutex<Vec<(HeldPlacement, Vec<String>)>>>,
+}
+
+impl Pipeline {
+    fn title_of(&self, id: &str) -> String {
+        self.ids
+            .lookup(id)
+            .and_then(|r| r.snapshot().title)
+            .unwrap_or_else(|| id.to_string())
+    }
+
+    /// The offered file's name without its extension, and where its labels are read from, the
+    /// offer left in place.
+    fn offered(&self, id: &str) -> (String, Option<LabelSource>) {
+        let Some(import) = self.imports.take(id) else {
+            return (String::new(), None);
+        };
+        let file = Path::new(&import.path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let labels = import.labels.clone();
+        self.imports.offer_import(id, import);
+        (file, Some(labels))
+    }
+
+    /// Takes the offered file into the library, or refuses it as AcoustID refuses a wrong
+    /// recording, leaving it where it was.
+    fn take_offered(&self, id: &str) -> anyhow::Result<String> {
+        let title = self.title_of(id);
+        if self.refused.lock().contains(&title) {
+            anyhow::bail!("AcoustID identified Lidarr's file as a live recording");
+        }
+        let import = self
+            .imports
+            .take(id)
+            .ok_or_else(|| anyhow::anyhow!("nothing offered for {id}"))?;
+        let placed = self.root.join(format!("Massive Attack - {title}.flac"));
+        std::fs::rename(&import.path, &placed)?;
+        self.taken.lock().push((id.to_string(), title, import.quiet));
+        Ok(placed.to_string_lossy().into_owned())
+    }
 }
 
 #[async_trait]
@@ -104,22 +164,98 @@ impl IDownloadService for Pipeline {
             ("soulseek", false, true, Some(DownloadSource::Lidarr), false)
         );
         assert!(replacement.is_none());
-        let title = self
-            .ids
-            .lookup(id)
-            .and_then(|r| r.snapshot().title)
-            .unwrap_or_else(|| id.to_string());
-        if self.refused.lock().contains(&title) {
-            anyhow::bail!("AcoustID identified Lidarr's file as a live recording");
+        let title = self.title_of(id);
+        let (file, labels) = self.offered(id);
+        self.asked.lock().push(Asked {
+            title,
+            file,
+            origin: None,
+            users: Vec::new(),
+            labels,
+        });
+        self.take_offered(id)
+    }
+
+    async fn execute_acquisition_to(
+        &self,
+        provider: &str,
+        id: &str,
+        trigger_album_download: bool,
+        force_permanent: bool,
+        source_override: Option<DownloadSource>,
+        token: &CancellationToken,
+        requested_by: Option<Vec<String>>,
+        upgrade_search: bool,
+        replacement: Option<Arc<ReplacementHandoff>>,
+        place: crate::services::common::AcquisitionPlace,
+    ) -> anyhow::Result<String> {
+        assert_eq!(
+            (
+                provider,
+                trigger_album_download,
+                force_permanent,
+                source_override,
+                upgrade_search
+            ),
+            ("soulseek", false, true, Some(DownloadSource::Lidarr), false)
+        );
+        assert!(replacement.is_none());
+        let _ = (token, requested_by);
+        let title = self.title_of(id);
+        let (file, labels) = self.offered(id);
+        self.asked.lock().push(Asked {
+            title: title.clone(),
+            file: file.clone(),
+            origin: place.origin,
+            users: place.gates.iter().map(|gate| gate.user.clone()).collect(),
+            labels,
+        });
+        // The file judged is the one offered: a take of the song is refused by its own name.
+        let named = |set: &HashSet<String>| set.iter().any(|title| file.ends_with(&format!(" - {title}")));
+        if !place.gates.is_empty() {
+            if named(&self.refused_for_hearts.lock()) {
+                for gate in &place.gates {
+                    place.ledger.record(
+                        &gate.user,
+                        gate.origin,
+                        crate::services::common::GateOutcome::NotAccepted("not the version heard".into()),
+                    );
+                }
+                anyhow::bail!("Lidarr's file for '{title}' is not kept: it does not sound like what played");
+            }
+            if named(&self.holding.lock()) {
+                let import = self
+                    .imports
+                    .take(id)
+                    .ok_or_else(|| anyhow::anyhow!("nothing offered for {id}"))?;
+                let folder = self.root.join(".octo-incoming/held/Track_soulseek_held");
+                std::fs::create_dir_all(&folder)?;
+                let held = folder.join(format!("{title}.flac"));
+                std::fs::rename(&import.path, &held)?;
+                return Err(crate::services::common::AcquisitionHeld {
+                    waiting_for: octo_core::fingerprint::heart_gate::WaitingFor::AcoustId,
+                    line: "Waiting for AcoustID".into(),
+                    files: vec![held.to_string_lossy().into_owned()],
+                    users: place.gates.iter().map(|gate| gate.user.clone()).collect(),
+                }
+                .into());
+            }
         }
-        let import = self
-            .imports
-            .take(id)
-            .ok_or_else(|| anyhow::anyhow!("nothing offered for {id}"))?;
-        let placed = self.root.join(format!("Massive Attack - {title}.flac"));
-        std::fs::rename(&import.path, &placed)?;
-        self.taken.lock().push((id.to_string(), title, import.quiet));
-        Ok(placed.to_string_lossy().into_owned())
+        let landed = self.take_offered(id)?;
+        for gate in &place.gates {
+            place.ledger.record_accepted(
+                &gate.user,
+                gate.origin,
+                octo_core::fingerprint::heart_gate::Acceptance::Sound,
+            );
+        }
+        Ok(landed)
+    }
+
+    async fn drop_held(&self, held: &HeldPlacement, users: &[String]) -> bool {
+        let _ = std::fs::remove_file(&held.held_path);
+        self.dropped.lock().push((held.clone(), users.to_vec()));
+        true
     }
 
     async fn download_album_with_source(
@@ -176,13 +312,21 @@ struct Fixture {
     imports: Arc<LidarrImportHandoff>,
     ids: Arc<ExternalIdRegistry>,
     refused: Arc<Mutex<HashSet<String>>>,
+    /// Titles whose file a hearted song's gates refuse.
+    refused_for_hearts: Arc<Mutex<HashSet<String>>>,
+    /// Titles whose file a hearted song's gates hold for AcoustID.
+    holding: Arc<Mutex<HashSet<String>>>,
     taken: Taken,
+    /// Every file the pipeline was asked to judge, in order.
+    asked: Arc<Mutex<Vec<Asked>>>,
     owned: Arc<Mutex<Vec<Candidate>>>,
     pending: Arc<LidarrPendingAlbums>,
     metadata: Arc<FakeMetadata>,
     tracker: Arc<AcquisitionTracker>,
     /// The held files the pipeline placed.
     placed: Arc<Mutex<Vec<HeldPlacement>>>,
+    /// The kept copies the pipeline dropped for a proven one, and for whom.
+    dropped: Arc<Mutex<Vec<(HeldPlacement, Vec<String>)>>>,
 }
 
 /// How a test's service is built beyond the defaults.
@@ -239,12 +383,16 @@ impl Fixture {
             imports: Arc::new(LidarrImportHandoff::new()),
             ids: Arc::new(ExternalIdRegistry::in_memory()),
             refused: Arc::default(),
+            refused_for_hearts: Arc::default(),
+            holding: Arc::default(),
             taken: Arc::default(),
+            asked: Arc::default(),
             owned: Arc::default(),
             pending: Arc::new(LidarrPendingAlbums::new(None)),
             metadata: Arc::new(FakeMetadata::default()),
             tracker: Arc::new(AcquisitionTracker::new(None, Clock::system())),
             placed: Arc::default(),
+            dropped: Arc::default(),
         }
     }
 
@@ -360,8 +508,12 @@ impl Fixture {
             ids: self.ids.clone(),
             imports: self.imports.clone(),
             refused: self.refused.clone(),
+            refused_for_hearts: self.refused_for_hearts.clone(),
+            holding: self.holding.clone(),
             taken: self.taken.clone(),
+            asked: self.asked.clone(),
             placed: self.placed.clone(),
+            dropped: self.dropped.clone(),
         });
         let client = Arc::new(LidarrClient::new(settings.clone()));
         client.set_metadata_poll(Duration::from_millis(20));
@@ -849,7 +1001,6 @@ async fn a_heart_waits_for_an_upgrade_on_the_album() {
     f.grabs_at_once("dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
     f.claims.upgrade_started(ALBUM_ID);
     let service = f.service(None, 30);
-    service.set_claim_poll(Duration::from_millis(10));
 
     let heart = {
         let service = service.clone();
@@ -921,6 +1072,7 @@ fn relative_paths_and_imported_path_edge_cases() {
 
 // ---- Lidarr's webhook ------------------------------------------------------------------------
 
+/// Lidarr's webhook for an import of Octo's download `dl-1`, delivered by its client.
 fn imported(paths: &[&str]) -> LidarrImportEvent {
     LidarrImportEvent {
         foreign_album_id: ALBUM_ID.into(),
@@ -928,6 +1080,8 @@ fn imported(paths: &[&str]) -> LidarrImportEvent {
         album: Some("Mezzanine".into()),
         paths: paths.iter().map(|p| p.to_string()).collect(),
         is_upgrade: false,
+        download_id: Some("dl-1".into()),
+        download_client: Some("qBittorrent".into()),
     }
 }
 
@@ -1101,6 +1255,7 @@ async fn the_owners_own_file_arriving_during_a_follow_is_left_alone_and_octo_ste
     let angel = f.lidarr.upgrade(1, "Angel", "FLAC");
     let mut event = imported(&[ANGEL]);
     event.is_upgrade = true;
+    event.download_id = Some("owners-own".into());
     assert_eq!(service.lidarr_imported(event).await, LidarrImportOutcome::NotOurs);
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1144,7 +1299,6 @@ async fn a_late_import_while_the_album_is_busy_is_taken_once_it_is_free() {
     f.lidarr.refresh();
 
     let restarted = f.service(None, 1);
-    restarted.set_claim_poll(Duration::from_millis(20));
     f.claims.upgrade_started(ALBUM_ID);
     assert_eq!(
         restarted.lidarr_imported(imported(&[ANGEL, TEARDROP])).await,
@@ -1736,3 +1890,9 @@ async fn an_artist_octo_used_before_whose_records_octo_deleted_is_used_again() {
 
 #[path = "lidarr_follow_tests.rs"]
 mod follow;
+
+#[path = "lidarr_hold_folder_tests.rs"]
+mod hold_folder;
+
+#[path = "lidarr_health_tests.rs"]
+mod health;

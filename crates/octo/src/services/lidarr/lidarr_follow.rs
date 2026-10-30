@@ -27,7 +27,8 @@
 //!   of another source for the artist, a kept copy with a download that makes no progress, the
 //!   person's "Stop waiting for Lidarr", every heart taken back), or when every download is
 //!   accounted for. Octo then removes its items, places the files it held back, and once the
-//!   watch list is empty puts the pick back, unless the song landed.
+//!   watch list is empty and no search of the album is queued or running puts the pick back,
+//!   unless the song landed.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -49,7 +50,7 @@ use crate::services::common::acquisition_tracker::acquisition_event_kinds;
 use crate::services::lidarr::lidarr_pending_albums::{
     FollowEnd, FollowedItem, HeldPlacement, PROVEN_ELSEWHERE, PendingAlbum, REPLACED_YOURS,
 };
-use crate::services::lidarr::lidarr_pick::{put_back_unsearched, retry_moved_records};
+use crate::services::lidarr::lidarr_pick::{put_back_searched, restore_after_landing, retry_moved_records};
 
 /// The commands inside which Lidarr writes a file and its row, holding its disk lock.
 const IMPORT_COMMANDS: [&str; 3] = [
@@ -306,7 +307,14 @@ impl Inner {
             let Some(entry) = self.pending.get(&run.key) else {
                 return Ok(Next::Finish);
             };
-            let accounted = entry.watched().next().is_none() && entry.pending_items.is_empty();
+            // Nothing is put back while a search of the album is queued or running: what it grabs
+            // in a window of Octo's is followed and removed like any grab of Octo's.
+            let searching = reading.commands.iter().any(|command| {
+                command.is_active()
+                    && command.name == "AlbumSearch"
+                    && command.album_ids().contains(&run.album_id)
+            });
+            let accounted = entry.watched().next().is_none() && entry.pending_items.is_empty() && !searching;
             if accounted && (run.quiet || why == FollowEnd::Done) {
                 return Ok(Next::Finish);
             }
@@ -711,6 +719,8 @@ impl Inner {
         }
 
         let octo_root = self.music.octo_root();
+        let gated = job.gated();
+        let mut held_any = false;
         let mut tracks: HashMap<i32, Vec<LidarrImportedTrack>> = HashMap::new();
         for file in mine {
             if entry.files_handed.contains(&file.id) {
@@ -760,9 +770,31 @@ impl Inner {
                     file.album_id, run.key
                 );
             }
-            if let Some(handoff) = self.take_import(job, &track, imported_path).await {
+            let dropped = rows
+                .get(&file.id)
+                .and_then(|row| row.dropped_path())
+                .and_then(|dropped| self.delivered(dropped, settings));
+            if gated {
+                // A hearted song's album: every track waits in the hold folder until one passes.
+                if self
+                    .hold_track(&run.key, &track, file.album_id, &imported_path, dropped)
+                    .await
+                {
+                    held_any = true;
+                }
+                continue;
+            }
+            let labels = self.labels(&run.key, dropped).await;
+            if let Some(handoff) = self.take_import(job, &track, imported_path, labels, true).await {
                 run.handed.push(handoff);
             }
+        }
+        if held_any {
+            run.handed.push(tokio::spawn(self.clone().settle(
+                job.clone(),
+                run.key.clone(),
+                false,
+            )));
         }
         Ok(())
     }
@@ -1066,13 +1098,15 @@ impl Inner {
         }
     }
 
-    /// The follow is over: the pipeline's work waited for, the pick put back unless its song
-    /// landed, and the hearts still waiting told.
-    async fn finish_follow(&self, job: &Arc<AlbumJob>, run: FollowRun) {
+    /// The follow is over: the pipeline's work waited for, the album's hold folder settled for the
+    /// last time (its tracks handed on when a hearted song passed, else deleted), the pick put back
+    /// unless its song landed (the pin restored either way), and the hearts still waiting told.
+    async fn finish_follow(self: &Arc<Self>, job: &Arc<AlbumJob>, run: FollowRun) {
         for handoff in run.handed {
             let _ = handoff.await;
         }
         let key = run.key;
+        self.clone().settle(job.clone(), key.clone(), true).await;
         let landed_titles = job
             .landed
             .lock()
@@ -1084,11 +1118,26 @@ impl Inner {
                 self.let_go(&key, entry.ended.unwrap_or(FollowEnd::Done)).await;
             }
             let entry = self.pending.get(&key).unwrap_or(entry);
-            if entry.ended == Some(FollowEnd::Done) && landed_titles > 0 {
-                self.pending.forget(&key);
+            *job.no_grab.lock() = entry.ended == Some(FollowEnd::NoGrab);
+            let poll = self.poll(&self.settings.current().lidarr);
+            // A hearted song passed before a restart counts as landed as much as one passed now.
+            if entry.ended == Some(FollowEnd::Done) && (landed_titles > 0 || !entry.passed.is_empty()) {
+                match restore_after_landing(&self.client, &self.pending, &entry, poll).await {
+                    Ok(()) => {
+                        info!("Octo's import of Lidarr's album {key} landed; its release choice is as it was")
+                    }
+                    Err(e) => warn!("Could not give Lidarr's album {key} its release choice back: {e}"),
+                }
             } else {
-                let poll = self.poll(&self.settings.current().lidarr);
-                match put_back_unsearched(&self.client, Some(self.pending.as_ref()), &entry, poll).await {
+                match put_back_searched(
+                    &self.client,
+                    Some(self.pending.as_ref()),
+                    &self.music,
+                    &entry,
+                    poll,
+                )
+                .await
+                {
                     Ok(()) => info!("Put back Lidarr's album {key} once Octo's downloads were accounted for"),
                     Err(e) => warn!("Could not put back Lidarr's album {key}: {e}"),
                 }

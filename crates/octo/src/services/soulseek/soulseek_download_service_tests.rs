@@ -2036,6 +2036,130 @@ async fn a_lidarr_fetched_file_the_preview_calls_another_song_is_removed_and_ref
     assert_eq!(placed_flacs(&root), 0);
 }
 
+/// Runs the song's acquisition through Lidarr's fetcher for `place`'s origin, gates and deny.
+async fn through_lidarr(
+    walk: &Walk,
+    place: crate::services::common::AcquisitionPlace,
+) -> anyhow::Result<String> {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        walk.service.execute_acquisition_to(
+            "soulseek",
+            walk.songs[3].external_id.as_deref().expect("an id"),
+            false,
+            true,
+            Some(DownloadSource::Lidarr),
+            &CancellationToken::new(),
+            None,
+            false,
+            None,
+            place,
+        ),
+    )
+    .await
+    .expect("within a minute")
+}
+
+/// A Find songs pick Lidarr fetched gets the pick's own Busy line, as a Soulseek one does: with
+/// AcoustID not answering, its file is thrown away and the pick ends "AcoustID is busy, try again".
+#[tokio::test]
+async fn a_find_songs_pick_lidarr_fetched_that_meets_a_busy_acoustid_ends_busy() {
+    let root = Root::new("octo-lidarr-pick-");
+    let Some((walk, fetcher)) = lidarr_walk(&root, "B").await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    walk.slskd.state.lock().lookup_by_video.insert(
+        String::new(),
+        json!({"status": "error", "error": {"code": 14, "message": "service unavailable"}}),
+    );
+
+    let busy = through_lidarr(
+        &walk,
+        crate::services::common::AcquisitionPlace {
+            origin: Some(AcquisitionOrigin::SongFinderPick),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("not kept");
+
+    let held = busy
+        .downcast_ref::<crate::services::common::AcquisitionHeld>()
+        .expect("ended at once");
+    assert_eq!(held.line, crate::services::common::song_finder::ACOUST_ID_BUSY);
+    assert!(held.files.is_empty(), "nothing waits anywhere");
+    let fetched = fetcher.fetched.lock().clone();
+    assert!(!std::path::Path::new(&fetched[0]).exists(), "{}", fetched[0]);
+    assert_eq!(placed_flacs(&root), 0);
+}
+
+/// A Find songs pick Lidarr fetched takes the pick's import rule: a file AcoustID's reading names
+/// as another recording is refused, though the shipped check would confirm it by its title.
+#[tokio::test]
+async fn a_find_songs_pick_lidarr_fetched_another_recording_by_its_reading_is_refused() {
+    let root = Root::new("octo-lidarr-pick-");
+    let Some((walk, _)) = lidarr_walk(&root, "B").await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    walk.slskd
+        .state
+        .lock()
+        .lookup_by_video
+        .insert(String::new(), answer_naming(&[("rec-remix", 12, "USCM51400099")]));
+
+    let refused = through_lidarr(
+        &walk,
+        crate::services::common::AcquisitionPlace {
+            origin: Some(AcquisitionOrigin::SongFinderPick),
+            gates: vec![HeartGate {
+                origin: AcquisitionOrigin::SongFinderPick,
+                ..import_gate(&["rec-started"])
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("refused");
+
+    assert!(refused.to_string().contains("another recording"), "{refused}");
+    assert_eq!(placed_flacs(&root), 0);
+}
+
+/// A Wrong song or Wrong version replacement Lidarr fetched is refused when AcoustID hears the
+/// original's recording in it again; a copy of another recording lands.
+#[tokio::test]
+async fn a_replacement_lidarr_fetched_refuses_its_originals_recording_again() {
+    let root = Root::new("octo-lidarr-deny-");
+    let Some((walk, _)) = lidarr_walk(&root, "B").await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    let replacing = || crate::services::common::AcquisitionPlace {
+        origin: Some(AcquisitionOrigin::Replacement),
+        deny: Some(crate::services::common::SoundDeny::Recordings(HeardRecording {
+            ids: vec!["rec-wrong".into()],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    walk.slskd
+        .state
+        .lock()
+        .lookup_by_video
+        .insert(String::new(), answer_naming(&[("rec-wrong", 20, "USCM51400077")]));
+    let refused = through_lidarr(&walk, replacing()).await;
+    assert!(refused.is_err(), "the original's recording again: {refused:?}");
+
+    walk.slskd.state.lock().lookup_by_video.insert(
+        String::new(),
+        answer_naming(&[("rec-started", 20, "USCM51400001")]),
+    );
+    let landed = through_lidarr(&walk, replacing()).await.expect("lands");
+    assert!(std::path::Path::new(&landed).is_file(), "{landed}");
+}
+
 #[tokio::test]
 async fn without_batches_the_file_is_found_by_name_the_old_way() {
     let root = Root::new("octo-attempts-");

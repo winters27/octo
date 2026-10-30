@@ -506,7 +506,13 @@ impl HeartAcquisitionCoordinator {
                 let (provider, external_id, requested_by) = owned3(provider, external_id, requested_by);
                 tokio::spawn(async move {
                     coordinator
-                        .hand_play_to_lidarr(&lidarr_key, &provider, &external_id, requested_by.as_deref())
+                        .hand_play_to_lidarr(
+                            &lidarr_key,
+                            &provider,
+                            &external_id,
+                            requested_by.as_deref(),
+                            &[],
+                        )
                         .await
                 });
             }
@@ -561,9 +567,16 @@ impl HeartAcquisitionCoordinator {
                 let lidarr = Arc::clone(&coordinator);
                 let (provider, external_id, requested_by) =
                     (provider.clone(), external_id.clone(), requested_by.clone());
+                let play_gates = gates.clone();
                 tokio::spawn(async move {
                     lidarr
-                        .hand_play_to_lidarr(&lidarr_key, &provider, &external_id, requested_by.as_deref())
+                        .hand_play_to_lidarr(
+                            &lidarr_key,
+                            &provider,
+                            &external_id,
+                            requested_by.as_deref(),
+                            &play_gates,
+                        )
                         .await
                 });
             }
@@ -826,12 +839,14 @@ impl HeartAcquisitionCoordinator {
         );
     }
 
+    /// A play's album through Lidarr, the played song's file judged by the play's own gate.
     async fn hand_play_to_lidarr(
         &self,
         key: &str,
         provider: &str,
         external_id: &str,
         requested_by: Option<&str>,
+        gates: &[HeartGate],
     ) {
         match self
             .lidarr
@@ -841,7 +856,7 @@ impl HeartAcquisitionCoordinator {
                 false,
                 requested_by,
                 AcquisitionOrigin::Play,
-                &[],
+                gates,
             )
             .await
         {
@@ -2793,13 +2808,30 @@ impl HeartAcquisitionCoordinator {
                 {
                     return Ok(TrackOutcome::HandedToLidarr);
                 }
-                // Lidarr last, and its walk got no answer: a heart holds until one comes, an
-                // import goes back on its trickle.
+                // Lidarr's file of the song waits in the one hold path for what its gate needs:
+                // the chain stops here and the hold resumes it, as for any source's held file.
+                if let Some(held) = self.lidarr.held_file(provider, external_id) {
+                    return Ok(self.hold_downloaded(
+                        provider,
+                        external_id,
+                        requested_by,
+                        origin,
+                        &holders,
+                        &held,
+                        filed,
+                    ));
+                }
+                // Lidarr last, and its walk got no answer or its indexers are failing: a heart
+                // holds until that changes, an import goes back on its trickle.
                 if is_last && let Some(busy) = self.lidarr.waits_on(provider, external_id) {
                     use crate::services::fingerprint::music_brainz_client::HeartBusy;
+                    use crate::services::lidarr::LidarrWaits;
                     let (waiting_for, question) = match busy {
-                        HeartBusy::MusicBrainz(question) => (WaitingFor::MusicBrainz, Some(question)),
-                        HeartBusy::Deezer => (WaitingFor::Deezer, None),
+                        LidarrWaits::Answer(HeartBusy::MusicBrainz(question)) => {
+                            (WaitingFor::MusicBrainz, Some(question))
+                        }
+                        LidarrWaits::Answer(HeartBusy::Deezer) => (WaitingFor::Deezer, None),
+                        LidarrWaits::Indexers => (WaitingFor::LidarrIndexers, None),
                     };
                     if files_hold(origin, waiting_for) {
                         self.file_hold(
