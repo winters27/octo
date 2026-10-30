@@ -159,6 +159,8 @@ pub(crate) struct FakeLidarr {
     pub album_calls: Mutex<Vec<LidarrCall>>,
     /// Why each call ran and how many gates it carried, track and album calls in order.
     pub origins: Mutex<Vec<(AcquisitionOrigin, usize)>>,
+    /// Every song's artist already has music in Lidarr, which is left alone.
+    pub left_alone: Mutex<bool>,
 }
 
 impl Default for FakeLidarr {
@@ -169,6 +171,7 @@ impl Default for FakeLidarr {
             track_calls: Mutex::new(Vec::new()),
             album_calls: Mutex::new(Vec::new()),
             origins: Mutex::new(Vec::new()),
+            left_alone: Mutex::new(false),
         }
     }
 }
@@ -250,6 +253,10 @@ impl ILidarrHeartAcquisitionService for FakeLidarr {
             requested_by.map(str::to_string),
         ));
         (self.album.lock())(provider, external_id, notify_failure)
+    }
+
+    fn left_alone(&self, _: &str, _: &str) -> bool {
+        *self.left_alone.lock()
     }
 }
 

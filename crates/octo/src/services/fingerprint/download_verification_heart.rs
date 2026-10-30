@@ -880,7 +880,7 @@ fn overlap(song: &HeartSong, rs: &[HeardRecording]) -> HeardRecording {
 
 /// The contexts a heart reads, in order: the person's most recent played one; else their most
 /// recent listed one; else every context, each catalog album once.
-fn pick_contexts(contexts: &[AlbumContext], user: &str) -> Vec<AlbumContext> {
+pub(crate) fn pick_contexts(contexts: &[AlbumContext], user: &str) -> Vec<AlbumContext> {
     let user = user.trim();
     let mine: Vec<&AlbumContext> = contexts
         .iter()
@@ -910,7 +910,7 @@ fn pick_contexts(contexts: &[AlbumContext], user: &str) -> Vec<AlbumContext> {
 
 /// The song as one album context lists it: its album, its place, its ISRC and its explicit value
 /// there, where the context knows them.
-fn song_in(song: &HeartSong, context: &AlbumContext) -> HeartSong {
+pub(crate) fn song_in(song: &HeartSong, context: &AlbumContext) -> HeartSong {
     let count = |value: Option<i32>| value.and_then(|v| u32::try_from(v).ok()).filter(|v| *v > 0);
     HeartSong {
         album: context

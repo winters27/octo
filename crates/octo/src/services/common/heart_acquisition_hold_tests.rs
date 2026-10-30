@@ -1277,6 +1277,40 @@ async fn the_kept_line_says_when_no_source_can_search_and_when_a_copy_could_not_
     }
 }
 
+/// Lidarr as the heart's only source: it can look for a better copy only for an artist with no
+/// music in the user's Lidarr. For an artist that has music there, Lidarr is left alone, and the
+/// line says to add a source that can search.
+#[tokio::test]
+async fn the_kept_line_counts_lidarr_only_for_an_artist_it_may_search() {
+    for (left_alone, line) in [(false, KEPT_AS_HEARD), (true, KEPT_NO_SOURCE)] {
+        let gates = HeardGates::reading(HeardReading::RStays { tag: None });
+        gates.heard("brandon", heard_video());
+        let rig = rig_with(&[HeartDownloadSource::Lidarr], gates);
+        *rig.lidarr.left_alone.lock() = left_alone;
+        rig.tracker.begin(
+            "soulseek",
+            "help",
+            None,
+            Some("brandon"),
+            None,
+            Some("Help!"),
+            None,
+        );
+        let (_, stop) = work(&rig, Arc::new(|_: &AcquisitionRequest, _| None));
+
+        let outcome = heart_of(&rig, "brandon").await;
+
+        assert!(matches!(outcome, TrackOutcome::KeptAsHeard(_)), "{outcome:?}");
+        assert_eq!(rig.lidarr.track_calls_for("soulseek", "help", true), 1);
+        assert_eq!(
+            rig.tracker.note_of("soulseek", "help").as_deref(),
+            Some(line),
+            "left alone: {left_alone}"
+        );
+        stop.cancel();
+    }
+}
+
 /// When even the heard audio cannot be had (the video gone), the heart ends with the plain line.
 #[tokio::test]
 async fn a_heart_whose_heard_video_is_gone_ends_with_the_plain_line() {

@@ -1596,6 +1596,7 @@ pub use heart::{
     ANOTHER_SONG_OR_TAKE, ANOTHER_SONG_PLAYED, HEARD_LOOKUP_BUSY, NEVER_PLAYED, YOUTUBE_PEER,
     became_with_duplicates,
 };
+pub(crate) use heart::{pick_contexts, song_in};
 
 #[cfg(test)]
 #[path = "download_verification_service_tests.rs"]

@@ -6,6 +6,7 @@ pub mod lidarr_client;
 pub mod lidarr_heart_acquisition_service;
 pub mod lidarr_import_handoff;
 pub mod lidarr_pending_albums;
+pub mod lidarr_pick;
 pub mod lidarr_track_fetcher;
 
 #[cfg(test)]
@@ -18,7 +19,8 @@ pub use lidarr_heart_acquisition_service::{
     LidarrImportOutcome,
 };
 pub use lidarr_import_handoff::{LidarrImport, LidarrImportHandoff};
-pub use lidarr_pending_albums::{LidarrPendingAlbums, PendingAlbum};
+pub use lidarr_pending_albums::{LidarrPendingAlbums, PendingAdd, PendingAlbum};
+pub use lidarr_pick::{ALREADY_LOOKING, ArtistMusic, LidarrArtistMusic};
 pub use lidarr_track_fetcher::{ILidarrTrackFetcher, LidarrTrackFetcher};
 pub use octo_core::lidarr::{
     LidarrAlbumCandidate, LidarrAlbumImportState, LidarrAlbumState, LidarrChoice, LidarrError,

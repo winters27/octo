@@ -71,7 +71,6 @@ impl Fixture {
             settings,
             identity,
             self.claims.clone(),
-            None,
         );
         fetcher.set_poll(Duration::from_millis(10));
         fetcher
@@ -414,7 +413,6 @@ async fn nothing_is_fetched_until_lidarr_is_set_up() {
         settings.clone(),
         NavidromeIdentityService::new(settings, reqwest::Client::new()),
         f.claims.clone(),
-        None,
     );
 
     let refused = f.fetch(&fetcher, teardrop(true, None)).await;

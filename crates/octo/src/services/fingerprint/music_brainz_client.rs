@@ -580,22 +580,6 @@ impl MusicBrainzClient {
         Ok(Some(pure::parse_recording_facts(&doc)?))
     }
 
-    /// The release group of the oldest official studio album a song appears on, or of a
-    /// soundtrack when no studio album has it. None when MusicBrainz knows neither.
-    pub async fn find_studio_album(
-        &self,
-        artist: &str,
-        title: &str,
-    ) -> Result<Option<String>, MusicBrainzError> {
-        let Some((url, plain_title)) = pure::studio_album_search(artist, title) else {
-            return Ok(None);
-        };
-        match self.get(&url, "studio album search").await? {
-            Some(doc) => Ok(pure::pick_studio_album(&doc, &plain_title)?),
-            None => Ok(None),
-        }
-    }
-
     /// Where the artist with this MusicBrainz id is from: a two-letter country, empty when
     /// MusicBrainz names none, None when it could not be asked. On the background lane;
     /// answers are remembered a day.
@@ -1859,4 +1843,4 @@ fn artist_key(artist_id: &str) -> String {
 
 #[cfg(test)]
 #[path = "music_brainz_client_tests.rs"]
-mod tests;
+pub(crate) mod tests;

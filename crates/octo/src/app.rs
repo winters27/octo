@@ -940,7 +940,6 @@ impl Acquisition {
             settings.clone(),
             navidrome.navidrome_identity.clone(),
             lidarr_album_claims.clone(),
-            Some(clients.music_brainz.clone()),
         ));
         let lidarr_track_fetcher: Arc<dyn ILidarrTrackFetcher> = lidarr_fetcher.clone();
         let spotiflac = Arc::new(SpotiflacClient::new(settings.clone()));
@@ -1001,27 +1000,31 @@ impl Acquisition {
         };
         acquisition_activity.set_downloads(&download_service);
 
-        let lidarr_hearts: Arc<dyn ILidarrHeartAcquisitionService> =
-            Arc::new(LidarrHeartAcquisitionService::new(
-                lidarr_client.clone(),
-                music_metadata.clone(),
-                clients.deezer_metadata.clone(),
-                settings.clone(),
-                navidrome.navidrome_identity.clone(),
-                integrations.notifications.clone(),
-                LidarrHeartExtras {
-                    tracker: Some(acquisition_tracker.clone()),
-                    music_brainz: Some(clients.music_brainz.clone()),
-                    claims: Some(lidarr_album_claims.clone()),
-                    imports: Some(lidarr_import_handoff.clone()),
-                    ids: Some(stores.external_id_registry.clone()),
-                    downloads: Some(download_service.clone()),
-                    journal: Some(stores.library_action_journal.clone()),
-                    ownership: Some(library_ownership.clone()),
-                    upgrades: Some(upgrade_queue.clone()),
-                    pending: Some(stores.lidarr_pending.clone()),
-                },
-            ));
+        let lidarr_heart_service = LidarrHeartAcquisitionService::new(
+            lidarr_client.clone(),
+            music_metadata.clone(),
+            clients.deezer_metadata.clone(),
+            settings.clone(),
+            navidrome.navidrome_identity.clone(),
+            integrations.notifications.clone(),
+            LidarrHeartExtras {
+                tracker: Some(acquisition_tracker.clone()),
+                music_brainz: Some(clients.music_brainz.clone()),
+                claims: Some(lidarr_album_claims.clone()),
+                imports: Some(lidarr_import_handoff.clone()),
+                ids: Some(stores.external_id_registry.clone()),
+                downloads: Some(download_service.clone()),
+                journal: Some(stores.library_action_journal.clone()),
+                ownership: Some(library_ownership.clone()),
+                upgrades: Some(upgrade_queue.clone()),
+                pending: Some(stores.lidarr_pending.clone()),
+                catalog: None,
+            },
+        );
+        // A pick a restart cut short before its search is put back.
+        lidarr_heart_service.resume_after_restart();
+        let lidarr_music = lidarr_heart_service.artist_music();
+        let lidarr_hearts: Arc<dyn ILidarrHeartAcquisitionService> = Arc::new(lidarr_heart_service);
         let heart_ownership = Arc::new(HeartOwnership::new(
             library_ownership.clone(),
             music_metadata.clone(),
@@ -1210,6 +1213,7 @@ impl Acquisition {
             soulseek_link: Some(soulseek_link.clone()),
             lidarr_fetcher: Some(lidarr_fetcher),
             lidarr_client: Some(lidarr_client.clone()),
+            lidarr_music: Some(lidarr_music),
             family: Default::default(),
             // A pick's file is held to the recording its song is, by the import rule.
             gates: downloads

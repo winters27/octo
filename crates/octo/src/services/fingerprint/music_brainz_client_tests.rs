@@ -836,18 +836,18 @@ const HELP_GROUP: &str = "0d44e1cb-c6e0-3453-8b68-4d2082f05421";
 const A_DOWNLOAD_CHECK: &str = "recording/11111111-1111-4111-8111-111111111111?inc=isrcs&fmt=json";
 
 /// A client on `server` with a short gap and step-back, so the lanes' turns take milliseconds.
-fn quick(server: &MockServer, timeout: Duration) -> MusicBrainzClient {
+pub(crate) fn quick(server: &MockServer, timeout: Duration) -> MusicBrainzClient {
     let base = Url::parse(&format!("{}/ws/2/", server.uri())).expect("parses");
     MusicBrainzClient::with_base_url(base).with_pace(QUICK, timeout, QUICK)
 }
 
-fn heart_album(folder: &str) -> PathBuf {
+pub(crate) fn heart_album(folder: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../octo-core/tests/fixtures/heart_album")
         .join(folder)
 }
 
-fn recorded_folder(folder: &str) -> Arc<RecordedAnswers> {
+pub(crate) fn recorded_folder(folder: &str) -> Arc<RecordedAnswers> {
     Arc::new(RecordedAnswers::open(&heart_album(folder)).expect("the folder's urls.tsv reads"))
 }
 
@@ -890,7 +890,7 @@ async fn until_received(server: &MockServer, count: usize) {
 
 /// Serves recorded answers by their exact question: a 404 for one recorded as answered 404, a
 /// 500 for any question the folder never recorded.
-struct Recorded(Arc<RecordedAnswers>);
+pub(crate) struct Recorded(pub(crate) Arc<RecordedAnswers>);
 
 impl Respond for Recorded {
     fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
@@ -904,13 +904,13 @@ impl Respond for Recorded {
 
 /// Deezer's side of a heart's questions, answered from the recorded Deezer answers: a question
 /// they do not hold fails the test.
-struct RecordedCatalog {
+pub(crate) struct RecordedCatalog {
     answers: RecordedAnswers,
     asked: Mutex<usize>,
 }
 
 impl RecordedCatalog {
-    fn open() -> Arc<RecordedCatalog> {
+    pub(crate) fn open() -> Arc<RecordedCatalog> {
         Arc::new(RecordedCatalog {
             answers: RecordedAnswers::open(&heart_album("deezer")).expect("the Deezer urls.tsv reads"),
             asked: Mutex::new(0),

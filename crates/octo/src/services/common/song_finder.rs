@@ -35,7 +35,7 @@ use crate::services::library::library_action_executor::LibraryActionExecutor;
 use crate::services::library::library_action_journal::LibraryActionJournal;
 use crate::services::library::upgrade_queue::{AudioSummary, UpgradeAsk, UpgradeQueue};
 use crate::services::library::{NavidromeSongPathResolver, UpgradeSources};
-use crate::services::lidarr::{LidarrClient, LidarrTrackFetcher};
+use crate::services::lidarr::{LidarrArtistMusic, LidarrClient, LidarrTrackFetcher};
 use crate::services::local::ILocalLibraryService;
 use crate::services::soulseek::rejected_peer_registry::RejectedPeerRegistry;
 use crate::services::soulseek::soulseek_candidates::{self, Judged};
@@ -273,8 +273,9 @@ pub struct SongFinderSeams {
     pub sources_for: SourcesFn,
     pub fetch: FetchFn,
     pub take_of: TakeFn,
-    /// Whether Lidarr may be used for the song's artist at all: an artist with music in Lidarr
-    /// gets no Lidarr copy, listed or picked. Never, until Lidarr's own check is given.
+    /// Whether Lidarr is left alone for the song's artist: an artist with music in Lidarr gets no
+    /// Lidarr copy, listed or picked. Read from the user's Lidarr when the services hold what
+    /// reads it; never left alone otherwise.
     pub lidarr_left_alone: LeftAloneFn,
 }
 
@@ -305,6 +306,8 @@ pub struct SongFinderServices {
     pub soulseek_link: Option<Arc<dyn ISoulseekLink>>,
     pub lidarr_fetcher: Option<Arc<LidarrTrackFetcher>>,
     pub lidarr_client: Option<Arc<LidarrClient>>,
+    /// What the user's Lidarr holds of an artist, which says when Lidarr is left alone.
+    pub lidarr_music: Option<LidarrArtistMusic>,
     /// Family's write gate, once Family's services exist: a family member's pick lands in
     /// their own library. Unset, or with Family off, every pick fills the shared library.
     pub family: std::sync::OnceLock<Arc<LibraryWriteGate>>,
@@ -507,7 +510,13 @@ impl SongFinder {
                     async move { Ok(fetch(&services, &target, &copy, &user, &ask).await) }.boxed()
                 })
             },
-            lidarr_left_alone: Arc::new(|_| async { false }.boxed()),
+            lidarr_left_alone: {
+                let services = services.clone();
+                Arc::new(move |target| {
+                    let services = services.clone();
+                    async move { lidarr_left_alone(&services, &target).await }.boxed()
+                })
+            },
             take_of: {
                 let services = services.clone();
                 Arc::new(move |target| {
@@ -1746,15 +1755,9 @@ async fn search_soulseek(
     Ok((copies, found.queries, Some(text)))
 }
 
-async fn search_lidarr(
-    services: &SongFinderServices,
-    target: &FindTarget,
-    ct: &CancellationToken,
-) -> anyhow::Result<SearchAnswer> {
-    let (Some(fetcher), Some(client)) = (&services.lidarr_fetcher, &services.lidarr_client) else {
-        anyhow::bail!("Lidarr is not available on this server.");
-    };
-    let request = LidarrTrackRequest {
+/// What Lidarr is asked for the song: the album a fetch finds it on.
+fn lidarr_request(target: &FindTarget) -> LidarrTrackRequest {
+    LidarrTrackRequest {
         artist: target.artist.clone(),
         title: target.title.clone(),
         album: target.album.clone(),
@@ -1763,7 +1766,57 @@ async fn search_lidarr(
         original_path: target.owned_path.clone(),
         release: None,
         step: None,
+    }
+}
+
+/// Whether Lidarr is left alone for the song: the album Lidarr would search for it belongs to an
+/// artist that already has music in the user's Lidarr (a track file, or audio in its folder).
+/// False when Lidarr cannot be asked, or knows no album with the song; the search says so then.
+async fn lidarr_left_alone(services: &SongFinderServices, target: &FindTarget) -> bool {
+    let (Some(fetcher), Some(music)) = (&services.lidarr_fetcher, &services.lidarr_music) else {
+        return false;
     };
+    let album = match fetcher
+        .find_album(&lidarr_request(target), &CancellationToken::new())
+        .await
+    {
+        Ok(Some(album)) => album,
+        Ok(None) => return false,
+        Err(e) => {
+            warn!(
+                "Could not find Lidarr's album of '{} - {}': {e}",
+                target.artist, target.title
+            );
+            return false;
+        }
+    };
+    let Some(artist) = album
+        .resource
+        .get("artist")
+        .and_then(|artist| artist.get("foreignArtistId"))
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return false;
+    };
+    match music.read(artist).await {
+        Ok(read) => read.has_music,
+        Err(e) => {
+            warn!("Could not read what Lidarr holds of artist {artist}: {e}");
+            false
+        }
+    }
+}
+
+async fn search_lidarr(
+    services: &SongFinderServices,
+    target: &FindTarget,
+    ct: &CancellationToken,
+) -> anyhow::Result<SearchAnswer> {
+    let (Some(fetcher), Some(client)) = (&services.lidarr_fetcher, &services.lidarr_client) else {
+        anyhow::bail!("Lidarr is not available on this server.");
+    };
+    let request = lidarr_request(target);
     let Some(album) = fetcher.find_album(&request, ct).await? else {
         return Ok((
             Vec::new(),

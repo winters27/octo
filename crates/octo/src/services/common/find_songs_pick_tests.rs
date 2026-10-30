@@ -2,7 +2,7 @@
 //! queue, picks no download used, and how many looks one person may run at once.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -11,8 +11,8 @@ use octo_core::fingerprint::heart_gate::{
 };
 use octo_core::models::download::AcquisitionCandidate;
 use octo_core::settings::{
-    AppSettings, LibraryAction, LibraryActionDefinition, LibraryActionSettings, SettingsStore,
-    SoulseekSettings,
+    AppSettings, LibraryAction, LibraryActionDefinition, LibraryActionSettings, LidarrSettings,
+    SettingsStore, SoulseekSettings, SubsonicSettings,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -31,6 +31,9 @@ use crate::services::library::UpgradeSources;
 use crate::services::library::library_action_executor::{LibraryActionExecutor, LibraryActionOutcome};
 use crate::services::library::library_action_journal::{LibraryActionEntry, LibraryActionJournal};
 use crate::services::library::upgrade_queue::{UpgradeAsk, UpgradeQueue};
+use crate::services::lidarr::fake_lidarr::{CatalogAlbum, FakeLidarr};
+use crate::services::lidarr::{LidarrAlbumClaims, LidarrArtistMusic, LidarrClient, LidarrTrackFetcher};
+use crate::services::subsonic::NavidromeIdentityService;
 
 fn owned() -> FindTarget {
     FindTarget {
@@ -123,6 +126,9 @@ fn build_with(
         gates: more.gates,
         journal: more.journal,
         tracker: more.tracker,
+        lidarr_fetcher: more.lidarr_fetcher,
+        lidarr_client: more.lidarr_client,
+        lidarr_music: more.lidarr_music,
         ..Default::default()
     }));
     finder.seams(|seams| {
@@ -666,9 +672,9 @@ fn lidarrs_choice() -> FoundCopy {
     )
 }
 
-/// A look over Soulseek and Lidarr, whose artist Lidarr leaves alone while `left_alone` says so;
-/// how many times Lidarr was searched.
-fn both_sources(server: &Server, left_alone: Arc<AtomicBool>) -> Arc<AtomicUsize> {
+/// A look over Soulseek and Lidarr, whether Lidarr is left alone read from the fake Lidarr; how
+/// many times Lidarr was searched.
+fn both_sources(server: &Server) -> Arc<AtomicUsize> {
     let searched = Arc::new(AtomicUsize::new(0));
     let counted = searched.clone();
     server.finder.seams(|seams| {
@@ -689,20 +695,75 @@ fn both_sources(server: &Server, left_alone: Arc<AtomicBool>) -> Arc<AtomicUsize
             }
             .boxed()
         });
-        seams.lidarr_left_alone = Arc::new(move |_| {
-            let left_alone = left_alone.load(Ordering::SeqCst);
-            async move { left_alone }.boxed()
-        });
     });
     searched
+}
+
+/// Lidarr's side of a look, over the fake Lidarr: Air's Moon Safari is in Lidarr's metadata, and
+/// Octo's library is where Lidarr's root folder lies.
+async fn lidarr_for_air() -> (
+    tempfile::TempDir,
+    FakeLidarr,
+    wiremock::MockServer,
+    SongFinderServices,
+) {
+    let root = tempfile::tempdir().expect("a temp dir");
+    let (fake, server) = FakeLidarr::start(root.path()).await;
+    fake.catalog_artist("air", "Air", 20);
+    fake.catalog_album(CatalogAlbum::new(
+        "rg-moon-safari",
+        "Moon Safari",
+        "air",
+        21,
+        &[(210, "La Femme d'Argent", 1), (212, "Sexy Boy", 2)],
+    ));
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+        lidarr: LidarrSettings {
+            base_url: Some(server.uri()),
+            api_key: Some("k".into()),
+            root_folder_path: Some("/data/music".into()),
+            quality_profile_id: 1,
+            metadata_profile_id: 1,
+            ..Default::default()
+        },
+        subsonic: SubsonicSettings {
+            auto_detect_download_path: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    settings.set_raw("Library:DownloadPath", Some(&root.path().to_string_lossy()));
+    let identity = NavidromeIdentityService::new(settings.clone(), reqwest::Client::new());
+    let client = Arc::new(LidarrClient::new(settings.clone()));
+    let fetcher = Arc::new(LidarrTrackFetcher::new(
+        client.clone(),
+        settings.clone(),
+        identity.clone(),
+        Arc::new(LidarrAlbumClaims::new()),
+    ));
+    let services = SongFinderServices {
+        lidarr_fetcher: Some(fetcher),
+        lidarr_client: Some(client.clone()),
+        lidarr_music: Some(LidarrArtistMusic::new(client, settings, identity)),
+        ..Default::default()
+    };
+    (root, fake, server, services)
+}
+
+/// Air's own album in the user's Lidarr, with a track file.
+fn air_has_music(lidarr: &FakeLidarr) {
+    lidarr.user_album("rg-moon-safari", false);
+    lidarr.import(210, "La Femme d'Argent", "FLAC");
 }
 
 /// An artist with music in Lidarr gets no Lidarr copy on the list, and Lidarr is not searched;
 /// the list says why, and Soulseek's copies are there as ever.
 #[tokio::test]
 async fn no_lidarr_copy_is_listed_for_an_artist_with_music_in_lidarr() {
-    let server = build(owned(), None);
-    let searched = both_sources(&server, Arc::new(AtomicBool::new(true)));
+    let (_root, lidarr, _lidarr_server, services) = lidarr_for_air().await;
+    air_has_music(&lidarr);
+    let server = build_with(owned(), None, services);
+    let searched = both_sources(&server);
 
     let look = look(&server.finder, "alice").await;
 
@@ -727,9 +788,9 @@ async fn no_lidarr_copy_is_listed_for_an_artist_with_music_in_lidarr() {
 /// line; the other copies stay on the list and can still be picked.
 #[tokio::test]
 async fn a_lidarr_pick_listed_before_the_artist_had_music_in_lidarr_is_refused_with_the_line() {
-    let server = build(owned(), None);
-    let left_alone = Arc::new(AtomicBool::new(false));
-    both_sources(&server, left_alone.clone());
+    let (_root, lidarr, _lidarr_server, services) = lidarr_for_air().await;
+    let server = build_with(owned(), None, services);
+    both_sources(&server);
     let look = look(&server.finder, "alice").await;
     let listed = look
         .copies
@@ -739,7 +800,7 @@ async fn a_lidarr_pick_listed_before_the_artist_had_music_in_lidarr_is_refused_w
         .id
         .clone();
 
-    left_alone.store(true, Ordering::SeqCst);
+    air_has_music(&lidarr);
     let refused = server.finder.pick_by_id(&look.id, &listed, "alice").await;
 
     assert_eq!(refused.state, library_action_states::SKIPPED);

@@ -8,7 +8,7 @@ use crate::common::SongIdentity;
 use crate::common::dotnet;
 use crate::fingerprint::track_match_comparer::TrackMatchComparer;
 use crate::json::element::{
-    ElementResult, enumerate_array, get_double, get_int32, get_property, get_string, try_get_property,
+    ElementResult, enumerate_array, get_double, get_int32, get_string, try_get_property,
 };
 
 /// The search for a recording by name, with a length window of ten seconds either way when
@@ -47,7 +47,7 @@ pub fn escape_query(value: &str) -> String {
     sb
 }
 
-/// The quoting the recording and studio album lookups use: backslashes and quotes only.
+/// The quoting the recording lookup uses: backslashes and quotes only.
 pub fn escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -66,111 +66,6 @@ pub fn find_recording_url(artist: &str, title: &str, duration_seconds: i32) -> O
         "recording/?query={}&fmt=json&limit=25",
         dotnet::escape_data_string(&query)
     ))
-}
-
-/// The relative URL the studio album lookup asks and the title its answer is read against, or
-/// None when there is nothing to ask.
-pub fn studio_album_search(artist: &str, title: &str) -> Option<(String, String)> {
-    let plain_title = SongIdentity::strip_features(title);
-    // Words, not a phrase: "They Dont Care About Us" has to find "They Don't Care About Us".
-    // Letters and digits are tested one UTF-16 unit at a time, so a character outside the BMP
-    // becomes two spaces.
-    let mut words = String::with_capacity(plain_title.len());
-    for c in plain_title.chars() {
-        if dotnet::is_letter_utf16(c) || dotnet::is_digit_utf16(c) {
-            words.push(c);
-        } else {
-            for _ in 0..c.len_utf16() {
-                words.push(' ');
-            }
-        }
-    }
-    let words = words.trim();
-    if dotnet::is_blank(artist) || words.is_empty() {
-        return None;
-    }
-    let query = format!(
-        "recording:({words}) AND artist:\"{}\" AND primarytype:album AND status:official",
-        escape(artist)
-    );
-    Some((
-        format!(
-            "recording/?query={}&fmt=json&limit=50",
-            dotnet::escape_data_string(&query)
-        ),
-        plain_title,
-    ))
-}
-
-/// The release group of the oldest official studio album a song appears on, else of a mixtape,
-/// else of a soundtrack. None when the answer names none of them.
-pub fn pick_studio_album(root: &Value, title: &str) -> ElementResult<Option<String>> {
-    let Some(recordings @ Value::Array(_)) = try_get_property(root, "recordings")? else {
-        return Ok(None);
-    };
-    let wanted = SongIdentity::key(title);
-    let mut group_id: Option<String> = None;
-    let mut group_date: Option<String> = None;
-    let mut group_rank = i32::MAX;
-    for recording in enumerate_array(recordings)? {
-        let Some(recording_title) = try_get_property(recording, "title")? else {
-            continue;
-        };
-        if SongIdentity::key(get_string(recording_title)?.unwrap_or("")) != wanted {
-            continue;
-        }
-        let Some(releases) = try_get_property(recording, "releases")? else {
-            continue;
-        };
-        for release in enumerate_array(releases)? {
-            // A bootleg, promotion or pseudo-release is never the album a song belongs to.
-            if let Some(status) = try_get_property(release, "status")?
-                && get_string(status)?.is_some_and(|s| s != "Official")
-            {
-                continue;
-            }
-            let Some(group) = try_get_property(release, "release-group")? else {
-                continue;
-            };
-            let Some(kind) = try_get_property(group, "primary-type")? else {
-                continue;
-            };
-            if get_string(kind)? != Some("Album") {
-                continue;
-            }
-            let mut secondary: Vec<Option<&str>> = Vec::new();
-            if let Some(s @ Value::Array(_)) = try_get_property(group, "secondary-types")? {
-                for x in enumerate_array(s)? {
-                    secondary.push(get_string(x)?);
-                }
-            }
-            let rank = match secondary.as_slice() {
-                [] => 0,
-                [Some("Mixtape/Street")] => 1,
-                [Some("Soundtrack")] => 2,
-                _ => -1,
-            };
-            if rank < 0 || rank > group_rank {
-                continue;
-            }
-
-            let date = match try_get_property(release, "date")? {
-                Some(d) => get_string(d)?.filter(|d| !d.is_empty()).map(str::to_string),
-                None => None,
-            };
-            let earlier = match (&date, &group_date) {
-                (Some(date), Some(known)) => is_earlier_date(date, known),
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
-            if rank < group_rank || group_id.is_none() || earlier {
-                group_id = get_string(get_property(group, "id")?)?.map(str::to_string);
-                group_date = date;
-                group_rank = rank;
-            }
-        }
-    }
-    Ok(group_id)
 }
 
 /// The relative URL of one artist by MusicBrainz id, or None for a blank id.

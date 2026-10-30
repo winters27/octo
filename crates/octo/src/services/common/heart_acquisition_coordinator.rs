@@ -2278,11 +2278,12 @@ impl HeartAcquisitionCoordinator {
                 KEPT_BESIDE_OWNED
             } else if ended.undecided {
                 KEPT_UNDECIDED
-            } else if ended
-                .steps
-                .iter()
-                .any(|step| matches!(step, HeartDownloadSource::Soulseek | HeartDownloadSource::Lidarr))
-            {
+            } else if ended.steps.iter().any(|step| match step {
+                HeartDownloadSource::Soulseek => true,
+                // Lidarr searches only for an artist with no music in it.
+                HeartDownloadSource::Lidarr => !self.lidarr.left_alone(provider, external_id),
+                HeartDownloadSource::YouTube => false,
+            }) {
                 KEPT_AS_HEARD
             } else {
                 KEPT_NO_SOURCE

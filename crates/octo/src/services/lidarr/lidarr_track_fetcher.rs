@@ -22,7 +22,6 @@ use tracing::{info, warn};
 
 use super::lidarr_heart_acquisition_service::{same_path, translate_imported_path};
 use super::{LidarrAlbumClaims, LidarrClient};
-use crate::services::fingerprint::{MusicBrainzClient, MusicBrainzError};
 use crate::services::library::UpgradeSources;
 use crate::services::subsonic::NavidromeIdentityService;
 
@@ -76,7 +75,6 @@ struct Inner {
     settings: Arc<SettingsStore>,
     nav_identity: NavidromeIdentityService,
     claims: Arc<LidarrAlbumClaims>,
-    music_brainz: Option<Arc<MusicBrainzClient>>,
     poll: Mutex<Duration>,
     /// By foreign album id, ignoring case; its lock also guards joining and leaving a session.
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -102,7 +100,6 @@ impl LidarrTrackFetcher {
         settings: Arc<SettingsStore>,
         nav_identity: NavidromeIdentityService,
         claims: Arc<LidarrAlbumClaims>,
-        music_brainz: Option<Arc<MusicBrainzClient>>,
     ) -> Self {
         LidarrTrackFetcher {
             inner: Arc::new(Inner {
@@ -110,7 +107,6 @@ impl LidarrTrackFetcher {
                 settings,
                 nav_identity,
                 claims,
-                music_brainz,
                 poll: Mutex::new(Duration::from_secs(10)),
                 sessions: Mutex::new(HashMap::new()),
             }),
@@ -123,8 +119,7 @@ impl LidarrTrackFetcher {
     }
 
     /// The album a song is on, found as a fetch finds it: from the original's own release group
-    /// tag, then by its album name, then the studio album MusicBrainz files the song under. Find
-    /// songs lists that album's releases.
+    /// tag, then by its album name. Find songs lists that album's releases.
     pub async fn find_album(
         &self,
         request: &LidarrTrackRequest,
@@ -473,8 +468,7 @@ impl Inner {
         ))
     }
 
-    /// The album: from the original's own release group tag, then by its album name, then
-    /// the studio album MusicBrainz files the song under.
+    /// The album: from the original's own release group tag, then by its album name.
     async fn find_album(
         &self,
         request: &LidarrTrackRequest,
@@ -488,24 +482,9 @@ impl Inner {
         if let Some(album) = request.album.as_deref().filter(|a| !dotnet::is_blank(a)) {
             match cancellable(ct, self.client.resolve_album(&request.artist, album, None)).await {
                 Ok(found) => return Ok(Some(found)),
-                // No single match by name; MusicBrainz next.
+                // No single match by name.
                 Err(LidarrError::InvalidOperation(_)) => {}
                 Err(e) => return Err(e),
-            }
-        }
-        if let Some(music_brainz) = &self.music_brainz {
-            let studio = cancellable(ct, async {
-                music_brainz
-                    .find_studio_album(&request.artist, &request.title)
-                    .await
-                    .map_err(|e| match e {
-                        MusicBrainzError::TimedOut => LidarrError::Canceled(e.to_string()),
-                        MusicBrainzError::Malformed(_) => LidarrError::InvalidOperation(e.to_string()),
-                    })
-            })
-            .await?;
-            if let Some(studio) = studio {
-                return cancellable(ct, self.client.resolve_album_by_foreign_id(&studio)).await;
             }
         }
         Ok(None)
