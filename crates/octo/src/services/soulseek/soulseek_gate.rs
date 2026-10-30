@@ -12,6 +12,7 @@ use octo_core::fingerprint::verification::{RecordingProof, read_answer};
 
 use super::*;
 use crate::services::common::heart_acquisition_coordinator::waiting_line;
+use crate::services::common::song_finder::ACOUST_ID_BUSY;
 use crate::services::common::soulseek_hold_store::held_root;
 use crate::services::common::{AcquisitionHeld, GateOutcome, HeldAcquisition, HeldKind, PlayOutcome};
 use crate::services::fingerprint::download_verification_service::{HeartCandidate, LabelSource};
@@ -330,6 +331,21 @@ impl SoulseekDownloadService {
                 None => FileJudged::Keep(verdict),
             };
         }
+        // A Find songs pick is never held: with AcoustID not answering, its file is thrown away and
+        // the pick ends with words the person can act on.
+        if download.origin == Some(AcquisitionOrigin::SongFinderPick)
+            && verdict.reason == octo_core::fingerprint::InconclusiveReason::LookupFailed
+            && self.verification.is_fingerprinting_enabled()
+        {
+            info!("AcoustID did not answer for the pick of {track_key}; its file is thrown away: {path}");
+            let _ = std::fs::remove_file(path);
+            return FileJudged::Hold(AcquisitionHeld {
+                waiting_for: WaitingFor::AcoustId,
+                line: ACOUST_ID_BUSY.to_string(),
+                files: Vec::new(),
+                users: Vec::new(),
+            });
+        }
         if verdict.verdict == VerificationVerdict::Mismatch && file_exists(path) {
             let file_ms = TagFile::open(path)
                 .ok()
@@ -348,6 +364,13 @@ impl SoulseekDownloadService {
         if self.import_refuses(base, download, path, &mut verdict) {
             return FileJudged::Refuse {
                 reason: "is another recording by AcoustID's reading".to_string(),
+                shared: false,
+                verdict,
+            };
+        }
+        if let Some(why) = self.denied_by_sound(base, download, &verdict) {
+            return FileJudged::Refuse {
+                reason: why.to_string(),
                 shared: false,
                 verdict,
             };
@@ -443,6 +466,30 @@ impl SoulseekDownloadService {
             }
             ImportJudgement::Stands { .. } => false,
         }
+    }
+
+    /// Why a Wrong song or Wrong version replacement refuses this file by its original's sound (its
+    /// dominant recording is the original's again, or its song is), or None.
+    pub(crate) fn denied_by_sound(
+        &self,
+        base: &BaseDownloadService,
+        download: &TrackDownload,
+        verdict: &VerificationResult,
+    ) -> Option<&'static str> {
+        let deny = download.deny.as_ref()?;
+        let answer = verdict.lookup.as_ref()?.answer.as_ref()?;
+        let min = base.current_soulseek_settings().effective_min_score_fraction();
+        let why = deny.refuses(answer, min)?;
+        let track_key = download.song.external_id.clone().unwrap_or_default();
+        info!("A replacement for {track_key} {why}; refusing it");
+        base.log_step_heard(
+            &track_key,
+            acquisition_event_kinds::CHECK,
+            "The copy you said was wrong, again; thrown away",
+            Some("AcoustID hears what the copy it was to replace is"),
+            verdict.heard(),
+        );
+        Some(why)
     }
 
     /// Whether every gate of a gated download has refused this peer's file before.

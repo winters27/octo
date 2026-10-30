@@ -3048,6 +3048,142 @@ async fn an_import_with_an_isrc_refuses_another_recording_and_one_without_still_
     assert!(std::path::Path::new(&landed).is_file(), "{landed}");
 }
 
+/// `place`'s acquisition of "Started", within a minute.
+async fn started_with(
+    walk: &Walk,
+    place: crate::services::common::AcquisitionPlace,
+) -> anyhow::Result<String> {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        walk.service.execute_acquisition_to(
+            "soulseek",
+            walk.songs[3].external_id.as_deref().expect("an id"),
+            false,
+            true,
+            Some(DownloadSource::Soulseek),
+            &CancellationToken::new(),
+            None,
+            false,
+            None,
+            place,
+        ),
+    )
+    .await
+    .expect("within a minute")
+}
+
+/// A Find songs pick takes the import rule: a file AcoustID's reading names as another recording is
+/// refused, though the shipped check confirms it by title, with that reason.
+#[tokio::test]
+async fn a_find_songs_pick_another_recording_by_its_reading_is_refused_with_the_reason() {
+    let root = Root::new("octo-pick-");
+    let Some((walk, _)) = verified_walk(&root).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    {
+        let mut state = walk.slskd.state.lock();
+        state.last_download = "x".into();
+        state
+            .lookup_by_video
+            .insert("x".into(), answer_naming(&[("rec-remix", 12, "USCM51400099")]));
+    }
+    let refused = started_with(
+        &walk,
+        crate::services::common::AcquisitionPlace {
+            origin: Some(AcquisitionOrigin::SongFinderPick),
+            gates: vec![HeartGate {
+                origin: AcquisitionOrigin::SongFinderPick,
+                ..import_gate(&["rec-started"])
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("refused");
+    assert!(refused.to_string().contains("another recording"), "{refused}");
+    assert_eq!(placed_flacs(&root), 0);
+}
+
+/// A Find songs pick is never held: a file whose lookup AcoustID does not answer is thrown away at
+/// once, and the pick ends with "AcoustID is busy, try again", trying no other peer.
+#[tokio::test]
+async fn a_find_songs_picks_file_that_meets_a_busy_acoustid_is_thrown_away_and_ends_busy() {
+    let root = Root::new("octo-pick-");
+    let Some((walk, _)) = verified_walk(&root).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    {
+        let mut state = walk.slskd.state.lock();
+        state.last_download = "x".into();
+        state.lookup_by_video.insert(
+            "x".into(),
+            json!({"status": "error", "error": {"code": 14, "message": "service unavailable"}}),
+        );
+    }
+    let busy = started_with(
+        &walk,
+        crate::services::common::AcquisitionPlace {
+            origin: Some(AcquisitionOrigin::SongFinderPick),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("not kept");
+    let held = busy
+        .downcast_ref::<crate::services::common::AcquisitionHeld>()
+        .expect("ended at once");
+    assert_eq!(held.line, crate::services::common::song_finder::ACOUST_ID_BUSY);
+    assert!(held.files.is_empty(), "nothing waits anywhere");
+    let users: Vec<String> = walk.slskd.batches().into_iter().map(|(u, ..)| u).collect();
+    assert_eq!(users, names(&["wrongpeer"]), "no other peer is tried");
+    let left: Vec<String> = files_under(&root.path())
+        .expect("the root lists")
+        .into_iter()
+        .filter(|f| f.ends_with(".flac"))
+        .collect();
+    assert!(left.is_empty(), "no file left: {left:?}");
+}
+
+/// A Wrong song or Wrong version replacement refuses a file AcoustID names as its original's
+/// recording again, and tries the next peer; a file of another recording lands.
+#[tokio::test]
+async fn a_replacement_refuses_its_originals_recording_again_and_tries_the_next_peer() {
+    let root = Root::new("octo-deny-");
+    let Some((walk, _)) = verified_walk(&root).await else {
+        eprintln!("skipped: ffmpeg or fpcalc is not on the PATH");
+        return;
+    };
+    let replacing = || crate::services::common::AcquisitionPlace {
+        origin: Some(AcquisitionOrigin::Replacement),
+        deny: Some(crate::services::common::SoundDeny::Recordings(HeardRecording {
+            ids: vec!["rec-wrong".into()],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    {
+        let mut state = walk.slskd.state.lock();
+        state.last_download = "x".into();
+        state
+            .lookup_by_video
+            .insert("x".into(), answer_naming(&[("rec-wrong", 20, "USCM51400077")]));
+    }
+    let refused = started_with(&walk, replacing()).await;
+    assert!(refused.is_err(), "the original's recording again: {refused:?}");
+    let users: Vec<String> = walk.slskd.batches().into_iter().map(|(u, ..)| u).collect();
+    assert_eq!(users, names(&["wrongpeer", "rightpeer"]), "the next was tried");
+
+    walk.slskd
+        .state
+        .lock()
+        .lookup_by_video
+        .insert("x".into(), answer_naming(&[("rec-started", 20, "USCM51400001")]));
+    let landed = started_with(&walk, replacing()).await.expect("lands");
+    assert!(std::path::Path::new(&landed).is_file(), "{landed}");
+}
+
 /// A clustered import the shipped check confirms lands as it does today, marked "version not
 /// proven": no Review entry, and no recording id written.
 #[tokio::test]
