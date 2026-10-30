@@ -6,7 +6,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
 use octo_core::common::dotnet::{self, compare_ordinal_ignore_case, eq_ignore_case};
-use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeartGate, WaitingFor};
+use octo_core::fingerprint::acoust_id_client::AcoustIdAnswer;
+use octo_core::fingerprint::heart_gate::{
+    Acceptance, AcquisitionOrigin, HeardRecording, HeartGate, WaitingFor,
+};
+use octo_core::fingerprint::verification::{SongName, is_same_song, read_answer};
 use octo_core::settings::DownloadSource;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
@@ -54,16 +58,26 @@ pub enum GateOutcome {
     Undecided,
 }
 
-/// The gates' verdicts on the file one acquisition ended with, by person and origin. Shared by
-/// everyone who waits on the acquisition, so each one reads their own gate's verdict.
+/// The gates' verdicts on the file one acquisition ended with, by person and origin, and for each
+/// verdict that accepted it, which acceptance did. Shared by everyone who waits on the
+/// acquisition, so each one reads their own gate's verdict.
 #[derive(Clone, Default)]
-pub struct GateLedger(Arc<Mutex<Vec<(String, AcquisitionOrigin, GateOutcome)>>>);
+pub struct GateLedger {
+    verdicts: Arc<Mutex<Vec<(String, AcquisitionOrigin, GateOutcome)>>>,
+    accepted_by: Arc<Mutex<Vec<(String, AcquisitionOrigin, Acceptance)>>>,
+}
 
 impl GateLedger {
-    /// Records one gate's verdict, a later one for the same person and origin replacing it.
+    /// Records one gate's verdict, a later one for the same person and origin replacing it. A
+    /// verdict that does not accept the file forgets how an earlier one accepted it.
     pub fn record(&self, user: &str, origin: AcquisitionOrigin, outcome: GateOutcome) {
         let user = user.trim();
-        let mut entries = self.0.lock();
+        if outcome != GateOutcome::Accepted {
+            self.accepted_by
+                .lock()
+                .retain(|(who, from, _)| !(*from == origin && eq_ignore_case(who, user)));
+        }
+        let mut entries = self.verdicts.lock();
         match entries
             .iter_mut()
             .find(|(who, from, _)| *from == origin && eq_ignore_case(who, user))
@@ -73,18 +87,42 @@ impl GateLedger {
         }
     }
 
+    /// Records that `user`'s gate of `origin` accepted the file, and by which acceptance: the
+    /// very audio heard, AcoustID's clear reading, or the master heard.
+    pub fn record_accepted(&self, user: &str, origin: AcquisitionOrigin, by: Acceptance) {
+        self.record(user, origin, GateOutcome::Accepted);
+        let user = user.trim();
+        let mut accepted = self.accepted_by.lock();
+        match accepted
+            .iter_mut()
+            .find(|(who, from, _)| *from == origin && eq_ignore_case(who, user))
+        {
+            Some(entry) => entry.2 = by,
+            None => accepted.push((user.to_string(), origin, by)),
+        }
+    }
+
     /// What `user`'s gate of `origin` said, when it judged the file.
     pub fn outcome_for(&self, user: &str, origin: AcquisitionOrigin) -> Option<GateOutcome> {
-        self.0
+        self.verdicts
             .lock()
             .iter()
             .find(|(who, from, _)| *from == origin && eq_ignore_case(who, user.trim()))
             .map(|(_, _, outcome)| outcome.clone())
     }
 
+    /// Which acceptance passed the file for `user`'s gate of `origin`, when it was recorded.
+    pub fn acceptance_for(&self, user: &str, origin: AcquisitionOrigin) -> Option<Acceptance> {
+        self.accepted_by
+            .lock()
+            .iter()
+            .find(|(who, from, _)| *from == origin && eq_ignore_case(who, user.trim()))
+            .map(|(_, _, by)| *by)
+    }
+
     /// Whether a gate accepted the file for `user`.
     pub fn accepted(&self, user: &str) -> bool {
-        self.0
+        self.verdicts
             .lock()
             .iter()
             .any(|(who, _, outcome)| *outcome == GateOutcome::Accepted && eq_ignore_case(who, user.trim()))
@@ -92,12 +130,13 @@ impl GateLedger {
 
     /// Whether any gate judged the file: none did when the acquisition ran the shipped checks.
     pub fn is_empty(&self) -> bool {
-        self.0.lock().is_empty()
+        self.verdicts.lock().is_empty()
     }
 
     /// Forgets every verdict, for a file that is not kept after all.
     pub fn clear(&self) {
-        self.0.lock().clear();
+        self.verdicts.lock().clear();
+        self.accepted_by.lock().clear();
     }
 }
 
@@ -113,7 +152,45 @@ impl Eq for GateLedger {}
 
 impl std::fmt::Debug for GateLedger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.0.lock().iter()).finish()
+        f.debug_list()
+            .entries(self.verdicts.lock().iter())
+            .entries(self.accepted_by.lock().iter())
+            .finish()
+    }
+}
+
+/// What a Wrong song or Wrong version replacement refuses by sound, from its original's own
+/// AcoustID answer, read once before the download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SoundDeny {
+    /// The original reads clearly as one recording: a file whose dominant recording is it, or one
+    /// of its same-note duplicates, is the original again.
+    Recordings(HeardRecording),
+    /// A Wrong song whose original reads ambiguous: a file whose dominant recording is that song
+    /// at all is the wrong song again.
+    Song(SongName),
+}
+
+/// Why a replacement is refused for being its original's recording again, as the rest of a
+/// sentence about the file.
+pub const SAME_RECORDING_AGAIN: &str = "is the same recording as the copy it was to replace";
+/// Why a replacement is refused for being its original's song again.
+pub const SAME_SONG_AGAIN: &str = "is the same song as the copy it was to replace";
+
+impl SoundDeny {
+    /// Why a file whose AcoustID answer is `answer` is refused, or None: only by its dominant
+    /// recording, among the results that reach `min_score`.
+    pub fn refuses(&self, answer: &AcoustIdAnswer, min_score: f64) -> Option<&'static str> {
+        let reading = read_answer(answer, &HeardRecording::default(), min_score);
+        let dominant = reading.dominant()?;
+        match self {
+            SoundDeny::Recordings(r) => (r.holds(&dominant.id)
+                || r.duplicates
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(&dominant.id)))
+            .then_some(SAME_RECORDING_AGAIN),
+            SoundDeny::Song(song) => is_same_song(&dominant.song(), song).then_some(SAME_SONG_AGAIN),
+        }
     }
 }
 
@@ -226,6 +303,8 @@ pub struct AcquisitionPlace {
     pub held_files: Vec<String>,
     /// Where each gate's verdict on the file is written, for everyone who waits on it.
     pub ledger: GateLedger,
+    /// What a replacement refuses by its original's sound.
+    pub deny: Option<SoundDeny>,
 }
 
 /// One queued request to fetch a permanent copy of a track.
@@ -275,6 +354,8 @@ pub struct AcquisitionRequest {
     /// Hearts and plays that joined with a gate of their own: their library, their name and their
     /// claim on the outcome are recorded only once their own gate passes the landed file.
     joiners: Mutex<Vec<GatedJoiner>>,
+    /// What a replacement refuses by its original's sound.
+    pub deny: Option<SoundDeny>,
 
     pub completion: Completion,
 }
@@ -322,6 +403,7 @@ impl AcquisitionRequest {
             gates: Mutex::new(Vec::new()),
             held_files: Mutex::new(Vec::new()),
             joiners: Mutex::new(Vec::new()),
+            deny: None,
             completion: Completion::default(),
         }
     }
@@ -455,6 +537,7 @@ impl AcquisitionRequest {
             gates: self.gates(),
             held_files: self.held_files.lock().clone(),
             ledger: self.completion.ledger().clone(),
+            deny: self.deny.clone(),
         }
     }
 
@@ -833,6 +916,48 @@ impl TrackAcquisitionQueue {
         upgrade_search: bool,
         replacement: Option<Arc<ReplacementHandoff>>,
     ) -> Completion {
+        self.enqueue_denying(
+            None,
+            origin,
+            gates,
+            held_files,
+            target,
+            flac_only,
+            provider,
+            external_id,
+            is_star,
+            trigger_album_download,
+            force_permanent,
+            source_override,
+            notify_on_failure,
+            requested_by,
+            upgrade_search,
+            replacement,
+        )
+    }
+
+    /// [`Self::enqueue_holding`] for a replacement that refuses files by its original's sound. A
+    /// request already in flight is joined as it is, without `deny`, as a replacement always was.
+    #[allow(clippy::too_many_arguments)] // enqueue_holding's arguments and what is refused
+    pub fn enqueue_denying(
+        &self,
+        deny: Option<SoundDeny>,
+        origin: Option<AcquisitionOrigin>,
+        gates: Vec<HeartGate>,
+        held_files: Vec<String>,
+        target: &AcquisitionTarget,
+        flac_only: bool,
+        provider: &str,
+        external_id: &str,
+        is_star: bool,
+        trigger_album_download: bool,
+        force_permanent: bool,
+        source_override: Option<DownloadSource>,
+        notify_on_failure: bool,
+        requested_by: Option<&str>,
+        upgrade_search: bool,
+        replacement: Option<Arc<ReplacementHandoff>>,
+    ) -> Completion {
         let mut request = AcquisitionRequest::new(
             provider,
             external_id,
@@ -847,6 +972,7 @@ impl TrackAcquisitionQueue {
         if let Some(origin) = origin {
             request = request.with_origin(origin);
         }
+        request.deny = deny;
         let request = Arc::new(request);
         request.add_requester(requested_by);
         request.add_target(target);

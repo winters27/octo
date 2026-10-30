@@ -552,6 +552,69 @@ fn the_journal_keeps_the_newest_two_thousand() {
     assert_eq!(all.last().map(|e| e.navidrome_id.as_str()), Some("song-5"));
 }
 
+/// The "wrong version asked" mark is the Wrong version Octo answered with the Find songs words. A
+/// pick of a copy that did not replace the file keeps it; a pick that replaced it, or any other
+/// action on the song, ends it; another song's actions never touch it.
+#[test]
+fn the_wrong_version_mark_lasts_until_a_pick_replaces_the_file_or_another_action_runs() {
+    const ASKED: &str = "pick the copy you want";
+    let journal = LibraryActionJournal::new();
+    let at = |seconds: i64| Utc::now() + chrono::TimeDelta::seconds(seconds);
+    assert!(!journal.wrong_version_asked("nd-1", ASKED));
+
+    journal.record(LibraryActionEntry {
+        detail: Some(ASKED.into()),
+        at_utc: at(1),
+        ..plain(LibraryAction::WrongVersion, "nd-1", LibraryActionState::Skipped)
+    });
+    assert!(journal.wrong_version_asked("nd-1", ASKED));
+    assert!(!journal.wrong_version_asked("nd-1", "other words"));
+
+    let pick = |state: LibraryActionState, seconds: i64| LibraryActionEntry {
+        key: LibraryActionJournal::make_key(
+            LibraryAction::WrongVersion,
+            "nd-1",
+            &format!("1:2{PICK_SUFFIX}"),
+        ),
+        at_utc: at(seconds),
+        ..plain(LibraryAction::WrongVersion, "nd-1", state)
+    };
+    journal.record(pick(LibraryActionState::Failed, 2));
+    assert!(
+        journal.wrong_version_asked("nd-1", ASKED),
+        "a pick refused keeps the mark"
+    );
+    journal.record(LibraryActionEntry {
+        at_utc: at(3),
+        ..plain(LibraryAction::BetterQuality, "nd-2", LibraryActionState::Applied)
+    });
+    assert!(
+        journal.wrong_version_asked("nd-1", ASKED),
+        "another song's action"
+    );
+
+    journal.record(pick(LibraryActionState::Applied, 4));
+    assert!(
+        !journal.wrong_version_asked("nd-1", ASKED),
+        "a pick replaced the file"
+    );
+
+    let other = LibraryActionJournal::new();
+    other.record(LibraryActionEntry {
+        detail: Some(ASKED.into()),
+        at_utc: at(1),
+        ..plain(LibraryAction::WrongVersion, "nd-1", LibraryActionState::Skipped)
+    });
+    other.record(LibraryActionEntry {
+        at_utc: at(2),
+        ..plain(LibraryAction::WrongSong, "nd-1", LibraryActionState::Failed)
+    });
+    assert!(
+        !other.wrong_version_asked("nd-1", ASKED),
+        "another action on the song"
+    );
+}
+
 #[test]
 fn keys_and_fingerprints_keep_their_format() {
     assert_eq!(

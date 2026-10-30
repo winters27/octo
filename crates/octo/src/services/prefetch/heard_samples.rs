@@ -1056,6 +1056,21 @@ impl HeardSamples {
             .map(|raw| raw.items)
     }
 
+    /// The compressed print of the first `length_seconds` of `path`, what an AcoustID lookup
+    /// sends, and the seconds decoded, in one `fpcalc` place of `class`.
+    pub async fn compressed_print(
+        &self,
+        path: &Path,
+        length_seconds: i32,
+        class: FpcalcClass,
+    ) -> Option<(String, i32)> {
+        let _slot = self.slot(class).await;
+        self.printer()
+            .compressed(path, length_seconds, self.timeout_seconds())
+            .await
+            .filter(|(print, _)| !print.is_empty())
+    }
+
     /// The heard audio's raw print over the whole song (`fpcalc -length 0`), from the held file,
     /// else one fresh fetch.
     pub async fn whole_song_print(&self, heard: &HeardRecord) -> WholePrint {

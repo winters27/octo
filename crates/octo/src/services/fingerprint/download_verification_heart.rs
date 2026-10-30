@@ -393,28 +393,11 @@ impl DownloadVerificationService {
         catalog: &HeardRecording,
         min: f64,
     ) -> Result<(HeardRecording, Option<String>), HeartBusy> {
-        let mut duplicates = Vec::new();
-        if let Some(music_brainz) = self.music_brainz.clone() {
-            let questions = HeartQuestions::new(music_brainz, Arc::clone(&parts.catalog), Lane::Heart);
-            for code in &dominant.isrcs {
-                let listed = questions.code_recordings(code).await?;
-                let Some(note) = listed
-                    .iter()
-                    .find(|recording| recording.id.eq_ignore_ascii_case(&dominant.id))
-                    .map(|recording| recording.note.clone())
-                else {
-                    continue;
-                };
-                duplicates.extend(
-                    listed
-                        .iter()
-                        .filter(|recording| recording.note == note)
-                        .filter(|recording| !recording.id.eq_ignore_ascii_case(&dominant.id))
-                        .map(|recording| recording.id.clone()),
-                );
-            }
-        }
-        Ok(became(answer, dominant, &duplicates, catalog, min))
+        let questions = self
+            .music_brainz
+            .clone()
+            .map(|music_brainz| HeartQuestions::new(music_brainz, Arc::clone(&parts.catalog), Lane::Heart));
+        became_with_duplicates(questions.as_ref(), answer, dominant, catalog, min).await
     }
 
     /// A heart never played: the song's pinned video, fetched and printed only to help find R. With
@@ -548,7 +531,8 @@ impl DownloadVerificationService {
         };
         let mut facts = FileFacts::new(outcome, labels);
         if let (Some(parts), Some(raw)) = (&parts, &raw) {
-            facts.heard_distance = reference_print(parts, gate)
+            facts.heard_distance = reference_print(parts, gate, settings.effective_fingerprint_seconds())
+                .await
                 .and_then(|heard| preview_check::compare(&raw.items, &heard))
                 .map(|comparison| comparison.bit_error);
         }
@@ -702,9 +686,44 @@ impl DownloadVerificationService {
 /// The peer name a refused video is remembered under.
 pub const YOUTUBE_PEER: &str = "youtube";
 
+/// R becomes an answer's dominant recording D and the recordings MusicBrainz files under D's own
+/// codes with D's note, and the tag a file kept as heard may carry. With no MusicBrainz to ask,
+/// D alone.
+pub async fn became_with_duplicates(
+    questions: Option<&HeartQuestions>,
+    answer: &AcoustIdAnswer,
+    dominant: &WeighedRecording,
+    catalog: &HeardRecording,
+    min: f64,
+) -> Result<(HeardRecording, Option<String>), HeartBusy> {
+    let mut duplicates = Vec::new();
+    if let Some(questions) = questions {
+        for code in &dominant.isrcs {
+            let listed = questions.code_recordings(code).await?;
+            let Some(note) = listed
+                .iter()
+                .find(|recording| recording.id.eq_ignore_ascii_case(&dominant.id))
+                .map(|recording| recording.note.clone())
+            else {
+                continue;
+            };
+            duplicates.extend(
+                listed
+                    .iter()
+                    .filter(|recording| recording.note == note)
+                    .filter(|recording| !recording.id.eq_ignore_ascii_case(&dominant.id))
+                    .map(|recording| recording.id.clone()),
+            );
+        }
+    }
+    Ok(became(answer, dominant, &duplicates, catalog, min))
+}
+
 /// The print a file is compared with for proof 2: what the person heard, or for a heart never
-/// played its stand-in when that is the reference.
-fn reference_print(parts: &HeartParts, gate: &HeartGate) -> Option<Vec<u32>> {
+/// played its stand-in when that is the reference. A file that is itself the heard audio (a kept
+/// file, a library song played) whose print is not stored is printed now, `seconds` of it, in a
+/// heart's `fpcalc` place.
+async fn reference_print(parts: &HeartParts, gate: &HeartGate, seconds: i32) -> Option<Vec<u32>> {
     let sample = match (&gate.heard, &gate.stand_in) {
         (Some(heard), _) => heard
             .sample_id
@@ -713,11 +732,22 @@ fn reference_print(parts: &HeartParts, gate: &HeartGate) -> Option<Vec<u32>> {
         (None, Some(stand_in)) if stand_in.is_reference => stand_in.sample_id.clone()?,
         _ => return None,
     };
-    parts
+    let stored = parts
         .samples
         .prints(&sample)
         .map(|prints| prints.raw)
-        .filter(|raw| !raw.is_empty())
+        .filter(|raw| !raw.is_empty());
+    if stored.is_some() {
+        return stored;
+    }
+    match gate.heard.as_ref().map(|heard| &heard.source) {
+        Some(HeardSource::Library { path } | HeardSource::Acquired { path }) => parts
+            .samples
+            .raw_print(Path::new(path), seconds, FpcalcClass::Heart)
+            .await
+            .filter(|raw| !raw.is_empty()),
+        _ => None,
+    }
 }
 
 /// The heard master's verdict on one file: from the person's open round of this acquisition,

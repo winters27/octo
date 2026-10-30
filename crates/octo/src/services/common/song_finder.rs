@@ -9,7 +9,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use octo_core::common::acquisition_tracker::user_safe;
 use octo_core::common::{Clock, dotnet};
-use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
+use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, WaitingFor};
 use octo_core::fingerprint::recording_identity::RecordingKind;
 use octo_core::lidarr::{LidarrRelease, LidarrTrackRequest};
 use octo_core::models::download::AcquisitionCandidate;
@@ -25,10 +25,14 @@ use tracing::{info, warn};
 
 use super::acquisition_tracker::{AcquisitionState, AcquisitionTracker, acquisition_kinds, key_of};
 use super::download_picks::{DownloadPicks, LIDARR_SOURCE, PickedCopy, SOULSEEK_SOURCE};
+use super::heart_acquisition_coordinator::{GateStart, HeartGates};
 use super::replace_anyway::{self, OtherTake, PickCompare, ReplaceCheck};
-use super::track_acquisition_queue::TrackAcquisitionQueue;
+use super::soulseek_hold_store::Holder;
+use super::track_acquisition_queue::{AcquisitionHeld, TrackAcquisitionQueue};
 use crate::services::common::AcquisitionTarget;
 use crate::services::family::LibraryWriteGate;
+use crate::services::library::library_action_executor::LibraryActionExecutor;
+use crate::services::library::library_action_journal::LibraryActionJournal;
 use crate::services::library::upgrade_queue::{AudioSummary, UpgradeAsk, UpgradeQueue};
 use crate::services::library::{NavidromeSongPathResolver, UpgradeSources};
 use crate::services::lidarr::{LidarrClient, LidarrTrackFetcher};
@@ -257,6 +261,9 @@ pub struct PickAsk {
 /// What take a library song's own file is, by its audio. None when it cannot be told.
 pub type TakeFn = Arc<dyn Fn(FindTarget) -> BoxFuture<'static, Option<RecordingKind>> + Send + Sync>;
 
+/// Whether Lidarr is left alone for the song's artist, who has music in it already.
+pub type LeftAloneFn = Arc<dyn Fn(FindTarget) -> BoxFuture<'static, bool> + Send + Sync>;
+
 /// The seams, so tests run a look without slskd, Lidarr or Navidrome.
 #[derive(Clone)]
 pub struct SongFinderSeams {
@@ -266,7 +273,19 @@ pub struct SongFinderSeams {
     pub sources_for: SourcesFn,
     pub fetch: FetchFn,
     pub take_of: TakeFn,
+    /// Whether Lidarr may be used for the song's artist at all: an artist with music in Lidarr
+    /// gets no Lidarr copy, listed or picked. Never, until Lidarr's own check is given.
+    pub lidarr_left_alone: LeftAloneFn,
 }
+
+/// A pick whose file AcoustID did not answer for: it is not kept, and the person can pick again.
+pub const ACOUST_ID_BUSY: &str = "AcoustID is busy, try again";
+/// A pick whose song MusicBrainz did not answer for.
+pub const MUSIC_BRAINZ_BUSY: &str = "MusicBrainz is busy, try again";
+/// A lossy copy picked for a lossless file the person said is the wrong version.
+pub const LOSSY_OVER_LOSSLESS: &str = "Your copy is lossless and this one is not. Replace it anyway?";
+/// Lidarr, for an artist with music in it already: no copy of it is listed or fetched.
+pub const LIDARR_LEFT_ALONE: &str = "Lidarr was left alone: this artist already has music in your Lidarr";
 
 /// The services a look uses when it needs them. Each may be missing.
 #[derive(Default, Clone)]
@@ -289,6 +308,11 @@ pub struct SongFinderServices {
     /// Family's write gate, once Family's services exist: a family member's pick lands in
     /// their own library. Unset, or with Family off, every pick fills the shared library.
     pub family: std::sync::OnceLock<Arc<LibraryWriteGate>>,
+    /// Builds a pick's gate: the recording the song is, which a pick's file is held to by the
+    /// import rule. Without it a pick keeps the shipped checks alone.
+    pub gates: Option<Arc<dyn HeartGates>>,
+    /// The library actions' journal, which says which songs carry the "wrong version asked" mark.
+    pub journal: Option<Arc<LibraryActionJournal>>,
 }
 
 impl SongFinderServices {
@@ -304,6 +328,13 @@ impl SongFinderServices {
 
     fn remembers(&self) -> bool {
         self.soulseek.as_ref().is_some_and(|s| s.remembers_rejections())
+    }
+
+    /// Whether the library song `library_id` carries the "wrong version asked" mark.
+    fn wrong_version_asked(&self, library_id: &str) -> bool {
+        self.journal.as_ref().is_some_and(|journal| {
+            journal.wrong_version_asked(library_id, LibraryActionExecutor::WRONG_VERSION_FIND_SONGS)
+        })
     }
 
     /// Why this person may not have a library song replaced right now, or None.
@@ -473,9 +504,10 @@ impl SongFinder {
                 let services = services.clone();
                 Arc::new(move |target, copy, user, ask| {
                     let services = services.clone();
-                    async move { Ok(fetch(&services, &target, &copy, &user, &ask)) }.boxed()
+                    async move { Ok(fetch(&services, &target, &copy, &user, &ask).await) }.boxed()
                 })
             },
+            lidarr_left_alone: Arc::new(|_| async { false }.boxed()),
             take_of: {
                 let services = services.clone();
                 Arc::new(move |target| {
@@ -719,23 +751,30 @@ impl SongFinder {
     }
 
     async fn search_one(&self, job: &Job, source: &str) {
-        let search = {
+        let (search, left_alone) = {
             let seams = self.seams.lock();
             if source == SOULSEEK_SOURCE {
-                seams.search_soulseek.clone()
+                (seams.search_soulseek.clone(), None)
             } else {
-                seams.search_lidarr.clone()
+                (seams.search_lidarr.clone(), Some(seams.lidarr_left_alone.clone()))
             }
         };
-        let limit = CancellationToken::new();
-        let answer =
+        // Lidarr is left alone for an artist with music in it: it lists no copy, so nobody picks
+        // one its import could put over the artist's own files.
+        let answer = if let Some(left_alone) = left_alone
+            && left_alone(job.target_now()).await
+        {
+            Ok((Vec::new(), Vec::new(), Some(LIDARR_LEFT_ALONE.to_string())))
+        } else {
+            let limit = CancellationToken::new();
             match tokio::time::timeout(Self::SEARCH_LIMIT, search(job.target_now(), limit.clone())).await {
                 Ok(answer) => answer,
                 Err(_) => {
                     limit.cancel();
                     Err(anyhow::anyhow!("The operation was canceled."))
                 }
-            };
+            }
+        };
         let result = match answer {
             Ok((copies, queries, text)) => {
                 merge(&mut job.state.lock(), copies);
@@ -828,6 +867,14 @@ impl SongFinder {
         let Some(copy) = copy else {
             return PickOutcome::skipped("That copy is not on the list.");
         };
+        // A Lidarr copy listed before its artist gained music in Lidarr is not fetched now; the
+        // person's other copies stay on the list.
+        if !copy.pick.is_soulseek() {
+            let left_alone = self.seams.lock().lidarr_left_alone.clone();
+            if left_alone(job.target_now()).await {
+                return PickOutcome::skipped(LIDARR_LEFT_ALONE);
+            }
+        }
         let fetch = self.seams.lock().fetch.clone();
         let ask = PickAsk { anyway, listed };
         match fetch(job.target_now(), copy, user.to_string(), ask).await {
@@ -870,6 +917,18 @@ impl SongFinder {
                 "Only a lossless release can take the place of the one in your library.".to_string(),
             );
         }
+        Self::copy_refusal(target, copy, settings, rejected, remembers)
+    }
+
+    /// Why a picked Soulseek file may not take a library song's place by the download's own name,
+    /// length and version checks, whatever its quality, or None.
+    pub fn copy_refusal(
+        target: &FindTarget,
+        copy: &FoundCopy,
+        settings: Option<&SoulseekSettings>,
+        rejected: Option<&RejectedPeerRegistry>,
+        remembers: bool,
+    ) -> Option<String> {
         let defaults = SoulseekSettings::default();
         let hit = copy.pick.to_hit()?;
         let why = soulseek_candidates::pick_refusal(
@@ -1221,7 +1280,17 @@ fn first_word(quality: Option<&str>) -> Option<&str> {
 // The defaults behind the seams
 // ---------------------------------------------------------------------------------------
 
-fn fetch(
+/// Whether a listed copy is lossless: a Soulseek file by its format, a Lidarr release by its
+/// quality; Lidarr's own choice searches for the profile's best and counts as lossless.
+fn copy_is_lossless(copy: &FoundCopy) -> bool {
+    if copy.pick.is_soulseek() {
+        is_lossless(copy.shown.format.as_deref())
+    } else {
+        copy.pick.release().is_none() || is_lossless(first_word(copy.shown.format.as_deref()))
+    }
+}
+
+async fn fetch(
     services: &SongFinderServices,
     target: &FindTarget,
     copy: &FoundCopy,
@@ -1232,7 +1301,38 @@ fn fetch(
         let settings = services.soulseek_settings();
         let mut pick = (*copy.pick).clone();
         let mut asked: Option<String> = None;
+        let marked = services.wrong_version_asked(library_id);
         match ask.anyway {
+            // The person said their copy is the wrong version, and Octo could not tell it apart
+            // by sound: the copy they pick replaces it as Wrong version does, whatever its quality,
+            // asked first when it would trade a lossless copy for a lossy one.
+            _ if marked => {
+                if let Some(refused) = SongFinder::copy_refusal(
+                    target,
+                    copy,
+                    Some(&settings),
+                    services.rejected(),
+                    services.remembers(),
+                ) {
+                    return PickOutcome::skipped(refused);
+                }
+                if is_lossless(target.owned_format.as_deref()) && !copy_is_lossless(copy) {
+                    match ask.anyway {
+                        None => return PickOutcome::skipped(LOSSY_OVER_LOSSLESS),
+                        Some(false) => {
+                            if let Some(gate) = services.upgrade_refusal(user) {
+                                return PickOutcome::skipped(gate);
+                            }
+                            return PickOutcome {
+                                compare: Some(replace_anyway::compare(target, copy, None)),
+                                ..PickOutcome::new(library_action_states::CONFIRM, LOSSY_OVER_LOSSLESS)
+                            };
+                        }
+                        Some(true) => {}
+                    }
+                }
+                pick.wrong_version = true;
+            }
             None => {
                 if let Some(refused) = SongFinder::replace_refusal(
                     target,
@@ -1375,6 +1475,30 @@ fn fetch(
     let (Some(acquisitions), Some(picks)) = (&services.acquisitions, &services.picks) else {
         return PickOutcome::skipped("The copy could not be asked for.");
     };
+    // The recording the song is, which the pick's file is held to by the import rule, asked now
+    // at the person's pace. A pick is never held: with MusicBrainz not answering, the person
+    // hears so and picks again.
+    let gates = match &services.gates {
+        Some(builder) => {
+            let asker = Holder {
+                user: user.to_string(),
+                ..Default::default()
+            };
+            match builder
+                .build(provider, &external_id, &asker, AcquisitionOrigin::SongFinderPick)
+                .await
+            {
+                GateStart::Ready(gate) => vec![gate],
+                GateStart::Hold {
+                    waiting_for: WaitingFor::MusicBrainz,
+                    ..
+                } => return PickOutcome::skipped(MUSIC_BRAINZ_BUSY),
+                // Nothing else of the catalog is needed to fetch it: the shipped checks decide.
+                GateStart::Hold { .. } => Vec::new(),
+            }
+        }
+        None => Vec::new(),
+    };
     picks.pin(&external_id, copy.pick.clone());
     if let Some(tracker) = &tracker {
         tracker.begin_kind(
@@ -1409,7 +1533,7 @@ fn fetch(
         .unwrap_or(AcquisitionTarget::Shared);
     let download = acquisitions.enqueue_as(
         Some(AcquisitionOrigin::SongFinderPick),
-        Vec::new(),
+        gates,
         &destination,
         false,
         provider,
@@ -1429,10 +1553,21 @@ fn fetch(
     );
     let (picks, pick, waited_id) = (picks.clone(), copy.pick.clone(), external_id.clone());
     tokio::spawn(async move {
-        if let Err(e) = download.wait().await
-            && let Some(tracker) = &tracker
-        {
-            tracker.fail(provider, &waited_id, Some(&e.root_cause().to_string()));
+        if let Err(e) = download.wait().await {
+            // A pick is never held: a file its check could not judge now is thrown away, and its
+            // row ends with the words the check gave.
+            let reason = match e.downcast_ref::<AcquisitionHeld>() {
+                Some(held) => {
+                    for file in &held.files {
+                        let _ = std::fs::remove_file(file);
+                    }
+                    held.line.clone()
+                }
+                None => e.root_cause().to_string(),
+            };
+            if let Some(tracker) = &tracker {
+                tracker.fail(provider, &waited_id, Some(&reason));
+            }
         }
         // However it ended, the pick was for this download and no later one.
         picks.forget(&waited_id, &pick);

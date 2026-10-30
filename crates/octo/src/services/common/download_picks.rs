@@ -50,6 +50,12 @@ pub struct PickedCopy {
     /// so: the song it is held to in place of the library file's own title, album and length.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anyway: Option<AnywaySong>,
+
+    /// Set when the copy replaces a library file the person said is the wrong version, which
+    /// Octo could not tell apart by sound: it replaces the file as Wrong version does, whatever
+    /// its quality.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub wrong_version: bool,
 }
 
 /// The song a copy picked to replace a library file anyway is held to: the library file's own
@@ -84,6 +90,7 @@ impl Default for PickedCopy {
             indexer_id: None,
             release_title: None,
             anyway: None,
+            wrong_version: false,
         }
     }
 }

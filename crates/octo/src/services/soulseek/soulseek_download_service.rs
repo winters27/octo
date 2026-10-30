@@ -751,6 +751,14 @@ impl SoulseekDownloadService {
                 }
                 continue;
             }
+            if let Some(why) = self.denied_by_sound(base, download, &verdict) {
+                let _ = std::fs::remove_file(&path);
+                last_refusal = Some(format!("YouTube's video for '{artist} - {title}' {why}"));
+                if ct.is_cancelled() {
+                    return Err(OperationCanceled.into());
+                }
+                continue;
+            }
             let song = &mut download.song;
             if verdict.verdict == VerificationVerdict::Mismatch {
                 if verdict.r#match.is_none() && verdict.matched_title.as_deref().is_none_or(str::is_empty) {

@@ -1592,7 +1592,10 @@ fn get_extension(path: &str) -> &str {
 #[path = "download_verification_heart.rs"]
 mod heart;
 
-pub use heart::{ANOTHER_SONG_OR_TAKE, ANOTHER_SONG_PLAYED, HEARD_LOOKUP_BUSY, NEVER_PLAYED, YOUTUBE_PEER};
+pub use heart::{
+    ANOTHER_SONG_OR_TAKE, ANOTHER_SONG_PLAYED, HEARD_LOOKUP_BUSY, NEVER_PLAYED, YOUTUBE_PEER,
+    became_with_duplicates,
+};
 
 #[cfg(test)]
 #[path = "download_verification_service_tests.rs"]
