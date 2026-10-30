@@ -252,6 +252,13 @@ impl SoulseekDownloadService {
             let _ = std::fs::remove_file(path);
             return FileJudged::NotProven(reason);
         }
+        // Whoever's gate could not tell this version apart keeps what they heard if nothing better
+        // is proven: their chain reads it here.
+        for (gate, check) in &checks {
+            if check.verdict == GateVerdict::Undecided(Undecided::KeepHeardCopy) {
+                ledger.record(&gate.user, gate.origin, GateOutcome::Undecided);
+            }
+        }
         // Not the song at all only when its audio cannot even be decoded; every other refusal is
         // one person's version, remembered for them alone.
         let shared = checks.iter().all(|(_, check)| {

@@ -975,6 +975,23 @@ impl HeartGates for DownloadVerificationService {
         }
     }
 
+    async fn owned_passes(&self, path: &str, gate: &HeartGate) -> bool {
+        let candidate = HeartCandidate {
+            labels: LabelSource::TheFile,
+            identity: Some(octo_core::fingerprint::heart_gate::HeardSource::Library {
+                path: path.to_string(),
+            }),
+            acquisition_key: String::new(),
+        };
+        let check = self
+            .verify_for_heart(std::path::Path::new(path), &candidate, gate)
+            .await;
+        matches!(
+            check.verdict,
+            octo_core::fingerprint::heart_gate::GateVerdict::Accept { .. }
+        )
+    }
+
     fn open_rounds(&self, acquisition_key: &str, gates: &[HeartGate]) -> Box<dyn Send> {
         let Some(parts) = self.heart.get() else {
             return Box::new(());
