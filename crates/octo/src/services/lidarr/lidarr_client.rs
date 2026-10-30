@@ -926,6 +926,15 @@ impl LidarrClient {
             .collect()
     }
 
+    /// Every queue item Lidarr has, of every artist, pending releases included.
+    pub async fn queue(&self) -> Result<Vec<LidarrQueueItem>, LidarrError> {
+        self.get_array("/api/v1/queue/details")
+            .await?
+            .iter()
+            .map(parse_queue_item)
+            .collect()
+    }
+
     /// The queue items of every album of one artist, pending releases included.
     pub async fn artist_queue(&self, artist_id: i32) -> Result<Vec<LidarrQueueItem>, LidarrError> {
         self.get_array(&format!("/api/v1/queue/details?artistId={artist_id}"))

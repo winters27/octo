@@ -1312,6 +1312,7 @@ impl HeartAcquisitionCoordinator {
     /// `user` took their heart back: they leave every hold of the song, whatever it waits for, and
     /// each hold nobody is left in ends, its row with the last. How many holds they left.
     pub fn leave_holds(&self, provider: &str, external_id: &str, user: &str) -> usize {
+        self.lidarr.unhearted(provider, external_id, user);
         let Some(holds) = self.extras.holds.as_ref() else {
             return 0;
         };
@@ -1484,7 +1485,11 @@ impl HeartAcquisitionCoordinator {
         target: &AcquisitionTarget,
         origin: AcquisitionOrigin,
     ) -> anyhow::Result<TrackOutcome> {
-        // A heart of a song is one of the events its kept-as-heard files are checked again on.
+        // A heart of a song is one of the events its kept-as-heard files are checked again on, and
+        // a Lidarr follow of it reads whether its download moved.
+        if matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart) {
+            self.lidarr.song_event(provider, external_id);
+        }
         if matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart)
             && let Some(kept) = self.extras.kept.clone()
         {
@@ -2074,6 +2079,33 @@ impl HeartAcquisitionCoordinator {
                     .await?
                 {
                     return Ok(TrackOutcome::HandedToLidarr);
+                }
+                // Lidarr last, and its walk got no answer: a heart holds until one comes, an
+                // import goes back on its trickle.
+                if is_last && let Some(busy) = self.lidarr.waits_on(provider, external_id) {
+                    use crate::services::fingerprint::music_brainz_client::HeartBusy;
+                    let (waiting_for, question) = match busy {
+                        HeartBusy::MusicBrainz(question) => (WaitingFor::MusicBrainz, Some(question)),
+                        HeartBusy::Deezer => (WaitingFor::Deezer, None),
+                    };
+                    if files_hold(origin, waiting_for) {
+                        self.file_hold(
+                            provider,
+                            external_id,
+                            requested_by,
+                            origin,
+                            waiting_for,
+                            holders.clone(),
+                            waiting_line(waiting_for),
+                            Vec::new(),
+                            question,
+                            filed,
+                        );
+                        return Ok(TrackOutcome::Held(waiting_for));
+                    }
+                    if origin == AcquisitionOrigin::Import && waiting_for == WaitingFor::MusicBrainz {
+                        return Ok(TrackOutcome::Held(waiting_for));
+                    }
                 }
                 continue;
             }

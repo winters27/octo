@@ -217,9 +217,9 @@ fn is_octos(pending: Option<&LidarrPendingAlbums>, download_id: Option<&str>) ->
 }
 
 /// What of an artist is the user's: the albums holding a file whose import row is not of one of
-/// Octo's own grabs (a row with no client, or a grab id no entry of Octo's lists), and the albums
-/// with a queue item that is not Octo's. A file with no import row (one a rescan linked) counts
-/// for nobody.
+/// Octo's own grabs (a row with no client, or a grab id no entry of Octo's lists), or a file the
+/// follow judged the user's when it came in, and the albums with a queue item that is not Octo's.
+/// A file with no import row that a rescan linked before Octo's search counts for nobody.
 #[derive(Debug, Default)]
 struct UsersOwn {
     file_albums: HashSet<i32>,
@@ -231,12 +231,16 @@ impl UsersOwn {
         client: &LidarrClient,
         pending: Option<&LidarrPendingAlbums>,
         artist_id: i32,
+        users_files: &[i32],
     ) -> Result<UsersOwn, LidarrError> {
         let mut own = UsersOwn::default();
         if artist_id <= 0 {
             return Ok(own);
         }
         let files = client.artist_track_files(artist_id).await?;
+        for file in files.iter().filter(|file| users_files.contains(&file.id)) {
+            own.file_albums.insert(file.album_id);
+        }
         if !files.is_empty() {
             for row in client
                 .artist_history(artist_id, Some(LidarrHistoryEvent::TrackFileImported))
@@ -271,7 +275,8 @@ impl UsersOwn {
     }
 }
 
-/// Puts back a pick that never searched, then forgets its entry:
+/// Puts back a pick that never searched, or whose follow ended with every download of Octo's
+/// accounted for and Octo's own files gone, then forgets its entry:
 /// - the album's release choice goes back to exactly what was saved, when it is still exactly
 ///   Octo's pin (a choice the user changed stays as the user set it), and the rescan the restore
 ///   queues is waited out;
@@ -305,7 +310,7 @@ pub async fn put_back_unsearched(
         .map(|album| album.artist_id)
         .filter(|id| *id > 0)
         .unwrap_or(entry.lidarr_artist_id);
-    let own = UsersOwn::read(client, pending, artist_id).await?;
+    let own = UsersOwn::read(client, pending, artist_id, &entry.users_files).await?;
     if entry.album_added
         && let Some(album) = &album
     {

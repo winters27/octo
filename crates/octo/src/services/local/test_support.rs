@@ -16,6 +16,8 @@ use super::{ILocalLibraryService, LocalSongMapping, ParsedExternalId, ParsedSong
 pub(crate) struct FakeLocalLibrary {
     pub by_tags: Mutex<Vec<(String, String, Option<String>, LocalSongMapping)>>,
     pub scans: AtomicUsize,
+    /// Every move of the records at one path to another, in order.
+    pub moved: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeLocalLibrary {
@@ -80,6 +82,13 @@ impl ILocalLibraryService for FakeLocalLibrary {
     async fn trigger_library_scan(&self, _force: bool) -> bool {
         self.scans.fetch_add(1, Ordering::SeqCst);
         true
+    }
+
+    async fn update_local_path(&self, old_path: &str, new_path: &str) -> anyhow::Result<usize> {
+        self.moved
+            .lock()
+            .push((old_path.to_string(), new_path.to_string()));
+        Ok(1)
     }
 
     async fn get_scan_status(&self) -> Option<ScanStatus> {

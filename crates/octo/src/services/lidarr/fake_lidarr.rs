@@ -152,6 +152,11 @@ pub(crate) struct Grab {
     /// The client keeps its copy after Lidarr's import (a seeding torrent), so the dropped file
     /// stays where the download put it.
     pub keeps_files: bool,
+    /// The download is finished the moment it is grabbed, so the refresh the grab queues imports
+    /// it at once.
+    pub finished: bool,
+    /// The client reports no folder for it, as SABnzbd does while it unpacks.
+    pub no_output_path: bool,
 }
 
 impl Grab {
@@ -177,7 +182,29 @@ impl Grab {
                 .collect(),
             release_id: None,
             keeps_files: true,
+            finished: false,
+            no_output_path: false,
         }
+    }
+
+    /// The same download, finished as it is grabbed.
+    pub fn finished(mut self) -> Grab {
+        self.finished = true;
+        self
+    }
+
+    /// The same download, its client reporting no folder for it.
+    pub fn without_output_path(mut self) -> Grab {
+        self.no_output_path = true;
+        self
+    }
+
+    /// The same download, one file of it matched to another album.
+    pub fn file_into_album(mut self, track_id: i32, album_id: i32) -> Grab {
+        for file in self.files.iter_mut().filter(|f| f.track_id == track_id) {
+            file.album_id = album_id;
+        }
+        self
     }
 
     /// The same download from another client: its type, its name in Lidarr, its protocol, and
@@ -354,6 +381,10 @@ struct State {
     downloads: Vec<Download>,
     /// What the next search of an album grabs.
     plans: Vec<(i32, Grab)>,
+    /// Albums whose next search holds a release back instead of grabbing, and why.
+    held_back: Vec<(i32, String)>,
+    /// Albums whose next search runs beside a search of the user's own for the same album.
+    overlapping: Vec<i32>,
     pending: Vec<PendingRelease>,
     /// The queue as the last refresh of the downloads left it; None after a restart.
     snapshot: Option<Vec<Value>>,
@@ -382,6 +413,8 @@ struct State {
     offered: Vec<(String, i32, String, i64)>,
     grabs: Vec<String>,
     requests: Vec<Recorded>,
+    /// Lidarr answers nothing but 503.
+    down: bool,
 }
 
 impl FakeLidarr {
@@ -421,6 +454,8 @@ impl FakeLidarr {
                 stale_statistics: BTreeMap::new(),
                 downloads: Vec::new(),
                 plans: Vec::new(),
+                held_back: Vec::new(),
+                overlapping: Vec::new(),
                 pending: Vec::new(),
                 snapshot: Some(Vec::new()),
                 failing_clients: BTreeSet::new(),
@@ -445,6 +480,7 @@ impl FakeLidarr {
                 offered: Vec::new(),
                 grabs: Vec::new(),
                 requests: Vec::new(),
+                down: false,
             })),
         };
         let server = MockServer::builder().start().await;
@@ -579,6 +615,11 @@ impl FakeLidarr {
         self.with(|state| state.health = checks);
     }
 
+    /// Lidarr stops answering (503 to everything), or answers again.
+    pub fn set_down(&self, down: bool) {
+        self.with(|state| state.down = down);
+    }
+
     /// Imports write their rows one per command step instead of all at once.
     pub fn set_rows_one_per_step(&self, on: bool) {
         self.with(|state| state.rows_one_per_step = on);
@@ -672,6 +713,42 @@ impl FakeLidarr {
         self.with(|state| state.pending.retain(|p| p.queue_id != queue_id));
     }
 
+    /// The next search of the album holds its release back (`delay`,
+    /// `downloadClientUnavailable`) instead of grabbing it.
+    pub fn plan_held_back(&self, album_id: i32, reason: &str) {
+        self.with(|state| state.held_back.push((album_id, reason.to_string())));
+    }
+
+    /// A pending release is grabbed after all: it leaves the queue's pending list and becomes
+    /// this download, with its `grabbed` row naming the search it came from.
+    pub fn grab_pending(&self, queue_id: i32, grab: Grab) {
+        self.with(|state| {
+            let album_id = state
+                .pending
+                .iter()
+                .find(|p| p.queue_id == queue_id)
+                .map(|p| p.album_id)
+                .expect("a pending release");
+            state.pending.retain(|p| p.queue_id != queue_id);
+            state.grab(album_id, grab, "Search");
+        });
+    }
+
+    /// The next search of the album runs beside a search of the user's own for it, both started
+    /// before either ends.
+    pub fn overlap_next_search(&self, album_id: i32) {
+        self.with(|state| state.overlapping.push(album_id));
+    }
+
+    /// A download-level row Lidarr writes for a download: `albumImportIncomplete`,
+    /// `downloadIgnored` and the like.
+    pub fn download_row(&self, download_id: &str, event: LidarrHistoryEvent) {
+        self.with(|state| {
+            let download = state.download(download_id).clone();
+            state.row_for_download(event, &download, None);
+        });
+    }
+
     /// The client reports how much is left.
     pub fn progress(&self, download_id: &str, size_left: i64) {
         self.with(|state| state.download(download_id).size_left = size_left);
@@ -680,25 +757,7 @@ impl FakeLidarr {
     /// The download finishes: its files lie in its folder, and the next refresh shows it ready
     /// to import.
     pub fn complete(&self, download_id: &str) {
-        self.with(|state| {
-            let root = state.local(LIDARR_DOWNLOADS).expect("the downloads folder");
-            let download = state.download(download_id);
-            download.state = Fetch::Completed;
-            download.size_left = 0;
-            let id = download.grab.download_id.clone();
-            let names: Vec<(String, String)> = download
-                .grab
-                .files
-                .iter()
-                .map(|f| (file_name(f.track_id, &f.title, &f.quality), f.title.clone()))
-                .collect();
-            for (name, title) in names {
-                write_file(
-                    &root.join(&id).join(&name),
-                    format!("{title} from {id}").as_bytes(),
-                );
-            }
-        });
+        self.with(|state| state.finish_download(download_id));
     }
 
     /// The client's own warning on the download, as qBittorrent gives a stalled torrent.
@@ -725,8 +784,8 @@ impl FakeLidarr {
         });
     }
 
-    /// Lidarr's state for a finished download it will not import: `importBlocked` or
-    /// `importFailed`.
+    /// Lidarr's state for a download it will not import, from the next refresh on:
+    /// `importBlocked`, `importFailed`, `downloadFailedPending`.
     pub fn block_import(&self, download_id: &str, tracked_state: &str) {
         self.with(|state| state.download(download_id).blocked = Some(tracked_state.to_string()));
     }
@@ -1227,11 +1286,38 @@ impl State {
                 "size": download.grab.size.to_string(),
             }))),
         );
+        let finished = download.grab.finished;
+        let download_id = download.grab.download_id.clone();
         self.downloads.push(download);
+        if finished {
+            self.finish_download(&download_id);
+        }
         self.queue("RefreshMonitoredDownloads", Map::new(), "unspecified", false);
     }
 
-    /// A search: the quick imports, then one planned grab for each album searched.
+    /// The download finishes: its files lie in its folder, ready for the next refresh.
+    fn finish_download(&mut self, download_id: &str) {
+        let root = self.local(LIDARR_DOWNLOADS).expect("the downloads folder");
+        let download = self.download(download_id);
+        download.state = Fetch::Completed;
+        download.size_left = 0;
+        let id = download.grab.download_id.clone();
+        let names: Vec<(String, String)> = download
+            .grab
+            .files
+            .iter()
+            .map(|f| (file_name(f.track_id, &f.title, &f.quality), f.title.clone()))
+            .collect();
+        for (name, title) in names {
+            write_file(
+                &root.join(&id).join(&name),
+                format!("{title} from {id}").as_bytes(),
+            );
+        }
+    }
+
+    /// A search: the quick imports, then one planned grab for each album searched, or a release
+    /// held back where one is planned.
     fn search(&mut self, album_ids: &[i32], release_source: &str) {
         self.searches += 1;
         if !self.hold_imports {
@@ -1240,6 +1326,20 @@ impl State {
             }
         }
         for album_id in album_ids {
+            if let Some(position) = self.held_back.iter().position(|(album, _)| album == album_id) {
+                let (_, reason) = self.held_back.remove(position);
+                let artist_id = self.albums.get(album_id).map_or(0, |a| a.artist_id);
+                let queue_id = 2_000_000_000 + self.next_queue;
+                self.next_queue += 1;
+                self.pending.push(PendingRelease {
+                    queue_id,
+                    album_id: *album_id,
+                    artist_id,
+                    title: format!("Pending release {queue_id}"),
+                    reason,
+                });
+                continue;
+            }
             if let Some(position) = self.plans.iter().position(|(album, _)| album == album_id) {
                 let (_, grab) = self.plans.remove(position);
                 self.grab(*album_id, grab, release_source);
@@ -1697,17 +1797,12 @@ impl State {
 
     fn queue_item(&self, download: &Download) -> Value {
         let (status, tracked) = match download.state {
-            Fetch::Downloading => ("downloading", "downloading".to_string()),
-            Fetch::Completed => (
-                "completed",
-                download
-                    .blocked
-                    .clone()
-                    .unwrap_or_else(|| "importPending".to_string()),
-            ),
-            Fetch::Failed => ("failed", "downloadFailed".to_string()),
-            Fetch::Imported => ("completed", "imported".to_string()),
+            Fetch::Downloading => ("downloading", "downloading"),
+            Fetch::Completed => ("completed", "importPending"),
+            Fetch::Failed => ("failed", "downloadFailed"),
+            Fetch::Imported => ("completed", "imported"),
         };
+        let tracked = download.blocked.clone().unwrap_or_else(|| tracked.to_string());
         let health = if download.warning {
             "warning"
         } else if download.state == Fetch::Failed {
@@ -1715,14 +1810,15 @@ impl State {
         } else {
             "ok"
         };
+        let output_path = (!download.grab.no_output_path)
+            .then(|| format!("{LIDARR_DOWNLOADS}/{}", download.grab.download_id));
         json!({
             "id": download.queue_id, "artistId": download.artist_id, "albumId": download.album_id,
             "title": download.grab.title, "size": download.grab.size as f64,
             "sizeleft": download.size_left as f64, "status": status, "trackedDownloadStatus": health,
             "trackedDownloadState": tracked, "statusMessages": [], "downloadId": download.grab.download_id,
             "protocol": download.grab.protocol, "downloadClient": download.grab.client_name,
-            "indexer": "Fake indexer",
-            "outputPath": format!("{LIDARR_DOWNLOADS}/{}", download.grab.download_id),
+            "indexer": "Fake indexer", "outputPath": output_path,
         })
     }
 
@@ -2259,7 +2355,24 @@ impl State {
                     .remove("name")
                     .and_then(|n| n.as_str().map(str::to_string))
                     .unwrap_or_default();
+                let overlap = (name == "AlbumSearch")
+                    .then(|| ids(&fields, "albumId", "albumIds"))
+                    .and_then(|albums| {
+                        let position = self
+                            .overlapping
+                            .iter()
+                            .position(|album| albums.contains(album))?;
+                        Some(self.overlapping.remove(position))
+                    });
                 let id = self.queue(&name, fields, "manual", false);
+                if let Some(album_id) = overlap {
+                    self.queue(
+                        "AlbumSearch",
+                        object(json!({ "albumIds": [album_id] })),
+                        "manual",
+                        false,
+                    );
+                }
                 if self.mode == CommandMode::Instant {
                     self.drain();
                 }
@@ -2720,6 +2833,9 @@ impl Respond for FakeLidarr {
             path,
             body: body.clone(),
         });
+        if state.down {
+            return answer(503, json!({ "message": "Lidarr is down" }));
+        }
         state.handle(request.method.as_str(), request.url.path(), &query, body.as_ref())
     }
 }

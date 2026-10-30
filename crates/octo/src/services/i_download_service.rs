@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::services::common::AcquisitionPlace;
 use crate::services::library::ReplacementHandoff;
+use crate::services::lidarr::HeldPlacement;
 
 /// An audio body being read, chunk by chunk. Dropping it closes the upstream response it reads
 /// from.
@@ -154,6 +155,13 @@ pub trait IDownloadService: Send + Sync {
     /// A transfer is running or finishing. The library Review sweep waits for none to be.
     fn has_active_downloads(&self) -> bool {
         false
+    }
+
+    /// Places a file a Lidarr follow held back from the library, now that no follow holds it:
+    /// moved where the layout files it, with the library's record moved along. Where it landed,
+    /// or None when it could not be placed (it then stays where it plays from).
+    async fn place_held(&self, _held: &HeldPlacement) -> Option<String> {
+        None
     }
 
     /// Gets the local path for a song if it has been downloaded already: the provider

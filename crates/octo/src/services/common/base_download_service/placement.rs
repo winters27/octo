@@ -8,7 +8,7 @@ use octo_core::fingerprint::VerificationVerdict;
 use octo_core::fingerprint::verification::RecordingProof;
 use octo_core::lyrics::lyrics_text::LyricsText;
 use octo_core::models::domain::Song;
-use octo_core::settings::FolderStructure;
+use octo_core::settings::{DownloadSource, FolderStructure};
 use octo_media::cover::cover_files;
 use octo_media::tags::KeptIdentityTags;
 use octo_media::tags::tag_writer_extras;
@@ -16,9 +16,11 @@ use tracing::{debug, error, info, warn};
 
 use super::{BaseDownloadService, FileNotFoundException, RequestedIdentity, file_exists, get_extension};
 use crate::services::common::acquisition_tracker::{acquisition_event_kinds, key_of};
+use crate::services::common::soulseek_hold_store::held_root;
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::replacement_handoff::ArrivedTags;
 use crate::services::library::{ReplacementHandoff, ReplacementRejectedException};
+use crate::services::lidarr::{FollowEnd, HELD_FOR_LIDARR, HeldPlacement};
 use crate::services::lyrics::lyrics_sidecar_writer::LyricsJob;
 use crate::services::soulseek::soulseek_download_service::INCOMING_FOLDER_NAME;
 
@@ -127,6 +129,186 @@ impl BaseDownloadService {
         root: &str,
     ) -> Placement {
         self.place_under(song, requested, current_path, Some(root)).await
+    }
+
+    /// Places a download as [`Self::place_in_library`] (or [`Self::place_in_root`], under `root`)
+    /// does, unless a follow of Octo's Lidarr search is open for its artist and the place the
+    /// layout gives it lies under one of Lidarr's root folders: a rescan there would link it into
+    /// the artist while Octo's own import is coming, and that import would then replace it. Such a
+    /// file waits in the one hold path, plays from there, and is placed when the follow ends. A
+    /// file another source proved by its sound ends the artist's follows instead (Lidarr's own
+    /// imports never do), and is placed as soon as Octo's items are out of Lidarr's queue.
+    pub(super) async fn place_or_hold(
+        &self,
+        song: &Song,
+        requested: &RequestedIdentity,
+        current_path: &str,
+        root: Option<&str>,
+        source: Option<DownloadSource>,
+    ) -> Placement {
+        if let Some(held) = self
+            .hold_for_lidarr(song, requested, current_path, root, source)
+            .await
+        {
+            return held;
+        }
+        self.place_under(song, requested, current_path, root).await
+    }
+
+    /// The file moved into the one hold path for the open follows it waits for, or None when no
+    /// follow holds it (or it could not be moved, and is placed as usual).
+    async fn hold_for_lidarr(
+        &self,
+        song: &Song,
+        requested: &RequestedIdentity,
+        current_path: &str,
+        root: Option<&str>,
+        source: Option<DownloadSource>,
+    ) -> Option<Placement> {
+        let pending = self.services.lidarr_pending.as_ref()?;
+        let download_path = self.download_path();
+        let layout_root = root.map_or_else(|| download_path.clone(), str::to_string);
+        if download_path.is_empty() || layout_root.is_empty() || !file_exists(current_path) {
+            return None;
+        }
+        let target = self.layout_target_in(&layout_root, song, requested, get_extension(current_path));
+        let choice = Self::choose_layout(song, requested, self.settings.current().soulseek.name_from_match);
+        let artists = vec![
+            song.artist.clone(),
+            song.primary_artist.clone().unwrap_or_default(),
+            choice.folder_artist,
+            choice.file_artist,
+            requested.artist.clone(),
+        ];
+        let follows = pending.covering(&artists, &choice.album, &target);
+        if follows.is_empty() {
+            return None;
+        }
+        let proof = song
+            .verification
+            .as_deref()
+            .map(|verification| verification.proof.clone())
+            .unwrap_or_default();
+        let proven = proof == RecordingProof::Proven && source != Some(DownloadSource::Lidarr);
+        if proven && !follows.iter().any(|follow| pending.is_running(follow)) {
+            // Nothing follows Lidarr right now, so no import of Octo's can race it.
+            for follow in &follows {
+                pending.request_end(follow, FollowEnd::ProvenElsewhere);
+            }
+            return None;
+        }
+        let (provider, external_id) = (
+            song.external_provider.as_deref().filter(|p| !dotnet::is_blank(p)),
+            song.external_id.as_deref().filter(|i| !dotnet::is_blank(i)),
+        );
+        let song_key = match (provider, external_id) {
+            (Some(provider), Some(id)) => format!("{provider}:{id}"),
+            _ => String::new(),
+        };
+        let name = if song_key.is_empty() {
+            uuid::Uuid::new_v4().simple().to_string()
+        } else {
+            song_key.clone()
+        };
+        let folder_name: String = format!("lidarr-follow-{name}")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let folder = held_root(Path::new(&download_path)).join(folder_name);
+        let _share = match &self.services.write_gate {
+            Some(gate) => Some(gate.write().await),
+            None => None,
+        };
+        if let Err(e) = std::fs::create_dir_all(&folder) {
+            warn!("Could not make the hold folder {}: {e}", folder.display());
+            return None;
+        }
+        let mut held_path = folder.join(get_file_name(&target)).to_string_lossy().into_owned();
+        if file_exists(&held_path) {
+            held_path = PathHelper::resolve_unique_path(&held_path);
+        }
+        if let Err(e) = move_file(current_path, &held_path) {
+            warn!("Could not hold {current_path} back from the library: {e}");
+            return None;
+        }
+        Self::try_remove_empty_parents(get_directory_name(current_path).as_deref(), &download_path);
+        pending.hold_placement(HeldPlacement {
+            song: song_key,
+            held_path: held_path.clone(),
+            target,
+            kept: matches!(proof, RecordingProof::AsHeard { .. } | RecordingProof::KeptByYou),
+            follows: follows.clone(),
+        });
+        if proven {
+            info!("{held_path} is proven: Octo stops following Lidarr for its artist and places it");
+            for follow in &follows {
+                pending.request_end(follow, FollowEnd::ProvenElsewhere);
+            }
+        } else {
+            info!("Holding {held_path} back from the library while Lidarr's download for its artist runs");
+            if let (Some(provider), Some(id)) = (provider, external_id) {
+                self.track(|tracker| {
+                    tracker.log(provider, id, acquisition_event_kinds::NOTE, HELD_FOR_LIDARR, None)
+                });
+            }
+        }
+        Some(Placement::new(held_path, false))
+    }
+
+    /// Places a file a Lidarr follow held back, now that no follow holds it: moved where the
+    /// layout gave it (beside a different file already there, never over it), with whatever was
+    /// written beside it, the library's record moved along, and a scan asked for. Never while a
+    /// library job or a download is placing files. None when it could not be placed.
+    pub async fn place_held_file(&self, held: &HeldPlacement) -> Option<String> {
+        let _share = match &self.services.write_gate {
+            Some(gate) => Some(gate.write().await),
+            None => None,
+        };
+        let _permit = self.download_lock.acquire().await.ok()?;
+        if !file_exists(&held.held_path) {
+            return None;
+        }
+        let mut target = held.target.clone();
+        if file_exists(&target) {
+            target = PathHelper::resolve_unique_path(&target);
+        }
+        if let Some(dir) = get_directory_name(&target).filter(|d| !d.is_empty())
+            && let Err(e) = std::fs::create_dir_all(&dir)
+        {
+            warn!("Could not make {dir} for a held file: {e}");
+            return None;
+        }
+        if let Err(e) = move_file(&held.held_path, &target) {
+            warn!("Could not place the held {}: {e}", held.held_path);
+            return None;
+        }
+        move_beside(&held.held_path, &target);
+        // The hold folder goes with its last file.
+        if let Some(folder) = Path::new(&held.held_path).parent() {
+            let _ = std::fs::remove_dir(folder);
+        }
+        if let Err(e) = self
+            .local_library
+            .update_local_path(&held.held_path, &target)
+            .await
+        {
+            warn!(
+                "Could not move the library's record of {} to {target}: {e}",
+                held.held_path
+            );
+        }
+        self.local_library.trigger_library_scan(false).await;
+        info!(
+            "Placed the held {} where the layout files it: {target}",
+            held.song
+        );
+        Some(target)
     }
 
     /// A song fetched ahead, moved to `<folder>/<provider>_<id>.<ext>`, where no library scan
@@ -582,6 +764,38 @@ pub(super) fn move_file(from: &str, to: &str) -> std::io::Result<()> {
     }
 }
 
+/// Moves the files written beside `from` (its name with another extension, such as its lyrics)
+/// to beside `to`, named after it. Best effort; one already there stays.
+fn move_beside(from: &str, to: &str) {
+    let (from, to) = (Path::new(from), Path::new(to));
+    let (Some(from_dir), Some(to_dir)) = (from.parent(), to.parent()) else {
+        return;
+    };
+    let (Some(from_stem), Some(to_stem)) = (from.file_stem(), to.file_stem()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(from_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.file_stem() != Some(from_stem) {
+            continue;
+        }
+        let Some(extension) = path.extension() else {
+            continue;
+        };
+        let beside = to_dir.join(format!(
+            "{}.{}",
+            to_stem.to_string_lossy(),
+            extension.to_string_lossy()
+        ));
+        if !beside.exists() {
+            let _ = std::fs::rename(&path, &beside);
+        }
+    }
+}
+
 /// The folder of a path: everything before the last separator, `"/"` for a file in the root,
 /// empty for a bare name, and `None` for the root itself or an empty path.
 pub(super) fn get_directory_name(path: &str) -> Option<String> {
@@ -616,3 +830,7 @@ fn find_file(dir: &Path, prefix: &str) -> std::io::Result<Option<String>> {
     }
     Ok(None)
 }
+
+#[cfg(test)]
+#[path = "placement_follow_tests.rs"]
+mod follow_tests;

@@ -978,6 +978,7 @@ impl Acquisition {
                         last_fm: Some(integrations.last_fm.clone()),
                         picks: Some(stores.download_picks.clone()),
                         write_gate: Some(stores.library_write_gate.clone()),
+                        lidarr_pending: Some(stores.lidarr_pending.clone()),
                         family: Some(navidrome.family_pool_service.clone() as Arc<dyn FamilyPlacement>),
                         arrivals: Some(stores.download_arrivals.clone()),
                         prefetched: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
@@ -1019,9 +1020,19 @@ impl Acquisition {
                 upgrades: Some(upgrade_queue.clone()),
                 pending: Some(stores.lidarr_pending.clone()),
                 catalog: None,
+                rounds: Some({
+                    let verification = downloads.tagging.download_verification.clone();
+                    let pause: crate::services::lidarr::PauseRounds = Arc::new(
+                        move |key: &str, gates: &[octo_core::fingerprint::heart_gate::HeartGate]| {
+                            verification.pause_rounds(key, gates)
+                        },
+                    );
+                    pause
+                }),
             },
         );
-        // A pick a restart cut short before its search is put back.
+        // A pick a restart cut short before its search is put back, and every search a restart
+        // cut short is followed on.
         lidarr_heart_service.resume_after_restart();
         let lidarr_music = lidarr_heart_service.artist_music();
         let lidarr_hearts: Arc<dyn ILidarrHeartAcquisitionService> = Arc::new(lidarr_heart_service);

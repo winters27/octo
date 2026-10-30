@@ -161,6 +161,8 @@ pub(crate) struct FakeLidarr {
     pub origins: Mutex<Vec<(AcquisitionOrigin, usize)>>,
     /// Every song's artist already has music in Lidarr, which is left alone.
     pub left_alone: Mutex<bool>,
+    /// What the next track call's walk got no answer from, read once.
+    pub waits: Mutex<Option<crate::services::fingerprint::music_brainz_client::HeartBusy>>,
 }
 
 impl Default for FakeLidarr {
@@ -172,6 +174,7 @@ impl Default for FakeLidarr {
             album_calls: Mutex::new(Vec::new()),
             origins: Mutex::new(Vec::new()),
             left_alone: Mutex::new(false),
+            waits: Mutex::new(None),
         }
     }
 }
@@ -257,6 +260,14 @@ impl ILidarrHeartAcquisitionService for FakeLidarr {
 
     fn left_alone(&self, _: &str, _: &str) -> bool {
         *self.left_alone.lock()
+    }
+
+    fn waits_on(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Option<crate::services::fingerprint::music_brainz_client::HeartBusy> {
+        self.waits.lock().take()
     }
 }
 

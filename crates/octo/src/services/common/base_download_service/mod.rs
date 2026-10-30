@@ -313,6 +313,9 @@ pub struct DownloadServices {
     pub picks: Option<Arc<DownloadPicks>>,
     /// The music folder's one-writer gate: a placement waits while a library job holds it.
     pub write_gate: Option<LibraryWriteGate>,
+    /// Octo's follows of its Lidarr searches: a file placed under Lidarr's root folders for a
+    /// followed artist waits in the hold path until the follow ends.
+    pub lidarr_pending: Option<Arc<crate::services::lidarr::LidarrPendingAlbums>>,
     /// The family pool, where members' downloads land. `None`, or Family off, places every
     /// download in the shared library as always.
     pub family: Option<Arc<dyn FamilyPlacement>>,
@@ -1333,8 +1336,20 @@ impl BaseDownloadService {
                 self.place_ahead(&landed_path, folder, external_provider, external_id)?,
                 false,
             ),
-            (None, None, None) => self.place_in_library(&song, &requested, &landed_path).await,
-            (None, Some(root), None) => self.place_in_root(&song, &requested, &landed_path, root).await,
+            (None, None, None) => {
+                self.place_or_hold(&song, &requested, &landed_path, None, options.source_override)
+                    .await
+            }
+            (None, Some(root), None) => {
+                self.place_or_hold(
+                    &song,
+                    &requested,
+                    &landed_path,
+                    Some(root),
+                    options.source_override,
+                )
+                .await
+            }
             (Some(_), _, None) => self.stage_replacement(&landed_path)?,
         };
         let mut local_path = placement.path.clone();
@@ -2647,6 +2662,10 @@ impl IDownloadService for BaseDownloadService {
             .lock()
             .values()
             .any(|info| info.status == DownloadStatus::InProgress)
+    }
+
+    async fn place_held(&self, held: &crate::services::lidarr::HeldPlacement) -> Option<String> {
+        self.place_held_file(held).await
     }
 
     async fn get_local_path_if_exists(&self, external_provider: &str, external_id: &str) -> Option<String> {

@@ -1,5 +1,6 @@
-//! A heart through Lidarr keeps the promises a Soulseek heart does. What Lidarr imports goes
-//! through the download pipeline song by song, so it meets the same checks; a song already in the
+//! A heart through Lidarr keeps the promises a Soulseek heart does. What Lidarr imports of Octo's
+//! own downloads goes through the download pipeline song by song, so it meets the same checks;
+//! a song already in the
 //! library is taken back out (an owned MP3 is queued for Better quality instead), a song removed
 //! with a library action stays removed, and the album's monitoring is never turned on. The heart
 //! learns whether its songs landed, so the next source can try what Lidarr could not get. Lidarr
@@ -40,7 +41,10 @@ use crate::services::library::library_ownership::Candidate;
 use crate::services::library::{
     LibraryActionEntry, LibraryActionJournal, LibraryActionState, ReplacementHandoff,
 };
-use crate::services::lidarr::fake_lidarr::{ALBUM_ID, ARTIST_ID, CatalogAlbum, CommandMode, FakeLidarr};
+use crate::services::lidarr::HeldPlacement;
+use crate::services::lidarr::fake_lidarr::{
+    ALBUM_ID, ARTIST_ID, CatalogAlbum, CommandMode, FakeLidarr, Grab,
+};
 use crate::services::local::test_support::FakeLocalLibrary;
 use crate::services::metadata::{DeezerRateLimitHandler, DeezerRateLimiter};
 
@@ -48,13 +52,15 @@ use crate::services::metadata::{DeezerRateLimitHandler, DeezerRateLimiter};
 type Taken = Arc<Mutex<Vec<(String, String, bool)>>>;
 
 /// The pipeline as far as Lidarr's files go: take the offered file, or refuse it the way
-/// AcoustID refuses a wrong recording, which leaves it where Lidarr put it.
+/// AcoustID refuses a wrong recording, which leaves it where Lidarr put it. A file a follow held
+/// back is placed at its target, and recorded.
 struct Pipeline {
     root: std::path::PathBuf,
     ids: Arc<ExternalIdRegistry>,
     imports: Arc<LidarrImportHandoff>,
     refused: Arc<Mutex<HashSet<String>>>,
     taken: Taken,
+    placed: Arc<Mutex<Vec<HeldPlacement>>>,
 }
 
 #[async_trait]
@@ -132,6 +138,15 @@ impl IDownloadService for Pipeline {
         None
     }
 
+    async fn place_held(&self, held: &HeldPlacement) -> Option<String> {
+        if let Some(dir) = Path::new(&held.target).parent() {
+            std::fs::create_dir_all(dir).ok()?;
+        }
+        std::fs::rename(&held.held_path, &held.target).ok()?;
+        self.placed.lock().push(held.clone());
+        Some(held.target.clone())
+    }
+
     async fn get_local_path_if_exists(&self, _: &str, _: &str) -> Option<String> {
         None
     }
@@ -166,6 +181,8 @@ struct Fixture {
     pending: Arc<LidarrPendingAlbums>,
     metadata: Arc<FakeMetadata>,
     tracker: Arc<AcquisitionTracker>,
+    /// The held files the pipeline placed.
+    placed: Arc<Mutex<Vec<HeldPlacement>>>,
 }
 
 /// How a test's service is built beyond the defaults.
@@ -178,6 +195,7 @@ struct Options {
     /// Where Octo's library is, when it is not where Lidarr's root folder lies: Octo then sees
     /// none of the files lying in Lidarr's folders.
     octo_root: Option<PathBuf>,
+    rounds: Option<PauseRounds>,
 }
 
 fn upgrades_on() -> LibraryActionSettings {
@@ -226,7 +244,14 @@ impl Fixture {
             pending: Arc::new(LidarrPendingAlbums::new(None)),
             metadata: Arc::new(FakeMetadata::default()),
             tracker: Arc::new(AcquisitionTracker::new(None, Clock::system())),
+            placed: Arc::default(),
         }
+    }
+
+    /// Lidarr's next search of Mezzanine grabs one download of these tracks, finished at once and
+    /// imported by the refresh the grab queues.
+    fn grabs_at_once(&self, download_id: &str, tracks: &[(i32, &str, &str)]) {
+        self.lidarr.plan_grab(7, Grab::of(download_id, tracks).finished());
     }
 
     fn id(&self, title: &str) -> String {
@@ -336,6 +361,7 @@ impl Fixture {
             imports: self.imports.clone(),
             refused: self.refused.clone(),
             taken: self.taken.clone(),
+            placed: self.placed.clone(),
         });
         let client = Arc::new(LidarrClient::new(settings.clone()));
         client.set_metadata_poll(Duration::from_millis(20));
@@ -358,6 +384,7 @@ impl Fixture {
                 upgrades: Some(self.upgrades.clone()),
                 pending: Some(self.pending.clone()),
                 catalog: options.catalog,
+                rounds: options.rounds,
             },
         );
         service.set_poll_override(Some(Duration::from_millis(20)));
@@ -475,8 +502,7 @@ impl Fixture {
     }
 
     async fn heart_the_album(&self, actions: Option<LibraryActionSettings>) -> bool {
-        self.lidarr
-            .on_search(&[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
+        self.grabs_at_once("dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
         let service = self.service(actions, 30);
         within(service.try_acquire_album(
             "soulseek",
@@ -504,8 +530,9 @@ impl Fixture {
             .expect("taken")
     }
 
-    /// The heart is answered as soon as its job ends; letting go of the claim comes right after,
-    /// so it is waited for. Monitoring was never turned on, so nothing gives it back.
+    /// The heart is answered as soon as its song lands; the follow lets go of the album once
+    /// Lidarr is done with Octo's download, so that is waited for. Monitoring was never turned on,
+    /// so nothing gives it back.
     async fn job_wound_up(&self) {
         until(|| !self.claims.heart_busy(ALBUM_ID)).await;
         assert!(
@@ -689,8 +716,7 @@ async fn a_song_the_pipeline_refuses_is_deleted_and_left_to_the_next_source() {
 #[tokio::test]
 async fn a_song_heart_lands_its_song_with_a_notice_and_the_rest_quietly() {
     let f = Fixture::new().await;
-    f.lidarr
-        .on_search(&[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
+    f.grabs_at_once("dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
 
     let service = f.service(None, 30);
     assert!(
@@ -720,11 +746,13 @@ async fn a_song_heart_lands_its_song_with_a_notice_and_the_rest_quietly() {
     assert_ne!(id_of("Angel"), f.id("Teardrop"));
 }
 
+/// A search that grabs nothing of Octo's ends the pick at once, put back: the album and the
+/// artist Octo's add created leave Lidarr, and the entry is forgotten.
 #[tokio::test]
-async fn nothing_arriving_in_time_is_a_miss_for_the_next_source() {
+async fn a_search_that_grabs_nothing_is_a_miss_put_back_for_the_next_source() {
     let f = Fixture::new().await;
 
-    let service = f.service(None, 1);
+    let service = f.service(None, 30);
     let landed = within(service.try_acquire_album(
         "soulseek",
         "mezzanine",
@@ -739,11 +767,28 @@ async fn nothing_arriving_in_time_is_a_miss_for_the_next_source() {
     assert!(f.taken.lock().is_empty());
     f.job_wound_up().await;
     assert!(!f.claims.heart_busy(ALBUM_ID));
+    assert!(f.pending.get(ALBUM_ID).is_none());
+    let deletes: Vec<String> = f
+        .changes()
+        .into_iter()
+        .filter(|c| c.starts_with("DELETE"))
+        .collect();
+    assert_eq!(
+        deletes,
+        [
+            "DELETE /api/v1/album/7?deleteFiles=false&addImportListExclusion=false",
+            "DELETE /api/v1/artist/5?deleteFiles=false&addImportListExclusion=false",
+        ]
+    );
 }
 
 #[tokio::test]
 async fn a_second_heart_on_the_same_album_joins_and_is_answered_too() {
     let f = Fixture::new().await;
+    f.lidarr.plan_grab(
+        7,
+        Grab::of("dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]),
+    );
     let service = f.service(None, 30);
 
     let first = {
@@ -775,11 +820,18 @@ async fn a_second_heart_on_the_same_album_joins_and_is_answered_too() {
             .await
         })
     };
-    // Bob has joined the running job before Lidarr brings anything.
+    // Bob has joined the running job before Lidarr brings anything, and his heart is on the
+    // album's saved entry beside Alice's.
     until(|| service.askers_of(ALBUM_ID).is_some_and(|a| a.len() == 2)).await;
-    // The release: Lidarr imports both songs.
-    f.lidarr.import(1, "Angel", "FLAC");
-    f.lidarr.import(3, "Teardrop", "FLAC");
+    until(|| {
+        f.pending
+            .get(ALBUM_ID)
+            .is_some_and(|entry| entry.holders == ["alice", "bob"])
+    })
+    .await;
+    // The release: Octo's download finishes, and Lidarr imports both songs.
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
 
     assert!(first.await.expect("the task"));
     assert!(second.await.expect("the task"));
@@ -794,8 +846,7 @@ async fn a_second_heart_on_the_same_album_joins_and_is_answered_too() {
 #[tokio::test]
 async fn a_heart_waits_for_an_upgrade_on_the_album() {
     let f = Fixture::new().await;
-    f.lidarr
-        .on_search(&[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
+    f.grabs_at_once("dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
     f.claims.upgrade_started(ALBUM_ID);
     let service = f.service(None, 30);
     service.set_claim_poll(Duration::from_millis(10));
@@ -886,9 +937,10 @@ const TEARDROP: &str = "/data/music/Massive Attack/Mezzanine/03 - Teardrop.flac"
 #[tokio::test]
 async fn lidarrs_webhook_wakes_the_waiting_heart_at_once() {
     let f = Fixture::new().await;
-    f.lidarr
-        .on_search(&[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
-    f.lidarr.hold_imports();
+    f.lidarr.plan_grab(
+        7,
+        Grab::of("dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]),
+    );
     let service = f.service(None, 600);
     // Without the webhook the heart would look again only in an hour.
     service.set_poll_override(Some(Duration::from_secs(3600)));
@@ -908,9 +960,10 @@ async fn lidarrs_webhook_wakes_the_waiting_heart_at_once() {
         })
     };
     until(|| f.lidarr.searches() == 1).await;
-    // Let the job take its first look, find nothing, and settle into its wait.
+    // Let the follow take its first look, find nothing imported, and settle into its wait.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    f.lidarr.release_imports();
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
 
     assert_eq!(
         service.lidarr_imported(imported(&[ANGEL, TEARDROP])).await,
@@ -920,12 +973,14 @@ async fn lidarrs_webhook_wakes_the_waiting_heart_at_once() {
     assert_eq!(f.taken(), ["Angel", "Teardrop"]);
 }
 
-#[tokio::test]
-async fn an_import_after_the_heart_stopped_waiting_is_still_taken() {
-    let f = Fixture::new().await;
-    f.lidarr
-        .on_search(&[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
-    f.lidarr.hold_imports();
+/// The album heart gave up at its timeout while Octo's download still moved, and stopped waiting
+/// for it.
+async fn heart_gave_up_on(
+    f: &Fixture,
+    download_id: &str,
+    tracks: &[(i32, &str, &str)],
+) -> LidarrHeartAcquisitionService {
+    f.lidarr.plan_grab(7, Grab::of(download_id, tracks));
     let service = f.service(None, 1);
     assert!(
         !within(service.try_acquire_album(
@@ -938,12 +993,32 @@ async fn an_import_after_the_heart_stopped_waiting_is_still_taken() {
         ))
         .await
     );
-    f.job_wound_up().await;
-    assert!(f.pending.get(ALBUM_ID).is_some());
+    assert!(f.pending.get(ALBUM_ID).is_some_and(|entry| entry.following()));
+    service
+}
+
+/// Octo stops, as a restart stops it, while its download still moves.
+async fn stopped(f: &Fixture, service: &LidarrHeartAcquisitionService) {
+    until(|| {
+        f.pending
+            .get(ALBUM_ID)
+            .is_some_and(|entry| entry.owns_grab("dl-1"))
+    })
+    .await;
+    service.stop_following();
+    until(|| !f.pending.is_running(ALBUM_ID)).await;
+}
+
+#[tokio::test]
+async fn an_import_after_the_heart_stopped_waiting_is_still_taken() {
+    let f = Fixture::new().await;
+    let service = heart_gave_up_on(&f, "dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]).await;
+    stopped(&f, &service).await;
 
     // Lidarr finishes later, after a restart for all Octo knows: a new service over the same
     // pending list.
-    f.lidarr.release_imports();
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
     let restarted = f.service(None, 1);
     assert_eq!(
         restarted.lidarr_imported(imported(&[ANGEL, TEARDROP])).await,
@@ -958,34 +1033,24 @@ async fn an_import_after_the_heart_stopped_waiting_is_still_taken() {
     assert!(f.pending.get(ALBUM_ID).is_none());
 }
 
+/// Which files are Octo's is read from Lidarr's own rows, never from the webhook's list: a
+/// webhook naming one file still has the follow take every file of Octo's download.
 #[tokio::test]
-async fn a_late_import_takes_only_the_files_lidarr_names() {
+async fn a_late_import_is_judged_by_its_rows_whatever_files_the_webhook_names() {
     let f = Fixture::new().await;
-    f.lidarr
-        .on_search(&[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
-    f.lidarr.hold_imports();
-    let service = f.service(None, 1);
-    assert!(
-        !within(service.try_acquire_album(
-            "soulseek",
-            "mezzanine",
-            true,
-            Some("alice"),
-            AcquisitionOrigin::AlbumHeart,
-            &[],
-        ))
-        .await
-    );
-    f.job_wound_up().await;
-    f.lidarr.release_imports();
+    let service = heart_gave_up_on(&f, "dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]).await;
+    stopped(&f, &service).await;
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
 
+    let restarted = f.service(None, 1);
     assert_eq!(
-        service.lidarr_imported(imported(&[ANGEL])).await,
+        restarted.lidarr_imported(imported(&[ANGEL])).await,
         LidarrImportOutcome::Late
     );
 
-    until(|| !f.claims.heart_busy(ALBUM_ID)).await;
-    assert_eq!(f.taken(), ["Angel"]);
+    until(|| !f.claims.heart_busy(ALBUM_ID) && f.pending.get(ALBUM_ID).is_none()).await;
+    assert_eq!(f.taken(), ["Angel", "Teardrop"]);
 }
 
 /// Angel in the library, as long as Lidarr says it runs.
@@ -997,34 +1062,40 @@ fn owned_angel(suffix: &str, bit_rate: i32) -> Candidate {
 }
 
 /// Teardrop is what the heart waited for, until it gave up; the owner's own Angel, an MP3 the
-/// owner has in the library, came into Lidarr afterwards. (A file the artist had before the
-/// search can no longer be: Lidarr is used only for an artist with no files.)
+/// owner has in the library, came into Lidarr afterwards with no import row (a rescan linked
+/// it) while Octo's download still moved. (A file the artist had before the search can no longer
+/// be: Lidarr is used only for an artist with no files.)
 async fn heart_gave_up_then_the_owner_added_angel(f: &Fixture) -> LidarrHeartAcquisitionService {
-    f.lidarr.on_search(&[(3, "Teardrop", "FLAC")]);
-    f.lidarr.hold_imports();
-    let service = f.service(None, 1);
-    assert!(
-        !within(service.try_acquire_album(
-            "soulseek",
-            "mezzanine",
-            true,
-            Some("alice"),
-            AcquisitionOrigin::AlbumHeart,
-            &[],
-        ))
-        .await
-    );
-    f.job_wound_up().await;
-    assert!(f.pending.get(ALBUM_ID).is_some());
+    let service = heart_gave_up_on(f, "dl-1", &[(3, "Teardrop", "FLAC")]).await;
+    until(|| {
+        f.pending
+            .get(ALBUM_ID)
+            .is_some_and(|entry| entry.owns_grab("dl-1"))
+    })
+    .await;
     f.lidarr.import(1, "Angel", "MP3-320");
     *f.owned.lock() = vec![owned_angel("mp3", 320)];
     service
 }
 
+/// The owner's own file arriving during a follow, before any file of Octo's: Octo steps aside
+/// (its download removed, never imported over the owner's file), puts the pick back keeping the
+/// album that now holds the owner's file, and the owner's later upgrade is left alone.
 #[tokio::test]
-async fn a_late_upgrade_of_the_owners_own_track_is_left_alone() {
+async fn the_owners_own_file_arriving_during_a_follow_is_left_alone_and_octo_steps_aside() {
     let f = Fixture::new().await;
     let service = heart_gave_up_then_the_owner_added_angel(&f).await;
+    until(|| f.pending.get(ALBUM_ID).is_none() && !f.claims.heart_busy(ALBUM_ID)).await;
+    assert!(
+        f.changes()
+            .iter()
+            .any(|c| c.starts_with("DELETE /api/v1/queue/1?")),
+        "Octo's own download is removed"
+    );
+    assert!(
+        !f.changes().iter().any(|c| c.starts_with("DELETE /api/v1/album")),
+        "the album holding the owner's file stays"
+    );
 
     // Lidarr upgrades the owner's Angel to FLAC on its own: a new file id at a new path.
     let angel = f.lidarr.upgrade(1, "Angel", "FLAC");
@@ -1038,104 +1109,47 @@ async fn a_late_upgrade_of_the_owners_own_track_is_left_alone() {
     assert_eq!(f.taken(), Vec::<String>::new());
 }
 
+/// A late import of Octo's own download is Octo's by its rows: one the pipeline refuses, and one
+/// of a song already in the library, are deleted through Lidarr, never left in its library.
 #[tokio::test]
-async fn a_late_import_never_deletes_through_lidarr() {
+async fn a_late_import_octo_does_not_take_is_deleted_through_lidarr() {
     let f = Fixture::new().await;
-    f.lidarr
-        .on_search(&[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
-    f.lidarr.hold_imports();
-    let service = f.service(None, 1);
-    assert!(
-        !within(service.try_acquire_album(
-            "soulseek",
-            "mezzanine",
-            true,
-            Some("alice"),
-            AcquisitionOrigin::AlbumHeart,
-            &[],
-        ))
-        .await
-    );
-    f.job_wound_up().await;
+    let _service = heart_gave_up_on(&f, "dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]).await;
     // Teardrop is refused by the pipeline, Angel is already in the library.
     f.refused.lock().insert("Teardrop".into());
     *f.owned.lock() = vec![owned_angel("flac", 1000)];
-    f.lidarr.release_imports();
-
-    assert_eq!(
-        service.lidarr_imported(imported(&[ANGEL, TEARDROP])).await,
-        LidarrImportOutcome::Late
-    );
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
 
     until(|| !f.claims.heart_busy(ALBUM_ID)).await;
     assert_eq!(f.taken(), Vec::<String>::new());
-    assert!(f.lidarr.deleted().is_empty());
-}
-
-#[tokio::test]
-async fn a_late_import_of_part_of_the_album_keeps_it_listed_for_the_rest() {
-    let f = Fixture::new().await;
-    f.lidarr.on_search(&[(1, "Angel", "FLAC")]);
-    f.lidarr.hold_imports();
-    let service = f.service(None, 1);
+    let mut deleted = f.lidarr.deleted();
+    deleted.sort_unstable();
+    assert_eq!(deleted, [100, 101]);
+    assert!(!f.root.path().join(TEARDROP_FILE).exists());
     assert!(
-        !within(service.try_acquire_album(
-            "soulseek",
-            "mezzanine",
-            true,
-            Some("alice"),
-            AcquisitionOrigin::AlbumHeart,
-            &[],
-        ))
-        .await
+        !f.root
+            .path()
+            .join("Massive Attack/Mezzanine/01 - Angel.flac")
+            .exists()
     );
-    f.job_wound_up().await;
-    f.lidarr.release_imports();
-
-    assert_eq!(
-        service.lidarr_imported(imported(&[ANGEL])).await,
-        LidarrImportOutcome::Late
-    );
-    until(|| f.taken.lock().len() == 1).await;
-    until(|| !f.claims.heart_busy(ALBUM_ID)).await;
-    // Teardrop has not come in yet, so the album stays listed.
-    assert!(f.pending.get(ALBUM_ID).is_some());
-
-    f.lidarr.import(3, "Teardrop", "FLAC");
-    assert_eq!(
-        service.lidarr_imported(imported(&[ANGEL, TEARDROP])).await,
-        LidarrImportOutcome::Late
-    );
-    until(|| f.taken.lock().len() == 2).await;
-    until(|| !f.claims.heart_busy(ALBUM_ID)).await;
-    assert_eq!(f.taken(), ["Angel", "Teardrop"]);
-    assert!(f.pending.get(ALBUM_ID).is_none());
 }
 
 #[tokio::test]
 async fn a_late_import_while_the_album_is_busy_is_taken_once_it_is_free() {
     let f = Fixture::new().await;
-    f.lidarr
-        .on_search(&[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
-    f.lidarr.hold_imports();
-    let service = f.service(None, 1);
-    service.set_claim_poll(Duration::from_millis(20));
-    assert!(
-        !within(service.try_acquire_album(
-            "soulseek",
-            "mezzanine",
-            true,
-            Some("alice"),
-            AcquisitionOrigin::AlbumHeart,
-            &[],
-        ))
-        .await
-    );
-    f.job_wound_up().await;
-    f.lidarr.release_imports();
+    let service = heart_gave_up_on(&f, "dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]).await;
+    stopped(&f, &service).await;
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
 
+    let restarted = f.service(None, 1);
+    restarted.set_claim_poll(Duration::from_millis(20));
     f.claims.upgrade_started(ALBUM_ID);
-    service.lidarr_imported(imported(&[ANGEL, TEARDROP])).await;
+    assert_eq!(
+        restarted.lidarr_imported(imported(&[ANGEL, TEARDROP])).await,
+        LidarrImportOutcome::Late
+    );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(f.taken().is_empty(), "taken while an upgrade held the album");
 
@@ -1424,8 +1438,7 @@ async fn an_unmonitored_album_the_users_lidarr_created_is_searched_and_stays_unm
     f.lidarr.catalog_album(protection());
     f.lidarr.user_album(ALBUM_ID, false);
     f.lidarr.user_album("rg-protection", false);
-    f.lidarr
-        .on_search(&[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
+    f.grabs_at_once("dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
     let service = f.service(None, 30);
 
     assert!(f.heart_teardrop(&service).await);
@@ -1713,9 +1726,13 @@ async fn an_artist_octo_used_before_whose_records_octo_deleted_is_used_again() {
     deleted.sort_unstable();
     assert_eq!(deleted, [100, 101]);
 
+    f.grabs_at_once("dl-2", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
     let service = f.service(None, 30);
     assert!(f.heart_teardrop(&service).await);
 
     assert_eq!(f.lidarr.searches(), 2);
     assert!(!service.left_alone("soulseek", "teardrop-heart"));
 }
+
+#[path = "lidarr_follow_tests.rs"]
+mod follow;
