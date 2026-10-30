@@ -62,6 +62,7 @@ mod tests {
             artist: Some("Massive Attack".into()),
             track_file_id: 101,
             quality: None,
+            foreign_recording_id: None,
         };
 
         assert!(match_song(&heart, &angel, false).is_none());

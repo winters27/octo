@@ -1,6 +1,8 @@
 //! Tests of the Lidarr client. A mock server answers every request with 200 and a body chosen by
-//! method and path, and keeps the requests.
+//! method and path, and keeps the requests; the calls the heart's rules make are tested against
+//! the fake Lidarr, request by request.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use octo_core::lidarr::LidarrAlbumCandidate;
@@ -10,6 +12,10 @@ use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use super::*;
+use crate::services::lidarr::fake_lidarr::{
+    ALBUM_ID, ARTIST_ID, CatalogAlbum, CommandMode, FakeLidarr, Grab, GrabFile, LIDARR_DOWNLOADS,
+    LIDARR_RECYCLE_BIN, LIDARR_ROOT, RETAGGED,
+};
 use crate::services::lidarr::lidarr_heart_acquisition_service::translate_imported_path;
 
 /// Answers each request with `respond(method, path)`, always 200.
@@ -630,10 +636,11 @@ async fn a_forgotten_pick_is_grabbed_again_under_its_new_guid() {
         size,
     };
 
-    client
-        .grab_picked(7, &pick(Some(300)))
-        .await
-        .expect("found again");
+    // The guid the grab went out under is the new one.
+    assert_eq!(
+        client.grab_picked(7, &pick(Some(300))).await,
+        Ok("fresh".to_string())
+    );
 
     let grabbed: Vec<Value> = requests(&server)
         .await
@@ -891,4 +898,1162 @@ fn the_wait_for_a_track_list_stops_at_five_minutes_whatever_the_import_timeout()
     assert_eq!(wait(3600), std::time::Duration::from_secs(5 * 60));
     assert_eq!(wait(120), std::time::Duration::from_secs(120));
     assert_eq!(wait(0), std::time::Duration::from_secs(1));
+}
+
+// ---- The calls the heart's rules make, against the fake Lidarr ------------------------------
+
+/// The fake Lidarr over a fresh octo root.
+async fn fake_lidarr() -> (tempfile::TempDir, FakeLidarr, MockServer) {
+    let root = tempfile::tempdir().expect("a temp dir");
+    let (fake, server) = FakeLidarr::start(root.path()).await;
+    (root, fake, server)
+}
+
+/// Each request the fake answered, as `METHOD path?query`.
+fn asked(fake: &FakeLidarr) -> Vec<String> {
+    fake.requests()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect()
+}
+
+#[tokio::test]
+async fn what_lidarr_holds_is_read_with_these_requests() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    fake.import(1, "Angel", "FLAC");
+    fake.set_stale_statistics(5, 0);
+    fake.catalog_artist("ot", "Other Artist", 6);
+    let elsewhere = tempfile::tempdir().expect("a temp dir");
+    fake.add_root_folder("/data/other", elsewhere.path());
+    let client = build(&server);
+
+    let artists = client.artists().await.expect("artists");
+    assert_eq!(artists.len(), 1);
+    assert_eq!(
+        (artists[0].id, artists[0].path.as_deref(), artists[0].monitored),
+        (5, Some("/data/music/Massive Attack"), true)
+    );
+    // The statistic is stale; the track file list says what the artist has.
+    assert_eq!(artists[0].track_file_count, Some(0));
+    assert_eq!(
+        client.find_artist("MA").await.expect("read").map(|a| a.id),
+        Some(5)
+    );
+    assert_eq!(
+        client.artist(5).await.expect("read").map(|a| a.name),
+        Some("Massive Attack".to_string())
+    );
+    assert_eq!(client.artist(99).await, Ok(None));
+    let album = client.album(7).await.expect("read").expect("held");
+    assert_eq!(
+        (album.monitored, album.any_release_ok, album.artist_id),
+        (false, true, 5)
+    );
+    assert_eq!(album.release_choice().releases.len(), 1);
+    assert!(
+        album
+            .release("mezzanine-uk")
+            .is_some_and(|r| r.id == 70 && r.monitored)
+    );
+    assert_eq!(client.album(99).await, Ok(None));
+    assert_eq!(
+        client
+            .album_by_foreign_id(ALBUM_ID)
+            .await
+            .expect("read")
+            .map(|a| a.id),
+        Some(7)
+    );
+    assert_eq!(client.album_by_foreign_id("missing").await, Ok(None));
+    assert_eq!(client.artist_albums(5).await.expect("read").len(), 1);
+    let files = client.artist_track_files(5).await.expect("read");
+    assert_eq!(
+        files.iter().map(|f| (f.id, f.album_id)).collect::<Vec<_>>(),
+        [(100, 7)]
+    );
+    assert_eq!(client.album_track_files(7).await.expect("read").len(), 1);
+    assert_eq!(
+        client
+            .root_folders()
+            .await
+            .expect("read")
+            .iter()
+            .map(|r| r.path.clone())
+            .collect::<Vec<_>>(),
+        [LIDARR_ROOT, "/data/other"]
+    );
+    assert_eq!(
+        client.artist_folder(ARTIST_ID).await,
+        Ok(Some("Massive Attack".to_string()))
+    );
+    assert_eq!(
+        client.artist_folder("ot").await,
+        Ok(Some("Other Artist".to_string()))
+    );
+    assert_eq!(client.artist_folder("nobody").await, Ok(None));
+
+    assert_eq!(
+        asked(&fake),
+        [
+            "GET /api/v1/artist",
+            "GET /api/v1/artist",
+            "GET /api/v1/artist/5",
+            "GET /api/v1/artist/99",
+            "GET /api/v1/album/7",
+            "GET /api/v1/album/99",
+            "GET /api/v1/album?foreignAlbumId=rg-mezzanine",
+            "GET /api/v1/album?foreignAlbumId=missing",
+            "GET /api/v1/album?artistId=5",
+            "GET /api/v1/trackfile?artistId=5",
+            "GET /api/v1/trackfile?albumId=7",
+            "GET /api/v1/rootfolder",
+            "GET /api/v1/artist/lookup?term=lidarr%3Ama",
+            "GET /api/v1/artist/lookup?term=lidarr%3Aot",
+            "GET /api/v1/artist/lookup?term=lidarr%3Anobody",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn lidarrs_settings_status_and_health_are_read_with_these_requests() {
+    let (_root, fake, server) = fake_lidarr().await;
+    let client = build(&server);
+
+    assert_eq!(client.completed_download_handling().await, Ok(true));
+    assert_eq!(client.writes_audio_tags().await, Ok(false));
+    assert_eq!(client.recycle_bin().await, Ok(None));
+    let started = client.start_time().await.expect("read").expect("a start time");
+    assert!(started < Utc::now());
+    assert_eq!(client.health().await, Ok(Vec::new()));
+
+    fake.set_completed_download_handling(false);
+    fake.set_write_audio_tags("newFiles");
+    fake.set_recycle_bin(true);
+    fake.set_health(json!([{
+        "source": "IndexerStatusCheck", "type": "error",
+        "message": "Indexers unavailable due to failures: Fake indexer",
+        "wikiUrl": "https://wiki.servarr.com/lidarr/system#indexers-are-unavailable-due-to-failures",
+    }]));
+    assert_eq!(client.completed_download_handling().await, Ok(false));
+    assert_eq!(client.writes_audio_tags().await, Ok(true));
+    assert_eq!(
+        client.recycle_bin().await,
+        Ok(Some(LIDARR_RECYCLE_BIN.to_string()))
+    );
+    let health = client.health().await.expect("read");
+    assert_eq!(
+        (health[0].source.as_str(), health[0].kind.as_str()),
+        ("IndexerStatusCheck", "error")
+    );
+
+    assert_eq!(
+        asked(&fake),
+        [
+            "GET /api/v1/config/downloadclient",
+            "GET /api/v1/config/metadataprovider",
+            "GET /api/v1/config/mediamanagement",
+            "GET /api/v1/system/status",
+            "GET /api/v1/health",
+            "GET /api/v1/config/downloadclient",
+            "GET /api/v1/config/metadataprovider",
+            "GET /api/v1/config/mediamanagement",
+            "GET /api/v1/health",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_album_is_added_unmonitored_under_a_new_artist_that_monitors_nothing() {
+    let (_root, fake, server) = fake_lidarr().await;
+    let client = build(&server);
+    let candidate = client
+        .resolve_album_by_foreign_id(ALBUM_ID)
+        .await
+        .expect("looked up")
+        .expect("known");
+
+    let added = client.add_album(&candidate, None).await.expect("added");
+
+    assert_eq!(
+        added,
+        LidarrAdded {
+            album_id: 7,
+            artist_id: 5
+        }
+    );
+    // The add alone: no search, and nothing else changed.
+    let changes = fake.changes();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(
+        (changes[0].method.as_str(), changes[0].path.as_str()),
+        ("POST", "/api/v1/album")
+    );
+    let body = changes[0].body.clone().expect("a body");
+    assert_eq!(body["monitored"], false);
+    assert_eq!(body["addOptions"], json!({ "searchForNewAlbum": false }));
+    assert!(body.get("id").is_none());
+    let artist = &body["artist"];
+    assert!(artist.get("id").is_none());
+    assert_eq!(artist["monitored"], false);
+    assert_eq!(artist["monitorNewItems"], "none");
+    assert_eq!(
+        artist["addOptions"],
+        json!({ "monitor": "none", "searchForMissingAlbums": false })
+    );
+    assert_eq!(artist["rootFolderPath"], "/data/music");
+    assert_eq!(
+        (
+            artist["qualityProfileId"].clone(),
+            artist["metadataProfileId"].clone()
+        ),
+        (json!(3), json!(4))
+    );
+    // Lidarr refreshed the new artist, then rescanned its folder.
+    let commands = client.commands().await.expect("listed");
+    assert_eq!(
+        commands
+            .iter()
+            .map(|c| (c.name.as_str(), c.status.as_str()))
+            .collect::<Vec<_>>(),
+        [("RefreshArtist", "completed"), ("RescanFolders", "completed")]
+    );
+    assert_eq!(commands[1].body["folders"], json!(["/data/music/Massive Attack"]));
+    assert!(commands[1].rescans_artist(5, Some("/data/music/Massive Attack")));
+    assert!(!client.album(7).await.expect("read").expect("held").monitored);
+    let artist = client.artist(5).await.expect("read").expect("held");
+    assert_eq!(
+        (artist.monitored, artist.monitor_new_items.as_deref()),
+        (false, Some("none"))
+    );
+    assert_eq!(client.wait_for_tracks(7, 5).await, Ok(true));
+}
+
+#[tokio::test]
+async fn an_album_is_added_under_an_artist_lidarr_has_which_stays_as_it_was() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_artist(ARTIST_ID, false);
+    let client = build(&server);
+    let candidate = client
+        .resolve_album_by_foreign_id(ALBUM_ID)
+        .await
+        .expect("looked up")
+        .expect("known");
+    let artist = client.find_artist(ARTIST_ID).await.expect("read").expect("held");
+
+    let added = client.add_album(&candidate, Some(&artist)).await.expect("added");
+
+    assert_eq!(added.album_id, 7);
+    let changes = fake.changes();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    let body = changes[0].body.clone().expect("a body");
+    assert_eq!(body["artistId"], 5);
+    assert_eq!(body["artist"], Value::Object(artist.resource.clone()));
+    assert_eq!(body["monitored"], false);
+    assert!(!client.artist(5).await.expect("read").expect("held").monitored);
+    let commands = client.commands().await.expect("listed");
+    assert_eq!(
+        commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        ["RefreshAlbum", "RescanFolders"]
+    );
+    assert_eq!(commands[0].refreshes(7, 5), Ok(true));
+}
+
+#[tokio::test]
+async fn the_adds_rescan_links_files_lying_in_the_artist_folder_with_no_history_row() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.set_write_audio_tags("allFiles");
+    let lying = fake.place_file(
+        "/data/music/Massive Attack/Mezzanine/03 - Teardrop.flac",
+        b"the user's own",
+    );
+    // Lidarr's scans skip dot folders, so a file Octo holds there is never linked.
+    let held = fake.place_file(
+        "/data/music/.octo-incoming/held/1/01 - Angel.flac",
+        b"held by Octo",
+    );
+    let client = build(&server);
+    let candidate = client
+        .resolve_album_by_foreign_id(ALBUM_ID)
+        .await
+        .expect("looked up")
+        .expect("known");
+
+    client.add_album(&candidate, None).await.expect("added");
+
+    let files = client.artist_track_files(5).await.expect("read");
+    assert_eq!(
+        files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        [Some(
+            "/data/music/Massive Attack/Mezzanine/03 - Teardrop.flac".to_string()
+        )]
+    );
+    assert_eq!(client.artist_history(5, None).await, Ok(Vec::new()));
+    // Lidarr wrote its own tags into the file it linked, and left the held one alone.
+    assert_eq!(
+        std::fs::read(&lying).expect("still there"),
+        [b"the user's own".as_slice(), RETAGGED].concat()
+    );
+    assert_eq!(std::fs::read(&held).expect("still there"), b"held by Octo");
+    // Each track carries the recording Lidarr matched it to.
+    let tracks = client.get_album_tracks(7).await.expect("read");
+    assert_eq!(
+        tracks
+            .iter()
+            .map(|t| (t.title.as_str(), t.has_file, t.foreign_recording_id.as_deref()))
+            .collect::<Vec<_>>(),
+        [("Angel", false, Some("rec-1")), ("Teardrop", true, Some("rec-3"))]
+    );
+}
+
+#[tokio::test]
+async fn waiting_for_a_track_list_that_never_comes_says_so() {
+    let (_root, fake, server) = fake_lidarr().await;
+    let mut empty = CatalogAlbum::new("rg-empty", "Empty", ARTIST_ID, 8, &[(20, "Gone", 1)]);
+    empty.tracks_appear = false;
+    empty.in_profile = false;
+    fake.catalog_album(empty);
+    fake.user_artist(ARTIST_ID, true);
+    let client = build_waiting(&server, 1);
+    let candidate = client
+        .resolve_album_by_foreign_id("rg-empty")
+        .await
+        .expect("looked up")
+        .expect("known");
+    let artist = client.find_artist(ARTIST_ID).await.expect("read").expect("held");
+    client.add_album(&candidate, Some(&artist)).await.expect("added");
+
+    let started = std::time::Instant::now();
+    assert_eq!(client.wait_for_tracks(8, 5).await, Ok(false));
+
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // One RefreshAlbum of its own, which brought nothing.
+    let refreshes = fake
+        .changes()
+        .into_iter()
+        .filter(|r| r.body.as_ref().is_some_and(|b| b["name"] == "RefreshAlbum"))
+        .count();
+    assert_eq!(refreshes, 1);
+}
+
+#[tokio::test]
+async fn a_release_pin_is_sent_and_put_back_exactly_and_lidarr_rescans_after_each() {
+    let (_root, fake, server) = fake_lidarr().await;
+    let mut two = CatalogAlbum::new("rg-two", "Two Releases", ARTIST_ID, 9, &[(30, "One", 1)]);
+    two.releases = vec![(90, "two-us".into()), (91, "two-uk".into())];
+    fake.catalog_album(two);
+    fake.user_album("rg-two", false);
+    // A file the pin unlinks and its rescan links again.
+    fake.import(30, "One", "FLAC");
+    let client = build(&server);
+    let album = client.album(9).await.expect("read").expect("held");
+    let saved = album.release_choice();
+    let uk = album.release("TWO-UK").expect("listed").id;
+    let pin = album.pinned_to(uk).expect("a pin");
+
+    let pinned = client.set_release_choice(9, &pin).await.expect("pinned");
+
+    assert_eq!(pinned.release_choice(), pin);
+    let put = fake.changes().last().cloned().expect("the change");
+    assert_eq!(
+        (put.method.as_str(), put.path.as_str()),
+        ("PUT", "/api/v1/album/9")
+    );
+    let body = put.body.expect("a body");
+    assert_eq!(body["anyReleaseOk"], false);
+    assert_eq!(body["monitored"], false);
+    assert_eq!(
+        body["releases"]
+            .as_array()
+            .expect("the releases")
+            .iter()
+            .map(|r| (r["id"].clone(), r["monitored"].clone()))
+            .collect::<Vec<_>>(),
+        [(json!(90), json!(false)), (json!(91), json!(true))]
+    );
+    let rescans = |commands: &[LidarrCommand]| {
+        commands
+            .iter()
+            .filter(|c| c.rescans_artist(5, Some("/data/music/Massive Attack")))
+            .count()
+    };
+    assert_eq!(rescans(&client.commands().await.expect("listed")), 1);
+    assert_eq!(client.album_track_files(9).await.expect("read").len(), 1);
+
+    let restored = client.set_release_choice(9, &saved).await.expect("restored");
+
+    assert_eq!(restored.release_choice(), saved);
+    assert_eq!(rescans(&client.commands().await.expect("listed")), 2);
+    // The album's own monitored flag never moved.
+    assert!(fake.monitor_changes().is_empty());
+}
+
+#[tokio::test]
+async fn an_album_search_sends_only_the_search_and_its_grab_is_read_from_history() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    fake.plan_grab(
+        7,
+        Grab::of("DL-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]),
+    );
+    let client = build(&server);
+    assert_eq!(
+        client.album_history_count(7, LidarrHistoryEvent::Grabbed).await,
+        Ok(0)
+    );
+
+    let command = client.album_search(7).await.expect("searched");
+
+    assert_eq!(command.name, "AlbumSearch");
+    let changes = fake.changes();
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(
+        changes[0].body,
+        Some(json!({ "name": "AlbumSearch", "albumIds": [7] }))
+    );
+    let read = client.command(command.id).await.expect("read").expect("listed");
+    let (started, ended) = (read.started.expect("started"), read.ended.expect("ended"));
+    assert_eq!(
+        client.album_history_count(7, LidarrHistoryEvent::Grabbed).await,
+        Ok(1)
+    );
+    let grabs = client
+        .album_history(7, LidarrHistoryEvent::Grabbed, Some(started))
+        .await
+        .expect("read");
+    assert_eq!(grabs.len(), 1);
+    assert!(grabs[0].date >= started && grabs[0].date <= ended);
+    assert_eq!(
+        (
+            grabs[0].download_id.as_deref(),
+            grabs[0].release_source(),
+            grabs[0].download_client()
+        ),
+        (Some("DL-1"), Some("UserInvokedSearch"), Some("QBittorrent"))
+    );
+    assert_eq!(
+        client
+            .album_history(
+                7,
+                LidarrHistoryEvent::Grabbed,
+                Some(ended + chrono::TimeDelta::seconds(1))
+            )
+            .await,
+        Ok(Vec::new())
+    );
+    assert!(!client.album(7).await.expect("read").expect("held").monitored);
+    let asked = asked(&fake);
+    for path in [
+        "GET /api/v1/history?albumId=7&eventType=1&pageSize=1",
+        "POST /api/v1/command",
+        "GET /api/v1/command/1",
+        "GET /api/v1/history?albumId=7&eventType=1&page=1&pageSize=100&sortKey=date&sortDirection=descending",
+    ] {
+        assert!(asked.iter().any(|a| a == path), "{path} in {asked:?}");
+    }
+}
+
+#[tokio::test]
+async fn commands_are_listed_and_read_by_id_as_they_move() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.set_command_mode(CommandMode::Held);
+    let client = build(&server);
+
+    let health = client.check_health().await.expect("asked");
+
+    assert_eq!(
+        (health.name.as_str(), health.status.as_str()),
+        ("CheckHealth", "queued")
+    );
+    assert_eq!(fake.changes()[0].body, Some(json!({ "name": "CheckHealth" })));
+    fake.queue_command("RescanFolders", json!({ "folders": null }), "scheduled");
+    let scan = fake.queue_command("DownloadedAlbumsScan", json!({}), "manual");
+    fake.step();
+    // One disk command at a time: the scan waits for the rescan.
+    let listed = client.commands().await.expect("listed");
+    assert_eq!(
+        listed.iter().map(|c| c.status.as_str()).collect::<Vec<_>>(),
+        ["started", "started", "queued"]
+    );
+    // A RescanFolders with no folders covers every root folder.
+    assert!(listed[1].rescans_artist(5, None));
+    fake.run_commands();
+    let ended = client.command(health.id).await.expect("read").expect("kept");
+    assert_eq!(ended.status, "completed");
+    assert!(ended.started.is_some() && ended.ended > ended.started);
+    fake.forget_command(scan);
+    assert_eq!(client.command(scan).await, Ok(None));
+    assert_eq!(
+        asked(&fake),
+        [
+            "POST /api/v1/command",
+            "GET /api/v1/command",
+            "GET /api/v1/command/1",
+            "GET /api/v1/command/3",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_queue_is_read_by_album_and_artist_and_octos_items_are_removed() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    fake.plan_grab(
+        7,
+        Grab::of("DL-1", &[(1, "Angel", "FLAC")]).by_client("Sabnzbd", "SAB Music", "usenet", false),
+    );
+    let client = build(&server);
+    client.album_search(7).await.expect("searched");
+    let pending = fake.pending_release(7, "delay");
+
+    let queue = client.album_queue(7).await.expect("read");
+
+    assert_eq!(queue.len(), 2);
+    assert_eq!(
+        (
+            queue[0].download_id.as_deref(),
+            queue[0].download_client.as_deref(),
+            queue[0].tracked_download_state.as_deref()
+        ),
+        (Some("DL-1"), Some("SAB Music"), Some("downloading"))
+    );
+    assert_eq!(
+        (
+            queue[1].id,
+            queue[1].download_id.clone(),
+            queue[1].status.as_deref()
+        ),
+        (pending, None, Some("delay"))
+    );
+    assert_eq!(client.artist_queue(5).await.expect("read").len(), 2);
+    assert_eq!(client.artist_queue(6).await, Ok(Vec::new()));
+    assert_eq!(
+        client.remove_queue_item(queue[0].id, false).await,
+        Ok(LidarrDeletion::Deleted)
+    );
+    assert_eq!(
+        client.remove_queue_item(queue[0].id, false).await,
+        Ok(LidarrDeletion::NotFound)
+    );
+    fake.drop_pending(pending);
+    assert_eq!(client.album_queue(7).await, Ok(Vec::new()));
+    // A plain removal writes no row that ends the download.
+    assert!(
+        client
+            .download_history("DL-1")
+            .await
+            .expect("read")
+            .iter()
+            .all(|r| !r.event.ends_download())
+    );
+    let asked = asked(&fake);
+    for path in [
+        "GET /api/v1/queue/details?albumIds=7",
+        "GET /api/v1/queue/details?artistId=5",
+        "GET /api/v1/queue/details?artistId=6",
+        "DELETE /api/v1/queue/1?removeFromClient=true&blocklist=false&skipRedownload=true",
+    ] {
+        assert!(asked.iter().any(|a| a == path), "{path} in {asked:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_finished_download_is_imported_and_followed_through_its_history() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    fake.plan_grab(
+        7,
+        Grab::of("DL-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]),
+    );
+    let client = build(&server);
+    client.album_search(7).await.expect("searched");
+    fake.complete("DL-1");
+    // Until Lidarr's next refresh its queue shows the download as it was.
+    let state_now = |queue: Vec<LidarrQueueItem>| queue[0].tracked_download_state.clone();
+    assert_eq!(
+        state_now(client.album_queue(7).await.expect("read")).as_deref(),
+        Some("downloading")
+    );
+
+    fake.refresh();
+
+    use LidarrHistoryEvent::{DownloadImported, Grabbed, TrackFileImported};
+    let rows = client.download_history("DL-1").await.expect("read");
+    // Newest first: the download's own row, one per file, then the grab.
+    assert_eq!(
+        rows.iter().map(|r| r.event).collect::<Vec<_>>(),
+        [DownloadImported, TrackFileImported, TrackFileImported, Grabbed]
+    );
+    let files = client.album_track_files(7).await.expect("read");
+    assert_eq!(files.len(), 2);
+    for row in &rows[1..3] {
+        assert!(files.iter().any(|f| Some(f.id) == row.file_id()));
+        assert_eq!(row.download_client(), Some("QBittorrent"));
+        // A seeding torrent keeps its own copy at the dropped path.
+        let dropped = row.dropped_path().expect("a dropped path");
+        assert!(dropped.starts_with(LIDARR_DOWNLOADS));
+        assert!(fake.local(dropped).is_file());
+    }
+    assert_eq!(
+        client
+            .artist_history(5, Some(TrackFileImported))
+            .await
+            .expect("read")
+            .len(),
+        2
+    );
+    assert_eq!(client.artist_history(5, None).await.expect("read").len(), 4);
+    // The queue still says the import is pending until the next refresh drops the item.
+    assert_eq!(
+        state_now(client.album_queue(7).await.expect("read")).as_deref(),
+        Some("importPending")
+    );
+    fake.refresh();
+    assert_eq!(client.album_queue(7).await, Ok(Vec::new()));
+    let asked = asked(&fake);
+    for path in [
+        "GET /api/v1/history?downloadId=DL-1&page=1&pageSize=100&sortKey=date&sortDirection=descending",
+        "GET /api/v1/history/artist?artistId=5&eventType=3",
+        "GET /api/v1/history/artist?artistId=5",
+    ] {
+        assert!(asked.iter().any(|a| a == path), "{path} in {asked:?}");
+    }
+}
+
+#[tokio::test]
+async fn history_is_read_page_by_page_and_back_to_a_time() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    for n in 0..120 {
+        fake.user_grab(7, Grab::of(&format!("DL-{n}"), &[]), "Rss");
+    }
+    let client = build(&server);
+
+    let rows = client
+        .album_history(7, LidarrHistoryEvent::Grabbed, None)
+        .await
+        .expect("read");
+
+    assert_eq!(rows.len(), 120);
+    assert!(rows.windows(2).all(|pair| pair[0].date >= pair[1].date));
+    let since = rows[9].date;
+    assert_eq!(
+        client
+            .album_history(7, LidarrHistoryEvent::Grabbed, Some(since))
+            .await
+            .expect("read")
+            .len(),
+        10
+    );
+    let pages: Vec<String> = asked(&fake)
+        .into_iter()
+        .filter(|a| a.starts_with("GET /api/v1/history?"))
+        .collect();
+    assert_eq!(
+        pages,
+        [
+            "GET /api/v1/history?albumId=7&eventType=1&page=1&pageSize=100&sortKey=date&sortDirection=descending",
+            "GET /api/v1/history?albumId=7&eventType=1&page=2&pageSize=100&sortKey=date&sortDirection=descending",
+            "GET /api/v1/history?albumId=7&eventType=1&page=1&pageSize=100&sortKey=date&sortDirection=descending",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn with_completed_download_handling_off_octo_imports_its_own_download_by_hand() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.set_completed_download_handling(false);
+    fake.user_album(ALBUM_ID, false);
+    let mut grab = Grab::of("DL-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]);
+    grab.files[1].rejection = Some("Not an upgrade for existing track file(s)".into());
+    fake.plan_grab(7, grab);
+    let client = build(&server);
+    client.album_search(7).await.expect("searched");
+    fake.complete("DL-1");
+    fake.refresh();
+    // Lidarr no longer tracks a finished download, and never imports it itself.
+    assert_eq!(client.album_queue(7).await, Ok(Vec::new()));
+    assert_eq!(client.album_track_files(7).await, Ok(Vec::new()));
+
+    let offered = client.manual_import_candidates("DL-1").await.expect("read");
+    assert_eq!(offered.len(), 2);
+    assert_eq!(
+        offered[1].rejections,
+        ["Not an upgrade for existing track file(s)"]
+    );
+    let take: Vec<LidarrManualImportItem> = offered
+        .into_iter()
+        .filter(|item| item.rejections.is_empty() && item.album_id == 7)
+        .collect();
+    let command = client.manual_import(&take).await.expect("asked");
+
+    assert_eq!(
+        fake.changes().last().and_then(|r| r.body.clone()),
+        Some(json!({
+            "name": "ManualImport",
+            "files": [{
+                "path": "/data/downloads/DL-1/01 - Angel.flac", "artistId": 5, "albumId": 7,
+                "albumReleaseId": 70, "trackIds": [1], "quality": { "quality": { "name": "FLAC" } },
+                "indexerFlags": 0, "downloadId": "DL-1", "disableReleaseSwitching": false,
+            }],
+            "importMode": "auto",
+            "replaceExistingFiles": false,
+        }))
+    );
+    assert_eq!(
+        client.command(command.id).await.expect("read").map(|c| c.status),
+        Some("completed".to_string())
+    );
+    let rows = client.download_history("DL-1").await.expect("read");
+    // Imported as that tracked download, so its row names the client; only part of the
+    // download came in, so no row ends it.
+    assert_eq!(
+        rows.iter().map(|r| r.event).collect::<Vec<_>>(),
+        [LidarrHistoryEvent::TrackFileImported, LidarrHistoryEvent::Grabbed]
+    );
+    assert_eq!(rows[0].download_client(), Some("QBittorrent"));
+    assert!(
+        asked(&fake)
+            .iter()
+            .any(|a| a == "GET /api/v1/manualimport?downloadId=DL-1&replaceExistingFiles=false")
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_moved_track_file_removes_only_its_record() {
+    let (root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    let angel = fake.import(1, "Angel", "FLAC");
+    let teardrop = fake.import(3, "Teardrop", "FLAC");
+    // Octo moved Angel into its hold folder.
+    let held = root.path().join(".octo-incoming/held/1/01 - Angel.flac");
+    std::fs::create_dir_all(held.parent().expect("a parent")).expect("the hold folder");
+    std::fs::rename(&angel, &held).expect("moved");
+    let client = build(&server);
+
+    assert_eq!(
+        client.delete_track_file_record(100).await,
+        Ok(LidarrDeletion::Deleted)
+    );
+    assert!(held.is_file());
+    assert_eq!(
+        client.delete_track_file_record(100).await,
+        Ok(LidarrDeletion::NotFound)
+    );
+    // With a recycle bin, a file still at its path is moved there, not removed.
+    fake.set_recycle_bin(true);
+    assert_eq!(
+        client.delete_track_file_record(101).await,
+        Ok(LidarrDeletion::Deleted)
+    );
+    assert!(!Path::new(&teardrop).exists());
+    assert!(
+        fake.local(LIDARR_RECYCLE_BIN)
+            .join("03 - Teardrop.flac")
+            .is_file()
+    );
+    let deleted = client
+        .artist_history(5, Some(LidarrHistoryEvent::TrackFileDeleted))
+        .await
+        .expect("read");
+    assert_eq!(
+        deleted.iter().map(|r| r.reason()).collect::<Vec<_>>(),
+        [Some("Manual"), Some("Manual")]
+    );
+    // With the artist's root folder empty, Lidarr keeps the record.
+    fake.import(1, "Angel", "FLAC");
+    std::fs::remove_dir_all(root.path().join("Massive Attack")).expect("removed");
+    std::fs::remove_dir_all(root.path().join(".octo-incoming")).expect("removed");
+    assert_eq!(
+        client.delete_track_file_record(102).await,
+        Ok(LidarrDeletion::Conflict)
+    );
+    assert_eq!(client.album_track_files(7).await.expect("read").len(), 1);
+    assert!(asked(&fake).iter().any(|a| a == "DELETE /api/v1/trackfile/100"));
+}
+
+#[tokio::test]
+async fn deleting_an_album_or_its_artist_leaves_the_disk_alone() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    let angel = fake.import(1, "Angel", "FLAC");
+    let client = build(&server);
+
+    assert_eq!(client.delete_album(7).await, Ok(LidarrDeletion::Deleted));
+    assert!(Path::new(&angel).is_file());
+    assert_eq!(client.album(7).await, Ok(None));
+    assert_eq!(client.delete_album(7).await, Ok(LidarrDeletion::NotFound));
+    assert_eq!(client.delete_artist(5).await, Ok(LidarrDeletion::Deleted));
+    assert!(Path::new(&angel).is_file());
+    assert_eq!(client.artists().await, Ok(Vec::new()));
+    let deletes: Vec<String> = asked(&fake)
+        .into_iter()
+        .filter(|a| a.starts_with("DELETE"))
+        .collect();
+    assert_eq!(
+        deletes,
+        [
+            "DELETE /api/v1/album/7?deleteFiles=false&addImportListExclusion=false",
+            "DELETE /api/v1/album/7?deleteFiles=false&addImportListExclusion=false",
+            "DELETE /api/v1/artist/5?deleteFiles=false&addImportListExclusion=false",
+        ]
+    );
+
+    // The fake deletes the artist's folder when asked to, so a test of a wrong request fails.
+    fake.user_album(ALBUM_ID, false);
+    let teardrop = fake.import(3, "Teardrop", "FLAC");
+    reqwest::Client::new()
+        .delete(format!("{}/api/v1/artist/5?deleteFiles=true", server.uri()))
+        .send()
+        .await
+        .expect("answered");
+    assert!(!Path::new(&teardrop).exists());
+}
+
+#[tokio::test]
+async fn an_import_replaces_every_file_the_album_had_and_writes_its_rows_after_its_files() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    // The user's own Angel: an import onto the album replaces it.
+    let users = fake.import(1, "Angel", "MP3-320");
+    fake.plan_grab(7, Grab::of("DL-1", &[(3, "Teardrop", "FLAC")]));
+    let client = build(&server);
+    client.album_search(7).await.expect("searched");
+    fake.complete("DL-1");
+    fake.set_rows_one_per_step(true);
+    fake.set_command_mode(CommandMode::PerPoll);
+    fake.refresh();
+    let active = async || -> Vec<String> {
+        client
+            .commands()
+            .await
+            .expect("listed")
+            .into_iter()
+            .filter(LidarrCommand::is_active)
+            .map(|c| c.name)
+            .collect()
+    };
+
+    // Each read of the commands moves Lidarr one step: the refresh runs, then the import
+    // starts, which moves its file in and the user's out before writing any row.
+    assert_eq!(active().await, ["RefreshMonitoredDownloads"]);
+    assert_eq!(active().await, ["ProcessMonitoredDownloads"]);
+    assert_eq!(
+        client
+            .album_track_files(7)
+            .await
+            .expect("read")
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        [101]
+    );
+    assert!(!Path::new(&users).exists());
+    let events = async || -> Vec<LidarrHistoryEvent> {
+        client
+            .download_history("DL-1")
+            .await
+            .expect("read")
+            .iter()
+            .map(|r| r.event)
+            .collect()
+    };
+    assert_eq!(events().await, [LidarrHistoryEvent::Grabbed]);
+    assert_eq!(active().await, ["ProcessMonitoredDownloads"]);
+    assert_eq!(
+        events().await,
+        [LidarrHistoryEvent::TrackFileImported, LidarrHistoryEvent::Grabbed]
+    );
+    assert_eq!(active().await, ["ProcessMonitoredDownloads"]);
+    assert_eq!(events().await[0], LidarrHistoryEvent::DownloadImported);
+    assert!(active().await.is_empty());
+    let replaced = client
+        .artist_history(5, Some(LidarrHistoryEvent::TrackFileDeleted))
+        .await
+        .expect("read");
+    assert_eq!(
+        replaced
+            .iter()
+            .map(|r| (r.reason(), r.source_title.as_str()))
+            .collect::<Vec<_>>(),
+        [(
+            Some("Upgrade"),
+            "/data/music/Massive Attack/Mezzanine/01 - Angel.mp3"
+        )]
+    );
+}
+
+#[tokio::test]
+async fn the_queue_is_lidarrs_last_refresh_and_empty_after_a_restart() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    fake.plan_grab(7, Grab::of("DL-1", &[(1, "Angel", "FLAC")]));
+    let client = build(&server);
+    let search = client.album_search(7).await.expect("searched");
+    let first_start = client.start_time().await.expect("read");
+    let left = |queue: Vec<LidarrQueueItem>| queue.first().and_then(|item| item.size_left_bytes);
+
+    fake.progress("DL-1", 1000);
+    assert_eq!(
+        left(client.album_queue(7).await.expect("read")),
+        Some(300_000_000)
+    );
+    fake.refresh();
+    assert_eq!(left(client.album_queue(7).await.expect("read")), Some(1000));
+
+    fake.restart();
+
+    assert_eq!(client.album_queue(7).await, Ok(Vec::new()));
+    assert!(client.start_time().await.expect("read") > first_start);
+    // The command list starts again; an older command is still read by its id.
+    assert_eq!(client.commands().await, Ok(Vec::new()));
+    assert_eq!(
+        client.command(search.id).await.expect("read").map(|c| c.status),
+        Some("completed".to_string())
+    );
+    fake.refresh();
+    assert_eq!(client.album_queue(7).await.expect("read").len(), 1);
+}
+
+#[tokio::test]
+async fn a_client_that_fails_a_refresh_drops_all_its_items_from_it() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    fake.user_grab(7, Grab::of("DL-1", &[]), "Rss");
+    fake.user_grab(
+        7,
+        Grab::of("DL-2", &[]).by_client("Transmission", "Transmission", "torrent", true),
+        "Rss",
+    );
+    let client = build(&server);
+    let listed = async || -> Vec<Option<String>> {
+        client
+            .artist_queue(5)
+            .await
+            .expect("read")
+            .into_iter()
+            .map(|item| item.download_id)
+            .collect()
+    };
+
+    fake.client_fails_next_refresh("qBittorrent");
+    fake.refresh();
+    assert_eq!(listed().await, [Some("DL-2".to_string())]);
+
+    fake.refresh();
+    assert_eq!(
+        listed().await,
+        [Some("DL-1".to_string()), Some("DL-2".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn downloads_show_their_clients_warnings_failures_and_removals() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    fake.plan_grab(7, Grab::of("DL-1", &[(1, "Angel", "FLAC")]));
+    fake.plan_grab(7, Grab::of("DL-2", &[(1, "Angel", "FLAC")]));
+    let client = build(&server);
+    client.album_search(7).await.expect("searched");
+    let item = |queue: &[LidarrQueueItem], id: &str| {
+        queue
+            .iter()
+            .find(|item| item.download_id.as_deref() == Some(id))
+            .cloned()
+    };
+
+    fake.stall("DL-1");
+    fake.refresh();
+    let queue = client.album_queue(7).await.expect("read");
+    assert_eq!(
+        item(&queue, "DL-1").and_then(|i| i.tracked_download_status),
+        Some("warning".to_string())
+    );
+
+    // A failed grab of a search: its row, and Lidarr's own new search, which grabs again.
+    fake.fail("DL-1");
+    let grabs = client
+        .album_history(7, LidarrHistoryEvent::Grabbed, None)
+        .await
+        .expect("read");
+    assert_eq!(
+        grabs
+            .iter()
+            .map(|r| (r.download_id.as_deref(), r.release_source()))
+            .collect::<Vec<_>>(),
+        [
+            (Some("DL-2"), Some("Search")),
+            (Some("DL-1"), Some("UserInvokedSearch"))
+        ]
+    );
+    assert!(
+        client
+            .download_history("DL-1")
+            .await
+            .expect("read")
+            .iter()
+            .any(|r| r.event == LidarrHistoryEvent::DownloadFailed)
+    );
+    assert!(client.commands().await.expect("listed").iter().any(|c| {
+        c.name == "AlbumSearch" && c.trigger.as_deref() == Some("unspecified") && c.album_ids() == [7]
+    }));
+
+    // The user's own grab, finished but blocked from importing.
+    fake.user_grab(
+        7,
+        Grab::of("DL-3", &[(3, "Teardrop", "FLAC")]),
+        "InteractiveSearch",
+    );
+    fake.complete("DL-3");
+    fake.block_import("DL-3", "importBlocked");
+    fake.refresh();
+    let queue = client.album_queue(7).await.expect("read");
+    let blocked = item(&queue, "DL-3").expect("listed");
+    assert_eq!(blocked.tracked_download_state.as_deref(), Some("importBlocked"));
+    assert_eq!(client.album_track_files(7).await, Ok(Vec::new()));
+
+    // Removed in the client: no row, and gone from the next refresh.
+    fake.remove_in_client("DL-2");
+    fake.refresh();
+    assert!(item(&client.album_queue(7).await.expect("read"), "DL-2").is_none());
+    assert!(
+        client
+            .download_history("DL-2")
+            .await
+            .expect("read")
+            .iter()
+            .all(|r| r.event == LidarrHistoryEvent::Grabbed)
+    );
+
+    // Removing with the blocklist marks the download failed.
+    assert_eq!(
+        client.remove_queue_item(blocked.id, true).await,
+        Ok(LidarrDeletion::Deleted)
+    );
+    assert!(
+        client
+            .download_history("DL-3")
+            .await
+            .expect("read")
+            .iter()
+            .any(|r| r.event == LidarrHistoryEvent::DownloadFailed)
+    );
+    let removal = format!(
+        "DELETE /api/v1/queue/{}?removeFromClient=true&blocklist=true&skipRedownload=true",
+        blocked.id
+    );
+    assert!(asked(&fake).contains(&removal));
+}
+
+#[tokio::test]
+async fn a_folder_import_names_no_client_even_with_a_guessed_download_id() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    let teardrop = GrabFile {
+        album_id: 7,
+        track_id: 3,
+        title: "Teardrop".into(),
+        quality: "FLAC".into(),
+        rejection: None,
+    };
+
+    fake.user_folder_import(&[teardrop], Some("DL-OCTO"));
+
+    let client = build(&server);
+    let rows = client.download_history("DL-OCTO").await.expect("read");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (
+            rows[0].event,
+            rows[0].download_client(),
+            rows[0].file_id().is_some()
+        ),
+        (LidarrHistoryEvent::TrackFileImported, None, true)
+    );
+    let commands = client.commands().await.expect("listed");
+    assert_eq!(
+        commands
+            .iter()
+            .map(|c| (c.name.as_str(), c.trigger.as_deref()))
+            .collect::<Vec<_>>(),
+        [("ManualImport", Some("manual"))]
+    );
+}
+
+#[tokio::test]
+async fn a_picked_release_is_grabbed_within_the_request_and_its_row_carries_its_guid() {
+    let (_root, fake, server) = fake_lidarr().await;
+    fake.user_album(ALBUM_ID, false);
+    fake.offer("picked", 3, "Massive Attack - Mezzanine [FLAC]", 400_000_000);
+    fake.plan_grab(7, Grab::of("DL-9", &[(3, "Teardrop", "FLAC")]));
+    let client = build(&server);
+    let pick = LidarrReleasePick {
+        guid: "picked".into(),
+        indexer_id: 3,
+        title: None,
+        size: None,
+    };
+
+    assert_eq!(client.grab_picked(7, &pick).await, Ok("picked".to_string()));
+
+    assert_eq!(fake.grabs(), ["picked"]);
+    let rows = client
+        .album_history(7, LidarrHistoryEvent::Grabbed, None)
+        .await
+        .expect("read");
+    assert_eq!(
+        (
+            rows[0].guid(),
+            rows[0].release_source(),
+            rows[0].download_id.as_deref()
+        ),
+        (Some("picked"), Some("InteractiveSearch"), Some("DL-9"))
+    );
+    // No command: the grab is the request itself.
+    assert!(!fake.changes().iter().any(|r| r.path == "/api/v1/command"));
+}
+
+#[tokio::test]
+async fn lidarrs_import_can_file_a_grab_under_another_album_and_monitor_its_release() {
+    let (_root, fake, server) = fake_lidarr().await;
+    let mut other = CatalogAlbum::new("rg-other", "Other", ARTIST_ID, 9, &[(40, "Angel", 1)]);
+    other.releases = vec![(90, "other-us".into()), (91, "other-uk".into())];
+    fake.catalog_album(other);
+    fake.user_album(ALBUM_ID, false);
+    fake.user_album("rg-other", false);
+    let mut grab = Grab::of("DL-1", &[(40, "Angel", "FLAC")]).into_album(9);
+    grab.release_id = Some(91);
+    fake.plan_grab(7, grab);
+    let client = build(&server);
+    client.album_search(7).await.expect("searched");
+    fake.complete("DL-1");
+
+    fake.refresh();
+
+    let imported: Vec<i32> = client
+        .download_history("DL-1")
+        .await
+        .expect("read")
+        .iter()
+        .filter(|r| r.event == LidarrHistoryEvent::TrackFileImported)
+        .map(|r| r.album_id)
+        .collect();
+    assert_eq!(imported, [9]);
+    assert_eq!(client.album_track_files(7).await, Ok(Vec::new()));
+    assert_eq!(client.album_track_files(9).await.expect("read").len(), 1);
+    // The import's SetMonitored: only the release it matched is monitored now.
+    let choice = client
+        .album(9)
+        .await
+        .expect("read")
+        .expect("held")
+        .release_choice();
+    assert_eq!(
+        choice
+            .releases
+            .iter()
+            .map(|r| (r.id, r.monitored))
+            .collect::<Vec<_>>(),
+        [(90, false), (91, true)]
+    );
 }

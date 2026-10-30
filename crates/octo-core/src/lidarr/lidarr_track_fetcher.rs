@@ -121,6 +121,7 @@ mod tests {
             artist: Some("Massive Attack".into()),
             track_file_id: number,
             quality: None,
+            foreign_recording_id: None,
         }
     }
 
