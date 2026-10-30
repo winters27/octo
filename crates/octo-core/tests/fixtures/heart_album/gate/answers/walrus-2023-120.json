@@ -1,0 +1,454 @@
+{
+ "answer": {
+  "results": [
+   {
+    "id": "915ac782-325d-4e45-987a-3659332b103f",
+    "recordings": [
+     {
+      "artists": [
+       {
+        "id": "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d",
+        "name": "The Beatles"
+       }
+      ],
+      "duration": 275.733,
+      "id": "21ca4704-2263-4e9f-ae4b-412af5d13e1e",
+      "isrcs": [
+       "GBAYE0601638",
+       "GBAYE6700024",
+       "GBUM72306578"
+      ],
+      "releasegroups": [
+       {
+        "artists": [
+         {
+          "id": "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d",
+          "name": "The Beatles"
+         }
+        ],
+        "id": "f2e0599e-222b-37a5-8544-2f68ce65fd66",
+        "releases": [
+         {
+          "country": "XW",
+          "date": {
+           "day": 10,
+           "month": 11,
+           "year": 2023
+          },
+          "id": "ff5a7bb0-0c20-4ee8-bf1b-90d60a298569",
+          "medium_count": 2,
+          "mediums": [
+           {
+            "format": "Digital Media",
+            "position": 1,
+            "track_count": 15,
+            "tracks": [
+             {
+              "id": "6ced24d0-9aae-4bb3-9a47-fc138d3e44ae",
+              "position": 9,
+              "title": "I Am the Walrus (2023 mix)"
+             }
+            ]
+           }
+          ],
+          "releaseevents": [
+           {
+            "country": "XW",
+            "date": {
+             "day": 10,
+             "month": 11,
+             "year": 2023
+            }
+           }
+          ],
+          "title": "The Beatles 1967\u20131970 (2023 edition)",
+          "track_count": 37
+         },
+         {
+          "country": "XW",
+          "date": {
+           "day": 10,
+           "month": 11,
+           "year": 2023
+          },
+          "id": "86fa66d8-f1c4-4e95-b1c1-639de1c8c9f7",
+          "medium_count": 2,
+          "mediums": [
+           {
+            "format": "Digital Media",
+            "position": 1,
+            "track_count": 15,
+            "tracks": [
+             {
+              "id": "398bff8a-8b0b-4243-aeab-dd45852951cd",
+              "position": 9,
+              "title": "I Am the Walrus (2023 mix)"
+             }
+            ]
+           }
+          ],
+          "releaseevents": [
+           {
+            "country": "XW",
+            "date": {
+             "day": 10,
+             "month": 11,
+             "year": 2023
+            }
+           }
+          ],
+          "title": "The Beatles 1967\u20131970 (2023 edition)",
+          "track_count": 37
+         },
+         {
+          "country": "XE",
+          "date": {
+           "day": 10,
+           "month": 11,
+           "year": 2023
+          },
+          "id": "a07638e4-dc4b-4aa6-8014-81eaa136463d",
+          "medium_count": 2,
+          "mediums": [
+           {
+            "format": "CD",
+            "position": 1,
+            "track_count": 15,
+            "tracks": [
+             {
+              "id": "2dff66fd-f630-4f7a-9d16-d30bc09b22b2",
+              "position": 9
+             }
+            ]
+           }
+          ],
+          "releaseevents": [
+           {
+            "country": "XE",
+            "date": {
+             "day": 10,
+             "month": 11,
+             "year": 2023
+            }
+           }
+          ],
+          "track_count": 37
+         },
+         {
+          "country": "XW",
+          "date": {
+           "day": 10,
+           "month": 11,
+           "year": 2023
+          },
+          "id": "3dd75ef3-0f4e-4526-92c7-d31af88aeb40",
+          "medium_count": 3,
+          "mediums": [
+           {
+            "format": "12\" Vinyl",
+            "position": 1,
+            "track_count": 14,
+            "tracks": [
+             {
+              "id": "9a2daae0-8ee3-4ba7-a413-52a80f5be477",
+              "position": 8,
+              "title": "I Am the Walrus (2023 mix)"
+             }
+            ]
+           }
+          ],
+          "releaseevents": [
+           {
+            "country": "XW",
+            "date": {
+             "day": 10,
+             "month": 11,
+             "year": 2023
+            }
+           }
+          ],
+          "track_count": 37
+         },
+         {
+          "date": {
+           "day": 10,
+           "month": 11,
+           "year": 2023
+          },
+          "id": "a2905aa4-edbd-41d6-b176-05889b649046",
+          "medium_count": 1,
+          "mediums": [
+           {
+            "format": "Digital Media",
+            "position": 1,
+            "track_count": 37,
+            "tracks": [
+             {
+              "id": "63b05aee-171f-40ef-a5b6-c6cf13a24490",
+              "position": 9,
+              "title": "I Am the Walrus (2023 mix)"
+             }
+            ]
+           }
+          ],
+          "releaseevents": [
+           {
+            "date": {
+             "day": 10,
+             "month": 11,
+             "year": 2023
+            }
+           }
+          ],
+          "title": "1967\u20131970 (2023 edition)",
+          "track_count": 37
+         }
+        ],
+        "secondarytypes": [
+         "Compilation"
+        ],
+        "title": "1967\u20131970",
+        "type": "Album"
+       },
+       {
+        "artists": [
+         {
+          "id": "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d",
+          "name": "The Beatles"
+         }
+        ],
+        "id": "041b2dd7-4931-485f-bef1-7411a41ceb6e",
+        "releases": [
+         {
+          "country": "XW",
+          "date": {
+           "day": 10,
+           "month": 11,
+           "year": 2023
+          },
+          "id": "82363e97-5511-4b6f-a75f-beae8949d269",
+          "medium_count": 4,
+          "mediums": [
+           {
+            "format": "CD",
+            "position": 3,
+            "title": "1967\u20131970",
+            "track_count": 15,
+            "tracks": [
+             {
+              "id": "b09e081c-b28c-46f3-82dc-92ab799e5c56",
+              "position": 9
+             }
+            ]
+           }
+          ],
+          "releaseevents": [
+           {
+            "country": "XW",
+            "date": {
+             "day": 10,
+             "month": 11,
+             "year": 2023
+            }
+           }
+          ],
+          "track_count": 75
+         },
+         {
+          "country": "XW",
+          "date": {
+           "day": 10,
+           "month": 11,
+           "year": 2023
+          },
+          "id": "d4f863da-3fa3-4414-b57c-fde2598e680c",
+          "medium_count": 6,
+          "mediums": [
+           {
+            "format": "12\" Vinyl",
+            "position": 4,
+            "title": "1967\u20131970 (2023 edition)",
+            "track_count": 14,
+            "tracks": [
+             {
+              "id": "89164e6c-b312-4512-a378-1ff255952dc6",
+              "position": 8,
+              "title": "I Am the Walrus (2023 mix)"
+             }
+            ]
+           }
+          ],
+          "releaseevents": [
+           {
+            "country": "XW",
+            "date": {
+             "day": 10,
+             "month": 11,
+             "year": 2023
+            }
+           }
+          ],
+          "track_count": 75
+         },
+         {
+          "country": "XW",
+          "date": {
+           "day": 10,
+           "month": 11,
+           "year": 2023
+          },
+          "id": "eb7fbc74-cfa7-4527-9a4d-0e171b11c894",
+          "medium_count": 6,
+          "mediums": [
+           {
+            "format": "12\" Vinyl",
+            "position": 4,
+            "title": "1967\u20131970 (2023 edition)",
+            "track_count": 14,
+            "tracks": [
+             {
+              "id": "73a657b0-30d7-4452-b581-446527a2ddfb",
+              "position": 8,
+              "title": "I Am the Walrus (2023 mix)"
+             }
+            ]
+           }
+          ],
+          "releaseevents": [
+           {
+            "country": "XW",
+            "date": {
+             "day": 10,
+             "month": 11,
+             "year": 2023
+            }
+           }
+          ],
+          "track_count": 75
+         }
+        ],
+        "secondarytypes": [
+         "Compilation"
+        ],
+        "title": "1962\u20131966 / 1967\u20131970",
+        "type": "Album"
+       },
+       {
+        "id": "95ab0f5d-d07d-4c08-b7dd-763a1cc2c652",
+        "releases": [
+         {
+          "date": {
+           "day": 28,
+           "month": 11,
+           "year": 2025
+          },
+          "id": "62d4d176-7f7a-4da5-8a00-7aa5f0eaeb06",
+          "medium_count": 1,
+          "mediums": [
+           {
+            "format": "Digital Media",
+            "position": 1,
+            "track_count": 37,
+            "tracks": [
+             {
+              "id": "fb804cf3-6aa9-48d7-b074-955bd6d2e7f2",
+              "position": 6,
+              "title": "I Am the Walrus (2023 mix)"
+             }
+            ]
+           }
+          ],
+          "releaseevents": [
+           {
+            "date": {
+             "day": 28,
+             "month": 11,
+             "year": 2025
+            }
+           }
+          ],
+          "track_count": 37
+         }
+        ],
+        "secondarytypes": [
+         "Compilation",
+         "Soundtrack"
+        ],
+        "title": "Anthology: Soundtrack to the Disney+ Series (Episodes 7-9)",
+        "type": "Album"
+       }
+      ],
+      "sources": 619,
+      "title": "I Am the Walrus"
+     },
+     {
+      "artists": [
+       {
+        "id": "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d",
+        "name": "The Beatles"
+       }
+      ],
+      "duration": 276.0,
+      "id": "ed8275f2-7f88-4b4a-97d5-6dcd7b0277fa",
+      "isrcs": [
+       "GBUM72309956"
+      ],
+      "releasegroups": [
+       {
+        "id": "f2e0599e-222b-37a5-8544-2f68ce65fd66",
+        "releases": [
+         {
+          "date": {
+           "day": 10,
+           "month": 11,
+           "year": 2023
+          },
+          "id": "71cbf824-23de-41a6-a81f-2181a124d057",
+          "medium_count": 2,
+          "mediums": [
+           {
+            "format": "Digital Media",
+            "position": 1,
+            "track_count": 15,
+            "tracks": [
+             {
+              "id": "e84bda48-93e3-4b18-b47a-0b49245eff50",
+              "position": 9
+             }
+            ]
+           }
+          ],
+          "releaseevents": [
+           {
+            "date": {
+             "day": 10,
+             "month": 11,
+             "year": 2023
+            }
+           }
+          ],
+          "title": "The Beatles 1967\u20131970 (2023 edition)",
+          "track_count": 37
+         }
+        ],
+        "secondarytypes": [
+         "Compilation"
+        ],
+        "title": "1967\u20131970",
+        "type": "Album"
+       }
+      ],
+      "sources": 3,
+      "title": "I Am the Walrus"
+     }
+    ],
+    "score": 0.9912975
+   }
+  ],
+  "status": "ok"
+ },
+ "duration": 276,
+ "fingerprint_sha256_16": "9f633d4d03c4eafb",
+ "http_status": 200,
+ "name": "walrus-2023-120"
+}

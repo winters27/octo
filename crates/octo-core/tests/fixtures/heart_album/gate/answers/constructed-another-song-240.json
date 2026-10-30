@@ -1,0 +1,28 @@
+{
+  "note": "Constructed, not a real AcoustID answer: a stream that stood in with another song by another artist (90% of the weight) while the hearted recording holds 2%. Recorded shape as the real answers.",
+  "answer": {
+    "status": "ok",
+    "results": [
+      {
+        "id": "c0ffee00-0000-4000-8000-00000000a001",
+        "score": 0.97,
+        "recordings": [
+          {
+            "id": "c0ffee00-0000-4000-8000-00000000b001",
+            "title": "Wonderwall",
+            "artists": [{"id": "39ab1aed-75e0-4140-bd47-540276886b60", "name": "Oasis"}],
+            "sources": 900,
+            "isrcs": ["GBBQY9500021"]
+          },
+          {
+            "id": "4416d38e-0f68-4c75-93b9-c1a793fccb49",
+            "title": "Help!",
+            "artists": [{"id": "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d", "name": "The Beatles"}],
+            "sources": 20,
+            "isrcs": ["GBAYE0601465"]
+          }
+        ]
+      }
+    ]
+  }
+}
