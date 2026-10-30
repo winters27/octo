@@ -2338,6 +2338,51 @@ impl SoulseekDownloadService {
     }
 }
 
+impl SoulseekDownloadService {
+    /// The first of a resumed hold's files that is still there and passes the checks a fresh
+    /// download's file meets; each one that fails is thrown away. None when none is left.
+    async fn take_held_file(
+        &self,
+        routing: &SoulseekRouting,
+        download: &mut TrackDownload,
+    ) -> Option<String> {
+        let held = std::mem::take(&mut download.held_files);
+        if held.is_empty() {
+            return None;
+        }
+        let isrc = download.song.isrc.clone().or(routing.isrc.clone());
+        let takes = self.verification.takes_for_routing(routing);
+        for file in held {
+            if !file_exists(&file) {
+                continue;
+            }
+            let verdict = self
+                .verification
+                .verify(
+                    &file,
+                    routing.artist.as_deref(),
+                    routing.title.as_deref(),
+                    isrc.as_deref(),
+                    &takes,
+                )
+                .await;
+            if verdict.verdict == VerificationVerdict::Mismatch {
+                info!(
+                    "A held file of '{}' failed its checks again; thrown away: {file}",
+                    download.song.title
+                );
+                let _ = std::fs::remove_file(&file);
+                continue;
+            }
+            info!("Resumed with its held file: {file}");
+            verdict.apply_tags_to(&mut download.song);
+            download.song.verification = Some(Box::new(verdict));
+            return Some(file);
+        }
+        None
+    }
+}
+
 /// Records the ids of a confirmed match, and its name too when tagging from MusicBrainz is on.
 /// Reads and writes the Song, never the routing. It reaches the tagger and the placement because
 /// the base passes ONE Song through the download, the identification, placement and tagging.
@@ -2556,6 +2601,15 @@ impl DownloadBackend for SoulseekDownloadService {
             copies.start(&video_id, total);
         }
 
+        // The format is the pinned video's, when the song is pinned to the video that played.
+        let itag = {
+            let now = routing.snapshot();
+            now.you_tube_id
+                .as_deref()
+                .filter(|pinned| *pinned == video_id)
+                .and(now.stream_itag.as_deref())
+                .and_then(|itag| itag.trim().parse::<u32>().ok())
+        };
         // The response owns the shim's connection: dropping the stream closes it.
         Ok(Some(DirectStreamInfo {
             audio_stream: Box::pin(opened.response.bytes_stream().map_err(std::io::Error::other)),
@@ -2564,6 +2618,8 @@ impl DownloadBackend for SoulseekDownloadService {
             quality: Some("youtube-m4a".to_string()),
             status_code: opened.status_code,
             content_range: opened.content_range,
+            video_id: Some(video_id),
+            itag,
         }))
     }
 
@@ -2587,6 +2643,11 @@ impl DownloadBackend for SoulseekDownloadService {
             ))
             .into());
         };
+        // A resumed hold brings back the files it held: the first still there that passes the
+        // checks is the download, before any source is asked.
+        if let Some(path) = self.take_held_file(&routing.snapshot(), download).await {
+            return Ok(path);
+        }
         let profile = if download.upgrade_search {
             SearchProfile::upgrade(&self.settings)
         } else {

@@ -213,6 +213,8 @@ impl IDownloadService for ShimDownloads {
             quality: None,
             status_code: 200,
             content_range: None,
+            video_id: None,
+            itag: None,
         }))
     }
 }

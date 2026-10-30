@@ -137,8 +137,8 @@ use crate::services::metadata::{
 use crate::services::metadata::{GenreBackfillJournal, GenreBackfillStore, GenreBackfillWorker};
 use crate::services::notifications::{DiscordSink, INotificationSink, NotificationService, NtfySink};
 use crate::services::prefetch::{
-    AppKeepReadySources, KeepReadyService, KeepReadyStore, PrefetchParts, PrefetchService, PrefetchStore,
-    PrefetchedFiles, PreviewCopies,
+    AppKeepReadySources, HeardSampleParts, HeardSamples, KeepReadyService, KeepReadyStore, PrefetchParts,
+    PrefetchService, PrefetchStore, PrefetchedFiles, PreviewCopies,
 };
 use crate::services::radio::{
     IRadioSource, LastFmRadioSource, ListenBrainzRadioSource, RadioOutcomeStore, RadioSourceSet,
@@ -321,6 +321,10 @@ pub struct AppInner {
     pub prefetch: Arc<PrefetchService>,
     /// `PreviewCopies`: whole copies of outside songs' previews, `<config>/preview-copies`.
     pub preview_copies: Arc<PreviewCopies>,
+    /// `HeardSamples`: the prints of what each person heard, `<config>/heard-samples`, with
+    /// scratch files under `<config>/preview-copies/scratch`; the `fpcalc` queue and the shim's
+    /// rounds.
+    pub heard_samples: Arc<HeardSamples>,
     /// `KeepReadyService`: each listener's playlists kept ready, `keep-ready.json`; its loop is the
     /// "KeepReady" worker.
     pub keep_ready: Arc<KeepReadyService>,
@@ -1031,8 +1035,31 @@ impl Acquisition {
                 ahead: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
                 gates: None,
                 music_brainz: Some(clients.music_brainz.clone()),
+                heard: Some(stores.heard_samples.clone()),
+                acoust_id_on: Some({
+                    let acoust_id = clients.acoust_id.clone();
+                    Arc::new(move || acoust_id.is_on())
+                }),
             },
         );
+        // The shim's rounds resume a held heart once the shim answers for it, and show a hold
+        // they moved on its row.
+        {
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            stores.heard_samples.on_resume(Arc::new(move |key: &str| {
+                if let Some(coordinator) = coordinator.upgrade() {
+                    coordinator.resume_held(key);
+                }
+            }));
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            stores.heard_samples.on_hold_row(Arc::new(
+                move |record: &crate::services::common::HeldAcquisition| {
+                    if let Some(coordinator) = coordinator.upgrade() {
+                        coordinator.hold_row_for(record);
+                    }
+                },
+            ));
+        }
         heart_acquisition_coordinator.use_family(FamilyHooks {
             gate: navidrome.family_write_gate.clone(),
             pool: navidrome.family_pool_service.clone(),
@@ -1103,10 +1130,13 @@ impl Acquisition {
             .with_family(self.family_pool_service.clone() as Arc<dyn FamilyPlacement>),
         );
         workers.register("AcquisitionWorker", move |stopping| worker.clone().run(stopping));
-        let resumer = Arc::new(SoulseekHoldResumer::new(
-            stores.soulseek_holds.clone(),
-            self.heart_acquisition_coordinator.clone(),
-        ));
+        let resumer = Arc::new(
+            SoulseekHoldResumer::new(
+                stores.soulseek_holds.clone(),
+                self.heart_acquisition_coordinator.clone(),
+            )
+            .with_heard(stores.heard_samples.clone()),
+        );
         workers.register("SoulseekHoldResumer", move |stopping| {
             resumer.clone().run(stopping)
         });
@@ -1327,6 +1357,7 @@ struct Stores {
     radio_queues: Arc<RadioQueueStore>,
     prefetch_store: Arc<PrefetchStore>,
     preview_copies: Arc<PreviewCopies>,
+    heard_samples: Arc<HeardSamples>,
     directory_browser: Arc<DirectoryBrowser>,
     browse_sessions: Arc<BrowseSessionStore>,
     rejected_peers: Arc<RejectedPeerRegistry>,
@@ -1408,6 +1439,20 @@ impl Stores {
             config_dir.join("cover-cache"),
             Arc::new(move || cover_settings.current().subsonic.effective_cover_cache_bytes()),
         ));
+        let soulseek_holds = Arc::new(SoulseekHoldStore::new(Some(
+            config_dir.join("soulseek-holds.json"),
+        )));
+        let heard_samples = HeardSamples::new(HeardSampleParts {
+            folder: config_dir.join("heard-samples"),
+            scratch: config_dir.join("preview-copies").join("scratch"),
+            settings: settings.clone(),
+            registry: external_id_registry.clone(),
+            youtube: you_tube_resolver.clone(),
+            copies: preview_copies.clone(),
+            prefetch: prefetch_store.clone(),
+            holds: soulseek_holds.clone(),
+            clock: Clock::system(),
+        });
         Stores {
             download_history: Arc::new(DownloadHistoryService::new(
                 config_dir.join("downloads-history.json"),
@@ -1415,9 +1460,7 @@ impl Stores {
             download_arrivals: Arc::new(DownloadArrivals::default()),
             download_concurrency: Arc::new(DownloadConcurrency::new(settings.clone())),
             download_picks: Arc::new(DownloadPicks::default()),
-            soulseek_holds: Arc::new(SoulseekHoldStore::new(Some(
-                config_dir.join("soulseek-holds.json"),
-            ))),
+            soulseek_holds,
             you_tube_resolver,
             subsonic_response_builder: Arc::new(SubsonicResponseBuilder::new(
                 stream_size_warmer.clone(),
@@ -1429,6 +1472,7 @@ impl Stores {
             radio_queues: Arc::new(RadioQueueStore::new()),
             prefetch_store,
             preview_copies,
+            heard_samples,
             directory_browser: Arc::new(DirectoryBrowser::new()),
             browse_sessions: Arc::new(BrowseSessionStore::new(Some(
                 config_dir.join("browse-sessions.json"),
@@ -3245,6 +3289,7 @@ impl AppState {
             radio_queues: stores.radio_queues,
             prefetch,
             preview_copies: stores.preview_copies,
+            heard_samples: stores.heard_samples,
             keep_ready,
             directory_browser: stores.directory_browser,
             browse_sessions: stores.browse_sessions,
@@ -3686,6 +3731,7 @@ impl AppState {
             radio_queues: stores.radio_queues,
             prefetch,
             preview_copies: stores.preview_copies,
+            heard_samples: stores.heard_samples,
             keep_ready,
             directory_browser: stores.directory_browser,
             browse_sessions: stores.browse_sessions,

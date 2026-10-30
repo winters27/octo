@@ -198,4 +198,8 @@ pub struct DirectStreamInfo {
     pub status_code: u16,
     /// Verbatim Content-Range header to forward to the client (only set when StatusCode == 206).
     pub content_range: Option<String>,
+    /// The video that played, when the stream is a video's.
+    pub video_id: Option<String>,
+    /// That video's audio format, when the routing is pinned to that same video and knows it.
+    pub itag: Option<u32>,
 }

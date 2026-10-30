@@ -662,6 +662,35 @@ impl ExternalIdRegistry {
             .collect()
     }
 
+    /// Up to `limit` videos pinned to songs, the most recently used song first, leaving out
+    /// `except`.
+    pub fn pinned_videos(&self, limit: usize, except: &std::collections::HashSet<String>) -> Vec<String> {
+        let routings: Vec<SharedRouting> = {
+            let lru = self.lru.lock();
+            lru.ids()
+                .into_iter()
+                .filter_map(|id| lru.by_id.get(&id).map(|(r, _)| r.clone()))
+                .collect()
+        };
+        let mut videos: Vec<String> = Vec::new();
+        for routing in routings {
+            if videos.len() >= limit {
+                break;
+            }
+            let r = routing.lock();
+            if r.kind != RoutingKind::Song {
+                continue;
+            }
+            if let Some(video) = r.you_tube_id.as_deref().filter(|v| !v.is_empty())
+                && !except.contains(video)
+                && !videos.iter().any(|known| known == video)
+            {
+                videos.push(video.to_string());
+            }
+        }
+        videos
+    }
+
     /// Marks the video the song under `short_id` plays as picked by the current ranking, but
     /// only while it still plays `video`. True when the record changed.
     pub fn stamp_pick(&self, short_id: &str, video: &str) -> bool {

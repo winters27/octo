@@ -545,6 +545,34 @@ impl AcquisitionTracker {
         }
     }
 
+    /// A held acquisition runs again: its row leaves the line it waited with at once and shows
+    /// the search, while its record keeps the row from being pruned until the run ends.
+    pub fn resume_row(&self, provider: &str, external_id: &str) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let now = self.now();
+        let mut state = self.state.lock();
+        if let Some(entry) = state.entries.get_mut(&key_of(provider, external_id))
+            && !entry.finished()
+        {
+            entry.state = AcquisitionState::Searching;
+            entry.progress = None;
+            entry.note = None;
+            entry.updated_at = now;
+        }
+    }
+
+    /// The line a row shows now, for tests.
+    #[cfg(test)]
+    pub fn note_of(&self, provider: &str, external_id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .entries
+            .get(&key_of(provider, external_id))
+            .and_then(|entry| entry.note.clone())
+    }
+
     /// Whether the row of this acquisition is held.
     pub fn is_held(&self, provider: &str, external_id: &str) -> bool {
         self.state

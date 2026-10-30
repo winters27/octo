@@ -735,6 +735,8 @@ impl SubsonicProxyService {
             quality: Some("navidrome-raw".to_string()),
             status_code: 200,
             content_range: None,
+            video_id: None,
+            itag: None,
         }))
     }
 }

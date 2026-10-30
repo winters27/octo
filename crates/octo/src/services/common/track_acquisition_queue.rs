@@ -128,6 +128,8 @@ pub struct AcquisitionPlace {
     pub origin: Option<AcquisitionOrigin>,
     /// One gate per heart or play that asked, each judged on its own.
     pub gates: Vec<HeartGate>,
+    /// The files a resumed hold held in the one hold path, which the download checks first.
+    pub held_files: Vec<String>,
 }
 
 /// One queued request to fetch a permanent copy of a track.
@@ -172,6 +174,8 @@ pub struct AcquisitionRequest {
     /// The gates of the hearts and plays that asked, one per person and origin, joiners'
     /// included.
     gates: Mutex<Vec<HeartGate>>,
+    /// The files a resumed hold held, which the download checks before any source.
+    held_files: Mutex<Vec<String>>,
 
     pub completion: Completion,
 }
@@ -206,7 +210,18 @@ impl AcquisitionRequest {
             flac_only: false,
             origin: None,
             gates: Mutex::new(Vec::new()),
+            held_files: Mutex::new(Vec::new()),
             completion: Completion::default(),
+        }
+    }
+
+    /// Adds files a resumed hold held, which the download checks before any source.
+    pub fn add_held_files(&self, files: &[String]) {
+        let mut held = self.held_files.lock();
+        for file in files {
+            if !held.contains(file) {
+                held.push(file.clone());
+            }
         }
     }
 
@@ -283,6 +298,7 @@ impl AcquisitionRequest {
             flac_only: self.flac_only,
             origin: self.origin,
             gates: self.gates(),
+            held_files: self.held_files.lock().clone(),
         }
     }
 
@@ -601,6 +617,46 @@ impl TrackAcquisitionQueue {
         upgrade_search: bool,
         replacement: Option<Arc<ReplacementHandoff>>,
     ) -> Completion {
+        self.enqueue_holding(
+            origin,
+            gates,
+            Vec::new(),
+            target,
+            flac_only,
+            provider,
+            external_id,
+            is_star,
+            trigger_album_download,
+            force_permanent,
+            source_override,
+            notify_on_failure,
+            requested_by,
+            upgrade_search,
+            replacement,
+        )
+    }
+
+    /// [`Self::enqueue_as`] for a resumed hold: `held_files` are the files it held, which the
+    /// download checks before any source.
+    #[allow(clippy::too_many_arguments)] // enqueue_as's arguments and the held files
+    pub fn enqueue_holding(
+        &self,
+        origin: Option<AcquisitionOrigin>,
+        gates: Vec<HeartGate>,
+        held_files: Vec<String>,
+        target: &AcquisitionTarget,
+        flac_only: bool,
+        provider: &str,
+        external_id: &str,
+        is_star: bool,
+        trigger_album_download: bool,
+        force_permanent: bool,
+        source_override: Option<DownloadSource>,
+        notify_on_failure: bool,
+        requested_by: Option<&str>,
+        upgrade_search: bool,
+        replacement: Option<Arc<ReplacementHandoff>>,
+    ) -> Completion {
         let mut request = AcquisitionRequest::new(
             provider,
             external_id,
@@ -621,6 +677,7 @@ impl TrackAcquisitionQueue {
         for gate in &gates {
             request.add_gate(gate.clone());
         }
+        request.add_held_files(&held_files);
         if upgrade_search {
             request.ask_for_upgrade_search();
         }
@@ -644,6 +701,7 @@ impl TrackAcquisitionQueue {
             for gate in gates {
                 existing.add_gate(gate);
             }
+            existing.add_held_files(&held_files);
             if upgrade_search {
                 existing.ask_for_upgrade_search();
             }

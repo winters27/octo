@@ -153,6 +153,8 @@ pub struct TrackDownload {
     pub flac_only: bool,
     /// A download ahead of a play, which leaves an album walk's queued files to the walk.
     pub ahead: bool,
+    /// The files a resumed hold held: checked first, as a fresh download's file is.
+    pub held_files: Vec<String>,
 }
 
 /// The source-specific parts of the download pipeline. Every call is handed the base, so a
@@ -1042,6 +1044,7 @@ impl BaseDownloadService {
                     muted: false,
                     flac_only,
                     ahead: options.prefetch,
+                    held_files: options.place.held_files.clone(),
                 };
                 let transferred = self
                     .backend

@@ -627,12 +627,263 @@ async fn a_play_handed_to_lidarr_says_it_is_a_play_and_a_play_never_holds() {
         [(AcquisitionOrigin::Play, 0)]
     );
 
-    // A play's gate that would hold is still its gate: the play is queued, and nothing is held.
-    let gates = rig
+    // A play's gate that would hold is no gate at all: the play fetches nothing, and nothing is
+    // held.
+    let held = rig
         .coordinator
         .play_gates("soulseek", "played", Some("brandon"), None)
         .await;
-    assert_eq!(gates.len(), 1);
-    assert_eq!(gates[0].origin, AcquisitionOrigin::Play);
+    assert_eq!(held, None);
     assert!(rig.holds.snapshot().is_empty());
+
+    // A ready gate is the play's only gate.
+    gates.ready("brandon");
+    let ready = rig
+        .coordinator
+        .play_gates("soulseek", "played", Some("brandon"), None)
+        .await
+        .expect("a ready gate");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].origin, AcquisitionOrigin::Play);
+}
+
+// ---- Held files, the resumed row, heard copies and plays ------------------------------------
+
+#[tokio::test]
+async fn a_resumed_hold_brings_its_held_files_and_its_row_leaves_the_hold_line_at_once() {
+    let holds = memory_holds();
+    let rig = rig(Arc::new(ListedGates::default()), None, holds.clone());
+    let mut record = held(
+        "help",
+        AcquisitionOrigin::Heart,
+        WaitingFor::AcoustId,
+        &["brandon"],
+    );
+    record.held_files = vec!["/downloads/.octo-incoming/held/Track_soulseek_help/help.flac".into()];
+    let record = holds.hold(record);
+    rig.coordinator.hold_row_for(&record);
+    assert_eq!(
+        rig.tracker.note_of("soulseek", "help").as_deref(),
+        Some("Waiting for AcoustId")
+    );
+
+    rig.coordinator.resume_held(&record.key());
+    let request = tokio::time::timeout(
+        Duration::from_secs(10),
+        rig.queue.dequeue(&CancellationToken::new()),
+    )
+    .await
+    .expect("the chain runs again")
+    .expect("a request");
+    // The row left its line when the resume started, before the download staged anything.
+    assert_eq!(rig.tracker.note_of("soulseek", "help"), None);
+    assert!(rig.tracker.is_held("soulseek", "help"), "held until the run ends");
+    assert_eq!(request.place().held_files, record.held_files);
+    rig.queue.release(&request);
+    request.completion.try_set_result("/music/help.flac");
+    until(|| holds.snapshot().is_empty()).await;
+    until(|| !rig.tracker.is_held("soulseek", "help")).await;
+}
+
+#[tokio::test]
+async fn two_people_held_in_one_record_hold_one_heard_copy_and_one_unheart_leaves_it_held() {
+    use crate::services::prefetch::heard_samples::tests::rig_in;
+    use crate::services::soulseek::SharedRouting;
+    use octo_core::fingerprint::heart_gate::{HeardRecord, HeardSource};
+    use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
+
+    const VIDEO: &str = "AAAAAAAAAA1";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("copies")).unwrap();
+    std::fs::write(
+        dir.path().join("copies").join(format!("{VIDEO}.preview")),
+        vec![0u8; 10],
+    )
+    .unwrap();
+    let holds = memory_holds();
+    let heard = rig_in(dir.path(), "http://127.0.0.1:1", holds.clone(), 16, 1 << 20);
+    let id = heard.registry.register(SharedRouting::new(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("The Beatles".into()),
+        title: Some("Help!".into()),
+        ..Default::default()
+    }));
+    for user in ["brandon", "anna"] {
+        heard.registry.remember_heard(
+            &id,
+            user,
+            HeardRecord {
+                heard_at: Utc::now(),
+                source: HeardSource::Video {
+                    id: VIDEO.into(),
+                    size: Some(10),
+                    content_type: "audio/mp4".into(),
+                    itag: None,
+                },
+                sample_id: None,
+            },
+            None,
+        );
+    }
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("brandon", WaitingFor::NotYetProven);
+    gates.hold("anna", WaitingFor::NotYetProven);
+    let coordinator = HeartAcquisitionCoordinator::new(
+        youtube_only(),
+        Arc::new(TrackAcquisitionQueue::new()),
+        Arc::new(FakeDownloads::default()),
+        Arc::new(FakeLidarr::default()),
+        HeartCoordinatorExtras {
+            tracker: Some(Arc::new(AcquisitionTracker::new(None, Clock::system()))),
+            id_registry: Some(heard.registry.clone()),
+            holds: Some(holds.clone()),
+            gates: Some(gates),
+            heard: Some(heard.samples.clone()),
+            ..Default::default()
+        },
+    );
+    for user in ["brandon", "anna"] {
+        coordinator
+            .acquire_track_outcome(
+                "soulseek",
+                &id,
+                Some(user),
+                None,
+                &AcquisitionTarget::Shared,
+                AcquisitionOrigin::Heart,
+            )
+            .await
+            .expect("ran");
+    }
+    let key = format!("Track:soulseek:{id}:NotYetProven");
+    until(|| !coordinator.resuming.lock().contains(&key)).await;
+    assert_eq!(users(&holds.get(&key).expect("held")), ["brandon", "anna"]);
+    assert!(heard.copies.is_held(VIDEO));
+
+    assert_eq!(coordinator.leave_holds("soulseek", &id, "anna"), 1);
+    assert!(heard.copies.is_held(VIDEO), "brandon still holds it");
+    heard.copies.drop_copy(VIDEO);
+    assert!(heard.copies.is_ready(VIDEO));
+    assert_eq!(coordinator.leave_holds("soulseek", &id, "brandon"), 1);
+    assert!(!heard.copies.is_held(VIDEO), "nobody holds it now");
+}
+
+/// A coordinator for plays with DownloadOnPlay and LidarrAlbumOnPlay on, AcoustID `on` or off.
+fn play_rig(on: bool, gates: Arc<dyn HeartGates>) -> Rig {
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+        subsonic: SubsonicSettings {
+            download_on_play: true,
+            lidarr_album_on_play: true,
+            heart_download_sources: vec![HeartDownloadStep {
+                source: HeartDownloadSource::YouTube,
+                song_enabled: Some(true),
+                album_enabled: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let queue = Arc::new(TrackAcquisitionQueue::new());
+    let tracker = Arc::new(AcquisitionTracker::new(None, Clock::system()));
+    let lidarr = Arc::new(FakeLidarr::default());
+    let holds = memory_holds();
+    let coordinator = HeartAcquisitionCoordinator::new(
+        settings,
+        queue.clone(),
+        Arc::new(FakeDownloads::default()),
+        lidarr.clone(),
+        HeartCoordinatorExtras {
+            tracker: Some(tracker.clone()),
+            holds: Some(holds.clone()),
+            gates: Some(gates),
+            acoust_id_on: Some(Arc::new(move || on)),
+            ..Default::default()
+        },
+    );
+    Rig {
+        coordinator,
+        queue,
+        holds,
+        tracker,
+        lidarr,
+    }
+}
+
+fn heard_video() -> HeardRecord {
+    HeardRecord {
+        heard_at: Utc::now(),
+        source: octo_core::fingerprint::heart_gate::HeardSource::Video {
+            id: "AAAAAAAAAA1".into(),
+            size: Some(10),
+            content_type: "audio/mp4".into(),
+            itag: None,
+        },
+        sample_id: None,
+    }
+}
+
+#[tokio::test]
+async fn with_acoust_id_off_a_play_that_heard_nothing_fetches_nothing_from_any_source() {
+    let rig = play_rig(false, Arc::new(ListedGates::default()));
+    rig.coordinator.queue_play_heard(
+        "soulseek",
+        "played",
+        Some("brandon"),
+        Some("c"),
+        Some("brandon"),
+        None,
+    );
+    rig.coordinator
+        .queue_play_ahead("soulseek", "next", Some("brandon"), Some("c"), Some("brandon"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(rig.queue.waiting_plays(), 0, "no download");
+    assert!(rig.lidarr.origins.lock().is_empty(), "no Lidarr album");
+
+    // A play that heard its audio still runs both, judged against what it heard.
+    let heard = heard_video();
+    rig.coordinator.queue_play_heard(
+        "soulseek",
+        "played",
+        Some("brandon"),
+        Some("c"),
+        Some("brandon"),
+        Some(heard.clone()),
+    );
+    until(|| rig.queue.waiting_plays() == 1 && rig.lidarr.origins.lock().len() == 1).await;
+    let request = tokio::time::timeout(
+        Duration::from_secs(10),
+        rig.queue.dequeue(&CancellationToken::new()),
+    )
+    .await
+    .expect("queued")
+    .expect("the play's download");
+    assert_eq!(request.origin, Some(AcquisitionOrigin::Play));
+    let gates = request.gates();
+    assert_eq!(gates.len(), 1);
+    assert_eq!(gates[0].heard, Some(heard));
+}
+
+#[tokio::test]
+async fn a_play_whose_gate_would_wait_downloads_nothing_and_holds_nothing() {
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("brandon", WaitingFor::AcoustIdOff);
+    let rig = play_rig(false, gates.clone());
+    rig.coordinator.queue_play_heard(
+        "soulseek",
+        "played",
+        Some("brandon"),
+        Some("c"),
+        Some("brandon"),
+        Some(heard_video()),
+    );
+    until(|| !gates.built.lock().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(rig.queue.waiting_plays(), 0);
+    assert!(rig.lidarr.origins.lock().is_empty());
+    assert!(rig.holds.snapshot().is_empty(), "a play never holds");
+    assert_eq!(
+        gates.built.lock()[0],
+        ("brandon".to_string(), AcquisitionOrigin::Play)
+    );
 }

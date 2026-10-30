@@ -1474,6 +1474,63 @@ async fn a_flac_beside_the_only_mp3_the_search_found_is_taken() {
     assert!(std::path::Path::new(&path).is_file());
 }
 
+/// A resumed hold brings back the file it held: the download checks it first and takes it, and
+/// no source is asked. A held file that is gone leaves the sources to run as ever.
+#[tokio::test]
+async fn a_resumed_holds_file_is_checked_first_and_taken_without_a_search() {
+    let root = Root::new("octo-held-");
+    let walk = build(&root, false, |_| Arc::new(|_: &str| Vec::new())).await;
+    let song = walk.songs[1].clone();
+    let held = root.write(".octo-incoming/held/Track_soulseek_hold-on/hold-on.flac", 0);
+    std::fs::write(&held, flac(200)).expect("the held file");
+    let path = tokio::time::timeout(
+        Duration::from_secs(60),
+        walk.service.execute_acquisition_to(
+            "soulseek",
+            song.external_id.as_deref().expect("an id"),
+            false,
+            true,
+            Some(DownloadSource::Soulseek),
+            &CancellationToken::new(),
+            None,
+            false,
+            None,
+            crate::services::common::AcquisitionPlace {
+                held_files: vec![held.clone()],
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("within a minute")
+    .expect("the held file lands");
+    assert!(walk.slskd.searches().is_empty(), "{:?}", walk.slskd.searches());
+    assert!(std::path::Path::new(&path).is_file());
+    assert!(!std::path::Path::new(&held).exists(), "it moved into the library");
+
+    // Gone from the hold path: the search runs as ever.
+    let other = walk.songs[3].clone();
+    let token = CancellationToken::new();
+    let searched = walk.service.execute_acquisition_to(
+        "soulseek",
+        other.external_id.as_deref().expect("an id"),
+        false,
+        true,
+        Some(DownloadSource::Soulseek),
+        &token,
+        None,
+        false,
+        None,
+        crate::services::common::AcquisitionPlace {
+            held_files: vec![root.0.path().join("gone.flac").to_string_lossy().into_owned()],
+            ..Default::default()
+        },
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(5), searched).await;
+    token.cancel();
+    assert!(!walk.slskd.searches().is_empty());
+}
+
 #[tokio::test]
 async fn no_flac_beside_the_mp3_means_no_download() {
     let root = Root::new("octo-albumwalk-");

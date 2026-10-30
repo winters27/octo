@@ -671,7 +671,11 @@ impl PrefetchService {
                 .store
                 .sweep(settings.effective_keep_days(), settings.effective_cache_bytes());
             if let Some(copies) = self.copies.get().cloned() {
-                let _ = tokio::task::spawn_blocking(move || copies.sweep()).await;
+                let swept = Arc::clone(&copies);
+                let _ = tokio::task::spawn_blocking(move || swept.sweep()).await;
+                // Held copies count toward the cap too: past it on their own, the oldest whose
+                // video still plays is let go.
+                copies.release_held_over_cap().await;
             }
         }
         if !settings.enabled {

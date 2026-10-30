@@ -188,10 +188,19 @@ impl FakeStreams {
                     quality: None,
                     status_code: 200,
                     content_range: None,
+                    video_id: None,
+                    itag: None,
                 })
             })),
         );
         fake
+    }
+
+    /// Answers this provider and id with `answer` from now on.
+    pub fn answer_with(&self, provider: &str, external_id: &str, answer: StreamAnswer) {
+        self.answers
+            .lock()
+            .insert((provider.to_string(), external_id.to_string()), Arc::new(answer));
     }
 
     pub fn stream_calls(&self) -> Vec<(String, String, Option<String>)> {

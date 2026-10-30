@@ -380,6 +380,72 @@ async fn dropping_a_copy_removes_it_and_its_file_but_never_one_a_playlist_holds(
     assert_eq!(copies.sizes(), (0, 0));
 }
 
+/// One second of a 440 Hz tone as a mono 16-bit WAV, a preview ffmpeg can read.
+fn wav() -> Vec<u8> {
+    let rate = 8_000u32;
+    let samples: Vec<i16> = (0..rate)
+        .map(|i| {
+            ((f64::from(i) * 2.0 * std::f64::consts::PI * 440.0 / f64::from(rate)).sin() * 8_000.0) as i16
+        })
+        .collect();
+    let data = samples.len() as u32 * 2;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&rate.to_le_bytes());
+    bytes.extend_from_slice(&(rate * 2).to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&data.to_le_bytes());
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+/// The FLAC stand-in is built once from the whole copy (made for it when there is none), counts
+/// toward the copies' bytes, and goes with its copy. ffmpeg is needed: without it the test fails.
+#[tokio::test]
+async fn a_flac_stand_in_is_built_once_counts_toward_the_cap_and_goes_with_its_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let (clock, _) = clock();
+    let preview = wav();
+    let source = Arc::new(FakeSource::new(preview.clone()));
+    let copies = copies(&dir, source.clone(), clock, u64::MAX);
+    let flac = copies
+        .flac_stand_in(VIDEO, Some(preview.len() as u64))
+        .await
+        .expect("ffmpeg made the stand-in");
+    assert_eq!(
+        flac,
+        dir.path()
+            .join("previews")
+            .join("flac")
+            .join(format!("{VIDEO}.flac"))
+    );
+    assert!(std::fs::read(&flac).unwrap().starts_with(b"fLaC"));
+    let flac_bytes = std::fs::metadata(&flac).unwrap().len();
+    assert_eq!(copies.sizes(), (1, preview.len() as u64 + flac_bytes));
+    assert_eq!(copies.built_flac(VIDEO), Some(flac.clone()));
+    let built = std::fs::metadata(&flac).unwrap().modified().unwrap();
+    assert_eq!(copies.flac_stand_in(VIDEO, None).await, Some(flac.clone()));
+    assert_eq!(
+        std::fs::metadata(&flac).unwrap().modified().unwrap(),
+        built,
+        "built once"
+    );
+    assert_eq!(source.opens.load(Ordering::SeqCst), 1);
+
+    copies.drop_copy(VIDEO);
+    assert!(!flac.exists(), "it goes with its copy");
+    assert_eq!(copies.built_flac(VIDEO), None);
+}
+
 #[tokio::test]
 async fn kept_copies_stop_starting_once_they_fill_their_room() {
     let dir = tempfile::tempdir().unwrap();
