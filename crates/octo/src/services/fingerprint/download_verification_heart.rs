@@ -24,8 +24,10 @@ use super::*;
 use crate::services::common::heart_acquisition_coordinator::{GateStart, HeartGates, waiting_line};
 use crate::services::common::{HeldAcquisition, Holder};
 use crate::services::fingerprint::heard_master_check::{HeardAudio, RoundGuard};
-use crate::services::fingerprint::music_brainz_client::{HeartBusy, HeartQuestions, Lane, heart_song};
-use crate::services::prefetch::heard_samples::{FpcalcClass, TopUp, sample_id_of};
+use crate::services::fingerprint::music_brainz_client::{
+    HeartBusy, HeartQuestions, Lane, code_question, heart_song, recording_question,
+};
+use crate::services::prefetch::heard_samples::{FpcalcClass, Printer, TopUp, sample_id_of};
 
 /// The downloads line of a heart whose heard lookup has not answered yet.
 pub const HEARD_LOOKUP_BUSY: &str = "Waiting for AcoustID to check what played";
@@ -69,6 +71,15 @@ impl DownloadVerificationService {
 
     fn min_score(&self) -> f64 {
         self.settings.current().soulseek.effective_min_score_fraction()
+    }
+
+    /// What prints a downloaded file: the heard samples' printer, which every heart's sound work
+    /// shares, once the heart gate has its parts; else `fpcalc` as the service was built with.
+    pub(crate) fn file_printer(&self) -> Arc<dyn Printer> {
+        match self.heart.get() {
+            Some(parts) => parts.samples.printer(),
+            None => self.fingerprinter.clone(),
+        }
     }
 
     /// Pauses each gate's open heard-master round of the acquisition: its heard copy goes and its
@@ -489,11 +500,12 @@ impl DownloadVerificationService {
                 Some(parts) => Some(parts.samples.slot(FpcalcClass::Heart).await),
                 None => None,
             };
+            let printer = self.file_printer();
             let seconds = settings.effective_fingerprint_seconds();
             let timeout = settings.effective_fingerprint_timeout_seconds();
-            let fingerprint = self.fingerprinter.fingerprint(path, seconds, timeout).await;
+            let fingerprint = printer.fingerprint(path, seconds, timeout).await;
             let raw = if fingerprint.outcome == FingerprintOutcome::Ok {
-                self.fingerprinter.raw_fingerprint(path, seconds, timeout).await
+                printer.raw(path, seconds, timeout).await
             } else {
                 None
             };
@@ -597,6 +609,9 @@ impl DownloadVerificationService {
                         Some(music_brainz) => music_brainz.current_recording(&id).await,
                         None => MusicBrainzFact::NotKnown,
                     };
+                    if matches!(fact, MusicBrainzFact::Busy) {
+                        self.remember_question(candidate, gate, recording_question(&id));
+                    }
                     facts.current_recordings.push((id, fact));
                 }
                 Judgement::Needs(Need::IsrcRecordings(code)) => {
@@ -604,11 +619,33 @@ impl DownloadVerificationService {
                         Some(music_brainz) => music_brainz.isrc_songs_for_heart(&code).await,
                         None => MusicBrainzFact::NotKnown,
                     };
+                    if matches!(fact, MusicBrainzFact::Busy) {
+                        self.remember_question(candidate, gate, code_question(&code));
+                    }
                     facts.isrc_recordings.push((code, fact));
                 }
             }
         }
         GateVerdict::Undecided(octo_core::fingerprint::heart_gate::Undecided::NotYetProven)
+    }
+
+    /// Keeps the MusicBrainz question a file's label check met busy, so the hold the file leaves
+    /// for this person asks it again once filed.
+    fn remember_question(&self, candidate: &HeartCandidate, gate: &HeartGate, question: Option<String>) {
+        let Some(question) = question else {
+            return;
+        };
+        let song = candidate
+            .acquisition_key
+            .strip_suffix(":flac")
+            .unwrap_or(&candidate.acquisition_key)
+            .to_string();
+        let mut kept = self.file_questions.lock();
+        // Bounded: a question waits here only between a file's check and its hold.
+        if kept.len() >= MOST_KEPT_PRINTS {
+            kept.clear();
+        }
+        kept.insert((song, gate.user.trim().to_lowercase()), question);
     }
 
     /// The verdict a kept file is tagged by: a recording the sound proved, with its id and the
@@ -971,6 +1008,27 @@ impl HeartGates for DownloadVerificationService {
                     self.client.hold_lookup(Box::new(move || resume(&key)));
                 }
             }
+            Some(WaitingFor::MusicBrainz) => {
+                // A hold a file's label check left: its question is asked again until it
+                // answers, as a gate's own question is.
+                let song = (
+                    format!("{}:{}", record.provider, record.external_id),
+                    user.trim().to_lowercase(),
+                );
+                let question = self.file_questions.lock().remove(&song);
+                let resume = self.resume.lock().clone();
+                if let (Some(question), Some(resume), Some(music_brainz)) =
+                    (question, resume, self.music_brainz.as_ref())
+                {
+                    music_brainz.re_ask(
+                        &question,
+                        Box::new(move |ended| {
+                            debug!("MusicBrainz {ended:?} the label question {key} waited on");
+                            resume(&key);
+                        }),
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -1056,3 +1114,7 @@ const MOST_KEPT_PRINTS: usize = 256;
 #[cfg(test)]
 #[path = "download_verification_heart_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "download_verification_gate_tests.rs"]
+mod gate_tests;

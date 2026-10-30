@@ -418,7 +418,7 @@ impl MusicBrainzClient {
     }
 
     async fn ask_code(&self, code: &str, key: String, lane: Lane) -> Result<IsrcLookup, MusicBrainzError> {
-        let lookup = format!("isrc/{code}?inc=artist-credits&fmt=json");
+        let lookup = code_question(code).unwrap_or_default();
         let recordings = match self.ask_on(&lookup, "code lookup", lane).await? {
             Asked::Answer(doc) => recordings_of(&doc, |_| true),
             Asked::NotKnown => Vec::new(),
@@ -448,7 +448,7 @@ impl MusicBrainzClient {
         if let Some(HeartRow::Recording(current)) = kept {
             return MusicBrainzFact::Known(current);
         }
-        let question = format!("recording/{id}?fmt=json");
+        let question = recording_question(&id).unwrap_or_default();
         match self.ask_on(&question, "recording lookup", Lane::Heart).await {
             Ok(Asked::Answer(doc)) => {
                 let current = doc
@@ -1175,6 +1175,19 @@ impl MusicBrainzClient {
 
 /// Whether a question looks something up by an id that is not a MusicBrainz id
 /// (`release/<id>`, `recording/<id>`, `artist/<id>`, ...): MusicBrainz has nothing by it.
+/// The question [`MusicBrainzClient::current_recording`] asks of one recording id, as
+/// [`MusicBrainzClient::re_ask`] takes it; None for an id that is no MusicBrainz id.
+pub fn recording_question(recording_id: &str) -> Option<String> {
+    let id = recording_id.trim().to_lowercase();
+    pure::is_mbid(&id).then(|| format!("recording/{id}?fmt=json"))
+}
+
+/// The code lookup's question for one ISRC, as [`MusicBrainzClient::re_ask`] takes it; None for
+/// a code that is no ISRC.
+pub fn code_question(isrc: &str) -> Option<String> {
+    SongIdentity::normalize_isrc(isrc).map(|code| format!("isrc/{code}?inc=artist-credits&fmt=json"))
+}
+
 fn asks_by_a_non_mbid(relative: &str) -> bool {
     let path = relative.split('?').next().unwrap_or("");
     let mut parts = path.split('/');
