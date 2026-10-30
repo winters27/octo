@@ -874,7 +874,7 @@ impl UpgradeWorker {
             }
             .to_string(),
         );
-        if settings.verify_downloads && !dotnet::is_blank(&settings.acoust_id_api_key) {
+        if settings.verify_downloads && settings.acoust_id_key_for_heart().is_some() {
             result.checks.push("AcoustID: the same recording".to_string());
         }
         if anyway {

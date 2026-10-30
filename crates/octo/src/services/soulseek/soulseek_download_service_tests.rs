@@ -997,9 +997,13 @@ async fn build_all(
     let acoust_id = url::Url::parse(&format!("{}/", server.uri())).expect("parses");
     let verification = Arc::new(DownloadVerificationService::new(
         Arc::new(AudioFingerprinter::new()),
-        Arc::new(AcoustIdClient::new(Arc::new(
-            AcoustIdRateLimitHandler::with_base_url(Arc::new(AcoustIdRateLimiter::new()), acoust_id),
-        ))),
+        Arc::new(AcoustIdClient::new(
+            Arc::new(AcoustIdRateLimitHandler::with_base_url(
+                Arc::new(AcoustIdRateLimiter::new()),
+                acoust_id,
+            )),
+            Arc::clone(&settings),
+        )),
         Arc::clone(&settings),
         None,
         None,

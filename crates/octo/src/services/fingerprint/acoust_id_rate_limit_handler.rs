@@ -13,12 +13,13 @@ use reqwest::header::CONTENT_TYPE;
 use tracing::{debug, warn};
 use url::Url;
 
-use super::acoust_id_rate_limiter::AcoustIdRateLimiter;
+use super::acoust_id_rate_limiter::{AcoustIdRateLimiter, CallPermit};
 use crate::services::framework::HttpAnswer;
 use crate::services::framework::http::resolve;
 
 /// Spends an [`AcoustIdRateLimiter`] permit before each AcoustID call. The limiter is the
-/// singleton; this is just the seam that consults it.
+/// singleton; this is just the seam that consults it. A form is posted only for a call that holds
+/// its turn ([`CallPermit`]).
 pub struct AcoustIdRateLimitHandler {
     client: reqwest::Client,
     limiter: Arc<AcoustIdRateLimiter>,
@@ -29,8 +30,8 @@ impl AcoustIdRateLimitHandler {
     pub const BASE_ADDRESS: &'static str = "https://api.acoustid.org/";
 
     /// Verification sits between a finished transfer and the file joining the library.
-    /// A slow AcoustID must cost seconds, never the download. It covers the wait for a permit
-    /// too: one timeout over the whole call.
+    /// A slow AcoustID must cost seconds, never the download. It covers the HTTP call alone, never
+    /// the wait for a turn, so a lane backed off to a long gap never times its queue out.
     pub const TIMEOUT: Duration = Duration::from_secs(10);
 
     pub fn new(limiter: Arc<AcoustIdRateLimiter>) -> Self {
@@ -94,9 +95,14 @@ impl AcoustIdRateLimitHandler {
         self.client.execute(request).await
     }
 
-    /// Posts a URL-encoded form through the client and reads the body, all of it inside
-    /// [`Self::TIMEOUT`].
-    pub async fn post_form(&self, relative: &str, body: String) -> anyhow::Result<HttpAnswer> {
+    /// Posts a URL-encoded form for a call that holds its turn, and reads the body, all of it
+    /// inside [`Self::TIMEOUT`], which starts only now.
+    pub async fn post_form(
+        &self,
+        _turn: &CallPermit,
+        relative: &str,
+        body: String,
+    ) -> anyhow::Result<HttpAnswer> {
         let url = resolve(&self.base, relative)?;
         let request = self
             .client
@@ -105,7 +111,7 @@ impl AcoustIdRateLimitHandler {
             .body(body)
             .build()?;
         let call = async {
-            let response = self.send(request).await?;
+            let response = self.client.execute(request).await?;
             HttpAnswer::read(response).await
         };
         match tokio::time::timeout(Self::TIMEOUT, call).await {

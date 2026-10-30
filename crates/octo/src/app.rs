@@ -1553,9 +1553,10 @@ impl MetadataClients {
             None => DeezerMetadataService::new(Arc::clone(&deezer_client), Arc::clone(settings)),
         });
         let acoust_id_rate_limiter = Arc::new(AcoustIdRateLimiter::new());
-        let acoust_id = Arc::new(AcoustIdClient::new(Arc::new(AcoustIdRateLimitHandler::new(
-            Arc::clone(&acoust_id_rate_limiter),
-        ))));
+        let acoust_id = Arc::new(AcoustIdClient::new(
+            Arc::new(AcoustIdRateLimitHandler::new(Arc::clone(&acoust_id_rate_limiter))),
+            Arc::clone(settings),
+        ));
 
         // The cover sources take their settings once: captured here, at construction.
         let current = settings.current();

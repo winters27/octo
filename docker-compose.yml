@@ -117,8 +117,8 @@ services:
       Soulseek__DownloadTimeoutSeconds: ${SLSKD_DOWNLOAD_TIMEOUT_SECONDS:-180}
       # Fingerprint every finished download and identify it before it joins the
       # library. A peer that sends a different recording gets that file remembered
-      # and never tried again. Needs the free AcoustID key; inert without one.
-      Soulseek__VerifyDownloads: ${SLSKD_VERIFY_DOWNLOADS:-false}
+      # and never tried again. On by default; Octo brings its own AcoustID key.
+      Soulseek__VerifyDownloads: ${SLSKD_VERIFY_DOWNLOADS:-true}
       # Never download a cover, a karaoke backing track or an instrumental, even
       # when a title asks for one, and leave such outside songs out of search,
       # radio, mixes and charts. On by default.

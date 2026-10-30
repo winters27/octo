@@ -834,9 +834,13 @@ async fn the_preview_verifier_answers_through_the_service() {
         },
         ..Default::default()
     }));
-    let client = Arc::new(AcoustIdClient::new(Arc::new(AcoustIdRateLimitHandler::new(
-        Arc::new(AcoustIdRateLimiter::new()),
-    ))));
+    let client = Arc::new(AcoustIdClient::with_built_in_key(
+        Arc::new(AcoustIdRateLimitHandler::new(
+            Arc::new(AcoustIdRateLimiter::new()),
+        )),
+        Arc::clone(&settings),
+        None,
+    ));
     let service = DownloadVerificationService::new(
         Arc::new(AudioFingerprinter::new()),
         client,
@@ -845,7 +849,7 @@ async fn the_preview_verifier_answers_through_the_service() {
         None,
     );
     let verifier: &dyn FingerprintVerifier = &service;
-    // No key: nothing to ask AcoustID with.
+    // No key, not even Octo's own: nothing to ask AcoustID with.
     assert!(!verifier.is_fingerprinting_enabled());
     assert!(service.remembers_rejections());
     assert_eq!(
@@ -853,7 +857,13 @@ async fn the_preview_verifier_answers_through_the_service() {
         InconclusiveReason::Disabled
     );
 
-    settings.set(AppSettings::default());
+    settings.set(AppSettings {
+        soulseek: SoulseekSettings {
+            verify_downloads: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
     assert_eq!(
         service
             .verify(
@@ -870,6 +880,57 @@ async fn the_preview_verifier_answers_through_the_service() {
         service.check_lossless("/nowhere.flac", None, None).await,
         SpectrumReport::unknown("not checked", 0)
     );
+}
+
+/// Verification is on for a default install, so a file refused once is remembered and the same
+/// peer's same file is never offered for download again.
+#[test]
+fn a_default_install_never_fetches_a_refused_file_again() {
+    use octo_core::settings::AppSettings;
+    use octo_core::soulseek::SoulseekFileHit;
+
+    use crate::services::fingerprint::{AcoustIdRateLimitHandler, AcoustIdRateLimiter};
+    use crate::services::soulseek::rejected_peer_registry::RejectedPeerRegistry;
+    use crate::services::soulseek::soulseek_download_service::candidate_allowed;
+
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings::default()));
+    let service = DownloadVerificationService::new(
+        Arc::new(AudioFingerprinter::new()),
+        Arc::new(AcoustIdClient::new(
+            Arc::new(AcoustIdRateLimitHandler::new(
+                Arc::new(AcoustIdRateLimiter::new()),
+            )),
+            Arc::clone(&settings),
+        )),
+        Arc::clone(&settings),
+        None,
+        None,
+    );
+    assert!(service.remembers_rejections());
+    let registry = RejectedPeerRegistry::in_memory();
+    registry.deny(
+        Some("peer1"),
+        Some("Help!.flac"),
+        "wrong recording",
+        "The Beatles - Help!",
+    );
+    let hit = |file: &str| SoulseekFileHit {
+        username: "peer1".into(),
+        filename: file.into(),
+        extension: "flac".into(),
+        size: 40_000_000,
+        ..Default::default()
+    };
+    assert!(!candidate_allowed(
+        &hit("Help!.flac"),
+        Some(&registry),
+        service.remembers_rejections()
+    ));
+    assert!(candidate_allowed(
+        &hit("Yesterday.flac"),
+        Some(&registry),
+        service.remembers_rejections()
+    ));
 }
 
 // ---- Stray links: a weak recording beside a much stronger one of another song ---------------
@@ -1723,9 +1784,12 @@ fn takes_follow_skip_covers_and_instrumentals() {
     use crate::services::fingerprint::{AcoustIdRateLimitHandler, AcoustIdRateLimiter};
 
     let settings = Arc::new(SettingsStore::for_tests(AppSettings::default()));
-    let client = Arc::new(AcoustIdClient::new(Arc::new(AcoustIdRateLimitHandler::new(
-        Arc::new(AcoustIdRateLimiter::new()),
-    ))));
+    let client = Arc::new(AcoustIdClient::new(
+        Arc::new(AcoustIdRateLimitHandler::new(
+            Arc::new(AcoustIdRateLimiter::new()),
+        )),
+        Arc::clone(&settings),
+    ));
     let service = DownloadVerificationService::new(
         Arc::new(AudioFingerprinter::new()),
         client,

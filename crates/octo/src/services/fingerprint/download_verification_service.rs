@@ -24,7 +24,7 @@ use octo_media::tags::{TagFile, tag_writer_extras};
 use tracing::{debug, info, warn};
 
 use super::acoust_id_client::AcoustIdClient;
-use super::acoust_id_rate_limiter::AcoustIdRateLimiter;
+use super::acoust_id_rate_limiter::{AcoustIdRateLimiter, LookupClass};
 use super::music_brainz_client::{MusicBrainzClient, MusicBrainzError};
 use super::preview_check::{self, PreviewOutcome, PreviewRequest, PreviewSource};
 
@@ -158,9 +158,9 @@ impl DownloadVerificationService {
         preview_check::check(source, &self.fingerprinter, Path::new(path), request, timeout).await
     }
 
-    /// AcoustID can answer at all.
+    /// AcoustID can answer at all: it is not `off`, and the user's key or Octo's own is usable.
     pub fn has_api_key(&self) -> bool {
-        !dotnet::is_blank(&self.settings.current().soulseek.acoust_id_api_key)
+        self.client.is_on()
     }
 
     /// The user asked Octo to police what peers deliver. Governs the deny-list on its own,
@@ -511,10 +511,15 @@ impl DownloadVerificationService {
             return reason(InconclusiveReason::NotFingerprinted);
         }
 
+        // The key and the lane follow the class of the work that asked (bulk unless it says
+        // otherwise), so a shared key never lets an import ahead of a heart.
+        let Some(key) = self.client.key_for(AcoustIdRateLimiter::class_now()) else {
+            return reason(InconclusiveReason::LookupFailed);
+        };
         let Some(lookup) = self
             .client
             .lookup(
-                &settings.acoust_id_api_key,
+                &key,
                 &print,
                 seconds,
                 settings.effective_acoust_id_timeout_seconds(),
@@ -1006,6 +1011,8 @@ impl DownloadVerificationService {
     }
 }
 
+/// The check a person starts with one click (the library editor's, the tag preview's): its lookup
+/// goes after hearts and plays, before family requests and bulk work.
 #[async_trait]
 impl FingerprintVerifier for DownloadVerificationService {
     fn is_fingerprinting_enabled(&self) -> bool {
@@ -1013,7 +1020,11 @@ impl FingerprintVerifier for DownloadVerificationService {
     }
 
     async fn verify(&self, path: &str, artist: &str, title: &str) -> VerificationResult {
-        DownloadVerificationService::verify(self, path, Some(artist), Some(title), None, &Takes::Any).await
+        AcoustIdRateLimiter::with_class(
+            LookupClass::Person,
+            DownloadVerificationService::verify(self, path, Some(artist), Some(title), None, &Takes::Any),
+        )
+        .await
     }
 }
 

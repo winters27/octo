@@ -2,6 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Octo's own AcoustID application key, which every install that sets no key of its own shares.
+/// Blank until the "Octo" application is registered with AcoustID: a blank built-in key counts as
+/// no key at all, so AcoustID is off for an install without one of its own.
+pub const OCTO_ACOUSTID_APPLICATION_KEY: &str = "";
+
+/// The `ACOUSTID_API_KEY` value that turns AcoustID off.
+pub const ACOUSTID_OFF: &str = "off";
+
 /// Configuration for the Soulseek (slskd) integration.
 /// Octo talks to a self-hosted slskd instance which fronts the Soulseek P2P network.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -94,8 +102,9 @@ pub struct SoulseekSettings {
     /// Fingerprint every finished download with Chromaprint and ask AcoustID what it actually
     /// is before accepting it. A Soulseek file identified as a different recording is discarded
     /// and the next peer tried; a YouTube file has no second candidate, so it is kept and, with
-    /// the Review playlist on, asked about. Off by default: it needs a free AcoustID key and
-    /// the fpcalc binary, and without both it can only ever be a no-op.
+    /// the Review playlist on, asked about. Needs the fpcalc binary. On by default: Octo brings
+    /// its own AcoustID key, so a default install checks what it downloads. Hearts and plays are
+    /// checked by their sound whatever this says.
     ///
     /// This also switches on the rejected-peer memory. A file discarded for being the wrong
     /// recording, by this check OR by the pre-existing duration check, is remembered by peer
@@ -110,9 +119,9 @@ pub struct SoulseekSettings {
     /// Environment variable: SKIP_COVERS_AND_INSTRUMENTALS
     pub skip_covers_and_instrumentals: bool,
 
-    /// AcoustID application key, free from https://acoustid.org/new-application. Blank
-    /// disables the lookup half of VerifyDownloads; the duration check and its rejection
-    /// memory keep working without it. Named ...ApiKey so the Config-sources tab masks it.
+    /// Your own AcoustID application key, free from https://acoustid.org/new-application. Blank
+    /// uses Octo's own key, which every install without one shares; `off` turns AcoustID off.
+    /// Named ...ApiKey so the Config-sources tab masks it.
     /// Environment variable: ACOUSTID_API_KEY
     pub acoust_id_api_key: String,
 
@@ -229,7 +238,7 @@ impl Default for SoulseekSettings {
             min_file_size_bytes: 5 * 1024 * 1024,
             preferred_extension: "flac".to_string(),
             download_timeout_seconds: 180,
-            verify_downloads: false,
+            verify_downloads: true,
             skip_covers_and_instrumentals: true,
             acoust_id_api_key: String::new(),
             tag_from_music_brainz: false,
@@ -304,6 +313,48 @@ impl SoulseekSettings {
     /// The same threshold as AcoustID reports it, in 0..1.
     pub fn effective_min_score_fraction(&self) -> f64 {
         f64::from(self.effective_min_match_score()) / 100.0
+    }
+
+    /// AcoustID is switched off by the `off` setting.
+    pub fn acoust_id_off(&self) -> bool {
+        self.acoust_id_api_key.trim().eq_ignore_ascii_case(ACOUSTID_OFF)
+    }
+
+    /// The user's own application key: set, and not `off`.
+    pub fn acoust_id_user_key(&self) -> Option<String> {
+        let key = self.acoust_id_api_key.trim();
+        (!key.is_empty() && !self.acoust_id_off()).then(|| key.to_string())
+    }
+
+    /// Octo's own application key, when it has one.
+    pub fn acoust_id_built_in_key() -> Option<&'static str> {
+        Self::built_in_key_of(OCTO_ACOUSTID_APPLICATION_KEY)
+    }
+
+    /// The key one person's own action looks up with (a heart's or a play's gate, a family
+    /// request, a click): the user's key, else Octo's own. None when AcoustID is off.
+    pub fn acoust_id_key_for_heart(&self) -> Option<String> {
+        self.key_for_heart_with(Self::acoust_id_built_in_key())
+    }
+
+    /// The key work nobody waits on looks up with: the user's own only. Without one, such work
+    /// may still use Octo's own key, at the shared lane's lowest place, but never a submission.
+    pub fn acoust_id_key_for_bulk(&self) -> Option<String> {
+        self.acoust_id_user_key()
+    }
+
+    /// [`Self::acoust_id_key_for_heart`] with a given built-in key.
+    pub fn key_for_heart_with(&self, built_in: Option<&str>) -> Option<String> {
+        if self.acoust_id_off() {
+            return None;
+        }
+        self.acoust_id_user_key()
+            .or_else(|| built_in.and_then(Self::built_in_key_of).map(str::to_string))
+    }
+
+    fn built_in_key_of(key: &str) -> Option<&str> {
+        let key = key.trim();
+        (!key.is_empty()).then_some(key)
     }
 
     /// SharedFolders as a list, blanks dropped.
@@ -400,6 +451,81 @@ mod tests {
             );
         }
         assert_eq!(SoulseekSettings::default().effective_web_url(), None);
+    }
+}
+
+#[cfg(test)]
+mod acoust_id_key_tests {
+    use super::*;
+
+    fn with_key(key: &str) -> SoulseekSettings {
+        SoulseekSettings {
+            acoust_id_api_key: key.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A blank key means Octo's own; `off`, in any case and with spaces, turns AcoustID off; the
+    /// user's own key wins for both kinds of work, and bulk work never gets Octo's own as a key.
+    #[test]
+    fn a_blank_key_means_octos_own_and_off_turns_acoustid_off() {
+        let octo = Some("octo-key");
+        for blank in ["", "   "] {
+            let s = with_key(blank);
+            assert_eq!(
+                s.key_for_heart_with(octo).as_deref(),
+                Some("octo-key"),
+                "{blank:?}"
+            );
+            assert_eq!(s.acoust_id_key_for_bulk(), None);
+            assert!(!s.acoust_id_off());
+        }
+        for off in ["off", " OFF ", "Off"] {
+            let s = with_key(off);
+            assert!(s.acoust_id_off());
+            assert_eq!(s.key_for_heart_with(octo), None, "{off:?}");
+            assert_eq!(s.acoust_id_key_for_bulk(), None);
+            assert_eq!(s.acoust_id_user_key(), None);
+        }
+        let own = with_key(" user-key ");
+        assert_eq!(own.key_for_heart_with(octo).as_deref(), Some("user-key"));
+        assert_eq!(own.key_for_heart_with(None).as_deref(), Some("user-key"));
+        assert_eq!(own.acoust_id_key_for_bulk().as_deref(), Some("user-key"));
+    }
+
+    /// Octo's own key counts only once it is set: a blank one is no key, so an install without a
+    /// key of its own has AcoustID off until then.
+    #[test]
+    fn octos_own_key_counts_only_once_it_is_set() {
+        let keyless = SoulseekSettings::default();
+        assert_eq!(keyless.key_for_heart_with(None), None);
+        assert_eq!(keyless.key_for_heart_with(Some("  ")), None);
+        let built_in = OCTO_ACOUSTID_APPLICATION_KEY.trim();
+        if built_in.is_empty() {
+            assert_eq!(SoulseekSettings::acoust_id_built_in_key(), None);
+            assert_eq!(keyless.acoust_id_key_for_heart(), None);
+        } else {
+            assert_eq!(SoulseekSettings::acoust_id_built_in_key(), Some(built_in));
+            assert_eq!(keyless.acoust_id_key_for_heart().as_deref(), Some(built_in));
+        }
+        assert_eq!(with_key("off").acoust_id_key_for_heart(), None);
+    }
+
+    /// Verification is on by default in the code and in the three files an install starts from.
+    #[test]
+    fn downloads_are_verified_by_default_everywhere() {
+        assert!(SoulseekSettings::default().verify_downloads);
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read =
+            |name: &str| std::fs::read_to_string(repo.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(read("octo/appsettings.json").contains(r#""VerifyDownloads": true,"#));
+        assert!(
+            read("docker-compose.yml").contains("Soulseek__VerifyDownloads: ${SLSKD_VERIFY_DOWNLOADS:-true}")
+        );
+        let example = read(".env.example");
+        assert!(example.lines().any(|line| line == "SLSKD_VERIFY_DOWNLOADS=true"));
+        assert!(example.lines().any(|line| line == "ACOUSTID_API_KEY="));
+        assert!(example.contains("ACOUSTID_API_KEY=off"));
     }
 }
 
