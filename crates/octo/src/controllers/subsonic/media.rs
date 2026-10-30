@@ -11,9 +11,13 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use chrono::Utc;
 use futures::FutureExt;
-use octo_core::common::dotnet::{self, is_blank};
+use octo_core::common::dotnet::{self, eq_ignore_case, is_blank};
 use octo_core::common::{SongIdentity, playlist_id_helper};
+use octo_core::fingerprint::heart_gate::{
+    AcquisitionOrigin, HeardRecord, HeardSource, NATIVE_CLIENT, PlayedMark,
+};
 use octo_core::models::radio::{LastFmRadioStation, LastFmRadioStationKind};
 use octo_core::settings::{AppSettings, HeartDownloadSource, NoticeKind};
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
@@ -36,13 +40,15 @@ use crate::http::catch_all;
 use crate::http::error::{AppError, AppResult, json_status, problem};
 use crate::http::routes::RouteSet;
 use crate::http::static_files::{RangeOutcome, parse_range};
-use crate::services::common::track_acquisition_queue::Completion;
+use crate::services::common::heart_acquisition_coordinator::track_base_key;
+use crate::services::common::track_acquisition_queue::{Completion, PlayOutcome};
 use crate::services::cover_art::local_cover_cache::{CoverPicture, Fetched, NotKept};
 use crate::services::family::{FamilyCaller, LibraryScope, audio_gate, family_caller};
 use crate::services::fingerprint::music_brainz_client::heart_song;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::library::{GeneratedPlaylist, navidrome_song_list};
-use crate::services::prefetch::{Source, from_start};
+use crate::services::prefetch::{Capture, FpcalcClass, Source, from_start, sample_cap, sample_id_of};
+use crate::services::soulseek::soulseek_download_service::played_size;
 use crate::services::subsonic::subsonic_proxy_service::content_type_of;
 use crate::services::subsonic::{CredentialVerdict, SubsonicProxyService};
 
@@ -126,7 +132,17 @@ pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
     let external_id = external_id.unwrap_or_default();
 
     if is_first_byte_request(call.method().as_str(), call.header("Range").as_deref()) {
+        // A stream and a heart of one song id meet on one registered routing.
+        state.external_id_registry.resolve_song(&external_id, true);
         warm_up_playing(&state, &external_id);
+        // A play of a held song is one of the shim's round events.
+        if !state
+            .soulseek_holds
+            .records_for(&track_base_key(&provider, &external_id))
+            .is_empty()
+        {
+            state.heard_samples.shim_event();
+        }
     }
 
     // Octo's apps read the bytes they get, whatever the listing declared, so a song with a file
@@ -200,9 +216,11 @@ pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
         if let Some(local_path) = local_path {
             match outside_file(&state, &call, caller.as_ref(), &local_path).await {
                 OutsideFile::Serve => {
+                    let source = file_source(&state, &provider, &external_id, &local_path, ahead);
                     if ahead {
                         state.prefetch.store().touch(&provider, &external_id);
                     }
+                    heard_file(&state, &call, &provider, &external_id, source, &local_path).await;
                     return serve_file(&call, &local_path).await;
                 }
                 OutsideFile::Relayed(response) => return Ok(response),
@@ -275,18 +293,172 @@ fn warm_up_playing(state: &AppState, external_id: &str) {
     }
     let Some(routing) = state
         .external_id_registry
-        .lookup(external_id)
+        .resolve_song(external_id, false)
         .map(|routing| routing.snapshot())
         .filter(|routing| routing.kind == RoutingKind::Song)
     else {
         return;
     };
+    // The album the song was played or listed from: the play's context, the most recently
+    // played first, else the most recently listed.
+    let contexts = state.external_id_registry.contexts(external_id);
+    let album = contexts
+        .iter()
+        .filter(|context| context.played_at.is_some())
+        .max_by_key(|context| context.played_at)
+        .or_else(|| contexts.iter().max_by_key(|context| context.listed_at))
+        .map(|context| context.catalog_album_id.clone())
+        .or_else(|| routing.external_album_id.clone());
     state.music_brainz.warm_up(
         external_id,
         heart_song(&routing),
-        routing.external_album_id.clone(),
+        album,
         state.deezer_metadata.clone(),
     );
+}
+
+/// Who a first-byte play of an outside song is heard by: the signed-in listener, when there is
+/// one and the request starts at the first byte.
+async fn heard_by_whom(state: &AppState, call: &SubsonicCall) -> Option<String> {
+    if !is_first_byte_request(call.method().as_str(), call.header("Range").as_deref()) {
+        return None;
+    }
+    signed_in_user(state, call)
+        .await
+        .ok()
+        .map(|user| user.trim().to_string())
+        .filter(|user| !user.is_empty())
+}
+
+/// Which of the listener's album contexts a play marks played: the stream's album when it names
+/// one, else the most recent one its client listed. Navidrome's own web UI, and a client that
+/// listed the album natively, mark the native context.
+fn played_mark(state: &AppState, call: &SubsonicCall, external_id: &str, user: &str) -> PlayedMark {
+    let catalog_album_id = call
+        .param_opt("albumId")
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let contexts = state.external_id_registry.contexts(external_id);
+    let listed_by = |client: &str| {
+        contexts.iter().any(|context| {
+            eq_ignore_case(context.user.trim(), user)
+                && context
+                    .client
+                    .as_deref()
+                    .is_some_and(|listed| eq_ignore_case(listed, client))
+        })
+    };
+    let client = match call.param_opt("c").map(str::trim).filter(|c| !c.is_empty()) {
+        Some(client) if eq_ignore_case(client, "NavidromeUI") => Some(NATIVE_CLIENT.to_string()),
+        Some(client) if !listed_by(client) && listed_by(NATIVE_CLIENT) => Some(NATIVE_CLIENT.to_string()),
+        Some(client) => Some(client.to_string()),
+        None if listed_by(NATIVE_CLIENT) => Some(NATIVE_CLIENT.to_string()),
+        None => None,
+    };
+    PlayedMark {
+        client,
+        catalog_album_id,
+    }
+}
+
+/// The song's length as the routing knows it.
+fn song_seconds(state: &AppState, external_id: &str) -> Option<i32> {
+    state
+        .external_id_registry
+        .resolve_song(external_id, false)
+        .and_then(|routing| routing.snapshot().duration)
+        .filter(|seconds| *seconds > 0)
+}
+
+/// Whose `fpcalc` run a play's sample is: a heart's when the listener holds the song.
+fn sample_class(state: &AppState, provider: &str, external_id: &str, user: &str) -> FpcalcClass {
+    let holds = state
+        .soulseek_holds
+        .records_for(&track_base_key(provider, external_id));
+    if holds
+        .iter()
+        .any(|record| record.holders.iter().any(|h| eq_ignore_case(h.user.trim(), user)))
+    {
+        FpcalcClass::Heart
+    } else {
+        FpcalcClass::Other
+    }
+}
+
+/// Keeps `source` as what `user` heard of the song now, with the played mark, and the id of its
+/// sample when its prints are already stored. Answers the record kept.
+fn keep_heard(
+    state: &AppState,
+    call: &SubsonicCall,
+    external_id: &str,
+    user: &str,
+    source: HeardSource,
+) -> HeardRecord {
+    let sample_id = sample_id_of(&source);
+    let stored = state.heard_samples.prints(&sample_id).is_some();
+    let record = HeardRecord {
+        heard_at: Utc::now(),
+        source,
+        sample_id: stored.then_some(sample_id),
+    };
+    state.external_id_registry.remember_heard(
+        external_id,
+        user,
+        record.clone(),
+        Some(played_mark(state, call, external_id, user)),
+    );
+    record
+}
+
+/// A file of an outside song served from its first byte: kept as what the listener heard, and
+/// printed as their sample unless a whole print of it is stored. None when nobody is heard.
+async fn heard_file(
+    state: &AppState,
+    call: &SubsonicCall,
+    provider: &str,
+    external_id: &str,
+    source: HeardSource,
+    path: &str,
+) -> Option<HeardRecord> {
+    let user = heard_by_whom(state, call).await?;
+    let record = keep_heard(state, call, external_id, &user, source);
+    let whole = state
+        .heard_samples
+        .prints(&sample_id_of(&record.source))
+        .is_some_and(|prints| prints.whole);
+    if !whole {
+        state.heard_samples.sample_file(
+            std::path::PathBuf::from(path),
+            Capture {
+                external_id: external_id.to_string(),
+                user: user.clone(),
+                record: record.clone(),
+                limit: 0,
+                total: None,
+                song_seconds: song_seconds(state, external_id),
+                class: sample_class(state, provider, external_id, &user),
+            },
+        );
+    }
+    Some(record)
+}
+
+/// What a played file of an outside song is: a song fetched ahead is that copy, any other a
+/// library file.
+fn file_source(state: &AppState, provider: &str, external_id: &str, path: &str, ahead: bool) -> HeardSource {
+    if ahead
+        && let Some((ready_at, source_file)) = state.prefetch.store().copy_identity(provider, external_id)
+    {
+        return HeardSource::Copy {
+            key: format!("{provider}:{external_id}"),
+            ready_at: Some(ready_at),
+            source_file,
+        };
+    }
+    HeardSource::Library {
+        path: path.to_string(),
+    }
 }
 
 /// Whether a song heart can go to Lidarr: Lidarr is one of the song hearts' sources, and its
@@ -369,20 +541,26 @@ async fn play_in_octo_app(
         length,
         !call.method().as_str().eq_ignore_ascii_case("HEAD"),
     );
-    start_play_acquisition(state, call, play).await?;
-    match source {
+    // The play's own acquisition starts once its source is chosen, carrying what it played.
+    let (response, heard) = match source {
         Source::File(file) => {
             let file = file.to_string_lossy().into_owned();
             match outside_file(state, call, play.caller, &file).await {
                 OutsideFile::Serve => {
+                    let fetched_ahead = ahead.as_deref() == Some(file.as_str());
+                    let heard_source =
+                        file_source(state, play.provider, play.external_id, &file, fetched_ahead);
                     state.prefetch.store().touch(play.provider, play.external_id);
                     info!("Playing {} from its FLAC copy ({file})", play.id);
-                    Ok(serve_file(call, &file)
+                    let heard =
+                        heard_file(state, call, play.provider, play.external_id, heard_source, &file).await;
+                    let response = serve_file(call, &file)
                         .await
-                        .unwrap_or_else(IntoResponse::into_response))
+                        .unwrap_or_else(IntoResponse::into_response);
+                    (response, heard)
                 }
-                OutsideFile::Relayed(response) => Ok(response),
-                OutsideFile::Withheld => preview_or_none(state, call, play).await,
+                OutsideFile::Relayed(response) => (response, None),
+                OutsideFile::Withheld => preview_or_none(state, call, play).await?,
             }
         }
         Source::Gone => {
@@ -390,19 +568,21 @@ async fn play_in_octo_app(
                 "The FLAC copy {} started on is gone; the player is asked to start again",
                 play.id
             );
-            Ok(StatusCode::SERVICE_UNAVAILABLE.into_response())
+            (StatusCode::SERVICE_UNAVAILABLE.into_response(), None)
         }
-        Source::Preview => preview_or_none(state, call, play).await,
-    }
+        Source::Preview => preview_or_none(state, call, play).await?,
+    };
+    start_play_acquisition(state, call, play, heard).await?;
+    Ok(response)
 }
 
-/// The preview, or the 404 Subsonic error when no source has one.
+/// The preview with what it played, or the 404 Subsonic error when no source has one.
 async fn preview_or_none(
     state: &AppState,
     call: &SubsonicCall,
     play: &OctoPlay<'_>,
-) -> anyhow::Result<Response> {
-    if let Some(preview) = try_direct_stream(state, call, play.provider, play.external_id, play.id).await? {
+) -> anyhow::Result<(Response, Option<HeardRecord>)> {
+    if let Some(preview) = direct_stream(state, call, play.provider, play.external_id, play.id).await? {
         return Ok(preview);
     }
     warn!("Direct stream not available for {}", play.id);
@@ -411,16 +591,17 @@ async fn preview_or_none(
         .create_error(play.format, 70, "No playable source found for this track")
         .into_response();
     *response.status_mut() = StatusCode::NOT_FOUND;
-    Ok(response)
+    Ok((response, None))
 }
 
 /// What a play starts besides its bytes, as `play_external` starts it: from the first byte the
-/// play itself (DownloadOnPlay, LidarrAlbumOnPlay), and with Wait for lossless on play the
-/// lossless copy, for a caller whose plays keep one. Nothing is waited for.
+/// play itself (DownloadOnPlay, LidarrAlbumOnPlay) with what it played, and with Wait for
+/// lossless on play the lossless copy, for a caller whose plays keep one. Nothing is waited for.
 async fn start_play_acquisition(
     state: &AppState,
     call: &SubsonicCall,
     play: &OctoPlay<'_>,
+    heard: Option<HeardRecord>,
 ) -> anyhow::Result<()> {
     let settings = state.settings.current().subsonic.clone();
     let range = call.header("Range");
@@ -429,34 +610,52 @@ async fn start_play_acquisition(
         return Ok(());
     }
     let who = signed_in_user(state, call).await.map_err(anyhow::Error::new)?;
+    let proven_somehow = heard.is_some() || state.acoust_id.is_on();
     if first_byte {
-        state.heart_acquisition_coordinator.queue_play(
+        state.heart_acquisition_coordinator.queue_play_heard(
             play.provider,
             play.external_id,
             requester_for(state, Some(&who)).as_deref(),
             Some(play.id),
             Some(&who),
+            heard,
         );
     }
+    // With AcoustID off and nothing heard, nothing could prove the lossless copy.
     if settings.wait_for_lossless_on_play
+        && proven_somehow
         && let Some(target) = state.family_write_gate.play_target(Some(&who))
     {
-        let _ = state.track_acquisition_queue.enqueue_for(
-            &target,
-            false,
-            play.provider,
-            play.external_id,
-            false,
-            false,
-            true,
-            None,
-            true,
-            requester_for(state, Some(&who)).as_deref(),
-            false,
-            None,
-        );
+        let _ = queue_lossless_play(state, &target, play.provider, play.external_id, &who);
     }
     Ok(())
+}
+
+/// The lossless copy a Wait for lossless play asks for, run as a play: its gate is built inside
+/// the acquisition, and its completion always resolves.
+fn queue_lossless_play(
+    state: &AppState,
+    target: &crate::services::common::AcquisitionTarget,
+    provider: &str,
+    external_id: &str,
+    who: &str,
+) -> Completion {
+    state.track_acquisition_queue.enqueue_as(
+        Some(AcquisitionOrigin::Play),
+        Vec::new(),
+        target,
+        false,
+        provider,
+        external_id,
+        false,
+        false,
+        true,
+        None,
+        true,
+        requester_for(state, Some(who)).as_deref(),
+        false,
+        None,
+    )
 }
 
 /// HEAD of `stream` or `download`. Players on iPhone send one before playing, for the type and
@@ -473,7 +672,13 @@ async fn audio_head(State(state): State<AppState>, req: Request) -> AppResult {
         return Ok(catch_all::catch_all(State(state), req).await);
     }
     let mut reply = stream(State(state), req).await?;
-    *reply.body_mut() = Body::empty();
+    // An answer that names no length (a stand-in not built yet) keeps naming none: an empty body
+    // of unknown size, so no length of 0 is made up for it.
+    *reply.body_mut() = if reply.headers().contains_key(header::CONTENT_LENGTH) {
+        Body::empty()
+    } else {
+        Body::from_stream(futures::stream::empty::<Result<bytes::Bytes, std::io::Error>>())
+    };
     Ok(reply)
 }
 
@@ -520,36 +725,35 @@ async fn play_external(
     // Range on every seek and while buffering. A transcoded request (format,
     // maxBitRate) is still a play and counts.
     let range = call.header("Range");
-    if is_first_byte_request(call.method().as_str(), range.as_deref()) {
+    let first_byte = is_first_byte_request(call.method().as_str(), range.as_deref());
+    // The play is queued once its source is chosen, with what that source played.
+    let queue_play = |heard: Option<HeardRecord>| async move {
+        if !first_byte {
+            return Ok::<(), anyhow::Error>(());
+        }
         let who = signed_in_user(state, call).await.map_err(anyhow::Error::new)?;
-        state.heart_acquisition_coordinator.queue_play(
+        state.heart_acquisition_coordinator.queue_play_heard(
             provider,
             external_id,
             requester_for(state, Some(&who)).as_deref(),
             Some(id),
             Some(&who),
+            heard,
         );
-    }
+        Ok(())
+    };
     if settings.wait_for_lossless_on_play {
         let who = signed_in_user(state, call).await.map_err(anyhow::Error::new)?;
         // A family member's play keeps a copy only when they may add songs at once, and then
         // in their own library; otherwise it plays from the source below.
         if let Some(target) = state.family_write_gate.play_target(Some(&who)) {
-            let acquisition = state.track_acquisition_queue.enqueue_for(
-                &target,
-                false,
-                provider,
-                external_id,
-                false,
-                false,
-                true,
-                None,
-                true,
-                requester_for(state, Some(&who)).as_deref(),
-                false,
-                None,
-            );
-            return serve_acquired(
+            // With AcoustID off nothing could prove a lossless copy: the wait is skipped and the
+            // stand-in plays.
+            let acquisition = state
+                .acoust_id
+                .is_on()
+                .then(|| queue_lossless_play(state, &target, provider, external_id, &who));
+            let (response, heard) = serve_acquired(
                 state,
                 call,
                 caller,
@@ -560,14 +764,19 @@ async fn play_external(
                 format,
                 true,
             )
-            .await;
+            .await?;
+            queue_play(heard).await?;
+            return Ok(response);
         }
     }
 
-    if let Some(direct) = try_direct_stream(state, call, provider, external_id, id).await? {
+    if let Some((direct, heard)) = direct_stream(state, call, provider, external_id, id).await? {
+        queue_play(heard).await?;
         return Ok(direct);
     }
 
+    // No playable source: the play is still queued, with nothing heard.
+    queue_play(None).await?;
     warn!("Direct stream not available for {id}");
     // A 404 with the Subsonic error body: a player that only reads the status still sees the
     // play failed, instead of trying to decode an error envelope as audio.
@@ -579,7 +788,12 @@ async fn play_external(
     Ok(response)
 }
 
-/// Wait for a queued acquisition and serve the file.
+/// Wait for a queued acquisition and serve the file, with what the play heard. With no
+/// acquisition (AcoustID is off, so nothing could prove a lossless copy) the wait is skipped.
+///
+/// Wherever the play would serve nothing lossless (no acquisition, a copy the gate could not
+/// prove, a bounded wait that ran out) the preview stands in as a whole FLAC file, so the
+/// listing's promise holds and no lossy bytes go out under it.
 ///
 /// Abandoning the WAIT leaves the transfer running, so a client that gives up costs it
 /// nothing.
@@ -588,13 +802,26 @@ async fn serve_acquired(
     state: &AppState,
     call: &SubsonicCall,
     caller: Option<&FamilyCaller>,
-    acquisition: Completion,
+    acquisition: Option<Completion>,
     provider: &str,
     external_id: &str,
     id: &str,
     format: &str,
     allow_preview_fallback: bool,
-) -> anyhow::Result<Response> {
+) -> anyhow::Result<(Response, Option<HeardRecord>)> {
+    let Some(acquisition) = acquisition else {
+        info!("AcoustID is off, so no lossless copy of {id} can be proven; the FLAC stand-in plays");
+        return match flac_stand_in(state, call, provider, external_id).await? {
+            Some(served) => Ok(served),
+            None => Ok((
+                state
+                    .subsonic_response_builder
+                    .create_error(format, 70, "No playable source found for this track")
+                    .into_response(),
+                None,
+            )),
+        };
+    };
     // Above 0, the wait is bounded and the preview stands in while the fetch keeps
     // running in the background; the next play of this id serves the landed file.
     let timeout = state
@@ -607,29 +834,36 @@ async fn serve_acquired(
 
     let outcome = if fallback {
         match tokio::time::timeout(Duration::from_secs(timeout as u64), acquisition.wait()).await {
-            Ok(outcome) => outcome.map_err(|e| (e.to_string(), false)),
-            Err(_) => Err(("The operation has timed out.".to_string(), true)),
+            Ok(outcome) => outcome.map_err(|e| (e.to_string(), false, not_proven(&e))),
+            Err(_) => Err(("The operation has timed out.".to_string(), true, false)),
         }
     } else {
-        acquisition.wait().await.map_err(|e| (e.to_string(), false))
+        acquisition
+            .wait()
+            .await
+            .map_err(|e| (e.to_string(), false, not_proven(&e)))
     };
 
     let path = match outcome {
         Ok(path) => path,
-        Err((message, timed_out)) => {
-            if fallback {
-                // The user opted into a bounded wait, trading the declared-lossless
-                // contract for playback that starts. Strict clients may refuse the
-                // lossy bytes; timeout 0 keeps the contract exact.
+        Err((message, timed_out, unproven)) => {
+            if fallback || unproven {
                 let reason = if timed_out {
                     format!("timeout {timeout}s")
                 } else {
                     message.clone()
                 };
                 info!(
-                    "Lossless wait ended early for {id} ({reason}); serving the preview while the fetch continues"
+                    "Lossless wait ended early for {id} ({reason}); the FLAC stand-in plays while the fetch continues"
                 );
-                if let Some(preview) = try_direct_stream(state, call, provider, external_id, id).await? {
+                if let Some(served) = flac_stand_in(state, call, provider, external_id).await? {
+                    return Ok(served);
+                }
+                // The user opted into a bounded wait, trading the declared-lossless contract for
+                // playback that starts; timeout 0 keeps the contract exact.
+                if fallback
+                    && let Some(preview) = direct_stream(state, call, provider, external_id, id).await?
+                {
                     return Ok(preview);
                 }
             } else {
@@ -637,32 +871,161 @@ async fn serve_acquired(
                 // lossless, so lossy bytes would be the same contract violation in reverse.
                 warn!("Lossless acquisition failed for {id}: {message}");
             }
-            return Ok(state
-                .subsonic_response_builder
-                .create_error(format, 70, &format!("Could not fetch a lossless copy: {message}"))
-                .into_response());
+            return Ok((
+                state
+                    .subsonic_response_builder
+                    .create_error(format, 70, &format!("Could not fetch a lossless copy: {message}"))
+                    .into_response(),
+                None,
+            ));
         }
     };
 
     if !Path::new(&path).is_file() {
-        return Ok(state
-            .subsonic_response_builder
-            .create_error(format, 70, "Lossless copy is no longer on disk")
-            .into_response());
+        return Ok((
+            state
+                .subsonic_response_builder
+                .create_error(format, 70, "Lossless copy is no longer on disk")
+                .into_response(),
+            None,
+        ));
     }
     match outside_file(state, call, caller, &path).await {
-        OutsideFile::Serve => serve_file(call, &path).await.map_err(anyhow::Error::new),
-        OutsideFile::Relayed(response) => Ok(response),
+        OutsideFile::Serve => {
+            let heard = heard_file(
+                state,
+                call,
+                provider,
+                external_id,
+                HeardSource::Acquired { path: path.clone() },
+                &path,
+            )
+            .await;
+            Ok((serve_file(call, &path).await.map_err(anyhow::Error::new)?, heard))
+        }
+        OutsideFile::Relayed(response) => Ok((response, None)),
         OutsideFile::Withheld => {
-            if let Some(preview) = try_direct_stream(state, call, provider, external_id, id).await? {
+            if let Some(preview) = direct_stream(state, call, provider, external_id, id).await? {
                 return Ok(preview);
             }
-            Ok(state
-                .subsonic_response_builder
-                .create_error(format, 70, "No playable source found for this track")
-                .into_response())
+            Ok((
+                state
+                    .subsonic_response_builder
+                    .create_error(format, 70, "No playable source found for this track")
+                    .into_response(),
+                None,
+            ))
         }
     }
+}
+
+/// Whether an acquisition ended because the gate could not prove the copy is what played.
+fn not_proven(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PlayOutcome>() == Some(&PlayOutcome::NotProven)
+}
+
+/// The song's preview as a whole FLAC file: its whole copy converted once into
+/// `<preview copies>/flac/<video id>.flac` and served as a file, so a `Range` read gets its real
+/// length and a seek works. A HEAD reads the built file's headers, or before it is built gets the
+/// type alone and builds nothing; a play from the first byte builds it and is heard from that
+/// video. None when there is no video or the file could not be made.
+async fn flac_stand_in(
+    state: &AppState,
+    call: &SubsonicCall,
+    provider: &str,
+    external_id: &str,
+) -> anyhow::Result<Option<(Response, Option<HeardRecord>)>> {
+    let pinned = state
+        .external_id_registry
+        .resolve_song(external_id, false)
+        .and_then(|routing| routing.snapshot().you_tube_id)
+        .filter(|video| !video.trim().is_empty());
+    if call.method().as_str().eq_ignore_ascii_case("HEAD") {
+        if let Some(built) = pinned
+            .as_deref()
+            .and_then(|video| state.preview_copies.built_flac(video))
+        {
+            return Ok(Some((serve_file(call, &built.to_string_lossy()).await?, None)));
+        }
+        let mut response = Response::new(Body::empty());
+        response
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/flac"));
+        response
+            .headers_mut()
+            .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        return Ok(Some((response, None)));
+    }
+    let confirmed = state
+        .external_id_registry
+        .stream_facts(external_id)
+        .filter(|facts| facts.size_confirmed)
+        .and_then(|facts| facts.size);
+    let (video, total) = match pinned {
+        Some(video) => (video, confirmed),
+        None => {
+            // Nothing pinned yet: the stream a play would get names the video.
+            let probe = state
+                .download_service
+                .get_direct_stream(
+                    provider,
+                    external_id,
+                    Some("bytes=0-1"),
+                    &CancellationToken::new(),
+                )
+                .await?;
+            let Some(probe) = probe else {
+                return Ok(None);
+            };
+            let total = played_size(
+                probe.status_code,
+                probe.content_length,
+                probe.content_range.as_deref(),
+            );
+            let Some(video) = probe.video_id else {
+                return Ok(None);
+            };
+            (video, total)
+        }
+    };
+    let Some(flac) = state.preview_copies.flac_stand_in(&video, total).await else {
+        warn!("No FLAC stand-in could be made of {video}");
+        return Ok(None);
+    };
+    let mut heard = None;
+    if let Some(user) = heard_by_whom(state, call).await
+        && let Some((size, content_type)) = state.preview_copies.copy_facts(&video)
+    {
+        let record = keep_heard(
+            state,
+            call,
+            external_id,
+            &user,
+            HeardSource::Video {
+                id: video.clone(),
+                size: Some(size),
+                content_type,
+                itag: None,
+            },
+        );
+        if let Some(copy) = state.preview_copies.copy_path_of(&video, Some(size), None) {
+            state.heard_samples.sample_file(
+                copy,
+                Capture {
+                    external_id: external_id.to_string(),
+                    user: user.clone(),
+                    record: record.clone(),
+                    limit: 0,
+                    total: Some(size),
+                    song_seconds: song_seconds(state, external_id),
+                    class: sample_class(state, provider, external_id, &user),
+                },
+            );
+        }
+        heard = Some(record);
+    }
+    let response = serve_file(call, &flac.to_string_lossy()).await?;
+    Ok(Some((response, heard)))
 }
 
 /// What Octo does with a file it holds for an outside song, for one caller.
@@ -713,14 +1076,16 @@ async fn outside_file(
     OutsideFile::Relayed(call.proxy.relay_stream(&parameters).await)
 }
 
-/// Proxy the lossy preview straight from the CDN. `None` when no source resolved.
-async fn try_direct_stream(
+/// Proxy the lossy preview straight from the CDN, with what it played: a play from the first
+/// byte keeps the video as what the listener heard and takes its sample from the bytes on their
+/// way. `None` when no source resolved.
+async fn direct_stream(
     state: &AppState,
     call: &SubsonicCall,
     provider: &str,
     external_id: &str,
     id: &str,
-) -> anyhow::Result<Option<Response>> {
+) -> anyhow::Result<Option<(Response, Option<HeardRecord>)>> {
     // Forward the client's Range header up the chain so the shim can
     // ask googlevideo for the requested byte range and we can return
     // a proper 206. iOS Subsonic clients refuse to play non-FLAC
@@ -740,7 +1105,7 @@ async fn try_direct_stream(
         && let Some(range) = range_header.as_deref()
         && matches!(parse_range(range, size), RangeOutcome::Unsatisfiable)
     {
-        return Ok(Some(range_not_satisfiable(size)));
+        return Ok(Some((range_not_satisfiable(size), None)));
     }
 
     let Some(direct) = state
@@ -762,15 +1127,56 @@ async fn try_direct_stream(
         direct.status_code
     );
     // The shim measures a played song's loudness; ask for it once it has had time to.
-    if matches!(direct.status_code, 200 | 206)
-        && is_first_byte_request(call.method().as_str(), range_header.as_deref())
-    {
+    let played = matches!(direct.status_code, 200 | 206);
+    if played && is_first_byte_request(call.method().as_str(), range_header.as_deref()) {
         state.stream_size_warmer.after_play(external_id);
+    }
+
+    // What played, for the listener: the video and its sample, taken from the bytes on their way.
+    let mut body = direct.audio_stream;
+    let mut heard = None;
+    if played
+        && let Some(video) = direct.video_id.clone()
+        && let Some(user) = heard_by_whom(state, call).await
+    {
+        let size = played_size(
+            direct.status_code,
+            direct.content_length,
+            direct.content_range.as_deref(),
+        );
+        let source = HeardSource::Video {
+            id: video,
+            size,
+            content_type: direct.content_type.clone(),
+            itag: direct.itag,
+        };
+        let record = keep_heard(state, call, external_id, &user, source);
+        let song = song_seconds(state, external_id);
+        let extension = if direct.content_type.contains("webm") {
+            "webm"
+        } else {
+            "m4a"
+        };
+        body = state.heard_samples.capture(
+            body,
+            Capture {
+                external_id: external_id.to_string(),
+                user: user.clone(),
+                record: record.clone(),
+                limit: sample_cap(size, song),
+                total: size,
+                song_seconds: song,
+                class: sample_class(state, provider, external_id, &user),
+            },
+            extension,
+        );
+        state.heard_samples.stream_ok();
+        heard = Some(record);
     }
 
     // Manual stream copy: the network stream isn't seekable, so the upstream's status code +
     // Content-Range are forwarded verbatim and the bytes copied to the response body.
-    let mut response = Response::new(Body::from_stream(direct.audio_stream));
+    let mut response = Response::new(Body::from_stream(body));
     *response.status_mut() = StatusCode::from_u16(direct.status_code).unwrap_or(StatusCode::OK);
     let headers = response.headers_mut();
     if let Some(length) = direct.content_length {
@@ -785,7 +1191,7 @@ async fn try_direct_stream(
     {
         headers.insert(header::CONTENT_RANGE, range);
     }
-    Ok(Some(response))
+    Ok(Some((response, heard)))
 }
 
 /// 416 with `Content-Range: bytes */<size>`, as a file past its end answers.

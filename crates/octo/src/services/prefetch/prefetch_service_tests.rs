@@ -379,6 +379,8 @@ async fn with_download_on_play_the_songs_coming_up_are_queued_as_plays_one_at_a_
         s.subsonic.wait_for_lossless_on_play = true;
         you_tube_first(s);
         s.prefetch.count = 2;
+        // AcoustID on: a song coming up has no heard audio, so only AcoustID can prove its copy.
+        s.soulseek.acoust_id_api_key = "user-key".into();
     });
     w.save_queue("alice", 0);
     w.service.on_playing("alice", &w.ids[0], None).await;

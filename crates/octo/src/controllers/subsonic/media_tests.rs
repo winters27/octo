@@ -47,6 +47,8 @@ fn playback_settings(url: &str, wait_for_lossless: bool, download_on_play: bool)
         "http://{}",
         crate::services::test_support::refused_address()
     ));
+    // AcoustID on, by a key of the user's own: a play's copy can be proven.
+    settings.soulseek.acoust_id_api_key = "user-key".into();
     settings
 }
 
@@ -1245,6 +1247,498 @@ async fn a_range_past_the_end_of_a_known_stream_is_a_416_with_its_size() {
     )
     .await;
     assert_eq!(downloads.stream_calls().len(), 1);
+}
+
+// ---- What a play heard ---------------------------------------------------------------------
+
+mod heard {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+    use octo_core::fingerprint::heart_gate::HeardSource;
+
+    use super::*;
+    use crate::services::i_download_service::DirectStreamInfo;
+    use crate::services::prefetch::heard_samples::tests::{BytePrinter, song_bytes};
+    use crate::services::prefetch::sample_id_of;
+    use crate::services::soulseek::soulseek_metadata_service::SoulseekMetadataService;
+
+    pub(super) const VIDEO_A: &str = "AAAAAAAAAA1";
+    pub(super) const VIDEO_B: &str = "BBBBBBBBBB2";
+    const SIGNED: &str = "u=alice&t=good&s=salt&v=1.16.1&c=test";
+
+    /// A direct stream of `video`: `bytes`, whole (200) or as the first-byte range `range_end`.
+    pub(super) fn video_stream(video: &str, bytes: &[u8], range_end: Option<usize>) -> DirectStreamInfo {
+        let total = bytes.len();
+        let (status, sent, content_range) = match range_end {
+            Some(end) => (206, &bytes[..=end], Some(format!("bytes 0-{end}/{total}"))),
+            None => (200, bytes, None),
+        };
+        let chunks: Vec<std::io::Result<Bytes>> =
+            sent.chunks(1024).map(|c| Ok(Bytes::copy_from_slice(c))).collect();
+        DirectStreamInfo {
+            audio_stream: Box::pin(futures::stream::iter(chunks)),
+            content_type: "audio/mp4".into(),
+            content_length: Some(sent.len() as u64),
+            quality: None,
+            status_code: status,
+            content_range,
+            video_id: Some(video.to_string()),
+            itag: None,
+        }
+    }
+
+    pub(super) struct Played {
+        pub state: crate::app::AppState,
+        pub downloads: Arc<FakeStreams>,
+        pub library: Arc<FakeLibrary>,
+        pub id: String,
+        _navidrome: MockServer,
+    }
+
+    /// A registered outside song, Help!, listed as `external-track`, its plays heard by alice.
+    pub(super) async fn played(wait_for_lossless: bool) -> Played {
+        played_with(wait_for_lossless, true, None).await
+    }
+
+    /// [`played`] with AcoustID `on` or off, and the preview copies `copies` when given.
+    pub(super) async fn played_with(
+        wait_for_lossless: bool,
+        on: bool,
+        copies: Option<Arc<crate::services::prefetch::PreviewCopies>>,
+    ) -> Played {
+        let navidrome = ping_ok().await;
+        let downloads = Arc::new(FakeStreams::default());
+        let library = Arc::new(FakeLibrary::default());
+        let mut settings = playback_settings(&navidrome.uri(), wait_for_lossless, false);
+        if !on {
+            settings.soulseek.acoust_id_api_key = "off".into();
+        }
+        let state = state_with(settings, |inner| {
+            inner.download_service = downloads.clone();
+            inner.local_library = library.clone();
+            if let Some(copies) = copies {
+                inner.preview_copies = copies;
+            }
+        });
+        state.heard_samples.use_printer(Arc::new(BytePrinter));
+        let id = state.external_id_registry.register(SoulseekRouting {
+            kind: RoutingKind::Song,
+            artist: Some("The Beatles".into()),
+            title: Some("Help!".into()),
+            duration: Some(200),
+            ..Default::default()
+        });
+        library.add_external("external-track", "soulseek", &id);
+        Played {
+            state,
+            downloads,
+            library,
+            id,
+            _navidrome: navidrome,
+        }
+    }
+
+    pub(super) async fn stream(state: &crate::app::AppState, range: Option<&str>) -> Reply {
+        let headers: Vec<(&str, &str)> = range.map(|r| ("Range", r)).into_iter().collect();
+        send(
+            &app(state),
+            Method::GET,
+            &format!("/rest/stream?id=external-track&{SIGNED}"),
+            &headers,
+            Body::empty(),
+        )
+        .await
+    }
+
+    fn heard_video(state: &crate::app::AppState, id: &str) -> Option<String> {
+        state
+            .external_id_registry
+            .heard_by(id, "alice")
+            .and_then(|record| record.source.video_id().map(str::to_string))
+    }
+
+    async fn until(condition: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the condition never held");
+    }
+
+    #[tokio::test]
+    async fn a_stream_keeps_the_video_that_played_and_a_later_re_pin_does_not_change_it() {
+        let p = played(false).await;
+        let bytes = song_bytes(200.0, 1);
+        let answer = bytes.clone();
+        p.downloads.answer_with(
+            "soulseek",
+            &p.id,
+            Box::new(move || Some(video_stream(VIDEO_A, &answer, None))),
+        );
+        let reply = stream(&p.state, None).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let record = p
+            .state
+            .external_id_registry
+            .heard_by(&p.id, "alice")
+            .expect("heard");
+        assert_eq!(
+            record.source,
+            HeardSource::Video {
+                id: VIDEO_A.into(),
+                size: Some(bytes.len() as u64),
+                content_type: "audio/mp4".into(),
+                itag: None,
+            }
+        );
+        p.state.external_id_registry.set_you_tube_id(&p.id, VIDEO_B);
+        p.state.external_id_registry.refuse_video(&p.id, VIDEO_A);
+        assert_eq!(heard_video(&p.state, &p.id).as_deref(), Some(VIDEO_A));
+        // A later range of the same play is no new play.
+        stream(&p.state, Some("bytes=1000-")).await;
+        assert_eq!(heard_video(&p.state, &p.id).as_deref(), Some(VIDEO_A));
+    }
+
+    #[tokio::test]
+    async fn a_probe_then_an_open_read_that_swaps_in_another_video_keeps_the_swapped_in_one() {
+        let p = played(false).await;
+        let bytes = song_bytes(200.0, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (answer, count) = (bytes.clone(), calls.clone());
+        p.downloads.answer_with(
+            "soulseek",
+            &p.id,
+            Box::new(move || {
+                // The probe plays the pinned video; the open read that follows swaps in the
+                // pending one.
+                Some(match count.fetch_add(1, Ordering::SeqCst) {
+                    0 => video_stream(VIDEO_A, &answer, Some(1)),
+                    _ => video_stream(VIDEO_B, &answer, None),
+                })
+            }),
+        );
+        stream(&p.state, Some("bytes=0-1")).await;
+        assert_eq!(heard_video(&p.state, &p.id).as_deref(), Some(VIDEO_A));
+        stream(&p.state, Some("bytes=0-")).await;
+        assert_eq!(heard_video(&p.state, &p.id).as_deref(), Some(VIDEO_B));
+    }
+
+    #[tokio::test]
+    async fn a_stream_of_a_decoded_id_then_a_heart_of_the_raw_id_finds_what_was_heard() {
+        let p = played(false).await;
+        let raw = SoulseekMetadataService::encode_external_id(&SoulseekRouting {
+            kind: RoutingKind::Song,
+            you_tube_id: Some(VIDEO_A.into()),
+            artist: Some("The Beatles".into()),
+            title: Some("Yesterday".into()),
+            duration: Some(125),
+            ..Default::default()
+        });
+        p.library.add_external("external-track", "soulseek", &raw);
+        let answer = song_bytes(125.0, 2);
+        p.downloads.answer_with(
+            "soulseek",
+            &raw,
+            Box::new(move || Some(video_stream(VIDEO_A, &answer, None))),
+        );
+        assert_eq!(
+            p.state
+                .external_id_registry
+                .resolve_song(&raw, false)
+                .map(|r| r.lock().you_tube_id.clone()),
+            Some(Some(VIDEO_A.into()))
+        );
+        let before = p.state.external_id_registry.count();
+        stream(&p.state, None).await;
+        assert_eq!(
+            p.state.external_id_registry.count(),
+            before + 1,
+            "the stream registered it"
+        );
+        // A heart holds the raw id too, and finds the record through the same resolver.
+        assert_eq!(heard_video(&p.state, &raw).as_deref(), Some(VIDEO_A));
+    }
+
+    #[tokio::test]
+    async fn a_search_re_registering_mid_stream_keeps_the_print_on_the_registered_routing() {
+        let p = played(false).await;
+        let bytes = song_bytes(200.0, 3);
+        let (sender, receiver) = futures::channel::mpsc::unbounded::<std::io::Result<Bytes>>();
+        let receiver = Arc::new(parking_lot::Mutex::new(Some(receiver)));
+        let total = bytes.len();
+        p.downloads.answer_with(
+            "soulseek",
+            &p.id,
+            Box::new(move || {
+                let body = receiver.lock().take()?;
+                Some(DirectStreamInfo {
+                    audio_stream: Box::pin(body),
+                    content_type: "audio/mp4".into(),
+                    content_length: Some(total as u64),
+                    quality: None,
+                    status_code: 200,
+                    content_range: None,
+                    video_id: Some(VIDEO_A.into()),
+                    itag: None,
+                })
+            }),
+        );
+        let state = p.state.clone();
+        let reply = tokio::spawn(async move { stream(&state, None).await });
+        let (first, rest) = bytes.split_at(bytes.len() / 2);
+        sender.unbounded_send(Ok(Bytes::copy_from_slice(first))).unwrap();
+        until(|| p.state.external_id_registry.heard_by(&p.id, "alice").is_some()).await;
+        // A search lists the song meanwhile: a new routing object takes the id.
+        let before = p.state.external_id_registry.lookup(&p.id).unwrap();
+        let again = p.state.external_id_registry.register(SoulseekRouting {
+            kind: RoutingKind::Song,
+            artist: Some("The Beatles".into()),
+            title: Some("Help!".into()),
+            duration: Some(200),
+            ..Default::default()
+        });
+        assert_eq!(again, p.id);
+        let after = p.state.external_id_registry.lookup(&p.id).unwrap();
+        assert!(!before.ptr_eq(&after), "the search swapped in a new routing");
+        sender.unbounded_send(Ok(Bytes::copy_from_slice(rest))).unwrap();
+        drop(sender);
+        assert_eq!(reply.await.unwrap().body.len(), bytes.len());
+        let id = p.id.clone();
+        let registry = p.state.external_id_registry.clone();
+        until(move || {
+            registry
+                .lookup(&id)
+                .and_then(|r| r.lock().heard_by("alice").and_then(|h| h.sample_id.clone()))
+                .is_some()
+        })
+        .await;
+        let sample = after
+            .lock()
+            .heard_by("alice")
+            .and_then(|h| h.sample_id.clone())
+            .unwrap();
+        let prints = p
+            .state
+            .heard_samples
+            .prints(&sample)
+            .expect("the print is stored");
+        assert!(prints.whole && prints.reaches_end);
+    }
+
+    #[tokio::test]
+    async fn a_whole_play_then_a_short_read_from_the_first_byte_keeps_the_whole_print() {
+        let p = played(false).await;
+        let bytes = song_bytes(200.0, 4);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (answer, count) = (bytes.clone(), calls.clone());
+        p.downloads.answer_with(
+            "soulseek",
+            &p.id,
+            Box::new(move || {
+                Some(match count.fetch_add(1, Ordering::SeqCst) {
+                    0 => video_stream(VIDEO_A, &answer, None),
+                    _ => video_stream(VIDEO_A, &answer, Some(1023)),
+                })
+            }),
+        );
+        stream(&p.state, None).await;
+        let id = sample_id_of(&HeardSource::Video {
+            id: VIDEO_A.into(),
+            size: Some(bytes.len() as u64),
+            content_type: "audio/mp4".into(),
+            itag: None,
+        });
+        let samples = p.state.heard_samples.clone();
+        let whole_id = id.clone();
+        until(move || samples.prints(&whole_id).is_some_and(|prints| prints.whole)).await;
+        let whole = p.state.heard_samples.prints(&id).unwrap();
+
+        stream(&p.state, Some("bytes=0-1023")).await;
+        // Its sample is printed short, and never takes the whole one's place.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(p.state.heard_samples.prints(&id), Some(whole));
+        let record = p.state.external_id_registry.heard_by(&p.id, "alice").unwrap();
+        assert_eq!(record.sample_id.as_deref(), Some(id.as_str()));
+    }
+}
+
+// ---- Play outcomes ---------------------------------------------------------------------------
+
+mod outcomes {
+    use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
+
+    use super::heard::{VIDEO_A, played_with, stream};
+    use super::*;
+    use crate::services::common::track_acquisition_queue::PlayOutcome;
+    use crate::services::prefetch::PreviewCopies;
+
+    /// The pinned preview's whole copy, a real WAV ffmpeg can make a FLAC of, in its own copies
+    /// folder.
+    fn copies_with_preview(dir: &std::path::Path) -> Arc<PreviewCopies> {
+        let folder = dir.join("copies");
+        std::fs::create_dir_all(&folder).unwrap();
+        let rate = 8_000u32;
+        let frames: Vec<i16> = (0..rate * 3)
+            .map(|i| {
+                ((f64::from(i) * 2.0 * std::f64::consts::PI * 440.0 / f64::from(rate)).sin() * 8_000.0) as i16
+            })
+            .collect();
+        let data = frames.len() as u32 * 2;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data.to_le_bytes());
+        for frame in frames {
+            wav.extend_from_slice(&frame.to_le_bytes());
+        }
+        std::fs::write(folder.join(format!("{VIDEO_A}.preview")), wav).unwrap();
+        PreviewCopies::new(
+            folder,
+            Arc::new(crate::services::you_tube::YouTubeResolver::with_base_url(Some(
+                "http://127.0.0.1:1",
+            ))),
+            octo_core::common::Clock::system(),
+            || 0,
+        )
+    }
+
+    /// A Wait for lossless play of the song pinned to its preview, with the preview's copy at
+    /// hand and AcoustID `on` or off.
+    async fn lossless_play(on: bool, dir: &std::path::Path) -> super::heard::Played {
+        let p = played_with(true, on, Some(copies_with_preview(dir))).await;
+        p.state.external_id_registry.set_you_tube_id(&p.id, VIDEO_A);
+        p
+    }
+
+    fn is_flac(reply: &Reply) -> bool {
+        reply.body.starts_with(b"fLaC")
+    }
+
+    #[tokio::test]
+    async fn with_acoust_id_off_wait_for_lossless_skips_the_wait_and_the_flac_stand_in_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = lossless_play(false, dir.path()).await;
+        let reply = stream(&p.state, None).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.header("content-type"), Some("audio/flac"));
+        assert!(is_flac(&reply));
+        assert_eq!(
+            p.state.track_acquisition_queue.waiting_plays(),
+            0,
+            "nothing waited for"
+        );
+        assert!(
+            dir.path()
+                .join("copies")
+                .join("flac")
+                .join(format!("{VIDEO_A}.flac"))
+                .is_file()
+        );
+        // The play heard the preview's video.
+        let heard = p.state.external_id_registry.heard_by(&p.id, "alice").unwrap();
+        assert_eq!(heard.source.video_id(), Some(VIDEO_A));
+    }
+
+    #[tokio::test]
+    async fn a_copy_the_gate_could_not_prove_resolves_the_wait_at_once_and_the_flac_stand_in_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = lossless_play(true, dir.path()).await;
+        let state = p.state.clone();
+        let reply = tokio::spawn(async move { stream(&state, None).await });
+        let request = tokio::time::timeout(
+            Duration::from_secs(30),
+            p.state.track_acquisition_queue.dequeue(&CancellationToken::new()),
+        )
+        .await
+        .expect("queued")
+        .expect("a request");
+        assert_eq!(request.origin, Some(AcquisitionOrigin::Play));
+        p.state.track_acquisition_queue.release(&request);
+        // Refused, held or not proven: the gate resolves the play's completion at once.
+        request
+            .completion
+            .try_set_error(anyhow::Error::new(PlayOutcome::NotProven));
+        let reply = tokio::time::timeout(Duration::from_secs(30), reply)
+            .await
+            .expect("the play is answered")
+            .unwrap();
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.header("content-type"), Some("audio/flac"));
+        assert!(is_flac(&reply));
+    }
+
+    #[tokio::test]
+    async fn the_flac_stand_in_answers_a_probe_a_seek_and_a_head_as_a_file_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = lossless_play(false, dir.path()).await;
+        let url = "/rest/stream?id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=test";
+        // Before it is built, a HEAD gets the type alone and builds nothing.
+        let head = send(&app(&p.state), Method::HEAD, url, &[], Body::empty()).await;
+        assert_eq!(head.status, StatusCode::OK);
+        assert_eq!(head.header("content-type"), Some("audio/flac"));
+        assert_eq!(head.header("content-length"), None);
+        let flac = dir
+            .path()
+            .join("copies")
+            .join("flac")
+            .join(format!("{VIDEO_A}.flac"));
+        assert!(!flac.exists());
+
+        // The probe counts as the first byte: it builds the file and gets its first two bytes.
+        let probe = stream(&p.state, Some("bytes=0-1")).await;
+        assert_eq!(probe.status, StatusCode::PARTIAL_CONTENT);
+        let length = std::fs::metadata(&flac).expect("built").len();
+        assert_eq!(
+            probe.header("content-range"),
+            Some(format!("bytes 0-1/{length}").as_str())
+        );
+        assert_eq!(probe.body.as_ref(), b"fL");
+        let seek = stream(&p.state, Some("bytes=100-")).await;
+        assert_eq!(seek.status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            seek.header("content-range"),
+            Some(format!("bytes 100-{}/{length}", length - 1).as_str())
+        );
+        assert_eq!(seek.body.len() as u64, length - 100);
+        let head = send(&app(&p.state), Method::HEAD, url, &[], Body::empty()).await;
+        assert_eq!(head.header("content-length"), Some(length.to_string().as_str()));
+        assert!(head.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_play_with_no_playable_source_still_queues_its_download() {
+        let navidrome = ping_ok().await;
+        let library = Arc::new(FakeLibrary::with_external(
+            "external-track",
+            "soulseek",
+            "track-id",
+        ));
+        let state = state_with(playback_settings(&navidrome.uri(), false, true), |inner| {
+            inner.download_service = Arc::new(FakeStreams::default());
+            inner.local_library = library.clone();
+        });
+        let reply = stream(&state, None).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND);
+        for _ in 0..100 {
+            if state.track_acquisition_queue.waiting_plays() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(state.track_acquisition_queue.waiting_plays(), 1);
+    }
 }
 
 // ---- A kept outside song in Octo's apps --------------------------------------------------
