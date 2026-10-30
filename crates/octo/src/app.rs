@@ -1211,6 +1211,11 @@ impl Acquisition {
             lidarr_fetcher: Some(lidarr_fetcher),
             lidarr_client: Some(lidarr_client.clone()),
             family: Default::default(),
+            // A pick's file is held to the recording its song is, by the import rule.
+            gates: downloads
+                .heart_gate
+                .then(|| verification.clone() as Arc<dyn HeartGates>),
+            journal: Some(stores.library_action_journal.clone()),
         }));
         song_finder.use_family(navidrome.family_write_gate.clone());
         let external_search = Arc::new(ExternalSearchService::new(
@@ -2467,8 +2472,11 @@ impl LibraryActions {
             sources: Some(acquisition.upgrade_sources.clone()),
             answers: Some(answers),
         }));
-        // Better quality of a file a heart kept is judged by that heart's own gate.
+        // Better quality of a file a heart kept is judged by that heart's own gate, and a Wrong song
+        // or Wrong version by what its original's own sound says. A copy picked for a Wrong
+        // version is compared with the song's own file, window by window.
         executor.use_kept_rechecks(acquisition.kept_rechecks.clone());
+        executor.use_master(Arc::new(HeardMasterCheck::new(stores.heard_samples.clone())));
         let rating_worker = Arc::new(LibraryActionRatingWorker::new(
             executor.clone(),
             navidrome.subsonic_proxy.clone(),
