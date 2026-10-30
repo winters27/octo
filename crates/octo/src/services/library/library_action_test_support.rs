@@ -56,10 +56,13 @@ pub(crate) fn store(settings: AppSettings) -> Arc<SettingsStore> {
     Arc::new(SettingsStore::for_tests(settings))
 }
 
-/// A stand-in `ILocalLibraryService`: answers nothing, and records the mappings forgotten.
+/// A stand-in `ILocalLibraryService`: answers nothing but the mappings it is given, records the
+/// paths forgotten, and hands a forgotten path's mappings back as the real library does, taking
+/// them again on a restore.
 #[derive(Default)]
 pub(crate) struct RecordingLibrary {
     pub forgotten: Mutex<Vec<String>>,
+    pub mappings: Mutex<Vec<LocalSongMapping>>,
 }
 
 #[async_trait]
@@ -85,7 +88,7 @@ impl ILocalLibraryService for RecordingLibrary {
     }
 
     async fn get_mappings(&self) -> Vec<LocalSongMapping> {
-        Vec::new()
+        self.mappings.lock().clone()
     }
 
     async fn find_mapping_by_tags(
@@ -102,7 +105,27 @@ impl ILocalLibraryService for RecordingLibrary {
         local_path: &str,
     ) -> anyhow::Result<Vec<crate::services::local::LocalSongMapping>> {
         self.forgotten.lock().push(local_path.to_string());
-        Ok(Vec::new())
+        let wanted = super::navidrome_song_path_resolver::get_full_path(local_path);
+        let mut mappings = self.mappings.lock();
+        let (gone, kept): (Vec<LocalSongMapping>, Vec<LocalSongMapping>) =
+            mappings.drain(..).partition(|mapping| {
+                octo_core::common::dotnet::eq_ignore_case(
+                    &super::navidrome_song_path_resolver::get_full_path(&mapping.local_path),
+                    &wanted,
+                )
+            });
+        *mappings = kept;
+        Ok(gone)
+    }
+
+    async fn restore_mappings(&self, mappings: &[LocalSongMapping], local_path: &str) -> anyhow::Result<()> {
+        self.mappings
+            .lock()
+            .extend(mappings.iter().cloned().map(|mapping| LocalSongMapping {
+                local_path: local_path.to_string(),
+                ..mapping
+            }));
+        Ok(())
     }
 
     async fn trigger_library_scan(&self, _force: bool) -> bool {

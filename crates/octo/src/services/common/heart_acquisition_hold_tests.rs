@@ -634,7 +634,7 @@ async fn a_play_handed_to_lidarr_says_it_is_a_play_and_a_play_never_holds() {
         .coordinator
         .play_gates("soulseek", "played", Some("brandon"), None)
         .await;
-    assert_eq!(held, None);
+    assert!(held.is_err(), "{held:?}");
     assert!(rig.holds.snapshot().is_empty());
 
     // A ready gate is the play's only gate.
@@ -905,10 +905,13 @@ fn land_judged(
     let stop = CancellationToken::new();
     let (queue, seen, token) = (queue.clone(), taken.clone(), stop.clone());
     tokio::spawn(async move {
+        let mut first = true;
         while let Some(request) = queue.dequeue(&token).await {
-            while request.gates().len() < askers {
+            // The first request waits for everyone who joins it; a later one is someone's own.
+            while first && request.gates().len() < askers {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            first = false;
             seen.lock().push(request.clone());
             let ledger = request.completion.ledger().clone();
             for gate in request.gates() {
@@ -963,7 +966,8 @@ async fn two_holders_who_heard_two_mixes_each_wait_for_their_own_file() {
 }
 
 /// Two people with different R join one request: the file lands for the one whose gate passed
-/// it, and never counts as the other's.
+/// it, and never counts as the other's, whose own heart goes on down its own chain: the step runs
+/// again as theirs, and with nothing proven for a heart never played it holds for a play.
 #[tokio::test]
 async fn two_hearts_joining_one_request_each_get_their_own() {
     let rig = rig(Arc::new(ListedGates::default()), None, memory_holds());
@@ -992,11 +996,680 @@ async fn two_hearts_joining_one_request_each_get_their_own() {
         brandon.await.expect("joined"),
         TrackOutcome::Landed("/music/help.flac".into())
     );
-    assert!(
-        matches!(anna.await.expect("joined"), TrackOutcome::Failed(_)),
-        "the 2009 file is not what anna heard"
+    assert_eq!(
+        anna.await.expect("joined"),
+        TrackOutcome::Held(WaitingFor::NotYetProven),
+        "the 2009 file is not what anna heard, and her own copy proved nothing"
     );
-    assert_eq!(landed.lock().len(), 1, "one download for both");
+    let landed = landed.lock().clone();
+    assert_eq!(landed.len(), 2, "one download for both, then anna's own");
+    let theirs: Vec<String> = landed[1].gates().into_iter().map(|gate| gate.user).collect();
+    assert_eq!(theirs, ["anna"]);
+    let record = rig
+        .holds
+        .get("Track:soulseek:help:NotYetProven")
+        .expect("anna holds for a play");
+    assert_eq!(users(&record), ["anna"]);
+    stop.cancel();
+}
+
+// ---- Keeping the heard audio when nothing is proven -------------------------------------------
+
+/// Gates of people who heard the song: ready, reading `reading` once something was heard (their
+/// own heard source, else the one listed for them), never played otherwise; held for `hold`
+/// when set.
+#[derive(Default)]
+struct HeardGates {
+    reading: Mutex<Option<HeardReading>>,
+    heard: Mutex<HashMap<String, HeardRecord>>,
+    hold: Mutex<Option<WaitingFor>>,
+}
+
+impl HeardGates {
+    fn reading(reading: HeardReading) -> Arc<Self> {
+        let gates = HeardGates::default();
+        *gates.reading.lock() = Some(reading);
+        Arc::new(gates)
+    }
+
+    fn heard(&self, user: &str, record: HeardRecord) {
+        self.heard.lock().insert(user.to_string(), record);
+    }
+}
+
+#[async_trait]
+impl HeartGates for HeardGates {
+    async fn build(&self, _: &str, _: &str, holder: &Holder, origin: AcquisitionOrigin) -> GateStart {
+        let mut gate = gate(holder, origin);
+        gate.heard = holder
+            .heard
+            .clone()
+            .or_else(|| self.heard.lock().get(&holder.user).cloned());
+        if gate.heard.is_some() {
+            gate.reading = self
+                .reading
+                .lock()
+                .clone()
+                .unwrap_or(HeardReading::OnlyHeardOrMaster);
+        }
+        match *self.hold.lock() {
+            Some(waiting_for) => GateStart::Hold {
+                gate,
+                waiting_for,
+                line: waiting_line(waiting_for).to_string(),
+                question: None,
+            },
+            None => GateStart::Ready(gate),
+        }
+    }
+}
+
+/// A heart coordinator whose chain runs these sources, with these gates.
+fn rig_with(sources: &[HeartDownloadSource], gates: Arc<dyn HeartGates>) -> Rig {
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+        subsonic: SubsonicSettings {
+            heart_download_sources: sources
+                .iter()
+                .map(|&source| HeartDownloadStep {
+                    source,
+                    song_enabled: Some(true),
+                    album_enabled: Some(true),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let queue = Arc::new(TrackAcquisitionQueue::new());
+    let tracker = Arc::new(AcquisitionTracker::new(None, Clock::system()));
+    let lidarr = Arc::new(FakeLidarr::default());
+    let holds = memory_holds();
+    let coordinator = HeartAcquisitionCoordinator::new(
+        settings,
+        queue.clone(),
+        Arc::new(FakeDownloads::default()),
+        lidarr.clone(),
+        HeartCoordinatorExtras {
+            tracker: Some(tracker.clone()),
+            holds: Some(holds.clone()),
+            gates: Some(gates),
+            ..Default::default()
+        },
+    );
+    Rig {
+        coordinator,
+        queue,
+        holds,
+        tracker,
+        lidarr,
+    }
+}
+
+/// What the worker does with the `n`th request it is handed: None lands it, accepted by every
+/// gate on it (and closes its row, as the download's placement does); Some fails it with these
+/// words, writing `Undecided` for every gate when the words say "undecided".
+type Judge = Arc<dyn Fn(&AcquisitionRequest, usize) -> Option<String> + Send + Sync>;
+
+fn work(rig: &Rig, judge: Judge) -> (Taken, CancellationToken) {
+    let taken: Taken = Arc::default();
+    let stop = CancellationToken::new();
+    let (queue, seen, token, tracker) = (
+        rig.queue.clone(),
+        taken.clone(),
+        stop.clone(),
+        rig.tracker.clone(),
+    );
+    tokio::spawn(async move {
+        let mut n = 0;
+        while let Some(request) = queue.dequeue(&token).await {
+            seen.lock().push(request.clone());
+            let ledger = request.completion.ledger().clone();
+            let verdict = judge(&request, n);
+            n += 1;
+            queue.release(&request);
+            match verdict {
+                None => {
+                    for gate in request.gates() {
+                        ledger.record(&gate.user, gate.origin, GateOutcome::Accepted);
+                    }
+                    tracker.complete(&request.provider, &request.external_id, None);
+                    request
+                        .completion
+                        .try_set_result(format!("/music/{}.m4a", request.external_id));
+                }
+                Some(words) => {
+                    if words.contains("undecided") {
+                        for gate in request.gates() {
+                            ledger.record(&gate.user, gate.origin, GateOutcome::Undecided);
+                        }
+                    }
+                    request.completion.try_set_error(anyhow::anyhow!(words));
+                }
+            }
+        }
+    });
+    (taken, stop)
+}
+
+/// Every source fails; the heard audio is had.
+fn sources_fail_heard_lands() -> Judge {
+    Arc::new(|request: &AcquisitionRequest, _| {
+        let keeping = request.source_override == Some(DownloadSource::YouTube)
+            && request
+                .gates()
+                .iter()
+                .all(|gate| gate.reading == HeardReading::OnlyHeardOrMaster);
+        (!keeping).then(|| "nothing it could prove".to_string())
+    })
+}
+
+/// What a gate's person heard, whenever they heard it.
+fn heard_of(gate: &HeartGate) -> Option<octo_core::fingerprint::heart_gate::HeardSource> {
+    gate.heard.as_ref().map(|heard| heard.source.clone())
+}
+
+async fn heart_of(rig: &Rig, user: &str) -> TrackOutcome {
+    rig.coordinator
+        .acquire_track_outcome(
+            "soulseek",
+            "help",
+            Some(user),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::Heart,
+        )
+        .await
+        .expect("ran")
+}
+
+/// Every source ran and none brought a copy that could be proven: the heart keeps the very audio
+/// the person heard, by its identity, kept as heard, its row saying so in one line. A source that
+/// can search means Octo keeps looking.
+#[tokio::test]
+async fn a_heart_with_nothing_proven_keeps_the_heard_audio_with_its_line() {
+    let gates = HeardGates::reading(HeardReading::RStays { tag: None });
+    gates.heard("brandon", heard_video());
+    let rig = rig_with(&[HeartDownloadSource::Soulseek], gates);
+    rig.tracker.begin(
+        "soulseek",
+        "help",
+        None,
+        Some("brandon"),
+        Some("The Beatles"),
+        Some("Help!"),
+        None,
+    );
+    let (taken, stop) = work(&rig, sources_fail_heard_lands());
+
+    let outcome = heart_of(&rig, "brandon").await;
+
+    assert_eq!(outcome, TrackOutcome::KeptAsHeard("/music/help.m4a".into()));
+    let taken = taken.lock().clone();
+    assert_eq!(taken.len(), 2, "the source, then the heard audio itself");
+    assert_eq!(taken[0].source_override, Some(DownloadSource::Soulseek));
+    assert_eq!(taken[1].source_override, Some(DownloadSource::YouTube));
+    let kept = taken[1].gates();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        kept[0].reading,
+        HeardReading::OnlyHeardOrMaster,
+        "only the heard audio passes"
+    );
+    assert_eq!(heard_of(&kept[0]), Some(heard_video().source));
+    assert_eq!(
+        rig.tracker.note_of("soulseek", "help").as_deref(),
+        Some(KEPT_AS_HEARD)
+    );
+    assert!(rig.holds.snapshot().is_empty());
+    stop.cancel();
+}
+
+/// The heart's sources cannot search (YouTube alone): the line says to add one. A copy AcoustID
+/// could not tell apart from another version: the line says Octo could not prove which this is.
+#[tokio::test]
+async fn the_kept_line_says_when_no_source_can_search_and_when_a_copy_could_not_be_told_apart() {
+    for (sources, first_fails, line) in [
+        (
+            vec![HeartDownloadSource::YouTube],
+            "nothing it could prove",
+            KEPT_NO_SOURCE,
+        ),
+        (
+            vec![HeartDownloadSource::Soulseek],
+            "undecided: the version could not be told apart",
+            KEPT_UNDECIDED,
+        ),
+    ] {
+        let gates = HeardGates::reading(HeardReading::RStays { tag: None });
+        gates.heard("brandon", heard_video());
+        let rig = rig_with(&sources, gates);
+        rig.tracker.begin(
+            "soulseek",
+            "help",
+            None,
+            Some("brandon"),
+            None,
+            Some("Help!"),
+            None,
+        );
+        let (_, stop) = work(
+            &rig,
+            Arc::new(move |_: &AcquisitionRequest, n| (n == 0).then(|| first_fails.to_string())),
+        );
+
+        assert_eq!(
+            heart_of(&rig, "brandon").await,
+            TrackOutcome::KeptAsHeard("/music/help.m4a".into())
+        );
+        assert_eq!(rig.tracker.note_of("soulseek", "help").as_deref(), Some(line));
+        stop.cancel();
+    }
+}
+
+/// When even the heard audio cannot be had (the video gone), the heart ends with the plain line.
+#[tokio::test]
+async fn a_heart_whose_heard_video_is_gone_ends_with_the_plain_line() {
+    let gates = HeardGates::reading(HeardReading::OnlyHeardOrMaster);
+    gates.heard("brandon", heard_video());
+    let rig = rig_with(&[HeartDownloadSource::Soulseek], gates);
+    rig.tracker.begin(
+        "soulseek",
+        "help",
+        None,
+        Some("brandon"),
+        None,
+        Some("Help!"),
+        None,
+    );
+    let (taken, stop) = work(
+        &rig,
+        Arc::new(|_: &AcquisitionRequest, _| Some("gone".to_string())),
+    );
+
+    assert_eq!(
+        heart_of(&rig, "brandon").await,
+        TrackOutcome::Failed(HEARD_GONE.to_string())
+    );
+    assert_eq!(taken.lock().len(), 2, "the heard audio was asked for");
+    let row = rig.tracker.detail("soulseek:help", None).expect("the row");
+    assert_eq!(row.state, AcquisitionState::Failed);
+    assert_eq!(row.error.as_deref(), Some(HEARD_GONE));
+    assert!(rig.holds.snapshot().is_empty());
+    stop.cancel();
+}
+
+/// A list heart of a song AcoustID has no entry for, never played, with every source refused,
+/// holds with "Play it once"; one play then keeps the heard audio and the hold ends.
+#[tokio::test]
+async fn a_list_heart_never_played_holds_play_it_once_and_one_play_keeps_the_heard_audio() {
+    let gates = HeardGates::reading(HeardReading::OnlyHeardOrMaster);
+    let rig = rig_with(&[HeartDownloadSource::Soulseek], gates);
+    let (taken, stop) = work(&rig, sources_fail_heard_lands());
+
+    assert_eq!(
+        heart_of(&rig, "brandon").await,
+        TrackOutcome::Held(WaitingFor::NotYetProven)
+    );
+    let key = "Track:soulseek:help:NotYetProven";
+    let record = rig.holds.get(key).expect("held for a play");
+    assert_eq!(record.line.as_deref(), Some(NEVER_PLAYED));
+    assert_eq!(taken.lock().len(), 1, "the source ran, and nothing was kept");
+    assert_eq!(
+        rig.tracker.note_of("soulseek", "help").as_deref(),
+        Some(NEVER_PLAYED)
+    );
+
+    // The person plays it: the hold runs with what they heard, and keeps it.
+    rig.coordinator.heard_again("help", "brandon", &heard_video());
+    until(|| rig.holds.snapshot().is_empty()).await;
+    let taken = taken.lock().clone();
+    assert_eq!(taken.len(), 3, "the source again, then the heard audio");
+    assert_eq!(taken[2].source_override, Some(DownloadSource::YouTube));
+    assert_eq!(heard_of(&taken[2].gates()[0]), Some(heard_video().source));
+    stop.cancel();
+}
+
+/// A search heart whose stand-in AcoustID does not know has nothing to prove a copy by: its gate
+/// holds before any source runs, so nothing is downloaded or kept until the person streams it.
+#[tokio::test]
+async fn a_search_heart_with_an_unknown_stand_in_keeps_nothing_until_it_is_streamed() {
+    let gates = Arc::new(HeardGates::default());
+    *gates.hold.lock() = Some(WaitingFor::NotYetProven);
+    let rig = rig_with(&[HeartDownloadSource::Soulseek], gates.clone());
+    let (taken, stop) = work(&rig, sources_fail_heard_lands());
+
+    assert_eq!(
+        heart_of(&rig, "brandon").await,
+        TrackOutcome::Held(WaitingFor::NotYetProven)
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(taken.lock().is_empty(), "nothing downloaded");
+
+    *gates.hold.lock() = None;
+    rig.coordinator.heard_again("help", "brandon", &heard_video());
+    until(|| rig.holds.snapshot().is_empty()).await;
+    assert_eq!(taken.lock().len(), 2, "the source, then the heard audio");
+    stop.cancel();
+}
+
+/// A held album track waits for a person's proof; after a restart it is asked again once, its
+/// row back with its line, without anyone playing it first.
+#[tokio::test]
+async fn a_held_album_track_is_asked_again_after_a_restart() {
+    let directory = tempfile::tempdir().expect("a temp dir");
+    let file = directory.path().join("soulseek-holds.json");
+    let line = "1 track waits: play it once, or keep it anyway";
+    {
+        let before = SoulseekHoldStore::new(Some(&file));
+        before.hold(HeldAcquisition {
+            album_track: Some(crate::services::common::soulseek_hold_store::HeldAlbumTrack {
+                album_key: "soulseek:help-album".into(),
+                song_ids: vec!["help".into()],
+                artist: "The Beatles".into(),
+                title: "Help!".into(),
+                duration_seconds: Some(139),
+                r: Default::default(),
+            }),
+            line: Some(line.into()),
+            ..held(
+                "help",
+                AcquisitionOrigin::AlbumHeart,
+                WaitingFor::NotYetProven,
+                &["brandon"],
+            )
+        });
+    }
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("brandon", WaitingFor::NotYetProven);
+    let rig = rig(gates.clone(), None, Arc::new(SoulseekHoldStore::new(Some(&file))));
+    Arc::new(SoulseekHoldResumer::new(
+        rig.holds.clone(),
+        rig.coordinator.clone(),
+    ))
+    .run(CancellationToken::new())
+    .await
+    .expect("ran");
+
+    until(|| !gates.built.lock().is_empty()).await;
+    assert_eq!(
+        gates.built.lock().clone(),
+        [("brandon".to_string(), AcquisitionOrigin::AlbumHeart)],
+        "asked again once"
+    );
+    until(|| rig.coordinator.resuming.lock().is_empty()).await;
+    let record = rig
+        .holds
+        .snapshot()
+        .into_iter()
+        .find(|record| record.album_track.is_some())
+        .expect("still held, as nothing proved it");
+    assert_eq!(users(&record), ["brandon"]);
+    assert!(rig.tracker.is_held("soulseek", "help"));
+}
+
+// ---- Already in your library -----------------------------------------------------------------
+
+/// `HeardGates` whose verdict on a library copy is `passes`, each copy judged noted.
+struct OwnedGates {
+    heard: Arc<HeardGates>,
+    passes: bool,
+    judged: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl HeartGates for OwnedGates {
+    async fn build(&self, provider: &str, id: &str, holder: &Holder, origin: AcquisitionOrigin) -> GateStart {
+        self.heard.build(provider, id, holder, origin).await
+    }
+
+    async fn owned_passes(&self, path: &str, _: &HeartGate) -> bool {
+        self.judged.lock().push(path.to_string());
+        self.passes
+    }
+}
+
+/// A coordinator whose library holds a copy of Help! (the 2015 mix, though nothing says so), at a
+/// temp file, with the owned check on, Soulseek as the heart's source and DownloadOnPlay on.
+fn owned_rig(gates: Arc<dyn HeartGates>) -> (Rig, tempfile::TempDir, String) {
+    use crate::services::common::test_fakes::FakeMetadata;
+    use crate::services::library::library_ownership::{Candidate, search_from};
+    use crate::services::library::{HeartOwnership, LibraryOwnership};
+    use futures::FutureExt;
+
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let owned_file = dir.path().join("Help!.flac").to_string_lossy().into_owned();
+    std::fs::write(&owned_file, b"the 2015 mix").expect("written");
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+        subsonic: SubsonicSettings {
+            skip_owned_songs: true,
+            download_on_play: true,
+            heart_download_sources: vec![HeartDownloadStep {
+                source: HeartDownloadSource::Soulseek,
+                song_enabled: Some(true),
+                album_enabled: Some(true),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let metadata = Arc::new(FakeMetadata::default());
+    metadata.songs.lock().insert(
+        ("soulseek".into(), "help".into()),
+        octo_core::models::domain::Song {
+            title: "Help!".into(),
+            artist: "The Beatles".into(),
+            album: "Help!".into(),
+            duration: Some(139),
+            ..Default::default()
+        },
+    );
+    let ownership = LibraryOwnership::new(
+        settings.clone(),
+        None,
+        Arc::new(crate::services::local::test_support::FakeLocalLibrary::default()),
+    );
+    ownership.set_search(search_from(Some(vec![Candidate {
+        id: "nd-help".into(),
+        artist: "The Beatles".into(),
+        title: "Help!".into(),
+        album: Some("Help!".into()),
+        duration: Some(139),
+        suffix: "flac".into(),
+        bit_rate: 900,
+        isrcs: Vec::new(),
+    }])));
+    let path = owned_file.clone();
+    ownership.set_resolve(Arc::new(move |_| {
+        let path = path.clone();
+        async move { Ok(Some(path)) }.boxed()
+    }));
+    let owned = Arc::new(HeartOwnership::new(
+        Arc::new(ownership),
+        metadata,
+        settings.clone(),
+        None,
+        None,
+    ));
+    let queue = Arc::new(TrackAcquisitionQueue::new());
+    let tracker = Arc::new(AcquisitionTracker::new(None, Clock::system()));
+    let lidarr = Arc::new(FakeLidarr::default());
+    let holds = memory_holds();
+    let coordinator = HeartAcquisitionCoordinator::new(
+        settings,
+        queue.clone(),
+        Arc::new(FakeDownloads::default()),
+        lidarr.clone(),
+        HeartCoordinatorExtras {
+            tracker: Some(tracker.clone()),
+            holds: Some(holds.clone()),
+            gates: Some(gates),
+            owned: Some(owned),
+            ..Default::default()
+        },
+    );
+    (
+        Rig {
+            coordinator,
+            queue,
+            holds,
+            tracker,
+            lidarr,
+        },
+        dir,
+        owned_file,
+    )
+}
+
+fn owned_gates(passes: bool) -> Arc<OwnedGates> {
+    let heard = HeardGates::reading(HeardReading::RStays { tag: None });
+    heard.heard("brandon", heard_video());
+    Arc::new(OwnedGates {
+        heard,
+        passes,
+        judged: Mutex::new(Vec::new()),
+    })
+}
+
+/// The 2015 Help! owned and the 2009 mix heard: nothing proves the owned copy is the version
+/// heard, so it is left untouched, never counted as the heart's (not favorited), and the heard
+/// audio is kept beside it, the row saying so.
+#[tokio::test]
+async fn a_heart_over_an_owned_copy_nothing_proves_keeps_the_heard_audio_beside_it() {
+    let gates = owned_gates(false);
+    let (rig, _dir, owned_file) = owned_rig(gates.clone());
+    rig.tracker.begin(
+        "soulseek",
+        "help",
+        None,
+        Some("brandon"),
+        None,
+        Some("Help!"),
+        None,
+    );
+    let (taken, stop) = work(&rig, sources_fail_heard_lands());
+
+    let outcome = heart_of(&rig, "brandon").await;
+
+    assert_eq!(outcome, TrackOutcome::KeptAsHeard("/music/help.m4a".into()));
+    assert_eq!(
+        gates.judged.lock().as_slice(),
+        std::slice::from_ref(&owned_file),
+        "the owned copy was judged"
+    );
+    assert_eq!(std::fs::read(&owned_file).expect("still there"), b"the 2015 mix");
+    assert_eq!(taken.lock().len(), 2, "the source, then the heard audio");
+    assert_eq!(
+        rig.tracker.note_of("soulseek", "help").as_deref(),
+        Some(KEPT_BESIDE_OWNED)
+    );
+    let row = rig.tracker.detail("soulseek:help", None).expect("the row");
+    assert_ne!(
+        row.library_id.as_deref(),
+        Some("nd-help"),
+        "never closed on the owned copy"
+    );
+    stop.cancel();
+}
+
+/// An owned copy the heart's own gate proves is the heart's: nothing is downloaded.
+#[tokio::test]
+async fn a_heart_over_an_owned_copy_its_gate_proves_downloads_nothing() {
+    let (rig, _dir, _) = owned_rig(owned_gates(true));
+    let (taken, stop) = work(&rig, sources_fail_heard_lands());
+
+    assert_eq!(heart_of(&rig, "brandon").await, TrackOutcome::AlreadyThere);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(taken.lock().is_empty());
+    stop.cancel();
+}
+
+/// A play over an owned copy downloads nothing, its row saying nothing checked it is the version
+/// heard.
+#[tokio::test]
+async fn a_play_over_an_owned_copy_downloads_nothing() {
+    let (rig, _dir, _) = owned_rig(owned_gates(false));
+    let (taken, stop) = work(&rig, Arc::new(|_: &AcquisitionRequest, _| None));
+
+    rig.coordinator.queue_play_heard(
+        "soulseek",
+        "help",
+        Some("brandon"),
+        Some("c"),
+        Some("brandon"),
+        Some(heard_video()),
+    );
+    until(|| {
+        rig.tracker
+            .detail("soulseek:help", None)
+            .is_some_and(|row| row.state == AcquisitionState::Done)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(taken.lock().is_empty(), "nothing downloaded");
+    assert_eq!(
+        rig.tracker.note_of("soulseek", "help").as_deref(),
+        Some(PLAY_OVER_OWNED)
+    );
+    stop.cancel();
+}
+
+/// A DownloadOnPlay play whose download nothing could prove keeps what it played instead: the
+/// heard video's own stream, judged by its identity alone.
+#[tokio::test]
+async fn a_download_on_play_play_whose_download_is_not_proven_keeps_the_heard_audio() {
+    let rig = play_rig(true, HeardGates::reading(HeardReading::RStays { tag: None }));
+    let (taken, stop) = work(
+        &rig,
+        Arc::new(|_: &AcquisitionRequest, n| (n == 0).then(|| "not proven".to_string())),
+    );
+    rig.coordinator.queue_play_heard(
+        "soulseek",
+        "played",
+        Some("brandon"),
+        Some("c"),
+        Some("brandon"),
+        Some(heard_video()),
+    );
+    until(|| taken.lock().len() == 2).await;
+    let kept = taken.lock()[1].clone();
+    assert_eq!(kept.origin, Some(AcquisitionOrigin::Play));
+    assert_eq!(kept.source_override, Some(DownloadSource::YouTube));
+    let gates = kept.gates();
+    assert_eq!(gates.len(), 1);
+    assert_eq!(gates[0].reading, HeardReading::OnlyHeardOrMaster);
+    assert_eq!(heard_of(&gates[0]), Some(heard_video().source));
+    until(|| kept.completion.is_completed()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(taken.lock().len(), 2, "nothing else is fetched");
+    stop.cancel();
+}
+
+/// A DownloadOnPlay play whose heard lookup AcoustID answers busy fetches no download from any
+/// source, and keeps the very audio it played.
+#[tokio::test]
+async fn a_download_on_play_play_with_acoust_id_busy_keeps_the_heard_audio_and_no_download() {
+    let gates = HeardGates::reading(HeardReading::Busy);
+    *gates.hold.lock() = Some(WaitingFor::AcoustId);
+    let rig = play_rig(true, gates);
+    let (taken, stop) = work(&rig, Arc::new(|_: &AcquisitionRequest, _| None));
+    rig.coordinator.queue_play_heard(
+        "soulseek",
+        "played",
+        Some("brandon"),
+        Some("c"),
+        Some("brandon"),
+        Some(heard_video()),
+    );
+    until(|| taken.lock().len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let taken = taken.lock().clone();
+    assert_eq!(taken.len(), 1, "only the heard audio");
+    assert_eq!(taken[0].source_override, Some(DownloadSource::YouTube));
+    assert_eq!(taken[0].gates()[0].reading, HeardReading::OnlyHeardOrMaster);
+    assert!(rig.lidarr.origins.lock().is_empty(), "no Lidarr album");
+    assert!(rig.holds.snapshot().is_empty(), "a play never holds");
     stop.cancel();
 }
 

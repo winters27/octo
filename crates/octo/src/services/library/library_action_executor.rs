@@ -36,6 +36,7 @@ use super::rejections::RejectionStore;
 use super::replacement_handoff::{
     BeforeReveal, OnRevealed, ReplacementHandoff, ReplacementRejectedException,
 };
+use super::upgrade_queue::{KeptFor, KeptRechecks};
 use super::upgrade_sources::UpgradeSources;
 use super::{NavidromeSongPathResolver, ResolvedSongFile};
 use crate::services::common::download_picks::AnywaySong;
@@ -43,7 +44,7 @@ use crate::services::common::{StarOnArrival, TrackAcquisitionQueue};
 use crate::services::cover_art::{CoverUpgradeWorker, RejectedCovers};
 use crate::services::library::library_tag_edits::{self, song_tag_fields};
 use crate::services::library::replacement_handoff::ArrivedTags;
-use crate::services::local::ILocalLibraryService;
+use crate::services::local::{ILocalLibraryService, LocalSongMapping};
 use crate::services::lyrics::{LyricsChoiceService, LyricsService, LyricsSidecarWriter};
 use crate::services::soulseek::soulseek_link::{OFFLINE_TEXT, SoulseekLinkState};
 use crate::services::soulseek::{
@@ -268,6 +269,8 @@ pub struct LibraryActionExecutor {
     seams: Mutex<ExecutorSeams>,
     /// Library health's duplicate fix, which Fix duplicates hands each request to.
     fixer: OnceLock<Arc<dyn DuplicateFixer>>,
+    /// What a file a heart kept is replaced by: only a copy that heart's own gate passes.
+    kept: OnceLock<Arc<KeptRechecks>>,
     /// The library's version check, which Check version hands each request to.
     version_checker: OnceLock<Arc<dyn super::version_check::VersionChecker>>,
     /// What the last Check version requests found, newest first.
@@ -428,6 +431,7 @@ impl LibraryActionExecutor {
             reconciled: AtomicBool::new(false),
             busy: Mutex::new(HashSet::new()),
             fixer: OnceLock::new(),
+            kept: OnceLock::new(),
             version_checker: OnceLock::new(),
             version_checks: Mutex::new(std::collections::VecDeque::new()),
             seams: Mutex::new(ExecutorSeams::default()),
@@ -446,6 +450,11 @@ impl LibraryActionExecutor {
     /// Hands every Fix duplicates request to Library health's duplicate fix.
     pub fn use_duplicate_fixer(&self, fixer: Arc<dyn DuplicateFixer>) {
         let _ = self.fixer.set(fixer);
+    }
+
+    /// Judges every Better quality of a file a heart kept by that heart's own gate. Once only.
+    pub fn use_kept_rechecks(&self, kept: Arc<KeptRechecks>) {
+        let _ = self.kept.set(kept);
     }
 
     /// Hands every Check version request to the library's version check.
@@ -1188,6 +1197,32 @@ impl LibraryActionExecutor {
             self.journal.set_denied_source(key, denied);
         }
 
+        // A file a heart kept (as heard, or anyway) is replaced only by a copy proven against it:
+        // its own gate, from what it remembers of that heart, is the one every candidate meets.
+        let kept = match (request.action, self.kept.get()) {
+            (LibraryAction::BetterQuality, Some(kept)) => {
+                kept.gate_for(&original.absolute_path, &request.username).await
+            }
+            _ => KeptFor::NotKept,
+        };
+        let kept_gate = match kept {
+            KeptFor::NotKept => None,
+            KeptFor::Gate(gate) => Some(*gate),
+            KeptFor::Nothing(why) => {
+                info!(
+                    "Library action {}: nothing is tried for the kept {}: {why}",
+                    action_name(request.action),
+                    original.absolute_path
+                );
+                return Replaced {
+                    outcome: LibraryActionOutcome::said(LibraryActionState::Skipped, why),
+                    quarantine_path: None,
+                    new_path: None,
+                    arrived: None,
+                };
+            }
+        };
+
         // Read while the original is in place: Navidrome built this song's ids from these tags.
         let identity = KeptIdentityTags::read(
             Path::new(&original.absolute_path),
@@ -1205,6 +1240,7 @@ impl LibraryActionExecutor {
             started_last_write: last_write_ticks(&original.absolute_path),
             quarantine_path: Mutex::new(None),
             any_quality: request.anyway.is_some(),
+            forgotten: Mutex::new(Vec::new()),
         });
         // What each source tried before the last one said, for the words when all of them miss.
         let mut misses: Vec<String> = Vec::new();
@@ -1274,10 +1310,12 @@ impl LibraryActionExecutor {
             // `download_song_internal` hands back a file it has a mapping for instead of
             // fetching. The handoff skips that, so only a download without one needs this.
             if handoff.is_none() {
-                self.library
+                let forgotten = self
+                    .library
                     .forget_mapping(&original.absolute_path)
                     .await
                     .map_err(Arc::new)?;
+                admission.forgotten.lock().extend(forgotten);
             }
 
             // In order, and on to the next when one finds nothing or its copy fails the checks:
@@ -1300,10 +1338,14 @@ impl LibraryActionExecutor {
                     )));
                 };
                 // A replacement is work nobody waits on: its file's check takes the bulk turn, and
-                // waits for it in the one hold path rather than keeping the download worker.
+                // waits for it in the one hold path rather than keeping the download worker. A file
+                // a heart kept is replaced only by a copy that heart's own gate passes.
                 let completion = self.acquisitions.enqueue_holding(
-                    Some(octo_core::fingerprint::heart_gate::AcquisitionOrigin::Replacement),
-                    Vec::new(),
+                    Some(match &kept_gate {
+                        Some(_) => octo_core::fingerprint::heart_gate::AcquisitionOrigin::Heart,
+                        None => octo_core::fingerprint::heart_gate::AcquisitionOrigin::Replacement,
+                    }),
+                    kept_gate.iter().cloned().collect(),
                     std::mem::take(&mut waiting),
                     &crate::services::common::AcquisitionTarget::Shared,
                     false,
@@ -1899,6 +1941,9 @@ struct Admission {
     quarantine_path: Mutex<Option<String>>,
     /// The person said to take the replacement whatever its quality.
     any_quality: bool,
+    /// The outside songs the original was mapped as, forgotten before a download that could not
+    /// carry its identity: saved with the original once it is in the trash.
+    forgotten: Mutex<Vec<LocalSongMapping>>,
 }
 
 impl Admission {
@@ -1971,10 +2016,18 @@ impl Admission {
         executor.journal.flush();
         // Only now that the original is out: a refused replacement leaves it with its
         // mapping, and so with the record of who sent it.
-        executor
-            .library
-            .forget_mapping(&self.original.absolute_path)
-            .await?;
+        let mut forgotten = std::mem::take(&mut *self.forgotten.lock());
+        forgotten.extend(
+            executor
+                .library
+                .forget_mapping(&self.original.absolute_path)
+                .await?,
+        );
+        // Saved with the original, so Put back gives it its outside songs again, a kept-as-heard
+        // file's heart with them.
+        if let Some(trashed) = moved.quarantine_path.as_deref() {
+            executor.quarantine.record_mappings(trashed, &forgotten);
+        }
         Ok(None)
     }
 

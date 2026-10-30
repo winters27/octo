@@ -28,9 +28,18 @@ use super::{
 use crate::services::common::acquisition_tracker::{acquisition_event_kinds, acquisition_kinds};
 use crate::services::common::download_picks::{DownloadPicks, PickedCopy};
 use crate::services::common::{AcquisitionTracker, DownloadConcurrency};
+use crate::services::fingerprint::AcoustIdClient;
+use crate::services::fingerprint::acoust_id_rate_limiter::LookupClass;
 use crate::services::framework::DotnetDictionary;
-use crate::services::soulseek::{ISoulseekLink, SoulseekMetadataService};
+use crate::services::library::navidrome_song_path_resolver::get_full_path;
+use crate::services::local::{ILocalLibraryService, KeptHeart, LocalSongMapping};
+use crate::services::soulseek::{ExternalIdRegistry, ISoulseekLink, SoulseekMetadataService};
 use crate::services::state_file;
+use octo_core::fingerprint::acoust_id_client::AcoustIdOutcome;
+use octo_core::fingerprint::heart_gate::{
+    AcquisitionOrigin, HeardAnswerReading, HeardReading, HeardRecord, HeardRecording, HeardSource, HeartGate,
+    became, read_heard_answer,
+};
 
 /// The words a job's state goes by on the wire. A contract with the Octo apps.
 pub struct UpgradeStates;
@@ -1046,6 +1055,252 @@ fn extension(path: &str) -> String {
     }
 }
 
+/// What reading a kept file's AcoustID answer again came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reread {
+    /// AcoustID did not answer: nothing changes until the next event.
+    Busy,
+    /// R stays as the heart had it: a copy is accepted by its own clear reading against R, or as
+    /// the very master the kept file is.
+    Stays { tag: Option<String> },
+    /// What played was this recording: R becomes it.
+    Became { r: HeardRecording, tag: Option<String> },
+    /// Nothing proves which recording the kept file is: only the very master it is can replace it.
+    OnlyHeardOrMaster,
+    /// The kept file is another song than the one hearted: nothing is tried for it.
+    AnotherSong,
+    /// Nothing to read it by: no print was kept with it, or AcoustID is off.
+    Unread,
+}
+
+impl Reread {
+    /// Whether a search for a better copy can succeed against this: only when a copy can be
+    /// accepted by more than the kept file's own master, which the heart's chain already looked
+    /// for when it kept it.
+    pub fn can_succeed(&self) -> bool {
+        matches!(self, Reread::Stays { .. } | Reread::Became { .. })
+    }
+}
+
+/// Starts the search for a better copy of one kept file.
+pub type KeptUpgrade = Arc<dyn Fn(LocalSongMapping) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// Files kept as heard, checked again on the events tied to work: a play or a heart of the song,
+/// a heart AcoustID's clear reading accepts (then the one kept file checked longest ago), and the
+/// person's own Retry. Each check sends one lookup of the print kept with the file (no `fpcalc`),
+/// reads it as what was heard is read, and only when a better copy could then be proven starts
+/// the search for one, whatever the weekly upgrade's settings and however recently it last tried.
+/// A check that finds nothing new fetches nothing.
+pub struct KeptRechecks {
+    library: Arc<dyn ILocalLibraryService>,
+    acoust_id: Arc<AcoustIdClient>,
+    settings: Arc<SettingsStore>,
+    registry: Arc<ExternalIdRegistry>,
+    upgrade: std::sync::OnceLock<KeptUpgrade>,
+    /// When each kept file was last checked, by its mapping's key, in the order of checks.
+    checked: Mutex<std::collections::HashMap<String, u64>>,
+    turn: std::sync::atomic::AtomicU64,
+    /// What the last check of each kept file read, taken by the search it started, so the
+    /// search sends no second lookup.
+    read: Mutex<std::collections::HashMap<String, Reread>>,
+}
+
+impl KeptRechecks {
+    pub fn new(
+        library: Arc<dyn ILocalLibraryService>,
+        acoust_id: Arc<AcoustIdClient>,
+        settings: Arc<SettingsStore>,
+        registry: Arc<ExternalIdRegistry>,
+    ) -> Self {
+        KeptRechecks {
+            library,
+            acoust_id,
+            settings,
+            registry,
+            upgrade: std::sync::OnceLock::new(),
+            checked: Mutex::new(std::collections::HashMap::new()),
+            turn: std::sync::atomic::AtomicU64::new(0),
+            read: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// How a search for a better copy is started. Once only.
+    pub fn use_upgrade(&self, upgrade: KeptUpgrade) {
+        let _ = self.upgrade.set(upgrade);
+    }
+
+    /// The kept files of one outside song.
+    async fn kept_of(&self, provider: &str, external_id: &str) -> Vec<LocalSongMapping> {
+        self.library
+            .get_mappings()
+            .await
+            .into_iter()
+            .filter(|mapping| {
+                mapping.external_provider == provider
+                    && mapping.external_id == external_id
+                    && mapping.heart.as_ref().is_some_and(|heart| heart.as_heard)
+                    && Path::new(&mapping.local_path).is_file()
+            })
+            .collect()
+    }
+
+    /// A play or a heart of the song: each of its kept files is checked again, once.
+    pub async fn song_event(&self, provider: &str, external_id: &str) {
+        for mapping in self.kept_of(provider, external_id).await {
+            self.recheck(mapping).await;
+        }
+    }
+
+    /// A heart AcoustID's clear reading accepted: the one kept file checked longest ago (never
+    /// before counts as longest) is checked next, so checks follow real proofs and never loop on
+    /// their own answers.
+    pub async fn after_a_proof(&self) {
+        let mut kept: Vec<LocalSongMapping> = self
+            .library
+            .get_mappings()
+            .await
+            .into_iter()
+            .filter(|mapping| {
+                mapping.heart.as_ref().is_some_and(|heart| heart.as_heard)
+                    && Path::new(&mapping.local_path).is_file()
+            })
+            .collect();
+        let checked = self.checked.lock().clone();
+        kept.sort_by_key(|mapping| {
+            (
+                checked.get(&mapping.key()).copied().unwrap_or(0),
+                mapping.downloaded_at,
+            )
+        });
+        if let Some(oldest) = kept.into_iter().next() {
+            self.recheck(oldest).await;
+        }
+    }
+
+    /// Checks one kept file again: one lookup, read as what was heard is read, and the search for
+    /// a better copy only when one could then be proven.
+    pub async fn recheck(&self, mapping: LocalSongMapping) -> Reread {
+        let Some(heart) = mapping.heart.clone() else {
+            return Reread::Unread;
+        };
+        let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.checked.lock().insert(mapping.key(), turn);
+        let read = self.reread(&heart).await;
+        info!("Checked the kept-as-heard {} again: {read:?}", mapping.local_path);
+        if read.can_succeed()
+            && let Some(upgrade) = self.upgrade.get().cloned()
+        {
+            self.read.lock().insert(mapping.key(), read.clone());
+            upgrade(mapping).await;
+        }
+        read
+    }
+
+    /// The kept file's AcoustID answer read again, from the print kept with it, as the heart's
+    /// gate reads what was heard against R.
+    pub async fn reread(&self, heart: &KeptHeart) -> Reread {
+        let (Some(print), Some(seconds)) = (heart.print.as_deref(), heart.seconds) else {
+            return Reread::Unread;
+        };
+        let r = heart.recording.clone().unwrap_or_default();
+        let min = self.settings.current().soulseek.effective_min_score_fraction();
+        let outcome = self
+            .acoust_id
+            .lookup_answer(LookupClass::Bulk, print, seconds)
+            .await;
+        match read_heard_answer(&outcome, &r, min) {
+            HeardAnswerReading::Busy => Reread::Busy,
+            HeardAnswerReading::NeedsClip => Reread::Unread,
+            HeardAnswerReading::AnotherSong => Reread::AnotherSong,
+            HeardAnswerReading::RStays { tag } => Reread::Stays { tag },
+            HeardAnswerReading::Becomes(dominant) => match &outcome {
+                AcoustIdOutcome::Answered(answer) => {
+                    let (r, tag) = became(answer, &dominant, &[], &r, min);
+                    Reread::Became { r, tag }
+                }
+                _ => Reread::OnlyHeardOrMaster,
+            },
+            HeardAnswerReading::OnlyHeardOrMaster => Reread::OnlyHeardOrMaster,
+        }
+    }
+
+    /// The gate a replacement of a kept file is judged by, so nothing short of a proof replaces
+    /// it: A1 against R as it now reads, or A2 against the kept file, which is the heard audio,
+    /// with proof 2 against it too. For a file kept anyway (not heard), the heard audio is the
+    /// hearting person's latest play of the song, and with none only A1 accepts.
+    pub async fn gate_for(&self, original_path: &str, requester: &str) -> KeptFor {
+        let wanted = get_full_path(original_path);
+        let Some(mapping) = self.library.get_mappings().await.into_iter().find(|mapping| {
+            (mapping.heart.is_some() || mapping.kept_unproven())
+                && dotnet::eq_ignore_case(&get_full_path(&mapping.local_path), &wanted)
+        }) else {
+            return KeptFor::NotKept;
+        };
+        let heart = mapping.heart.clone().unwrap_or_default();
+        let user = heart
+            .users
+            .first()
+            .cloned()
+            .unwrap_or_else(|| requester.to_string());
+        let mut gate = HeartGate {
+            user: user.clone(),
+            origin: AcquisitionOrigin::Heart,
+            r: heart.recording.clone(),
+            heard: None,
+            heard_seconds: heart.seconds,
+            reading: HeardReading::RStays { tag: None },
+            stand_in: None,
+        };
+        if heart.as_heard {
+            let known = self.read.lock().remove(&mapping.key());
+            let read = match known {
+                Some(read) => read,
+                None => self.reread(&heart).await,
+            };
+            gate.reading = match read {
+                Reread::Stays { tag } => HeardReading::RStays { tag },
+                Reread::Became { r, tag } => {
+                    gate.r = Some(r);
+                    HeardReading::RBecame { tag }
+                }
+                Reread::OnlyHeardOrMaster | Reread::Unread => HeardReading::OnlyHeardOrMaster,
+                Reread::AnotherSong => return KeptFor::Nothing(KEPT_IS_ANOTHER_SONG),
+                Reread::Busy => return KeptFor::Nothing(KEPT_BUSY),
+            };
+            gate.heard = Some(HeardRecord {
+                heard_at: mapping.downloaded_at,
+                source: HeardSource::Library {
+                    path: mapping.local_path.clone(),
+                },
+                sample_id: heart.heard.as_ref().and_then(|heard| heard.sample_id.clone()),
+            });
+        } else {
+            gate.heard = self.registry.heard_by(&mapping.external_id, &user);
+        }
+        KeptFor::Gate(Box::new(gate))
+    }
+}
+
+/// Why nothing is tried for a kept file whose AcoustID answer now names another song.
+pub const KEPT_IS_ANOTHER_SONG: &str = "AcoustID says the copy you kept is another song; nothing replaces it";
+/// Why nothing is tried for a kept file while AcoustID does not answer.
+pub const KEPT_BUSY: &str = "AcoustID is busy, try again";
+
+/// What a replacement of a library file is judged by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeptFor {
+    /// Nobody's heart kept the file: the replacement keeps its own checks.
+    NotKept,
+    /// A heart kept the file: only a copy this gate passes replaces it.
+    Gate(Box<HeartGate>),
+    /// A heart kept the file and nothing can be proven against it now, with why.
+    Nothing(&'static str),
+}
+
 #[cfg(test)]
 #[path = "upgrade_queue_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "kept_rechecks_tests.rs"]
+mod kept_tests;

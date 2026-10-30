@@ -7,7 +7,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::common::dotnet::eq_ignore_case;
-use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeardRecord, HeartGate, WaitingFor};
+use octo_core::fingerprint::heart_gate::{
+    AcquisitionOrigin, HeardReading, HeardRecord, HeartGate, WaitingFor,
+};
 use octo_core::settings::{DownloadSource, HeartDownloadSource, SettingsStore};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +24,7 @@ use super::{
 };
 use crate::services::family::{FamilyPool, LibraryScope, LibraryWriteGate, WriteDecision};
 use crate::services::fingerprint::MusicBrainzClient;
+use crate::services::fingerprint::download_verification_service::{ANOTHER_SONG_PLAYED, NEVER_PLAYED};
 use crate::services::i_download_service::IDownloadService;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::imports::trickle_worker::{TrickleCheckLater, WAITING_FOR_ANSWER};
@@ -69,6 +72,13 @@ pub trait HeartGates: Send + Sync {
     fn open_rounds(&self, _acquisition_key: &str, _gates: &[HeartGate]) -> Box<dyn Send> {
         Box::new(())
     }
+
+    /// Whether `gate` proves the person's library copy at `path` is the version they heard: its
+    /// own clear reading against R, or the very master that played. Without a way to judge it,
+    /// an owned copy never counts.
+    async fn owned_passes(&self, _path: &str, _gate: &HeartGate) -> bool {
+        false
+    }
 }
 
 /// The coordinator's optional collaborators, each `None` by default.
@@ -97,6 +107,9 @@ pub struct HeartCoordinatorExtras {
     pub heard: Option<Arc<HeardSamples>>,
     /// Whether AcoustID is on. Without it, it counts as on.
     pub acoust_id_on: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    /// Files kept as heard, checked again when their song is hearted and after each heart a gate
+    /// proves. Without it nothing is checked again.
+    pub kept: Option<Arc<crate::services::library::upgrade_queue::KeptRechecks>>,
 }
 
 /// How one song's heart chain ended.
@@ -131,6 +144,51 @@ fn files_hold(origin: AcquisitionOrigin, waiting_for: WaitingFor) -> bool {
 /// What a chain notes in `filed` for a holder whose gate did not pass the file that landed: they
 /// stay where they were.
 const STAYS: &str = "";
+
+/// The downloads line of a heart that kept the heard audio, while a source can look for better.
+pub const KEPT_AS_HEARD: &str =
+    "Kept the version you heard. Octo keeps looking for a better copy it can prove";
+/// The downloads line of a heart that kept the heard audio when none of its sources can search.
+pub const KEPT_NO_SOURCE: &str =
+    "Kept the version you heard. Add Soulseek or Mornye in your sources so Octo can look for a better copy";
+/// The downloads line of a heart that kept the heard audio after a copy AcoustID could not tell
+/// apart from another version.
+pub const KEPT_UNDECIDED: &str =
+    "Kept the version you heard: Octo could not prove which version this copy is";
+/// The downloads line of a heart whose heard audio is gone with nothing proven.
+pub const HEARD_GONE: &str = "Octo could not find a copy it can prove is the version you heard";
+/// The downloads line of a heart over a library copy nothing proves, the heard audio kept beside it.
+pub const KEPT_BESIDE_OWNED: &str = "You already had a copy; Octo kept the version you heard beside it";
+/// The downloads line of a play over a library copy: nothing is downloaded.
+pub const PLAY_OVER_OWNED: &str =
+    "You already have this song; Octo could not check it is the version you heard";
+
+/// How a heart's chain ended when no source brought a file its gates passed.
+struct ChainEnd<'a> {
+    holders: &'a [Holder],
+    gates: &'a [HeartGate],
+    /// A file a gate could not tell apart from another version was passed over.
+    undecided: bool,
+    /// The library already had a copy nothing proved is the version heard.
+    beside_owned: bool,
+    /// The sources the chain ran.
+    steps: &'a [HeartDownloadSource],
+    /// The last source's reason.
+    reason: String,
+}
+
+/// The gates that keep the heard audio itself: each judges only the very audio its person heard,
+/// by its identity, so nothing but that copy can pass, and no other video is tried for it.
+fn keep_gates(gates: &[HeartGate]) -> Vec<HeartGate> {
+    gates
+        .iter()
+        .filter(|gate| gate.heard.is_some())
+        .map(|gate| HeartGate {
+            reading: HeardReading::OnlyHeardOrMaster,
+            ..gate.clone()
+        })
+        .collect()
+}
 
 /// The line a held row shows when its hold kept none of its own.
 pub(crate) fn waiting_line(waiting_for: WaitingFor) -> &'static str {
@@ -426,16 +484,41 @@ impl HeartAcquisitionCoordinator {
         let (provider, external_id, requested_by) = owned3(provider, external_id, requested_by);
         let (client_id, owner) = (client_id.map(str::to_string), owner.map(str::to_string));
         tokio::spawn(async move {
-            let Some(gates) = coordinator
-                .play_gates(&provider, &external_id, requested_by.as_deref(), heard)
+            // A play never downloads over a copy already in the library: its row says so.
+            if coordinator
+                .play_over_owned(
+                    &provider,
+                    &external_id,
+                    client_id.as_deref(),
+                    owner.as_deref(),
+                    &target,
+                )
                 .await
-            else {
-                // A play never holds: what its gate would wait for, it does without.
-                info!(
-                    "The gate of the play of {provider}:{external_id} would wait; the play fetches nothing"
-                );
+            {
                 coordinator.lidarr_plays.lock().remove(&lidarr_key);
                 return;
+            }
+            let gates = match coordinator
+                .play_gates(&provider, &external_id, requested_by.as_deref(), heard)
+                .await
+            {
+                Ok(gates) => gates,
+                Err(held) => {
+                    let (gate, waiting) = *held;
+                    // A play never holds: what its gate would wait for, it does without.
+                    info!(
+                        "The gate of the play of {provider}:{external_id} would wait; the play fetches nothing"
+                    );
+                    coordinator.lidarr_plays.lock().remove(&lidarr_key);
+                    // With DownloadOnPlay, a play whose heard lookup AcoustID could not answer
+                    // keeps what it played, and nothing else.
+                    if source.is_some() && waiting == WaitingFor::AcoustId {
+                        coordinator
+                            .keep_play_heard(&provider, &external_id, requested_by.as_deref(), &target, gate)
+                            .await;
+                    }
+                    return;
+                }
             };
             if lidarr {
                 // Never behind a Soulseek outage's wait.
@@ -484,17 +567,17 @@ impl HeartAcquisitionCoordinator {
     }
 
     /// A play's gate, built from what this play itself played (never another play's), when
-    /// gates are built at all. None when the gate would hold: a play never holds, so it fetches
-    /// nothing then.
+    /// gates are built at all. Err when the gate would hold, with that gate and what it would
+    /// wait for: a play never holds, so it fetches nothing then.
     async fn play_gates(
         &self,
         provider: &str,
         external_id: &str,
         requested_by: Option<&str>,
         heard: Option<HeardRecord>,
-    ) -> Option<Vec<HeartGate>> {
+    ) -> Result<Vec<HeartGate>, Box<(HeartGate, WaitingFor)>> {
         let Some(builder) = self.extras.gates.clone() else {
-            return Some(Vec::new());
+            return Ok(Vec::new());
         };
         let holder = Holder {
             user: requested_by.map(str::trim).unwrap_or_default().to_string(),
@@ -505,8 +588,82 @@ impl HeartAcquisitionCoordinator {
             .build(provider, external_id, &holder, AcquisitionOrigin::Play)
             .await
         {
-            GateStart::Ready(gate) => Some(vec![gate]),
-            GateStart::Hold { .. } => None,
+            GateStart::Ready(gate) => Ok(vec![gate]),
+            GateStart::Hold {
+                gate, waiting_for, ..
+            } => Err(Box::new((gate, waiting_for))),
+        }
+    }
+
+    /// Whether the library already has a copy of the played song (in the scope of whose library
+    /// the play is for): then the play downloads nothing, and its row closes on that copy with the
+    /// line that says nothing checked it is the version heard.
+    async fn play_over_owned(
+        &self,
+        provider: &str,
+        external_id: &str,
+        client_id: Option<&str>,
+        owner: Option<&str>,
+        target: &AcquisitionTarget,
+    ) -> bool {
+        let scope = match target {
+            AcquisitionTarget::Shared => LibraryScope::Shared,
+            AcquisitionTarget::Member(user) => LibraryScope::Viewer(user.clone()),
+        };
+        let Some((song, copy)) = self.owned_copy(provider, external_id, &scope).await else {
+            return false;
+        };
+        info!(
+            "The play of {provider}:{external_id} downloads nothing: the library has {}",
+            copy.absolute_path
+        );
+        if let Some(tracker) = self.tracker() {
+            tracker.begin(
+                provider,
+                external_id,
+                client_id,
+                owner,
+                Some(&song.artist),
+                Some(&song.title),
+                Some(&song.album),
+            );
+            tracker.done_line(provider, external_id, PLAY_OVER_OWNED);
+        }
+        self.settle(provider, external_id, &copy);
+        true
+    }
+
+    /// A DownloadOnPlay play nothing could prove keeps the very audio it played, kept as heard,
+    /// when it heard a video that may be the song: never a stream that stood in with another song,
+    /// and never anything else fetched for it.
+    async fn keep_play_heard(
+        &self,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        target: &AcquisitionTarget,
+        gate: HeartGate,
+    ) {
+        let heard_video = gate
+            .heard
+            .as_ref()
+            .is_some_and(|heard| heard.source.video_id().is_some());
+        if !heard_video || matches!(gate.reading, HeardReading::NotHeard | HeardReading::AnotherSong) {
+            return;
+        }
+        match self
+            .keep_heard(
+                provider,
+                external_id,
+                requested_by,
+                AcquisitionOrigin::Play,
+                target,
+                &[gate],
+            )
+            .await
+        {
+            Ok((path, _)) => info!("The play of {provider}:{external_id} kept what it played: {path}"),
+            Err(e) => debug!("The play of {provider}:{external_id} could not keep what it played: {e}"),
         }
     }
 
@@ -553,6 +710,7 @@ impl HeartAcquisitionCoordinator {
                 );
             }
         };
+        let own_gates = gates.clone();
         let Some(request) = self.direct_queue.try_enqueue_play_for(
             target,
             provider,
@@ -565,12 +723,26 @@ impl HeartAcquisitionCoordinator {
             return;
         };
         let tracker = self.tracker().cloned();
+        let coordinator = self.me.clone();
         let (provider, external_id) = (provider.to_string(), external_id.to_string());
+        let (requested_by, target) = (requested_by.map(str::to_string), target.clone());
         tokio::spawn(async move {
             let Err(reason) = request.completion.wait().await else {
                 return;
             };
             debug!("Play download failed for {provider}:{external_id}: {reason}");
+            // Nothing its gate could pass: the play keeps what it played instead.
+            let mine = |gate: &&HeartGate| {
+                !request.completion.ledger().accepted(&gate.user)
+                    && reason.downcast_ref::<AcquisitionHeld>().is_none()
+            };
+            if let (Some(coordinator), Some(gate)) =
+                (coordinator.upgrade(), own_gates.iter().find(mine).cloned())
+            {
+                coordinator
+                    .keep_play_heard(&provider, &external_id, requested_by.as_deref(), &target, gate)
+                    .await;
+            }
             // A heart that joined owns the row, and may still be trying its next source.
             if !request.is_star
                 && !request.heart_joined()
@@ -1312,22 +1484,39 @@ impl HeartAcquisitionCoordinator {
         target: &AcquisitionTarget,
         origin: AcquisitionOrigin,
     ) -> anyhow::Result<TrackOutcome> {
+        // A heart of a song is one of the events its kept-as-heard files are checked again on.
+        if matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart)
+            && let Some(kept) = self.extras.kept.clone()
+        {
+            let (provider, external_id) = (provider.to_string(), external_id.to_string());
+            tokio::spawn(async move { kept.song_event(&provider, &external_id).await });
+        }
         if let Some(waiting) = self.join_hold(provider, external_id, requested_by, origin) {
             return Ok(TrackOutcome::Held(waiting));
         }
         let holders = vec![self.holder_for(external_id, requested_by)];
-        self.track_chain(
-            provider,
-            external_id,
-            requested_by,
-            held_since_utc,
-            target,
-            origin,
-            holders,
-            Vec::new(),
-            &mut Vec::new(),
-        )
-        .await
+        let outcome = self
+            .track_chain(
+                provider,
+                external_id,
+                requested_by,
+                held_since_utc,
+                target,
+                origin,
+                holders,
+                Vec::new(),
+                &mut Vec::new(),
+            )
+            .await;
+        // A heart a gate proved: the kept file checked longest ago is checked again next.
+        if matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart)
+            && matches!(outcome, Ok(TrackOutcome::Landed(_)))
+            && self.extras.gates.is_some()
+            && let Some(kept) = self.extras.kept.clone()
+        {
+            tokio::spawn(async move { kept.after_a_proof().await });
+        }
+        outcome
     }
 
     /// One person's place in a heart's gate: who they are and what they heard of the song.
@@ -1661,9 +1850,14 @@ impl HeartAcquisitionCoordinator {
             AcquisitionTarget::Shared => LibraryScope::Shared,
             AcquisitionTarget::Member(user) => LibraryScope::Viewer(user.clone()),
         };
-        if self
-            .already_yours(provider, external_id, requested_by, &scope)
-            .await
+        // A heart's owned copy counts only when its own gate proves it is the version heard, so
+        // its gate is built first; every other acquisition counts it as before.
+        let judged = self.extras.gates.is_some()
+            && matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart);
+        if !judged
+            && self
+                .already_yours(provider, external_id, requested_by, &scope)
+                .await
         {
             return Ok(TrackOutcome::AlreadyThere);
         }
@@ -1674,6 +1868,29 @@ impl HeartAcquisitionCoordinator {
             Ok(gates) => gates,
             Err(waiting) => return Ok(TrackOutcome::Held(waiting)),
         };
+        let mut beside_owned = false;
+        if judged && let Some((song, copy)) = self.owned_copy(provider, external_id, &scope).await {
+            let mut proven = false;
+            if let Some(builder) = &self.extras.gates {
+                for gate in &gates {
+                    if builder.owned_passes(&copy.absolute_path, gate).await {
+                        proven = true;
+                        break;
+                    }
+                }
+            }
+            if proven {
+                self.keep_owned(provider, external_id, requested_by, &song, &copy);
+                return Ok(TrackOutcome::AlreadyThere);
+            }
+            // Nobody can prove the owned copy is the version heard: it is left as it is, never
+            // counted as the heart's, and the chain runs.
+            info!(
+                "{provider}:{external_id} has a copy in the library ({}) nothing proves is the version heard; it is left alone",
+                copy.absolute_path
+            );
+            beside_owned = true;
+        }
         // Holders whose gate holds are filed already; the chain runs for the others.
         let holders: Vec<Holder> = if gates.is_empty() {
             holders
@@ -1762,6 +1979,8 @@ impl HeartAcquisitionCoordinator {
             .into_iter()
             .filter(|step| *target == AcquisitionTarget::Shared || *step != HeartDownloadSource::Lidarr)
             .collect();
+        // A file one of these gates could not tell apart from another version was passed over.
+        let mut undecided = false;
         for (index, &step) in steps.iter().enumerate() {
             let is_last = index == steps.len() - 1;
             // One entry for the whole chain. The first direct source is still waiting for the
@@ -1802,6 +2021,9 @@ impl HeartAcquisitionCoordinator {
             // partway through it. Every other source, and Soulseek once the wait is over, goes on
             // exactly as before.
             let wait_until = self.soulseek_deadline(&steps, index, held_since_utc);
+            // A file another acquisition landed, which joined this one, that none of these
+            // holders' own gates passed: the step runs once more as their own.
+            let mut ran_as_joiner = false;
             let failure = loop {
                 self.hold_for_soulseek(
                     HeldKind::Track,
@@ -1833,7 +2055,8 @@ impl HeartAcquisitionCoordinator {
                 );
                 match completion.wait().await {
                     Ok(path) => {
-                        return Ok(self.landed_for(
+                        let noted = filed.len();
+                        match self.landed_for(
                             provider,
                             external_id,
                             requested_by,
@@ -1842,9 +2065,28 @@ impl HeartAcquisitionCoordinator {
                             completion.ledger(),
                             path,
                             filed,
-                        ));
+                        ) {
+                            // Nobody here has it: their own gates go on down their own chain.
+                            TrackOutcome::Failed(why) => {
+                                filed.truncate(noted);
+                                if !ran_as_joiner {
+                                    ran_as_joiner = true;
+                                    info!(
+                                        "{provider}:{external_id} landed for someone else; its own heart goes on with {}",
+                                        source_name(step)
+                                    );
+                                    continue;
+                                }
+                                break Arc::new(anyhow::anyhow!(why));
+                            }
+                            outcome => return Ok(outcome),
+                        }
                     }
                     Err(failure) => {
+                        undecided |= holders.iter().any(|holder| {
+                            completion.ledger().outcome_for(&holder.user, origin)
+                                == Some(super::GateOutcome::Undecided)
+                        });
                         // Held in the one hold path: the chain stops here and the hold resumes it.
                         if let Some(held) = failure.downcast_ref::<AcquisitionHeld>() {
                             return Ok(self.hold_downloaded(
@@ -1874,20 +2116,197 @@ impl HeartAcquisitionCoordinator {
                 source_enum_name(step)
             );
             if is_last {
-                if let Some(tracker) = self.tracker() {
-                    tracker.fail(provider, external_id, Some(&failure.to_string()));
-                }
-                return Ok(TrackOutcome::Failed(failure.to_string()));
+                let ended = ChainEnd {
+                    holders: &holders,
+                    gates: &gates,
+                    undecided,
+                    beside_owned,
+                    steps: &steps,
+                    reason: failure.to_string(),
+                };
+                return Ok(self
+                    .nothing_proven(provider, external_id, requested_by, origin, target, ended, filed)
+                    .await);
             }
             // The next enabled source owns the fallback.
         }
         // Only reached when the last source was Lidarr and it said no. It records its own
         // reason first; this is the fallback when it could not.
         const NO_SOURCE: &str = "No download source could get this song.";
-        if let Some(tracker) = self.tracker() {
-            tracker.fail(provider, external_id, Some(NO_SOURCE));
+        let ended = ChainEnd {
+            holders: &holders,
+            gates: &gates,
+            undecided,
+            beside_owned,
+            steps: &steps,
+            reason: NO_SOURCE.to_string(),
+        };
+        Ok(self
+            .nothing_proven(provider, external_id, requested_by, origin, target, ended, filed)
+            .await)
+    }
+
+    /// Every source of a heart's chain ran and none brought a file its gates passed. A heart that
+    /// was never played holds until a play records what the person hears, and so does one whose
+    /// stream stood in with another song. One that heard the song keeps the heard audio itself:
+    /// the whole copy of the very stream that played, kept as heard, with the line that says so
+    /// and on the path that keeps looking for a copy it can prove. Only when even the heard audio
+    /// cannot be had does it end, with the plain line. Every other origin fails as before.
+    #[allow(clippy::too_many_arguments)] // the song, who asked, why and how the chain ended
+    async fn nothing_proven(
+        &self,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        origin: AcquisitionOrigin,
+        target: &AcquisitionTarget,
+        ended: ChainEnd<'_>,
+        filed: &mut Vec<(String, String)>,
+    ) -> TrackOutcome {
+        let fail = |line: &str| {
+            if let Some(tracker) = self.tracker() {
+                tracker.fail(provider, external_id, Some(line));
+            }
+            TrackOutcome::Failed(line.to_string())
+        };
+        let hearts = matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart);
+        if !hearts || ended.gates.is_empty() {
+            return fail(&ended.reason);
         }
-        Ok(TrackOutcome::Failed(NO_SOURCE.to_string()))
+        let holder_of = |gate: &HeartGate| {
+            ended
+                .holders
+                .iter()
+                .find(|holder| eq_ignore_case(holder.user.trim(), gate.user.trim()))
+                .cloned()
+                .unwrap_or_else(|| Holder {
+                    user: gate.user.clone(),
+                    heard: gate.heard.clone(),
+                    ..Default::default()
+                })
+        };
+        let mut held = None;
+        let mut keeping: Vec<HeartGate> = Vec::new();
+        for gate in ended.gates {
+            let line = match gate.reading {
+                HeardReading::NotHeard => NEVER_PLAYED,
+                HeardReading::AnotherSong => ANOTHER_SONG_PLAYED,
+                _ => {
+                    if gate.heard.is_some() {
+                        keeping.push(gate.clone());
+                    }
+                    continue;
+                }
+            };
+            held.get_or_insert(WaitingFor::NotYetProven);
+            self.file_hold(
+                provider,
+                external_id,
+                requested_by,
+                origin,
+                WaitingFor::NotYetProven,
+                vec![holder_of(gate)],
+                line,
+                Vec::new(),
+                None,
+                filed,
+            );
+        }
+        if !keeping.is_empty() {
+            let line = if ended.beside_owned {
+                KEPT_BESIDE_OWNED
+            } else if ended.undecided {
+                KEPT_UNDECIDED
+            } else if ended
+                .steps
+                .iter()
+                .any(|step| matches!(step, HeartDownloadSource::Soulseek | HeartDownloadSource::Lidarr))
+            {
+                KEPT_AS_HEARD
+            } else {
+                KEPT_NO_SOURCE
+            };
+            if let Some(tracker) = self.tracker() {
+                tracker.done_line(provider, external_id, line);
+            }
+            info!("Nothing proven for {provider}:{external_id}; keeping the version that was heard");
+            let keepers: Vec<Holder> = keeping.iter().map(holder_of).collect();
+            match self
+                .keep_heard(provider, external_id, requested_by, origin, target, &keeping)
+                .await
+            {
+                Ok((path, ledger)) => {
+                    match self.landed_for(
+                        provider,
+                        external_id,
+                        requested_by,
+                        origin,
+                        &keepers,
+                        &ledger,
+                        path,
+                        filed,
+                    ) {
+                        TrackOutcome::Landed(path) => return TrackOutcome::KeptAsHeard(path),
+                        TrackOutcome::Held(waiting) => {
+                            held.get_or_insert(waiting);
+                        }
+                        _ => {}
+                    }
+                }
+                Err(failure) => {
+                    if let Some(waits) = failure.downcast_ref::<AcquisitionHeld>() {
+                        return self.hold_downloaded(
+                            provider,
+                            external_id,
+                            requested_by,
+                            origin,
+                            &keepers,
+                            waits,
+                            filed,
+                        );
+                    }
+                    info!("The heard audio of {provider}:{external_id} cannot be had: {failure}");
+                }
+            }
+        }
+        match held {
+            Some(waiting) => TrackOutcome::Held(waiting),
+            None if keeping.is_empty() => fail(&ended.reason),
+            None => fail(HEARD_GONE),
+        }
+    }
+
+    /// Keeps the very audio these gates' people heard, by its identity: the whole copy of the heard
+    /// video's own stream, at the heard format and size, kept as heard. Nothing else is fetched
+    /// for it. The path it landed at and its gates' verdicts, or why it could not be had.
+    async fn keep_heard(
+        &self,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        origin: AcquisitionOrigin,
+        target: &AcquisitionTarget,
+        gates: &[HeartGate],
+    ) -> Result<(String, super::GateLedger), Arc<anyhow::Error>> {
+        let completion = self.direct_queue.enqueue_holding(
+            Some(origin),
+            keep_gates(gates),
+            Vec::new(),
+            target,
+            false,
+            provider,
+            external_id,
+            origin != AcquisitionOrigin::Play,
+            false,
+            true,
+            Some(DownloadSource::YouTube),
+            origin != AcquisitionOrigin::Play,
+            requested_by,
+            false,
+            None,
+        );
+        let path = completion.wait().await?;
+        Ok((path, completion.ledger().clone()))
     }
 
     /// The album chain of an album heart. `Err` for a Lidarr step that failed.
@@ -2052,13 +2471,41 @@ impl HeartAcquisitionCoordinator {
         requested_by: Option<&str>,
         scope: &LibraryScope,
     ) -> bool {
+        let Some((song, copy)) = self.owned_copy(provider, external_id, scope).await else {
+            return false;
+        };
+        self.keep_owned(provider, external_id, requested_by, &song, &copy);
+        true
+    }
+
+    /// The library's copy of the song in `scope`, when the owned check is on and finds one.
+    async fn owned_copy(
+        &self,
+        provider: &str,
+        external_id: &str,
+        scope: &LibraryScope,
+    ) -> Option<(octo_core::models::domain::Song, OwnedCopy)> {
+        self.extras
+            .owned
+            .as_ref()?
+            .find_song_in(scope, provider, external_id)
+            .await
+    }
+
+    /// The heart is the owned copy's: it is favorited, its row closed on it, and a lossy copy
+    /// queued for Better quality.
+    fn keep_owned(
+        &self,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        song: &octo_core::models::domain::Song,
+        copy: &OwnedCopy,
+    ) {
         let Some(owned) = &self.extras.owned else {
-            return false;
+            return;
         };
-        let Some((song, copy)) = owned.find_song_in(scope, provider, external_id).await else {
-            return false;
-        };
-        let upgrading = owned.queue_upgrade_if_wanted(&copy, &song, requested_by);
+        let upgrading = owned.queue_upgrade_if_wanted(copy, song, requested_by);
         // Before the row closes, so the close never reads as a download that landed.
         if let Some(stars) = &self.extras.stars {
             stars.favorite_owned(
@@ -2081,8 +2528,7 @@ impl HeartAcquisitionCoordinator {
                 ""
             }
         );
-        self.settle(provider, external_id, &copy);
-        true
+        self.settle(provider, external_id, copy);
     }
 
     /// An album heart where every song is already in the library: each is favorited

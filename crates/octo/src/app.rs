@@ -108,6 +108,7 @@ use crate::services::library::library_youtube_check::{
 use crate::services::library::navidrome_song_list;
 use crate::services::library::tidy::worker::ListSongs;
 use crate::services::library::tidy::{TidyJournal, TidyServices, TidyStore, TidyWorker};
+use crate::services::library::upgrade_queue::{KeptRechecks, UpgradeAsk};
 use crate::services::library::{AlbumOwnership, GeneratedPlaylistService, LibrarySnapshot};
 use crate::services::library::{ChartPlaylistService, LibraryMatchCache};
 use crate::services::library::{
@@ -130,7 +131,7 @@ use crate::services::lidarr::{
 };
 use crate::services::listen_brainz::{ListenBrainzRadioClient, ListenBrainzService};
 use crate::services::local::DownloadHistoryService;
-use crate::services::local::{ILocalLibraryService, LocalLibraryService};
+use crate::services::local::{ILocalLibraryService, LocalLibraryService, LocalSongMapping};
 use crate::services::lyrics::{
     LyricsChoiceService, LyricsChoiceStore, LyricsLibraryStore, LyricsLibraryWorker, LyricsService,
     LyricsSidecarWriter, LyricsUndoJournal, lyrics_http,
@@ -871,6 +872,7 @@ struct Acquisition {
     heart_acquisition_coordinator: Arc<HeartAcquisitionCoordinator>,
     external_search: Arc<ExternalSearchService>,
     family_pool_service: Arc<FamilyPool>,
+    kept_rechecks: Arc<KeptRechecks>,
 }
 
 impl Acquisition {
@@ -1051,12 +1053,66 @@ impl Acquisition {
             let acoust_id = clients.acoust_id.clone();
             track_acquisition_queue.use_turns(Arc::new(move |wake| acoust_id.hold_lookup(wake)));
         }
+        // Files kept as heard are checked again on a play or a heart of their song and after each
+        // heart a gate proves; a check that could now prove a better copy queues its upgrade.
+        let kept_rechecks = Arc::new(KeptRechecks::new(
+            navidrome.local_library.clone(),
+            clients.acoust_id.clone(),
+            settings.clone(),
+            stores.external_id_registry.clone(),
+        ));
+        {
+            let (resolver, upgrades) = (
+                navidrome.navidrome_song_path_resolver.clone(),
+                upgrade_queue.clone(),
+            );
+            kept_rechecks.use_upgrade(Arc::new(move |kept: LocalSongMapping| {
+                let (resolver, upgrades) = (resolver.clone(), upgrades.clone());
+                Box::pin(async move {
+                    let Some(navidrome_id) = resolver
+                        .find_id_by_path(&kept.artist, &kept.title, &kept.local_path)
+                        .await
+                    else {
+                        tracing::info!(
+                            "Navidrome does not show {} yet; its upgrade waits for the next check",
+                            kept.local_path
+                        );
+                        return;
+                    };
+                    let requester = kept
+                        .heart
+                        .as_ref()
+                        .and_then(|heart| heart.users.first().cloned())
+                        .unwrap_or_default();
+                    upgrades.add(
+                        vec![UpgradeAsk {
+                            title: Some(kept.title.clone()),
+                            artist: Some(kept.artist.clone()),
+                            album: Some(kept.album.clone()),
+                            ..UpgradeAsk::new(navidrome_id)
+                        }],
+                        &requester,
+                        "recheck",
+                    );
+                })
+            }));
+            let kept = kept_rechecks.clone();
+            stores
+                .external_id_registry
+                .on_heard(Arc::new(move |id: &str, _: &str, _: &HeardRecord| {
+                    let (kept, id) = (kept.clone(), id.to_string());
+                    tokio::spawn(async move {
+                        kept.song_event(SoulseekMetadataService::PROVIDER_NAME, &id).await
+                    });
+                }));
+        }
         let heart_acquisition_coordinator = HeartAcquisitionCoordinator::new(
             settings.clone(),
             track_acquisition_queue.clone(),
             download_service.clone(),
             lidarr_hearts.clone(),
             HeartCoordinatorExtras {
+                kept: Some(kept_rechecks.clone()),
                 tracker: Some(acquisition_tracker.clone()),
                 id_registry: Some(stores.external_id_registry.clone()),
                 soulseek: Some(soulseek_link.clone()),
@@ -1169,6 +1225,7 @@ impl Acquisition {
             heart_acquisition_coordinator,
             external_search,
             family_pool_service: navidrome.family_pool_service.clone(),
+            kept_rechecks,
         }
     }
 
@@ -2397,6 +2454,8 @@ impl LibraryActions {
             sources: Some(acquisition.upgrade_sources.clone()),
             answers: Some(answers),
         }));
+        // Better quality of a file a heart kept is judged by that heart's own gate.
+        executor.use_kept_rechecks(acquisition.kept_rechecks.clone());
         let rating_worker = Arc::new(LibraryActionRatingWorker::new(
             executor.clone(),
             navidrome.subsonic_proxy.clone(),

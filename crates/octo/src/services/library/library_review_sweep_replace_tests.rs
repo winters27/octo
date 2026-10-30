@@ -21,6 +21,7 @@ use crate::services::library::library_action_test_support::{
 use crate::services::library::library_edit_service::LibraryEditServices;
 use crate::services::library::library_tag_edits::TagEditJournal;
 use crate::services::library::{LibraryActionQuarantine, LibraryEditService, LibraryRescan, NoticeState};
+use crate::services::local::LocalSongMapping;
 use crate::services::subsonic::NavidromeIdentityService;
 
 const FILE_NAME: &str = "Massive Attack - Teardrop.mp3";
@@ -355,4 +356,462 @@ async fn the_sweep_replaces_a_song_its_preview_says_is_another_and_put_back_rest
     assert_eq!(verifier.verified.load(Ordering::SeqCst), 1);
     assert!(queue.is_idle());
     assert_eq!(std::fs::read(&song).expect("the song"), original_bytes);
+}
+
+/// With "Re-check Octo's downloads" on, a file kept as heard whose YouTube preview measures 0.5
+/// is left alone: the sweep never checks it, and the re-check of Octo's downloads never takes it.
+/// Octo's other downloads are checked as before.
+#[tokio::test]
+async fn a_kept_as_heard_file_is_left_alone_when_the_sweep_checks_octos_downloads() {
+    for kept in [false, true] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("music");
+        std::fs::create_dir_all(&root).expect("the music root");
+        let song = root.join(FILE_NAME);
+        teardrop_mp3(&song, 20);
+        let settings = store(AppSettings {
+            library_actions: LibraryActionSettings {
+                enabled: true,
+                dry_run: false,
+                review_enabled: true,
+                review_sweep_per_hour: 3600,
+                review_sweep_auto_replace_preview: true,
+                review_sweep_octo_downloads: true,
+                allowed_users: vec!["admin".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let library = Arc::new(RecordingLibrary::default());
+        library.mappings.lock().push(LocalSongMapping {
+            external_provider: "soulseek".into(),
+            external_id: "teardrop".into(),
+            local_path: slash_root(&song),
+            artist: "Massive Attack".into(),
+            title: "Teardrop".into(),
+            proof_mark: kept.then(|| "as heard on YouTube".into()),
+            heart: kept.then(|| crate::services::local::KeptHeart {
+                users: vec!["admin".into()],
+                as_heard: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let verifier = Arc::new(HeardAsAnother::default());
+        let swept_root = slash_root(&root);
+        let worker = Arc::new(LibraryReviewSweepWorker::new(
+            LibraryReviewSweepParts {
+                store: Arc::new(ReviewSweepStore::new(None)),
+                notices: Arc::new(NoticeQueue::new()),
+                verifier: verifier.clone(),
+                activity: Arc::new(Idle),
+                library: library.clone(),
+                settings: settings.clone(),
+                music_root: Box::new(move || swept_root.clone()),
+            },
+            Clock::system(),
+        ));
+        for _ in 0..3 {
+            worker.tick().await;
+        }
+
+        let checked = verifier.verified.load(Ordering::SeqCst);
+        let rechecked = worker.recheck_octo().await;
+        if kept {
+            assert_eq!(checked, 0, "the kept-as-heard file is never checked");
+            assert_eq!(rechecked, 0, "nor taken by the re-check");
+        } else {
+            assert_eq!(checked, 1, "Octo's other download is checked");
+            assert_eq!(rechecked, 1);
+        }
+    }
+}
+
+/// A person's `action` on Octo's kept-as-heard download of an outside song, the replacement
+/// played as the download service plays it, then Put back. Answers the library's mappings after
+/// the replacement and after Put back, and the song's path.
+async fn replaced_then_put_back(
+    action: LibraryAction,
+) -> (Vec<LocalSongMapping>, Vec<LocalSongMapping>, String) {
+    use crate::services::local::KeptHeart;
+    use octo_core::fingerprint::heart_gate::{HeardRecord, HeardSource};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("music");
+    std::fs::create_dir_all(&root).expect("the music root");
+    let song = root.join(FILE_NAME);
+    teardrop_mp3(&song, 20);
+    let original_bytes = std::fs::read(&song).expect("the original");
+    let navidrome = navidrome(original_bytes.len() as i64).await;
+    let settings = store(AppSettings {
+        library_actions: LibraryActionSettings {
+            enabled: true,
+            dry_run: false,
+            keep_replaced_originals: true,
+            allowed_users: vec!["admin".into()],
+            actions: vec![LibraryActionDefinition {
+                action,
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        subsonic: SubsonicSettings {
+            url: Some(navidrome.uri()),
+            admin_username: Some("admin".into()),
+            admin_password: Some("secret".into()),
+            auto_detect_download_path: false,
+            download_source: DownloadSource::Soulseek,
+            ..Default::default()
+        },
+        soulseek: SoulseekSettings {
+            enabled: true,
+            base_url: Some("http://slskd.test".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let music_root = slash_root(&root);
+    settings.set_raw("Library:DownloadPath", Some(&music_root));
+    let song_path = slash_root(&song);
+    let kept = LocalSongMapping {
+        external_provider: "soulseek".into(),
+        external_id: "teardrop".into(),
+        local_path: song_path.clone(),
+        artist: "Massive Attack".into(),
+        title: "Teardrop".into(),
+        proof_mark: Some("as heard on YouTube".into()),
+        heart: Some(KeptHeart {
+            users: vec!["admin".into()],
+            heard: Some(HeardRecord {
+                heard_at: Utc::now(),
+                source: HeardSource::Video {
+                    id: "u7K72X4eo_s".into(),
+                    size: Some(4_000_000),
+                    content_type: "audio/mp4".into(),
+                    itag: Some(140),
+                },
+                sample_id: None,
+            }),
+            as_heard: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let journal = Arc::new(LibraryActionJournal::new());
+    let library = Arc::new(RecordingLibrary::default());
+    library.mappings.lock().push(kept);
+    let queue = Arc::new(TrackAcquisitionQueue::new());
+    let actions = executor(
+        &settings,
+        Extras {
+            journal: Some(journal.clone()),
+            library: Some(library.clone()),
+            queue: Some(queue.clone()),
+            ..Default::default()
+        },
+    );
+    actions.configure(|seams| {
+        seams.history_poll = Duration::from_millis(1);
+        seams.history_attempts = 1;
+        seams.shows_at = Some(Arc::new(|_, _| async { true }.boxed()));
+        seams.force_scan = Some(Arc::new(|| async { true }.boxed()));
+    });
+    let http = crate::services::http_client_factory::default_client();
+    let identity = NavidromeIdentityService::new(settings.clone(), http.clone());
+    let resolver = Arc::new(NavidromeSongPathResolver::new(
+        identity,
+        library.clone(),
+        http,
+        settings.clone(),
+    ));
+    assert!(resolver.resolve("nd-1").await.is_some());
+
+    let mut request = LibraryActionRequest::new(action, "nd-1", "admin");
+    if action == LibraryAction::BetterQuality {
+        request.anyway = Some(crate::services::common::download_picks::AnywaySong {
+            title: "Teardrop".into(),
+            album: Some("Mezzanine".into()),
+            length: Some(330),
+            retitle: false,
+        });
+    }
+    let applying = actions.clone();
+    let applied = tokio::spawn(async move { applying.apply(request).await });
+    let never = CancellationToken::new();
+    let download = tokio::time::timeout(Duration::from_secs(10), queue.dequeue(&never))
+        .await
+        .expect("a download in time")
+        .expect("a download");
+    let incoming = root.join(".octo-incoming");
+    std::fs::create_dir_all(&incoming).expect("the incoming folder");
+    let staged = incoming.join("replacement.mp3");
+    teardrop_mp3(&staged, 30);
+    let staged = slash_root(&staged);
+    let handoff = download.replacement.clone().expect("a handoff");
+    assert_eq!((handoff.before_reveal)(staged.clone()).await, None);
+    let target = handoff.target_for(".mp3").expect("a free name");
+    std::fs::rename(&staged, &target).expect("moved in");
+    handoff.set_revealed_path(target.clone());
+    if let Some(revealed) = &handoff.on_revealed {
+        revealed(&target);
+    }
+    queue.release(&download);
+    download.completion.try_set_result(&target);
+    let outcome = tokio::time::timeout(Duration::from_secs(10), applied)
+        .await
+        .expect("applied in time")
+        .expect("no panic")
+        .expect("applied");
+    assert_eq!(outcome.state, LibraryActionState::Applied, "{outcome:?}");
+    let replaced = library.mappings.lock().clone();
+    until(|| {
+        journal
+            .recent(10)
+            .iter()
+            .any(|entry| entry.history_kept == Some(true))
+    })
+    .await;
+
+    let edits = LibraryEditService::new(
+        resolver,
+        Arc::new(LibraryActionQuarantine::new(settings.clone())),
+        journal,
+        Arc::new(TagEditJournal::new(None)),
+        Arc::new(LibraryRescan::new(None)),
+        settings.clone(),
+        LibraryEditServices {
+            library: Some(library.clone()),
+            ..Default::default()
+        },
+    );
+    let put_back = edits.restore("nd-1", "admin").await;
+    assert_eq!(put_back.state, "applied", "{put_back:?}");
+    assert_eq!(std::fs::read(&song).expect("the song"), original_bytes);
+    let restored = library.mappings.lock().clone();
+    (replaced, restored, song_path)
+}
+
+/// Better quality over a file kept as heard (the weekly upgrade's, the upgrade queue's and the
+/// action's are all this one) is judged by the heart that kept it: AcoustID still does not know the
+/// kept file, so only its own master may replace it, measured against the kept file itself. A copy
+/// that gate refuses (an unprovable FLAC, then an other-mix FLAC) leaves the kept file and its
+/// mapping where they were, both times.
+#[tokio::test]
+async fn better_quality_over_a_kept_as_heard_file_is_judged_by_its_heart_and_a_refused_copy_leaves_it() {
+    use crate::services::fingerprint::{AcoustIdClient, AcoustIdRateLimitHandler, AcoustIdRateLimiter};
+    use crate::services::library::upgrade_queue::KeptRechecks;
+    use crate::services::local::KeptHeart;
+    use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeardReading, HeardRecording, HeardSource};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("music");
+    std::fs::create_dir_all(&root).expect("the music root");
+    let song = root.join(FILE_NAME);
+    teardrop_mp3(&song, 20);
+    let original_bytes = std::fs::read(&song).expect("the original");
+    let navidrome = navidrome(original_bytes.len() as i64).await;
+    let acoust_id = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(r#"{"status":"ok","results":[]}"#, "application/json"),
+        )
+        .mount(&acoust_id)
+        .await;
+    let settings = store(AppSettings {
+        library_actions: LibraryActionSettings {
+            enabled: true,
+            dry_run: false,
+            keep_replaced_originals: true,
+            allowed_users: vec!["admin".into()],
+            actions: vec![LibraryActionDefinition {
+                action: LibraryAction::BetterQuality,
+                enabled: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        subsonic: SubsonicSettings {
+            url: Some(navidrome.uri()),
+            admin_username: Some("admin".into()),
+            admin_password: Some("secret".into()),
+            auto_detect_download_path: false,
+            download_source: DownloadSource::Soulseek,
+            ..Default::default()
+        },
+        soulseek: SoulseekSettings {
+            enabled: true,
+            base_url: Some("http://slskd.test".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    settings.set_raw("Library:DownloadPath", Some(&slash_root(&root)));
+    let song_path = slash_root(&song);
+    let r = HeardRecording {
+        ids: vec!["0a1b2c3d-0000-0000-0000-000000000001".into()],
+        title: "Teardrop".into(),
+        artist: "Massive Attack".into(),
+        ..Default::default()
+    };
+    let library = Arc::new(RecordingLibrary::default());
+    library.mappings.lock().push(LocalSongMapping {
+        external_provider: "soulseek".into(),
+        external_id: "teardrop".into(),
+        local_path: song_path.clone(),
+        artist: "Massive Attack".into(),
+        title: "Teardrop".into(),
+        proof_mark: Some("as heard on YouTube".into()),
+        heart: Some(KeptHeart {
+            users: vec!["anna".into()],
+            recording: Some(r.clone()),
+            as_heard: true,
+            print: Some("AQADtEqk".into()),
+            seconds: Some(330),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let queue = Arc::new(TrackAcquisitionQueue::new());
+    let actions = executor(
+        &settings,
+        Extras {
+            library: Some(library.clone()),
+            queue: Some(queue.clone()),
+            ..Default::default()
+        },
+    );
+    let limiter = Arc::new(
+        AcoustIdRateLimiter::with_gaps(Duration::from_millis(1), Duration::from_millis(1))
+            .with_jitter(|| 1.0),
+    );
+    let client = Arc::new(AcoustIdClient::with_built_in_key(
+        Arc::new(AcoustIdRateLimitHandler::with_base_url(
+            limiter,
+            url::Url::parse(&format!("{}/", acoust_id.uri())).expect("parses"),
+        )),
+        settings.clone(),
+        Some("octo-key"),
+    ));
+    actions.use_kept_rechecks(Arc::new(KeptRechecks::new(
+        library.clone(),
+        client,
+        settings.clone(),
+        Arc::new(crate::services::soulseek::ExternalIdRegistry::in_memory()),
+    )));
+    let http = crate::services::http_client_factory::default_client();
+    let resolver = NavidromeSongPathResolver::new(
+        NavidromeIdentityService::new(settings.clone(), http.clone()),
+        library.clone(),
+        http,
+        settings.clone(),
+    );
+    assert!(resolver.resolve("nd-1").await.is_some());
+
+    for offered in ["an unprovable FLAC", "an other-mix FLAC"] {
+        let applying = actions.clone();
+        let applied = tokio::spawn(async move {
+            applying
+                .apply(LibraryActionRequest::new(
+                    LibraryAction::BetterQuality,
+                    "nd-1",
+                    "admin",
+                ))
+                .await
+        });
+        let never = CancellationToken::new();
+        let download = tokio::time::timeout(Duration::from_secs(10), queue.dequeue(&never))
+            .await
+            .expect("a download in time")
+            .expect("a download");
+        assert_eq!(
+            download.origin,
+            Some(AcquisitionOrigin::Heart),
+            "judged by the heart"
+        );
+        let gates = download.gates();
+        assert_eq!(gates.len(), 1, "{gates:?}");
+        assert_eq!(gates[0].user, "anna");
+        assert_eq!(gates[0].r, Some(r.clone()));
+        assert_eq!(gates[0].reading, HeardReading::OnlyHeardOrMaster);
+        assert_eq!(
+            gates[0].heard.as_ref().map(|heard| heard.source.clone()),
+            Some(HeardSource::Library {
+                path: song_path.clone()
+            }),
+            "measured against the kept file itself"
+        );
+        // The gate refuses what it was offered, as the download's check point does.
+        queue.release(&download);
+        download
+            .completion
+            .try_set_error(anyhow::anyhow!("{offered} is not the version you heard"));
+        let outcome = tokio::time::timeout(Duration::from_secs(10), applied)
+            .await
+            .expect("ended in time")
+            .expect("no panic")
+            .expect("ran");
+        assert_ne!(
+            outcome.state,
+            LibraryActionState::Applied,
+            "{offered}: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&song).expect("the song"),
+            original_bytes,
+            "{offered}"
+        );
+        let mappings = library.mappings.lock().clone();
+        assert_eq!(mappings.len(), 1, "{offered}: {mappings:?}");
+        assert_eq!(mappings[0].local_path, song_path);
+    }
+}
+
+/// Wrong song on a kept-as-heard file, then Put back: while the replacement is in, the outside
+/// song maps to nothing; once the original is back, its outside id maps to the restored file,
+/// still kept as heard for the person who hearted it.
+#[tokio::test]
+async fn wrong_song_on_a_kept_as_heard_file_then_put_back_maps_its_outside_id_again() {
+    let (replaced, restored, song) = replaced_then_put_back(LibraryAction::WrongSong).await;
+    assert!(
+        replaced.iter().all(|mapping| mapping.external_id != "teardrop"),
+        "{replaced:?}"
+    );
+    let back: Vec<&LocalSongMapping> = restored
+        .iter()
+        .filter(|mapping| mapping.external_id == "teardrop")
+        .collect();
+    assert_eq!(back.len(), 1, "{restored:?}");
+    assert!(same_file(&back[0].local_path, &song), "{restored:?}");
+    let heart = back[0].heart.as_ref().expect("still kept as heard");
+    assert!(heart.as_heard && heart.is_for("admin"));
+    assert_eq!(back[0].proof_mark.as_deref(), Some("as heard on YouTube"));
+}
+
+/// The same for a plain Better quality replacement put back.
+#[tokio::test]
+async fn better_quality_on_a_kept_as_heard_file_then_put_back_maps_its_outside_id_again() {
+    let (replaced, restored, song) = replaced_then_put_back(LibraryAction::BetterQuality).await;
+    assert!(
+        replaced.iter().all(|mapping| mapping.external_id != "teardrop"),
+        "{replaced:?}"
+    );
+    let back: Vec<&LocalSongMapping> = restored
+        .iter()
+        .filter(|mapping| mapping.external_id == "teardrop")
+        .collect();
+    assert_eq!(back.len(), 1, "{restored:?}");
+    assert!(same_file(&back[0].local_path, &song), "{restored:?}");
+    assert!(back[0].heart.as_ref().is_some_and(|heart| heart.as_heard));
+}
+
+/// Whether two spellings of a path name one file: the trash gives a restored path back without
+/// its drive on Windows, so the paths are compared from the music folder down.
+fn same_file(a: &str, b: &str) -> bool {
+    let tail = |path: &str| {
+        let path = path.replace('\\', "/");
+        path.find("/music/")
+            .map_or(path.clone(), |at| path[at..].to_string())
+    };
+    tail(a) == tail(b)
 }

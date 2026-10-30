@@ -254,6 +254,9 @@ struct Entry {
 
     /// The hold offers to keep the heard audio anyway.
     keep_anyway: bool,
+
+    /// The line this run's row keeps once it is done: what was kept and why.
+    done_line: Option<String>,
 }
 
 impl Entry {
@@ -524,6 +527,13 @@ impl AcquisitionTracker {
         entry.note = note;
         entry.updated_at = now;
         prune(&mut state, now);
+    }
+
+    /// The one line this run's row says if it ends done (what was kept, and why): shown and
+    /// logged when it does, never when it fails. Nothing for a row already finished or not there.
+    pub fn done_line(&self, provider: &str, external_id: &str, line: &str) {
+        let line = Some(line.trim().to_string()).filter(|line| !line.is_empty());
+        self.update(provider, external_id, false, |entry| entry.done_line = line);
     }
 
     /// Lets the row of an acquisition go back to the usual rules once `holds` keeps no record of
@@ -1245,7 +1255,7 @@ impl AcquisitionTracker {
             entry.state = AcquisitionState::Done;
             entry.progress = None;
             entry.error = None;
-            entry.note = None;
+            entry.note = entry.done_line.clone();
             if let Some(library_id) = library_id.filter(|l| !blank(l)) {
                 entry.library_id = Some(library_id.to_string());
             }
@@ -1262,6 +1272,9 @@ impl AcquisitionTracker {
                 not_shown,
                 None,
             );
+            if let Some(line) = entry.done_line.clone() {
+                add(entry, now, acquisition_event_kinds::NOTE, &line, None, None);
+            }
             end_of(&state, key)
         };
         self.raise(ended);
@@ -1403,6 +1416,7 @@ fn open<'a>(
         entry.error = None;
         entry.library_id = None;
         entry.note = None;
+        entry.done_line = None;
         entry.kind = acquisition_kinds::DOWNLOAD.to_string();
         entry.quality = None;
         entry.peer = None;
@@ -1444,6 +1458,7 @@ fn open<'a>(
                 already_there: false,
                 held: false,
                 keep_anyway: false,
+                done_line: None,
             },
         );
     }

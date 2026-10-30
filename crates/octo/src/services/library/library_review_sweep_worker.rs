@@ -1009,18 +1009,18 @@ impl LibraryReviewSweepWorker {
             let trash = library_walk::trash_folder(Path::new(&root), &settings);
             let listed = Arc::new(Self::enumerate(&root, Some(&trash)));
             *self.files.lock() = Some(listed.clone());
-            let octo_files: HashSet<String> = if settings.review_sweep_octo_downloads {
-                HashSet::new()
-            } else {
-                self.library
-                    .get_mappings()
-                    .await
-                    .into_iter()
-                    .map(|mapping| mapping.local_path)
-                    .filter(|path| !path.is_empty())
-                    .map(|path| get_full_path(&path))
-                    .collect()
-            };
+            // A file kept as heard (or kept anyway) is the very audio a person heard: the sweep
+            // never acts on it on its own, even when it checks Octo's other downloads.
+            let octo_files: HashSet<String> = self
+                .library
+                .get_mappings()
+                .await
+                .into_iter()
+                .filter(|mapping| !settings.review_sweep_octo_downloads || mapping.kept_unproven())
+                .map(|mapping| mapping.local_path)
+                .filter(|path| !path.is_empty())
+                .map(|path| get_full_path(&path))
+                .collect();
             *self.octo_files.lock() = Arc::new(octo_files);
             // Start over was pressed while the library was being listed. Keeping this listing
             // would leave the pass with a total of 0, so the next tick lists it again.
@@ -1794,7 +1794,8 @@ impl LibraryReviewSweepWorker {
     }
 
     /// Octo's own downloads inside the music folder, library-relative with `/`, in ordinal
-    /// order. Hidden folders, the quarantine among them, are left out.
+    /// order. Hidden folders, the quarantine among them, are left out, and so are files kept as
+    /// heard or kept anyway, which the sweep never acts on.
     async fn octo_downloads(&self, root: &str) -> Vec<String> {
         let base = get_full_path(root);
         let prefix = format!("{}/", base.trim_end_matches('/'));
@@ -1803,6 +1804,7 @@ impl LibraryReviewSweepWorker {
             .get_mappings()
             .await
             .into_iter()
+            .filter(|mapping| !mapping.kept_unproven())
             .map(|mapping| mapping.local_path)
             .filter(|path| !path.is_empty())
             .filter_map(|path| {
