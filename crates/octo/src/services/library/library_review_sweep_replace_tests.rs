@@ -592,17 +592,25 @@ async fn replaced_then_put_back(
     (replaced, restored, song_path)
 }
 
-/// Better quality over a file kept as heard (the weekly upgrade's, the upgrade queue's and the
-/// action's are all this one) is judged by the heart that kept it: AcoustID still does not know the
-/// kept file, so only its own master may replace it, measured against the kept file itself. A copy
-/// that gate refuses (an unprovable FLAC, then an other-mix FLAC) leaves the kept file and its
-/// mapping where they were, both times.
-#[tokio::test]
-async fn better_quality_over_a_kept_as_heard_file_is_judged_by_its_heart_and_a_refused_copy_leaves_it() {
+/// Better quality over Octo's kept-as-heard Teardrop, kept for anna, its heart checked against an
+/// AcoustID that does not know it.
+struct KeptRig {
+    _dir: tempfile::TempDir,
+    _servers: [MockServer; 2],
+    song: PathBuf,
+    song_path: String,
+    original_bytes: Vec<u8>,
+    r: octo_core::fingerprint::heart_gate::HeardRecording,
+    library: Arc<RecordingLibrary>,
+    queue: Arc<TrackAcquisitionQueue>,
+    actions: Arc<LibraryActionExecutor>,
+}
+
+async fn kept_rig() -> KeptRig {
     use crate::services::fingerprint::{AcoustIdClient, AcoustIdRateLimitHandler, AcoustIdRateLimiter};
     use crate::services::library::upgrade_queue::KeptRechecks;
     use crate::services::local::KeptHeart;
-    use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeardReading, HeardRecording, HeardSource};
+    use octo_core::fingerprint::heart_gate::HeardRecording;
 
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path().join("music");
@@ -707,7 +715,39 @@ async fn better_quality_over_a_kept_as_heard_file_is_judged_by_its_heart_and_a_r
         settings.clone(),
     );
     assert!(resolver.resolve("nd-1").await.is_some());
+    KeptRig {
+        _dir: dir,
+        _servers: [navidrome, acoust_id],
+        song,
+        song_path,
+        original_bytes,
+        r,
+        library,
+        queue,
+        actions,
+    }
+}
 
+/// Better quality over a file kept as heard (the weekly upgrade's, the upgrade queue's and the
+/// action's are all this one) is judged by the heart that kept it: AcoustID still does not know the
+/// kept file, so only its own master may replace it, measured against the kept file itself. A copy
+/// that gate refuses (an unprovable FLAC, then an other-mix FLAC) leaves the kept file and its
+/// mapping where they were, both times.
+#[tokio::test]
+async fn better_quality_over_a_kept_as_heard_file_is_judged_by_its_heart_and_a_refused_copy_leaves_it() {
+    use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeardReading, HeardSource};
+
+    let KeptRig {
+        _dir,
+        _servers,
+        song,
+        song_path,
+        original_bytes,
+        r,
+        library,
+        queue,
+        actions,
+    } = kept_rig().await;
     for offered in ["an unprovable FLAC", "an other-mix FLAC"] {
         let applying = actions.clone();
         let applied = tokio::spawn(async move {
@@ -764,6 +804,68 @@ async fn better_quality_over_a_kept_as_heard_file_is_judged_by_its_heart_and_a_r
         let mappings = library.mappings.lock().clone();
         assert_eq!(mappings.len(), 1, "{offered}: {mappings:?}");
         assert_eq!(mappings[0].local_path, song_path);
+    }
+}
+
+/// An upgrade of a kept file never holds: a copy its heart's gate cannot judge now (AcoustID or
+/// MusicBrainz not answering) is thrown away at once, nothing waits for AcoustID's turn, the kept
+/// file stays with its mapping, and the action ends quietly, for the next check to try again.
+#[tokio::test]
+async fn an_upgrade_of_a_kept_file_that_meets_a_busy_lookup_stops_quietly_and_holds_nothing() {
+    use crate::services::common::AcquisitionHeld;
+    use octo_core::fingerprint::heart_gate::WaitingFor;
+
+    for waiting_for in [WaitingFor::AcoustId, WaitingFor::MusicBrainz] {
+        let rig = kept_rig().await;
+        let waited = Arc::new(AtomicUsize::new(0));
+        let counted = waited.clone();
+        rig.queue
+            .use_turns(Arc::new(move |_wake: Box<dyn FnOnce() + Send>| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }));
+        let applying = rig.actions.clone();
+        let applied = tokio::spawn(async move {
+            applying
+                .apply(LibraryActionRequest::new(
+                    LibraryAction::BetterQuality,
+                    "nd-1",
+                    "admin",
+                ))
+                .await
+        });
+        let never = CancellationToken::new();
+        let download = tokio::time::timeout(Duration::from_secs(10), rig.queue.dequeue(&never))
+            .await
+            .expect("a download in time")
+            .expect("a download");
+        // The check point held the copy aside, as it does for a heart.
+        let held = rig.song.with_file_name("held.flac");
+        std::fs::write(&held, b"a copy nobody could judge").expect("written");
+        rig.queue.release(&download);
+        download
+            .completion
+            .try_set_error(anyhow::Error::new(AcquisitionHeld {
+                waiting_for,
+                line: "Waiting for AcoustID".into(),
+                files: vec![slash_root(&held)],
+                users: Vec::new(),
+            }));
+        let outcome = tokio::time::timeout(Duration::from_secs(10), applied)
+            .await
+            .expect("ended at once, waiting for nothing")
+            .expect("no panic")
+            .expect("ran");
+
+        assert_eq!(outcome.state, LibraryActionState::Skipped, "{waiting_for:?}");
+        assert_eq!(outcome.detail, None, "quietly: {outcome:?}");
+        assert_eq!(waited.load(Ordering::SeqCst), 0, "no turn waited for");
+        assert!(!held.exists(), "the copy is thrown away");
+        assert_eq!(std::fs::read(&rig.song).expect("the song"), rig.original_bytes);
+        let mappings = rig.library.mappings.lock().clone();
+        assert_eq!(mappings.len(), 1, "{mappings:?}");
+        assert!(mappings[0].heart.as_ref().is_some_and(|heart| heart.as_heard));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rig.queue.is_idle(), "nothing queued again");
     }
 }
 

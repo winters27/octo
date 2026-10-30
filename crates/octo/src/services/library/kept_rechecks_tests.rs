@@ -176,9 +176,9 @@ async fn help_2009_240_as_the_kept_files_answer_reads_r_stays_and_the_upgrade_ru
         }
     );
     assert_eq!(
-        heard.sample_id.as_deref(),
-        Some("sample-1"),
-        "proof 2 against what played"
+        heard.sample_id,
+        Some(sample_id_of(&heard.source)),
+        "proof 2 against the kept file itself"
     );
     assert_eq!(rig.lookups().await, 1, "the search sent no second lookup");
 }
@@ -286,19 +286,222 @@ async fn an_upgrade_of_a_kept_file_acoust_id_does_not_know_accepts_only_its_own_
     );
 }
 
-/// A kept file whose answer now names another song entirely: nothing is tried for it.
+/// What a kept file's checks held: the provider, the song's id, the people and the line.
+type Held = Arc<Mutex<Vec<(String, String, Vec<String>, String)>>>;
+
+fn holds_of(rechecks: &KeptRechecks) -> Held {
+    let held: Held = Arc::default();
+    let told = held.clone();
+    rechecks.use_hold(Arc::new(
+        move |provider: &str, id: &str, users: &[String], line: &str| {
+            told.lock()
+                .push((provider.into(), id.into(), users.to_vec(), line.into()))
+        },
+    ));
+    held
+}
+
+/// A kept file whose answer now names another song entirely (a believed different song): no
+/// search for a better copy, its video refused for the song as a heart's gate refuses what played
+/// when it was another song, the heart held "not yet proven" with the line a stream that stood in
+/// with another song gets, and the kept file left where it is. Better quality on it is skipped with
+/// that same line, and does the same.
 #[tokio::test]
-async fn a_kept_file_now_named_as_another_song_is_not_upgraded() {
+async fn a_kept_file_now_named_as_another_song_refuses_its_video_and_holds_its_heart() {
     let other = r#"{"status":"ok","results":[{"id":"fp","score":0.98,"recordings":[{"id":"aaaaaaaa-0000-0000-0000-000000000000","title":"Yellow Submarine","duration":139,"sources":60,"artists":[{"id":"b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d","name":"The Beatles"}]}]}]}"#;
     let rig = rig(other, kept_as_heard).await;
+    let id = rig.registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("The Beatles".into()),
+        title: Some("Help!".into()),
+        ..Default::default()
+    });
+    rig.library.mappings.lock()[0].external_id = id.clone();
+    let held = holds_of(&rig.rechecks);
 
     let kept = rig.library.mappings.lock()[0].clone();
     assert_eq!(rig.rechecks.recheck(kept).await, Reread::AnotherSong);
-    assert!(rig.upgraded.lock().is_empty());
+
+    assert!(rig.upgraded.lock().is_empty(), "no search for a better copy");
+    let routing = rig
+        .registry
+        .resolve_song(&id, false)
+        .expect("the song")
+        .snapshot();
+    assert_eq!(
+        rig.registry.refusals_for(&routing),
+        ["u7K72X4eo_s"],
+        "the kept file's video is refused for the song"
+    );
+    let line = ANOTHER_SONG_PLAYED.to_string();
+    assert_eq!(
+        held.lock().clone(),
+        [(
+            "soulseek".to_string(),
+            id.clone(),
+            vec!["brandon".to_string()],
+            line.clone()
+        )]
+    );
+    assert!(Path::new(&rig.path).is_file(), "the kept file stays");
+    assert_eq!(rig.library.mappings.lock().len(), 1, "and keeps its mapping");
+
     assert_eq!(
         rig.rechecks.gate_for(&rig.path, "brandon").await,
-        KeptFor::Nothing(KEPT_IS_ANOTHER_SONG)
+        KeptFor::Nothing(ANOTHER_SONG_PLAYED),
+        "Better quality on it is skipped with the same line"
     );
+    assert_eq!(held.lock().len(), 2, "and holds the heart as a check does");
+}
+
+/// When what played becomes R at a check, R is that recording and the recordings MusicBrainz
+/// files under its own codes with its note, asked as the heart's gate asks them; a recording of
+/// another note under the same code is not R.
+#[tokio::test]
+async fn r_becoming_what_played_takes_its_same_note_duplicates() {
+    const CODE: &str = "GBUM71505911";
+    const DUPLICATE: &str = "11111111-2222-3333-4444-555555555555";
+    const OTHER_NOTE: &str = "66666666-7777-8888-9999-000000000000";
+    let music_brainz = MockServer::start().await;
+    Mock::given(wiremock::matchers::path(format!("/ws/2/isrc/{CODE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!(
+                r#"{{"isrc":"{CODE}","recordings":[{{"id":"{HELP_2015}","title":"Help!","disambiguation":"2015 mix"}},{{"id":"{DUPLICATE}","title":"Help!","disambiguation":"2015 mix"}},{{"id":"{OTHER_NOTE}","title":"Help!","disambiguation":"2009 remaster"}}]}}"#
+            ),
+            "application/json",
+        ))
+        .mount(&music_brainz)
+        .await;
+    let answer = format!(
+        r#"{{"status":"ok","results":[{{"id":"fp","score":0.98,"recordings":[{{"id":"{HELP_2015}","title":"Help!","duration":139,"sources":60,"isrcs":["{CODE}"],"artists":[{{"id":"{BEATLES}","name":"The Beatles"}}]}}]}}]}}"#
+    );
+    let rig = rig(&answer, kept_as_heard).await;
+    let quick = Duration::from_millis(5);
+    rig.rechecks.use_music_brainz(
+        Arc::new(
+            MusicBrainzClient::with_base_url(
+                Url::parse(&format!("{}/ws/2/", music_brainz.uri())).expect("parses"),
+            )
+            .with_pace(quick, Duration::from_secs(2), quick),
+        ),
+        Arc::new(NoCatalog),
+    );
+
+    let gate = gate_of(rig.rechecks.gate_for(&rig.path, "brandon").await);
+
+    assert!(
+        matches!(gate.reading, HeardReading::RBecame { .. }),
+        "{:?}",
+        gate.reading
+    );
+    let r = gate.r.expect("R");
+    assert_eq!(r.ids, [HELP_2015, DUPLICATE]);
+    assert!(!r.holds(OTHER_NOTE), "another note under the same code is not R");
+}
+
+/// Deezer, never asked by a kept file's checks.
+pub(super) struct NoCatalog;
+
+#[async_trait::async_trait]
+impl CatalogQuestions for NoCatalog {
+    async fn album_search(
+        &self,
+        _: &str,
+        _: &str,
+        _: Lane,
+    ) -> crate::services::metadata::deezer_metadata_service::DeezerAsked<
+        Vec<octo_core::fingerprint::heart_release::CatalogAlbumHit>,
+    > {
+        crate::services::metadata::deezer_metadata_service::DeezerAsked::NoData
+    }
+
+    async fn album(
+        &self,
+        _: &str,
+        _: Lane,
+    ) -> crate::services::metadata::deezer_metadata_service::DeezerAsked<(
+        octo_core::fingerprint::heart_release::CatalogAlbum,
+        Vec<octo_core::fingerprint::heart_release::CatalogTrack>,
+    )> {
+        crate::services::metadata::deezer_metadata_service::DeezerAsked::NoData
+    }
+}
+
+/// The kept file's print, kept with it, is stored as the sample the gate's proof 2 compares
+/// replacements with, so an emptied heard-sample store still has it; a file kept with no print
+/// stores nothing here (proof 2 prints the file itself).
+#[tokio::test]
+async fn the_kept_files_own_print_is_what_proof_two_compares_with() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let holds = Arc::new(crate::services::common::SoulseekHoldStore::new(None::<PathBuf>));
+    let samples = crate::services::prefetch::heard_samples::tests::rig_in(
+        dir.path(),
+        "http://127.0.0.1:9",
+        holds,
+        16,
+        64 << 20,
+    )
+    .samples;
+    let items: Vec<u32> = (0..900u32).map(|at| at.wrapping_mul(2_654_435_761)).collect();
+    let print = compressed_of(&items);
+    let rig = rig(&naming(HELP_2009), |path| {
+        let mut kept = kept_as_heard(path);
+        kept.heart.as_mut().expect("kept").print = Some(print.clone());
+        kept
+    })
+    .await;
+    rig.rechecks.use_samples(samples.clone());
+
+    let gate = gate_of(rig.rechecks.gate_for(&rig.path, "brandon").await);
+
+    let sample = gate
+        .heard
+        .and_then(|heard| heard.sample_id)
+        .expect("the kept file's sample");
+    assert_eq!(samples.prints(&sample).map(|prints| prints.raw), Some(items));
+}
+
+/// A compressed print of `items`, as `fpcalc` writes one.
+fn compressed_of(items: &[u32]) -> String {
+    use base64::Engine;
+    let mut steps: Vec<u8> = Vec::new();
+    let mut exceptions: Vec<u8> = Vec::new();
+    for (at, item) in items.iter().enumerate() {
+        let mut x = if at == 0 { *item } else { item ^ items[at - 1] };
+        let (mut bit, mut last) = (1u8, 0u8);
+        while x != 0 {
+            if x & 1 == 1 {
+                let step = bit - last;
+                if step >= 7 {
+                    steps.push(7);
+                    exceptions.push(step - 7);
+                } else {
+                    steps.push(step);
+                }
+                last = bit;
+            }
+            x >>= 1;
+            bit += 1;
+        }
+        steps.push(0);
+    }
+    let pack = |values: &[u8], width: usize| -> Vec<u8> {
+        let mut out = vec![0u8; (values.len() * width).div_ceil(8)];
+        for (index, value) in values.iter().enumerate() {
+            for offset in 0..width {
+                if (value >> offset) & 1 == 1 {
+                    let at = index * width + offset;
+                    out[at / 8] |= 1 << (at % 8);
+                }
+            }
+        }
+        out
+    };
+    let count = items.len();
+    let mut bytes = vec![1, (count >> 16) as u8, (count >> 8) as u8, count as u8];
+    bytes.extend(pack(&steps, 3));
+    bytes.extend(pack(&exceptions, 5));
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// A "Keep these anyway" track nobody played is never replaced on a pass against itself: it is not

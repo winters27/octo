@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::common::dotnet::eq_ignore_case;
 use octo_core::fingerprint::heart_gate::{
-    AcquisitionOrigin, HeardReading, HeardRecord, HeartGate, WaitingFor,
+    Acceptance, AcquisitionOrigin, HeardReading, HeardRecord, HeartGate, WaitingFor,
 };
 use octo_core::settings::{DownloadSource, HeartDownloadSource, SettingsStore};
 use parking_lot::Mutex;
@@ -1495,28 +1495,88 @@ impl HeartAcquisitionCoordinator {
             return Ok(TrackOutcome::Held(waiting));
         }
         let holders = vec![self.holder_for(external_id, requested_by)];
-        let outcome = self
-            .track_chain(
+        self.track_chain(
+            provider,
+            external_id,
+            requested_by,
+            held_since_utc,
+            target,
+            origin,
+            holders,
+            Vec::new(),
+            &mut Vec::new(),
+        )
+        .await
+    }
+
+    /// Each heart AcoustID's clear reading accepted the landed file for: the kept file checked
+    /// longest ago is checked again next, once per such heart, so checks follow real proofs. A file
+    /// kept as the very audio heard, or as the master heard, starts none.
+    fn after_proofs(&self, origin: AcquisitionOrigin, holders: &[Holder], ledger: &super::GateLedger) {
+        if !matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart) {
+            return;
+        }
+        let Some(kept) = self.extras.kept.clone() else {
+            return;
+        };
+        let proofs = holders
+            .iter()
+            .filter(|holder| ledger.acceptance_for(&holder.user, origin) == Some(Acceptance::Sound))
+            .count();
+        if proofs == 0 {
+            return;
+        }
+        tokio::spawn(async move {
+            for _ in 0..proofs {
+                kept.after_a_proof().await;
+            }
+        });
+    }
+
+    /// Holds `users`' heart of a song "not yet proven" with `line`, joining a hold already there,
+    /// its row held with that line: the copy kept for them turned out to be another song, so only
+    /// a new play of the song can prove one. Each holder carries what they last heard of it.
+    pub fn hold_not_yet_proven(&self, provider: &str, external_id: &str, users: &[String], line: &str) {
+        let holders: Vec<Holder> = users
+            .iter()
+            .map(|user| user.trim())
+            .filter(|user| !user.is_empty())
+            .map(|user| self.holder_for(external_id, Some(user)))
+            .collect();
+        let Some(first) = holders.first().map(|holder| holder.user.clone()) else {
+            return;
+        };
+        if let Some(tracker) = self.tracker()
+            && !tracker.is_held(provider, external_id)
+        {
+            let routing = self
+                .extras
+                .id_registry
+                .as_ref()
+                .and_then(|ids| ids.resolve_song(external_id, false))
+                .map(|shared| shared.snapshot());
+            tracker.begin(
                 provider,
                 external_id,
-                requested_by,
-                held_since_utc,
-                target,
-                origin,
-                holders,
-                Vec::new(),
-                &mut Vec::new(),
-            )
-            .await;
-        // A heart a gate proved: the kept file checked longest ago is checked again next.
-        if matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart)
-            && matches!(outcome, Ok(TrackOutcome::Landed(_)))
-            && self.extras.gates.is_some()
-            && let Some(kept) = self.extras.kept.clone()
-        {
-            tokio::spawn(async move { kept.after_a_proof().await });
+                None,
+                Some(&first),
+                routing.as_ref().and_then(|r| r.artist.as_deref()),
+                routing.as_ref().and_then(|r| r.title.as_deref()),
+                routing.as_ref().and_then(|r| r.album.as_deref()),
+            );
         }
-        outcome
+        self.file_hold(
+            provider,
+            external_id,
+            Some(&first),
+            AcquisitionOrigin::Heart,
+            WaitingFor::NotYetProven,
+            holders,
+            line,
+            Vec::new(),
+            None,
+            &mut Vec::new(),
+        );
     }
 
     /// One person's place in a heart's gate: who they are and what they heard of the song.
@@ -1786,6 +1846,7 @@ impl HeartAcquisitionCoordinator {
         if ledger.is_empty() || holders.is_empty() {
             return TrackOutcome::Landed(path);
         }
+        self.after_proofs(origin, holders, ledger);
         let mut landed = false;
         let mut held = None;
         let mut why = None;

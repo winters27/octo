@@ -1066,6 +1066,15 @@ impl HeartGates for HeardGates {
 
 /// A heart coordinator whose chain runs these sources, with these gates.
 fn rig_with(sources: &[HeartDownloadSource], gates: Arc<dyn HeartGates>) -> Rig {
+    rig_checking(sources, gates, None)
+}
+
+/// [`rig_with`], checking these kept files again on the events their checks follow.
+fn rig_checking(
+    sources: &[HeartDownloadSource],
+    gates: Arc<dyn HeartGates>,
+    kept: Option<Arc<crate::services::library::upgrade_queue::KeptRechecks>>,
+) -> Rig {
     let settings = Arc::new(SettingsStore::for_tests(AppSettings {
         subsonic: SubsonicSettings {
             heart_download_sources: sources
@@ -1094,6 +1103,7 @@ fn rig_with(sources: &[HeartDownloadSource], gates: Arc<dyn HeartGates>) -> Rig 
             tracker: Some(tracker.clone()),
             holds: Some(holds.clone()),
             gates: Some(gates),
+            kept,
             ..Default::default()
         },
     );
@@ -1746,4 +1756,205 @@ async fn a_held_song_streamed_again_runs_its_hold_with_what_was_heard_now() {
         record.holders[0].heard.as_ref().map(|heard| heard.source.clone()),
         Some(played.source)
     );
+}
+
+// ---- Kept files checked again ------------------------------------------------------------------
+
+/// Octo's kept-as-heard file of `song`, its print kept with it, checked again against an AcoustID
+/// that does not know it; the AcoustID that counts the lookups.
+async fn kept_file_checks(
+    dir: &std::path::Path,
+    song: &str,
+) -> (
+    Arc<crate::services::library::upgrade_queue::KeptRechecks>,
+    MockServer,
+) {
+    use crate::services::fingerprint::{AcoustIdClient, AcoustIdRateLimitHandler, AcoustIdRateLimiter};
+    use crate::services::library::library_action_test_support::RecordingLibrary;
+    use crate::services::local::{KeptHeart, LocalSongMapping};
+
+    let acoust_id = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(r#"{"status":"ok","results":[]}"#, "application/json"),
+        )
+        .mount(&acoust_id)
+        .await;
+    let path = dir.join("kept.m4a");
+    std::fs::write(&path, b"the audio that played").expect("written");
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings::default()));
+    let limiter = Arc::new(
+        AcoustIdRateLimiter::with_gaps(Duration::from_millis(1), Duration::from_millis(1))
+            .with_jitter(|| 1.0),
+    );
+    let client = Arc::new(AcoustIdClient::with_built_in_key(
+        Arc::new(AcoustIdRateLimitHandler::with_base_url(
+            limiter,
+            Url::parse(&format!("{}/", acoust_id.uri())).expect("parses"),
+        )),
+        settings.clone(),
+        Some("octo-key"),
+    ));
+    let library = Arc::new(RecordingLibrary::default());
+    library.mappings.lock().push(LocalSongMapping {
+        external_provider: "soulseek".into(),
+        external_id: song.into(),
+        local_path: path.to_string_lossy().replace('\\', "/"),
+        heart: Some(KeptHeart {
+            users: vec!["brandon".into()],
+            as_heard: true,
+            print: Some("AQADtEqk".into()),
+            seconds: Some(139),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let kept = Arc::new(crate::services::library::upgrade_queue::KeptRechecks::new(
+        library,
+        client,
+        settings,
+        Arc::new(ExternalIdRegistry::in_memory()),
+    ));
+    (kept, acoust_id)
+}
+
+/// A heart whose kept copy a check found to be another song holds "not yet proven" with the line a
+/// stream that stood in with another song gets, its finished row held again with that line; a
+/// second such check joins the same hold.
+#[tokio::test]
+async fn a_heart_whose_kept_copy_is_another_song_holds_for_a_play_with_its_line() {
+    let rig = rig_with(&[HeartDownloadSource::Soulseek], Arc::new(ListedGates::default()));
+    rig.tracker.begin(
+        "soulseek",
+        "help",
+        None,
+        Some("brandon"),
+        Some("The Beatles"),
+        Some("Help!"),
+        None,
+    );
+    rig.tracker.done_line("soulseek", "help", KEPT_AS_HEARD);
+    rig.tracker.complete("soulseek", "help", None);
+
+    for _ in 0..2 {
+        rig.coordinator
+            .hold_not_yet_proven("soulseek", "help", &["brandon".into()], ANOTHER_SONG_PLAYED);
+    }
+
+    let records = rig.holds.snapshot();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].key(), "Track:soulseek:help:NotYetProven");
+    assert_eq!(users(&records[0]), ["brandon"]);
+    assert_eq!(records[0].line.as_deref(), Some(ANOTHER_SONG_PLAYED));
+    assert!(rig.tracker.is_held("soulseek", "help"));
+    assert_eq!(
+        rig.tracker.note_of("soulseek", "help").as_deref(),
+        Some(ANOTHER_SONG_PLAYED)
+    );
+}
+
+/// How many lookups `acoust_id` has had once `wanted` arrived, or after a short wait for none.
+async fn lookups_settle(acoust_id: &MockServer, wanted: usize) -> usize {
+    for _ in 0..200 {
+        let seen = acoust_id.received_requests().await.unwrap_or_default().len();
+        if wanted > 0 && seen >= wanted {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    acoust_id.received_requests().await.unwrap_or_default().len()
+}
+
+/// Lands every request, each gate on it accepting the file by `by`, as the download's check point
+/// writes it.
+fn accept_by(rig: &Rig, by: octo_core::fingerprint::heart_gate::Acceptance) -> (Taken, CancellationToken) {
+    let taken: Taken = Arc::default();
+    let stop = CancellationToken::new();
+    let (queue, seen, token) = (rig.queue.clone(), taken.clone(), stop.clone());
+    tokio::spawn(async move {
+        while let Some(request) = queue.dequeue(&token).await {
+            seen.lock().push(request.clone());
+            let ledger = request.completion.ledger().clone();
+            for gate in request.gates() {
+                ledger.record_accepted(&gate.user, gate.origin, by);
+            }
+            queue.release(&request);
+            request
+                .completion
+                .try_set_result(format!("/music/{}.flac", request.external_id));
+        }
+    });
+    (taken, stop)
+}
+
+/// Only a heart AcoustID's clear reading accepted checks the kept file checked longest ago; a heart
+/// the master heard or the very audio heard proved checks none.
+#[tokio::test]
+async fn only_a_clear_readings_proof_checks_a_kept_file_again() {
+    use octo_core::fingerprint::heart_gate::Acceptance;
+
+    for (by, checks) in [
+        (Acceptance::Sound, 1),
+        (Acceptance::HeardMaster, 0),
+        (Acceptance::HeardAudio, 0),
+    ] {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (kept, acoust_id) = kept_file_checks(dir.path(), "yesterday").await;
+        let gates = HeardGates::reading(HeardReading::RStays { tag: None });
+        gates.heard("brandon", heard_video());
+        let rig = rig_checking(&[HeartDownloadSource::Soulseek], gates, Some(kept));
+        let (_taken, stop) = accept_by(&rig, by);
+
+        assert_eq!(
+            heart_of(&rig, "brandon").await,
+            TrackOutcome::Landed("/music/help.flac".into()),
+            "{by:?}"
+        );
+        assert_eq!(
+            lookups_settle(&acoust_id, checks).await,
+            checks,
+            "{by:?}: the kept file is checked again only after a clear reading's proof"
+        );
+        stop.cancel();
+    }
+}
+
+/// The person's own Retry on a downloads row (the apps star the song again) is one of the events a
+/// song's kept files and holds are checked on: their kept-as-heard file of it is checked again with
+/// one lookup, and their heart held "not yet proven" runs again.
+#[tokio::test]
+async fn the_persons_own_retry_checks_their_kept_file_and_their_held_heart_again() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (kept, acoust_id) = kept_file_checks(dir.path(), "help").await;
+    let gates = Arc::new(HeardGates::default());
+    *gates.hold.lock() = Some(WaitingFor::NotYetProven);
+    let rig = rig_checking(&[HeartDownloadSource::Soulseek], gates, Some(kept));
+    rig.holds.hold(held(
+        "help",
+        AcquisitionOrigin::Heart,
+        WaitingFor::NotYetProven,
+        &["brandon"],
+    ));
+    let (taken, stop) = work(&rig, sources_fail_heard_lands());
+
+    // Retry: the same person's heart of the same song.
+    assert_eq!(
+        heart_of(&rig, "brandon").await,
+        TrackOutcome::Held(WaitingFor::NotYetProven),
+        "it joins the hold it already waits in"
+    );
+
+    assert_eq!(
+        lookups_settle(&acoust_id, 1).await,
+        1,
+        "the kept file's print is looked up once"
+    );
+    until(|| rig.coordinator.resuming.lock().is_empty()).await;
+    let record = rig
+        .holds
+        .get("Track:soulseek:help:NotYetProven")
+        .expect("still held, nothing proven");
+    assert_eq!(users(&record), ["brandon"]);
+    assert!(taken.lock().is_empty(), "its gate holds again before any source");
+    stop.cancel();
 }

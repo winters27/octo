@@ -1176,7 +1176,20 @@ impl Acquisition {
                     }
                 },
             ));
+            // A kept file that a check finds is another song holds its heart for a play.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            kept_rechecks.use_hold(Arc::new(
+                move |provider: &str, id: &str, users: &[String], line: &str| {
+                    if let Some(coordinator) = coordinator.upgrade() {
+                        coordinator.hold_not_yet_proven(provider, id, users, line);
+                    }
+                },
+            ));
         }
+        // A kept file's checks ask MusicBrainz as the heart's gate does, and its replacements are
+        // compared with its own print.
+        kept_rechecks.use_music_brainz(clients.music_brainz.clone(), clients.deezer_metadata.clone());
+        kept_rechecks.use_samples(stores.heard_samples.clone());
         heart_acquisition_coordinator.use_family(FamilyHooks {
             gate: navidrome.family_write_gate.clone(),
             pool: navidrome.family_pool_service.clone(),

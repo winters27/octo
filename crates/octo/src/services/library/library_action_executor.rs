@@ -217,6 +217,12 @@ pub struct LibraryActionExecutorParts {
     pub answers: Option<SongAnswers>,
 }
 
+/// A copy for a file a heart kept that its gate could not judge now: the replacement stops, and
+/// the kept file waits for its next check.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("the copy could not be judged now")]
+struct KeptUpgradeWaits;
+
 /// How a replacement ended: the outcome, where the original waits, and the new file.
 struct Replaced {
     outcome: LibraryActionOutcome,
@@ -1361,6 +1367,17 @@ impl LibraryActionExecutor {
                     handoff.clone(),
                 );
                 let outcome = completion.wait().await;
+                // A file a heart kept is never held for: a copy its gate cannot judge now (AcoustID
+                // or MusicBrainz not answering) is thrown away, and the next check tries again.
+                if kept_gate.is_some()
+                    && let Err(e) = &outcome
+                    && let Some(held) = e.downcast_ref::<crate::services::common::AcquisitionHeld>()
+                {
+                    for file in &held.files {
+                        try_delete(file);
+                    }
+                    return Err(Arc::new(anyhow::Error::new(KeptUpgradeWaits)));
+                }
                 // Its file waits in the one hold path for AcoustID's bulk turn: once the lane gives
                 // turns again, the same source goes on with that file.
                 if let Err(e) = &outcome
@@ -1406,6 +1423,32 @@ impl LibraryActionExecutor {
         let quarantine_path = || admission.quarantine_path.lock().clone();
         let replacement = match attempt {
             Ok(replacement) => replacement.unwrap_or_default(),
+            Err(e) if e.downcast_ref::<KeptUpgradeWaits>().is_some() => {
+                // Nothing moved: the kept file stays as it is, with the outside songs it had.
+                let forgotten = std::mem::take(&mut *admission.forgotten.lock());
+                if !forgotten.is_empty()
+                    && let Err(e) = self
+                        .library
+                        .restore_mappings(&forgotten, &original.absolute_path)
+                        .await
+                {
+                    warn!(
+                        "The outside songs of {} could not be linked to it again: {e}",
+                        original.absolute_path
+                    );
+                }
+                info!(
+                    "Library action {}: the copy for the kept {} could not be judged now; it waits for the next check",
+                    action_name(request.action),
+                    original.absolute_path
+                );
+                return Replaced {
+                    outcome: LibraryActionOutcome::new(LibraryActionState::Skipped, None),
+                    quarantine_path: None,
+                    new_path: None,
+                    arrived: None,
+                };
+            }
             Err(e) => {
                 if let Some(rejected) = is_rejected(&e) {
                     // Refused before it was ever in the library; the original never moved.
