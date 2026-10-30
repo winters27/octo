@@ -112,7 +112,14 @@ fn gate_of(built: GateBuild) -> HeartGate {
 }
 
 /// A file in the rig's folder whose sound is named, with `isrc` as its own tag.
-fn file(rig: &GateRig, name: &str, print: &str, master: &str, answer: &str, isrc: Option<&str>) -> std::path::PathBuf {
+fn file(
+    rig: &GateRig,
+    name: &str,
+    print: &str,
+    master: &str,
+    answer: &str,
+    isrc: Option<&str>,
+) -> std::path::PathBuf {
     let path = rig.dir.path().join(format!("{name}.flac"));
     sound_flac(&path, 200, &sound_bytes(print, master, answer), isrc);
     path
@@ -148,7 +155,11 @@ async fn a_search_heart_never_played_takes_r_from_its_pinned_videos_stand_in() {
     let GateBuild::Ready(gate) = build(&rig, &id, None).await else {
         panic!("the stand-in gave R");
     };
-    assert_eq!(rig.streams_of(VIDEO).await, 1, "the pinned video was fetched once");
+    assert_eq!(
+        rig.streams_of(VIDEO).await,
+        1,
+        "the pinned video was fetched once"
+    );
     assert_eq!(gate.r.as_ref().expect("R").ids, [HELP_2015]);
     assert_eq!(gate.reading, HeardReading::NotHeard, "a stand-in is never heard");
     assert!(gate.heard.is_none());
@@ -158,7 +169,10 @@ async fn a_search_heart_never_played_takes_r_from_its_pinned_videos_stand_in() {
 
     rig.answers.answer("file", &clear_2015);
     let like_it = file(&rig, "like", "stand-in", "a", "file", None);
-    let check = rig.service.verify_for_heart(&like_it, &candidate(&id), &gate).await;
+    let check = rig
+        .service
+        .verify_for_heart(&like_it, &candidate(&id), &gate)
+        .await;
     assert!(
         matches!(
             check.verdict,
@@ -171,7 +185,10 @@ async fn a_search_heart_never_played_takes_r_from_its_pinned_videos_stand_in() {
         check.verdict
     );
     let unlike = file(&rig, "unlike", "another-take", "b", "file", None);
-    let check = rig.service.verify_for_heart(&unlike, &candidate(&id), &gate).await;
+    let check = rig
+        .service
+        .verify_for_heart(&unlike, &candidate(&id), &gate)
+        .await;
     assert_eq!(check.verdict, GateVerdict::Refuse(Refusal::DiffersFromHeard));
 }
 
@@ -274,7 +291,11 @@ async fn a_64_kb_heard_print_is_topped_up_and_proof_2_runs_against_the_whole_pri
         panic!("the topped-up print was read");
     };
     assert_eq!(rig.streams_of(VIDEO).await, 1, "one fetch tops it up");
-    assert_eq!(rig.answers.asked(), ["heard-whole"], "the whole print was looked up");
+    assert_eq!(
+        rig.answers.asked(),
+        ["heard-whole"],
+        "the whole print was looked up"
+    );
     let kept = rig
         .rig
         .samples
@@ -325,7 +346,8 @@ async fn a_transient_shim_failure_holds_the_heart_for_the_shim() {
         waits(&built),
         Some((
             WaitingFor::Shim,
-            crate::services::common::heart_acquisition_coordinator::waiting_line(WaitingFor::Shim).to_string()
+            crate::services::common::heart_acquisition_coordinator::waiting_line(WaitingFor::Shim)
+                .to_string()
         ))
     );
     assert!(rig.answers.asked().is_empty(), "nothing was looked up");
@@ -387,7 +409,14 @@ async fn taylors_version_is_refused_by_proof_2_even_when_acoust_id_names_2008() 
             "USCJY0803275",
         )]),
     );
-    let tv = file(&rig, "tv", "taylors-version", "lovestory-tv", "wrongly-2008", None);
+    let tv = file(
+        &rig,
+        "tv",
+        "taylors-version",
+        "lovestory-tv",
+        "wrongly-2008",
+        None,
+    );
     let check = rig.service.verify_for_heart(&tv, &candidate("x"), &gate).await;
     assert_eq!(check.verdict, GateVerdict::Refuse(Refusal::DiffersFromHeard));
     assert_eq!(rig.answers.asked(), ["wrongly-2008"]);
@@ -445,7 +474,8 @@ fn help_heard(rig: &GateRig) -> HeartGate {
 /// when its own ISRC is one MusicBrainz lists on another release of the same song, and is refused
 /// when its ISRC names another song.
 #[tokio::test]
-async fn with_acoust_id_busy_an_a2_passing_file_from_another_release_lands_and_one_naming_another_song_is_refused() {
+async fn with_acoust_id_busy_an_a2_passing_file_from_another_release_lands_and_one_naming_another_song_is_refused()
+ {
     let rig = gate_rig(GateSetup::default()).await;
     rig.shim_streams(VIDEO, sound_bytes("-", "help-2009-master", "-"))
         .await;
@@ -508,8 +538,14 @@ async fn with_acoust_id_busy_an_a2_passing_file_from_another_release_lands_and_o
         .await;
     assert_eq!(check.verdict, GateVerdict::Refuse(Refusal::Label));
     let asked = rig.music_brainz().asked();
-    assert!(asked.iter().any(|p| p.ends_with("/isrc/GBXYZ1500001")), "{asked:?}");
-    assert!(asked.iter().any(|p| p.ends_with("/isrc/GBXYZ9500002")), "{asked:?}");
+    assert!(
+        asked.iter().any(|p| p.ends_with("/isrc/GBXYZ1500001")),
+        "{asked:?}"
+    );
+    assert!(
+        asked.iter().any(|p| p.ends_with("/isrc/GBXYZ9500002")),
+        "{asked:?}"
+    );
 }
 
 /// A file's label question MusicBrainz does not answer holds the file for MusicBrainz; filed, the
@@ -591,11 +627,8 @@ async fn on_deezer(rig: &GateRig, isrc: &str, title: &str, seconds: i32, clip: &
         ))
         .mount(&rig.shim)
         .await;
-    let clip_print = std::fs::read(
-        gate_fixture("../clip")
-            .join(format!("{clip}-clip.json")),
-    )
-    .expect("the clip print");
+    let clip_print =
+        std::fs::read(gate_fixture("../clip").join(format!("{clip}-clip.json"))).expect("the clip print");
     Mock::given(path(format!("/clip/{clip}.mp3")))
         .respond_with(ResponseTemplate::new(200).set_body_raw(clip_print, "audio/mpeg"))
         .mount(&rig.shim)
@@ -627,14 +660,18 @@ async fn walrus_heard(rig: &GateRig) -> (String, HeardRecord) {
         you_tube_id: Some(VIDEO.into()),
         ..Default::default()
     });
-    on_deezer(rig, WALRUS_CODE, "I Am The Walrus (Remastered 2009)", 276, "walrus-2009").await;
-    rig.printer
-        .register("walrus-2023-heard", frozen_print("walrus-2023-240"));
-    rig.shim_streams(
-        VIDEO,
-        sound_bytes("walrus-2023-heard", "walrus-2023-master", "-"),
+    on_deezer(
+        rig,
+        WALRUS_CODE,
+        "I Am The Walrus (Remastered 2009)",
+        276,
+        "walrus-2009",
     )
     .await;
+    rig.printer
+        .register("walrus-2023-heard", frozen_print("walrus-2023-240"));
+    rig.shim_streams(VIDEO, sound_bytes("walrus-2023-heard", "walrus-2023-master", "-"))
+        .await;
     let record = heard_with(rig, VIDEO, frozen_print("walrus-2023-240"), true, "heard");
     (id, record)
 }
@@ -666,7 +703,10 @@ async fn with_acoust_id_off_walrus_2023_on_the_topic_channel_is_this_song_and_it
         "x",
         None,
     );
-    let check = rig.service.verify_for_heart(&master, &candidate(&id), &gate).await;
+    let check = rig
+        .service
+        .verify_for_heart(&master, &candidate(&id), &gate)
+        .await;
     assert!(
         matches!(
             check.verdict,

@@ -82,14 +82,19 @@ pub(crate) fn sound_flac(path: &Path, seconds: u64, sound: &[u8], isrc: Option<&
     std::fs::write(path, bytes).expect("the file is written");
     if let Some(isrc) = isrc {
         let mut file = octo_media::tags::TagFile::open(path).expect("the FLAC opens");
-        octo_media::tags::tag_writer_extras::set_text(&mut file, octo_media::tags::TagFields::ISRC, Some(isrc));
+        octo_media::tags::tag_writer_extras::set_text(
+            &mut file,
+            octo_media::tags::TagFields::ISRC,
+            Some(isrc),
+        );
         file.save().expect("the tag is saved");
     }
 }
 
 fn seed_of(name: &str) -> u32 {
-    name.bytes()
-        .fold(2_166_136_261u32, |hash, byte| (hash ^ u32::from(byte)).wrapping_mul(16_777_619))
+    name.bytes().fold(2_166_136_261u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    })
 }
 
 /// `seconds` of print items for a print name: one name, one print.
@@ -284,15 +289,17 @@ impl Respond for AcoustIdByPrint {
         match self.answers.lock().get(&name).cloned() {
             Some((200, body)) => ResponseTemplate::new(200).set_body_raw(body, "application/json"),
             Some((status, _)) => ResponseTemplate::new(status),
-            None => ResponseTemplate::new(200)
-                .set_body_raw(r#"{"status":"ok","results":[]}"#, "application/json"),
+            None => {
+                ResponseTemplate::new(200).set_body_raw(r#"{"status":"ok","results":[]}"#, "application/json")
+            }
         }
     }
 }
 
 /// The frozen AcoustID answer `name` (a `gate/answers` file), as AcoustID sent it.
 pub(crate) fn frozen_body(name: &str) -> String {
-    let text = std::fs::read_to_string(gate_fixture(&format!("answers/{name}.json"))).expect("the frozen answer");
+    let text =
+        std::fs::read_to_string(gate_fixture(&format!("answers/{name}.json"))).expect("the frozen answer");
     let root: serde_json::Value = serde_json::from_str(&text).expect("JSON");
     root["answer"].to_string()
 }
@@ -395,16 +402,14 @@ pub(crate) struct GateRig {
     pub service: Arc<DownloadVerificationService>,
     pub rig: Rig,
     pub holds: Arc<SoulseekHoldStore>,
-    pub settings: Arc<SettingsStore>,
-    pub acoust_id: MockServer,
+    /// AcoustID, kept running for the rig's life.
+    _acoust_id: MockServer,
     pub answers: AcoustIdByPrint,
     /// The shim, Deezer and the clips' CDN.
     pub shim: MockServer,
     pub music_brainz: Option<(MockServer, MusicBrainzByQuestion, Arc<MusicBrainzClient>)>,
-    pub master: Arc<HeardMasterCheck>,
     pub printer: Arc<SoundPrinter>,
     pub rejected: Arc<RejectedPeerRegistry>,
-    pub limiter: Arc<AcoustIdRateLimiter>,
     pub dir: tempfile::TempDir,
 }
 
@@ -434,11 +439,12 @@ pub(crate) async fn gate_rig(setup: GateSetup) -> GateRig {
         ..Default::default()
     }));
     let limiter = Arc::new(
-        AcoustIdRateLimiter::with_gaps(Duration::from_millis(1), Duration::from_millis(20)).with_jitter(|| 1.0),
+        AcoustIdRateLimiter::with_gaps(Duration::from_millis(1), Duration::from_millis(20))
+            .with_jitter(|| 1.0),
     );
     let base = Url::parse(&format!("{}/", acoust_id.uri())).expect("parses");
     let client = Arc::new(AcoustIdClient::with_built_in_key(
-        Arc::new(AcoustIdRateLimitHandler::with_base_url(limiter.clone(), base)),
+        Arc::new(AcoustIdRateLimitHandler::with_base_url(limiter, base)),
         settings.clone(),
         Some(OCTO_KEY),
     ));
@@ -451,7 +457,11 @@ pub(crate) async fn gate_rig(setup: GateSetup) -> GateRig {
             .await;
         let base = Url::parse(&format!("{}/ws/2/", server.uri())).expect("parses");
         let quick = Duration::from_millis(5);
-        let client = Arc::new(MusicBrainzClient::with_base_url(base).with_pace(quick, Duration::from_millis(500), quick));
+        let client = Arc::new(MusicBrainzClient::with_base_url(base).with_pace(
+            quick,
+            Duration::from_millis(500),
+            quick,
+        ));
         Some((server, questions, client))
     } else {
         None
@@ -482,7 +492,7 @@ pub(crate) async fn gate_rig(setup: GateSetup) -> GateRig {
     service.use_heart(HeartParts {
         registry: rig.registry.clone(),
         samples: rig.samples.clone(),
-        master: master.clone(),
+        master,
         clip: Arc::new(clip),
         catalog: setup.catalog,
         holds: holds.clone(),
@@ -492,15 +502,12 @@ pub(crate) async fn gate_rig(setup: GateSetup) -> GateRig {
         service,
         rig,
         holds,
-        settings,
-        acoust_id,
+        _acoust_id: acoust_id,
         answers,
         shim,
         music_brainz,
-        master,
         printer,
         rejected,
-        limiter,
         dir,
     }
 }

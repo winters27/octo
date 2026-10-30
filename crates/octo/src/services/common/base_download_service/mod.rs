@@ -244,6 +244,11 @@ pub trait DownloadBackend: Send + Sync + 'static {
     ) -> bool {
         true
     }
+
+    /// A song fetched ahead kept for a download nobody gates: each heart or play that joined it is
+    /// judged by its own gate, so it counts the copy as its own only when that gate passes it. The
+    /// default judges nothing.
+    async fn judge_ahead_joiners(&self, _download: &TrackDownload, _path: &str, _identity: HeardSource) {}
 }
 
 /// The notice queue's review: ask one person about a download they can settle by listening. False
@@ -1082,7 +1087,12 @@ impl BaseDownloadService {
                     None
                 }
             }
-            Some((landed, fetched_from, _)) => Some((landed, fetched_from)),
+            Some((landed, fetched_from, identity)) => {
+                self.backend
+                    .judge_ahead_joiners(&new_download(song.clone()), &landed, identity)
+                    .await;
+                Some((landed, fetched_from))
+            }
             None => None,
         };
 

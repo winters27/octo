@@ -834,6 +834,7 @@ impl SoulseekDownloadService {
                 verdict.apply_tags_to(song);
             }
             song.verification = Some(Box::new(verdict));
+            self.judge_joiners(download, &path, None).await;
             return Ok(path);
         }
         Err(file_not_found(last_refusal.unwrap_or_else(|| {
@@ -2777,6 +2778,10 @@ impl DownloadBackend for SoulseekDownloadService {
         identity: HeardSource,
     ) -> bool {
         self.judge_ahead_copy(download, path, identity).await
+    }
+
+    async fn judge_ahead_joiners(&self, download: &TrackDownload, path: &str, identity: HeardSource) {
+        self.judge_joiners(download, path, Some(identity)).await;
     }
 
     // =========================================================================

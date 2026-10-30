@@ -32,7 +32,7 @@ use super::music_brainz_client::{CatalogQuestions, MusicBrainzClient, MusicBrain
 use super::preview_check::{self, PreviewOutcome, PreviewRequest, PreviewSource};
 use crate::services::common::SoulseekHoldStore;
 use crate::services::prefetch::HeardSamples;
-use crate::services::prefetch::heard_samples::{Printer, ResumeHold};
+use crate::services::prefetch::heard_samples::ResumeHold;
 use crate::services::soulseek::ExternalIdRegistry;
 use crate::services::soulseek::rejected_peer_registry::RejectedPeerRegistry;
 
