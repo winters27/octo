@@ -1033,10 +1033,11 @@ fn a_named_flac_keeps_its_isrc_tag_and_its_sound() {
 
 // ---- The bulk turn ------------------------------------------------------------------------------
 
-/// Octo's own key's bulk pace backed off to its outage ceiling (640 s, scaled down here to 640 ms
+/// Octo's own key's bulk pace backed off to its outage ceiling (640 s, scaled down here to 3.2 s
 /// with the floors), an import queued first and a heart behind it, one download worker: the
 /// import's file cannot have its bulk turn now, so it waits in the hold path and its job ends; the
-/// heart starts at once and lands; the import lands only once its bulk turn comes.
+/// heart starts at once and lands while the import still waits; the import lands only once its
+/// bulk turn comes.
 #[tokio::test]
 async fn a_heart_behind_an_import_on_a_backed_off_bulk_gap_starts_at_once_and_the_import_lands_after_its_turn()
  {
@@ -1047,7 +1048,7 @@ async fn a_heart_behind_an_import_on_a_backed_off_bulk_gap_starts_at_once_and_th
     use crate::services::fingerprint::acoust_id_rate_limiter::{BusyKind, CallEnd, KeyLane, LookupClass};
 
     let limiter = Arc::new(
-        AcoustIdRateLimiter::with_gaps(Duration::from_millis(200), Duration::from_millis(20))
+        AcoustIdRateLimiter::with_gaps(Duration::from_millis(200), Duration::from_millis(100))
             .with_jitter(|| 1.0),
     );
     let root = Root::new("octo-gate-bulk-");
@@ -1138,10 +1139,10 @@ async fn a_heart_behind_an_import_on_a_backed_off_bulk_gap_starts_at_once_and_th
             .expect("a turn")
             .end(CallEnd::Busy(BusyKind::Outage));
     }
-    let turn = std::time::Instant::now() + Duration::from_millis(640);
+    let turn = std::time::Instant::now() + Duration::from_millis(3200);
     assert_eq!(
         limiter.gap(KeyLane::BuiltIn, LookupClass::Bulk),
-        Duration::from_millis(640)
+        Duration::from_millis(3200)
     );
 
     let importing = coordinator.clone();
@@ -1176,17 +1177,14 @@ async fn a_heart_behind_an_import_on_a_backed_off_bulk_gap_starts_at_once_and_th
         .await
         .expect("the heart ran");
     assert!(matches!(hearted, TrackOutcome::Landed(_)), "{hearted:?}");
-    assert!(
-        std::time::Instant::now() < turn,
-        "the heart never waited for the import's bulk turn"
-    );
+    // The heart never waited for the import's bulk turn: the import still waits for it.
+    assert_eq!(placed_flacs(&root), 1, "only the heart's file is placed yet");
+    let held: Vec<String> = g.holds.snapshot().iter().map(|record| record.key()).collect();
+    assert_eq!(held, [format!("Track:soulseek:{intro}:AcoustId")]);
     import
         .await
         .expect("joined")
         .expect("the import's job ended without an error");
-    assert_eq!(placed_flacs(&root), 1, "only the heart's file is placed yet");
-    let held: Vec<String> = g.holds.snapshot().iter().map(|record| record.key()).collect();
-    assert_eq!(held, [format!("Track:soulseek:{intro}:AcoustId")]);
 
     for _ in 0..1000 {
         if placed_flacs(&root) == 2 && g.holds.snapshot().is_empty() {
