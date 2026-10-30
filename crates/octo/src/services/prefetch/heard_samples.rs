@@ -1386,6 +1386,12 @@ impl HeardSamples {
             "{} answered busy in {STUCK_ROUNDS} rounds; {} waits for a new play",
             wait.video, wait.hold_key
         );
+        // A keep they asked for goes with them, so the new play keeps what it hears.
+        let user = holder.user.trim().to_string();
+        let asked = record
+            .keep_requested
+            .iter()
+            .any(|asker| asker.trim().eq_ignore_ascii_case(&user));
         // The files of a hold nobody else waits in go with the last holder.
         let ended = self.holds.release_holder(&wait.hold_key, &wait.user).is_none();
         let held_files = if ended {
@@ -1397,12 +1403,23 @@ impl HeardSamples {
             waiting_for: Some(WaitingFor::NotYetProven),
             holders: vec![holder],
             held_files,
+            keep_requested: Vec::new(),
             line: Some(STUCK_LINE.to_string()),
             ..record
         });
         let moved = self
             .holds
-            .update(&moved.key(), |r| r.line = Some(STUCK_LINE.to_string()))
+            .update(&moved.key(), |r| {
+                r.line = Some(STUCK_LINE.to_string());
+                if asked
+                    && !r
+                        .keep_requested
+                        .iter()
+                        .any(|asker| asker.trim().eq_ignore_ascii_case(&user))
+                {
+                    r.keep_requested.push(user.clone());
+                }
+            })
             .unwrap_or(moved);
         let row = self.row.lock().clone();
         if let Some(row) = row {
