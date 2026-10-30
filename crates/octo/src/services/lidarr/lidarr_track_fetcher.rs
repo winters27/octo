@@ -324,7 +324,7 @@ async fn tag_of(path: Option<&str>, key: lofty::tag::ItemKey) -> Option<String> 
         let file = lofty::read_from_path(&path).ok()?;
         file.tags()
             .iter()
-            .find_map(|tag| tag.get_string(key.clone()).filter(|id| !id.is_empty()))
+            .find_map(|tag| tag.get_string(key).filter(|id| !id.is_empty()))
             .map(str::to_string)
     })
     .await
