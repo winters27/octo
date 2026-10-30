@@ -54,6 +54,7 @@ use crate::services::cover_art::{
 use octo_media::cover::CoverArtService;
 
 use crate::services::charts::{AppleMusicPages, ChartCountryStore, ChartsWarmWorker, GenreNames};
+use crate::services::common::HeartGates;
 use crate::services::common::IAcquisitionActivity;
 use crate::services::common::TopSongsService;
 use crate::services::cover_art::{AnimatedArt, ArtworkHints, HintedArtwork};
@@ -67,7 +68,6 @@ use crate::services::family::{
     NavidromeAdmin, NavidromeMemberStars, PersonalLibrary, PlayerCaps, PoolParts, RequestStore, SavedStore,
     ScopeResolver, family_service::FamilyService,
 };
-use crate::services::common::HeartGates;
 use crate::services::fingerprint::catalog_clip::CatalogClip;
 use crate::services::fingerprint::download_verification_service::HeartParts;
 use crate::services::fingerprint::heard_master_check::HeardMasterCheck;
@@ -1107,13 +1107,13 @@ impl Acquisition {
             }));
             // A held song streamed again brings a new heard source to the holds that wait on one.
             let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
-            stores
-                .external_id_registry
-                .on_heard(Arc::new(move |id: &str, user: &str, record: &HeardRecord| {
+            stores.external_id_registry.on_heard(Arc::new(
+                move |id: &str, user: &str, record: &HeardRecord| {
                     if let Some(coordinator) = coordinator.upgrade() {
                         coordinator.heard_again(id, user, record);
                     }
-                }));
+                },
+            ));
         }
         heart_acquisition_coordinator.use_family(FamilyHooks {
             gate: navidrome.family_write_gate.clone(),

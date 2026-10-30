@@ -493,6 +493,42 @@ async fn a_refused_replacement_keeps_the_originals_mapping() {
     assert!(f.forgotten().is_empty());
 }
 
+/// A replacement runs as a replacement: work nobody waits on, whose file's check takes the bulk
+/// turn. A file left waiting for that turn in the one hold path goes on with the same source once
+/// AcoustID's lane gives turns again, and the replacement lands from it.
+#[tokio::test]
+async fn a_replacement_runs_as_one_and_its_file_waits_for_the_bulk_turn() {
+    let f = Fixture::new().await;
+    // The lane gives turns again at once here.
+    f.queue
+        .use_turns(Arc::new(|wake: Box<dyn FnOnce() + Send>| wake()));
+    let action = spawn_apply(&f.plain_executor(), wrong_version());
+    let download = f.next_download().await;
+    assert_eq!(
+        download.origin,
+        Some(octo_core::fingerprint::heart_gate::AcquisitionOrigin::Replacement)
+    );
+    let staged = f.staged(&flac(), ".flac");
+    f.fail(
+        &download,
+        anyhow::Error::new(crate::services::common::AcquisitionHeld {
+            waiting_for: octo_core::fingerprint::heart_gate::WaitingFor::AcoustId,
+            line: "Waiting for AcoustID".into(),
+            files: vec![staged.clone()],
+            users: Vec::new(),
+        }),
+    );
+
+    let again = f.next_download().await;
+    assert_eq!(again.place().held_files, std::slice::from_ref(&staged));
+    assert!(again.replacement.is_some(), "still the same replacement");
+    let landed = reveal(&again, &staged).await.expect("admitted");
+    f.finish(&again, &landed);
+    let outcome = outcome_of(action).await;
+    assert_eq!(outcome.state, LibraryActionState::Applied);
+    assert!(Path::new(&f.revealed()).exists());
+}
+
 /// The replacement moved in and then the bookkeeping after it failed (saving the mappings, say).
 /// Restoring the original now would put a duplicate beside it, or be refused at a shared path;
 /// the swap is done, so it counts as applied.

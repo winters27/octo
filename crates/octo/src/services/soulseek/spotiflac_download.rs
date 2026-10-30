@@ -56,7 +56,7 @@ impl SoulseekDownloadService {
                 .download_via_spotiflac(base, &client, routing, download, ct)
                 .await;
             return match first {
-                Err(e) if soulseek_on && !ct.is_cancelled() => {
+                Err(e) if soulseek_on && !ct.is_cancelled() && goes_on(&e) => {
                     info!("Mornye brought nothing ({e}); asking Soulseek");
                     base.log_step(
                         &track_key,
@@ -74,7 +74,7 @@ impl SoulseekDownloadService {
             .download_via_soulseek(base, routing, download, profile, ct)
             .await
         {
-            Err(e) if !ct.is_cancelled() => {
+            Err(e) if !ct.is_cancelled() && goes_on(&e) => {
                 info!("Soulseek brought nothing ({e}); asking Mornye");
                 base.log_step(
                     &track_key,
@@ -435,7 +435,11 @@ impl SoulseekDownloadService {
                 discard_rejected_download(path, started_utc);
                 return Err(not_proven());
             }
-            FileJudged::Refuse { reason, shared, verdict } => {
+            FileJudged::Refuse {
+                reason,
+                shared,
+                verdict,
+            } => {
                 discard_rejected_download(path, started_utc);
                 if shared && verdict.verdict == VerificationVerdict::Mismatch {
                     warn!(
@@ -504,6 +508,15 @@ impl SoulseekDownloadService {
     }
 }
 
+/// Whether a lossless source's failure lets the other one be asked: not when its file waits in the
+/// hold path, nor when a play's download was not proven.
+fn goes_on(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AcquisitionHeld>().is_none()
+        && error
+            .downcast_ref::<crate::services::common::PlayOutcome>()
+            .is_none()
+}
+
 /// How a wait for a Mornye job ended without a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Waited {
@@ -527,7 +540,7 @@ fn audio_in(job_dir: &str) -> Option<(String, u64)> {
 
 /// Removes Mornye job folders a placed or discarded download left empty, after half an hour,
 /// and any a day old. Only inside Octo's own Mornye folder.
-fn sweep_spotiflac_folders(download_path: &str) {
+pub(super) fn sweep_spotiflac_folders(download_path: &str) {
     let jobs = combine(download_path, SPOTIFLAC_FOLDER);
     let sweep = || -> std::io::Result<()> {
         if !Path::new(&jobs).is_dir() {

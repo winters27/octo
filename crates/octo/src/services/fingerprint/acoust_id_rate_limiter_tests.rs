@@ -424,12 +424,14 @@ async fn an_answered_call_wakes_the_oldest_held_lookup() {
     busy_turn.end(CallEnd::Busy(BusyKind::Outage));
     assert!(woken.lock().is_empty(), "a busy answer wakes nothing at once");
 
+    // The person pace is backed off now, so the next answered call here is bulk work's, whose own
+    // pace is free.
     let start = Instant::now();
     let turn = limiter
-        .permit(KeyLane::BuiltIn, LookupClass::Heart, true)
+        .permit(KeyLane::BuiltIn, LookupClass::Bulk, true)
         .await
         .expect("a turn");
-    assert_eq!(Instant::now() - start, Duration::from_secs(4));
+    assert_eq!(Instant::now(), start);
     turn.end(CallEnd::Answered);
     assert_eq!(woken.lock().iter().map(|(n, _)| *n).collect::<Vec<_>>(), [1]);
 }

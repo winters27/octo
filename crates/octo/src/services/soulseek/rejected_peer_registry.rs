@@ -269,7 +269,9 @@ impl RejectedPeerRegistry {
         }
         self.dirty.store(true, Ordering::SeqCst);
         if for_heart {
-            info!("Remembering {username} -> {filename} as refused for one heart's version of {track} ({reason})");
+            info!(
+                "Remembering {username} -> {filename} as refused for one heart's version of {track} ({reason})"
+            );
         } else {
             info!("Remembering rejected candidate {username} -> {filename} ({reason})");
         }
@@ -559,10 +561,19 @@ mod tests {
         let (_dir, path) = temp_path();
         {
             let first = RejectedPeerRegistry::new(Some(&path), None);
-            first.deny_for_heart("song-1", &r(&["rec-2009"]), Some("peer1"), Some(FILE1), "another mix");
+            first.deny_for_heart(
+                "song-1",
+                &r(&["rec-2009"]),
+                Some("peer1"),
+                Some(FILE1),
+                "another mix",
+            );
             first.deny(Some("peer2"), Some(FILE2), "is a karaoke version", "A - B");
             assert!(first.is_denied_for_heart("song-1", &r(&["REC-2009"]), Some("peer1"), Some(FILE1)));
-            assert!(!first.is_denied(Some("peer1"), Some(FILE1)), "imports still take it");
+            assert!(
+                !first.is_denied(Some("peer1"), Some(FILE1)),
+                "imports still take it"
+            );
             assert!(!first.is_denied_for_heart("song-1", &r(&["rec-2015"]), Some("peer1"), Some(FILE1)));
             assert!(!first.is_denied_for_heart("song-2", &r(&["rec-2009"]), Some("peer1"), Some(FILE1)));
             assert!(!first.is_denied_for_heart("song-1", &r(&["rec-2009"]), Some("peer2"), Some(FILE2)));

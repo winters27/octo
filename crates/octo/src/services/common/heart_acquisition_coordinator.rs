@@ -1119,10 +1119,21 @@ impl HeartAcquisitionCoordinator {
                 self.let_go_of_copies(&record.provider, &record.external_id, holder);
             }
         }
-        if holds.get(&key).is_none()
-            && let Some(tracker) = self.tracker()
-        {
-            tracker.release_row(&record.provider, &record.external_id, &holds);
+        match holds.get(&key) {
+            None => {
+                if let Some(tracker) = self.tracker() {
+                    tracker.release_row(&record.provider, &record.external_id, &holds);
+                }
+            }
+            // Someone still waits here (a file landed only for the others): the row says so.
+            Some(still) => {
+                if self
+                    .tracker()
+                    .is_some_and(|tracker| !tracker.is_held(&record.provider, &record.external_id))
+                {
+                    self.hold_row_for(&still);
+                }
+            }
         }
     }
 
@@ -1685,13 +1696,12 @@ impl HeartAcquisitionCoordinator {
         // takes the file from the folder instead of a transfer. With gates, only when someone
         // heard that very copy: any other copy is judged when a source of the chain reaches it.
         let ahead_copy = super::acquisition_key(provider, external_id, false);
-        let heard_ahead = gates.is_empty()
-            || gates.iter().any(|gate| {
-                matches!(
-                    gate.heard.as_ref().map(|heard| &heard.source),
-                    Some(octo_core::fingerprint::heart_gate::HeardSource::Copy { key, .. }) if *key == ahead_copy
-                )
-            });
+        let heard_ahead = gates.is_empty() || gates.iter().any(|gate| {
+            matches!(
+                gate.heard.as_ref().map(|heard| &heard.source),
+                Some(octo_core::fingerprint::heart_gate::HeardSource::Copy { key, .. }) if *key == ahead_copy
+            )
+        });
         if heard_ahead
             && self
                 .extras

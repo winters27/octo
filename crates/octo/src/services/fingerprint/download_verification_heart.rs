@@ -21,10 +21,10 @@ use octo_media::tags::tag_writer_extras;
 use tracing::{debug, info};
 
 use super::*;
-use crate::services::fingerprint::heard_master_check::{HeardAudio, RoundGuard};
-use crate::services::fingerprint::music_brainz_client::{HeartBusy, HeartQuestions, Lane, heart_song};
 use crate::services::common::heart_acquisition_coordinator::{GateStart, HeartGates, waiting_line};
 use crate::services::common::{HeldAcquisition, Holder};
+use crate::services::fingerprint::heard_master_check::{HeardAudio, RoundGuard};
+use crate::services::fingerprint::music_brainz_client::{HeartBusy, HeartQuestions, Lane, heart_song};
 use crate::services::prefetch::heard_samples::{FpcalcClass, TopUp, sample_id_of};
 
 /// The downloads line of a heart whose heard lookup has not answered yet.
@@ -234,9 +234,7 @@ impl DownloadVerificationService {
                         "What played for {external_id} was another song; its video {video} is refused for the song"
                     );
                     parts.registry.refuse_video(external_id, video);
-                    parts
-                        .registry
-                        .refuse_song_video(&song.artist, &song.title, video);
+                    parts.registry.refuse_song_video(&song.artist, &song.title, video);
                 }
                 gate.reading = HeardReading::AnotherSong;
                 if catalog.ids.is_empty() {
@@ -265,10 +263,7 @@ impl DownloadVerificationService {
                     gate.reading = HeardReading::OnlyHeardOrMaster;
                     return GateBuild::Ready(gate);
                 }
-                match self
-                    .became_r(&parts, answer, &dominant, &catalog, min)
-                    .await
-                {
+                match self.became_r(&parts, answer, &dominant, &catalog, min).await {
                     Ok((r, tag)) => {
                         info!(
                             "What played for {external_id} was the recording {}; it is what the heart keeps",
@@ -322,7 +317,8 @@ impl DownloadVerificationService {
         let Some(prints) = prints else {
             return HeardLookup::Gone;
         };
-        let seconds = song_seconds.or_else(|| prints.reaches_end.then_some(prints.seconds).filter(|s| *s > 0));
+        let seconds =
+            song_seconds.or_else(|| prints.reaches_end.then_some(prints.seconds).filter(|s| *s > 0));
         let Some(seconds) = seconds else {
             debug!("The heard audio's length is not known; its sample is read by the catalog's clip");
             return HeardLookup::Read(AcoustIdOutcome::Unreadable { code: None }, None);
@@ -373,24 +369,7 @@ impl DownloadVerificationService {
         // A stable sort: contexts of one kind keep their order.
         ranked.sort_by_key(|(kind, _)| *kind);
         let rs: Vec<HeardRecording> = ranked.into_iter().map(|(_, r)| r).collect();
-        let codes: HashSet<String> = rs
-            .iter()
-            .flat_map(|r| r.isrcs.iter().map(|code| code.to_uppercase()))
-            .collect();
-        if rs.len() == 1 || codes.len() <= 1 {
-            return Ok(rs.into_iter().next().unwrap_or_else(|| named_r(song)));
-        }
-        // They disagree on the ISRC: only a heard answer clear against exactly one picks it.
-        if let Some(AcoustIdOutcome::Answered(answer)) = heard_answer {
-            let clear: Vec<&HeardRecording> = rs
-                .iter()
-                .filter(|r| read_answer(answer, r, min).reading == Reading::Clear)
-                .collect();
-            if let [only] = clear.as_slice() {
-                return Ok((*only).clone());
-            }
-        }
-        Ok(overlap(song, &rs))
+        Ok(settle_candidates(song, rs, heard_answer, min))
     }
 
     /// R becomes the recording that played and the recordings MusicBrainz files under its own
@@ -441,7 +420,11 @@ impl DownloadVerificationService {
         catalog: &HeardRecording,
         min: f64,
     ) {
-        let Some(video) = routing.you_tube_id.clone().filter(|video| !video.trim().is_empty()) else {
+        let Some(video) = routing
+            .you_tube_id
+            .clone()
+            .filter(|video| !video.trim().is_empty())
+        else {
             return;
         };
         let facts = parts.registry.stream_facts(external_id).unwrap_or_default();
@@ -489,7 +472,12 @@ impl DownloadVerificationService {
     /// for until it gives a verdict: the heard master from the person's open round (else a round of
     /// this file alone), and MusicBrainz's word on a merged id or a code. Never the shipped
     /// `verify` and never the song's YouTube preview: a preview cannot tell two mixes apart.
-    pub async fn verify_for_heart(&self, path: &Path, candidate: &HeartCandidate, gate: &HeartGate) -> HeartCheck {
+    pub async fn verify_for_heart(
+        &self,
+        path: &Path,
+        candidate: &HeartCandidate,
+        gate: &HeartGate,
+    ) -> HeartCheck {
         let parts = self.heart.get().cloned();
         let settings = self.settings.current().soulseek.clone();
         let file = path.to_string_lossy().to_string();
@@ -556,9 +544,7 @@ impl DownloadVerificationService {
             (Some(heard), Some(identity)) => is_heard_audio(&heard.source, identity),
             _ => false,
         };
-        let verdict = self
-            .settle(&parts, &mut facts, gate, candidate, path)
-            .await;
+        let verdict = self.settle(&parts, &mut facts, gate, candidate, path).await;
 
         let verification = match lookup {
             Some(lookup) => {
@@ -652,10 +638,7 @@ impl DownloadVerificationService {
                             .cloned()
                     });
                     kept.matched_title = named.as_ref().map(|r| r.title.clone()).or(kept.matched_title);
-                    kept.matched_artist = named
-                        .as_ref()
-                        .map(|r| r.artist_credit())
-                        .or(kept.matched_artist);
+                    kept.matched_artist = named.as_ref().map(|r| r.artist_credit()).or(kept.matched_artist);
                     kept.r#match = named;
                 }
                 kept.recording_id = Some(id.clone());
@@ -764,6 +747,34 @@ fn r_of(song: &HeartSong, identity: &HeardIdentity) -> HeardRecording {
     }
 }
 
+/// R from the candidate contexts' R sets, the first by kind first: the first when they agree on
+/// the ISRC; when they disagree, the one the heard answer reads clear against alone (a dominant
+/// recording alone never picks one), else their overlap.
+fn settle_candidates(
+    song: &HeartSong,
+    rs: Vec<HeardRecording>,
+    heard_answer: Option<&AcoustIdOutcome>,
+    min: f64,
+) -> HeardRecording {
+    let codes: HashSet<String> = rs
+        .iter()
+        .flat_map(|r| r.isrcs.iter().map(|code| code.to_uppercase()))
+        .collect();
+    if rs.len() <= 1 || codes.len() <= 1 {
+        return rs.into_iter().next().unwrap_or_else(|| named_r(song));
+    }
+    if let Some(AcoustIdOutcome::Answered(answer)) = heard_answer {
+        let clear: Vec<&HeardRecording> = rs
+            .iter()
+            .filter(|r| read_answer(answer, r, min).reading == Reading::Clear)
+            .collect();
+        if let [only] = clear.as_slice() {
+            return (*only).clone();
+        }
+    }
+    overlap(song, &rs)
+}
+
 /// The R every candidate shares: the recordings in all of them, and every candidate's ISRC, since
 /// any of them may be the one heard. None shared gives no identity.
 fn overlap(song: &HeartSong, rs: &[HeardRecording]) -> HeardRecording {
@@ -772,7 +783,10 @@ fn overlap(song: &HeartSong, rs: &[HeardRecording]) -> HeardRecording {
     };
     let shared = |ids: &[String], of: fn(&HeardRecording) -> &Vec<String>| -> Vec<String> {
         ids.iter()
-            .filter(|id| rest.iter().all(|r| of(r).iter().any(|other| other.eq_ignore_ascii_case(id))))
+            .filter(|id| {
+                rest.iter()
+                    .all(|r| of(r).iter().any(|other| other.eq_ignore_ascii_case(id)))
+            })
             .cloned()
             .collect()
     };
@@ -873,10 +887,9 @@ fn kind_of_group(group: &GroupFacts) -> u8 {
     if has("Compilation") {
         2
     } else if primary.eq_ignore_ascii_case("Album")
-        && group
-            .secondary_types
-            .iter()
-            .all(|secondary| secondary.eq_ignore_ascii_case("Soundtrack") || secondary.eq_ignore_ascii_case("Live"))
+        && group.secondary_types.iter().all(|secondary| {
+            secondary.eq_ignore_ascii_case("Soundtrack") || secondary.eq_ignore_ascii_case("Live")
+        })
     {
         0
     } else if (primary.eq_ignore_ascii_case("Single") || primary.eq_ignore_ascii_case("EP"))
@@ -968,12 +981,7 @@ impl HeartGates for DownloadVerificationService {
         };
         let rounds: Vec<RoundGuard> = gates
             .iter()
-            .filter(|gate| {
-                !matches!(
-                    gate.reading,
-                    HeardReading::NotHeard | HeardReading::AnotherSong
-                )
-            })
+            .filter(|gate| !matches!(gate.reading, HeardReading::NotHeard | HeardReading::AnotherSong))
             .filter_map(|gate| {
                 let heard = gate.heard.clone()?;
                 Some(
@@ -990,7 +998,8 @@ impl HeartGates for DownloadVerificationService {
 impl DownloadVerificationService {
     /// The clip prints a holder's hold already keeps, or that their last gate took.
     fn prints_for(&self, provider: &str, external_id: &str, holder: &Holder) -> ClipPrints {
-        let base = crate::services::common::heart_acquisition_coordinator::track_base_key(provider, external_id);
+        let base =
+            crate::services::common::heart_acquisition_coordinator::track_base_key(provider, external_id);
         if let Some(kept) = self
             .clip_prints
             .lock()
@@ -1019,7 +1028,8 @@ impl DownloadVerificationService {
         if prints == ClipPrints::default() {
             return;
         }
-        let base = crate::services::common::heart_acquisition_coordinator::track_base_key(provider, external_id);
+        let base =
+            crate::services::common::heart_acquisition_coordinator::track_base_key(provider, external_id);
         if let Some(parts) = self.heart.get() {
             for record in parts.holds.records_for(&base) {
                 if record
@@ -1042,3 +1052,7 @@ impl DownloadVerificationService {
 
 /// The most clip prints kept between a gate and its hold.
 const MOST_KEPT_PRINTS: usize = 256;
+
+#[cfg(test)]
+#[path = "download_verification_heart_tests.rs"]
+mod tests;

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeartGate};
 use octo_core::settings::DownloadSource;
 use tokio_util::sync::CancellationToken;
 
@@ -270,4 +271,120 @@ async fn stars_lined_up_count_toward_the_bound() {
         taken += 1;
     }
     assert_eq!(taken, TrackAcquisitionQueue::STAR_CAPACITY);
+}
+
+// ---- Joiners with a gate of their own ---------------------------------------------------------
+
+fn gate(user: &str, origin: AcquisitionOrigin) -> HeartGate {
+    HeartGate {
+        user: user.into(),
+        origin,
+        r: None,
+        heard: None,
+        heard_seconds: None,
+        reading: octo_core::fingerprint::heart_gate::HeardReading::NotHeard,
+        stand_in: None,
+    }
+}
+
+fn heart_as(
+    queue: &TrackAcquisitionQueue,
+    id: &str,
+    user: &str,
+    target: AcquisitionTarget,
+    gates: Vec<HeartGate>,
+) -> Completion {
+    queue.enqueue_as(
+        Some(AcquisitionOrigin::Heart),
+        gates,
+        &target,
+        false,
+        "soulseek",
+        id,
+        true,
+        false,
+        true,
+        None,
+        true,
+        Some(user),
+        false,
+        None,
+    )
+}
+
+/// With Family on, a heart that joins a request in flight with its own gate gets its member's
+/// link only when its own gate passed the landed file: a refused joiner gets no link and no
+/// attribution, and one that passed gets both.
+#[tokio::test]
+async fn a_joiner_its_own_gate_refused_gets_no_link_and_no_attribution() {
+    let queue = TrackAcquisitionQueue::new();
+    let first = heart_as(
+        &queue,
+        "song",
+        "alice",
+        AcquisitionTarget::Member("alice".into()),
+        vec![gate("alice", AcquisitionOrigin::Heart)],
+    );
+    heart_as(
+        &queue,
+        "song",
+        "bob",
+        AcquisitionTarget::Member("bob".into()),
+        vec![gate("bob", AcquisitionOrigin::Heart)],
+    );
+    heart_as(
+        &queue,
+        "song",
+        "carol",
+        AcquisitionTarget::Member("carol".into()),
+        vec![gate("carol", AcquisitionOrigin::Heart)],
+    );
+    let request = queue.dequeue(&CancellationToken::new()).await.expect("a request");
+    assert_eq!(request.pool_members(), ["alice"], "joiners wait for their gates");
+    assert_eq!(request.requested_by(), ["alice"]);
+    assert_eq!(request.gates().len(), 3, "each joiner is judged on its own");
+    // The download's check point writes each gate's verdict.
+    let ledger = first.ledger();
+    ledger.record("alice", AcquisitionOrigin::Heart, GateOutcome::Accepted);
+    ledger.record(
+        "bob",
+        AcquisitionOrigin::Heart,
+        GateOutcome::NotAccepted("another mix".into()),
+    );
+    ledger.record("carol", AcquisitionOrigin::Heart, GateOutcome::Accepted);
+    request.settle_joiners();
+    assert_eq!(request.pool_members(), ["alice", "carol"]);
+    assert_eq!(request.requested_by(), ["alice", "carol"]);
+}
+
+/// A joiner without a gate (the shipped checks) is recorded at once, as it always was; and when
+/// no gate judged the landed file, every gated joiner is recorded too.
+#[tokio::test]
+async fn joiners_with_no_verdict_on_the_file_are_recorded_as_before() {
+    let queue = TrackAcquisitionQueue::new();
+    heart_as(
+        &queue,
+        "song",
+        "alice",
+        AcquisitionTarget::Member("alice".into()),
+        Vec::new(),
+    );
+    heart_as(
+        &queue,
+        "song",
+        "bob",
+        AcquisitionTarget::Member("bob".into()),
+        Vec::new(),
+    );
+    heart_as(
+        &queue,
+        "song",
+        "carol",
+        AcquisitionTarget::Member("carol".into()),
+        vec![gate("carol", AcquisitionOrigin::Heart)],
+    );
+    let request = queue.dequeue(&CancellationToken::new()).await.expect("a request");
+    assert_eq!(request.pool_members(), ["alice", "bob"]);
+    request.settle_joiners();
+    assert_eq!(request.pool_members(), ["alice", "bob", "carol"]);
 }

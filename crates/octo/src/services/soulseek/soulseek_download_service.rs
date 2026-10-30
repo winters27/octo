@@ -60,8 +60,8 @@ use crate::services::common::{
     OperationCanceled, TrackDownload,
 };
 use crate::services::fingerprint::DownloadVerificationService;
-use crate::services::fingerprint::download_verification_service::YOUTUBE_PEER;
 use crate::services::fingerprint::acoust_id_rate_limiter::{AcoustIdRateLimiter, LookupClass};
+use crate::services::fingerprint::download_verification_service::YOUTUBE_PEER;
 use crate::services::fingerprint::download_verification_service::trustworthy;
 use crate::services::fingerprint::preview_check::{
     self, Heard, PreviewFacts, PreviewOutcome, PreviewRequest,
@@ -658,7 +658,9 @@ impl SoulseekDownloadService {
             .await?;
             let Some(path) = path.filter(|p| !p.is_empty() && file_exists(p)) else {
                 // One video the shim could not save is no reason to give up: the next is tried.
-                warn!("YouTube MP3 download failed for video {video_id} of '{artist} - {title}'; trying the next video");
+                warn!(
+                    "YouTube MP3 download failed for video {video_id} of '{artist} - {title}'; trying the next video"
+                );
                 last_refusal = Some(format!("YouTube MP3 download failed for '{artist} - {title}'"));
                 if ct.is_cancelled() {
                     return Err(OperationCanceled.into());
@@ -1959,8 +1961,9 @@ impl SoulseekDownloadService {
                                      advancing without blaming {}",
                                     hit.username
                                 );
-                                last_error =
-                                    Some("the downloaded file disappeared while it was being identified".into());
+                                last_error = Some(
+                                    "the downloaded file disappeared while it was being identified".into(),
+                                );
                                 // Like the held-back copy: with the caller gone, no other peer is tried.
                                 if caller_gave_up {
                                     break;
@@ -1993,7 +1996,8 @@ impl SoulseekDownloadService {
                                     ),
                                     verdict.heard(),
                                 );
-                                let identified = format!("AcoustID identified the file as {}", verdict.describe());
+                                let identified =
+                                    format!("AcoustID identified the file as {}", verdict.describe());
                                 if !verdict.deny_reason.is_empty() {
                                     last_refusal = Some((identified.clone(), verdict.deny_reason.clone()));
                                 }
@@ -2797,10 +2801,7 @@ impl DownloadBackend for SoulseekDownloadService {
         };
         // A resumed hold brings back the files it held: the first still there that passes the
         // checks is the download, before any source is asked.
-        if let Some(path) = self
-            .take_held_file(base, &routing.snapshot(), download)
-            .await?
-        {
+        if let Some(path) = self.take_held_file(base, &routing.snapshot(), download).await? {
             return Ok(path);
         }
         // A play judged inside its own acquisition (Wait for lossless, queued with no gate) gets
@@ -2866,7 +2867,7 @@ impl DownloadBackend for SoulseekDownloadService {
             }
             source => source,
         };
-        match source {
+        let fetched = match source {
             DownloadSource::YouTube => {
                 self.download_via_you_tube(base, &routing, download, true, cancellation_token)
                     .await
@@ -2881,7 +2882,13 @@ impl DownloadBackend for SoulseekDownloadService {
                     .await
                 {
                     Ok(path) => Ok(path),
-                    Err(e) if !cancellation_token.is_cancelled() => {
+                    // A file that waits in the hold path, or a play nothing proved, is no reason
+                    // to fetch an MP3.
+                    Err(e)
+                        if !cancellation_token.is_cancelled()
+                            && e.downcast_ref::<AcquisitionHeld>().is_none()
+                            && e.downcast_ref::<crate::services::common::PlayOutcome>().is_none() =>
+                    {
                         warn!("Lossless download failed ({e}); falling back to YouTube MP3");
                         if !download.suppress_notify {
                             base.notifications().notify(NotificationEvent {
@@ -2907,6 +2914,24 @@ impl DownloadBackend for SoulseekDownloadService {
                 self.download_lossless(base, &snapshot, download, &profile, cancellation_token)
                     .await
             }
+        };
+        // A play's download that no gate passed resolves "not proven", so a play waiting on it
+        // serves its stand-in.
+        let plays_only = gated(download)
+            && download
+                .gates
+                .iter()
+                .all(|gate| gate.origin == octo_core::fingerprint::heart_gate::AcquisitionOrigin::Play);
+        match fetched {
+            Err(e)
+                if plays_only
+                    && e.downcast_ref::<OperationCanceled>().is_none()
+                    && e.downcast_ref::<AcquisitionHeld>().is_none() =>
+            {
+                info!("The play of {external_id} keeps no copy: {e}");
+                Err(not_proven())
+            }
+            other => other,
         }
     }
 

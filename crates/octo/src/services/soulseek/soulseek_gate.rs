@@ -5,8 +5,8 @@
 //! whose lookup would have to wait for its bulk turn moves its file to the one hold path instead.
 
 use octo_core::fingerprint::heart_gate::{
-    AcquisitionOrigin, FileFacts, GateVerdict, HeardReading, HeardSource, HeartGate, ImportJudgement, Refusal,
-    TagClaim, Undecided, WaitingFor, import_judgement,
+    AcquisitionOrigin, FileFacts, GateVerdict, HeardReading, HeardSource, HeartGate, ImportJudgement,
+    Refusal, TagClaim, Undecided, WaitingFor, import_judgement,
 };
 use octo_core::fingerprint::verification::{RecordingProof, read_answer};
 
@@ -60,9 +60,10 @@ fn verdict_words(verdict: &GateVerdict) -> (&'static str, &'static str) {
             octo_core::fingerprint::heart_gate::Acceptance::HeardAudio => {
                 ("The very audio you heard", "Kept as the copy that played")
             }
-            octo_core::fingerprint::heart_gate::Acceptance::Sound => {
-                ("AcoustID: the recording you heard", "Its sound proves the version")
-            }
+            octo_core::fingerprint::heart_gate::Acceptance::Sound => (
+                "AcoustID: the recording you heard",
+                "Its sound proves the version",
+            ),
             octo_core::fingerprint::heart_gate::Acceptance::HeardMaster => {
                 ("The master you heard", "It matches what played, window by window")
             }
@@ -242,7 +243,11 @@ impl SoulseekDownloadService {
             .all(|gate| gate.origin == AcquisitionOrigin::Play);
         let (_, first) = &checks[0];
         let reason = not_kept(verdict_words(&first.verdict).1);
-        if plays_only && checks.iter().any(|(_, check)| matches!(check.verdict, GateVerdict::Hold(_))) {
+        if plays_only
+            && checks
+                .iter()
+                .any(|(_, check)| matches!(check.verdict, GateVerdict::Hold(_)))
+        {
             // A play never holds: what its gate cannot judge now is thrown away.
             let _ = std::fs::remove_file(path);
             return FileJudged::NotProven(reason);
@@ -319,7 +324,8 @@ impl SoulseekDownloadService {
             let file_ms = TagFile::open(path)
                 .ok()
                 .map(|file| file.duration().as_millis() as i64);
-            verdict = DownloadVerificationService::settle_stray_link(verdict, &title, routing.duration, file_ms);
+            verdict =
+                DownloadVerificationService::settle_stray_link(verdict, &title, routing.duration, file_ms);
         }
         if verdict.verdict == VerificationVerdict::Mismatch {
             return FileJudged::Refuse {
@@ -391,7 +397,9 @@ impl SoulseekDownloadService {
         );
         match import_judgement(&reading, &facts, &r) {
             ImportJudgement::Refuse => {
-                warn!("AcoustID's reading names another recording than {track_key} asked for in {path}; refusing it");
+                warn!(
+                    "AcoustID's reading names another recording than {track_key} asked for in {path}; refusing it"
+                );
                 base.log_step_heard(
                     &track_key,
                     acquisition_event_kinds::CHECK,
@@ -410,7 +418,9 @@ impl SoulseekDownloadService {
                 }
                 true
             }
-            ImportJudgement::Stands { proven: false } if verdict.verdict == VerificationVerdict::Confirmed => {
+            ImportJudgement::Stands { proven: false }
+                if verdict.verdict == VerificationVerdict::Confirmed =>
+            {
                 info!("{track_key} is confirmed, but its sound cannot settle the version: {path}");
                 verdict.proof = RecordingProof::NotProven;
                 base.log_step(
@@ -440,7 +450,13 @@ impl SoulseekDownloadService {
     }
 
     /// Remembers a peer's file one heart's or play's gate refused, for that gate's song and R only.
-    pub(crate) fn deny_for_gates(&self, download: &TrackDownload, username: &str, filename: &str, reason: &str) {
+    pub(crate) fn deny_for_gates(
+        &self,
+        download: &TrackDownload,
+        username: &str,
+        filename: &str,
+        reason: &str,
+    ) {
         let song = download.song.external_id.clone().unwrap_or_default();
         for gate in &download.gates {
             self.rejected_peers.deny_for_heart(
@@ -590,7 +606,12 @@ impl SoulseekDownloadService {
 /// The audio stream of a whole copy of a video's stream, remuxed into its own container without
 /// re-encoding: AAC in mp4 as `.m4a`, Opus in webm as `.opus`. None when ffmpeg is missing or
 /// failed.
-pub(crate) async fn remux_audio(copy: &Path, content_type: &str, folder: &str, video_id: &str) -> Option<String> {
+pub(crate) async fn remux_audio(
+    copy: &Path,
+    content_type: &str,
+    folder: &str,
+    video_id: &str,
+) -> Option<String> {
     let extension = if content_type.to_ascii_lowercase().contains("webm") {
         "opus"
     } else {

@@ -888,6 +888,53 @@ mod tests {
     use super::*;
     use crate::fingerprint::acoust_id_client::{AcoustIdCredit, AcoustIdRelease};
 
+    /// No tag claims a version the sound did not prove: a confirmed file kept as heard, one whose
+    /// sound could not settle the version, and one kept by the person take no recording id and no
+    /// name from the match, and carry their import row's mark; a proven one and the shipped
+    /// checks' own are tagged as before.
+    #[test]
+    fn only_a_proven_or_shipped_confirmation_writes_recording_tags() {
+        let confirmed = |proof: RecordingProof| VerificationResult {
+            verdict: VerificationVerdict::Confirmed,
+            recording_id: Some("rec".into()),
+            matched_title: Some("Help!".into()),
+            tags_authoritative: true,
+            proof,
+            ..Default::default()
+        };
+        for (proof, writes, mark) in [
+            (RecordingProof::Shipped, true, None),
+            (RecordingProof::Proven, true, None),
+            (
+                RecordingProof::AsHeard {
+                    video_id: Some("vid".into()),
+                },
+                false,
+                Some("as heard on YouTube"),
+            ),
+            (
+                RecordingProof::AsHeard { video_id: None },
+                false,
+                Some("as heard"),
+            ),
+            (RecordingProof::NotProven, false, Some("version not proven")),
+            (
+                RecordingProof::KeptByYou,
+                false,
+                Some("kept by you, version not proven"),
+            ),
+        ] {
+            let mut song = Song {
+                title: "Help".into(),
+                ..Default::default()
+            };
+            confirmed(proof.clone()).apply_tags_to(&mut song);
+            assert_eq!(song.music_brainz_recording_id.is_some(), writes, "{proof:?}");
+            assert_eq!(song.title == "Help!", writes, "{proof:?}");
+            assert_eq!(proof.row_mark(), mark);
+        }
+    }
+
     #[test]
     fn needs_review_only_for_questions_a_person_can_settle() {
         let cases = [

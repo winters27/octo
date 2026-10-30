@@ -17,6 +17,7 @@ use wiremock::matchers::path;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
+use crate::services::common::GateOutcome;
 use crate::services::common::test_fakes::{FakeDownloads, FakeLidarr, until};
 use crate::services::common::{AcquisitionRequest, SoulseekHoldResumer};
 use crate::services::fingerprint::music_brainz_client::{CatalogQuestions, HeartBusy, HeartQuestions, Lane};
@@ -885,5 +886,191 @@ async fn a_play_whose_gate_would_wait_downloads_nothing_and_holds_nothing() {
     assert_eq!(
         gates.built.lock()[0],
         ("brandon".to_string(), AcquisitionOrigin::Play)
+    );
+}
+
+// ---- Each holder's own verdict on a file that landed ------------------------------------------
+
+type Accepting = Arc<Mutex<Vec<String>>>;
+
+/// Lands every request the queue hands out once `askers` gates are on it, writing each gate's
+/// verdict as the download's check point does: accepted for a user listed in `accepting`, not
+/// accepted for anyone else.
+fn land_judged(
+    queue: &Arc<TrackAcquisitionQueue>,
+    askers: usize,
+    accepting: Accepting,
+) -> (Taken, CancellationToken) {
+    let taken: Taken = Arc::default();
+    let stop = CancellationToken::new();
+    let (queue, seen, token) = (queue.clone(), taken.clone(), stop.clone());
+    tokio::spawn(async move {
+        while let Some(request) = queue.dequeue(&token).await {
+            while request.gates().len() < askers {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            seen.lock().push(request.clone());
+            let ledger = request.completion.ledger().clone();
+            for gate in request.gates() {
+                let outcome = if accepting.lock().contains(&gate.user) {
+                    GateOutcome::Accepted
+                } else {
+                    GateOutcome::NotAccepted("another mix".into())
+                };
+                ledger.record(&gate.user, gate.origin, outcome);
+            }
+            queue.release(&request);
+            request
+                .completion
+                .try_set_result(format!("/music/{}.flac", request.external_id));
+        }
+    });
+    (taken, stop)
+}
+
+/// A record with two holders who heard two mixes resumes as one acquisition: the file of the
+/// first's mix lands for the first, the second stays held, and the record ends only when the
+/// second's own file lands.
+#[tokio::test]
+async fn two_holders_who_heard_two_mixes_each_wait_for_their_own_file() {
+    let gates = Arc::new(ListedGates::default());
+    let holds = memory_holds();
+    holds.hold(held(
+        "help",
+        AcquisitionOrigin::Heart,
+        WaitingFor::NotYetProven,
+        &["brandon", "anna"],
+    ));
+    let rig = rig(gates.clone(), None, holds);
+    let accepting: Accepting = Arc::new(Mutex::new(vec!["brandon".to_string()]));
+    let (landed, stop) = land_judged(&rig.queue, 1, accepting.clone());
+    let key = "Track:soulseek:help:NotYetProven";
+    rig.coordinator.resume_held(key);
+    until(|| landed.lock().len() == 1).await;
+    until(|| !rig.coordinator.resuming.lock().contains(key)).await;
+    assert_eq!(landed.lock()[0].gates().len(), 2, "one acquisition, both gates");
+    let record = rig.holds.get(key).expect("anna stays held");
+    assert_eq!(users(&record), ["anna"]);
+    assert!(rig.tracker.is_held("soulseek", "help"));
+
+    // Her own mix lands: the record ends.
+    *accepting.lock() = vec!["anna".to_string()];
+    rig.coordinator.resume_held(key);
+    until(|| rig.holds.snapshot().is_empty()).await;
+    assert_eq!(landed.lock().len(), 2);
+    until(|| !rig.tracker.is_held("soulseek", "help")).await;
+    stop.cancel();
+}
+
+/// Two people with different R join one request: the file lands for the one whose gate passed
+/// it, and never counts as the other's.
+#[tokio::test]
+async fn two_hearts_joining_one_request_each_get_their_own() {
+    let rig = rig(Arc::new(ListedGates::default()), None, memory_holds());
+    let accepting: Accepting = Arc::new(Mutex::new(vec!["brandon".to_string()]));
+    let (landed, stop) = land_judged(&rig.queue, 2, accepting);
+    let heart = |user: &'static str| {
+        let coordinator = rig.coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .acquire_track_outcome(
+                    "soulseek",
+                    "help",
+                    Some(user),
+                    None,
+                    &AcquisitionTarget::Shared,
+                    AcquisitionOrigin::Heart,
+                )
+                .await
+                .expect("ran")
+        })
+    };
+    let brandon = heart("brandon");
+    until(|| rig.queue.is_in_flight("soulseek", "help")).await;
+    let anna = heart("anna");
+    assert_eq!(
+        brandon.await.expect("joined"),
+        TrackOutcome::Landed("/music/help.flac".into())
+    );
+    assert!(
+        matches!(anna.await.expect("joined"), TrackOutcome::Failed(_)),
+        "the 2009 file is not what anna heard"
+    );
+    assert_eq!(landed.lock().len(), 1, "one download for both");
+    stop.cancel();
+}
+
+/// AcoustID working again runs every hold the clip check left through the heard answer, and
+/// AcoustID turning off runs every hold waiting for it through the catalog's clip; each leaves the
+/// other wait's holds alone.
+#[tokio::test]
+async fn acoust_id_turning_on_or_off_runs_the_holds_that_wait_on_it_again() {
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("anna", WaitingFor::AcoustIdOff);
+    gates.hold("brandon", WaitingFor::AcoustId);
+    let holds = memory_holds();
+    holds.hold(held(
+        "help",
+        AcquisitionOrigin::Heart,
+        WaitingFor::AcoustIdOff,
+        &["anna"],
+    ));
+    holds.hold(held(
+        "yesterday",
+        AcquisitionOrigin::Heart,
+        WaitingFor::AcoustId,
+        &["brandon"],
+    ));
+    let rig = rig(gates.clone(), None, holds);
+
+    rig.coordinator.resume_waiting(WaitingFor::AcoustIdOff);
+    until(|| rig.coordinator.resuming.lock().is_empty() && !gates.built.lock().is_empty()).await;
+    let built: Vec<String> = gates.built.lock().iter().map(|(user, _)| user.clone()).collect();
+    assert_eq!(built, ["anna"]);
+
+    rig.coordinator.resume_waiting(WaitingFor::AcoustId);
+    until(|| rig.coordinator.resuming.lock().is_empty() && gates.built.lock().len() == 2).await;
+    let built: Vec<String> = gates.built.lock().iter().map(|(user, _)| user.clone()).collect();
+    assert_eq!(built, ["anna", "brandon"]);
+}
+
+/// A held song streamed again brings its holder's new heard source to the hold, which runs again
+/// with it; a hold of another wait, or another person's play, changes nothing.
+#[tokio::test]
+async fn a_held_song_streamed_again_runs_its_hold_with_what_was_heard_now() {
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("brandon", WaitingFor::NotYetProven);
+    let holds = memory_holds();
+    holds.hold(held(
+        "help",
+        AcquisitionOrigin::Heart,
+        WaitingFor::NotYetProven,
+        &["brandon"],
+    ));
+    let rig = rig(gates.clone(), None, holds);
+    let played = HeardRecord {
+        heard_at: Utc::now(),
+        source: octo_core::fingerprint::heart_gate::HeardSource::Video {
+            id: "AAAAAAAAAA1".into(),
+            size: Some(1000),
+            content_type: "audio/mp4".into(),
+            itag: None,
+        },
+        sample_id: None,
+    };
+    rig.coordinator.heard_again("help", "anna", &played);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(gates.built.lock().is_empty(), "anna holds nothing here");
+
+    rig.coordinator.heard_again("help", "Brandon", &played);
+    until(|| !gates.built.lock().is_empty()).await;
+    until(|| rig.coordinator.resuming.lock().is_empty()).await;
+    let record = rig
+        .holds
+        .get("Track:soulseek:help:NotYetProven")
+        .expect("held again");
+    assert_eq!(
+        record.holders[0].heard.as_ref().map(|heard| heard.source.clone()),
+        Some(played.source)
     );
 }
