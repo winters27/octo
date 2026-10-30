@@ -13,3 +13,7 @@ pub use acoust_id_rate_limit_handler::AcoustIdRateLimitHandler;
 pub use acoust_id_rate_limiter::AcoustIdRateLimiter;
 pub use download_verification_service::{DownloadVerificationService, RecordingIsrcs};
 pub use music_brainz_client::{IsrcLookup, MusicBrainzClient, MusicBrainzError};
+
+#[cfg(test)]
+#[path = "heart_gate_cases_tests.rs"]
+mod heart_gate_cases_tests;
