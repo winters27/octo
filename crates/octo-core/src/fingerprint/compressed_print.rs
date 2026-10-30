@@ -45,10 +45,8 @@ pub fn decompress(print: &str) -> Option<Vec<u32>> {
     if rest.len() * 8 < exceptions * 5 {
         return None;
     }
-    let mut exception = 0;
-    for step in steps.iter_mut().filter(|step| **step == MAX_NORMAL) {
+    for (exception, step) in steps.iter_mut().filter(|step| **step == MAX_NORMAL).enumerate() {
         *step += bits_at(rest, exception * 5, 5);
-        exception += 1;
     }
 
     let mut items: Vec<u32> = Vec::with_capacity(count);
