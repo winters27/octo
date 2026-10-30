@@ -385,6 +385,7 @@ impl AcoustIdClient {
         duration_seconds: i32,
         wait: bool,
     ) -> (Option<AcoustIdOutcome>, Option<AcoustIdLookup>) {
+        let class = AcoustIdRateLimiter::floored(class);
         // The user's key, then Octo's own: each one AcoustID rejects is set aside.
         for _ in 0..2 {
             let Some((key, lane)) = self.keys.key_for(class) else {

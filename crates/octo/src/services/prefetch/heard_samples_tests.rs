@@ -986,3 +986,6 @@ async fn a_top_up_prints_the_heard_video_once_fetched_fresh() {
     rig.samples.top_up(&record, Some(200)).await;
     assert_eq!(asked(&shim, "/stream").await.len(), 1);
 }
+
+#[path = "heard_samples_keep_tests.rs"]
+mod keep;

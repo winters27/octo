@@ -784,6 +784,46 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
             }
         }
     }
+    // Hearted albums with held tracks: the caller leaves each, and a held track nobody is left in
+    // is deleted.
+    let album_holds: Vec<(String, String)> = outside
+        .iter()
+        .filter(|(key, _)| *key == "albumId")
+        .map(|(_, id)| {
+            let provider = state
+                .local_library
+                .parse_song_id(id)
+                .1
+                .unwrap_or_else(|| SoulseekMetadataService::PROVIDER_NAME.to_string());
+            (provider, id.clone())
+        })
+        .filter(|(provider, id)| {
+            let album_key = crate::services::common::acquisition_tracker::key_of(provider, id);
+            state.soulseek_holds.snapshot().iter().any(|record| {
+                record
+                    .album_track
+                    .as_ref()
+                    .is_some_and(|track| track.album_key == album_key)
+                    || (record.kind == crate::services::common::HeldKind::Album && record.external_id == *id)
+            })
+        })
+        .collect();
+    if !album_holds.is_empty() {
+        if member.is_none() {
+            match refuse_unless_signed_in(&state, &call, &format).await {
+                Ok(None) => {}
+                Ok(Some(refused)) => return refused,
+                Err(error) => return error.into_response(),
+            }
+        }
+        if let Ok(who) = signed_in_user(&state, &call).await {
+            for (provider, album_id) in &album_holds {
+                state
+                    .heart_acquisition_coordinator
+                    .leave_album_holds(provider, album_id, &who);
+            }
+        }
+    }
 
     if !mapped && (outside.is_empty() || (member.is_none() && library.is_empty() && held.is_empty())) {
         return match member {

@@ -66,6 +66,10 @@ struct Options {
     limiter: Option<Arc<AcoustIdRateLimiter>>,
     /// Downloads nobody gates are verified as today.
     verify: bool,
+    /// The gates of hearted albums' chains, which the walk of "album-1" files tracks by.
+    album_gates: Option<Arc<crate::services::common::AlbumGates>>,
+    /// The library landed files are registered in; a fake that keeps nothing by default.
+    library: Option<Arc<dyn crate::services::local::ILocalLibraryService>>,
 }
 
 /// A 180 s FLAC whose sound is named, with `isrc` as its own tag.
@@ -237,9 +241,22 @@ async fn gated_with(root: &Root, source: DownloadSource, peers: Vec<Peer>, optio
             song.clone(),
         );
     }
+    metadata.albums.lock().insert(
+        ("soulseek".into(), "album-1".into()),
+        Album {
+            id: "album-1".into(),
+            title: "Nothing Was the Same".into(),
+            artist: "Drake".into(),
+            songs: songs.clone(),
+            ..Default::default()
+        },
+    );
     let core = DownloadCore {
         settings: Arc::clone(&settings),
-        local_library: Arc::new(FakeLocalLibrary::default()),
+        local_library: options
+            .library
+            .clone()
+            .unwrap_or_else(|| Arc::new(FakeLocalLibrary::default())),
         metadata: Arc::new(metadata),
         navidrome_identity: NavidromeIdentityService::new(Arc::clone(&settings), reqwest::Client::new()),
         history: Arc::new(DownloadHistoryService::new(root.0.path().join("history.json"))),
@@ -256,6 +273,7 @@ async fn gated_with(root: &Root, source: DownloadSource, peers: Vec<Peer>, optio
         concurrency: Some(Arc::new(DownloadConcurrency::new(Arc::clone(&settings)))),
         review_queue: Some(reviews.clone()),
         prefetched: Some(prefetch.clone() as Arc<dyn PrefetchedFiles>),
+        album_gates: options.album_gates.clone(),
         ..Default::default()
     };
     let acoust_id = url::Url::parse(&format!("{}/", server.uri())).expect("parses");
@@ -1201,3 +1219,9 @@ async fn a_heart_behind_an_import_on_a_backed_off_bulk_gap_starts_at_once_and_th
     assert!(std::time::Instant::now() >= turn);
     stop.cancel();
 }
+
+#[path = "soulseek_album_gate_tests.rs"]
+mod album;
+
+#[path = "soulseek_keep_anyway_tests.rs"]
+mod keep_anyway;

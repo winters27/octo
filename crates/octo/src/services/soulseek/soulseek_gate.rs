@@ -11,11 +11,12 @@ use octo_core::fingerprint::heart_gate::{
 use octo_core::fingerprint::verification::{RecordingProof, read_answer};
 
 use super::*;
-use crate::services::common::heart_acquisition_coordinator::waiting_line;
+use crate::services::common::album_gates::{self, AlbumGateTrack, TrackCheck};
+use crate::services::common::heart_acquisition_coordinator::{KEEP_WAITS_FOR_YOUTUBE, waiting_line};
 use crate::services::common::song_finder::ACOUST_ID_BUSY;
 use crate::services::common::soulseek_hold_store::held_root;
 use crate::services::common::{AcquisitionHeld, GateOutcome, HeldAcquisition, HeldKind, PlayOutcome};
-use crate::services::fingerprint::download_verification_service::{HeartCandidate, LabelSource};
+use crate::services::fingerprint::download_verification_service::{HeartCandidate, HeartCheck, LabelSource};
 
 /// What a source's check point did with one downloaded file.
 #[derive(Debug)]
@@ -110,6 +111,30 @@ fn not_kept(detail: &str) -> String {
     }
 }
 
+/// A hearted album's track gate's verdict on its file, under the album's rule: the catalog track
+/// is the song being downloaded, and the file fits it by its own title tag and length.
+fn album_track_verdict(
+    gate: &HeartGate,
+    check: &HeartCheck,
+    song: &Song,
+    title: Option<&str>,
+    seconds: Option<i32>,
+) -> GateVerdict {
+    let r = gate.r.clone().unwrap_or_default();
+    let track = AlbumGateTrack {
+        title: song.title.clone(),
+        duration_seconds: song.duration.or(gate.heard_seconds),
+        ..Default::default()
+    };
+    album_gates::album_verdict(TrackCheck {
+        track: 0,
+        verdict: check.verdict.clone(),
+        reading: check.reading.clone(),
+        no_recording: r.ids.is_empty(),
+        fits: album_gates::fits(&track, title, seconds),
+    })
+}
+
 /// The line a row holds with while a file waits for `waiting_for`.
 fn file_line(waiting_for: WaitingFor) -> &'static str {
     match waiting_for {
@@ -138,6 +163,9 @@ impl SoulseekDownloadService {
             .judge_shipped(base, routing, download, path, length_known)
             .await;
         if matches!(judged, FileJudged::Keep(_)) {
+            // What the checks said of an earlier candidate they refused is not what they said of
+            // the file kept: the kept file is everyone's who asked, as the shipped checks keep it.
+            download.ledger.clear();
             self.judge_joiners(download, path, identity).await;
         }
         judged
@@ -216,11 +244,21 @@ impl SoulseekDownloadService {
             acquisition_key: download.acquisition_key.clone(),
         };
         let mut checks = Vec::with_capacity(download.gates.len());
+        // A hearted album's track is filed by the album's rule, which reads the file's own title
+        // tag and length beside its sound.
+        let album_file = download
+            .gates
+            .iter()
+            .any(|gate| gate.origin == AcquisitionOrigin::AlbumHeart)
+            .then(|| album_gates::title_and_length(path));
         for gate in &download.gates {
-            let check = self
+            let mut check = self
                 .verification
                 .verify_for_heart(Path::new(path), &candidate, gate)
                 .await;
+            if let (AcquisitionOrigin::AlbumHeart, Some((title, seconds))) = (gate.origin, &album_file) {
+                check.verdict = album_track_verdict(gate, &check, &download.song, title.as_deref(), *seconds);
+            }
             let (text, detail) = verdict_words(&check.verdict);
             base.log_step_heard(
                 &track_key,
@@ -288,10 +326,16 @@ impl SoulseekDownloadService {
                 matches!(check.verdict, GateVerdict::Hold(_)) && gate.origin != AcquisitionOrigin::Play
             })
             .collect();
-        if let Some((_, first)) = holding.first() {
+        if let Some((gate, first)) = holding.first() {
             let GateVerdict::Hold(waiting_for) = first.verdict else {
                 unreachable!("only holds were kept");
             };
+            let line =
+                if gate.origin == AcquisitionOrigin::AlbumHeart && waiting_for == WaitingFor::NotYetProven {
+                    album_gates::tracks_wait_line(1)
+                } else {
+                    file_line(waiting_for).to_string()
+                };
             let Some(moved) = move_to_hold(base, &download.song, path) else {
                 return FileJudged::Refuse {
                     reason: "the file could not be moved aside to wait".to_string(),
@@ -304,7 +348,7 @@ impl SoulseekDownloadService {
             }
             return FileJudged::Hold(AcquisitionHeld {
                 waiting_for,
-                line: file_line(waiting_for).to_string(),
+                line,
                 files: vec![moved],
                 users: holding.iter().map(|(gate, _)| gate.user.clone()).collect(),
             });
@@ -619,6 +663,7 @@ impl SoulseekDownloadService {
             .filter(|source| source.video_id().is_some())
             .collect();
         let length_known = routing.duration.is_some_and(|s| s > 0);
+        let mut busy = false;
         for source in heard {
             let HeardSource::Video {
                 id,
@@ -629,8 +674,13 @@ impl SoulseekDownloadService {
             else {
                 continue;
             };
-            let crate::services::prefetch::HeardCopy::Ready(copy) = copies.heard_copy(&source).await else {
-                continue;
+            let copy = match copies.heard_copy(&source).await {
+                crate::services::prefetch::HeardCopy::Ready(copy) => copy,
+                crate::services::prefetch::HeardCopy::Busy => {
+                    busy = true;
+                    continue;
+                }
+                crate::services::prefetch::HeardCopy::Gone => continue,
             };
             let Ok(size) = std::fs::metadata(&copy).map(|meta| meta.len()) else {
                 continue;
@@ -670,7 +720,76 @@ impl SoulseekDownloadService {
                 }
             }
         }
+        // A person's keep whose heard video YouTube does not answer for now waits for it, rather
+        // than ending as if the video were gone.
+        if busy && download.keep_anyway {
+            info!(
+                "YouTube does not answer for the heard video of {}; the keep waits for it",
+                download.track_id
+            );
+            return Some(Err(AcquisitionHeld {
+                waiting_for: WaitingFor::Shim,
+                line: KEEP_WAITS_FOR_YOUTUBE.to_string(),
+                files: Vec::new(),
+                users: download.gates.iter().map(|gate| gate.user.clone()).collect(),
+            }
+            .into()));
+        }
         None
+    }
+
+    /// A person's keep of what their hold kept: the first held file still there lands as it is,
+    /// nothing judged, marked "kept by you, version not proven", and printed once so a later check
+    /// can read its sound; every other held file goes. Each gate's person counts it as theirs, by
+    /// no proof. None when no held file is left.
+    pub(crate) async fn keep_held_file(
+        &self,
+        base: &BaseDownloadService,
+        download: &mut TrackDownload,
+    ) -> Option<String> {
+        let held = std::mem::take(&mut download.held_files);
+        let mut left = held.into_iter().filter(|file| file_exists(file));
+        let file = left.next()?;
+        for other in left {
+            let _ = std::fs::remove_file(&other);
+        }
+        let settings = base.current_soulseek_settings();
+        let printed = self
+            .verification
+            .file_printer()
+            .fingerprint(
+                Path::new(&file),
+                settings.effective_fingerprint_seconds(),
+                settings.effective_fingerprint_timeout_seconds(),
+            )
+            .await;
+        let seconds = TagFile::open(&file)
+            .ok()
+            .map(|tags| tags.duration_seconds())
+            .filter(|seconds| *seconds > 0)
+            .unwrap_or(printed.decoded_seconds);
+        download.song.verification = Some(Box::new(VerificationResult {
+            proof: RecordingProof::KeptByYou,
+            fingerprint: printed.fingerprint.filter(|print| !print.is_empty()),
+            duration_seconds: seconds,
+            ..Default::default()
+        }));
+        download.song.isrc = None;
+        download.song.music_brainz_recording_id = None;
+        for gate in &download.gates {
+            download
+                .ledger
+                .record(&gate.user, gate.origin, GateOutcome::Accepted);
+        }
+        let track_key = download.song.external_id.clone().unwrap_or_default();
+        base.log_step(
+            &track_key,
+            acquisition_event_kinds::CHECK,
+            "Kept by you, version not proven",
+            None,
+        );
+        info!("Kept anyway: its held file {file}");
+        Some(file)
     }
 }
 

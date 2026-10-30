@@ -489,7 +489,10 @@ async fn get_open_subsonic_extensions_adds_octo_acquisitions_to_navidromes_list(
     assert_eq!(envelope["status"], "ok");
     assert_eq!(envelope["openSubsonic"], true);
     let extensions = extensions_of(&envelope);
-    assert_eq!(extension(&extensions, "octoAcquisitions"), Some(&vec![1, 2, 3]));
+    assert_eq!(
+        extension(&extensions, "octoAcquisitions"),
+        Some(&vec![1, 2, 3, 4])
+    );
     assert!(extension(&extensions, "formPost").is_some());
     assert!(extension(&extensions, "songLyrics").is_some());
 }
@@ -513,7 +516,7 @@ async fn get_open_subsonic_extensions_adds_it_in_xml_too() {
         .filter(|e| e.name == "versions")
         .map(XElement::value)
         .collect();
-    assert_eq!(versions, ["1", "2", "3"]);
+    assert_eq!(versions, ["1", "2", "3", "4"]);
 }
 
 // ---- Version 2: the downloads drawer --------------------------------------------------------

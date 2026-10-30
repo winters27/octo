@@ -21,6 +21,7 @@ use octo_media::tags::tag_writer_extras;
 use tracing::{debug, info};
 
 use super::*;
+use crate::services::common::album_gates::{self, AlbumGate, AlbumGateTrack, TrackCheck, TrackFiling};
 use crate::services::common::heart_acquisition_coordinator::{GateStart, HeartGates, waiting_line};
 use crate::services::common::{HeldAcquisition, Holder};
 use crate::services::fingerprint::heard_master_check::{HeardAudio, RoundGuard};
@@ -51,6 +52,17 @@ enum HeardLookup {
     ShimBusy,
     /// The heard audio is gone and no whole print of it is kept.
     Gone,
+}
+
+/// One file's sound as read once: its prints, its length and AcoustID's answer for it.
+#[derive(Clone)]
+struct FileSound {
+    raw: Option<octo_media::audio::RawFingerprint>,
+    print: Option<String>,
+    seconds: i32,
+    file_ms: Option<i64>,
+    outcome: AcoustIdOutcome,
+    lookup: Option<octo_core::fingerprint::AcoustIdLookup>,
 }
 
 impl DownloadVerificationService {
@@ -116,6 +128,23 @@ impl DownloadVerificationService {
         heard: Option<HeardRecord>,
         prints: &mut ClipPrints,
     ) -> GateBuild {
+        self.build_heart_gate_with(provider, external_id, user, origin, heard, prints, None)
+            .await
+    }
+
+    /// [`Self::build_heart_gate`] with R already known (an album track's own recording), so no
+    /// album context is read for it; what was heard is read against that R.
+    #[allow(clippy::too_many_arguments)] // the gate's facts, its prints and the R it is held to
+    pub async fn build_heart_gate_with(
+        &self,
+        provider: &str,
+        external_id: &str,
+        user: &str,
+        origin: AcquisitionOrigin,
+        heard: Option<HeardRecord>,
+        prints: &mut ClipPrints,
+        known_r: Option<HeardRecording>,
+    ) -> GateBuild {
         let _ = provider;
         let personal = matches!(
             origin,
@@ -132,6 +161,7 @@ impl DownloadVerificationService {
             stand_in: None,
         };
         let Some(parts) = self.heart.get().cloned() else {
+            gate.r = known_r;
             return GateBuild::Ready(gate);
         };
         let Some(routing) = parts
@@ -139,6 +169,7 @@ impl DownloadVerificationService {
             .resolve_song(external_id, personal)
             .map(|shared| shared.snapshot())
         else {
+            gate.r = known_r;
             return GateBuild::Ready(gate);
         };
         let song = heart_song(&routing);
@@ -165,10 +196,14 @@ impl DownloadVerificationService {
             return hold(gate, WaitingFor::AcoustId, HEARD_LOOKUP_BUSY, None);
         }
 
-        let catalog = match self
-            .catalog_r(&parts, external_id, user, &song, heard_answer.as_ref(), min)
-            .await
-        {
+        let known = match known_r {
+            Some(r) => Ok(r),
+            None => {
+                self.catalog_r(&parts, external_id, user, &song, heard_answer.as_ref(), min)
+                    .await
+            }
+        };
+        let catalog = match known {
             Ok(catalog) => catalog,
             // A family request never holds: it goes on with the routing's names alone.
             Err(_) if origin == AcquisitionOrigin::Request => named_r(&song),
@@ -196,7 +231,9 @@ impl DownloadVerificationService {
                 gate.reading = HeardReading::OnlyHeardOrMaster;
                 return GateBuild::Ready(gate);
             }
-            if origin == AcquisitionOrigin::Play {
+            // A play, and a hearted album's track, are judged against R alone: an album track is
+            // never helped by a stand-in, and one nothing proves waits for a play or the person.
+            if matches!(origin, AcquisitionOrigin::Play | AcquisitionOrigin::AlbumHeart) {
                 return GateBuild::Ready(gate);
             }
             self.stand_in(&parts, external_id, &routing, &mut gate, &catalog, min)
@@ -472,12 +509,42 @@ impl DownloadVerificationService {
         candidate: &HeartCandidate,
         gate: &HeartGate,
     ) -> HeartCheck {
+        let sound = match self.file_sound(path, LookupClass::for_origin(gate.origin)).await {
+            Ok(sound) => sound,
+            Err(check) => return *check,
+        };
+        self.check_sound(&sound, candidate, gate, path).await
+    }
+
+    /// One file judged with several gates (an album file against each of its tracks' gates): it
+    /// is printed and looked up once, on the first gate's class, then each gate judges it as
+    /// [`Self::verify_for_heart`] would. One check per gate, in their order.
+    pub async fn verify_for_album(
+        &self,
+        path: &Path,
+        candidate: &HeartCandidate,
+        gates: &[HeartGate],
+    ) -> Vec<HeartCheck> {
+        let Some(first) = gates.first() else {
+            return Vec::new();
+        };
+        let sound = match self.file_sound(path, LookupClass::for_origin(first.origin)).await {
+            Ok(sound) => sound,
+            Err(check) => return vec![*check; gates.len()],
+        };
+        let mut checks = Vec::with_capacity(gates.len());
+        for gate in gates {
+            checks.push(self.check_sound(&sound, candidate, gate, path).await);
+        }
+        checks
+    }
+
+    /// One file's print and its AcoustID answer, on `class`'s lane: the check that refuses it
+    /// when its audio cannot be decoded.
+    async fn file_sound(&self, path: &Path, class: LookupClass) -> Result<FileSound, Box<HeartCheck>> {
         let parts = self.heart.get().cloned();
         let settings = self.settings.current().soulseek.clone();
         let file = path.to_string_lossy().to_string();
-        let r = gate.r.clone().unwrap_or_default();
-        let (title, artist) = (r.title.clone(), r.artist.clone());
-
         let (fingerprint, raw) = {
             let _slot = match &parts {
                 Some(parts) => Some(parts.samples.slot(FpcalcClass::Heart).await),
@@ -495,7 +562,7 @@ impl DownloadVerificationService {
             (fingerprint, raw)
         };
         if fingerprint.outcome == FingerprintOutcome::Undecodable {
-            return HeartCheck {
+            return Err(Box::new(HeartCheck {
                 verdict: GateVerdict::Refuse(octo_core::fingerprint::heart_gate::Refusal::Unreadable),
                 reading: None,
                 verification: VerificationResult {
@@ -503,7 +570,7 @@ impl DownloadVerificationService {
                     deny_reason: "delivered a file with no decodable audio".to_string(),
                     ..Default::default()
                 },
-            };
+            }));
         }
         let (mut seconds, file_ms) = read_duration(&file);
         if seconds <= 0 {
@@ -511,14 +578,43 @@ impl DownloadVerificationService {
         }
         let print = fingerprint.fingerprint.clone().filter(|print| !print.is_empty());
         let (outcome, lookup) = match (&print, seconds > 0) {
-            (Some(print), true) => {
-                self.client
-                    .lookup_answer_read(LookupClass::for_origin(gate.origin), print, seconds)
-                    .await
-            }
+            (Some(print), true) => self.client.lookup_answer_read(class, print, seconds).await,
             // A file nothing could fingerprint is one AcoustID cannot check.
             _ => (AcoustIdOutcome::Unreadable { code: None }, None),
         };
+        Ok(FileSound {
+            raw,
+            print,
+            seconds,
+            file_ms,
+            outcome,
+            lookup,
+        })
+    }
+
+    /// One gate's check of a file whose sound is read: its labels from where its source delivered
+    /// them, its distance from the heard print (proof 2), whether it is the very audio that played
+    /// (A0), and every fact the gate asks for until it gives a verdict.
+    async fn check_sound(
+        &self,
+        sound: &FileSound,
+        candidate: &HeartCandidate,
+        gate: &HeartGate,
+        path: &Path,
+    ) -> HeartCheck {
+        let parts = self.heart.get().cloned();
+        let settings = self.settings.current().soulseek.clone();
+        let file = path.to_string_lossy().to_string();
+        let r = gate.r.clone().unwrap_or_default();
+        let (title, artist) = (r.title.clone(), r.artist.clone());
+        let FileSound {
+            raw,
+            print,
+            seconds,
+            file_ms,
+            outcome,
+            lookup,
+        } = sound.clone();
 
         let labels = match &candidate.labels {
             LabelSource::TheFile => labels_of(&file),
@@ -994,20 +1090,64 @@ impl HeartGates for DownloadVerificationService {
         )
         .await;
         self.keep_prints(provider, external_id, &holder.user, prints);
-        match built {
-            GateBuild::Ready(gate) => GateStart::Ready(gate),
-            GateBuild::Hold {
-                gate,
-                waiting_for,
-                line,
-                question,
-            } => GateStart::Hold {
-                gate,
-                waiting_for,
-                line,
-                question,
-            },
-        }
+        start_of(built)
+    }
+
+    async fn build_for_track(
+        &self,
+        provider: &str,
+        external_id: &str,
+        holder: &Holder,
+        origin: AcquisitionOrigin,
+        r: &HeardRecording,
+    ) -> GateStart {
+        let mut prints = self.prints_for(provider, external_id, holder);
+        let built = AcoustIdRateLimiter::with_class(
+            LookupClass::for_origin(origin),
+            self.build_heart_gate_with(
+                provider,
+                external_id,
+                &holder.user,
+                origin,
+                holder.heard.clone(),
+                &mut prints,
+                Some(r.clone()),
+            ),
+        )
+        .await;
+        self.keep_prints(provider, external_id, &holder.user, prints);
+        start_of(built)
+    }
+
+    async fn judge_held(&self, path: &str, acquisition_key: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
+        let candidate = HeartCandidate {
+            labels: LabelSource::TheFile,
+            identity: None,
+            acquisition_key: acquisition_key.to_string(),
+        };
+        let checks = self
+            .verify_for_album(std::path::Path::new(path), &candidate, gates)
+            .await;
+        let (title, seconds) = album_gates::title_and_length(path);
+        gates
+            .iter()
+            .zip(checks)
+            .map(|(gate, check)| {
+                let r = gate.r.clone().unwrap_or_default();
+                let track = AlbumGateTrack {
+                    title: r.title.clone(),
+                    duration_seconds: gate.heard_seconds,
+                    ..Default::default()
+                };
+                album_gates::album_verdict(TrackCheck {
+                    track: 0,
+                    verdict: check.verdict,
+                    reading: check.reading,
+                    no_recording: r.ids.is_empty(),
+                    fits: album_gates::fits(&track, title.as_deref(), seconds),
+                })
+            })
+            .collect()
     }
 
     fn on_filed(&self, record: &HeldAcquisition, user: &str) {
@@ -1155,6 +1295,83 @@ impl DownloadVerificationService {
     }
 }
 
+/// What building a gate came to, as the heart chain reads it.
+fn start_of(built: GateBuild) -> GateStart {
+    match built {
+        GateBuild::Ready(gate) => GateStart::Ready(gate),
+        GateBuild::Hold {
+            gate,
+            waiting_for,
+            line,
+            question,
+        } => GateStart::Hold {
+            gate,
+            waiting_for,
+            line,
+            question,
+        },
+    }
+}
+
+impl DownloadVerificationService {
+    /// Files one file of a hearted album (one of a whole album's import) among its `unfilled`
+    /// tracks, in catalog order, by its own sound against each track's own recording: printed and
+    /// looked up once, each track's gate judging it, then [`album_gates::file_among`]. Positions
+    /// never decide, and its labels are judged only against the track it is filed against. Answers
+    /// where it is filed and, for a file that lands, the verdict it is tagged by.
+    pub async fn file_album_file(
+        &self,
+        path: &Path,
+        labels: LabelSource,
+        gate: &AlbumGate,
+        unfilled: &[usize],
+        acquisition_key: &str,
+    ) -> (TrackFiling, Option<VerificationResult>) {
+        let tracks: Vec<(usize, &AlbumGateTrack)> = unfilled
+            .iter()
+            .filter_map(|index| gate.tracks.get(*index).map(|track| (*index, track)))
+            .collect();
+        if tracks.is_empty() {
+            return (
+                TrackFiling::Refuse(octo_core::fingerprint::heart_gate::Refusal::Unknown),
+                None,
+            );
+        }
+        let gates: Vec<HeartGate> = tracks.iter().map(|(_, track)| gate.gate_for(track)).collect();
+        let candidate = HeartCandidate {
+            labels,
+            identity: None,
+            acquisition_key: acquisition_key.to_string(),
+        };
+        let checks = self.verify_for_album(path, &candidate, &gates).await;
+        let (title, seconds) = album_gates::title_and_length(&path.to_string_lossy());
+        let read: Vec<TrackCheck> = tracks
+            .iter()
+            .zip(&checks)
+            .map(|((index, track), check)| TrackCheck {
+                track: *index,
+                verdict: check.verdict.clone(),
+                reading: check.reading.clone(),
+                no_recording: track.r.ids.is_empty(),
+                fits: album_gates::fits(track, title.as_deref(), seconds),
+            })
+            .collect();
+        let filing = album_gates::file_among(&read);
+        let at = match &filing {
+            TrackFiling::Land { track, .. } | TrackFiling::Hold { track, .. } => {
+                tracks.iter().position(|(index, _)| index == track)
+            }
+            TrackFiling::Refuse(_) => None,
+        };
+        let verification = match (&filing, at) {
+            (TrackFiling::Land { .. }, Some(at)) => Some(Self::kept_verification(&checks[at], &gates[at])),
+            (_, Some(at)) => Some(checks[at].verification.clone()),
+            (_, None) => checks.first().map(|check| check.verification.clone()),
+        };
+        (filing, verification)
+    }
+}
+
 /// The most clip prints kept between a gate and its hold.
 const MOST_KEPT_PRINTS: usize = 256;
 
@@ -1165,3 +1382,7 @@ mod tests;
 #[cfg(test)]
 #[path = "download_verification_gate_tests.rs"]
 mod gate_tests;
+
+#[cfg(test)]
+#[path = "download_verification_album_tests.rs"]
+mod album_tests;

@@ -86,7 +86,13 @@ pub async fn get_acquisitions(State(state): State<AppState>, req: Request) -> Ap
     let rows = if is_blank(&username) {
         Vec::new()
     } else {
-        state.acquisition_tracker.for_user(&username)
+        // Keep anyway is offered only to someone who may keep the row, read from the holds.
+        let marks = state.heart_acquisition_coordinator.keep_marks(&username);
+        let mut rows = state.acquisition_tracker.for_user(&username);
+        for row in &mut rows {
+            marks.mark(row);
+        }
+        rows
     };
     Ok(builder.create_acquisitions_response(&rows).into_response())
 }
@@ -550,7 +556,7 @@ fn named(name: &str) -> Option<&str> {
 /// Whether the caller is one of Navidrome's admins, asked with their own sign-in. False when
 /// Navidrome cannot say, so a change to the library's files is never allowed by an outage. Asked
 /// every time: a role taken away counts at once, and it is one call to Navidrome.
-async fn is_caller_admin(call: &SubsonicCall, username: &str) -> bool {
+pub(super) async fn is_caller_admin(call: &SubsonicCall, username: &str) -> bool {
     if is_blank(username) {
         return false;
     }

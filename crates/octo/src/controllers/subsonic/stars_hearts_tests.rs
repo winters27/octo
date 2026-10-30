@@ -405,6 +405,67 @@ async fn an_unstar_by_one_of_two_octo_app_users_keeps_the_others_hold() {
     assert!(t.state.soulseek_holds.snapshot().is_empty(), "nobody is left");
 }
 
+/// Un-hearting an album deletes its held tracks: each track nobody else holds ends, its held file
+/// with it, and a wrong sign-in takes nobody off.
+#[tokio::test]
+async fn an_album_unstar_deletes_its_held_tracks() {
+    use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, WaitingFor};
+
+    use crate::services::common::acquisition_tracker::key_of;
+    use crate::services::common::soulseek_hold_store::HeldAlbumTrack;
+    use crate::services::common::{HeldAcquisition, StarOnArrival};
+
+    let t = HeartApp::new().await;
+    let album = t.register(RoutingKind::Album, "Mezzanine");
+    let angel = t.register(RoutingKind::Song, "Angel");
+    let (_, provider, external_id) = t.state.local_library.parse_song_id(&angel);
+    let provider = provider.expect("an outside id");
+    let file = t._directory.path().join("angel.flac");
+    std::fs::write(&file, b"the held track").expect("written");
+    let record = t.state.soulseek_holds.hold(HeldAcquisition {
+        provider: provider.clone(),
+        external_id: external_id.expect("an outside id"),
+        requested_by: Some("alice".into()),
+        origin: Some(AcquisitionOrigin::AlbumHeart),
+        waiting_for: Some(WaitingFor::NotYetProven),
+        held_files: vec![file.to_string_lossy().to_string()],
+        album_track: Some(HeldAlbumTrack {
+            album_key: key_of(&provider, &album),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let octo_app = StarOnArrival::OCTO_APP_CLIENT;
+
+    get(
+        &t.app,
+        &format!(
+            "/rest/unstar.view?{}&f=json&albumId={album}",
+            auth("alice", "bad", octo_app)
+        ),
+    )
+    .await;
+    assert!(
+        t.state.soulseek_holds.get(&record.key()).is_some(),
+        "a wrong sign-in"
+    );
+
+    let reply = get(
+        &t.app,
+        &format!(
+            "/rest/unstar.view?{}&f=json&albumId={album}",
+            auth("alice", "good", octo_app)
+        ),
+    )
+    .await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    assert!(
+        t.state.soulseek_holds.snapshot().is_empty(),
+        "the held track ends"
+    );
+    assert!(!file.exists(), "its held file is deleted");
+}
+
 /// Someone else cannot take back a heart by naming its owner without their sign-in.
 #[tokio::test]
 async fn an_unstar_with_a_wrong_sign_in_keeps_the_heart() {

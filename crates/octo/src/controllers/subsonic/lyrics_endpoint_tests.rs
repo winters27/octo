@@ -956,6 +956,6 @@ async fn extensions_song_lyrics_two_always_octo_lyrics_only_while_lookups_run() 
         if fetch {
             assert_eq!(extensions["octoLyrics"], [1]);
         }
-        assert_eq!(extensions["octoAcquisitions"], [1, 2, 3], "fetch={fetch}");
+        assert_eq!(extensions["octoAcquisitions"], [1, 2, 3, 4], "fetch={fetch}");
     }
 }

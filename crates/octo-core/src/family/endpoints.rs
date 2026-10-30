@@ -145,6 +145,7 @@ pub const REST_ENDPOINTS: &[(&str, EndpointClass)] = &[
     ("importAction", LibraryWrite),
     ("importFile", LibraryWrite),
     ("importText", LibraryWrite),
+    ("keepAcquisitionAnyway", LibraryWrite),
     ("libraryAction", LibraryWrite),
     ("pickFoundSong", LibraryWrite),
     // A listener's own chart countries.
@@ -414,6 +415,7 @@ mod tests {
             "importText",
             "setLyricsChoice",
             "findSongs",
+            "keepAcquisitionAnyway",
         ] {
             assert_eq!(rest_class(name), Some(LibraryWrite), "{name}");
         }

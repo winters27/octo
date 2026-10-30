@@ -73,7 +73,7 @@ fn assert_golden(reply: SubsonicReply, file: &str, name: &str) {
 
 /// A recorded extensions list with the extensions added since the 2026.10.03.2 recording:
 /// octoImports (versions 1 and 2) and octoLists (versions 1 and 2) after the extensions it
-/// lists, and octoAcquisitions at versions 1, 2 and 3.
+/// lists, and octoAcquisitions at versions 1 to 4.
 /// These golden tests keep the older recording and add those entries to it.
 fn recorded_with_ported_extensions(file: &str, name: &str) -> Recorded {
     let mut want = recorded(file, name);
@@ -85,7 +85,7 @@ fn recorded_with_ported_extensions(file: &str, name: &str) -> Recorded {
         );
         (
             r#"{"name":"octoAcquisitions","versions":[1]}"#,
-            r#"{"name":"octoAcquisitions","versions":[1,2,3]}"#,
+            r#"{"name":"octoAcquisitions","versions":[1,2,3,4]}"#,
         )
     } else {
         let at = want
@@ -101,7 +101,7 @@ fn recorded_with_ported_extensions(file: &str, name: &str) -> Recorded {
         );
         (
             "<openSubsonicExtensions name=\"octoAcquisitions\">\n    <versions>1</versions>\n",
-            "<openSubsonicExtensions name=\"octoAcquisitions\">\n    <versions>1</versions>\n    <versions>2</versions>\n    <versions>3</versions>\n",
+            "<openSubsonicExtensions name=\"octoAcquisitions\">\n    <versions>1</versions>\n    <versions>2</versions>\n    <versions>3</versions>\n    <versions>4</versions>\n",
         )
     };
     assert!(

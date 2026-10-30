@@ -536,6 +536,13 @@ pub fn acquisition_json(row: &AcquisitionSnapshot) -> Fields {
         row.library_id.clone().unwrap_or_else(|| row.id.clone()).into(),
     );
     fields.insert("logLines".into(), row.log_lines.into());
+    // octoAcquisitions 4: written only when set, never as null.
+    if row.keep_anyway {
+        fields.insert("keepAnyway".into(), true.into());
+    }
+    if let Some(held) = row.held_tracks.filter(|held| *held > 0) {
+        fields.insert("heldTracks".into(), held.into());
+    }
     fields
 }
 

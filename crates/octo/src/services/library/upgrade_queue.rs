@@ -1112,12 +1112,26 @@ pub type KeptUpgrade = Arc<dyn Fn(LocalSongMapping) -> BoxFuture<'static, ()> + 
 /// song's id, the people and the line.
 pub type HoldHeart = Arc<dyn Fn(&str, &str, &[String], &str) + Send + Sync>;
 
-/// Files kept as heard, checked again on the events tied to work: a play or a heart of the song,
-/// a heart AcoustID's clear reading accepts (then the one kept file checked longest ago), and the
-/// person's own Retry. Each check sends one lookup of the print kept with the file (no `fpcalc`),
-/// reads it as what was heard is read, and only when a better copy could then be proven starts
-/// the search for one, whatever the weekly upgrade's settings and however recently it last tried.
-/// A check that finds nothing new fetches nothing.
+/// The holds a person waits on ("not yet proven" hearts and hearted albums' held tracks), each by
+/// its key with since when it waits.
+pub type WaitingHolds = Arc<dyn Fn() -> Vec<(String, DateTime<Utc>)> + Send + Sync>;
+
+/// Checks one hold again by its key.
+pub type RecheckHold = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// One item a heart's proof may check again.
+enum Recheckable {
+    Kept(Box<LocalSongMapping>),
+    Held(String),
+}
+
+/// Files kept as heard or kept anyway, checked again on the events tied to work: a play or a heart
+/// of the song, a heart AcoustID's clear reading accepts, and the person's own Retry. Each check sends one
+/// lookup of the print kept with the file (no `fpcalc`), reads it as what was heard is read, and
+/// only when a better copy could then be proven starts the search for one, whatever the weekly
+/// upgrade's settings and however recently it last tried. A check that finds nothing new fetches
+/// nothing. Each proof checks the one item of every kind (kept files, hearts held "not yet proven"
+/// and hearted albums' held tracks) checked longest ago, one pool for all three.
 pub struct KeptRechecks {
     library: Arc<dyn ILocalLibraryService>,
     acoust_id: Arc<AcoustIdClient>,
@@ -1131,7 +1145,9 @@ pub struct KeptRechecks {
     music_brainz: std::sync::OnceLock<(Arc<MusicBrainzClient>, Arc<dyn CatalogQuestions>)>,
     /// Where a kept file's own print waits as the sample its replacements are compared with.
     samples: std::sync::OnceLock<Arc<HeardSamples>>,
-    /// When each kept file was last checked, by its mapping's key, in the order of checks.
+    /// The holds a person waits on, and how one is checked again.
+    holds: std::sync::OnceLock<(WaitingHolds, RecheckHold)>,
+    /// When each item was last checked, by its kind and key, in the order of checks.
     checked: Mutex<std::collections::HashMap<String, u64>>,
     turn: std::sync::atomic::AtomicU64,
     /// What the last check of each kept file read, taken by the search it started, so the
@@ -1155,6 +1171,7 @@ impl KeptRechecks {
             hold: std::sync::OnceLock::new(),
             music_brainz: std::sync::OnceLock::new(),
             samples: std::sync::OnceLock::new(),
+            holds: std::sync::OnceLock::new(),
             checked: Mutex::new(std::collections::HashMap::new()),
             turn: std::sync::atomic::AtomicU64::new(0),
             read: Mutex::new(std::collections::HashMap::new()),
@@ -1200,7 +1217,7 @@ impl KeptRechecks {
             .filter(|mapping| {
                 mapping.external_provider == provider
                     && mapping.external_id == external_id
-                    && mapping.heart.as_ref().is_some_and(|heart| heart.as_heard)
+                    && rechecked(mapping)
                     && Path::new(&mapping.local_path).is_file()
             })
             .collect()
@@ -1213,29 +1230,65 @@ impl KeptRechecks {
         }
     }
 
-    /// A heart AcoustID's clear reading accepted: the one kept file checked longest ago (never
-    /// before counts as longest) is checked next, so checks follow real proofs and never loop on
-    /// their own answers.
+    /// The holds a person waits on, and how one is checked again: they join kept files in the
+    /// order a heart's proof checks items in. Once only.
+    pub fn use_holds(&self, waiting: WaitingHolds, recheck: RecheckHold) {
+        let _ = self.holds.set((waiting, recheck));
+    }
+
+    /// The hold `key` was checked again now, by whatever event: it goes to the back of the order.
+    pub fn checked_hold(&self, key: &str) {
+        self.mark(&held_item(key));
+    }
+
+    fn mark(&self, item: &str) {
+        let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.checked.lock().insert(item.to_string(), turn);
+    }
+
+    /// A heart AcoustID's clear reading accepted: the one item checked longest ago (never before
+    /// counts as longest; ties go to the one kept or held longest), of every kind at once (a file
+    /// kept as heard, a heart held "not yet proven", a hearted album's held track), is checked
+    /// next, so checks follow real proofs and never loop on their own answers.
     pub async fn after_a_proof(&self) {
-        let mut kept: Vec<LocalSongMapping> = self
+        let checked = self.checked.lock().clone();
+        let mut items: Vec<(u64, DateTime<Utc>, Recheckable)> = self
             .library
             .get_mappings()
             .await
             .into_iter()
-            .filter(|mapping| {
-                mapping.heart.as_ref().is_some_and(|heart| heart.as_heard)
-                    && Path::new(&mapping.local_path).is_file()
+            .filter(|mapping| rechecked(mapping) && Path::new(&mapping.local_path).is_file())
+            .map(|mapping| {
+                (
+                    checked.get(&kept_item(&mapping)).copied().unwrap_or(0),
+                    mapping.downloaded_at,
+                    Recheckable::Kept(Box::new(mapping)),
+                )
             })
             .collect();
-        let checked = self.checked.lock().clone();
-        kept.sort_by_key(|mapping| {
-            (
-                checked.get(&mapping.key()).copied().unwrap_or(0),
-                mapping.downloaded_at,
-            )
-        });
-        if let Some(oldest) = kept.into_iter().next() {
-            self.recheck(oldest).await;
+        if let Some((waiting, _)) = self.holds.get() {
+            items.extend(waiting().into_iter().map(|(key, since)| {
+                (
+                    checked.get(&held_item(&key)).copied().unwrap_or(0),
+                    since,
+                    Recheckable::Held(key),
+                )
+            }));
+        }
+        // A stable sort: items of one turn and one time keep their order.
+        items.sort_by_key(|(turn, since, _)| (*turn, *since));
+        match items.into_iter().next().map(|(_, _, item)| item) {
+            Some(Recheckable::Kept(mapping)) => {
+                self.recheck(*mapping).await;
+            }
+            Some(Recheckable::Held(key)) => {
+                info!("A proof checks the held {key} again");
+                self.checked_hold(&key);
+                if let Some((_, recheck)) = self.holds.get() {
+                    recheck(&key);
+                }
+            }
+            None => {}
         }
     }
 
@@ -1245,21 +1298,33 @@ impl KeptRechecks {
         let Some(heart) = mapping.heart.clone() else {
             return Reread::Unread;
         };
-        let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        self.checked.lock().insert(mapping.key(), turn);
+        self.mark(&kept_item(&mapping));
         let read = self.reread(&heart).await;
         info!("Checked the kept-as-heard {} again: {read:?}", mapping.local_path);
         if read == Reread::AnotherSong {
             self.another_song(&mapping, &heart);
             return read;
         }
-        if read.can_succeed()
+        if self.worth_a_search(&mapping, &heart, &read)
             && let Some(upgrade) = self.upgrade.get().cloned()
         {
             self.read.lock().insert(mapping.key(), read.clone());
             upgrade(mapping).await;
         }
         read
+    }
+
+    /// Whether a search for a better copy of a kept file could prove one: by its sound as it now
+    /// reads, or, for a file kept anyway that nobody heard, against what its person has heard of the
+    /// song since, whose master a copy may then be.
+    fn worth_a_search(&self, mapping: &LocalSongMapping, heart: &KeptHeart, read: &Reread) -> bool {
+        read.can_succeed()
+            || (!heart.as_heard
+                && matches!(read, Reread::OnlyHeardOrMaster | Reread::Unread)
+                && heart
+                    .users
+                    .first()
+                    .is_some_and(|user| self.registry.heard_by(&mapping.external_id, user).is_some()))
     }
 
     /// The kept file is another song than the one hearted: its video is refused for the song, as
@@ -1499,6 +1564,22 @@ impl KeptRechecks {
     }
 }
 
+/// Whether a library file is checked again on the events tied to work: one a heart kept with no
+/// proven recording, kept as heard or kept anyway.
+fn rechecked(mapping: &LocalSongMapping) -> bool {
+    mapping.heart.is_some() && mapping.kept_unproven()
+}
+
+/// A kept file's place in the order checks follow proofs in.
+fn kept_item(mapping: &LocalSongMapping) -> String {
+    format!("kept|{}", mapping.key())
+}
+
+/// A hold's place in the order checks follow proofs in.
+fn held_item(key: &str) -> String {
+    format!("held|{key}")
+}
+
 /// Why nothing is tried for a kept file while AcoustID does not answer.
 pub const KEPT_BUSY: &str = "AcoustID is busy, try again";
 
@@ -1524,3 +1605,11 @@ mod kept_tests;
 #[cfg(test)]
 #[path = "kept_proof_two_tests.rs"]
 mod kept_proof_two_tests;
+
+#[cfg(test)]
+#[path = "kept_pool_tests.rs"]
+mod kept_pool_tests;
+
+#[cfg(test)]
+#[path = "kept_anyway_rechecks_tests.rs"]
+mod kept_anyway_rechecks_tests;

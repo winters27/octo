@@ -2812,10 +2812,28 @@ impl DownloadBackend for SoulseekDownloadService {
             ))
             .into());
         };
+        // A person's keep lands a file its hold kept, as it is, or else only the audio they heard
+        // (YouTube's own copy of it): nothing is searched for.
+        if download.keep_anyway {
+            if let Some(path) = self.keep_held_file(base, download).await {
+                return Ok(path);
+            }
+            if download.source_override != Some(DownloadSource::YouTube) {
+                anyhow::bail!("Nothing this download held is left to keep");
+            }
+        }
         // A resumed hold brings back the files it held: the first still there that passes the
         // checks is the download, before any source is asked.
+        let held_track = download.origin
+            == Some(octo_core::fingerprint::heart_gate::AcquisitionOrigin::AlbumHeart)
+            && !download.held_files.is_empty();
         if let Some(path) = self.take_held_file(base, &routing.snapshot(), download).await? {
             return Ok(path);
+        }
+        // A hearted album's held track is checked by its own held files alone: nothing else is
+        // fetched for it.
+        if held_track {
+            anyhow::bail!("The held copy of this album track is not its recording");
         }
         // A play judged inside its own acquisition (Wait for lossless, queued with no gate) gets
         // its gate now; one with no identity to prove anything by is not proven at once.

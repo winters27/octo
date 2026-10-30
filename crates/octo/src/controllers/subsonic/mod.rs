@@ -47,6 +47,8 @@ mod fresh_marks_tests;
 #[cfg(test)]
 mod import_streaming_tests;
 #[cfg(test)]
+mod keep_anyway_tests;
+#[cfg(test)]
 mod library_edit_tests;
 #[cfg(test)]
 mod list_groups_tests;

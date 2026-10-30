@@ -20,6 +20,8 @@ tokio::task_local! {
     static BACKGROUND_FLOW: bool;
     /// Set for the work run by [`AcoustIdRateLimiter::with_class`].
     static CALL_CLASS: LookupClass;
+    /// Set for the work run by [`AcoustIdRateLimiter::at_least`].
+    static CLASS_FLOOR: LookupClass;
     /// Set for the work run by [`AcoustIdRateLimiter::if_free`]: whether a call in it found no
     /// free turn.
     static TURNED_AWAY: Arc<AtomicBool>;
@@ -463,6 +465,17 @@ impl AcoustIdRateLimiter {
     /// The current work's class: the one [`Self::with_class`] set, else work nobody waits on.
     pub fn class_now() -> LookupClass {
         CALL_CLASS.try_with(|class| *class).unwrap_or(LookupClass::Bulk)
+    }
+
+    /// Lookups started inside `work` take no earlier place than `floor`'s, whatever class they
+    /// are asked with. The floor ends when `work` does.
+    pub async fn at_least<T>(floor: LookupClass, work: impl Future<Output = T>) -> T {
+        CLASS_FLOOR.scope(floor, work).await
+    }
+
+    /// `class`, or the current work's floor when that comes later.
+    pub fn floored(class: LookupClass) -> LookupClass {
+        CLASS_FLOOR.try_with(|floor| class.max(*floor)).unwrap_or(class)
     }
 
     /// Calls started inside `work` take a turn only when one is free at once, and never wait for
