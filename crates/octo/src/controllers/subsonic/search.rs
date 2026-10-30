@@ -117,8 +117,11 @@ pub async fn search3(State(state): State<AppState>, req: Request) -> Result<Resp
     // Always include local results. The split itself lives in SearchBudget so it can be
     // unit-tested; the local floor used to be a flat 20, which is also the spec default for
     // songCount, so the most common search in the wild left nothing for discovery at all (#14).
-    let (budget_local, external_target) =
-        SearchBudget::compute(requested_songs, subsonic.enable_search_discovery);
+    let (budget_local, external_target) = SearchBudget::compute(
+        requested_songs,
+        subsonic.enable_search_discovery,
+        subsonic.effective_search_library_only_up_to(),
+    );
     // The library first for most clients; see page_one_split.
     let (local_song_target, external_share) =
         page_one_split(&call.parameters, requested_songs, budget_local, external_target);
@@ -447,7 +450,15 @@ async fn search_later_song_page(
         // again as if page one had asked for this page's count. The build is shared with
         // any page one still running for the query, so a client that asks for two pages
         // at once gets one build.
-        let (budget_local, external_target) = SearchBudget::compute(requested_songs, true);
+        let (budget_local, external_target) = SearchBudget::compute(
+            requested_songs,
+            true,
+            state
+                .settings
+                .current()
+                .subsonic
+                .effective_search_library_only_up_to(),
+        );
         if external_target == 0 {
             return Ok(None);
         }

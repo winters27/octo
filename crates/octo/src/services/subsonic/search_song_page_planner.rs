@@ -141,7 +141,7 @@ mod tests {
             if self.library_first {
                 (SearchBudget::library_first_target(self.page_one_count), 0)
             } else {
-                SearchBudget::compute(self.page_one_count, true)
+                SearchBudget::compute(self.page_one_count, true, SearchBudget::LOCAL_SONG_FLOOR)
             }
         }
         fn prefix_count(&self) -> i32 {

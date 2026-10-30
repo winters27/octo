@@ -863,7 +863,8 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // country mixes' four: :CountryMixes, :Countries, :MaxCountryPlaylists and
     // :CountryLookupsPerRefresh, Lidarr:WebhookSecret, Soulseek:Enabled,
     // RadioSources:ListenBrainzRadioMode, Subsonic:StreamSizeWarmPerMinute,
-    // Subsonic:SearchDurationWaitMs, Subsonic:SearchLastFmWaitMs, Subsonic:CoverCacheMb,
+    // Subsonic:SearchDurationWaitMs, Subsonic:SearchLastFmWaitMs,
+    // Subsonic:SearchLibraryOnlyUpTo, Subsonic:CoverCacheMb,
     // Subsonic:SizeFlagClients, Soulseek:SkipCoversAndInstrumentals and
     // LibraryActions:TagCheckPerHour (in their sections), the year and artist mixes' four:
     // GeneratedPlaylists:Years, :MaxYearPlaylists, :Artists and :ArtistCount, the sweep's
@@ -871,23 +872,23 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // then LibraryActions:KeepRatedCopies, Subsonic:DownloadAlbumOnSongStar,
     // Metadata:AnimatedArt and Subsonic:CoverBadge, then LibraryActions:YoutubeCheckPerHour and
     // the sweep's preview replacing, LibraryActions:ReviewSweepAutoReplacePreview, listed last.
-    assert_eq!(rows.len(), 206);
+    assert_eq!(rows.len(), 207);
     assert!(!rows.iter().any(|r| {
         r["Key"]
             .as_str()
             .is_some_and(|k| k.starts_with("Imports:Spotify"))
     }));
-    assert_eq!(rows[194]["Key"], "GeneratedPlaylists:Years");
-    assert_eq!(rows[197]["Key"], "GeneratedPlaylists:ArtistCount");
-    assert_eq!(rows[198]["Key"], "LibraryActions:ReviewSweepAutoReplace");
-    assert_eq!(rows[199]["Key"], "LibraryActions:ReviewSweepAutoReplacePerDay");
-    assert_eq!(rows[200]["Key"], "LibraryActions:KeepRatedCopies");
-    assert_eq!(rows[201]["Key"], "Subsonic:DownloadAlbumOnSongStar");
-    assert_eq!(rows[202]["Key"], "Metadata:AnimatedArt");
-    assert_eq!(rows[203]["Key"], "Subsonic:CoverBadge");
-    assert_eq!(rows[204]["Key"], "LibraryActions:YoutubeCheckPerHour");
+    assert_eq!(rows[195]["Key"], "GeneratedPlaylists:Years");
+    assert_eq!(rows[198]["Key"], "GeneratedPlaylists:ArtistCount");
+    assert_eq!(rows[199]["Key"], "LibraryActions:ReviewSweepAutoReplace");
+    assert_eq!(rows[200]["Key"], "LibraryActions:ReviewSweepAutoReplacePerDay");
+    assert_eq!(rows[201]["Key"], "LibraryActions:KeepRatedCopies");
+    assert_eq!(rows[202]["Key"], "Subsonic:DownloadAlbumOnSongStar");
+    assert_eq!(rows[203]["Key"], "Metadata:AnimatedArt");
+    assert_eq!(rows[204]["Key"], "Subsonic:CoverBadge");
+    assert_eq!(rows[205]["Key"], "LibraryActions:YoutubeCheckPerHour");
     assert_eq!(row("LibraryActions:YoutubeCheckPerHour")["IsSecret"], false);
-    assert_eq!(rows[205]["Key"], "LibraryActions:ReviewSweepAutoReplacePreview");
+    assert_eq!(rows[206]["Key"], "LibraryActions:ReviewSweepAutoReplacePreview");
     assert_eq!(
         row("LibraryActions:ReviewSweepAutoReplacePreview")["IsSecret"],
         false

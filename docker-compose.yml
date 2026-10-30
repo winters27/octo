@@ -73,6 +73,7 @@ services:
       Subsonic__WaitForSearchDurations: ${WAIT_FOR_SEARCH_DURATIONS:-true}
       Subsonic__SearchDurationWaitMs: ${SEARCH_DURATION_WAIT_MS:-1000}
       Subsonic__SearchLastFmWaitMs: ${SEARCH_LASTFM_WAIT_MS:-1000}
+      Subsonic__SearchLibraryOnlyUpTo: ${SEARCH_LIBRARY_ONLY_UP_TO:-12}
       Subsonic__StreamSizeWarmPerMinute: ${STREAM_SIZE_WARM_PER_MINUTE:-5}
       Subsonic__CoverCacheMb: ${COVER_CACHE_MB:-1024}
       # The small octopus on outside covers in other apps: it marks songs not in your
