@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
 use octo_core::common::dotnet::{self, compare_ordinal_ignore_case, eq_ignore_case};
-use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeartGate, WaitingFor};
+use octo_core::fingerprint::heart_gate::{Acceptance, AcquisitionOrigin, HeartGate, WaitingFor};
 use octo_core::settings::DownloadSource;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
@@ -54,16 +54,26 @@ pub enum GateOutcome {
     Undecided,
 }
 
-/// The gates' verdicts on the file one acquisition ended with, by person and origin. Shared by
-/// everyone who waits on the acquisition, so each one reads their own gate's verdict.
+/// The gates' verdicts on the file one acquisition ended with, by person and origin, and for each
+/// verdict that accepted it, which acceptance did. Shared by everyone who waits on the
+/// acquisition, so each one reads their own gate's verdict.
 #[derive(Clone, Default)]
-pub struct GateLedger(Arc<Mutex<Vec<(String, AcquisitionOrigin, GateOutcome)>>>);
+pub struct GateLedger {
+    verdicts: Arc<Mutex<Vec<(String, AcquisitionOrigin, GateOutcome)>>>,
+    accepted_by: Arc<Mutex<Vec<(String, AcquisitionOrigin, Acceptance)>>>,
+}
 
 impl GateLedger {
-    /// Records one gate's verdict, a later one for the same person and origin replacing it.
+    /// Records one gate's verdict, a later one for the same person and origin replacing it. A
+    /// verdict that does not accept the file forgets how an earlier one accepted it.
     pub fn record(&self, user: &str, origin: AcquisitionOrigin, outcome: GateOutcome) {
         let user = user.trim();
-        let mut entries = self.0.lock();
+        if outcome != GateOutcome::Accepted {
+            self.accepted_by
+                .lock()
+                .retain(|(who, from, _)| !(*from == origin && eq_ignore_case(who, user)));
+        }
+        let mut entries = self.verdicts.lock();
         match entries
             .iter_mut()
             .find(|(who, from, _)| *from == origin && eq_ignore_case(who, user))
@@ -73,18 +83,42 @@ impl GateLedger {
         }
     }
 
+    /// Records that `user`'s gate of `origin` accepted the file, and by which acceptance: the
+    /// very audio heard, AcoustID's clear reading, or the master heard.
+    pub fn record_accepted(&self, user: &str, origin: AcquisitionOrigin, by: Acceptance) {
+        self.record(user, origin, GateOutcome::Accepted);
+        let user = user.trim();
+        let mut accepted = self.accepted_by.lock();
+        match accepted
+            .iter_mut()
+            .find(|(who, from, _)| *from == origin && eq_ignore_case(who, user))
+        {
+            Some(entry) => entry.2 = by,
+            None => accepted.push((user.to_string(), origin, by)),
+        }
+    }
+
     /// What `user`'s gate of `origin` said, when it judged the file.
     pub fn outcome_for(&self, user: &str, origin: AcquisitionOrigin) -> Option<GateOutcome> {
-        self.0
+        self.verdicts
             .lock()
             .iter()
             .find(|(who, from, _)| *from == origin && eq_ignore_case(who, user.trim()))
             .map(|(_, _, outcome)| outcome.clone())
     }
 
+    /// Which acceptance passed the file for `user`'s gate of `origin`, when it was recorded.
+    pub fn acceptance_for(&self, user: &str, origin: AcquisitionOrigin) -> Option<Acceptance> {
+        self.accepted_by
+            .lock()
+            .iter()
+            .find(|(who, from, _)| *from == origin && eq_ignore_case(who, user.trim()))
+            .map(|(_, _, by)| *by)
+    }
+
     /// Whether a gate accepted the file for `user`.
     pub fn accepted(&self, user: &str) -> bool {
-        self.0
+        self.verdicts
             .lock()
             .iter()
             .any(|(who, _, outcome)| *outcome == GateOutcome::Accepted && eq_ignore_case(who, user.trim()))
@@ -92,12 +126,13 @@ impl GateLedger {
 
     /// Whether any gate judged the file: none did when the acquisition ran the shipped checks.
     pub fn is_empty(&self) -> bool {
-        self.0.lock().is_empty()
+        self.verdicts.lock().is_empty()
     }
 
     /// Forgets every verdict, for a file that is not kept after all.
     pub fn clear(&self) {
-        self.0.lock().clear();
+        self.verdicts.lock().clear();
+        self.accepted_by.lock().clear();
     }
 }
 
@@ -113,7 +148,10 @@ impl Eq for GateLedger {}
 
 impl std::fmt::Debug for GateLedger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.0.lock().iter()).finish()
+        f.debug_list()
+            .entries(self.verdicts.lock().iter())
+            .entries(self.accepted_by.lock().iter())
+            .finish()
     }
 }
 
