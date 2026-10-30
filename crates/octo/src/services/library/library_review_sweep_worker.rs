@@ -178,6 +178,13 @@ pub trait SweepReplacer: Send + Sync {
 
     /// Runs the request to its end.
     async fn replace(&self, request: LibraryActionRequest) -> anyhow::Result<LibraryActionOutcome>;
+
+    /// Whether the song `song_id` carries the "wrong version asked" mark: the person said it is
+    /// the wrong version, and Octo could not tell it apart by sound.
+    async fn wrong_version_asked(&self, song_id: &str) -> bool {
+        let _ = song_id;
+        false
+    }
 }
 
 /// The people besides the admin who can star or rate songs, whose marks the admin's own sign-in
@@ -319,6 +326,12 @@ impl SweepReplacer for ExecutorSweepReplacer {
         tokio::spawn(async move { executor.apply(request).await })
             .await
             .map_err(|e| anyhow::anyhow!("the replacement stopped: {e}"))?
+    }
+
+    async fn wrong_version_asked(&self, song_id: &str) -> bool {
+        self.executor
+            .journal()
+            .wrong_version_asked(song_id, LibraryActionExecutor::WRONG_VERSION_FIND_SONGS)
     }
 }
 
@@ -723,7 +736,14 @@ enum Replacing {
     Declined,
     /// Soulseek is out and the replacement may come from nowhere else: the song stays unchecked.
     Waits,
+    /// The person said the song is the wrong version and Octo could not tell it apart by sound:
+    /// the copy is theirs to pick, so the file stays a question that says so.
+    PickInFindSongs,
 }
+
+/// Why the sweep leaves a song in Review for its person to pick the copy they want.
+pub const PICK_IN_FIND_SONGS: &str =
+    "Octo cannot tell this version apart by sound; pick the copy you want in Find songs";
 
 /// The audio files the sweep walks: the same extensions the cover upgrade walks.
 const AUDIO_EXTENSIONS: [&str; 14] = crate::services::cover_art::CoverUpgradeWorker::AUDIO_EXTENSIONS;
@@ -1375,6 +1395,7 @@ impl LibraryReviewSweepWorker {
 
         self.lookup_failures.store(0, Ordering::SeqCst);
         self.unfingerprinted.store(0, Ordering::SeqCst);
+        let mut pick_in_find_songs = false;
         let replaced = if outcome == Outcome::Ask
             // A file someone was asked about while this check looked at it stays theirs to answer.
             && !self.notices.reviewed_paths().contains(&path)
@@ -1390,6 +1411,10 @@ impl LibraryReviewSweepWorker {
             match self.replace(step.keeper, &path, &file, &question).await {
                 Replacing::Done => true,
                 Replacing::Declined => false,
+                Replacing::PickInFindSongs => {
+                    pick_in_find_songs = true;
+                    false
+                }
                 // Soulseek is out: the song stays unchecked, no try or breaker count is spent, and
                 // the sweep comes back to it.
                 Replacing::Waits => {
@@ -1408,9 +1433,13 @@ impl LibraryReviewSweepWorker {
         };
         let asked = !replaced
             && outcome == Outcome::Ask
-            && self
-                .notices
-                .add_review_from(step.keeper, &path, song, &question, NoticeOrigin::LibrarySweep);
+            && if pick_in_find_songs {
+                self.notices
+                    .add_library_question(step.keeper, &path, song, PICK_IN_FIND_SONGS)
+            } else {
+                self.notices
+                    .add_review_from(step.keeper, &path, song, &question, NoticeOrigin::LibrarySweep)
+            };
         if asked {
             info!(
                 "Asking {} about '{} - {}' from the library: {}",
@@ -1487,6 +1516,13 @@ impl LibraryReviewSweepWorker {
             );
             return Replacing::Declined;
         };
+        if replacer.wrong_version_asked(&id).await {
+            info!(
+                "Library review sweep: '{} - {}' is a version Octo cannot tell apart by sound, so its person picks the copy",
+                song.artist, song.title
+            );
+            return Replacing::PickInFindSongs;
+        }
         match replacer.marked(&id).await {
             Some(false) => {}
             Some(true) => {

@@ -388,3 +388,67 @@ async fn joiners_with_no_verdict_on_the_file_are_recorded_as_before() {
     request.settle_joiners();
     assert_eq!(request.pool_members(), ["alice", "bob", "carol"]);
 }
+
+/// An AcoustID answer whose recordings are these (id, title, artist, submissions), every one at
+/// the match score.
+fn answer_of(recordings: &[(&str, &str, &str, i64)]) -> AcoustIdAnswer {
+    let doc = serde_json::json!({"status": "ok", "results": [{
+        "id": "fp", "score": 0.97,
+        "recordings": recordings.iter().map(|(id, title, artist, sources)| serde_json::json!({
+            "id": id, "title": title, "artists": [{"name": artist}], "sources": sources,
+        })).collect::<Vec<_>>(),
+    }]});
+    octo_core::fingerprint::acoust_id_client::parse_answer(&doc)
+        .expect("parses")
+        .expect("an answer")
+}
+
+/// A Wrong song or Wrong version replacement refuses a file whose dominant recording is its
+/// original's clear recording or one of that recording's same-note duplicates, and for a Wrong song
+/// whose original read ambiguous, any recording of the original's song; any other file stands,
+/// whatever else its answer names.
+#[test]
+fn a_replacement_refuses_its_originals_recording_or_song_again_by_the_dominant_recording() {
+    let recordings = SoundDeny::Recordings(HeardRecording {
+        ids: vec!["help-2015".into(), "help-2015-again".into()],
+        duplicates: vec!["help-2015".into(), "help-2015-again".into()],
+        ..Default::default()
+    });
+    let min = 0.8;
+    for dominant in ["help-2015", "HELP-2015-AGAIN"] {
+        let file = answer_of(&[
+            (dominant, "Help!", "The Beatles", 60),
+            ("help-2009", "Help!", "The Beatles", 5),
+        ]);
+        assert_eq!(
+            recordings.refuses(&file, min),
+            Some(SAME_RECORDING_AGAIN),
+            "{dominant}"
+        );
+    }
+    let other_mix = answer_of(&[
+        ("help-2009", "Help!", "The Beatles", 60),
+        ("help-2015", "Help!", "The Beatles", 5),
+    ]);
+    assert_eq!(recordings.refuses(&other_mix, min), None, "another mix stands");
+    assert_eq!(
+        recordings.refuses(&answer_of(&[]), min),
+        None,
+        "an unknown file stands"
+    );
+
+    let song = SoundDeny::Song(octo_core::fingerprint::verification::SongName {
+        title: "Yellow Submarine".into(),
+        artists: vec!["The Beatles".into()],
+        artist_ids: Vec::new(),
+    });
+    let again = answer_of(&[(
+        "ys-remaster",
+        "Yellow Submarine (Remastered 2009)",
+        "The Beatles",
+        40,
+    )]);
+    assert_eq!(song.refuses(&again, min), Some(SAME_SONG_AGAIN));
+    let wanted = answer_of(&[("help-2009", "Help!", "The Beatles", 60)]);
+    assert_eq!(song.refuses(&wanted, min), None, "the song asked for stands");
+}

@@ -130,6 +130,10 @@ pub struct LibraryActionEntry {
     pub denied_source: Option<DeniedSource>,
 }
 
+/// What the file fingerprint in a Find songs pick's key ends with, so a pick that replaces a song
+/// as Wrong version does is an action of its own.
+pub const PICK_SUFFIX: &str = ":pick";
+
 /// One Soulseek user's file, as the rejected peer registry keys it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -452,6 +456,24 @@ impl LibraryActionJournal {
             denied_source: Some(denied),
             ..existing
         });
+    }
+
+    /// Whether the song `navidrome_id` carries the "wrong version asked" mark: its latest action,
+    /// leaving out picks of a copy that did not replace the file, is a Wrong version that Octo
+    /// answered with `asked` (the words that send the person to Find songs). Any other action on
+    /// the song, or a pick that replaced its file, ends the mark.
+    pub fn wrong_version_asked(&self, navidrome_id: &str, asked: &str) -> bool {
+        let entries = self.entries.lock();
+        entries
+            .ordered()
+            .filter(|entry| entry.navidrome_id == navidrome_id && !entry.dry_run)
+            .filter(|entry| !(entry.key.ends_with(PICK_SUFFIX) && entry.state != LibraryActionState::Applied))
+            .max_by_key(|entry| entry.at_utc)
+            .is_some_and(|latest| {
+                latest.action == LibraryAction::WrongVersion
+                    && latest.state == LibraryActionState::Skipped
+                    && latest.detail.as_deref() == Some(asked)
+            })
     }
 
     /// Has the user said they do not want this track back?

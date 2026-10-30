@@ -6,7 +6,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
 use octo_core::common::dotnet::{self, compare_ordinal_ignore_case, eq_ignore_case};
-use octo_core::fingerprint::heart_gate::{Acceptance, AcquisitionOrigin, HeartGate, WaitingFor};
+use octo_core::fingerprint::acoust_id_client::AcoustIdAnswer;
+use octo_core::fingerprint::heart_gate::{
+    Acceptance, AcquisitionOrigin, HeardRecording, HeartGate, WaitingFor,
+};
+use octo_core::fingerprint::verification::{SongName, is_same_song, read_answer};
 use octo_core::settings::DownloadSource;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
@@ -155,6 +159,41 @@ impl std::fmt::Debug for GateLedger {
     }
 }
 
+/// What a Wrong song or Wrong version replacement refuses by sound, from its original's own
+/// AcoustID answer, read once before the download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SoundDeny {
+    /// The original reads clearly as one recording: a file whose dominant recording is it, or one
+    /// of its same-note duplicates, is the original again.
+    Recordings(HeardRecording),
+    /// A Wrong song whose original reads ambiguous: a file whose dominant recording is that song
+    /// at all is the wrong song again.
+    Song(SongName),
+}
+
+/// Why a replacement is refused for being its original's recording again, as the rest of a
+/// sentence about the file.
+pub const SAME_RECORDING_AGAIN: &str = "is the same recording as the copy it was to replace";
+/// Why a replacement is refused for being its original's song again.
+pub const SAME_SONG_AGAIN: &str = "is the same song as the copy it was to replace";
+
+impl SoundDeny {
+    /// Why a file whose AcoustID answer is `answer` is refused, or None: only by its dominant
+    /// recording, among the results that reach `min_score`.
+    pub fn refuses(&self, answer: &AcoustIdAnswer, min_score: f64) -> Option<&'static str> {
+        let reading = read_answer(answer, &HeardRecording::default(), min_score);
+        let dominant = reading.dominant()?;
+        match self {
+            SoundDeny::Recordings(r) => (r.holds(&dominant.id)
+                || r.duplicates
+                    .iter()
+                    .any(|id| id.eq_ignore_ascii_case(&dominant.id)))
+            .then_some(SAME_RECORDING_AGAIN),
+            SoundDeny::Song(song) => is_same_song(&dominant.song(), song).then_some(SAME_SONG_AGAIN),
+        }
+    }
+}
+
 /// The key an acquisition of a track runs under: `provider:id`, and `:flac` for a request that
 /// wants only a real FLAC copy.
 pub fn acquisition_key(provider: &str, external_id: &str, flac_only: bool) -> String {
@@ -264,6 +303,8 @@ pub struct AcquisitionPlace {
     pub held_files: Vec<String>,
     /// Where each gate's verdict on the file is written, for everyone who waits on it.
     pub ledger: GateLedger,
+    /// What a replacement refuses by its original's sound.
+    pub deny: Option<SoundDeny>,
 }
 
 /// One queued request to fetch a permanent copy of a track.
@@ -313,6 +354,8 @@ pub struct AcquisitionRequest {
     /// Hearts and plays that joined with a gate of their own: their library, their name and their
     /// claim on the outcome are recorded only once their own gate passes the landed file.
     joiners: Mutex<Vec<GatedJoiner>>,
+    /// What a replacement refuses by its original's sound.
+    pub deny: Option<SoundDeny>,
 
     pub completion: Completion,
 }
@@ -360,6 +403,7 @@ impl AcquisitionRequest {
             gates: Mutex::new(Vec::new()),
             held_files: Mutex::new(Vec::new()),
             joiners: Mutex::new(Vec::new()),
+            deny: None,
             completion: Completion::default(),
         }
     }
@@ -493,6 +537,7 @@ impl AcquisitionRequest {
             gates: self.gates(),
             held_files: self.held_files.lock().clone(),
             ledger: self.completion.ledger().clone(),
+            deny: self.deny.clone(),
         }
     }
 
@@ -871,6 +916,48 @@ impl TrackAcquisitionQueue {
         upgrade_search: bool,
         replacement: Option<Arc<ReplacementHandoff>>,
     ) -> Completion {
+        self.enqueue_denying(
+            None,
+            origin,
+            gates,
+            held_files,
+            target,
+            flac_only,
+            provider,
+            external_id,
+            is_star,
+            trigger_album_download,
+            force_permanent,
+            source_override,
+            notify_on_failure,
+            requested_by,
+            upgrade_search,
+            replacement,
+        )
+    }
+
+    /// [`Self::enqueue_holding`] for a replacement that refuses files by its original's sound. A
+    /// request already in flight is joined as it is, without `deny`, as a replacement always was.
+    #[allow(clippy::too_many_arguments)] // enqueue_holding's arguments and what is refused
+    pub fn enqueue_denying(
+        &self,
+        deny: Option<SoundDeny>,
+        origin: Option<AcquisitionOrigin>,
+        gates: Vec<HeartGate>,
+        held_files: Vec<String>,
+        target: &AcquisitionTarget,
+        flac_only: bool,
+        provider: &str,
+        external_id: &str,
+        is_star: bool,
+        trigger_album_download: bool,
+        force_permanent: bool,
+        source_override: Option<DownloadSource>,
+        notify_on_failure: bool,
+        requested_by: Option<&str>,
+        upgrade_search: bool,
+        replacement: Option<Arc<ReplacementHandoff>>,
+    ) -> Completion {
         let mut request = AcquisitionRequest::new(
             provider,
             external_id,
@@ -885,6 +972,7 @@ impl TrackAcquisitionQueue {
         if let Some(origin) = origin {
             request = request.with_origin(origin);
         }
+        request.deny = deny;
         let request = Arc::new(request);
         request.add_requester(requested_by);
         request.add_target(target);

@@ -38,7 +38,7 @@ use crate::services::framework::DotnetDictionary;
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::local::{ILocalLibraryService, KeptHeart, LocalSongMapping};
 use crate::services::prefetch::HeardSamples;
-use crate::services::prefetch::heard_samples::{HeardPrints, sample_id_of};
+use crate::services::prefetch::heard_samples::{FpcalcClass, HeardPrints, sample_id_of};
 use crate::services::soulseek::{ExternalIdRegistry, ISoulseekLink, SoulseekMetadataService};
 use crate::services::state_file;
 use octo_core::fingerprint::acoust_id_client::AcoustIdOutcome;
@@ -47,6 +47,7 @@ use octo_core::fingerprint::heart_gate::{
     AcquisitionOrigin, HeardAnswerReading, HeardReading, HeardRecord, HeardRecording, HeardSource, HeartGate,
     read_heard_answer,
 };
+use octo_core::fingerprint::verification::{Reading, SongName, read_answer};
 
 /// The words a job's state goes by on the wire. A contract with the Octo apps.
 pub struct UpgradeStates;
@@ -700,8 +701,19 @@ impl UpgradeWorker {
         // One pick for the whole job, so the one pinned is the one let go below.
         let pick = job.pick.clone().map(Arc::new);
         let acquired: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let mut request =
-            LibraryActionRequest::new(LibraryAction::BetterQuality, &job.navidrome_id, &job.requested_by);
+        // A copy picked for a song the person said is the wrong version replaces it as Wrong
+        // version does; every other job is Better quality.
+        let wrong_version = pick.as_ref().is_some_and(|pick| pick.wrong_version);
+        let mut request = LibraryActionRequest::new(
+            if wrong_version {
+                LibraryAction::WrongVersion
+            } else {
+                LibraryAction::BetterQuality
+            },
+            &job.navidrome_id,
+            &job.requested_by,
+        );
+        request.picked = wrong_version;
         let (pinned, heard) = (pick.clone(), acquired.clone());
         request.on_replacement_queued = Some(Arc::new(move |provider: &str, external_id: &str| {
             *heard.lock() = Some(external_id.to_string());
@@ -909,6 +921,9 @@ impl UpgradeWorker {
     /// theirs: "The copy you picked did not replace yours: it was the wrong recording. Your copy
     /// was kept."
     pub fn pick_not_taken(detail: Option<&str>) -> String {
+        if detail == Some(LibraryActionExecutor::SAME_AS_REJECTED) {
+            return LibraryActionExecutor::SAME_AS_REJECTED.to_string();
+        }
         let why = user_safe(detail).unwrap_or_default();
         let why = why.split(", so nothing changed").next().unwrap_or("").trim();
         let why = why.trim_end_matches('.');
@@ -1402,6 +1417,85 @@ impl KeptRechecks {
             gate.heard = self.registry.heard_by(&mapping.external_id, &user);
         }
         KeptFor::Gate(Box::new(gate))
+    }
+}
+
+/// What a library file's own AcoustID answer says of it, read once before a Wrong song or a
+/// Wrong version replacement downloads anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginalSound {
+    /// Nothing of its sound is known: AcoustID is off, or the file could not be printed or read.
+    Unread,
+    /// AcoustID or MusicBrainz did not answer.
+    Busy,
+    /// No result reaches the match score: AcoustID does not know it.
+    Empty,
+    /// No result at the match score links a recording, or an unlinked fingerprint scores above
+    /// every linked one.
+    Unknown,
+    /// One recording, clearly: it and the recordings MusicBrainz files under its codes with its
+    /// note.
+    Clear(HeardRecording),
+    /// The same song, but AcoustID cannot tell which version: the song its dominant recording is.
+    Ambiguous(SongName),
+}
+
+impl KeptRechecks {
+    /// What `path`'s own sound says it is: one lookup of its print (of the length downloads are
+    /// printed at, in the `fpcalc` queue's ordinary place) on `class`'s lane, sent with the file's
+    /// length. Its dominant recording read clear (with that recording's same-note duplicates, as R
+    /// becomes what played) is Clear; any other dominant recording is that recording's song.
+    pub async fn original_sound(
+        &self,
+        path: &str,
+        seconds: Option<i32>,
+        class: LookupClass,
+    ) -> OriginalSound {
+        let Some(samples) = self.samples.get() else {
+            return OriginalSound::Unread;
+        };
+        let settings = self.settings.current().soulseek.clone();
+        let Some((print, decoded)) = samples
+            .compressed_print(
+                Path::new(path),
+                settings.effective_fingerprint_seconds(),
+                FpcalcClass::Other,
+            )
+            .await
+        else {
+            return OriginalSound::Unread;
+        };
+        let Some(length) = seconds.filter(|s| *s > 0).or(Some(decoded).filter(|s| *s > 0)) else {
+            return OriginalSound::Unread;
+        };
+        let min = settings.effective_min_score_fraction();
+        let answer = match self.acoust_id.lookup_answer(class, &print, length).await {
+            AcoustIdOutcome::Answered(answer) => answer,
+            AcoustIdOutcome::Busy => return OriginalSound::Busy,
+            AcoustIdOutcome::Off | AcoustIdOutcome::Unreadable { .. } => return OriginalSound::Unread,
+        };
+        let reading = read_answer(&answer, &HeardRecording::default(), min);
+        if reading.reading == Reading::Empty {
+            return OriginalSound::Empty;
+        }
+        let Some(dominant) = reading.dominant().cloned() else {
+            return OriginalSound::Unknown;
+        };
+        let named = HeardRecording {
+            title: dominant.title.clone(),
+            artist: dominant
+                .artists
+                .first()
+                .map(|artist| artist.name.clone())
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        let questions = self.questions();
+        match became_with_duplicates(questions.as_ref(), &answer, &dominant, &named, min).await {
+            Ok((r, Some(_))) => OriginalSound::Clear(r),
+            Ok((_, None)) => OriginalSound::Ambiguous(dominant.song()),
+            Err(_) => OriginalSound::Busy,
+        }
     }
 }
 

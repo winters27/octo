@@ -73,7 +73,7 @@ use tracing::{debug, error, info, warn};
 use crate::services::common::acquisition_tracker::{acquisition_event_kinds, key_of};
 use crate::services::common::{
     AcquisitionPlace, AcquisitionState, AcquisitionTracker, DownloadArrivals, DownloadConcurrency,
-    DownloadPicks, GateLedger, acquisition_key,
+    DownloadPicks, GateLedger, SoundDeny, acquisition_key,
 };
 use crate::services::cover_art::DownloadCoverResolver;
 use crate::services::family::FamilyPlacement;
@@ -170,6 +170,8 @@ pub struct TrackDownload {
     pub ledger: GateLedger,
     /// Everyone who asked for the song, as the request had them when it started.
     pub requested_by: Vec<String>,
+    /// What a replacement refuses by its original's sound.
+    pub deny: Option<SoundDeny>,
 }
 
 /// The source-specific parts of the download pipeline. Every call is handed the base, so a
@@ -1150,6 +1152,7 @@ impl BaseDownloadService {
             acquisition_key: acquisition_key(external_provider, external_id, flac_only),
             ledger: options.place.ledger.clone(),
             requested_by: options.requested_by.clone().unwrap_or_default(),
+            deny: options.place.deny.clone(),
         };
         // A heart's or a play's gates judge a song fetched ahead before it is kept; one they pass
         // over is gone, and the download runs.
