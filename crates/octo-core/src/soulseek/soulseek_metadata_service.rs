@@ -3,10 +3,13 @@
 //!
 //! The service itself lives in `octo::services::soulseek::soulseek_metadata_service`.
 
+use chrono::{DateTime, Utc};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
+use crate::common::dotnet::eq_ignore_case;
+use crate::fingerprint::heart_gate::{AlbumContext, HeardBy, HeardRecord, PlayedMark};
 use crate::soulseek::song_length::LengthSource;
 use crate::soulseek::stream_facts::StreamFacts;
 
@@ -122,6 +125,14 @@ pub struct SoulseekRouting {
     /// next starts at its first byte. Not persisted.
     #[serde(skip)]
     pub pending_video: Option<String>,
+
+    /// The albums people listed or played this song from, at most 8, the least recently listed
+    /// first out. Never sent to a client.
+    pub contexts: Vec<AlbumContext>,
+
+    /// What each person heard of this song, one per person, at most 8, the least recently heard
+    /// first out.
+    pub heard: Vec<HeardBy>,
 }
 
 /// The gain and peak are plain measured numbers, never NaN, so equality is total.
@@ -136,6 +147,131 @@ impl SoulseekRouting {
 
     /// The mark of a video the song was named by, which no ranking picked.
     pub const VIDEO_NAMED: u8 = u8::MAX;
+
+    /// How many album contexts a song keeps; the least recently listed goes first.
+    pub const MAX_CONTEXTS: usize = 8;
+
+    /// How many people's heard records a song keeps; the least recently heard goes first.
+    pub const MAX_HEARD: usize = 8;
+
+    /// Adds `context`, or moves the person's context of the same catalog album to it: one per
+    /// person and album, the most recently listed last. A listing older than the one kept never
+    /// replaces it, and a played time already known stays. True when anything changed.
+    pub fn remember_context(&mut self, context: AlbumContext) -> bool {
+        if context.user.trim().is_empty() || context.catalog_album_id.trim().is_empty() {
+            return false;
+        }
+        let before = self.contexts.clone();
+        let mut context = context;
+        if let Some(at) = self.contexts.iter().position(|known| {
+            eq_ignore_case(&known.user, &context.user) && known.catalog_album_id == context.catalog_album_id
+        }) {
+            let known = &self.contexts[at];
+            if known.listed_at > context.listed_at {
+                return false;
+            }
+            context.played_at = known.played_at.max(context.played_at);
+            self.contexts.remove(at);
+        }
+        self.contexts.push(context);
+        self.contexts.sort_by_key(|known| known.listed_at);
+        let excess = self.contexts.len().saturating_sub(Self::MAX_CONTEXTS);
+        self.contexts.drain(..excess);
+        self.contexts != before
+    }
+
+    /// Marks played, at `at`, the context of `user`'s that a play names: the one whose catalog
+    /// album id is the mark's, else the one most recently listed by the mark's client. True when
+    /// one was marked.
+    pub fn mark_played(&mut self, user: &str, mark: &PlayedMark, at: DateTime<Utc>) -> bool {
+        let by_album = mark
+            .catalog_album_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .and_then(|id| {
+                self.contexts
+                    .iter()
+                    .rposition(|known| eq_ignore_case(&known.user, user) && known.catalog_album_id == id)
+            });
+        let same_client = |known: &AlbumContext| match (&known.client, &mark.client) {
+            (Some(listed), Some(played)) => eq_ignore_case(listed, played),
+            (None, None) => true,
+            _ => false,
+        };
+        let found = by_album.or_else(|| {
+            self.contexts
+                .iter()
+                .rposition(|known| eq_ignore_case(&known.user, user) && same_client(known))
+        });
+        let Some(found) = found else {
+            return false;
+        };
+        let context = &mut self.contexts[found];
+        if context.played_at.is_some_and(|played| played >= at) {
+            return false;
+        }
+        context.played_at = Some(at);
+        true
+    }
+
+    /// Keeps `record` as what `user` heard of this song, one record per person: a record heard
+    /// at the same time or later replaces the one kept, an earlier one never does. A record of the
+    /// same source and time with no sample keeps the sample already known. True when anything
+    /// changed.
+    pub fn remember_heard(&mut self, user: &str, record: HeardRecord) -> bool {
+        let user = user.trim();
+        if user.is_empty() {
+            return false;
+        }
+        let mut record = record;
+        if let Some(at) = self
+            .heard
+            .iter()
+            .position(|known| eq_ignore_case(&known.user, user))
+        {
+            let known = &self.heard[at].record;
+            if known.heard_at > record.heard_at {
+                return false;
+            }
+            if record.sample_id.is_none()
+                && known.heard_at == record.heard_at
+                && known.source == record.source
+            {
+                record.sample_id = known.sample_id.clone();
+            }
+            if *known == record {
+                return false;
+            }
+            self.heard.remove(at);
+        }
+        self.heard.push(HeardBy {
+            user: user.to_string(),
+            record,
+        });
+        self.heard.sort_by_key(|known| known.record.heard_at);
+        let excess = self.heard.len().saturating_sub(Self::MAX_HEARD);
+        self.heard.drain(..excess);
+        true
+    }
+
+    /// What `user` heard of this song, when it is kept.
+    pub fn heard_by(&self, user: &str) -> Option<&HeardRecord> {
+        self.heard
+            .iter()
+            .find(|known| eq_ignore_case(&known.user, user))
+            .map(|known| &known.record)
+    }
+
+    /// Takes another copy's album contexts and heard records, keeping for each person (and
+    /// album) the later one, so an older copy never writes back over a newer one.
+    pub fn merge_heard(&mut self, contexts: &[AlbumContext], heard: &[HeardBy]) {
+        for context in contexts {
+            self.remember_context(context.clone());
+        }
+        for known in heard {
+            self.remember_heard(&known.user, known.record.clone());
+        }
+    }
 
     pub fn has_you_tube(&self) -> bool {
         self.you_tube_id.as_deref().is_some_and(|id| !id.is_empty())
@@ -293,6 +429,8 @@ impl Serialize for SoulseekRouting {
             self.track_peak.is_some(),
             !self.refused_videos.is_empty(),
             self.video_pick > 0,
+            !self.contexts.is_empty(),
+            !self.heard.is_empty(),
         ]
         .into_iter()
         .filter(|known| *known)
@@ -349,6 +487,12 @@ impl Serialize for SoulseekRouting {
         }
         if self.video_pick > 0 {
             s.serialize_field("VideoPick", &self.video_pick)?;
+        }
+        if !self.contexts.is_empty() {
+            s.serialize_field("Contexts", &self.contexts)?;
+        }
+        if !self.heard.is_empty() {
+            s.serialize_field("Heard", &self.heard)?;
         }
         if from_file {
             s.serialize_field(SHOWN_FROM_FILE, &true)?;
@@ -613,5 +757,182 @@ mod tests {
 
         routing.pin_video("vid-b");
         assert_eq!(routing.stream_facts(), StreamFacts::default());
+    }
+
+    use crate::fingerprint::heart_gate::HeardSource;
+    use chrono::TimeZone;
+
+    fn at(minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 29, 12, minute, 0).unwrap()
+    }
+
+    fn context(user: &str, client: &str, album: &str, minute: u32) -> AlbumContext {
+        AlbumContext {
+            user: user.into(),
+            client: Some(client.into()),
+            catalog_album_id: album.into(),
+            album: Some(format!("Album {album}")),
+            listed_at: at(minute),
+            ..Default::default()
+        }
+    }
+
+    fn heard(video: &str, minute: u32) -> HeardRecord {
+        HeardRecord {
+            heard_at: at(minute),
+            source: HeardSource::Video {
+                id: video.into(),
+                size: Some(1000),
+                content_type: "audio/mp4".into(),
+                itag: None,
+            },
+            sample_id: None,
+        }
+    }
+
+    #[test]
+    fn two_users_on_two_clients_keep_a_context_each() {
+        let mut routing = SoulseekRouting::default();
+        assert!(routing.remember_context(context("brandon", "OctoPlayer", "302127", 1)));
+        assert!(routing.remember_context(context("anna", "Feishin", "302127", 2)));
+        assert!(routing.remember_context(context("brandon", "OctoPlayer", "6575789", 3)));
+        assert_eq!(routing.contexts.len(), 3);
+
+        // Listing the same album again moves it last and keeps its played time.
+        assert!(routing.mark_played(
+            "brandon",
+            &PlayedMark {
+                client: Some("octoplayer".into()),
+                catalog_album_id: None,
+            },
+            at(4)
+        ));
+        assert_eq!(
+            routing.contexts[2].played_at,
+            Some(at(4)),
+            "the client's newest listing"
+        );
+        assert!(routing.remember_context(context("Brandon", "OctoPlayer", "302127", 5)));
+        let albums: Vec<(&str, &str)> = routing
+            .contexts
+            .iter()
+            .map(|c| (c.user.as_str(), c.catalog_album_id.as_str()))
+            .collect();
+        assert_eq!(
+            albums,
+            [("anna", "302127"), ("brandon", "6575789"), ("Brandon", "302127")]
+        );
+        assert_eq!(routing.contexts[1].played_at, Some(at(4)));
+
+        // The stream's album wins over the client's newest listing.
+        assert!(routing.mark_played(
+            "anna",
+            &PlayedMark {
+                client: Some("other".into()),
+                catalog_album_id: Some("302127".into()),
+            },
+            at(6)
+        ));
+        assert_eq!(routing.contexts[0].played_at, Some(at(6)));
+        // Nothing of the user's matches: nothing marked.
+        assert!(!routing.mark_played("nobody", &PlayedMark::default(), at(7)));
+    }
+
+    #[test]
+    fn an_older_listing_never_replaces_a_newer_one_and_eight_contexts_are_kept() {
+        let mut routing = SoulseekRouting::default();
+        assert!(routing.remember_context(context("brandon", "c", "a", 9)));
+        let mut older = context("brandon", "c", "a", 3);
+        older.album = Some("stale".into());
+        assert!(!routing.remember_context(older));
+        assert_eq!(routing.contexts[0].album.as_deref(), Some("Album a"));
+
+        for minute in 10..20 {
+            routing.remember_context(context("brandon", "c", &format!("x{minute}"), minute));
+        }
+        assert_eq!(routing.contexts.len(), SoulseekRouting::MAX_CONTEXTS);
+        assert_eq!(
+            routing.contexts[0].catalog_album_id, "x12",
+            "the least recently listed went"
+        );
+    }
+
+    #[test]
+    fn one_heard_record_per_person_the_later_one_kept() {
+        let mut routing = SoulseekRouting::default();
+        assert!(routing.remember_heard("brandon", heard("v1", 5)));
+        assert!(
+            !routing.remember_heard("Brandon", heard("v0", 4)),
+            "an older record never replaces"
+        );
+        assert_eq!(
+            routing.heard_by("BRANDON").and_then(|r| r.source.video_id()),
+            Some("v1")
+        );
+
+        // The sample of the same play arrives later and is kept; a write without it keeps it.
+        let mut sampled = heard("v1", 5);
+        sampled.sample_id = Some("s1".into());
+        assert!(routing.remember_heard("brandon", sampled));
+        assert!(!routing.remember_heard("brandon", heard("v1", 5)));
+        assert_eq!(
+            routing.heard_by("brandon").unwrap().sample_id.as_deref(),
+            Some("s1")
+        );
+
+        assert!(routing.remember_heard("brandon", heard("v2", 6)));
+        assert_eq!(routing.heard.len(), 1);
+        for (minute, user) in (10..20).zip(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]) {
+            routing.remember_heard(user, heard("v", minute));
+        }
+        assert_eq!(routing.heard.len(), SoulseekRouting::MAX_HEARD);
+        assert!(
+            routing.heard_by("brandon").is_none(),
+            "the least recently heard went"
+        );
+    }
+
+    #[test]
+    fn merging_keeps_the_newer_record_of_each_person() {
+        let mut fresh = SoulseekRouting::default();
+        fresh.remember_heard("brandon", heard("old", 1));
+        fresh.remember_context(context("brandon", "c", "a", 1));
+        let mut registered = SoulseekRouting::default();
+        registered.remember_heard("brandon", heard("new", 2));
+        registered.remember_heard("anna", heard("hers", 3));
+        registered.remember_context(context("brandon", "c", "a", 2));
+
+        fresh.merge_heard(&registered.contexts, &registered.heard);
+        assert_eq!(
+            fresh.heard_by("brandon").and_then(|r| r.source.video_id()),
+            Some("new")
+        );
+        assert_eq!(
+            fresh.heard_by("anna").and_then(|r| r.source.video_id()),
+            Some("hers")
+        );
+        assert_eq!(fresh.contexts.len(), 1);
+        assert_eq!(fresh.contexts[0].listed_at, at(2));
+    }
+
+    #[test]
+    fn contexts_and_heard_records_are_written_only_when_there_are_some() {
+        let none = crate::json::to_string(&SoulseekRouting::default());
+        assert!(
+            !none.contains("Contexts") && !none.contains("\"Heard\""),
+            "{none}"
+        );
+
+        let mut routing = SoulseekRouting::default();
+        routing.remember_context(context("brandon", "c", "302127", 1));
+        routing.remember_heard("brandon", heard("v1", 2));
+        let json = crate::json::to_string(&routing);
+        assert!(json.contains(r#""Contexts":[{"User":"brandon""#), "{json}");
+        assert!(
+            json.contains(r#""Heard":[{"User":"brandon","Record":{"#),
+            "{json}"
+        );
+        let back: SoulseekRouting = serde_json::from_str(&json).expect("reads back");
+        assert_eq!(back, routing);
     }
 }

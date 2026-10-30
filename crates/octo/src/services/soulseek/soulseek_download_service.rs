@@ -267,12 +267,7 @@ impl SoulseekDownloadService {
     }
 
     fn routing_for(&self, external_id: &str) -> Option<SharedRouting> {
-        self.id_registry.lookup(external_id).or_else(|| {
-            SoulseekMetadataService::try_decode_external_id(Some(external_id)).map(|mut routing| {
-                self.id_registry.apply_refusals(&mut routing);
-                SharedRouting::new(routing)
-            })
-        })
+        self.id_registry.resolve_song(external_id, false)
     }
 
     // =========================================================================

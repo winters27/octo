@@ -1763,10 +1763,12 @@ impl IMusicMetadataService for SoulseekMetadataService {
             return None;
         }
 
-        let routing = match self.inner.lookup(external_id) {
-            Some(routing) => routing.snapshot(),
-            None => Self::try_decode_external_id(Some(external_id))?,
-        };
+        // Never registers: ids a client sends must not fill the registry.
+        let routing = self
+            .inner
+            .id_registry
+            .resolve_song(external_id, false)?
+            .snapshot();
 
         Some(Song {
             id: external_id.to_string(),
@@ -1829,6 +1831,16 @@ impl IMusicMetadataService for SoulseekMetadataService {
                 .and_then(|m| m.album_title.clone())
                 .unwrap_or_else(|| placeholder.clone());
             deezer_album_id = inner.deezer.find_album_id(artist, &album_name).await;
+            // Kept on the album, so a listing of it names the catalog's album as its songs'
+            // context.
+            if let Some(found) = deezer_album_id.as_deref().filter(|id| !id.is_empty())
+                && let Some(shared) = inner.lookup(external_id)
+            {
+                let mut album = shared.lock();
+                if album.external_album_id.as_deref().is_none_or(str::is_empty) {
+                    album.external_album_id = Some(found.to_string());
+                }
+            }
         }
 
         let mut album = Album {

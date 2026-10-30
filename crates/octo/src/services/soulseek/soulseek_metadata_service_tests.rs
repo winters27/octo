@@ -355,6 +355,20 @@ fn album_id_from_song_row(h: &Harness, artist: &str, title: &str) -> String {
     })
 }
 
+/// An album a song row minted with no catalog id keeps the one its name found, so a listing of
+/// it names the catalog's album as its songs' context.
+#[tokio::test]
+async fn get_album_keeps_the_catalog_id_it_found_by_name_on_the_album() {
+    let h = build_service(full_album_routes()).await;
+    let album_id = album_id_from_song_row(&h, "Test Artist", "Test Album");
+    assert_eq!(h.lookup(&album_id).external_album_id, None);
+
+    let album = h.service.get_album(PROVIDER, &album_id).await.expect("an album");
+
+    assert_eq!(album.songs.len(), 2);
+    assert_eq!(h.lookup(&album_id).external_album_id.as_deref(), Some("1"));
+}
+
 #[tokio::test]
 async fn get_album_song_row_album_deezer_cannot_name_lists_the_song_that_named_it() {
     // Issue #59: an upload Deezer does not know gets a single-style album named after

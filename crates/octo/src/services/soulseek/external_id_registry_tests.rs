@@ -741,3 +741,243 @@ fn a_mint_with_a_video_is_named_and_a_search_remint_keeps_the_stamp() {
     assert_eq!(same, id);
     assert_eq!(registry.lookup(&id).expect("known").snapshot().video_pick, 3);
 }
+
+// ---- One resolver per song id; contexts and heard records -------------------------------
+
+fn heard_video(video: &str, minute: u32) -> HeardRecord {
+    use chrono::TimeZone;
+    HeardRecord {
+        heard_at: chrono::Utc.with_ymd_and_hms(2026, 10, 29, 12, minute, 0).unwrap(),
+        source: octo_core::fingerprint::heart_gate::HeardSource::Video {
+            id: video.into(),
+            size: Some(4_000_000),
+            content_type: "audio/webm".into(),
+            itag: None,
+        },
+        sample_id: None,
+    }
+}
+
+fn context(user: &str, client: &str, album: &str) -> AlbumContext {
+    AlbumContext {
+        user: user.into(),
+        client: Some(client.into()),
+        catalog_album_id: album.into(),
+        album: Some("Help!".into()),
+        disc: Some(1),
+        track: Some(13),
+        total: Some(14),
+        isrc: Some("GBAYE0601477".into()),
+        listed_at: chrono::Utc::now(),
+        ..Default::default()
+    }
+}
+
+/// A song as a client holds it before the registry has seen it: its `yt|` id.
+fn raw_id(artist: &str, title: &str, video: &str) -> String {
+    SoulseekMetadataService::encode_external_id(&SoulseekRouting {
+        you_tube_id: Some(video.into()),
+        duration: Some(125),
+        ..song(artist, title)
+    })
+}
+
+#[test]
+fn unknown_decoded_song_ids_read_by_get_song_register_nothing() {
+    let registry = ExternalIdRegistry::in_memory();
+    for n in 0..20_000 {
+        let id = raw_id("Somebody", &format!("Song {n}"), &format!("v{n}"));
+        let found = registry.resolve_song(&id, false).expect("decodes");
+        assert_eq!(found.lock().title.as_deref(), Some(format!("Song {n}").as_str()));
+    }
+    assert_eq!(registry.count(), 0);
+    assert!(registry.resolve_song("not an id", false).is_none());
+}
+
+#[test]
+fn a_stream_of_a_decoded_id_and_a_heart_of_the_raw_id_meet_on_one_routing() {
+    let registry = ExternalIdRegistry::in_memory();
+    let raw = raw_id("The Beatles", "Yesterday", "vid-y");
+    // The stream registers it and records what played.
+    assert!(registry.remember_heard(&raw, "brandon", heard_video("vid-y", 1), None));
+    assert_eq!(registry.count(), 1);
+    // The heart holds the raw id and finds the record; so does the short id it hashes to.
+    let heard = registry.heard_by(&raw, "Brandon").expect("found by the raw id");
+    assert_eq!(heard.source.video_id(), Some("vid-y"));
+    let decoded = SoulseekMetadataService::try_decode_external_id(Some(&raw)).expect("decodes");
+    let short = ExternalIdRegistry::make_short_id(&decoded);
+    let by_short = registry.resolve_song(&short, true).expect("registered");
+    assert!(by_short.ptr_eq(&registry.resolve_song(&raw, true).expect("the same one")));
+    assert_eq!(registry.count(), 1, "the heart's resolve registered nothing more");
+}
+
+#[test]
+fn a_heard_record_written_by_id_lands_on_the_routing_a_search_registered_meanwhile() {
+    let registry = ExternalIdRegistry::in_memory();
+    let id = registry.register(song("The Beatles", "Yesterday"));
+    // The stream holds this routing while the print is taken...
+    let held = registry.lookup(&id).expect("known");
+    // ...and a search mints the song again meanwhile, swapping in a new routing.
+    let again = registry.register(song("The Beatles", "Yesterday"));
+    assert_eq!(again, id);
+    let registered = registry.lookup(&id).expect("known");
+    assert!(!registered.ptr_eq(&held));
+
+    let mut record = heard_video("vid-y", 2);
+    record.sample_id = Some("sample-1".into());
+    assert!(registry.remember_heard(&id, "brandon", record, None));
+    let sample = registered
+        .lock()
+        .heard_by("brandon")
+        .and_then(|r| r.sample_id.clone());
+    assert_eq!(sample.as_deref(), Some("sample-1"));
+    assert!(
+        held.lock().heard.is_empty(),
+        "nothing written to the routing the stream held"
+    );
+}
+
+#[test]
+fn a_re_register_carrying_an_older_heard_record_keeps_the_newer_one() {
+    let registry = ExternalIdRegistry::in_memory();
+    let id = registry.register(song("The Beatles", "Help!"));
+    registry.remember_heard(&id, "brandon", heard_video("new", 9), None);
+    registry.remember_context(&id, context("brandon", "OctoPlayer", "302127"));
+
+    // A copy read from elsewhere (another process's decode, an old file) with an older record.
+    let mut stale = song("The Beatles", "Help!");
+    stale.remember_heard("brandon", heard_video("old", 3));
+    stale.remember_heard("anna", heard_video("hers", 4));
+    assert_eq!(registry.register(stale), id);
+
+    let kept = registry.lookup(&id).expect("known").snapshot();
+    assert_eq!(
+        kept.heard_by("brandon").and_then(|r| r.source.video_id()),
+        Some("new")
+    );
+    assert_eq!(
+        kept.heard_by("anna").and_then(|r| r.source.video_id()),
+        Some("hers")
+    );
+    assert_eq!(kept.contexts.len(), 1, "the context came across too");
+}
+
+#[test]
+fn a_heard_video_swapped_away_and_refused_for_the_song_is_still_what_was_heard() {
+    let registry = ExternalIdRegistry::in_memory();
+    let id = registry.register(SoulseekRouting {
+        you_tube_id: Some("heard".into()),
+        ..song("The Beatles", "Yesterday")
+    });
+    registry.remember_heard(&id, "brandon", heard_video("heard", 1), None);
+    // The re-check swaps the video away at the next play's first byte...
+    assert!(registry.set_pending_video(&id, "heard", "better"));
+    let routing = registry.lookup(&id).expect("known");
+    registry.apply_pending_video(&routing);
+    // ...and a YouTube download then refuses it for the song as another take.
+    registry.refuse_video(&id, "heard");
+    let kept = routing.snapshot();
+    assert_eq!(kept.you_tube_id.as_deref(), Some("better"));
+    assert!(kept.refuses_video("heard"));
+    let heard = registry.heard_by(&id, "brandon").expect("kept");
+    assert_eq!(heard.source.video_id(), Some("heard"));
+}
+
+#[test]
+fn refusing_by_a_raw_id_reaches_the_registered_routing() {
+    let registry = ExternalIdRegistry::in_memory();
+    let raw = raw_id("The Beatles", "Yesterday", "vid-y");
+    let routing = registry.resolve_song(&raw, true).expect("registered");
+    assert!(registry.refuse_video(&raw, "vid-y"));
+    assert!(routing.lock().refuses_video("vid-y"));
+    assert_eq!(routing.lock().you_tube_id, None);
+}
+
+#[test]
+fn contexts_survive_a_restart_and_a_song_evicted_meanwhile_is_found_again_by_its_raw_id() {
+    let (_dir, path) = temp_path("external-ids.json");
+    let raw = raw_id("The Beatles", "Yesterday", "vid-y");
+    let id = {
+        let registry = ExternalIdRegistry::new(Some(&path));
+        let id = registry.resolve(&raw, true).expect("registered").id;
+        assert!(registry.remember_context(&id, context("brandon", "OctoPlayer", "302127")));
+        assert!(registry.remember_context(&id, context("anna", "Feishin", "1781")));
+        registry.remember_heard(&raw, "brandon", heard_video("vid-y", 1), None);
+        registry.flush();
+        id
+    };
+    let restarted = ExternalIdRegistry::new(Some(&path));
+    let contexts = restarted.contexts(&raw);
+    let users: Vec<(&str, Option<&str>, &str)> = contexts
+        .iter()
+        .map(|c| (c.user.as_str(), c.client.as_deref(), c.catalog_album_id.as_str()))
+        .collect();
+    assert_eq!(
+        users,
+        [
+            ("brandon", Some("OctoPlayer"), "302127"),
+            ("anna", Some("Feishin"), "1781")
+        ]
+    );
+    assert!(restarted.heard_by(&id, "brandon").is_some());
+
+    // Evicted from the LRU by 10,000 newer songs: a write by the raw id lands on a routing
+    // registered again, and the heart reads it there.
+    for n in 0..ExternalIdRegistry::MAX_ENTRIES {
+        restarted.register(song("Filler", &format!("{n}")));
+    }
+    assert!(restarted.lookup(&id).is_none(), "evicted");
+    assert!(restarted.remember_heard(&raw, "brandon", heard_video("vid-y", 5), None));
+    assert!(restarted.heard_by(&raw, "brandon").is_some());
+}
+
+#[test]
+fn a_heard_record_is_told_to_every_listener_once_stored() {
+    let registry = ExternalIdRegistry::in_memory();
+    let told: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let seen = told.clone();
+    registry.on_heard(Arc::new(move |id, user, _| {
+        seen.lock().push((id.to_string(), user.to_string()))
+    }));
+    let raw = raw_id("The Beatles", "Yesterday", "vid-y");
+    assert!(registry.remember_heard(&raw, " brandon ", heard_video("vid-y", 2), None));
+    // An older record changes nothing and tells nobody.
+    assert!(!registry.remember_heard(&raw, "brandon", heard_video("vid-y", 1), None));
+    let short = registry.resolve(&raw, false).expect("registered").id;
+    assert_eq!(*told.lock(), [(short, "brandon".to_string())]);
+}
+
+#[test]
+fn a_play_marks_the_users_context_from_the_same_client_played() {
+    let registry = ExternalIdRegistry::in_memory();
+    let id = registry.register(song("The Beatles", "Yesterday"));
+    registry.remember_context(&id, context("brandon", "OctoPlayer", "302127"));
+    registry.remember_context(&id, context("brandon", "Feishin", "1781"));
+    assert!(registry.remember_heard(
+        &id,
+        "brandon",
+        heard_video("v", 3),
+        Some(PlayedMark {
+            client: Some("OctoPlayer".into()),
+            catalog_album_id: None,
+        })
+    ));
+    let contexts = registry.contexts(&id);
+    assert!(contexts[0].played_at.is_some(), "{contexts:?}");
+    assert!(contexts[1].played_at.is_none());
+}
+
+#[test]
+fn a_song_routing_never_takes_the_catalogs_album_id_from_an_older_copy() {
+    let registry = ExternalIdRegistry::in_memory();
+    // A routing written before songs stopped carrying it.
+    let id = registry.register(SoulseekRouting {
+        external_album_id: Some("302127".into()),
+        ..song("The Beatles", "Yesterday")
+    });
+    registry.register(song("The Beatles", "Yesterday"));
+    assert_eq!(
+        registry.lookup(&id).expect("known").lock().external_album_id,
+        None
+    );
+}

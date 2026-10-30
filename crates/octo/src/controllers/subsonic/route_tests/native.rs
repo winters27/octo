@@ -200,6 +200,54 @@ async fn native_artist_an_outside_artist_opens_with_their_albums() {
     assert_eq!(opened.status, StatusCode::OK, "{}", opened.body);
 }
 
+/// An outside album opened through Navidrome's own API (Feishin, Navidrome's web UI) records, for
+/// each of its songs, the reader's context under `navidrome-native` with the catalog's album, the
+/// song's place on it and its code.
+#[tokio::test]
+async fn opening_an_outside_album_natively_records_each_songs_context_for_its_reader() {
+    use octo_core::fingerprint::heart_gate::NATIVE_CLIENT;
+
+    let fixture = fixture().await;
+    let album_id = fixture.state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Album,
+        artist: Some("Test Artist".into()),
+        album: Some("Test Album".into()),
+        external_album_id: Some("1".into()),
+        ..Default::default()
+    });
+
+    let opened = get(&fixture.app, &format!("/api/album/{album_id}?u=brandon")).await;
+    assert_eq!(opened.status, StatusCode::OK, "{}", opened.body);
+    let listed = get(&fixture.app, &format!("/api/song?album_id={album_id}&u=anna")).await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+
+    let rows = listed.json();
+    let songs = rows.as_array().expect("a list");
+    assert_eq!(songs.len(), 4);
+    for (place, song) in songs.iter().enumerate() {
+        let id = song["id"].as_str().expect("an id");
+        let contexts = fixture.state.external_id_registry.contexts(id);
+        let read: Vec<(&str, Option<&str>, &str)> = contexts
+            .iter()
+            .map(|c| (c.user.as_str(), c.client.as_deref(), c.catalog_album_id.as_str()))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("brandon", Some(NATIVE_CLIENT), "1"),
+                ("anna", Some(NATIVE_CLIENT), "1")
+            ],
+            "{id}"
+        );
+        assert_eq!(contexts[0].track, Some(place as i32 + 1));
+        assert_eq!(contexts[0].total, Some(4));
+        assert_eq!(
+            contexts[0].isrc.as_deref(),
+            Some(format!("GBAAA000000{}", place + 1).as_str())
+        );
+    }
+}
+
 #[tokio::test]
 async fn native_artist_the_page_and_its_albums_at_once_ask_the_catalog_once() {
     // Feishin asks for the artist and the album list together. Each walked the catalog,

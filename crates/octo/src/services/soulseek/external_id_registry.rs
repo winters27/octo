@@ -8,13 +8,27 @@ use std::time::Duration;
 
 use indexmap::IndexMap;
 use octo_core::common::SongIdentity;
+use octo_core::fingerprint::heart_gate::{AlbumContext, HeardRecord, PlayedMark};
 use octo_core::soulseek::{LengthSource, RoutingKind, SongLength, SoulseekRouting, StreamFacts};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use super::SoulseekMetadataService;
 use crate::services::state_file;
+
+/// Told of every heard record the registry stores: the registered routing's short id, the user
+/// and the record.
+pub type HeardListener = Arc<dyn Fn(&str, &str, &HeardRecord) + Send + Sync>;
+
+/// A song id resolved to its routing: the id it is (or would be) registered under, and whether
+/// the registry holds it.
+struct Resolved {
+    id: String,
+    routing: SharedRouting,
+    registered: bool,
+}
 
 /// A routing the registry and its callers share. The registry keeps the very routing a caller
 /// registered and hands the same one back from `lookup`, and callers change it in place
@@ -101,6 +115,8 @@ pub struct ExternalIdRegistry {
     /// taking a routing's lock.
     refused: Mutex<IndexMap<String, Vec<String>>>,
     refused_dirty: AtomicBool,
+    /// Told after a heard record is stored, outside every lock.
+    heard_listeners: Mutex<Vec<HeardListener>>,
 }
 
 /// One line of `refused-videos.json`.
@@ -196,6 +212,7 @@ impl ExternalIdRegistry {
             recovery: Mutex::new(None),
             refused: Mutex::new(IndexMap::new()),
             refused_dirty: AtomicBool::new(false),
+            heard_listeners: Mutex::new(Vec::new()),
         };
         if registry.path.is_some() {
             registry.load_refused();
@@ -235,22 +252,31 @@ impl ExternalIdRegistry {
                     p.album.clone(),
                 )
             };
-            let (prev_video, prev_stream, prev_refused, prev_pick) = {
+            let (prev_video, prev_stream, prev_refused, prev_pick, prev_contexts, prev_heard) = {
                 let p = previous.lock();
                 (
                     p.you_tube_id.clone().filter(|v| !v.is_empty()),
                     p.stream_facts(),
                     p.refused_videos.clone(),
                     p.video_pick,
+                    p.contexts.clone(),
+                    p.heard.clone(),
                 )
             };
             let mut r = routing.lock();
             // A song row mints an album routing with no Deezer id (`convert_song_to_json`), and
             // it hashes to the same id as the one an album search already resolved. Registering
             // it must not erase that id. Best-effort only: this is an optimization, and losing
-            // the race just sends `get_album` down its cached name-lookup fallback.
-            if r.external_album_id.is_none() && prev_album_id.is_some() {
+            // the race just sends `get_album` down its cached name-lookup fallback. A song never
+            // carries the catalog's album id: the albums it was listed from are its contexts.
+            if r.kind != RoutingKind::Song && r.external_album_id.is_none() && prev_album_id.is_some() {
                 r.external_album_id = prev_album_id;
+            }
+            // The albums people listed the song from and what each person heard: a fresh mint
+            // carries none, and a copy read from elsewhere may carry older ones, so each person
+            // keeps the later of the two.
+            if !prev_contexts.is_empty() || !prev_heard.is_empty() {
+                r.merge_heard(&prev_contexts, &prev_heard);
             }
             // Every search and every station playlist mints its songs again, and each mint is a
             // fresh routing. Without this, the length a lookup found for a song lasted until the
@@ -346,6 +372,126 @@ impl ExternalIdRegistry {
 
     pub fn set_recovery(&self, recover: RoutingRecovery) {
         *self.recovery.lock() = Some(recover);
+    }
+
+    /// The routing a song id stands for: the one registered under `id`, else the one registered
+    /// under the id its decoded routing (`yt|...`) hashes to. A decoded routing found under
+    /// neither is registered only with `register` (a stream or a heart); otherwise it is handed
+    /// back unsaved, with the song's refused videos, so ids a client sends never fill the
+    /// registry.
+    pub fn resolve_song(&self, id: &str, register: bool) -> Option<SharedRouting> {
+        self.resolve(id, register).map(|found| found.routing)
+    }
+
+    fn resolve(&self, id: &str, register: bool) -> Option<Resolved> {
+        if id.trim().is_empty() {
+            return None;
+        }
+        if let Some(routing) = self.lookup(id) {
+            return Some(Resolved {
+                id: id.to_string(),
+                routing,
+                registered: true,
+            });
+        }
+        let mut decoded = SoulseekMetadataService::try_decode_external_id(Some(id))?;
+        let short = Self::make_short_id(&decoded);
+        if let Some(routing) = self.lookup(&short) {
+            return Some(Resolved {
+                id: short,
+                routing,
+                registered: true,
+            });
+        }
+        if register {
+            let routing = SharedRouting::new(decoded);
+            let id = self.register(routing.clone());
+            return Some(Resolved {
+                id,
+                routing,
+                registered: true,
+            });
+        }
+        self.apply_refusals(&mut decoded);
+        Some(Resolved {
+            id: short,
+            routing: SharedRouting::new(decoded),
+            registered: false,
+        })
+    }
+
+    /// Keeps `record` as what `user` heard of the song `id` names, resolved now (registering a
+    /// decoded id), so a write that outlived the routing it started from lands on the one
+    /// registered. With `played`, the user's context it names is marked played. One record per
+    /// user: a later one replaces, an earlier one never does. Every [`Self::on_heard`] listener is
+    /// told of a stored record. True when anything changed.
+    pub fn remember_heard(
+        &self,
+        id: &str,
+        user: &str,
+        record: HeardRecord,
+        played: Option<PlayedMark>,
+    ) -> bool {
+        let Some(found) = self.resolve(id, true) else {
+            return false;
+        };
+        let (stored, marked) = {
+            let mut r = found.routing.lock();
+            if r.kind != RoutingKind::Song {
+                return false;
+            }
+            let stored = r.remember_heard(user, record.clone());
+            let marked = played.is_some_and(|mark| r.mark_played(user, &mark, record.heard_at));
+            (stored, marked)
+        };
+        if !stored && !marked {
+            return false;
+        }
+        self.dirty.store(true, Ordering::SeqCst);
+        if stored {
+            let listeners = self.heard_listeners.lock().clone();
+            for listener in listeners {
+                listener(&found.id, user.trim(), &record);
+            }
+        }
+        true
+    }
+
+    /// What `user` heard of the song `id` names, when it is kept.
+    pub fn heard_by(&self, id: &str, user: &str) -> Option<HeardRecord> {
+        let found = self.resolve(id, false)?;
+        let r = found.routing.lock();
+        r.heard_by(user).cloned()
+    }
+
+    /// Adds or moves a person's album context on the registered song `id`: one per person and
+    /// catalog album, at most [`SoulseekRouting::MAX_CONTEXTS`]. True when anything changed.
+    pub fn remember_context(&self, id: &str, context: AlbumContext) -> bool {
+        let Some(found) = self.resolve(id, false).filter(|found| found.registered) else {
+            return false;
+        };
+        let changed = {
+            let mut r = found.routing.lock();
+            r.kind == RoutingKind::Song && r.remember_context(context)
+        };
+        if changed {
+            self.dirty.store(true, Ordering::SeqCst);
+        }
+        changed
+    }
+
+    /// The albums people listed or played the song `id` names from, the least recently listed
+    /// first.
+    pub fn contexts(&self, id: &str) -> Vec<AlbumContext> {
+        self.resolve(id, false)
+            .map(|found| found.routing.lock().contexts.clone())
+            .unwrap_or_default()
+    }
+
+    /// Adds a listener told after [`Self::remember_heard`] stores a record, outside the
+    /// registry's locks, with the registered routing's short id, the user and the record.
+    pub fn on_heard(&self, listener: HeardListener) {
+        self.heard_listeners.lock().push(listener);
     }
 
     /// How many ids the registry holds.
@@ -633,20 +779,22 @@ impl ExternalIdRegistry {
         true
     }
 
-    /// Refuses `video` for the song under `short_id`: unpinned with what was learned from it, and
-    /// never pinned for it again, by that id or by any other routing of the same song. True when
-    /// anything changed.
+    /// Refuses `video` for the song `short_id` names (a registered id or a decoded one):
+    /// unpinned with what was learned from it, and never pinned for it again, by that id or by
+    /// any other routing of the same song. What each person heard stays. True when anything
+    /// changed.
     pub fn refuse_video(&self, short_id: &str, video: &str) -> bool {
         if short_id.is_empty() || video.is_empty() {
             return false;
         }
-        let Some(routing) = self.lru.lock().by_id.get(short_id).map(|(r, _)| r.clone()) else {
+        let Some(found) = self.resolve(short_id, false) else {
             return false;
         };
+        let routing = found.routing;
         let (mut changed, artist, title, is_song) = {
             let mut r = routing.lock();
             (
-                r.refuse_video(video),
+                r.refuse_video(video) && found.registered,
                 r.artist.clone().unwrap_or_default(),
                 r.title.clone().unwrap_or_default(),
                 r.kind == RoutingKind::Song,

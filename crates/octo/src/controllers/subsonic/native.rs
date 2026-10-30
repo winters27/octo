@@ -11,6 +11,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header}
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use octo_core::common::{dotnet, skipped_takes};
+use octo_core::fingerprint::heart_gate::NATIVE_CLIENT;
 use octo_core::json::datetime::format_utc;
 use octo_core::json::dom::Node;
 use octo_core::models::domain::{Album, Artist, Song};
@@ -81,7 +82,7 @@ pub async fn answer(state: &AppState, request: &NativeRequest<'_>) -> Result<Opt
 
     // Native album detail for an external id. Same path-vs-query problem as the
     // song case above.
-    if let Some(album) = try_serve_native_external_album(state, request.endpoint).await {
+    if let Some(album) = try_serve_native_external_album(state, request).await {
         return Ok(Some(album));
     }
 
@@ -673,9 +674,10 @@ fn non_null_text(node: &Node) -> Option<String> {
     (!matches!(node, Node::Null)).then(|| node_text(node))
 }
 
-/// Native single-album detail: GET /api/album/{id} for one of Octo's album ids.
-async fn try_serve_native_external_album(state: &AppState, endpoint: &str) -> Option<Response> {
-    let id = leaf_id(endpoint, "api/album/")?;
+/// Native single-album detail: GET /api/album/{id} for one of Octo's album ids. Opening it
+/// records the album as the reader's context of each of its songs.
+async fn try_serve_native_external_album(state: &AppState, request: &NativeRequest<'_>) -> Option<Response> {
+    let id = leaf_id(request.endpoint, "api/album/")?;
     if routing_kind(state, &id) != Some(RoutingKind::Album) {
         return None;
     }
@@ -683,12 +685,20 @@ async fn try_serve_native_external_album(state: &AppState, endpoint: &str) -> Op
         .metadata_service
         .get_album(SoulseekMetadataService::PROVIDER_NAME, &id)
         .await?;
+    remember_native_listing(state, request, &id, &album);
     let body = octo_core::json::to_string(&native_album_object(&album, 1));
     Some(written_json(
         body.into_bytes(),
         HeaderMap::new(),
         "application/json",
     ))
+}
+
+/// An outside album read through Navidrome's own API, recorded as the reader's context of its
+/// songs. That API sends no client name, so the context is filed under [`NATIVE_CLIENT`].
+fn remember_native_listing(state: &AppState, request: &NativeRequest<'_>, album_id: &str, album: &Album) {
+    let user = native_username(state, request.parameters, request.headers);
+    super::browsing::remember_listed_album(state, &user, Some(NATIVE_CLIENT), album_id, album);
 }
 
 fn routing_kind(state: &AppState, id: &str) -> Option<RoutingKind> {
@@ -713,6 +723,7 @@ async fn try_serve_native_album_songs(state: &AppState, request: &NativeRequest<
         .metadata_service
         .get_album(SoulseekMetadataService::PROVIDER_NAME, album_id)
         .await?;
+    remember_native_listing(state, request, album_id, &album);
     let rows: Vec<Value> = album
         .songs
         .iter()
