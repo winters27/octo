@@ -1656,3 +1656,261 @@ fn a_hearts_rows_keep_at_most_20000_rows_and_drop_the_least_recently_used() {
     assert_eq!(rows.rows, 10_001);
     assert_eq!(HEART_ROWS_MAX, 20_000);
 }
+
+// ---- the warm-up ------------------------------------------------------------------------------
+
+/// Deezer's side of a warm-up: it knows no album, and keeps which album each question named and
+/// on which lane. A question for the album `held` waits until the test lets `hold` go.
+struct WatchedCatalog {
+    asked: Mutex<Vec<(String, Lane)>>,
+    held: String,
+    hold: tokio::sync::Mutex<()>,
+}
+
+impl WatchedCatalog {
+    fn holding(album_id: &str) -> Arc<WatchedCatalog> {
+        Arc::new(WatchedCatalog {
+            asked: Mutex::new(Vec::new()),
+            held: album_id.to_string(),
+            hold: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    fn albums(&self) -> Vec<String> {
+        self.asked.lock().iter().map(|(album, _)| album.clone()).collect()
+    }
+
+    fn lanes(&self) -> Vec<Lane> {
+        self.asked.lock().iter().map(|(_, lane)| *lane).collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl CatalogQuestions for WatchedCatalog {
+    async fn album_search(
+        &self,
+        _artist: &str,
+        _album: &str,
+        lane: Lane,
+    ) -> DeezerAsked<Vec<CatalogAlbumHit>> {
+        self.asked.lock().push(("search".to_string(), lane));
+        DeezerAsked::NoData
+    }
+
+    async fn album(&self, album_id: &str, lane: Lane) -> DeezerAsked<(CatalogAlbum, Vec<CatalogTrack>)> {
+        self.asked.lock().push((album_id.to_string(), lane));
+        if album_id == self.held {
+            let _released = self.hold.lock().await;
+        }
+        DeezerAsked::NoData
+    }
+}
+
+/// A song with nothing MusicBrainz is asked about: no ISRC, so no recordings and no artist.
+fn plain_song(title: &str) -> HeartSong {
+    HeartSong {
+        artist: "Artist".into(),
+        title: title.into(),
+        ..HeartSong::default()
+    }
+}
+
+/// Waits until `done` says so.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    for _ in 0..1000 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("{what} never happened");
+}
+
+#[tokio::test]
+async fn the_warm_up_keeps_the_newest_8_songs_and_asks_the_newest_first() {
+    let server = MockServer::builder().start().await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+    let catalog = WatchedCatalog::holding("a0");
+    let held = catalog.hold.lock().await;
+
+    client.warm_up("song-0", plain_song("0"), Some("a0".into()), catalog.clone());
+    until("the first song's question", || catalog.albums().len() == 1).await;
+    for n in 1..=10 {
+        client.warm_up(
+            &format!("song-{n}"),
+            plain_song(&n.to_string()),
+            Some(format!("a{n}")),
+            catalog.clone(),
+        );
+    }
+    drop(held);
+    client.warmed_up().await;
+
+    // The ninth and tenth songs put out the two that had waited longest.
+    assert_eq!(
+        catalog.albums(),
+        ["a0", "a10", "a9", "a8", "a7", "a6", "a5", "a4", "a3"]
+    );
+    assert!(
+        catalog.lanes().iter().all(|lane| *lane == Lane::Background),
+        "{:?}",
+        catalog.lanes()
+    );
+    assert!(calls(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_song_waiting_or_being_warmed_is_queued_once() {
+    let server = MockServer::builder().start().await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+    let catalog = WatchedCatalog::holding("x");
+    let held = catalog.hold.lock().await;
+
+    client.warm_up("x", plain_song("x"), Some("x".into()), catalog.clone());
+    until("the first song's question", || catalog.albums().len() == 1).await;
+    // Played again while its questions are out: it is not queued.
+    client.warm_up("x", plain_song("x"), Some("x".into()), catalog.clone());
+    client.warm_up("y", plain_song("y"), Some("y".into()), catalog.clone());
+    client.warm_up("z", plain_song("z"), Some("z".into()), catalog.clone());
+    // Played again while it waits: it moves to the front.
+    client.warm_up("y", plain_song("y"), Some("y".into()), catalog.clone());
+    drop(held);
+    client.warmed_up().await;
+    assert_eq!(catalog.albums(), ["x", "y", "z"]);
+
+    // Once its warm-up is over, a song played again is queued again.
+    client.warm_up("x", plain_song("x"), Some("x".into()), catalog.clone());
+    client.warmed_up().await;
+    assert_eq!(catalog.albums(), ["x", "y", "z", "x"]);
+}
+
+#[tokio::test]
+async fn a_warmed_up_song_leaves_a_heart_only_its_carriers_to_ask() {
+    let answers = recorded_folder("rows/beatles-yesterday_a0");
+    let server = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(Recorded(Arc::clone(&answers)))
+        .mount(&server)
+        .await;
+    let catalog = RecordedCatalog::open();
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+    let song = HeartSong {
+        artist: "The Beatles".into(),
+        title: "Yesterday (Remastered 2009)".into(),
+        album: "Help! (Remastered 2009)".into(),
+        disc: Some(1),
+        position: Some(13),
+        total_tracks: Some(14),
+        isrc: YESTERDAY_CODE.into(),
+        seconds: 123,
+        explicit: catalog
+            .answer(&release::deezer_album_tracks_url("12047944"))
+            .map(|doc| release::read_catalog_tracks(&doc))
+            .unwrap_or_default()
+            .iter()
+            .find(|track| track.id == "116348366")
+            .and_then(|track| track.explicit),
+    };
+
+    client.warm_up(
+        "yesterday",
+        song.clone(),
+        Some("12047944".into()),
+        catalog.clone(),
+    );
+    client.warmed_up().await;
+
+    // Every recorded question but the carriers page, each once.
+    let is_carriers = |question: &str| question.starts_with("release?recording=");
+    let carriers: Vec<String> = answers
+        .questions()
+        .iter()
+        .map(|line| line.question.clone())
+        .filter(|question| is_carriers(question))
+        .collect();
+    assert_eq!(carriers.len(), 1);
+    let warmed = asked(&server).await;
+    assert!(!warmed.iter().any(|question| is_carriers(question)), "{warmed:?}");
+    let mut once = warmed.clone();
+    once.sort();
+    once.dedup();
+    assert_eq!(once.len(), warmed.len(), "{warmed:?}");
+    assert_eq!(warmed.len(), answers.questions().len() - 1, "{warmed:?}");
+
+    // Hearted now, its identity and its artist come from what the warm-up kept.
+    let deezer_asked = catalog.asked();
+    let questions = HeartQuestions::new(Arc::clone(&client), catalog.clone(), Lane::Heart);
+    let identity = questions
+        .identity(&song, Some("12047944"))
+        .await
+        .expect("answered");
+    assert_eq!(identity.listened_group.as_deref(), Some(HELP_GROUP));
+    assert_eq!(asked(&server).await, warmed);
+    assert_eq!(catalog.asked(), deezer_asked);
+    let walk = questions.walk(&song, &identity).await.expect("answered");
+    assert_eq!(walk.first().map(String::as_str), Some(HELP_GROUP));
+    assert_eq!(asked(&server).await[warmed.len()..], carriers);
+}
+
+#[tokio::test]
+async fn a_warm_up_asks_on_the_background_lane_and_a_busy_answer_ends_its_turn() {
+    let server = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+    let catalog = WatchedCatalog::holding("");
+    let song = HeartSong {
+        isrc: YESTERDAY_CODE.into(),
+        ..plain_song("Yesterday")
+    };
+
+    client.warm_up("yesterday", song, None, catalog.clone());
+    client.warmed_up().await;
+
+    // Asked once: the background lane never asks again, where a heart's question would.
+    assert_eq!(asked(&server).await, [YESTERDAY_CODE_LOOKUP]);
+    let last = *client.gate.try_lock().expect("the gate is free");
+    assert_eq!(last.map(|call| call.lane), Some(Lane::Background));
+    // With no album id and no album title, Deezer has nothing to be asked.
+    assert!(catalog.albums().is_empty());
+}
+
+#[test]
+fn a_routing_reads_as_the_song_a_heart_knows() {
+    let routing = SoulseekRouting {
+        artist: Some(" The Beatles ".into()),
+        title: Some("Yesterday (Remastered 2009)".into()),
+        album: Some("Help! (Remastered 2009)".into()),
+        duration: Some(123),
+        track: Some(13),
+        disc_number: Some(1),
+        total_tracks: Some(14),
+        isrc: Some("GBAYE0601477".into()),
+        explicit_content: Some(4),
+        ..SoulseekRouting::default()
+    };
+    assert_eq!(
+        heart_song(&routing),
+        HeartSong {
+            artist: "The Beatles".into(),
+            title: "Yesterday (Remastered 2009)".into(),
+            album: "Help! (Remastered 2009)".into(),
+            disc: Some(1),
+            position: Some(13),
+            total_tracks: Some(14),
+            isrc: "GBAYE0601477".into(),
+            seconds: 123,
+            explicit: Some(1),
+        }
+    );
+    // A count or a length that is not above zero is unknown.
+    let bare = SoulseekRouting {
+        track: Some(0),
+        disc_number: Some(-1),
+        duration: Some(0),
+        ..SoulseekRouting::default()
+    };
+    assert_eq!(heart_song(&bare), HeartSong::default());
+}

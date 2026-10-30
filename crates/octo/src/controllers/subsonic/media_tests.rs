@@ -8,7 +8,9 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Method, StatusCode};
 use indexmap::IndexMap;
-use octo_core::settings::{AppSettings, GeneratedPlaylistSettings, SubsonicSettings};
+use octo_core::settings::{
+    AppSettings, GeneratedPlaylistSettings, HeartDownloadSource, HeartDownloadStep, SubsonicSettings,
+};
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
 use octo_subsonic::xml::XElement;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +20,7 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 use super::caller_checks::is_first_byte_request;
 use super::media::draws_its_own_marks_in;
 use super::test_app::*;
+use crate::services::fingerprint::music_brainz_client::MusicBrainzClient;
 
 /// Navidrome accepting every sign-in: these tests are about what plays, not who.
 async fn ping_ok() -> MockServer {
@@ -146,6 +149,83 @@ async fn an_outside_download_sent_as_a_form_is_the_song_too() {
     .await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.body.as_ref(), [4, 5]);
+}
+
+/// Playback settings whose Lidarr takes album hearts, and song hearts too when `song_hearts`,
+/// with its address and key set when `set_up`.
+fn lidarr_heart_settings(url: &str, song_hearts: bool, set_up: bool) -> AppSettings {
+    let mut settings = playback_settings(url, false, false);
+    settings.subsonic.heart_download_sources = vec![HeartDownloadStep {
+        source: HeartDownloadSource::Lidarr,
+        enabled: None,
+        song_enabled: Some(song_hearts),
+        album_enabled: Some(true),
+    }];
+    if set_up {
+        settings.lidarr.base_url = Some(format!(
+            "http://{}",
+            crate::services::test_support::refused_address()
+        ));
+        settings.lidarr.api_key = Some("key".into());
+    }
+    settings
+}
+
+/// A play of an outside song from its first byte asks ahead what a heart of it asks MusicBrainz
+/// first, and only while song hearts can go to Lidarr.
+#[tokio::test]
+async fn a_play_warms_a_hearts_questions_only_while_song_hearts_can_go_to_lidarr() {
+    let navidrome = ping_ok().await;
+    for (song_hearts, set_up, warms) in [(true, true, true), (false, true, false), (true, false, false)] {
+        // MusicBrainz knows nothing, so the code lookup is the warm-up's one question.
+        let music_brainz = MockServer::start().await;
+        let base = url::Url::parse(&format!("{}/ws/2/", music_brainz.uri())).expect("parses");
+        let pace = Duration::from_millis(10);
+        let client =
+            Arc::new(MusicBrainzClient::with_base_url(base).with_pace(pace, Duration::from_secs(5), pace));
+        let library = Arc::new(FakeLibrary::default());
+        let state = state_with(
+            lidarr_heart_settings(&navidrome.uri(), song_hearts, set_up),
+            |inner| {
+                inner.download_service = Arc::new(FakeStreams::default());
+                inner.local_library = library.clone();
+                inner.music_brainz = client.clone();
+            },
+        );
+        let id = state.external_id_registry.register(SoulseekRouting {
+            kind: RoutingKind::Song,
+            artist: Some("The Beatles".into()),
+            title: Some("Yesterday".into()),
+            isrc: Some("GBAYE0601477".into()),
+            ..Default::default()
+        });
+        library.add_external("external-track", "soulseek", &id);
+        let app = app(&state);
+        let uri = "/rest/stream?id=external-track&u=alice&t=good&s=salt&v=1.16.1&c=test";
+        let asked = || async {
+            music_brainz
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|request| format!("{}?{}", request.url.path(), request.url.query().unwrap_or("")))
+                .collect::<Vec<String>>()
+        };
+
+        // A later range is no play.
+        send(&app, Method::GET, uri, &[("Range", "bytes=100-")], Body::empty()).await;
+        client.warmed_up().await;
+        assert!(asked().await.is_empty(), "{song_hearts} {set_up}");
+
+        get(&app, uri).await;
+        client.warmed_up().await;
+        let expected: &[&str] = if warms {
+            &["/ws/2/isrc/GBAYE0601477?inc=artist-credits&fmt=json"]
+        } else {
+            &[]
+        };
+        assert_eq!(asked().await, expected, "{song_hearts} {set_up}");
+    }
 }
 
 #[tokio::test]

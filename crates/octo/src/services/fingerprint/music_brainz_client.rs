@@ -21,6 +21,8 @@ use octo_core::fingerprint::heart_release::{
 use octo_core::fingerprint::music_brainz_client as pure;
 use octo_core::fingerprint::recording_identity::RecordingFacts;
 use octo_core::json::element::ElementError;
+use octo_core::models::domain::explicit_status;
+use octo_core::soulseek::SoulseekRouting;
 use octo_core::tagging::{ReleaseDetails, ReleaseLookup};
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -143,6 +145,9 @@ const SETTLED_MAX: usize = 64;
 /// The most compact rows a heart's answers are kept as, on every lane together.
 const HEART_ROWS_MAX: usize = 20_000;
 
+/// The most songs waiting for a warm-up: one more puts out the song that has waited longest.
+const WARM_UPS_MAX: usize = 8;
+
 /// One question for MusicBrainz, asked only when a person keeps a track AcoustID had never heard
 /// of: which recording is this? That is the MusicBrainz id a confirmed fingerprint needs before
 /// AcoustID will take it (#47). And one more, asked only while verifying a download whose
@@ -186,6 +191,8 @@ pub struct MusicBrainzClient {
     code_flights: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<CodeFlight>>>>>,
     /// A heart's answers, as compact rows.
     heart_rows: Mutex<HeartRows>,
+    /// The songs waiting to have a heart's first questions asked ahead, and the one being asked.
+    warm_ups: Mutex<WarmUps>,
     /// Release lookups are remembered a day, since an album's tracks ask for the same
     /// release one by one; searches six hours. Every entry counts as one, so the limit is a count.
     cache: MemoryCache<Cached>,
@@ -226,6 +233,7 @@ impl MusicBrainzClient {
             settled: Mutex::new(VecDeque::new()),
             code_flights: Mutex::new(HashMap::new()),
             heart_rows: Mutex::new(HeartRows::default()),
+            warm_ups: Mutex::new(WarmUps::default()),
             cache: MemoryCache::new(2000),
             artists: Mutex::new(HashMap::new()),
             credits: Mutex::new(HashMap::new()),
@@ -1081,6 +1089,88 @@ impl MusicBrainzClient {
             () = retry_after_ends => {}
         }
     }
+
+    /// Asks ahead what a heart of this song asks first, so its answers are kept as a heart's rows
+    /// by the time the person hearts it: the catalog album (`catalog_album_id`, else found from
+    /// the song's album title), the recordings its ISRC names, the release its barcode names and
+    /// where its artist is from. Never the carriers. Every question goes on the background lanes
+    /// of MusicBrainz and Deezer, and a busy answer ends the song's turn: nothing holds for it.
+    ///
+    /// Songs wait in one queue of [`WARM_UPS_MAX`], the newest asked first; one more puts out the
+    /// song that has waited longest. A song is in it once: `key` names it, a song asked again
+    /// while it waits moves to the front, and one asked again while its own questions are out is
+    /// not queued. One song is asked at a time.
+    pub fn warm_up(
+        self: &Arc<Self>,
+        key: &str,
+        song: HeartSong,
+        catalog_album_id: Option<String>,
+        catalog: Arc<dyn CatalogQuestions>,
+    ) {
+        let start = {
+            let mut warm_ups = self.warm_ups.lock();
+            if warm_ups.warming.as_deref() == Some(key) {
+                return;
+            }
+            warm_ups.waiting.retain(|waiting| waiting.key != key);
+            if warm_ups.waiting.len() >= WARM_UPS_MAX {
+                warm_ups.waiting.pop_front();
+            }
+            warm_ups.waiting.push_back(WaitingWarmUp {
+                key: key.to_string(),
+                song,
+                catalog_album_id,
+                catalog,
+            });
+            !std::mem::replace(&mut warm_ups.running, true)
+        };
+        if start {
+            let this = Arc::clone(self);
+            tokio::spawn(async move { this.warm_waiting().await });
+        }
+    }
+
+    /// The warm-up's one task: asks each waiting song's questions, the newest first, until none is
+    /// left.
+    async fn warm_waiting(self: Arc<Self>) {
+        loop {
+            let next = {
+                let mut warm_ups = self.warm_ups.lock();
+                let next = warm_ups.waiting.pop_back();
+                warm_ups.warming = next.as_ref().map(|waiting| waiting.key.clone());
+                if next.is_none() {
+                    warm_ups.running = false;
+                }
+                next
+            };
+            let Some(next) = next else {
+                return;
+            };
+            let questions = HeartQuestions::new(Arc::clone(&self), next.catalog, Lane::Background);
+            let warmed = match questions
+                .identity(&next.song, next.catalog_album_id.as_deref())
+                .await
+            {
+                Ok(identity) => questions.home_country(&identity.artist_id).await.map(drop),
+                Err(busy) => Err(busy),
+            };
+            if let Err(busy) = warmed {
+                debug!("the warm-up of {} stopped: {busy:?} did not answer", next.key);
+            }
+        }
+    }
+
+    /// Waits until the warm-up has no song left, waiting or being asked.
+    #[cfg(test)]
+    pub(crate) async fn warmed_up(&self) {
+        for _ in 0..2000 {
+            if !self.warm_ups.lock().running {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the warm-up never finished");
+    }
 }
 
 /// Whether a question looks something up by an id that is not a MusicBrainz id
@@ -1239,6 +1329,44 @@ struct HeldQuestion {
 struct HeldQuestions {
     queue: VecDeque<HeldQuestion>,
     running: bool,
+}
+
+/// One song waiting for its warm-up.
+struct WaitingWarmUp {
+    key: String,
+    song: HeartSong,
+    catalog_album_id: Option<String>,
+    catalog: Arc<dyn CatalogQuestions>,
+}
+
+/// The warm-up's songs, the newest last, the one being asked, and whether its task is running.
+#[derive(Default)]
+struct WarmUps {
+    waiting: VecDeque<WaitingWarmUp>,
+    warming: Option<String>,
+    running: bool,
+}
+
+/// What a heart knows of a song from its routing: the catalog row and the album it was listed
+/// from. A count that is not above zero is unknown.
+pub fn heart_song(routing: &SoulseekRouting) -> HeartSong {
+    let text = |value: &Option<String>| value.as_deref().map(str::trim).unwrap_or_default().to_string();
+    let count = |value: Option<i32>| {
+        value
+            .and_then(|count| u32::try_from(count).ok())
+            .filter(|count| *count > 0)
+    };
+    HeartSong {
+        artist: text(&routing.artist),
+        title: text(&routing.title),
+        album: text(&routing.album),
+        disc: count(routing.disc_number),
+        position: count(routing.track),
+        total_tracks: count(routing.total_tracks),
+        isrc: text(&routing.isrc),
+        seconds: count(routing.duration).unwrap_or(0),
+        explicit: explicit_status::from_catalog(routing.explicit_content, None),
+    }
 }
 
 /// The music database calls the release identifier makes. A timeout is the error the

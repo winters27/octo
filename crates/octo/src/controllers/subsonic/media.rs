@@ -15,7 +15,7 @@ use futures::FutureExt;
 use octo_core::common::dotnet::{self, is_blank};
 use octo_core::common::{SongIdentity, playlist_id_helper};
 use octo_core::models::radio::{LastFmRadioStation, LastFmRadioStationKind};
-use octo_core::settings::NoticeKind;
+use octo_core::settings::{AppSettings, HeartDownloadSource, NoticeKind};
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
 use octo_media::cover::{CoverGlyph, CoverSeed, ListCover, list_kinds};
 use octo_subsonic::SubsonicCredential;
@@ -39,6 +39,7 @@ use crate::http::static_files::{RangeOutcome, parse_range};
 use crate::services::common::track_acquisition_queue::Completion;
 use crate::services::cover_art::local_cover_cache::{CoverPicture, Fetched, NotKept};
 use crate::services::family::{FamilyCaller, LibraryScope, audio_gate, family_caller};
+use crate::services::fingerprint::music_brainz_client::heart_song;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::library::{GeneratedPlaylist, navidrome_song_list};
 use crate::services::prefetch::{Source, from_start};
@@ -123,6 +124,10 @@ pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
 
     let provider = provider.unwrap_or_default();
     let external_id = external_id.unwrap_or_default();
+
+    if is_first_byte_request(call.method().as_str(), call.header("Range").as_deref()) {
+        warm_up_playing(&state, &external_id);
+    }
 
     // Octo's apps read the bytes they get, whatever the listing declared, so a song with a file
     // here (fetched ahead, or kept by a heart) plays as that file there, for every play that
@@ -259,6 +264,42 @@ fn note_playing(
             state.prefetch.on_playing(&who, &id, caller.as_ref()).await;
         }
     });
+}
+
+/// While song hearts can go to Lidarr, a play of an outside song from its first byte asks ahead
+/// what a heart of it asks MusicBrainz and Deezer first, on their background lanes, so a heart
+/// that follows finds those answers kept. The stream never waits for it.
+fn warm_up_playing(state: &AppState, external_id: &str) {
+    if !lidarr_takes_song_hearts(&state.settings.current()) {
+        return;
+    }
+    let Some(routing) = state
+        .external_id_registry
+        .lookup(external_id)
+        .map(|routing| routing.snapshot())
+        .filter(|routing| routing.kind == RoutingKind::Song)
+    else {
+        return;
+    };
+    state.music_brainz.warm_up(
+        external_id,
+        heart_song(&routing),
+        routing.external_album_id.clone(),
+        state.deezer_metadata.clone(),
+    );
+}
+
+/// Whether a song heart can go to Lidarr: Lidarr is one of the song hearts' sources, and its
+/// address and key are set.
+fn lidarr_takes_song_hearts(settings: &AppSettings) -> bool {
+    let lidarr = &settings.lidarr;
+    lidarr.base_url.as_deref().is_some_and(|url| !is_blank(url))
+        && lidarr.api_key.as_deref().is_some_and(|key| !is_blank(key))
+        && settings
+            .subsonic
+            .effective_heart_download_sources()
+            .iter()
+            .any(|step| step.source == HeartDownloadSource::Lidarr && step.song_enabled == Some(true))
 }
 
 /// One play of an outside song in an Octo app, as `stream` read it.
