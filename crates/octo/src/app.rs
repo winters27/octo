@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use octo_core::common::Clock;
+use octo_core::fingerprint::heart_gate::{HeardRecord, WaitingFor};
 use octo_core::places::PlaceIndex;
 use octo_core::settings::{AppSettings, RestartTracker, SettingsFileWriter, SettingsStore};
 use octo_core::tagging::{CatalogLookup, FingerprintVerifier, ReleaseIdentifier, ReleaseLookup, TagPreview};
@@ -66,6 +67,10 @@ use crate::services::family::{
     NavidromeAdmin, NavidromeMemberStars, PersonalLibrary, PlayerCaps, PoolParts, RequestStore, SavedStore,
     ScopeResolver, family_service::FamilyService,
 };
+use crate::services::common::HeartGates;
+use crate::services::fingerprint::catalog_clip::CatalogClip;
+use crate::services::fingerprint::download_verification_service::HeartParts;
+use crate::services::fingerprint::heard_master_check::HeardMasterCheck;
 use crate::services::fingerprint::preview_check::PreviewSource;
 use crate::services::fingerprint::{
     AcoustIdClient, AcoustIdRateLimitHandler, AcoustIdRateLimiter, DownloadVerificationService,
@@ -1020,6 +1025,28 @@ impl Acquisition {
             Some(upgrade_queue.clone()),
             Some(upgrade_sources.clone()),
         ));
+        // The heart gate: what each person heard, the heard-master runner and the catalog's clip,
+        // over the verification service every source's check point asks.
+        let verification = downloads.tagging.download_verification.clone();
+        verification.use_heart(HeartParts {
+            registry: stores.external_id_registry.clone(),
+            samples: stores.heard_samples.clone(),
+            master: Arc::new(HeardMasterCheck::new(stores.heard_samples.clone())),
+            clip: Arc::new(CatalogClip::new(
+                clients.deezer_metadata.clone(),
+                stores.heard_samples.clone(),
+                stores.you_tube_resolver.clone(),
+            )),
+            catalog: clients.deezer_metadata.clone(),
+            holds: stores.soulseek_holds.clone(),
+            rejected: stores.rejected_peers.clone(),
+        });
+        // A replacement's file that waits for AcoustID's bulk turn goes on once the lane gives
+        // turns again.
+        {
+            let acoust_id = clients.acoust_id.clone();
+            track_acquisition_queue.use_turns(Arc::new(move |wake| acoust_id.hold_lookup(wake)));
+        }
         let heart_acquisition_coordinator = HeartAcquisitionCoordinator::new(
             settings.clone(),
             track_acquisition_queue.clone(),
@@ -1033,7 +1060,7 @@ impl Acquisition {
                 owned: Some(heart_ownership.clone()),
                 stars: Some(star_on_arrival.clone()),
                 ahead: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
-                gates: None,
+                gates: Some(verification.clone() as Arc<dyn HeartGates>),
                 music_brainz: Some(clients.music_brainz.clone()),
                 heard: Some(stores.heard_samples.clone()),
                 acoust_id_on: Some({
@@ -1059,6 +1086,34 @@ impl Acquisition {
                     }
                 },
             ));
+            // A hold waiting for AcoustID resumes when its held lookup's turn comes.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            verification.on_resume(Arc::new(move |key: &str| {
+                if let Some(coordinator) = coordinator.upgrade() {
+                    coordinator.resume_held(key);
+                }
+            }));
+            // AcoustID turning off runs every hold waiting for it through the catalog's clip; a
+            // key working again runs every hold the clip check left through the heard answer.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            clients.acoust_id.subscribe_on(Arc::new(move |on: bool| {
+                if let Some(coordinator) = coordinator.upgrade() {
+                    coordinator.resume_waiting(if on {
+                        WaitingFor::AcoustIdOff
+                    } else {
+                        WaitingFor::AcoustId
+                    });
+                }
+            }));
+            // A held song streamed again brings a new heard source to the holds that wait on one.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            stores
+                .external_id_registry
+                .on_heard(Arc::new(move |id: &str, user: &str, record: &HeardRecord| {
+                    if let Some(coordinator) = coordinator.upgrade() {
+                        coordinator.heard_again(id, user, record);
+                    }
+                }));
         }
         heart_acquisition_coordinator.use_family(FamilyHooks {
             gate: navidrome.family_write_gate.clone(),

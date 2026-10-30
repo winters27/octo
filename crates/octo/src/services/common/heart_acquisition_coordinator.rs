@@ -59,6 +59,16 @@ pub trait HeartGates: Send + Sync {
         holder: &Holder,
         origin: AcquisitionOrigin,
     ) -> GateStart;
+
+    /// `user` was filed in the hold `record`: what their gate took is kept with it, and what the
+    /// hold waits for is asked again until it answers.
+    fn on_filed(&self, _record: &HeldAcquisition, _user: &str) {}
+
+    /// Opens one heard-master round per gate for one pass of the chain over the acquisition
+    /// `acquisition_key`; the rounds end when what this returns is dropped.
+    fn open_rounds(&self, _acquisition_key: &str, _gates: &[HeartGate]) -> Box<dyn Send> {
+        Box::new(())
+    }
 }
 
 /// The coordinator's optional collaborators, each `None` by default.
@@ -117,6 +127,10 @@ fn files_hold(origin: AcquisitionOrigin, waiting_for: WaitingFor) -> bool {
         _ => true,
     }
 }
+
+/// What a chain notes in `filed` for a holder whose gate did not pass the file that landed: they
+/// stay where they were.
+const STAYS: &str = "";
 
 /// The line a held row shows when its hold kept none of its own.
 pub(crate) fn waiting_line(waiting_for: WaitingFor) -> &'static str {
@@ -946,6 +960,91 @@ impl HeartAcquisitionCoordinator {
         });
     }
 
+    /// Runs again now every held acquisition that waits for `waiting_for`: AcoustID turning off
+    /// sends every hold waiting for it to the catalog's clip, and a key working again sends every
+    /// hold the clip check left back to the heard answer.
+    pub fn resume_waiting(self: &Arc<Self>, waiting_for: WaitingFor) {
+        let Some(holds) = self.extras.holds.as_ref() else {
+            return;
+        };
+        for record in holds
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.waiting_for == Some(waiting_for))
+        {
+            self.resume_held(&record.key());
+        }
+    }
+
+    /// `user` streamed a song that holds for them: every hold of it that waits on what they heard
+    /// (a proof, the heard lookup, the catalog's clip or the shim) takes this newer heard source
+    /// and runs again with it.
+    pub fn heard_again(self: &Arc<Self>, external_id: &str, user: &str, record: &HeardRecord) {
+        let Some(holds) = self.extras.holds.as_ref() else {
+            return;
+        };
+        let routing_of = |id: &str| {
+            self.extras
+                .id_registry
+                .as_ref()
+                .and_then(|ids| ids.resolve_song(id, false))
+                .map(|shared| shared.snapshot())
+                .map(|routing| (routing.artist, routing.title, routing.duration))
+        };
+        let streamed = routing_of(external_id);
+        for held in holds.snapshot() {
+            if held.kind != HeldKind::Track
+                || !matches!(
+                    held.waiting_for,
+                    Some(
+                        WaitingFor::NotYetProven
+                            | WaitingFor::AcoustId
+                            | WaitingFor::Deezer
+                            | WaitingFor::Shim
+                    )
+                )
+                || !held
+                    .holders
+                    .iter()
+                    .any(|holder| eq_ignore_case(holder.user.trim(), user.trim()))
+            {
+                continue;
+            }
+            let same_song = held.external_id == external_id
+                || (streamed.is_some() && routing_of(&held.external_id) == streamed);
+            if !same_song {
+                continue;
+            }
+            let newer = held
+                .holders
+                .iter()
+                .find(|holder| eq_ignore_case(holder.user.trim(), user.trim()))
+                .is_some_and(|holder| {
+                    holder
+                        .heard
+                        .as_ref()
+                        .is_none_or(|known| known.heard_at < record.heard_at)
+                });
+            if !newer {
+                continue;
+            }
+            let key = held.key();
+            holds.update(&key, |kept| {
+                if let Some(holder) = kept
+                    .holders
+                    .iter_mut()
+                    .find(|holder| eq_ignore_case(holder.user.trim(), user.trim()))
+                {
+                    holder.heard = Some(record.clone());
+                    holder.whole_heard_print = None;
+                    holder.shim_tries = Default::default();
+                }
+            });
+            info!("{user} streamed held {key} again; it runs again with what they heard now");
+            self.resume_held(&key);
+        }
+    }
+
     async fn run_held(&self, record: &HeldAcquisition) {
         let Some(holds) = self.extras.holds.clone() else {
             return;
@@ -1008,7 +1107,7 @@ impl HeartAcquisitionCoordinator {
         };
         let stays = |user: &str| {
             let keys = filed_under(user);
-            keys.contains(&key.as_str()) || (held_again && keys.is_empty())
+            keys.contains(&key.as_str()) || keys.contains(&STAYS) || (held_again && keys.is_empty())
         };
         if record.holders.is_empty() {
             if !stays("") {
@@ -1393,6 +1492,11 @@ impl HeartAcquisitionCoordinator {
             })
             .unwrap_or(kept);
         self.hold_copies(&kept);
+        if let Some(gates) = &self.extras.gates {
+            for user in &users {
+                gates.on_filed(&kept, user);
+            }
+        }
         filed.extend(users.into_iter().map(|user| (user, key.clone())));
         if let Some(tracker) = self.tracker() {
             let owners: Vec<String> = kept.holders.iter().map(|holder| holder.user.clone()).collect();
@@ -1463,6 +1567,67 @@ impl HeartAcquisitionCoordinator {
         TrackOutcome::Held(held.waiting_for)
     }
 
+    /// A file landed: what it is for each holder, by their own gate's verdict. A holder whose gate
+    /// passed it has it; one whose gate holds is filed under that wait; one whose gate did not pass
+    /// it never counts it as theirs, and stays where they were when this runs a hold again. With
+    /// no gate's verdict on the file (the shipped checks ran) it is everyone's, as before.
+    #[allow(clippy::too_many_arguments)] // the song, who held it, the verdicts and where they went
+    fn landed_for(
+        &self,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        origin: AcquisitionOrigin,
+        holders: &[Holder],
+        ledger: &super::GateLedger,
+        path: String,
+        filed: &mut Vec<(String, String)>,
+    ) -> TrackOutcome {
+        if ledger.is_empty() || holders.is_empty() {
+            return TrackOutcome::Landed(path);
+        }
+        let mut landed = false;
+        let mut held = None;
+        let mut why = None;
+        for holder in holders {
+            match ledger.outcome_for(&holder.user, origin) {
+                Some(super::GateOutcome::Accepted) => landed = true,
+                Some(super::GateOutcome::Held(waiting)) => {
+                    held.get_or_insert(waiting);
+                    self.file_hold(
+                        provider,
+                        external_id,
+                        requested_by,
+                        origin,
+                        waiting,
+                        vec![holder.clone()],
+                        waiting_line(waiting),
+                        Vec::new(),
+                        None,
+                        filed,
+                    );
+                }
+                outcome => {
+                    let reason = match outcome {
+                        Some(super::GateOutcome::NotAccepted(reason)) => reason,
+                        _ => "Their own check never judged the copy that landed".to_string(),
+                    };
+                    info!(
+                        "{provider}:{external_id} landed, and is not what {} heard: {reason}",
+                        holder.user
+                    );
+                    filed.push((holder.user.trim().to_string(), STAYS.to_string()));
+                    why.get_or_insert(reason);
+                }
+            }
+        }
+        match (landed, held, why) {
+            (true, _, _) => TrackOutcome::Landed(path),
+            (false, Some(waiting), _) => TrackOutcome::Held(waiting),
+            (false, None, why) => TrackOutcome::Failed(why.unwrap_or_default()),
+        }
+    }
+
     /// The song chain for these holders: their gates first, then the sources in order, every
     /// file judged with every ready gate. `held_files` are what a resumed hold held: the first
     /// direct source checks them before it fetches anything. `filed` says which holders were
@@ -1498,13 +1663,41 @@ impl HeartAcquisitionCoordinator {
             Ok(gates) => gates,
             Err(waiting) => return Ok(TrackOutcome::Held(waiting)),
         };
+        // Holders whose gate holds are filed already; the chain runs for the others.
+        let holders: Vec<Holder> = if gates.is_empty() {
+            holders
+        } else {
+            holders
+                .into_iter()
+                .filter(|holder| {
+                    gates
+                        .iter()
+                        .any(|gate| eq_ignore_case(gate.user.trim(), holder.user.trim()))
+                })
+                .collect()
+        };
+        // One heard-master round per person for this pass of the chain: one copy of what they
+        // heard serves every candidate the pass judges.
+        let _rounds = self.extras.gates.as_ref().map(|builder| {
+            builder.open_rounds(&super::acquisition_key(provider, external_id, false), &gates)
+        });
         // A song fetched ahead is kept at once: no outage hold, no Lidarr hand-off. The download
-        // takes the file from the folder instead of a transfer.
-        if self
-            .extras
-            .ahead
-            .as_ref()
-            .is_some_and(|ahead| ahead.has(provider, external_id))
+        // takes the file from the folder instead of a transfer. With gates, only when someone
+        // heard that very copy: any other copy is judged when a source of the chain reaches it.
+        let ahead_copy = super::acquisition_key(provider, external_id, false);
+        let heard_ahead = gates.is_empty()
+            || gates.iter().any(|gate| {
+                matches!(
+                    gate.heard.as_ref().map(|heard| &heard.source),
+                    Some(octo_core::fingerprint::heart_gate::HeardSource::Copy { key, .. }) if *key == ahead_copy
+                )
+            });
+        if heard_ahead
+            && self
+                .extras
+                .ahead
+                .as_ref()
+                .is_some_and(|ahead| ahead.has(provider, external_id))
         {
             info!("{provider}:{external_id} was downloaded ahead; keeping that copy");
             let completion = self.direct_queue.enqueue_holding(
@@ -1525,7 +1718,16 @@ impl HeartAcquisitionCoordinator {
                 None,
             );
             return Ok(match completion.wait().await {
-                Ok(path) => TrackOutcome::Landed(path),
+                Ok(path) => self.landed_for(
+                    provider,
+                    external_id,
+                    requested_by,
+                    origin,
+                    &holders,
+                    completion.ledger(),
+                    path,
+                    filed,
+                ),
                 Err(failure) => {
                     if let Some(held) = failure.downcast_ref::<AcquisitionHeld>() {
                         return Ok(self.hold_downloaded(
@@ -1620,7 +1822,18 @@ impl HeartAcquisitionCoordinator {
                     None,
                 );
                 match completion.wait().await {
-                    Ok(path) => return Ok(TrackOutcome::Landed(path)),
+                    Ok(path) => {
+                        return Ok(self.landed_for(
+                            provider,
+                            external_id,
+                            requested_by,
+                            origin,
+                            &holders,
+                            completion.ledger(),
+                            path,
+                            filed,
+                        ));
+                    }
                     Err(failure) => {
                         // Held in the one hold path: the chain stops here and the hold resumes it.
                         if let Some(held) = failure.downcast_ref::<AcquisitionHeld>() {

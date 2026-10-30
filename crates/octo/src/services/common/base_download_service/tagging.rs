@@ -493,6 +493,34 @@ impl BaseDownloadService {
     /// was found to be (see `tag_guard`). What it changed or found goes in the song's plan
     /// notes, its download log and the server log.
     fn guard_tags(&self, song: &mut Song) {
+        // No tag claims a version the sound did not prove: a file kept as heard, one a shipped
+        // check confirmed while its sound could not settle the version, and one the person kept
+        // anyway carry no recording id, no ISRC and no release of their own.
+        if let Some(proof) = song
+            .verification
+            .as_deref()
+            .map(|verification| verification.proof.clone())
+            .filter(|proof| !proof.allows_recording_tags())
+        {
+            let claimed = song.music_brainz_recording_id.is_some() || song.isrc.is_some();
+            song.music_brainz_recording_id = None;
+            song.isrc = None;
+            song.music_brainz_release_id = None;
+            song.music_brainz_release_group_id = None;
+            if claimed {
+                let mark = proof.row_mark().unwrap_or("version not proven");
+                if let Some(plan) = song.tag_plan.as_deref_mut() {
+                    plan.notes
+                        .push(format!("{mark}: no recording id or ISRC is written"));
+                }
+                self.log_song_step(
+                    song,
+                    acquisition_event_kinds::TAGS,
+                    "No recording id or ISRC written",
+                    Some(&format!("{mark}: its sound did not prove which recording it is")),
+                );
+            }
+        }
         let identity = Identity::of(song.verification.as_deref());
         let chosen = song
             .tag_plan

@@ -174,6 +174,10 @@ pub struct VerificationResult {
     /// The score an AcoustID answer had to reach to count, in 0..1, as the decision used it.
     /// 0 when no answer was weighed.
     pub threshold: f64,
+
+    /// What the sound proved about which recording the file is, which decides whether its
+    /// recording-level tags are written.
+    pub proof: RecordingProof,
 }
 
 /// How many of the other recordings AcoustID heard a check line keeps.
@@ -449,8 +453,12 @@ impl VerificationResult {
     /// The name overwrite is unconditional where the Deezer fill is conditional. That one fills
     /// only what is missing, because a peer's own tags beat nothing. A confirmed fingerprint
     /// match beats the peer, which is the entire point of the setting.
+    ///
+    /// A file the sound did not prove as a catalog recording (kept as heard, confirmed only by a
+    /// shipped check its sound could not settle, kept by the person) takes no recording-level
+    /// tags and no name from the match: no tag claims a version the sound did not prove.
     pub fn apply_tags_to(&self, song: &mut Song) {
-        if self.verdict != VerificationVerdict::Confirmed {
+        if self.verdict != VerificationVerdict::Confirmed || !self.proof.allows_recording_tags() {
             return;
         }
 
@@ -614,6 +622,27 @@ pub enum RecordingProof {
     NotProven,
     /// The person kept it anyway.
     KeptByYou,
+}
+
+impl RecordingProof {
+    /// Whether a file of this proof may carry a MusicBrainz recording id, an ISRC and the names a
+    /// match gives: only when the sound proved the recording, or the shipped checks alone decided
+    /// as they always have.
+    pub fn allows_recording_tags(&self) -> bool {
+        matches!(self, Self::Shipped | Self::Proven)
+    }
+
+    /// The words an import row carries for a file of this proof, when there are any: "version not
+    /// proven", "as heard", "as heard on YouTube".
+    pub fn row_mark(&self) -> Option<&'static str> {
+        match self {
+            Self::Shipped | Self::Proven => None,
+            Self::AsHeard { video_id: Some(_) } => Some("as heard on YouTube"),
+            Self::AsHeard { video_id: None } => Some("as heard"),
+            Self::NotProven => Some("version not proven"),
+            Self::KeptByYou => Some("kept by you, version not proven"),
+        }
+    }
 }
 
 /// One percent of an answer's weight. While the dominant recording is not R's, R's recordings

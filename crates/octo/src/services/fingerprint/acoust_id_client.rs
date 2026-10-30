@@ -345,9 +345,24 @@ impl AcoustIdClient {
         fingerprint: &str,
         duration_seconds: i32,
     ) -> AcoustIdOutcome {
-        self.lookup_answer_on(class, fingerprint, duration_seconds, true)
+        self.lookup_answer_read(class, fingerprint, duration_seconds)
             .await
-            .unwrap_or(AcoustIdOutcome::Busy)
+            .0
+    }
+
+    /// [`Self::lookup_answer`], with the same answer read as the shipped checks read it
+    /// ([`AcoustIdLookup`], its cut and its releases) when AcoustID answered `ok`: one call gives
+    /// the gate its reading and the downloads log its line.
+    pub async fn lookup_answer_read(
+        &self,
+        class: LookupClass,
+        fingerprint: &str,
+        duration_seconds: i32,
+    ) -> (AcoustIdOutcome, Option<AcoustIdLookup>) {
+        let (outcome, lookup) = self
+            .lookup_answer_on(class, fingerprint, duration_seconds, true)
+            .await;
+        (outcome.unwrap_or(AcoustIdOutcome::Busy), lookup)
     }
 
     /// [`Self::lookup_answer`] when a turn is free at once; None at once otherwise, with nothing
@@ -360,6 +375,7 @@ impl AcoustIdClient {
     ) -> Option<AcoustIdOutcome> {
         self.lookup_answer_on(class, fingerprint, duration_seconds, false)
             .await
+            .0
     }
 
     async fn lookup_answer_on(
@@ -368,22 +384,26 @@ impl AcoustIdClient {
         fingerprint: &str,
         duration_seconds: i32,
         wait: bool,
-    ) -> Option<AcoustIdOutcome> {
+    ) -> (Option<AcoustIdOutcome>, Option<AcoustIdLookup>) {
         // The user's key, then Octo's own: each one AcoustID rejects is set aside.
         for _ in 0..2 {
             let Some((key, lane)) = self.keys.key_for(class) else {
-                return Some(AcoustIdOutcome::Off);
+                return (Some(AcoustIdOutcome::Off), None);
             };
             let turn = self.http.limiter().permit(lane, class, wait).await;
             let Some(turn) = turn else {
                 // A turn that is not free is never AcoustID's answer.
-                return wait.then_some(AcoustIdOutcome::Busy);
+                return (wait.then_some(AcoustIdOutcome::Busy), None);
             };
             let body = encode_form(&build_lookup_form(&key, fingerprint, duration_seconds));
             let reply = Reply::of(
                 self.post_within(&turn, "v2/lookup", body, self.timeout_seconds())
                     .await,
             );
+            let read = match &reply {
+                Reply::Body(doc) => parse_lookup(doc).ok().filter(|lookup| lookup.is_ok),
+                Reply::Busy(_) => None,
+            };
             let (end, outcome) = match reply {
                 Reply::Busy(kind) => (CallEnd::Busy(kind), Some(AcoustIdOutcome::Busy)),
                 Reply::Body(doc) => match parse_answer(&doc) {
@@ -408,7 +428,8 @@ impl AcoustIdClient {
             turn.end(end);
             if let Some(outcome) = outcome {
                 self.keys.note();
-                return Some(outcome);
+                let read = read.filter(|_| matches!(outcome, AcoustIdOutcome::Answered(_)));
+                return (Some(outcome), read);
             }
             warn!(
                 "acoustid rejected {}; it is set aside until the settings change",
@@ -417,7 +438,14 @@ impl AcoustIdClient {
             self.keys.set_aside(lane);
             self.keys.note();
         }
-        Some(AcoustIdOutcome::Off)
+        (Some(AcoustIdOutcome::Off), None)
+    }
+
+    /// Whether a call of `class` would find its pace backed off now, on the lane its key takes.
+    pub fn backing_off(&self, class: LookupClass) -> bool {
+        self.keys
+            .key_for(class)
+            .is_some_and(|(_, lane)| self.http.limiter().backing_off(lane, class))
     }
 
     /// Ask AcoustID what this fingerprint is. Returns None on any transport or parse

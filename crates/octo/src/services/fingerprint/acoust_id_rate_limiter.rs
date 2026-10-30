@@ -4,6 +4,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
@@ -19,6 +20,9 @@ tokio::task_local! {
     static BACKGROUND_FLOW: bool;
     /// Set for the work run by [`AcoustIdRateLimiter::with_class`].
     static CALL_CLASS: LookupClass;
+    /// Set for the work run by [`AcoustIdRateLimiter::if_free`]: whether a call in it found no
+    /// free turn.
+    static TURNED_AWAY: Arc<AtomicBool>;
 }
 
 /// Whose AcoustID call this is, which decides the key it uses and its place in the queue: earlier
@@ -461,6 +465,33 @@ impl AcoustIdRateLimiter {
         CALL_CLASS.try_with(|class| *class).unwrap_or(LookupClass::Bulk)
     }
 
+    /// Calls started inside `work` take a turn only when one is free at once, and never wait for
+    /// one. The second value says whether one of them found none, so a caller tells "AcoustID was
+    /// not asked" from AcoustID failing.
+    pub async fn if_free<T>(work: impl Future<Output = T>) -> (T, bool) {
+        let turned_away = Arc::new(AtomicBool::new(false));
+        let done = TURNED_AWAY.scope(Arc::clone(&turned_away), work).await;
+        (done, turned_away.load(Ordering::SeqCst))
+    }
+
+    /// Whether the current work takes only a turn that is free at once.
+    fn if_free_now() -> bool {
+        TURNED_AWAY.try_with(|_| true).unwrap_or(false)
+    }
+
+    /// Notes that a call of [`Self::if_free`]'s work found no free turn.
+    fn note_turned_away() {
+        let _ = TURNED_AWAY.try_with(|flag| flag.store(true, Ordering::SeqCst));
+    }
+
+    /// Whether a class's pace on a lane is backed off above where it starts: AcoustID answered a
+    /// call of that pace Busy, and has not answered enough since to bring it back.
+    pub fn backing_off(&self, lane: KeyLane, class: LookupClass) -> bool {
+        let lane = self.lanes.lane(lane);
+        let gap = lane.pacing.lock().gaps[lane.pace(class)];
+        gap.current > gap.floor
+    }
+
     /// A permit of the user's own key's budget, as the shipped lane gives it.
     pub async fn acquire(&self) -> RateLimitLease {
         let window = self
@@ -483,11 +514,18 @@ impl AcoustIdRateLimiter {
     }
 
     /// A turn for one call, taken before the call's own timeout starts, so the wait is never
-    /// counted against AcoustID. With `wait` false, or in the background lane, a turn that is not
-    /// free at once is None, and nothing is queued. On the user's lane a full queue is None too;
-    /// Octo's own key's lane never refuses a call that waits.
+    /// counted against AcoustID. With `wait` false, in the background lane, or inside
+    /// [`Self::if_free`], a turn that is not free at once is None, and nothing is queued. A heart's,
+    /// a play's, a person's or a family request's call never waits while its pace is backed off
+    /// ([`Self::backing_off`]): that gap grows to an hour, and the work that asked holds or takes
+    /// its own busy path instead of keeping the download worker. On the user's lane a full queue is
+    /// None too; Octo's own key's lane never refuses a call that waits.
     pub async fn permit(&self, lane: KeyLane, class: LookupClass, wait: bool) -> Option<CallPermit> {
-        let wait = wait && !Self::in_background_now();
+        let if_free = Self::if_free_now();
+        let wait = wait
+            && !Self::in_background_now()
+            && !if_free
+            && (class.is_bulk() || !self.backing_off(lane, class));
         let shared = self.lanes.lane(lane);
         let entry = {
             let mut pacing = shared.pacing.lock();
@@ -521,7 +559,12 @@ impl AcoustIdRateLimiter {
             };
             match turn {
                 None => break,
-                Some(_) if !wait => return None,
+                Some(_) if !wait => {
+                    if if_free {
+                        Self::note_turned_away();
+                    }
+                    return None;
+                }
                 Some(Turn::At(at)) => {
                     tokio::select! {
                         _ = notified => {}
@@ -545,6 +588,9 @@ impl AcoustIdRateLimiter {
                 window.attempt_acquire()
             };
             if !lease.is_acquired() {
+                if if_free {
+                    Self::note_turned_away();
+                }
                 return None;
             }
         }

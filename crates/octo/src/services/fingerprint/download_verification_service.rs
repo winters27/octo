@@ -2,8 +2,8 @@
 //! `octo_core::fingerprint::verification`.
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,8 +11,9 @@ use octo_core::common::SongIdentity;
 use octo_core::common::dotnet;
 use octo_core::common::song_versions::strip_versions;
 use octo_core::common::version_gap::{self, Against};
+use octo_core::fingerprint::heart_gate::{GateVerdict, HeardSource, HeartGate, WaitingFor};
 use octo_core::fingerprint::recording_identity::{self, RecordingFacts, RecordingKind, Takes};
-use octo_core::fingerprint::verification::MIN_SOURCES_TO_CONFIRM;
+use octo_core::fingerprint::verification::{AnswerReading, MIN_SOURCES_TO_CONFIRM};
 use octo_core::fingerprint::{
     AcoustIdLookup, AcoustIdRecording, AcoustIdResult, InconclusiveReason, TrackMatchComparer,
     VerificationResult, VerificationVerdict,
@@ -25,14 +26,85 @@ use tracing::{debug, info, warn};
 
 use super::acoust_id_client::AcoustIdClient;
 use super::acoust_id_rate_limiter::{AcoustIdRateLimiter, LookupClass};
-use super::music_brainz_client::{MusicBrainzClient, MusicBrainzError};
+use super::catalog_clip::{CatalogClip, ClipPrints};
+use super::heard_master_check::HeardMasterCheck;
+use super::music_brainz_client::{CatalogQuestions, MusicBrainzClient, MusicBrainzError};
 use super::preview_check::{self, PreviewOutcome, PreviewRequest, PreviewSource};
+use crate::services::common::SoulseekHoldStore;
+use crate::services::prefetch::HeardSamples;
+use crate::services::prefetch::heard_samples::ResumeHold;
+use crate::services::soulseek::ExternalIdRegistry;
+use crate::services::soulseek::rejected_peer_registry::RejectedPeerRegistry;
 
 /// The ISRCs MusicBrainz listed per recording id, with ids compared ignoring case.
 pub type RecordingIsrcs = HashMap<String, Vec<String>>;
 
 /// What MusicBrainz says each recording is, by lowercased recording id.
 pub type FactsById = HashMap<String, RecordingFacts>;
+
+/// Where a candidate file's own labels are read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelSource {
+    /// The file itself, as its source delivered it.
+    TheFile,
+    /// Another file that holds the download as delivered (a Lidarr download at its dropped path).
+    Delivered(PathBuf),
+    /// The file has no usable labels (a Lidarr import with Write Metadata on).
+    None,
+}
+
+/// What a verify step knows of one candidate beyond its path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartCandidate {
+    pub labels: LabelSource,
+    /// The file's own identity when it is a copy of the kind heard audio is (a prefetch copy, a
+    /// whole copy of a video's stream).
+    pub identity: Option<HeardSource>,
+    /// The acquisition's key, which finds the open heard-master round.
+    pub acquisition_key: String,
+}
+
+/// One file judged for one gate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeartCheck {
+    pub verdict: GateVerdict,
+    /// The file's own reading against the gate's R, when AcoustID answered.
+    pub reading: Option<AnswerReading>,
+    /// The shipped reading of the same answer: the log's line, and what
+    /// `names_another_recording` reads for the YouTube loop.
+    pub verification: VerificationResult,
+}
+
+/// What building one heart's or play's gate came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateBuild {
+    /// Judge every file with this gate.
+    Ready(HeartGate),
+    /// The heart holds before any source runs (a busy answer, AcoustID off and the clip check
+    /// unsettled, a believed different song with nothing to try), with its downloads line.
+    /// `question` is the MusicBrainz question that did not answer, when that is what it waits for.
+    Hold {
+        gate: HeartGate,
+        waiting_for: WaitingFor,
+        line: String,
+        question: Option<String>,
+    },
+}
+
+/// What the heart gate reads besides AcoustID: the songs and what each person heard, the heard
+/// prints and the `fpcalc` queue, the heard-master runner, the catalog's clip, Deezer's side of
+/// a heart's questions, the holds (the prints a held heart keeps) and the refusals only hearts
+/// read.
+#[derive(Clone)]
+pub struct HeartParts {
+    pub registry: Arc<ExternalIdRegistry>,
+    pub samples: Arc<HeardSamples>,
+    pub master: Arc<HeardMasterCheck>,
+    pub clip: Arc<CatalogClip>,
+    pub catalog: Arc<dyn CatalogQuestions>,
+    pub holds: Arc<SoulseekHoldStore>,
+    pub rejected: Arc<RejectedPeerRegistry>,
+}
 
 /// Asks what a finished download actually contains, rather than what its name and advertised
 /// length claim.
@@ -47,6 +119,12 @@ pub struct DownloadVerificationService {
     settings: Arc<SettingsStore>,
     music_brainz: Option<Arc<MusicBrainzClient>>,
     spectrum: Option<Arc<SpectrumAnalyzer>>,
+    /// What the heart gate reads, once the app has built it.
+    heart: OnceLock<HeartParts>,
+    /// Resumes a hold by its key when what it waited for answers.
+    resume: parking_lot::Mutex<Option<ResumeHold>>,
+    /// Clip prints a gate took for a person, by song and person, until their hold keeps them.
+    clip_prints: parking_lot::Mutex<HashMap<(String, String), ClipPrints>>,
 }
 
 impl DownloadVerificationService {
@@ -72,6 +150,9 @@ impl DownloadVerificationService {
             settings,
             music_brainz,
             spectrum,
+            heart: OnceLock::new(),
+            resume: parking_lot::Mutex::new(None),
+            clip_prints: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1503,6 +1584,11 @@ fn get_extension(path: &str) -> &str {
         _ => "",
     }
 }
+
+#[path = "download_verification_heart.rs"]
+mod heart;
+
+pub use heart::{ANOTHER_SONG_OR_TAKE, ANOTHER_SONG_PLAYED, HEARD_LOOKUP_BUSY, NEVER_PLAYED, YOUTUBE_PEER};
 
 #[cfg(test)]
 #[path = "download_verification_service_tests.rs"]

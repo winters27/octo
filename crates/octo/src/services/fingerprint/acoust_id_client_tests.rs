@@ -333,8 +333,13 @@ async fn the_429_and_503_stubs_set_the_gap_series_on_both_lanes() {
     let server = series(answers).await;
     let settings = settings_with("");
     let client = client_on(&server, &settings, quick(), Some(OCTO_KEY));
+    // A backed-off heart lookup never waits for its turn, so each is sent once its turn is due.
+    let due = |client: &AcoustIdClient, lane: KeyLane| {
+        tokio::time::sleep(client.http.limiter().gap(lane, LookupClass::Heart) + Duration::from_millis(5))
+    };
     let mut gaps = Vec::new();
     for _ in 0..8 {
+        due(&client, KeyLane::BuiltIn).await;
         client.lookup_answer(LookupClass::Heart, "AQAD", 200).await;
         gaps.push(client.http.limiter().gap(KeyLane::BuiltIn, LookupClass::Heart));
     }
@@ -346,6 +351,7 @@ async fn the_429_and_503_stubs_set_the_gap_series_on_both_lanes() {
     let client = client_on(&server, &settings, quick(), Some(OCTO_KEY));
     let mut gaps = Vec::new();
     for _ in 0..8 {
+        due(&client, KeyLane::BuiltIn).await;
         client.lookup_answer(LookupClass::Heart, "AQAD", 200).await;
         gaps.push(client.http.limiter().gap(KeyLane::BuiltIn, LookupClass::Heart));
     }
@@ -363,6 +369,7 @@ async fn the_429_and_503_stubs_set_the_gap_series_on_both_lanes() {
     let floor = AcoustIdRateLimiter::USER_GAP;
     let mut gaps = Vec::new();
     for _ in 0..3 {
+        due(&client, KeyLane::User).await;
         client.lookup_answer(LookupClass::Heart, "AQAD", 200).await;
         gaps.push(client.http.limiter().gap(KeyLane::User, LookupClass::Heart));
     }

@@ -53,6 +53,7 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use octo_core::common::{PathHelper, SongIdentity, dotnet};
 use octo_core::fingerprint::VerificationResult;
+use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeardSource, HeartGate};
 use octo_core::models::domain::{Album, Song};
 use octo_core::models::download::{AcquisitionHeard, DownloadHistoryEntry, DownloadInfo, DownloadStatus};
 use octo_core::notifications::{NotificationEvent, NotificationEventType};
@@ -72,7 +73,7 @@ use tracing::{debug, error, info, warn};
 use crate::services::common::acquisition_tracker::{acquisition_event_kinds, key_of};
 use crate::services::common::{
     AcquisitionPlace, AcquisitionState, AcquisitionTracker, DownloadArrivals, DownloadConcurrency,
-    DownloadPicks,
+    DownloadPicks, GateLedger, acquisition_key,
 };
 use crate::services::cover_art::DownloadCoverResolver;
 use crate::services::family::FamilyPlacement;
@@ -155,6 +156,16 @@ pub struct TrackDownload {
     pub ahead: bool,
     /// The files a resumed hold held: checked first, as a fresh download's file is.
     pub held_files: Vec<String>,
+    /// Why the acquisition runs; None for one queued without an origin (the shipped checks).
+    pub origin: Option<AcquisitionOrigin>,
+    /// The gate of each heart or play that asked: a file is judged against each on its own.
+    pub gates: Vec<HeartGate>,
+    /// The acquisition's key, which finds each person's open heard-master round.
+    pub acquisition_key: String,
+    /// Where each gate's verdict on the file is written.
+    pub ledger: GateLedger,
+    /// Everyone who asked for the song, as the request had them when it started.
+    pub requested_by: Vec<String>,
 }
 
 /// The source-specific parts of the download pipeline. Every call is handed the base, so a
@@ -216,6 +227,19 @@ pub trait DownloadBackend: Send + Sync + 'static {
 
     /// Called when the walk ends, however it ends: let go of whatever was prepared and not used.
     async fn finish_album(&self, _base: &BaseDownloadService, _prepared: &[String]) {}
+
+    /// Judges a song fetched ahead before a heart or a play keeps it, as its gates judge a fresh
+    /// download: true keeps it (the song carries the verdict it is tagged by); false passes it
+    /// over, and the download runs. The default keeps it, as every download always did.
+    async fn judge_ahead(
+        &self,
+        _base: &BaseDownloadService,
+        _download: &mut TrackDownload,
+        _path: &str,
+        _identity: HeardSource,
+    ) -> bool {
+        true
+    }
 }
 
 /// The notice queue's review: ask one person about a download they can settle by listening. False
@@ -1014,6 +1038,49 @@ impl BaseDownloadService {
             self.promote_ahead(external_provider, external_id, &mut song)
         };
 
+        let new_download = |song: Song| TrackDownload {
+            track_id: external_id.to_string(),
+            song,
+            suppress_notify: silence,
+            source_override: options.source_override,
+            upgrade_search: options.upgrade_search,
+            replacing_path: options.replacement.as_ref().map(|r| r.original_path.clone()),
+            fetched_from: None,
+            muted: false,
+            flac_only,
+            ahead: options.prefetch,
+            held_files: options.place.held_files.clone(),
+            origin: options.place.origin,
+            gates: options.place.gates.clone(),
+            acquisition_key: acquisition_key(external_provider, external_id, flac_only),
+            ledger: options.place.ledger.clone(),
+            requested_by: options.requested_by.clone().unwrap_or_default(),
+        };
+        // A heart's or a play's gates judge a song fetched ahead before it is kept; one they pass
+        // over is gone, and the download runs.
+        let gated = matches!(
+            options.place.origin,
+            Some(AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart | AcquisitionOrigin::Play)
+        ) && !options.place.gates.is_empty();
+        let promoted = match promoted {
+            Some((landed, fetched_from, identity)) if gated => {
+                let mut judged = new_download(song.clone());
+                if self
+                    .backend
+                    .judge_ahead(self, &mut judged, &landed, identity)
+                    .await
+                {
+                    song = judged.song;
+                    Some((landed, fetched_from))
+                } else {
+                    let _ = std::fs::remove_file(&landed);
+                    None
+                }
+            }
+            Some((landed, fetched_from, _)) => Some((landed, fetched_from)),
+            None => None,
+        };
+
         let (transferred, fetched_from, muted) = match promoted {
             Some((landed, fetched_from)) => (Ok(landed), fetched_from, false),
             None => {
@@ -1033,19 +1100,7 @@ impl BaseDownloadService {
                         .await
                         .ok();
                 }
-                let mut download = TrackDownload {
-                    track_id: external_id.to_string(),
-                    song,
-                    suppress_notify: silence,
-                    source_override: options.source_override,
-                    upgrade_search: options.upgrade_search,
-                    replacing_path: options.replacement.as_ref().map(|r| r.original_path.clone()),
-                    fetched_from: None,
-                    muted: false,
-                    flac_only,
-                    ahead: options.prefetch,
-                    held_files: options.place.held_files.clone(),
-                };
+                let mut download = new_download(song);
                 let transferred = self
                     .backend
                     .download_track(self, &mut download, cancellation_token)
@@ -1386,7 +1441,7 @@ impl BaseDownloadService {
         external_provider: &str,
         external_id: &str,
         song: &mut Song,
-    ) -> Option<(String, Option<String>)> {
+    ) -> Option<(String, Option<String>, HeardSource)> {
         let prefetched = self.services.prefetched.as_ref()?;
         if !prefetched.has(external_provider, external_id) {
             return None;
@@ -1424,9 +1479,17 @@ impl BaseDownloadService {
                 None,
             )
         });
+        // The copy's own identity, as a heard copy of it is recorded: the same entry under the same
+        // key, made ready from the same file.
+        let identity = HeardSource::Copy {
+            key: format!("{external_provider}:{external_id}"),
+            ready_at: taken.sidecar.ready_at,
+            source_file: taken.sidecar.source_file.clone(),
+        };
         Some((
             taken.path.to_string_lossy().into_owned(),
             taken.sidecar.fetched_from.clone(),
+            identity,
         ))
     }
 

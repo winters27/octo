@@ -1291,13 +1291,22 @@ impl LibraryActionExecutor {
                 .record_requested_by
                 .then_some(request.username.as_str());
             let mut attempt = 0;
+            // The file a replacement's check left waiting for AcoustID's bulk turn.
+            let mut waiting: Vec<String> = Vec::new();
             loop {
                 let Some(&source) = sources.get(attempt) else {
                     return Err(Arc::new(anyhow::anyhow!(
                         "Index was out of range. Must be non-negative and less than the size of the collection. (Parameter 'index')"
                     )));
                 };
-                let completion = self.acquisitions.enqueue(
+                // A replacement is work nobody waits on: its file's check takes the bulk turn, and
+                // waits for it in the one hold path rather than keeping the download worker.
+                let completion = self.acquisitions.enqueue_holding(
+                    Some(octo_core::fingerprint::heart_gate::AcquisitionOrigin::Replacement),
+                    Vec::new(),
+                    std::mem::take(&mut waiting),
+                    &crate::services::common::AcquisitionTarget::Shared,
+                    false,
                     SoulseekMetadataService::PROVIDER_NAME,
                     &external_id,
                     true,
@@ -1309,7 +1318,23 @@ impl LibraryActionExecutor {
                     upgrade_search,
                     handoff.clone(),
                 );
-                match completion.wait().await {
+                let outcome = completion.wait().await;
+                // Its file waits in the one hold path for AcoustID's bulk turn: once the lane gives
+                // turns again, the same source goes on with that file.
+                if let Err(e) = &outcome
+                    && let Some(held) = e.downcast_ref::<crate::services::common::AcquisitionHeld>()
+                    && self.acquisitions.wait_for_turn().await
+                {
+                    info!(
+                        "Library action {}: the copy of '{} - {}' waited for AcoustID; going on with it",
+                        action_name(request.action),
+                        original.artist,
+                        original.title
+                    );
+                    waiting = held.files.clone();
+                    continue;
+                }
+                match outcome {
                     Ok(path) => return Ok(Some(path)),
                     Err(e)
                         if attempt + 1 < sources.len()

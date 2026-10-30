@@ -9,6 +9,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::common::Clock;
 use octo_core::common::dotnet::ordinal_ignore_case_key;
+use octo_core::fingerprint::heart_gate::HeardRecording;
 use octo_core::json::datetime;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,11 @@ pub struct Entry {
     pub track: String,
     #[serde(with = "datetime::utc")]
     pub rejected_utc: DateTime<Utc>,
+    /// For a refusal by one heart's or play's gate, the song and the recording it wanted, which
+    /// only heart and play origins read; empty for the shared refusals every download reads.
+    /// Written only when set, so the shared list's lines stay as they were.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub heart: String,
 }
 
 impl Default for Entry {
@@ -41,8 +47,31 @@ impl Default for Entry {
             track: String::new(),
             // The earliest time, for an entry whose line in the file has none.
             rejected_utc: datetime::min_value(),
+            heart: String::new(),
         }
     }
+}
+
+impl Entry {
+    /// The key the list finds this entry by: its peer and file, and for a heart's refusal its
+    /// song and recording too.
+    fn key(&self) -> String {
+        let shared = RejectedPeerRegistry::make_key(Some(&self.username), Some(&self.filename));
+        if self.heart.is_empty() {
+            shared
+        } else {
+            format!("heart|{}|{shared}", self.heart)
+        }
+    }
+}
+
+/// The scope of a heart's refusal: the song, and the recording ids the gate wanted, in order of
+/// their own so one R always gives one scope.
+fn heart_scope(song: &str, r: &HeardRecording) -> String {
+    let mut ids: Vec<String> = r.ids.iter().map(|id| id.trim().to_lowercase()).collect();
+    ids.sort();
+    ids.dedup();
+    format!("{}|{}", song.trim(), ids.join(","))
 }
 
 /// Remembers the peer-and-file pairs a completed download proved were the wrong recording,
@@ -169,27 +198,81 @@ impl RejectedPeerRegistry {
     }
 
     pub fn deny(&self, username: Option<&str>, filename: Option<&str>, reason: &str, track: &str) {
+        self.remember(username, filename, reason, track, String::new());
+    }
+
+    /// A refusal by one heart's or play's gate: this peer's file is not the recording `r` for the
+    /// song `song`, which says nothing about whether it is the song at all. Only heart and play
+    /// origins read it ([`Self::is_denied_for_heart`]), so the same file still serves imports and
+    /// other people's hearts. A video is remembered under the peer name "youtube".
+    pub fn deny_for_heart(
+        &self,
+        song: &str,
+        r: &HeardRecording,
+        username: Option<&str>,
+        filename: Option<&str>,
+        reason: &str,
+    ) {
+        self.remember(username, filename, reason, song, heart_scope(song, r));
+    }
+
+    /// Whether a heart's or play's gate refused this peer's file for the song and this R.
+    pub fn is_denied_for_heart(
+        &self,
+        song: &str,
+        r: &HeardRecording,
+        username: Option<&str>,
+        filename: Option<&str>,
+    ) -> bool {
+        let (Some(username), Some(filename)) = (
+            username.filter(|u| !u.is_empty()),
+            filename.filter(|f| !f.is_empty()),
+        ) else {
+            return false;
+        };
+        let entry = Entry {
+            username: username.to_string(),
+            filename: filename.to_string(),
+            heart: heart_scope(song, r),
+            ..Default::default()
+        };
+        self.is_denied_key(&ordinal_ignore_case_key(&entry.key()))
+    }
+
+    fn remember(
+        &self,
+        username: Option<&str>,
+        filename: Option<&str>,
+        reason: &str,
+        track: &str,
+        heart: String,
+    ) {
         let (Some(username), Some(filename)) = (
             username.filter(|u| !u.is_empty()),
             filename.filter(|f| !f.is_empty()),
         ) else {
             return;
         };
-        let key = Self::make_key(Some(username), Some(filename));
         let entry = Entry {
             username: username.to_string(),
             filename: filename.to_string(),
             reason: reason.to_string(),
             track: track.to_string(),
             rejected_utc: self.clock.now(),
+            heart,
         };
+        let for_heart = !entry.heart.is_empty();
         {
             let mut lru = self.lru.lock();
-            lru.put(ordinal_ignore_case_key(&key), entry);
+            lru.put(ordinal_ignore_case_key(&entry.key()), entry);
             lru.trim();
         }
         self.dirty.store(true, Ordering::SeqCst);
-        info!("Remembering rejected candidate {username} -> {filename} ({reason})");
+        if for_heart {
+            info!("Remembering {username} -> {filename} as refused for one heart's version of {track} ({reason})");
+        } else {
+            info!("Remembering rejected candidate {username} -> {filename} ({reason})");
+        }
     }
 
     /// Expiry is enforced here rather than by a sweep timer: a container that runs for
@@ -204,14 +287,18 @@ impl RejectedPeerRegistry {
             return false;
         };
         let folded = ordinal_ignore_case_key(&Self::make_key(Some(username), Some(filename)));
+        self.is_denied_key(&folded)
+    }
+
+    fn is_denied_key(&self, folded: &str) -> bool {
         let mut lru = self.lru.lock();
-        let Some((entry, _)) = lru.by_key.get(&folded) else {
+        let Some((entry, _)) = lru.by_key.get(folded) else {
             return false;
         };
         if !Self::is_expired(entry.rejected_utc, self.clock.now(), (self.ttl_days)()) {
             return true;
         }
-        lru.forget(&folded);
+        lru.forget(folded);
         drop(lru);
         self.dirty.store(true, Ordering::SeqCst);
         false
@@ -275,8 +362,7 @@ impl RejectedPeerRegistry {
                 if Self::is_expired(entry.rejected_utc, now, (self.ttl_days)()) {
                     continue;
                 }
-                let folded =
-                    ordinal_ignore_case_key(&Self::make_key(Some(&entry.username), Some(&entry.filename)));
+                let folded = ordinal_ignore_case_key(&entry.key());
                 match lru.by_key.get_mut(&folded) {
                     Some((existing, _)) => *existing = entry,
                     None => {
@@ -455,6 +541,38 @@ mod tests {
         let registry = RejectedPeerRegistry::new(Some(&path), None);
         assert_eq!(registry.count(), 0);
         assert!(!registry.is_denied(Some("peer1"), Some(FILE1)));
+    }
+
+    fn r(ids: &[&str]) -> HeardRecording {
+        HeardRecording {
+            ids: ids.iter().map(|id| id.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A heart's refusal is its own: it never bars the peer's file for an import (the shared
+    /// list), nor for a heart of the same song that wants another recording; the shared list
+    /// never reads as a heart's refusal either. Both survive a restart, and the shared list's
+    /// lines carry no heart field.
+    #[test]
+    fn a_hearts_refusal_bars_only_that_song_and_recording() {
+        let (_dir, path) = temp_path();
+        {
+            let first = RejectedPeerRegistry::new(Some(&path), None);
+            first.deny_for_heart("song-1", &r(&["rec-2009"]), Some("peer1"), Some(FILE1), "another mix");
+            first.deny(Some("peer2"), Some(FILE2), "is a karaoke version", "A - B");
+            assert!(first.is_denied_for_heart("song-1", &r(&["REC-2009"]), Some("peer1"), Some(FILE1)));
+            assert!(!first.is_denied(Some("peer1"), Some(FILE1)), "imports still take it");
+            assert!(!first.is_denied_for_heart("song-1", &r(&["rec-2015"]), Some("peer1"), Some(FILE1)));
+            assert!(!first.is_denied_for_heart("song-2", &r(&["rec-2009"]), Some("peer1"), Some(FILE1)));
+            assert!(!first.is_denied_for_heart("song-1", &r(&["rec-2009"]), Some("peer2"), Some(FILE2)));
+        }
+        let text = std::fs::read_to_string(&path).expect("written");
+        assert_eq!(text.matches("\"Heart\"").count(), 1, "{text}");
+        let second = RejectedPeerRegistry::new(Some(&path), None);
+        assert!(second.is_denied_for_heart("song-1", &r(&["rec-2009"]), Some("peer1"), Some(FILE1)));
+        assert!(!second.is_denied(Some("peer1"), Some(FILE1)));
+        assert!(second.is_denied(Some("peer2"), Some(FILE2)));
     }
 
     #[test]

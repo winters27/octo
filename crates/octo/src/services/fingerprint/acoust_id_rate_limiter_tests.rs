@@ -151,6 +151,8 @@ async fn gaps_after(
 ) -> Vec<Duration> {
     let mut gaps = vec![limiter.gap(lane, class)];
     for _ in 0..calls {
+        // A backed-off pace never waits for its turn, so the next call comes once it is due.
+        tokio::time::sleep(limiter.gap(lane, class)).await;
         let turn = limiter.permit(lane, class, true).await.expect("a turn");
         turn.end(end);
         gaps.push(limiter.gap(lane, class));
@@ -225,10 +227,79 @@ async fn the_users_key_keeps_its_budget_and_backs_off_from_its_own_floor() {
     )
     .await;
     assert_eq!(overload[16], Duration::from_secs(3_600));
-    // Backed off, the next call waits the whole gap.
+    // Backed off, a heart's call never waits the gap out: it is refused at once, and gets its turn
+    // once the gap has passed.
+    assert!(
+        limiter
+            .permit(KeyLane::User, LookupClass::Heart, true)
+            .await
+            .is_none()
+    );
     let before = Instant::now();
+    tokio::time::sleep(Duration::from_secs(3_600)).await;
     call(&limiter, KeyLane::User, LookupClass::Heart).await;
     assert_eq!(Instant::now() - before, Duration::from_secs(3_600));
+}
+
+/// While a person-class pace is backed off above where it starts, a heart's, a person's or a
+/// family request's call that is not free at once is refused without waiting; bulk work still
+/// waits its turn. At the starting gap a heart's call waits inline as before.
+#[tokio::test(start_paused = true)]
+async fn a_backed_off_person_pace_never_waits_but_bulk_still_does() {
+    let limiter = steady();
+    call(&limiter, KeyLane::BuiltIn, LookupClass::Bulk).await;
+    call(&limiter, KeyLane::BuiltIn, LookupClass::Heart).await;
+    // At the starting gap the next heart waits its 2 s.
+    let start = Instant::now();
+    call(&limiter, KeyLane::BuiltIn, LookupClass::Heart).await;
+    assert_eq!(Instant::now() - start, AcoustIdRateLimiter::PERSON_GAP);
+    // One busy answer doubles the person gap.
+    let turn = limiter
+        .permit(KeyLane::BuiltIn, LookupClass::Heart, true)
+        .await
+        .expect("a turn");
+    turn.end(CallEnd::Busy(BusyKind::Outage));
+    assert!(limiter.backing_off(KeyLane::BuiltIn, LookupClass::Heart));
+    for class in [LookupClass::Heart, LookupClass::Person, LookupClass::Family] {
+        let start = Instant::now();
+        assert!(
+            limiter.permit(KeyLane::BuiltIn, class, true).await.is_none(),
+            "{class:?}"
+        );
+        assert_eq!(Instant::now(), start, "{class:?} waited");
+    }
+    assert!(!limiter.backing_off(KeyLane::BuiltIn, LookupClass::Bulk));
+    let bulk = limiter
+        .permit(KeyLane::BuiltIn, LookupClass::Bulk, true)
+        .now_or_never();
+    assert!(bulk.is_none(), "bulk work queues for its turn");
+}
+
+/// Work run only if a turn is free is refused at once when none is, and says it was turned away;
+/// work that found its turn says nothing.
+#[tokio::test(start_paused = true)]
+async fn work_run_only_if_free_says_when_it_was_turned_away() {
+    let limiter = steady();
+    let (first, turned_away) = AcoustIdRateLimiter::if_free(async {
+        limiter
+            .permit(KeyLane::BuiltIn, LookupClass::Bulk, true)
+            .await
+            .map(|turn| turn.end(CallEnd::Answered))
+    })
+    .await;
+    assert!(first.is_some());
+    assert!(!turned_away);
+    let start = Instant::now();
+    let (second, turned_away) = AcoustIdRateLimiter::if_free(async {
+        limiter
+            .permit(KeyLane::BuiltIn, LookupClass::Bulk, true)
+            .await
+            .is_some()
+    })
+    .await;
+    assert!(!second);
+    assert!(turned_away);
+    assert_eq!(Instant::now(), start);
 }
 
 /// The random spread is a quarter either way.

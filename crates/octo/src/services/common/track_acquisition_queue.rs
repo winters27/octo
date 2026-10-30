@@ -40,6 +40,90 @@ pub struct AcquisitionHeld {
     pub users: Vec<String>,
 }
 
+/// What one heart's or play's gate said of the file its acquisition kept or held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// The file is what this person heard.
+    Accepted,
+    /// The gate holds for this.
+    Held(WaitingFor),
+    /// The file is not provably what they heard: refused, or undecided, and why.
+    NotAccepted(String),
+}
+
+/// The gates' verdicts on the file one acquisition ended with, by person and origin. Shared by
+/// everyone who waits on the acquisition, so each one reads their own gate's verdict.
+#[derive(Clone, Default)]
+pub struct GateLedger(Arc<Mutex<Vec<(String, AcquisitionOrigin, GateOutcome)>>>);
+
+impl GateLedger {
+    /// Records one gate's verdict, a later one for the same person and origin replacing it.
+    pub fn record(&self, user: &str, origin: AcquisitionOrigin, outcome: GateOutcome) {
+        let user = user.trim();
+        let mut entries = self.0.lock();
+        match entries
+            .iter_mut()
+            .find(|(who, from, _)| *from == origin && eq_ignore_case(who, user))
+        {
+            Some(entry) => entry.2 = outcome,
+            None => entries.push((user.to_string(), origin, outcome)),
+        }
+    }
+
+    /// What `user`'s gate of `origin` said, when it judged the file.
+    pub fn outcome_for(&self, user: &str, origin: AcquisitionOrigin) -> Option<GateOutcome> {
+        self.0
+            .lock()
+            .iter()
+            .find(|(who, from, _)| *from == origin && eq_ignore_case(who, user.trim()))
+            .map(|(_, _, outcome)| outcome.clone())
+    }
+
+    /// Whether a gate accepted the file for `user`.
+    pub fn accepted(&self, user: &str) -> bool {
+        self.0
+            .lock()
+            .iter()
+            .any(|(who, _, outcome)| *outcome == GateOutcome::Accepted && eq_ignore_case(who, user.trim()))
+    }
+
+    /// Whether any gate judged the file: none did when the acquisition ran the shipped checks.
+    pub fn is_empty(&self) -> bool {
+        self.0.lock().is_empty()
+    }
+
+    /// Forgets every verdict, for a file that is not kept after all.
+    pub fn clear(&self) {
+        self.0.lock().clear();
+    }
+}
+
+/// A ledger is where verdicts are written, never part of what a place asks for, so any two
+/// compare equal.
+impl PartialEq for GateLedger {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for GateLedger {}
+
+impl std::fmt::Debug for GateLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.lock().iter()).finish()
+    }
+}
+
+/// The key an acquisition of a track runs under: `provider:id`, and `:flac` for a request that
+/// wants only a real FLAC copy.
+pub fn acquisition_key(provider: &str, external_id: &str, flac_only: bool) -> String {
+    if flac_only {
+        format!("{provider}:{external_id}:flac")
+    } else {
+        format!("{provider}:{external_id}")
+    }
+}
+
 /// A one-shot completion: completed once, by the worker or by a drop, and awaited by everyone
 /// who joined the request. Waiters are woken as tasks of their own, so completing this never
 /// runs a waiting request's continuation (response headers, body writes, the client's whole
@@ -47,17 +131,24 @@ pub struct AcquisitionHeld {
 #[derive(Clone)]
 pub struct Completion {
     outcome: Arc<watch::Sender<Option<AcquisitionOutcome>>>,
+    ledger: GateLedger,
 }
 
 impl Default for Completion {
     fn default() -> Self {
         Completion {
             outcome: Arc::new(watch::Sender::new(None)),
+            ledger: GateLedger::default(),
         }
     }
 }
 
 impl Completion {
+    /// What each gate said of the file the acquisition ended with.
+    pub fn ledger(&self) -> &GateLedger {
+        &self.ledger
+    }
+
     /// Completes with the file's path; false when it had already completed.
     pub fn try_set_result(&self, path: impl Into<String>) -> bool {
         self.try_set(Ok(path.into()))
@@ -130,6 +221,8 @@ pub struct AcquisitionPlace {
     pub gates: Vec<HeartGate>,
     /// The files a resumed hold held in the one hold path, which the download checks first.
     pub held_files: Vec<String>,
+    /// Where each gate's verdict on the file is written, for everyone who waits on it.
+    pub ledger: GateLedger,
 }
 
 /// One queued request to fetch a permanent copy of a track.
@@ -176,8 +269,22 @@ pub struct AcquisitionRequest {
     gates: Mutex<Vec<HeartGate>>,
     /// The files a resumed hold held, which the download checks before any source.
     held_files: Mutex<Vec<String>>,
+    /// Hearts and plays that joined with a gate of their own: their library, their name and their
+    /// claim on the outcome are recorded only once their own gate passes the landed file.
+    joiners: Mutex<Vec<GatedJoiner>>,
 
     pub completion: Completion,
+}
+
+/// A heart or play that joined a request in flight with its own gate, waiting for that gate's
+/// verdict on the landed file.
+#[derive(Debug, Clone)]
+struct GatedJoiner {
+    users: Vec<String>,
+    requested_by: Option<String>,
+    target: AcquisitionTarget,
+    /// A heart joining a play: it owns the outcome once its gate passes.
+    heart: Option<bool>,
 }
 
 impl AcquisitionRequest {
@@ -211,7 +318,52 @@ impl AcquisitionRequest {
             origin: None,
             gates: Mutex::new(Vec::new()),
             held_files: Mutex::new(Vec::new()),
+            joiners: Mutex::new(Vec::new()),
             completion: Completion::default(),
+        }
+    }
+
+    /// A heart or play joining with its own gates: its library, its name and (for a heart joining
+    /// a play) its claim on the outcome wait for its own gate's verdict on the landed file.
+    fn join_gated(
+        &self,
+        gates: &[HeartGate],
+        requested_by: Option<&str>,
+        target: &AcquisitionTarget,
+        heart: Option<bool>,
+    ) {
+        for gate in gates {
+            self.add_gate(gate.clone());
+        }
+        self.joiners.lock().push(GatedJoiner {
+            users: gates.iter().map(|gate| gate.user.trim().to_string()).collect(),
+            requested_by: requested_by.map(str::to_string),
+            target: target.clone(),
+            heart,
+        });
+    }
+
+    /// The file landed: every gated joiner whose own gate passed it is recorded now, with its
+    /// library, its name and its claim; one its gate did not pass gets none of them. When no gate
+    /// judged the file at all (the shipped checks ran), every joiner is recorded as before.
+    pub(crate) fn settle_joiners(&self) {
+        let joiners = std::mem::take(&mut *self.joiners.lock());
+        let ledger = self.completion.ledger();
+        let judged = !ledger.is_empty();
+        for joiner in joiners {
+            if judged && !joiner.users.iter().any(|user| ledger.accepted(user)) {
+                debug!(
+                    "{} joined {} and its own gate did not pass the file; no link and no attribution",
+                    joiner.users.join(", "),
+                    self.key()
+                );
+                continue;
+            }
+            self.add_requester(joiner.requested_by.as_deref());
+            self.add_target(&joiner.target);
+            if let Some(notify) = joiner.heart {
+                self.join_heart(notify);
+            }
         }
     }
 
@@ -299,6 +451,7 @@ impl AcquisitionRequest {
             origin: self.origin,
             gates: self.gates(),
             held_files: self.held_files.lock().clone(),
+            ledger: self.completion.ledger().clone(),
         }
     }
 
@@ -356,11 +509,7 @@ impl AcquisitionRequest {
     /// `provider:id`, whoever it is for: a second member joins the download in flight. A
     /// request for a real FLAC copy is its own job.
     pub fn key(&self) -> String {
-        if self.flac_only {
-            format!("{}:{}:flac", self.provider, self.external_id)
-        } else {
-            format!("{}:{}", self.provider, self.external_id)
-        }
+        acquisition_key(&self.provider, &self.external_id, self.flac_only)
     }
 }
 
@@ -370,6 +519,9 @@ pub(crate) type OnSkippedPlay = Arc<dyn Fn() + Send + Sync>;
 
 /// Whether stars take turns per person now.
 pub type FairTurns = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Holds a wake until AcoustID's lane gives a turn again: the AcoustID client's `hold_lookup`.
+pub type TurnWaiter = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 
 struct Receivers {
     stars: mpsc::Receiver<Arc<AcquisitionRequest>>,
@@ -460,6 +612,9 @@ pub struct TrackAcquisitionQueue {
     /// Whether stars take turns per person (while Family is on); otherwise first in, first out.
     fair_turns: FairTurns,
 
+    /// Wakes work whose file waits for AcoustID's bulk turn, once the lane gives turns again.
+    turns: Mutex<Option<TurnWaiter>>,
+
     #[cfg(test)]
     on_skipped_play: Mutex<Option<OnSkippedPlay>>,
 }
@@ -492,9 +647,27 @@ impl TrackAcquisitionQueue {
             waiting_plays: AtomicI32::new(0),
             waiting_stars: AtomicUsize::new(0),
             fair_turns: Arc::new(|| false),
+            turns: Mutex::new(None),
             #[cfg(test)]
             on_skipped_play: Mutex::new(None),
         }
+    }
+
+    /// Wakes work whose file waits for AcoustID's bulk turn through `turns`.
+    pub fn use_turns(&self, turns: TurnWaiter) {
+        *self.turns.lock() = Some(turns);
+    }
+
+    /// Waits until AcoustID's lane gives turns again; false at once when nothing can say so.
+    pub async fn wait_for_turn(&self) -> bool {
+        let Some(turns) = self.turns.lock().clone() else {
+            return false;
+        };
+        let (woken, wait) = tokio::sync::oneshot::channel::<()>();
+        turns(Box::new(move || {
+            let _ = woken.send(());
+        }));
+        wait.await.is_ok()
     }
 
     /// Stars take turns per person while `fair` says so (Family on); otherwise they keep the
@@ -696,19 +869,23 @@ impl TrackAcquisitionQueue {
             // Already queued or running. Join it rather than fetching the same file twice,
             // and record this caller on the request that is actually going to run, so the
             // file is attributed to everyone who asked and not just to whoever was first.
-            existing.add_requester(requested_by);
-            existing.add_target(target);
-            for gate in gates {
-                existing.add_gate(gate);
+            // A heart for a track a play already asked for. The source cannot change any more, but
+            // the failure is now someone's explicit ask, and the heart chain still owns its fallback.
+            let heart = (is_star && !existing.is_star).then_some(notify_on_failure);
+            if gates.is_empty() {
+                existing.add_requester(requested_by);
+                existing.add_target(target);
+                if let Some(notify) = heart {
+                    existing.join_heart(notify);
+                }
+            } else {
+                // A heart or play with its own gate counts the file as its own only once that gate
+                // passes it.
+                existing.join_gated(&gates, requested_by, target, heart);
             }
             existing.add_held_files(&held_files);
             if upgrade_search {
                 existing.ask_for_upgrade_search();
-            }
-            // A heart for a track a play already asked for. The source cannot change any more, but
-            // the failure is now someone's explicit ask, and the heart chain still owns its fallback.
-            if is_star && !existing.is_star {
-                existing.join_heart(notify_on_failure);
             }
             return existing.completion.clone();
         }
@@ -804,11 +981,7 @@ impl TrackAcquisitionQueue {
         // Already wanted: ride along, whatever is waiting.
         let known = self.in_flight.lock().get(&request.key()).cloned();
         if let Some(known) = known {
-            known.add_requester(requested_by);
-            known.add_target(target);
-            for gate in gates {
-                known.add_gate(gate);
-            }
+            join_play(&known, &gates, requested_by, target);
             return Some(known);
         }
         // The waiting slot is taken BEFORE the key is claimed. Claiming first and letting go on a
@@ -843,11 +1016,7 @@ impl TrackAcquisitionQueue {
         };
         if let Some(existing) = existing {
             self.waiting_plays.fetch_sub(1, Ordering::SeqCst);
-            existing.add_requester(requested_by);
-            existing.add_target(target);
-            for gate in gates {
-                existing.add_gate(gate);
-            }
+            join_play(&existing, &gates, requested_by, target);
             return Some(existing);
         }
         if let Some(on_queued) = on_queued {
@@ -921,6 +1090,22 @@ impl TrackAcquisitionQueue {
 
 fn queue_full() -> anyhow::Error {
     anyhow::anyhow!("Acquisition queue is full; try again shortly.")
+}
+
+/// A play riding along on a request in flight: with a gate of its own, its library and name wait
+/// for that gate's verdict; without one, they are recorded at once.
+fn join_play(
+    request: &AcquisitionRequest,
+    gates: &[HeartGate],
+    requested_by: Option<&str>,
+    target: &AcquisitionTarget,
+) {
+    if gates.is_empty() {
+        request.add_requester(requested_by);
+        request.add_target(target);
+    } else {
+        request.join_gated(gates, requested_by, target, None);
+    }
 }
 
 #[cfg(test)]

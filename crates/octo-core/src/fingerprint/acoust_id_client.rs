@@ -183,6 +183,9 @@ pub struct AcoustIdLookup {
     pub is_ok: bool,
     pub error: Option<String>,
     pub results: Vec<AcoustIdResult>,
+    /// The same answer read whole ([`parse_answer`]), every result and recording with no cut, when
+    /// its status was `ok`: what the heart gate's reading takes.
+    pub answer: Option<AcoustIdAnswer>,
 }
 
 impl AcoustIdLookup {
@@ -191,6 +194,7 @@ impl AcoustIdLookup {
             is_ok,
             error: error.map(str::to_string),
             results,
+            answer: None,
         }
     }
 }
@@ -380,6 +384,7 @@ pub fn parse_lookup(root: &Value) -> ElementResult<AcoustIdLookup> {
             is_ok: false,
             error: Some(message.unwrap_or_else(|| "unknown error".to_string())),
             results: Vec::new(),
+            answer: None,
         });
     }
 
@@ -403,6 +408,7 @@ pub fn parse_lookup(root: &Value) -> ElementResult<AcoustIdLookup> {
         is_ok: true,
         error: None,
         results,
+        answer: parse_answer(root).ok().and_then(Result::ok),
     })
 }
 

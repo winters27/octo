@@ -137,6 +137,12 @@ impl AcquisitionWorker {
         }
         .unwrap_or_else(|_| Err(anyhow::anyhow!("the acquisition panicked")));
 
+        // Hearts and plays that joined with a gate of their own count the file only when that
+        // gate passed it.
+        if attempt.is_ok() {
+            request.settle_joiners();
+        }
+
         // Members who joined while it ran get their link too, a file the shared library came to
         // want moves there, and a member who cannot see the shared library a file landed in
         // gets a pool copy of it.

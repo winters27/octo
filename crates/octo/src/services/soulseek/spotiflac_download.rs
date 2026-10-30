@@ -418,62 +418,55 @@ impl SoulseekDownloadService {
             )));
         }
 
-        let song = &mut download.song;
-        let mut verdict = self
-            .verification
-            .verify(
-                path,
-                routing.artist.as_deref(),
-                routing.title.as_deref(),
-                song.isrc.as_deref().or(routing.isrc.as_deref()),
-                &self.verification.takes_for_routing(routing),
-            )
-            .await;
-        if verdict.verdict == VerificationVerdict::Mismatch && file_exists(path) {
-            let file_ms = TagFile::open(path)
-                .ok()
-                .map(|file| file.duration().as_millis() as i64);
-            verdict =
-                DownloadVerificationService::settle_stray_link(verdict, &title, routing.duration, file_ms);
-        }
-        if verdict.verdict == VerificationVerdict::Mismatch {
-            warn!(
-                "Mornye brought {} for '{artist} - {title}' (AcoustID score {}); discarding it",
-                verdict.describe(),
-                percent(verdict.score)
-            );
-            discard_rejected_download(path, started_utc);
-            base.log_step_heard(
-                &track_key,
-                acquisition_event_kinds::CHECK,
-                &mismatch_text(&verdict),
-                Some(
-                    if verdict.kind.is_some_and(|kind| kind != RecordingKind::Studio) {
-                        "Not the take asked for; thrown away"
-                    } else {
-                        "Not the song asked for; thrown away"
-                    },
-                ),
-                verdict.heard(),
-            );
-            return Err(file_not_found(format!(
-                "AcoustID identified Mornye's file as {}",
-                verdict.describe()
-            )));
-        }
+        // A heart's or a play's file is judged by each asker's own gate; every other download keeps
+        // the shipped checks (AcoustID, then the song's YouTube preview).
         let length_known = routing.duration.is_some_and(|s| s > 0) && actual_secs > 0;
         let verdict = match self
-            .refused_by_preview(base, routing, &track_key, path, verdict, length_known)
+            .judge_file(base, routing, download, path, None, length_known)
             .await
         {
-            PreviewSays::Keep(kept) => kept,
-            PreviewSays::Refuse(reason) => {
+            FileJudged::Keep(verdict) => verdict,
+            FileJudged::Hold(held) => {
+                info!("Mornye's file for '{artist} - {title}' waits: {}", held.line);
+                return Err(held.into());
+            }
+            FileJudged::NotProven(why) => {
+                info!("Mornye's file for the play of '{artist} - {title}' is not kept: {why}");
                 discard_rejected_download(path, started_utc);
+                return Err(not_proven());
+            }
+            FileJudged::Refuse { reason, shared, verdict } => {
+                discard_rejected_download(path, started_utc);
+                if shared && verdict.verdict == VerificationVerdict::Mismatch {
+                    warn!(
+                        "Mornye brought {} for '{artist} - {title}' (AcoustID score {}); discarding it",
+                        verdict.describe(),
+                        percent(verdict.score)
+                    );
+                    base.log_step_heard(
+                        &track_key,
+                        acquisition_event_kinds::CHECK,
+                        &mismatch_text(&verdict),
+                        Some(
+                            if verdict.kind.is_some_and(|kind| kind != RecordingKind::Studio) {
+                                "Not the take asked for; thrown away"
+                            } else {
+                                "Not the song asked for; thrown away"
+                            },
+                        ),
+                        verdict.heard(),
+                    );
+                    return Err(file_not_found(format!(
+                        "AcoustID identified Mornye's file as {}",
+                        verdict.describe()
+                    )));
+                }
                 return Err(file_not_found(format!(
                     "Mornye's file for '{artist} - {title}' {reason}"
                 )));
             }
         };
+        let song = &mut download.song;
 
         let spectrum = self
             .verification
