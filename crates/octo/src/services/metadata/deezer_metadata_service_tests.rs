@@ -6,11 +6,12 @@
 
 use octo_core::settings::{AppSettings, ExplicitFilter, MetadataSettings, SubsonicSettings};
 use tracing::Level;
-use wiremock::MockServer;
+use wiremock::matchers::path;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 use crate::services::metadata::deezer_rate_limiter::DeezerRateLimiter;
-use crate::services::test_support::{LogCapture, Matching, Routes, received};
+use crate::services::test_support::{LogCapture, Matching, Routes, received, refused_address};
 
 struct Harness {
     service: DeezerMetadataService,
@@ -1416,4 +1417,398 @@ fn a_hit_of_a_far_length_is_another_recording_when_both_lengths_are_known() {
     assert_eq!(ids(Some(338)), [2, 3]);
     assert_eq!(ids(None), [1, 2, 3]);
     assert_eq!(ids(Some(0)), [1, 2, 3]);
+}
+
+// ---- The clip check's and the heart's lookups ---------------------------------------------
+
+/// Yesterday as `track/<id>` and `track/isrc:<CODE>` answer it, cut to a few fields.
+const YESTERDAY_TRACK: &str = r#"{"id":116348164,"readable":true,"title":"Yesterday (Remastered 2009)",
+    "title_short":"Yesterday","isrc":"GBAYE0601477","duration":123,"track_position":13,"disk_number":1,
+    "preview":"https://cdnt-preview.dzcdn.net/api/1/1/4/f/b/0/4fb0ce16.mp3?hdnea=exp=1792886716~hmac=cdec16e3",
+    "artist":{"id":1,"name":"The Beatles"},"album":{"id":12047952,"title":"Help! (Remastered)"}}"#;
+
+fn yesterday() -> DeezerTrack {
+    DeezerTrack {
+        id: "116348164".into(),
+        title: "Yesterday (Remastered 2009)".into(),
+        artist: "The Beatles".into(),
+        duration_seconds: Some(123),
+        isrc: Some("GBAYE0601477".into()),
+        clip_url: Some(
+            "https://cdnt-preview.dzcdn.net/api/1/1/4/f/b/0/4fb0ce16.mp3?hdnea=exp=1792886716~hmac=cdec16e3"
+                .into(),
+        ),
+    }
+}
+
+const HELP_ALBUM: &str = r#"{"id":12047952,"title":"Help! (Remastered)","upc":"094638241256",
+    "record_type":"album","nb_tracks":14,"artist":{"name":"The Beatles"}}"#;
+
+const HELP_TRACKS: &str = r#"{"total":2,"data":[
+    {"id":116348150,"title":"Help! (Remastered 2009)","isrc":"GBAYE0601467","duration":138,
+     "track_position":1,"disk_number":1,"explicit_lyrics":false,"explicit_content_lyrics":0},
+    {"id":116348164,"title":"Yesterday (Remastered 2009)","isrc":"GBAYE0601477","duration":123,
+     "track_position":13,"disk_number":1,"explicit_lyrics":false,"explicit_content_lyrics":0}
+]}"#;
+
+const ONE_MORE_TIME_HIT: &str = r#"{"data":[{"id":3135556,"title":"One More Time","duration":320,
+    "artist":{"id":27,"name":"Daft Punk"},"album":{"id":302127,"title":"Discovery"}}]}"#;
+
+const ONE_MORE_TIME_TRACK: &str = r#"{"id":3135556,"title":"One More Time","duration":320,
+    "isrc":"GBDUW0000053","preview":"https://cdnt-preview.dzcdn.net/api/1/1/a/b/c/0/abc.mp3?hdnea=exp=1~hmac=x",
+    "artist":{"id":27,"name":"Daft Punk"},"album":{"id":302127,"title":"Discovery"}}"#;
+
+/// Every request's path after the base, with its query, as it was sent.
+async fn asked(server: &MockServer) -> Vec<String> {
+    received(server)
+        .await
+        .iter()
+        .map(|r| match r.url.query() {
+            Some(query) => format!("{}?{query}", &r.url.path()[1..]),
+            None => r.url.path()[1..].to_string(),
+        })
+        .collect()
+}
+
+/// A service asking `base` in place of api.deezer.com, unmetered.
+fn service_on(base: String) -> DeezerMetadataService {
+    DeezerMetadataService::with_base_url(
+        Arc::new(DeezerRateLimitHandler::new(Arc::new(DeezerRateLimiter::new()))),
+        Arc::new(SettingsStore::for_tests(AppSettings::default())),
+        base,
+    )
+}
+
+/// The clip check's questions and the heart's album questions are asked byte for byte as the
+/// heart's builders write them, and the heart's album search is `find_album_id`'s own question.
+#[tokio::test]
+async fn the_clip_checks_and_the_hearts_questions_are_asked_byte_for_byte() {
+    // Every request 404s: only the questions are looked at here.
+    let h = Harness::new(vec![]).await;
+    assert_eq!(h.service.clip_track("116348164").await, DeezerAsked::Busy);
+    assert_eq!(
+        h.service.clip_track_by_isrc("gb-aye-06-01477").await,
+        DeezerAsked::Busy
+    );
+    assert_eq!(h.service.album_rows("12047952", false).await, DeezerAsked::Busy);
+    assert_eq!(
+        h.service.album_search_hits("The Beatles", "Help!", false).await,
+        DeezerAsked::Busy
+    );
+    assert_eq!(h.service.find_album_id("The Beatles", "Help!").await, None);
+
+    let search = deezer_album_search_url("The Beatles", "Help!").expect("an album search");
+    assert_eq!(search, "search/album?q=The%20Beatles%20Help%21&limit=5");
+    let mut expected = vec![
+        "track/116348164".to_string(),
+        "track/isrc:GBAYE0601477".to_string(),
+        deezer_album_url("12047952"),
+        deezer_album_tracks_url("12047952"),
+        search.clone(),
+        search,
+    ];
+    expected.sort();
+    let mut questions = asked(&h.server).await;
+    questions.sort();
+    assert_eq!(questions, expected);
+}
+
+/// A track answer gives its id, title, artist, length, ISRC and clip URL, and is asked afresh
+/// every time: the clip's URL is signed and soon runs out.
+#[tokio::test]
+async fn a_track_reads_its_clip_and_is_asked_afresh_every_time() {
+    let h = Harness::new(vec![
+        ("/track/isrc:GBAYE0601477", YESTERDAY_TRACK),
+        ("/track/116348164", YESTERDAY_TRACK),
+        (
+            "/track/7",
+            r#"{"id":7,"title":"Song","duration":0,"preview":"","artist":{"name":"A"}}"#,
+        ),
+    ])
+    .await;
+    assert_eq!(
+        h.service.clip_track("116348164").await,
+        DeezerAsked::Answer(yesterday())
+    );
+    assert_eq!(
+        h.service.clip_track(" 116348164 ").await,
+        DeezerAsked::Answer(yesterday())
+    );
+    assert_eq!(
+        h.service.clip_track_by_isrc("GBAYE0601477").await,
+        DeezerAsked::Answer(yesterday())
+    );
+    assert_eq!(h.calls("/track/116348164"), 2);
+    // An empty clip URL and a zero length are unknown.
+    assert_eq!(
+        h.service.clip_track("7").await,
+        DeezerAsked::Answer(DeezerTrack {
+            id: "7".into(),
+            title: "Song".into(),
+            artist: "A".into(),
+            ..Default::default()
+        })
+    );
+    // Nothing to ask: nothing is asked.
+    assert_eq!(h.service.clip_track(" ").await, DeezerAsked::NoData);
+    assert_eq!(
+        h.service.clip_track_by_isrc("not a code").await,
+        DeezerAsked::NoData
+    );
+    assert_eq!(received(&h.server).await.len(), 4);
+}
+
+/// Deezer's own "no data" and an answer with nothing in it are no data; a refusal in any other
+/// words, a 429, a 5xx and a network error are busy, never no data.
+#[tokio::test]
+async fn a_track_lookup_keeps_busy_apart_from_no_data() {
+    let server = MockServer::start().await;
+    let answers = [
+        (
+            "/track/1",
+            ResponseTemplate::new(200).set_body_string(NO_DATA_ENVELOPE),
+        ),
+        ("/track/2", ResponseTemplate::new(200).set_body_string("{}")),
+        (
+            "/track/3",
+            ResponseTemplate::new(200).set_body_string(QUOTA_ENVELOPE),
+        ),
+        ("/track/4", ResponseTemplate::new(429)),
+        ("/track/5", ResponseTemplate::new(503)),
+        (
+            "/track/isrc:GBAYE0601477",
+            ResponseTemplate::new(200).set_body_string(NO_DATA_ENVELOPE),
+        ),
+    ];
+    for (route, answer) in answers {
+        Mock::given(path(route)).respond_with(answer).mount(&server).await;
+    }
+    let service = service_on(server.uri());
+    assert_eq!(service.clip_track("1").await, DeezerAsked::NoData);
+    assert_eq!(service.clip_track("2").await, DeezerAsked::NoData);
+    assert_eq!(service.clip_track("3").await, DeezerAsked::Busy);
+    assert_eq!(service.clip_track("4").await, DeezerAsked::Busy);
+    assert_eq!(service.clip_track("5").await, DeezerAsked::Busy);
+    assert_eq!(
+        service.clip_track_by_isrc("GBAYE0601477").await,
+        DeezerAsked::NoData
+    );
+    let unreachable = service_on(format!("http://{}", refused_address()));
+    assert_eq!(unreachable.clip_track("1").await, DeezerAsked::Busy);
+    assert_eq!(
+        unreachable.clip_track_by_isrc("GBAYE0601477").await,
+        DeezerAsked::Busy
+    );
+}
+
+/// The track search asks the full track lookup's own searches, then the track it found.
+#[tokio::test]
+async fn the_track_search_asks_the_full_lookups_own_searches_then_the_track() {
+    let routes = || {
+        vec![
+            ("/track/3135556", ONE_MORE_TIME_TRACK),
+            ("/search?", ONE_MORE_TIME_HIT),
+            ("/album/302127", ALBUM_DETAIL_JSON),
+        ]
+    };
+    let searched = Harness::new(routes()).await;
+    assert_eq!(
+        searched
+            .service
+            .clip_track_search("Daft Punk", "One More Time")
+            .await,
+        DeezerAsked::Answer(DeezerTrack {
+            id: "3135556".into(),
+            title: "One More Time".into(),
+            artist: "Daft Punk".into(),
+            duration_seconds: Some(320),
+            isrc: Some("GBDUW0000053".into()),
+            clip_url: Some(
+                "https://cdnt-preview.dzcdn.net/api/1/1/a/b/c/0/abc.mp3?hdnea=exp=1~hmac=x".into()
+            ),
+        })
+    );
+    let full = Harness::new(routes()).await;
+    let meta = full
+        .service
+        .enrich_track_full("Daft Punk", "One More Time")
+        .await
+        .expect("the full lookup finds it");
+    assert_eq!(meta.track_id.as_deref(), Some("3135556"));
+
+    let searches = |questions: &[String]| -> Vec<String> {
+        questions
+            .iter()
+            .filter(|question| question.starts_with("search"))
+            .cloned()
+            .collect()
+    };
+    let by_search = asked(&searched.server).await;
+    assert_eq!(searches(&by_search), searches(&asked(&full.server).await));
+    assert_eq!(by_search.last().map(String::as_str), Some("track/3135556"));
+}
+
+/// A search that did not answer is busy; one that finds the song nowhere is no data.
+#[tokio::test]
+async fn the_track_search_keeps_busy_apart_from_no_track() {
+    let busy = Harness::new(vec![("/search?", QUOTA_ENVELOPE)]).await;
+    assert_eq!(
+        busy.service.clip_track_search("Daft Punk", "One More Time").await,
+        DeezerAsked::Busy
+    );
+    let nowhere = Harness::new(vec![("/search", r#"{"data":[]}"#)]).await;
+    assert_eq!(
+        nowhere
+            .service
+            .clip_track_search("Daft Punk", "One More Time")
+            .await,
+        DeezerAsked::NoData
+    );
+    assert_eq!(
+        nowhere.service.clip_track_search(" ", "").await,
+        DeezerAsked::NoData
+    );
+}
+
+/// A catalog album comes back as the heart's rows, each track with its id.
+#[tokio::test]
+async fn a_catalog_album_carries_each_tracks_id() {
+    let h = Harness::new(vec![
+        ("/album/12047952/tracks", HELP_TRACKS),
+        ("/album/12047952", HELP_ALBUM),
+    ])
+    .await;
+    let DeezerAsked::Answer((album, tracks)) = h.service.album_rows("12047952", false).await else {
+        panic!("the album answers");
+    };
+    assert_eq!(
+        album,
+        CatalogAlbum {
+            id: "12047952".into(),
+            upc: "094638241256".into(),
+            record_type: "album".into(),
+            track_count: Some(14),
+        }
+    );
+    assert_eq!(
+        tracks
+            .iter()
+            .map(|t| (t.id.as_str(), t.disc, t.position, t.isrc.as_str(), t.seconds))
+            .collect::<Vec<_>>(),
+        [
+            ("116348150", Some(1), Some(1), "GBAYE0601467", 138),
+            ("116348164", Some(1), Some(13), "GBAYE0601477", 123),
+        ]
+    );
+}
+
+/// No such album, or one with no tracks, is no data; a tracklist that did not answer is busy.
+#[tokio::test]
+async fn a_catalog_album_keeps_busy_apart_from_no_album() {
+    let gone = Harness::new(vec![
+        ("/album/1/tracks", HELP_TRACKS),
+        ("/album/1", NO_DATA_ENVELOPE),
+    ])
+    .await;
+    assert_eq!(gone.service.album_rows("1", false).await, DeezerAsked::NoData);
+    let throttled = Harness::new(vec![
+        ("/album/1/tracks", QUOTA_ENVELOPE),
+        ("/album/1", HELP_ALBUM),
+    ])
+    .await;
+    assert_eq!(throttled.service.album_rows("1", false).await, DeezerAsked::Busy);
+    let empty = Harness::new(vec![
+        ("/album/1/tracks", r#"{"total":0,"data":[]}"#),
+        ("/album/1", HELP_ALBUM),
+    ])
+    .await;
+    assert_eq!(empty.service.album_rows("1", true).await, DeezerAsked::NoData);
+    assert_eq!(empty.service.album_rows(" ", false).await, DeezerAsked::NoData);
+}
+
+/// D2b's search gives its albums in search order; no album is no data, a refusal is busy, and a
+/// blank album title asks nothing.
+#[tokio::test]
+async fn the_album_search_reads_its_albums_in_order_and_keeps_busy_apart() {
+    let found = r#"{"data":[
+        {"id":12047952,"title":"Help! (Remastered)","artist":{"name":"The Beatles"}},
+        {"id":6157080,"title":"Help!","artist":{"name":"The Beatles"}}
+    ]}"#;
+    let h = Harness::new(vec![("/search/album", found)]).await;
+    assert_eq!(
+        h.service.album_search_hits("The Beatles", "Help!", false).await,
+        DeezerAsked::Answer(vec![
+            CatalogAlbumHit {
+                id: "12047952".into(),
+                title: "Help! (Remastered)".into(),
+                artist: "The Beatles".into(),
+            },
+            CatalogAlbumHit {
+                id: "6157080".into(),
+                title: "Help!".into(),
+                artist: "The Beatles".into(),
+            },
+        ])
+    );
+    assert_eq!(
+        h.service.album_search_hits("The Beatles", " ", false).await,
+        DeezerAsked::NoData
+    );
+    assert_eq!(h.calls("/search/album"), 1);
+    let none = Harness::new(vec![("/search/album", r#"{"data":[]}"#)]).await;
+    assert_eq!(
+        none.service.album_search_hits("The Beatles", "Help!", true).await,
+        DeezerAsked::NoData
+    );
+    let busy = Harness::new(vec![("/search/album", QUOTA_ENVELOPE)]).await;
+    assert_eq!(
+        busy.service
+            .album_search_hits("The Beatles", "Help!", false)
+            .await,
+        DeezerAsked::Busy
+    );
+}
+
+/// With the interactive window spent, the shipped `get` gives up while it waits for its permit;
+/// the clip check's lookup waits the permit out and still has its whole timeout for the call.
+#[tokio::test]
+async fn a_busy_queue_never_times_a_track_lookup_out() {
+    let server = MockServer::start().await;
+    Mock::given(path("/track/116348164"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(YESTERDAY_TRACK))
+        .mount(&server)
+        .await;
+    // The mock server is the API here, so every request is metered.
+    let http = Arc::new(
+        DeezerRateLimitHandler::with_api_host(Arc::new(DeezerRateLimiter::new()), "127.0.0.1")
+            .with_timeout(Duration::from_millis(500)),
+    );
+    let service = DeezerMetadataService::with_base_url(
+        Arc::clone(&http),
+        Arc::new(SettingsStore::for_tests(AppSettings::default())),
+        server.uri(),
+    );
+    // Every interactive permit spent at once: the next comes back with the window, about 5 s on.
+    for _ in 0..30 {
+        assert!(http.limiter().acquire(false).await.is_acquired());
+    }
+
+    let url = format!("{}/track/116348164", server.uri());
+    let error = http
+        .get(&url, false, None)
+        .await
+        .expect_err("the shipped call gives up inside the wait");
+    assert!(error.to_string().starts_with("No answer came within"), "{error}");
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        service.clip_track("116348164").await,
+        DeezerAsked::Answer(yesterday())
+    );
+    assert!(
+        started.elapsed() > Duration::from_millis(500),
+        "the lookup waited past its timeout for the permit: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(received(&server).await.len(), 1);
 }

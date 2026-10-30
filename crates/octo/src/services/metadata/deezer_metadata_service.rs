@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use octo_core::common::SongIdentity;
 use octo_core::common::dotnet::{self, escape_data_string, is_blank};
+use octo_core::fingerprint::heart_release::{
+    CatalogAlbum, CatalogAlbumHit, CatalogTrack, deezer_album_search_url, deezer_album_tracks_url,
+    deezer_album_url, read_album_search, read_catalog_album, read_catalog_tracks,
+};
 use octo_core::json::element::{
     ElementResult, array_length, enumerate_array, get_double, get_int32, get_int64, str_prop,
     try_get_property,
@@ -105,6 +109,16 @@ impl DeezerResponse {
             transient: true,
         }
     }
+
+    /// The call as the clip check and a heart's questions read it: a call that may succeed later
+    /// is Busy, Deezer's own "no data" is NoData, and a document is the answer.
+    fn asked(self) -> DeezerAsked<Value> {
+        match self {
+            DeezerResponse { transient: true, .. } => DeezerAsked::Busy,
+            DeezerResponse { doc: None, .. } => DeezerAsked::NoData,
+            DeezerResponse { doc: Some(doc), .. } => DeezerAsked::Answer(doc),
+        }
+    }
 }
 
 /// A call that never answered (its task ended early) is transient, never "nothing found".
@@ -112,6 +126,28 @@ impl Default for DeezerResponse {
     fn default() -> Self {
         Self::transient()
     }
+}
+
+/// How Deezer answered one of the clip check's or a heart's questions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeezerAsked<T> {
+    Answer(T),
+    /// Deezer's own "no data" (error code 800), or an answer with nothing in it.
+    NoData,
+    /// `transient`, a 429, the limiter's wait running out, a network error or a 5xx.
+    Busy,
+}
+
+/// One Deezer track as the clip check reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeezerTrack {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub duration_seconds: Option<i32>,
+    pub isrc: Option<String>,
+    /// The `preview` field: the signed, short-lived URL of the track's 30 s clip.
+    pub clip_url: Option<String>,
 }
 
 /// Enriches external (YouTube-resolved) tracks with real album/artist metadata
@@ -277,7 +313,7 @@ impl DeezerMetadataService {
             let (transient, found) = if first_query_only {
                 self.find_track_first_query(artist, title).await?
             } else {
-                self.find_track(artist, title, background).await?
+                self.find_track(artist, title, background, false).await?
             };
             if transient {
                 return anyhow::Ok(Flow::Return(None));
@@ -363,7 +399,7 @@ impl DeezerMetadataService {
         // a tagger with an album title and cover art beats one with nothing.
         let mut detail_unresolved = false;
         let attempt = async {
-            let (transient, found) = self.find_track(artist, title, false).await?;
+            let (transient, found) = self.find_track(artist, title, false, false).await?;
             if transient {
                 return anyhow::Ok(Flow::Return(None));
             }
@@ -1070,13 +1106,11 @@ impl DeezerMetadataService {
 
         let mut id = None;
         let attempt = async {
-            let q = escape_data_string(&plain_query(&[artist, album]));
-            let r = self
-                .get_json(
-                    &format!("{}/search/album?q={q}&limit={MATCH_CANDIDATES}", self.base()),
-                    false,
-                )
-                .await;
+            // The question a heart asks for its catalog album: one builder, so the two never part.
+            let Some(path) = deezer_album_search_url(artist, album) else {
+                return anyhow::Ok(Flow::Return(None));
+            };
+            let r = self.get_json(&format!("{}/{path}", self.base()), false).await;
             if r.transient {
                 return anyhow::Ok(Flow::Return(None));
             }
@@ -1461,23 +1495,160 @@ impl DeezerMetadataService {
         }
     }
 
+    /// One track by its catalog id (`track/<id>`), with the URL of its 30 s clip as Deezer gave
+    /// it. Asked on the interactive lane with its permit taken before the request's timer starts,
+    /// and never cached: the clip's URL is signed and soon runs out.
+    pub async fn clip_track(&self, id: &str) -> DeezerAsked<DeezerTrack> {
+        let id = id.trim();
+        if id.is_empty() {
+            return DeezerAsked::NoData;
+        }
+        let url = format!("{}/track/{}", self.base(), escape_data_string(id));
+        read_track(self.get_json_after_permit(&url, false).await.asked())
+    }
+
+    /// The track Deezer files under an ISRC (`track/isrc:<CODE>`), asked as [`Self::clip_track`]
+    /// is. NoData, without asking, for a value that is not an ISRC.
+    pub async fn clip_track_by_isrc(&self, isrc: &str) -> DeezerAsked<DeezerTrack> {
+        let Some(code) = SongIdentity::normalize_isrc(isrc) else {
+            return DeezerAsked::NoData;
+        };
+        let url = format!("{}/track/isrc:{code}", self.base());
+        read_track(self.get_json_after_permit(&url, false).await.asked())
+    }
+
+    /// The track [`Self::enrich_track_full`] finds for an artist and title, by its own searches,
+    /// then that track asked as [`Self::clip_track`] is. Every question takes its permit before
+    /// its timer starts. A search answer that cannot be read is NoData.
+    pub async fn clip_track_search(&self, artist: &str, title: &str) -> DeezerAsked<DeezerTrack> {
+        if is_blank(artist) && is_blank(title) {
+            return DeezerAsked::NoData;
+        }
+        let found = match self.find_track(artist, title, false, true).await {
+            Ok((true, _)) => return DeezerAsked::Busy,
+            Ok((false, found)) => found,
+            Err(e) => {
+                debug!("deezer clip track search '{artist} - {title}' could not be read: {e}");
+                return DeezerAsked::NoData;
+            }
+        };
+        match found.as_ref().map(|(hit, _)| number_id(hit)) {
+            Some(Ok(Some(id))) => self.clip_track(&id).await,
+            _ => DeezerAsked::NoData,
+        }
+    }
+
+    /// One catalog album as a heart's rows hold it: the album (`album/<id>`, with its barcode,
+    /// record type and track count) and its tracks (`album/<id>/tracks?limit=300`, each with its
+    /// id), the two asked at once, each with its permit taken before its timer starts. NoData
+    /// when Deezer has no such album or lists no tracks for it; Busy when either call did not
+    /// answer. Not cached here: the heart keeps its own rows.
+    pub async fn album_rows(
+        &self,
+        album_id: &str,
+        background: bool,
+    ) -> DeezerAsked<(CatalogAlbum, Vec<CatalogTrack>)> {
+        if is_blank(album_id) {
+            return DeezerAsked::NoData;
+        }
+        let album_url = format!("{}/{}", self.base(), deezer_album_url(album_id));
+        let tracks_url = format!("{}/{}", self.base(), deezer_album_tracks_url(album_id));
+        let (album, tracks) = tokio::join!(
+            self.get_json_after_permit(&album_url, background),
+            self.get_json_after_permit(&tracks_url, background)
+        );
+        let album = match album.asked() {
+            DeezerAsked::Answer(doc) => read_catalog_album(&doc),
+            DeezerAsked::NoData => None,
+            DeezerAsked::Busy => return DeezerAsked::Busy,
+        };
+        let Some(album) = album else {
+            return DeezerAsked::NoData;
+        };
+        match tracks.asked() {
+            DeezerAsked::Answer(doc) => {
+                // A tracklist Deezer cut short reads as an empty one, and a heart keeps the rows
+                // it finds for good: an album with no tracks is never an answer.
+                let tracks = read_catalog_tracks(&doc);
+                if tracks.is_empty() {
+                    DeezerAsked::NoData
+                } else {
+                    DeezerAsked::Answer((album, tracks))
+                }
+            }
+            DeezerAsked::NoData => DeezerAsked::NoData,
+            DeezerAsked::Busy => DeezerAsked::Busy,
+        }
+    }
+
+    /// The albums Deezer's album search finds for an artist and album title, in search order:
+    /// [`Self::find_album_id`]'s own question, asked with its permit taken before its timer
+    /// starts. NoData for a blank album title or a search that finds no album.
+    pub async fn album_search_hits(
+        &self,
+        artist: &str,
+        album: &str,
+        background: bool,
+    ) -> DeezerAsked<Vec<CatalogAlbumHit>> {
+        let Some(path) = deezer_album_search_url(artist, album) else {
+            return DeezerAsked::NoData;
+        };
+        let url = format!("{}/{path}", self.base());
+        match self.get_json_after_permit(&url, background).await.asked() {
+            DeezerAsked::Answer(doc) => {
+                let hits = read_album_search(&doc);
+                if hits.is_empty() {
+                    DeezerAsked::NoData
+                } else {
+                    DeezerAsked::Answer(hits)
+                }
+            }
+            DeezerAsked::NoData => DeezerAsked::NoData,
+            DeezerAsked::Busy => DeezerAsked::Busy,
+        }
+    }
+
     async fn get_json(&self, url: &str, background: bool) -> DeezerResponse {
+        self.call_json(url, background, false).await
+    }
+
+    /// [`Self::get_json`] with the permit taken before the request's timer starts, so a busy
+    /// queue is waited out, never read as a call that did not answer.
+    async fn get_json_after_permit(&self, url: &str, background: bool) -> DeezerResponse {
+        self.call_json(url, background, true).await
+    }
+
+    async fn call_json(&self, url: &str, background: bool, after_permit: bool) -> DeezerResponse {
         let this = self.clone();
         let address = url.to_string();
+        // A call that waits out the queue never joins one that may give up inside it.
+        let key = if after_permit {
+            format!("{background}|after-permit|{url}")
+        } else {
+            format!("{background}|{url}")
+        };
         self.inner
             .in_flight_calls
-            .run(&format!("{background}|{url}"), async move {
-                this.fetch_json(&address, background).await
+            .run(&key, async move {
+                this.fetch_json(&address, background, after_permit).await
             })
             .await
     }
 
-    async fn fetch_json(&self, url: &str, background: bool) -> DeezerResponse {
+    async fn fetch_json(&self, url: &str, background: bool, after_permit: bool) -> DeezerResponse {
         // Genre names in album payloads localize to the caller's IP country
         // unless this header pins them. Read per request, so a settings
         // change reaches the next lookup without a restart.
         let language = accept_language_header::header_value(&self.inner.settings.current().metadata);
-        let answer = match self.inner.http.get(url, background, language.as_deref()).await {
+        let asked = if after_permit {
+            self.inner
+                .http
+                .get_after_permit(url, background, language.as_deref())
+                .await
+        } else {
+            self.inner.http.get(url, background, language.as_deref()).await
+        };
+        let answer = match asked {
             Ok(answer) => answer,
             Err(e) => {
                 debug!("deezer request {url} failed: {e}");
@@ -1668,11 +1839,13 @@ impl DeezerMetadataService {
         }
     }
 
+    /// With `after_permit`, every question of the search takes its permit before its timer starts.
     async fn find_track(
         &self,
         artist: &str,
         title: &str,
         background: bool,
+        after_permit: bool,
     ) -> ElementResult<(bool, Option<(Value, Option<Value>)>)> {
         let mut artist_id = None;
         for variant in SongIdentity::query_variants(title, artist)
@@ -1684,7 +1857,7 @@ impl DeezerMetadataService {
                 self.base(),
                 escape_data_string(&variant.text())
             );
-            let r = self.get_json(&url, background).await;
+            let r = self.call_json(&url, background, after_permit).await;
             if r.transient {
                 return Ok((true, None));
             }
@@ -1696,8 +1869,9 @@ impl DeezerMetadataService {
             }
         }
 
-        let (transient, on_album, album_artist_id) =
-            self.find_track_on_album(artist, title, background).await?;
+        let (transient, on_album, album_artist_id) = self
+            .find_track_on_album(artist, title, background, after_permit)
+            .await?;
         if transient {
             return Ok((true, None));
         }
@@ -1713,7 +1887,7 @@ impl DeezerMetadataService {
             self.base(),
             escape_data_string(&artist_id)
         );
-        let r = self.get_json(&url, background).await;
+        let r = self.call_json(&url, background, after_permit).await;
         if r.transient {
             return Ok((true, None));
         }
@@ -1732,19 +1906,21 @@ impl DeezerMetadataService {
         artist: &str,
         title: &str,
         background: bool,
+        after_permit: bool,
     ) -> ElementResult<(bool, Option<(Value, Option<Value>)>, Option<String>)> {
         let query = plain_query(&[artist, title]);
         if query.is_empty() {
             return Ok((false, None, None));
         }
         let albums = self
-            .get_json(
+            .call_json(
                 &format!(
                     "{}/search/album?q={}&limit={MATCH_CANDIDATES}",
                     self.base(),
                     escape_data_string(&query)
                 ),
                 background,
+                after_permit,
             )
             .await;
         if albums.transient {
@@ -1760,12 +1936,13 @@ impl DeezerMetadataService {
         };
 
         let tracklist = self
-            .get_json(
+            .call_json(
                 &format!(
                     "{}/album/{album_id}/tracks?limit={ALBUM_TRACKS_LIMIT}",
                     self.base()
                 ),
                 background,
+                after_permit,
             )
             .await;
         if tracklist.transient {
@@ -1780,7 +1957,11 @@ impl DeezerMetadataService {
         };
 
         let detail = self
-            .get_json(&format!("{}/track/{track_id}", self.base()), background)
+            .call_json(
+                &format!("{}/track/{track_id}", self.base()),
+                background,
+                after_permit,
+            )
             .await;
         if detail.transient {
             return Ok((true, None, None));
@@ -2104,6 +2285,47 @@ fn number_id(element: &Value) -> ElementResult<Option<String>> {
     Ok(match try_get_property(element, "id")? {
         Some(id @ Value::Number(_)) => Some(get_int64(id)?.to_string()),
         _ => None,
+    })
+}
+
+/// A track answer as the clip check reads it: NoData when it names no track. Fields that are
+/// missing or of another kind are left empty rather than failing the answer.
+fn read_track(asked: DeezerAsked<Value>) -> DeezerAsked<DeezerTrack> {
+    let doc = match asked {
+        DeezerAsked::Answer(doc) => doc,
+        DeezerAsked::NoData => return DeezerAsked::NoData,
+        DeezerAsked::Busy => return DeezerAsked::Busy,
+    };
+    let text = |value: &Value, field: &str| {
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    let id = match doc.get("id") {
+        Some(Value::Number(id)) => id.as_i64().map(|id| id.to_string()).unwrap_or_default(),
+        Some(Value::String(id)) => id.trim().to_string(),
+        _ => String::new(),
+    };
+    if id.is_empty() {
+        return DeezerAsked::NoData;
+    }
+    DeezerAsked::Answer(DeezerTrack {
+        id,
+        title: text(&doc, "title").unwrap_or_default(),
+        artist: doc
+            .get("artist")
+            .and_then(|artist| text(artist, "name"))
+            .unwrap_or_default(),
+        duration_seconds: doc
+            .get("duration")
+            .and_then(Value::as_i64)
+            .and_then(|seconds| i32::try_from(seconds).ok())
+            .filter(|seconds| *seconds > 0),
+        isrc: text(&doc, "isrc").and_then(|code| SongIdentity::normalize_isrc(&code)),
+        clip_url: text(&doc, "preview"),
     })
 }
 
