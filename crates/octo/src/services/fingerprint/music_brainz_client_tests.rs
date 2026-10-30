@@ -1,9 +1,13 @@
-//! The MusicBrainz client: its cache and escaping. Reading release details and candidate
-//! sources is tested with the tagging code; the query builders are tested in
-//! `octo_core::fingerprint::music_brainz_client`.
+//! The MusicBrainz client: its cache, escaping and lanes, the heart lane's retries, the re-asker
+//! and a heart's questions. Reading release details and candidate sources is tested with the
+//! tagging code; the query builders and the pick are tested in `octo_core`.
 
+use std::path::{Path, PathBuf};
+
+use octo_core::fingerprint::heart_release::{RecordedAnswer, RecordedAnswers, VARIOUS_ARTISTS_ID};
+use tokio::sync::mpsc;
 use wiremock::matchers::{any, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 use super::*;
 
@@ -742,7 +746,7 @@ async fn each_kind_of_answer_is_read_and_only_a_refused_question_is_warned() {
             Asked::Answer(_) => "answer",
             Asked::NotKnown => "not known",
             Asked::Refused => "refused",
-            Asked::Busy => "busy",
+            Asked::Busy { .. } => "busy",
         };
         assert_eq!(kind, expected);
     }
@@ -818,4 +822,837 @@ async fn a_big_code_answer_keeps_25_releases_a_recording_and_drops_its_dj_mix_se
         CandidateSources::from_isrc_lookup(&doc),
         CandidateSources::from_isrc_lookup(&whole)
     );
+}
+
+// ---- the heart lane, the re-asker and a heart's questions -----------------------------------
+
+/// The gap the lane tests keep between calls, and their background step-back.
+const QUICK: Duration = Duration::from_millis(50);
+
+const YESTERDAY_CODE: &str = "GBAYE0601477";
+const YESTERDAY_CODE_LOOKUP: &str = "isrc/GBAYE0601477?inc=artist-credits&fmt=json";
+const YESTERDAY_1987: &str = "c05194a3-f6f0-4f52-b78a-13fb5580bc0f";
+const HELP_GROUP: &str = "0d44e1cb-c6e0-3453-8b68-4d2082f05421";
+const A_DOWNLOAD_CHECK: &str = "recording/11111111-1111-4111-8111-111111111111?inc=isrcs&fmt=json";
+
+/// A client on `server` with a short gap and step-back, so the lanes' turns take milliseconds.
+fn quick(server: &MockServer, timeout: Duration) -> MusicBrainzClient {
+    let base = Url::parse(&format!("{}/ws/2/", server.uri())).expect("parses");
+    MusicBrainzClient::with_base_url(base).with_pace(QUICK, timeout, QUICK)
+}
+
+fn heart_album(folder: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../octo-core/tests/fixtures/heart_album")
+        .join(folder)
+}
+
+fn recorded_folder(folder: &str) -> Arc<RecordedAnswers> {
+    Arc::new(RecordedAnswers::open(&heart_album(folder)).expect("the folder's urls.tsv reads"))
+}
+
+/// Yesterday's code lookup, as MusicBrainz answered it.
+fn yesterday_code() -> String {
+    std::fs::read_to_string(heart_album("rows/beatles-yesterday_a0/isrc-lookup.json"))
+        .expect("the recorded code lookup")
+}
+
+/// The question a request asked: its address after the base, with its query.
+fn question_of(request: &wiremock::Request) -> String {
+    let path = request.url.path();
+    let path = path.strip_prefix("/ws/2/").unwrap_or(path);
+    match request.url.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    }
+}
+
+async fn asked(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(question_of)
+        .collect()
+}
+
+/// Waits until the server has received `count` requests.
+async fn until_received(server: &MockServer, count: usize) {
+    for _ in 0..1000 {
+        if calls(server).await.len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the server never received {count} requests");
+}
+
+/// Serves recorded answers by their exact question: a 404 for one recorded as answered 404, a
+/// 500 for any question the folder never recorded.
+struct Recorded(Arc<RecordedAnswers>);
+
+impl Respond for Recorded {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        match self.0.get(&question_of(request)) {
+            Some(RecordedAnswer::Found(doc)) => ResponseTemplate::new(200).set_body_json(doc),
+            Some(RecordedAnswer::NotFound) => ResponseTemplate::new(404),
+            None => ResponseTemplate::new(500),
+        }
+    }
+}
+
+/// Deezer's side of a heart's questions, answered from the recorded Deezer answers: a question
+/// they do not hold fails the test.
+struct RecordedCatalog {
+    answers: RecordedAnswers,
+    asked: Mutex<usize>,
+}
+
+impl RecordedCatalog {
+    fn open() -> Arc<RecordedCatalog> {
+        Arc::new(RecordedCatalog {
+            answers: RecordedAnswers::open(&heart_album("deezer")).expect("the Deezer urls.tsv reads"),
+            asked: Mutex::new(0),
+        })
+    }
+
+    fn answer(&self, question: &str) -> Option<Value> {
+        match self.answers.answer(question) {
+            RecordedAnswer::Found(doc) => Some(doc),
+            RecordedAnswer::NotFound => None,
+        }
+    }
+
+    /// How many questions a heart asked it.
+    fn asked(&self) -> usize {
+        *self.asked.lock()
+    }
+}
+
+#[async_trait::async_trait]
+impl CatalogQuestions for RecordedCatalog {
+    async fn album_search(
+        &self,
+        artist: &str,
+        album: &str,
+        _lane: Lane,
+    ) -> DeezerAsked<Vec<CatalogAlbumHit>> {
+        *self.asked.lock() += 1;
+        match release::deezer_album_search_url(artist, album).and_then(|question| self.answer(&question)) {
+            Some(doc) => DeezerAsked::Answer(release::read_album_search(&doc)),
+            None => DeezerAsked::NoData,
+        }
+    }
+
+    async fn album(&self, album_id: &str, _lane: Lane) -> DeezerAsked<(CatalogAlbum, Vec<CatalogTrack>)> {
+        *self.asked.lock() += 1;
+        let album = self
+            .answer(&release::deezer_album_url(album_id))
+            .and_then(|doc| release::read_catalog_album(&doc));
+        let tracks = self
+            .answer(&release::deezer_album_tracks_url(album_id))
+            .map(|doc| release::read_catalog_tracks(&doc))
+            .unwrap_or_default();
+        match album {
+            Some(album) => DeezerAsked::Answer((album, tracks)),
+            None => DeezerAsked::NoData,
+        }
+    }
+}
+
+/// A wake that sends how a held question ended.
+fn wake_into(sender: &mpsc::UnboundedSender<ReAsked>) -> Box<dyn FnOnce(ReAsked) + Send> {
+    let sender = sender.clone();
+    Box::new(move |how: ReAsked| {
+        let _ = sender.send(how);
+    })
+}
+
+/// How a held question ended, within a few seconds.
+async fn ending(ended: &mut mpsc::UnboundedReceiver<ReAsked>) -> ReAsked {
+    tokio::time::timeout(Duration::from_secs(8), ended.recv())
+        .await
+        .expect("the held question ended in time")
+        .expect("an ending")
+}
+
+#[tokio::test]
+async fn yesterday_from_help_through_the_whole_sequence_gives_help() {
+    let answers = recorded_folder("rows/beatles-yesterday_a0");
+    let server = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(Recorded(Arc::clone(&answers)))
+        .mount(&server)
+        .await;
+    let catalog = RecordedCatalog::open();
+    let listing = catalog
+        .answer(&release::deezer_album_tracks_url("12047944"))
+        .map(|doc| release::read_catalog_tracks(&doc))
+        .unwrap_or_default();
+    let questions = HeartQuestions::new(
+        Arc::new(quick(&server, Duration::from_secs(5))),
+        catalog.clone(),
+        Lane::Heart,
+    );
+    let song = HeartSong {
+        artist: "The Beatles".into(),
+        title: "Yesterday (Remastered 2009)".into(),
+        album: "Help! (Remastered 2009)".into(),
+        disc: Some(1),
+        position: Some(13),
+        total_tracks: Some(14),
+        isrc: YESTERDAY_CODE.into(),
+        seconds: 123,
+        explicit: listing
+            .iter()
+            .find(|track| track.id == "116348366")
+            .and_then(|track| track.explicit),
+    };
+
+    let identity = questions
+        .identity(&song, Some("12047944"))
+        .await
+        .expect("answered");
+    let walk = questions.walk(&song, &identity).await.expect("answered");
+
+    assert_eq!(identity.listened_group.as_deref(), Some(HELP_GROUP));
+    assert_eq!(walk.first().map(String::as_str), Some(HELP_GROUP));
+    // Every recorded question was asked once, and nothing else.
+    let unasked: Vec<&str> = answers
+        .unasked()
+        .iter()
+        .map(|line| line.question.as_str())
+        .collect();
+    assert!(unasked.is_empty(), "{unasked:?}");
+    let sent = asked(&server).await;
+    assert_eq!(sent.len(), answers.questions().len(), "{sent:?}");
+
+    // Asked again, every answer comes from a heart's rows and the code's own entry.
+    let deezer_asked = catalog.asked();
+    assert_eq!(
+        questions.identity(&song, Some("12047944")).await,
+        Ok(identity.clone())
+    );
+    assert_eq!(questions.walk(&song, &identity).await, Ok(walk));
+    assert_eq!(asked(&server).await.len(), sent.len());
+    assert_eq!(catalog.asked(), deezer_asked);
+}
+
+#[tokio::test]
+async fn a_heart_question_answered_503_is_asked_again_and_answered() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(json_answer(yesterday_code()))
+        .mount(&server)
+        .await;
+    let client = quick(&server, Duration::from_secs(5));
+
+    let IsrcLookup::Found(doc) = client
+        .isrc_recordings_for_heart(YESTERDAY_CODE)
+        .await
+        .expect("no timeout")
+    else {
+        panic!("found");
+    };
+    assert_eq!(ids(&doc), [YESTERDAY_1987]);
+    assert_eq!(calls(&server).await.len(), 2);
+}
+
+#[tokio::test]
+async fn four_503s_are_busy_name_the_question_and_leave_nothing_kept() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(4)
+        .mount(&server)
+        .await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(json_answer(yesterday_code()))
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+    let questions = HeartQuestions::new(Arc::clone(&client), RecordedCatalog::open(), Lane::Heart);
+
+    assert_eq!(
+        questions.code_recordings(YESTERDAY_CODE).await,
+        Err(HeartBusy::MusicBrainz(YESTERDAY_CODE_LOOKUP.to_string()))
+    );
+    assert_eq!(calls(&server).await.len(), 4, "the question and three retries");
+    // Nothing was kept: the next ask goes to MusicBrainz, which answers now.
+    let IsrcLookup::Found(doc) = client
+        .isrc_recordings_for_heart(YESTERDAY_CODE)
+        .await
+        .expect("no timeout")
+    else {
+        panic!("found");
+    };
+    assert_eq!(ids(&doc), [YESTERDAY_1987]);
+    assert_eq!(calls(&server).await.len(), 5);
+}
+
+#[tokio::test]
+async fn a_retry_after_of_30_seconds_is_busy_at_once_and_the_re_asker_waits_for_it() {
+    let server = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "30"))
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        client
+            .isrc_recordings_for_heart(YESTERDAY_CODE)
+            .await
+            .expect("no timeout"),
+        IsrcLookup::Unanswered
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(calls(&server).await.len(), 1, "never asked again");
+    // While it runs, a heart's question is busy without being sent, and a held one waits.
+    assert_eq!(
+        client.current_recording(YESTERDAY_1987).await,
+        MusicBrainzFact::Busy
+    );
+    let (woke, mut ended) = mpsc::unbounded_channel();
+    client.re_ask(YESTERDAY_CODE_LOOKUP, wake_into(&woke));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(calls(&server).await.len(), 1);
+    assert!(ended.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn the_re_asker_waits_out_a_short_retry_after_and_hands_its_answer_on() {
+    let probe = recorded_folder("c4-probe");
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "1"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(json_answer(yesterday_code()))
+        .mount(&server)
+        .await;
+    Mock::given(any())
+        .respond_with(Recorded(Arc::clone(&probe)))
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+
+    let (woke, mut ended) = mpsc::unbounded_channel();
+    let started = std::time::Instant::now();
+    client.re_ask(YESTERDAY_CODE_LOOKUP, wake_into(&woke));
+    assert_eq!(ending(&mut ended).await, ReAsked::Answered);
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    // The held question's answer is the next ask's: nothing more is sent.
+    let before = calls(&server).await.len();
+    let IsrcLookup::Found(doc) = client
+        .isrc_recordings_for_heart(YESTERDAY_CODE)
+        .await
+        .expect("no timeout")
+    else {
+        panic!("found");
+    };
+    assert_eq!(ids(&doc), [YESTERDAY_1987]);
+    assert_eq!(calls(&server).await.len(), before);
+}
+
+#[tokio::test]
+async fn a_code_musicbrainz_does_not_know_gives_no_identity_and_no_retry() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/isrc/ZZZZZ0000001"))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_raw(recorded("isrc-not-found.json"), "application/json"),
+        )
+        .mount(&server)
+        .await;
+    let questions = HeartQuestions::new(
+        Arc::new(quick(&server, Duration::from_secs(5))),
+        RecordedCatalog::open(),
+        Lane::Heart,
+    );
+    let song = HeartSong {
+        artist: "The Beatles".into(),
+        title: "Yesterday".into(),
+        isrc: "ZZZZZ0000001".into(),
+        ..HeartSong::default()
+    };
+
+    let identity = questions
+        .identity(&song, None)
+        .await
+        .expect("answered, never busy");
+    assert!(identity.recordings.is_empty(), "{identity:?}");
+    assert_eq!(identity.listened_group, None);
+    assert_eq!(calls(&server).await.len(), 1, "a 404 is an answer");
+}
+
+#[tokio::test]
+async fn a_refused_code_question_is_refused_once_and_never_held() {
+    let server = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(400).set_body_raw(recorded("isrc-refused.json"), "application/json"),
+        )
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+
+    assert_eq!(
+        client
+            .isrc_recordings_for_heart("GBA077700130")
+            .await
+            .expect("no timeout"),
+        IsrcLookup::Refused
+    );
+    assert_eq!(
+        calls(&server).await.len(),
+        1,
+        "a refused question is not asked again"
+    );
+    let questions = HeartQuestions::new(Arc::clone(&client), RecordedCatalog::open(), Lane::Heart);
+    assert_eq!(questions.code_recordings("GBA077700130").await, Ok(Vec::new()));
+    assert_eq!(
+        client.isrc_songs_for_heart("GBA077700130").await,
+        MusicBrainzFact::NotKnown
+    );
+    assert_eq!(calls(&server).await.len(), 3);
+}
+
+#[tokio::test]
+async fn a_heart_and_an_import_asking_one_code_share_one_question() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(json_answer(yesterday_code()).set_delay(Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+    let import = crate::services::imports::import_matcher::isrc_recordings_from(Arc::clone(&client));
+
+    let heart = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.isrc_recordings_for_heart(YESTERDAY_CODE).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let imported = import(YESTERDAY_CODE.to_string()).await;
+    let hearted = heart.await.expect("the heart's task ends").expect("no timeout");
+
+    let IsrcLookup::Found(doc) = hearted else {
+        panic!("found");
+    };
+    assert_eq!(ids(&doc), [YESTERDAY_1987]);
+    let imported: Vec<String> = imported
+        .expect("answered")
+        .into_iter()
+        .map(|recording| recording.id)
+        .collect();
+    assert_eq!(imported, [YESTERDAY_1987]);
+    assert_eq!(calls(&server).await.len(), 1);
+}
+
+#[tokio::test]
+async fn the_tagger_and_the_matcher_keep_their_lanes_and_only_a_heart_asks_again() {
+    for (asker, sent) in [("tagger", 1), ("matcher", 1), ("heart", 4)] {
+        let server = MockServer::builder().start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let client = quick(&server, Duration::from_secs(5));
+        let lookup = match asker {
+            "tagger" => client.lookup_isrc("GBA077700130").await,
+            "matcher" => client.isrc_recordings_in_background("GBA077700130").await,
+            _ => client.isrc_recordings_for_heart("GBA077700130").await,
+        };
+        assert_eq!(lookup.expect("no timeout"), IsrcLookup::Unanswered, "{asker}");
+        assert_eq!(calls(&server).await.len(), sent, "{asker}");
+    }
+}
+
+#[tokio::test]
+async fn a_carriers_page_that_timed_out_is_asked_again_in_pages_of_25() {
+    let pages = recorded_folder("c4-timeout-retry");
+    let server = MockServer::builder().start().await;
+    Mock::given(query_param("limit", "100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{}")
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(any())
+        .respond_with(Recorded(Arc::clone(&pages)))
+        .mount(&server)
+        .await;
+    let questions = HeartQuestions::new(
+        Arc::new(quick(&server, Duration::from_millis(300))),
+        RecordedCatalog::open(),
+        Lane::Heart,
+    );
+
+    let carriers = questions.carriers(YESTERDAY_1987).await.expect("answered");
+
+    let whole_page = release::carriers_url(YESTERDAY_1987, 0, release::CARRIERS_PAGE).expect("an id");
+    let mut expected = vec![whole_page.clone()];
+    expected.extend(pages.questions().iter().map(|line| line.question.clone()));
+    assert_eq!(asked(&server).await, expected);
+    // The three pages of 25 hold the 66 releases the one page of 100 lists.
+    let row = RecordedAnswers::open(&heart_album("rows/beatles-yesterday_a0")).expect("the row reads");
+    let RecordedAnswer::Found(doc) = row.answer(&whole_page) else {
+        panic!("the page of 100 is recorded");
+    };
+    let mut wanted: Vec<String> = release::read_carrier_page(&doc)
+        .releases
+        .into_iter()
+        .map(|carrier| carrier.id)
+        .collect();
+    let mut got: Vec<String> = carriers
+        .releases
+        .iter()
+        .map(|carrier| carrier.id.clone())
+        .collect();
+    wanted.sort();
+    got.sort();
+    assert_eq!(got.len(), 66);
+    assert_eq!(got, wanted);
+}
+
+#[tokio::test]
+async fn an_always_failing_page_and_code_lookup_on_an_idle_client_end_after_three_failures() {
+    let probe = recorded_folder("c4-probe");
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/artist/89ad4ac3-39f7-470e-963a-56509c546377"))
+        .respond_with(Recorded(Arc::clone(&probe)))
+        .mount(&server)
+        .await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+    let page = release::carriers_url(YESTERDAY_1987, 0, release::CARRIERS_PAGE).expect("an id");
+
+    let (page_woke, mut page_ended) = mpsc::unbounded_channel();
+    let (code_woke, mut code_ended) = mpsc::unbounded_channel();
+    client.re_ask(&page, wake_into(&page_woke));
+    client.re_ask(YESTERDAY_CODE_LOOKUP, wake_into(&code_woke));
+    assert_eq!(ending(&mut page_ended).await, ReAsked::GaveUp);
+    assert_eq!(ending(&mut code_ended).await, ReAsked::GaveUp);
+
+    let sent = asked(&server).await;
+    assert_eq!(sent.iter().filter(|question| **question == page).count(), 3);
+    assert_eq!(
+        sent.iter()
+            .filter(|question| *question == YESTERDAY_CODE_LOOKUP)
+            .count(),
+        3
+    );
+    assert!(sent.iter().any(|question| question == PROBE), "{sent:?}");
+    // The walk then goes on without the page, and the identity without the code: asked once
+    // more, neither is sent.
+    let questions = HeartQuestions::new(Arc::clone(&client), RecordedCatalog::open(), Lane::Heart);
+    let carriers = questions.carriers(YESTERDAY_1987).await.expect("not busy");
+    assert!(carriers.releases.is_empty());
+    assert_eq!(questions.code_recordings(YESTERDAY_CODE).await, Ok(Vec::new()));
+    assert_eq!(asked(&server).await.len(), sent.len());
+}
+
+#[tokio::test]
+async fn the_probe_asks_musicbrainz_past_its_kept_rows_and_a_failed_probe_keeps_the_hold() {
+    let probe = recorded_folder("c4-probe");
+    let server = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(Recorded(Arc::clone(&probe)))
+        .up_to_n_times(2)
+        .mount(&server)
+        .await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+    // The probe's artist is kept both ways: the day-long artist entry and a heart's rows.
+    assert_eq!(
+        client
+            .artist_country(VARIOUS_ARTISTS_ID)
+            .await
+            .expect("no timeout"),
+        Some(String::new())
+    );
+    let questions = HeartQuestions::new(Arc::clone(&client), RecordedCatalog::open(), Lane::Heart);
+    assert_eq!(
+        questions.home_country(VARIOUS_ARTISTS_ID).await,
+        Ok(String::new())
+    );
+    assert_eq!(calls(&server).await.len(), 2);
+
+    // MusicBrainz now fails every question.
+    let (woke, mut ended) = mpsc::unbounded_channel();
+    client.re_ask(YESTERDAY_CODE_LOOKUP, wake_into(&woke));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let sent = asked(&server).await;
+    assert_eq!(
+        sent[2..],
+        [YESTERDAY_CODE_LOOKUP.to_string(), PROBE.to_string()],
+        "the probe went to MusicBrainz"
+    );
+    assert!(
+        ended.try_recv().is_err(),
+        "a failed probe keeps the question held"
+    );
+
+    // Once MusicBrainz answers another question, the held one is asked again and answered.
+    server.reset().await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(json_answer(yesterday_code()))
+        .mount(&server)
+        .await;
+    Mock::given(any())
+        .respond_with(json_answer(r#"{"isrcs": []}"#.to_string()))
+        .mount(&server)
+        .await;
+    client
+        .fetch_isrcs("11111111-1111-4111-8111-111111111111")
+        .await
+        .expect("no timeout");
+    assert_eq!(ending(&mut ended).await, ReAsked::Answered);
+}
+
+#[test]
+fn the_probe_is_the_recorded_various_artists_question() {
+    assert_eq!(
+        pure::artist_lookup_url(VARIOUS_ARTISTS_ID).as_deref(),
+        Some(PROBE)
+    );
+    let recorded = recorded_folder("c4-probe");
+    let questions: Vec<&str> = recorded
+        .questions()
+        .iter()
+        .map(|line| line.question.as_str())
+        .collect();
+    assert_eq!(questions, [PROBE]);
+}
+
+#[tokio::test]
+async fn the_gate_is_free_while_a_heart_question_is_out() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(json_answer(yesterday_code()).set_delay(Duration::from_millis(1500)))
+        .mount(&server)
+        .await;
+    Mock::given(any())
+        .respond_with(json_answer(r#"{"isrcs": []}"#.to_string()))
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+
+    let heart = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.isrc_recordings_for_heart(YESTERDAY_CODE).await })
+    };
+    until_received(&server, 1).await;
+    let started = std::time::Instant::now();
+    client
+        .fetch_isrcs("11111111-1111-4111-8111-111111111111")
+        .await
+        .expect("no timeout");
+    let waited = started.elapsed();
+
+    assert!(waited < Duration::from_millis(1000), "waited {waited:?}");
+    assert!(!heart.is_finished(), "the heart's question is still out");
+    let hearted = heart.await.expect("the heart's task ends").expect("no timeout");
+    assert!(matches!(hearted, IsrcLookup::Found(_)), "{hearted:?}");
+}
+
+#[tokio::test]
+async fn a_download_check_queued_during_a_hearts_retries_goes_first() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(json_answer(yesterday_code()))
+        .mount(&server)
+        .await;
+    Mock::given(any())
+        .respond_with(json_answer(r#"{"isrcs": []}"#.to_string()))
+        .mount(&server)
+        .await;
+    let base = Url::parse(&format!("{}/ws/2/", server.uri())).expect("parses");
+    let gap = Duration::from_millis(400);
+    let client = Arc::new(MusicBrainzClient::with_base_url(base).with_pace(gap, Duration::from_secs(5), gap));
+
+    let heart = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.isrc_recordings_for_heart(YESTERDAY_CODE).await })
+    };
+    until_received(&server, 1).await;
+    client
+        .fetch_isrcs("11111111-1111-4111-8111-111111111111")
+        .await
+        .expect("no timeout");
+    let hearted = heart.await.expect("the heart's task ends").expect("no timeout");
+
+    assert!(matches!(hearted, IsrcLookup::Found(_)), "{hearted:?}");
+    assert_eq!(
+        asked(&server).await,
+        [YESTERDAY_CODE_LOOKUP, A_DOWNLOAD_CHECK, YESTERDAY_CODE_LOOKUP]
+    );
+}
+
+#[tokio::test]
+async fn the_background_lane_steps_aside_while_a_heart_question_waits() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "1"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(json_answer(yesterday_code()))
+        .mount(&server)
+        .await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string(ROSALIA))
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+
+    let heart = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.isrc_recordings_for_heart(YESTERDAY_CODE).await })
+    };
+    until_received(&server, 1).await;
+    // The heart waits out MusicBrainz's second with the gate free; the background lane still
+    // waits for it.
+    let country = client.artist_country("a-rosalia").await.expect("no timeout");
+    let hearted = heart.await.expect("the heart's task ends").expect("no timeout");
+
+    assert_eq!(country.as_deref(), Some("ES"));
+    assert!(matches!(hearted, IsrcLookup::Found(_)), "{hearted:?}");
+    assert_eq!(
+        asked(&server).await,
+        [
+            YESTERDAY_CODE_LOOKUP,
+            YESTERDAY_CODE_LOOKUP,
+            "artist/a-rosalia?fmt=json"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_merged_recording_answers_with_the_one_it_became_and_is_kept() {
+    const MERGED: &str = "6a3e7d5c-0000-4000-8000-000000000001";
+    const GONE: &str = "6a3e7d5c-0000-4000-8000-000000000002";
+    const BUSY: &str = "6a3e7d5c-0000-4000-8000-000000000003";
+    let server = MockServer::builder().start().await;
+    Mock::given(path(format!("/ws/2/recording/{MERGED}")))
+        .respond_with(json_answer(format!(
+            r#"{{"id": "{YESTERDAY_1987}", "title": "Yesterday"}}"#
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(path(format!("/ws/2/recording/{GONE}")))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let client = quick(&server, Duration::from_secs(5));
+
+    assert_eq!(
+        client.current_recording(&MERGED.to_uppercase()).await,
+        MusicBrainzFact::Known(YESTERDAY_1987.to_string())
+    );
+    assert_eq!(
+        client.current_recording(MERGED).await,
+        MusicBrainzFact::Known(YESTERDAY_1987.to_string())
+    );
+    assert_eq!(client.current_recording(GONE).await, MusicBrainzFact::NotKnown);
+    assert_eq!(
+        client.current_recording("not-an-id").await,
+        MusicBrainzFact::NotKnown
+    );
+    assert_eq!(
+        asked(&server).await,
+        [
+            format!("recording/{MERGED}?fmt=json"),
+            format!("recording/{GONE}?fmt=json")
+        ]
+    );
+    assert_eq!(client.current_recording(BUSY).await, MusicBrainzFact::Busy);
+    assert_eq!(
+        calls(&server).await.len(),
+        6,
+        "a busy one is asked again three times"
+    );
+}
+
+#[tokio::test]
+async fn a_codes_recordings_read_as_answer_recordings() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/isrc/GBAYE0601477"))
+        .respond_with(json_answer(yesterday_code()))
+        .mount(&server)
+        .await;
+    let client = quick(&server, Duration::from_secs(5));
+
+    assert_eq!(
+        client.isrc_songs_for_heart("gb-aye-06-01477").await,
+        MusicBrainzFact::Known(vec![AnswerRecording {
+            id: YESTERDAY_1987.into(),
+            title: "Yesterday".into(),
+            artists: vec![AnswerArtist {
+                id: Some("b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d".into()),
+                name: "The Beatles".into(),
+            }],
+            duration_seconds: Some(125.666),
+            isrcs: vec![YESTERDAY_CODE.into()],
+            sources: 0,
+        }])
+    );
+}
+
+#[test]
+fn a_hearts_rows_keep_at_most_20000_rows_and_drop_the_least_recently_used() {
+    let mut rows = HeartRows::default();
+    rows.put("carriers|a".into(), HeartRow::Country("A".into()), 10_000);
+    rows.put("carriers|b".into(), HeartRow::Country("B".into()), 10_000);
+    assert!(rows.get("carriers|a").is_some());
+
+    rows.put("carriers|c".into(), HeartRow::Country("C".into()), 1);
+
+    assert!(
+        rows.get("carriers|b").is_none(),
+        "the least recently used goes first"
+    );
+    assert!(rows.get("carriers|a").is_some());
+    assert!(rows.get("carriers|c").is_some());
+    rows.put("carriers|d".into(), HeartRow::Country("D".into()), 20_001);
+    assert!(
+        rows.get("carriers|d").is_none(),
+        "an answer bigger than the cache is not kept"
+    );
+    assert_eq!(rows.rows, 10_001);
+    assert_eq!(HEART_ROWS_MAX, 20_000);
 }

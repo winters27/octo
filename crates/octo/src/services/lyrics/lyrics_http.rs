@@ -1,6 +1,7 @@
 //! What the lyrics sources share: their two named HTTP clients, URL escaping, the `Retry-After`
-//! delta, and the rules for reading an answer (a property of something that is not an object is a
-//! `ShapeError`, which the sources turn into a failed lookup).
+//! delta (the shared HTTP helpers' own), and the rules for reading an answer (a property of
+//! something that is not an object is a `ShapeError`, which the sources turn into a failed
+//! lookup).
 
 use std::time::Duration;
 
@@ -8,8 +9,9 @@ use base64::Engine;
 use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
-use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::Value;
+
+pub(crate) use crate::services::framework::http::retry_after_delta;
 
 /// The client LRCLIB, NetEase and lyrics.ovh share.
 pub const LYRICS_CLIENT_NAME: &str = "lyrics";
@@ -50,19 +52,6 @@ const DATA_STRING: &AsciiSet = &NON_ALPHANUMERIC
 
 pub(crate) fn escape_data_string(text: &str) -> String {
     utf8_percent_encode(text, DATA_STRING).to_string()
-}
-
-/// A `Retry-After` given in seconds. A date, or nothing readable, is None, and the caller's
-/// default cool-down applies.
-pub(crate) fn retry_after_delta(headers: &HeaderMap) -> Option<Duration> {
-    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    value
-        .parse::<i32>()
-        .ok()
-        .map(|seconds| Duration::from_secs(seconds as u64))
 }
 
 /// An integer, with white space either side and a leading sign allowed.
@@ -148,8 +137,6 @@ pub(crate) fn round_to_int(value: f64) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use reqwest::header::HeaderValue;
-
     use super::*;
 
     #[test]
@@ -160,19 +147,6 @@ mod tests {
         );
         assert_eq!(escape_data_string("a.b_c~d"), "a.b_c~d");
         assert_eq!(escape_data_string("宇多田"), "%E5%AE%87%E5%A4%9A%E7%94%B0");
-    }
-
-    #[test]
-    fn retry_after_is_read_only_in_seconds() {
-        let mut headers = HeaderMap::new();
-        assert_eq!(retry_after_delta(&headers), None);
-        headers.insert(RETRY_AFTER, HeaderValue::from_static("300"));
-        assert_eq!(retry_after_delta(&headers), Some(Duration::from_secs(300)));
-        headers.insert(
-            RETRY_AFTER,
-            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
-        );
-        assert_eq!(retry_after_delta(&headers), None);
     }
 
     #[test]

@@ -1,24 +1,37 @@
-//! The MusicBrainz client, its HTTP half: the one-a-second gate, the cache and the "musicbrainz"
-//! client (base address https://musicbrainz.org/ws/2/, a 10 s timeout, Octo's User-Agent). The
-//! query builders and the readers are in `octo_core::fingerprint::music_brainz_client`.
+//! The MusicBrainz client, its HTTP half: the one-a-second gate and its three lanes, the cache,
+//! the "musicbrainz" client (base address https://musicbrainz.org/ws/2/, a 10 s timeout, Octo's
+//! User-Agent), and the re-asker of the questions a heart holds for. The query builders and the
+//! readers are in `octo_core::fingerprint::music_brainz_client`.
+//!
+//! [`HeartQuestions`] asks a heart's questions of MusicBrainz and Deezer and keeps their answers
+//! as the compact rows `octo_core::fingerprint::heart_release` picks a release from.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use octo_core::common::{SongIdentity, dotnet, octo_user_agent};
+use octo_core::fingerprint::acoust_id_client::{AnswerArtist, AnswerRecording};
+use octo_core::fingerprint::heart_gate::MusicBrainzFact;
+use octo_core::fingerprint::heart_release::{
+    self as release, BarcodeRelease, Carriers, CatalogAlbum, CatalogAlbumHit, CatalogTrack, CodeRecording,
+    HeardIdentity, HeartSong,
+};
 use octo_core::fingerprint::music_brainz_client as pure;
 use octo_core::fingerprint::recording_identity::RecordingFacts;
 use octo_core::json::element::ElementError;
 use octo_core::tagging::{ReleaseDetails, ReleaseLookup};
 use parking_lot::Mutex;
 use serde_json::Value;
+use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 use url::Url;
 
 use crate::services::framework::http::{client_builder, parse_json, resolve};
 use crate::services::framework::{HttpAnswer, MemoryCache};
+use crate::services::metadata::deezer_metadata_service::{DeezerAsked, DeezerMetadataService};
 
 /// The client's errors, which callers catch.
 #[derive(Debug, thiserror::Error)]
@@ -40,7 +53,7 @@ enum Cached {
 }
 
 /// How MusicBrainz answered one question.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Asked {
     /// A 200 with a readable body.
     Answer(Value),
@@ -48,8 +61,9 @@ enum Asked {
     NotKnown,
     /// Any other 4xx but 429: MusicBrainz does not take the question as it was asked.
     Refused,
-    /// A 429, a 5xx, a body that could not be read, or no answer at all: worth asking again.
-    Busy,
+    /// A 429, a 5xx, a body that could not be read, or no answer at all: worth asking again, after
+    /// `retry_after` when MusicBrainz said how long to wait.
+    Busy { retry_after: Option<Duration> },
 }
 
 impl Asked {
@@ -57,8 +71,12 @@ impl Asked {
     fn found(self) -> Option<Value> {
         match self {
             Asked::Answer(doc) => Some(doc),
-            Asked::NotKnown | Asked::Refused | Asked::Busy => None,
+            Asked::NotKnown | Asked::Refused | Asked::Busy { .. } => None,
         }
+    }
+
+    fn is_busy(&self) -> bool {
+        matches!(self, Asked::Busy { .. })
     }
 }
 
@@ -79,6 +97,52 @@ pub enum IsrcLookup {
 /// The releases kept per recording of a code: the candidate reader takes no more.
 const MOST_RELEASES_PER_RECORDING: usize = 25;
 
+/// Which queue a MusicBrainz question waits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Lane {
+    /// A download being checked or a person waiting on the answer.
+    Foreground,
+    /// A heart's identity, its walk and its label lookups: after the gate is let go, in order,
+    /// alternating with download checks, ahead of Background, with retries.
+    Heart,
+    /// Work nobody waits on.
+    Background,
+}
+
+/// How a question held for MusicBrainz ended for the one who waited on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReAsked {
+    /// MusicBrainz answered it.
+    Answered,
+    /// It failed three times while MusicBrainz answered other questions: one MusicBrainz cannot
+    /// answer. Asked once more, it answers that nothing is known by it.
+    GaveUp,
+}
+
+/// How many times a heart's question is asked again after a busy answer or a timeout.
+const HEART_RETRIES: u32 = 3;
+
+/// The longest `Retry-After` a heart's question waits out before it asks again: four of the
+/// gate's turns. A longer one makes the question busy at once, and the re-asker waits it out.
+const LONGEST_HEART_WAIT: Duration = Duration::from_millis(4400);
+
+/// The longest `Retry-After` kept: MusicBrainz never asks for more, and a bigger number is junk.
+const LONGEST_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many times a held question may fail while MusicBrainz answers other questions before it
+/// is one MusicBrainz cannot answer.
+const HELD_FAILURES: u32 = 3;
+
+/// The question that tells whether MusicBrainz answers at all: the Various Artists artist, sent
+/// past every cache.
+const PROBE: &str = "artist/89ad4ac3-39f7-470e-963a-56509c546377?fmt=json";
+
+/// The most answers of held questions kept for the next ask of each.
+const SETTLED_MAX: usize = 64;
+
+/// The most compact rows a heart's answers are kept as, on every lane together.
+const HEART_ROWS_MAX: usize = 20_000;
+
 /// One question for MusicBrainz, asked only when a person keeps a track AcoustID had never heard
 /// of: which recording is this? That is the MusicBrainz id a confirmed fingerprint needs before
 /// AcoustID will take it (#47). And one more, asked only while verifying a download whose
@@ -92,11 +156,36 @@ const MOST_RELEASES_PER_RECORDING: usize = 25;
 pub struct MusicBrainzClient {
     client: reqwest::Client,
     base: Url,
-    /// One call at a time, and when the last one was made: held across the wait and the call. The
-    /// background lane only ever tries it (see [`Self::get_background`]).
+    /// One call at a time, and when the last one was made and on which lane. A download check
+    /// holds it across its wait and its call; a heart's question takes its turn and lets go before
+    /// it sends (see [`Self::heart_turn`]); the background lane only ever tries it (see
+    /// [`Self::get_background`]).
     gate: tokio::sync::Mutex<Option<LastCall>>,
+    /// The least time between two calls.
+    gap: Duration,
     /// How long the background lane waits when the gate is busy.
     background_backoff: Duration,
+    /// Heart questions ask one at a time, in the order they came, their retries included.
+    heart_line: tokio::sync::Mutex<()>,
+    /// Heart questions asking or waiting to: the background lane steps aside while there is one.
+    hearts_waiting: AtomicUsize,
+    /// When MusicBrainz's last `Retry-After` ends: heart questions and the re-asker send nothing
+    /// before it.
+    not_before: Mutex<Option<Instant>>,
+    /// How many definite answers MusicBrainz has given, on every lane: the re-asker reads from it
+    /// whether MusicBrainz answered other questions.
+    answers: watch::Sender<u64>,
+    /// The questions held until MusicBrainz answers them, oldest first.
+    held: Mutex<HeldQuestions>,
+    /// A question held again while the re-asker waits: it tries again at once.
+    nudge: Notify,
+    /// What held questions came to, each kept for the next ask of that question.
+    settled: Mutex<VecDeque<(String, Asked)>>,
+    /// Code lookups on their way, by cache key: a caller asking a code another caller is asking
+    /// waits for that answer.
+    code_flights: Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<CodeFlight>>>>>,
+    /// A heart's answers, as compact rows.
+    heart_rows: Mutex<HeartRows>,
     /// Release lookups are remembered a day, since an album's tracks ask for the same
     /// release one by one; searches six hours. Every entry counts as one, so the limit is a count.
     cache: MemoryCache<Cached>,
@@ -122,20 +211,40 @@ impl MusicBrainzClient {
 
     /// A client for another base address: a test's mock server.
     pub fn with_base_url(base: Url) -> Self {
-        let client = client_builder()
-            .timeout(Self::TIMEOUT)
-            .user_agent(octo_user_agent::value())
-            .build()
-            .expect("the MusicBrainz HTTP client builds");
         Self {
-            client,
+            client: http_client(Self::TIMEOUT),
             base,
             gate: tokio::sync::Mutex::new(None),
+            gap: Self::MINIMUM_GAP,
             background_backoff: Self::BACKGROUND_BACKOFF,
+            heart_line: tokio::sync::Mutex::new(()),
+            hearts_waiting: AtomicUsize::new(0),
+            not_before: Mutex::new(None),
+            answers: watch::Sender::new(0),
+            held: Mutex::new(HeldQuestions::default()),
+            nudge: Notify::new(),
+            settled: Mutex::new(VecDeque::new()),
+            code_flights: Mutex::new(HashMap::new()),
+            heart_rows: Mutex::new(HeartRows::default()),
             cache: MemoryCache::new(2000),
             artists: Mutex::new(HashMap::new()),
             credits: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The same client with its gap between calls, its request timeout and its background
+    /// step-back set, so a test of the lanes runs in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn with_pace(
+        mut self,
+        gap: Duration,
+        timeout: Duration,
+        background_backoff: Duration,
+    ) -> Self {
+        self.client = http_client(timeout);
+        self.gap = gap;
+        self.background_backoff = background_backoff;
+        self
     }
 
     /// One release in full: its label and catalog number, barcode, status, country, date, its
@@ -255,6 +364,19 @@ impl MusicBrainzClient {
     /// entered and lists each recording once. A DJ-mix segment is left out. Only a found answer
     /// is remembered.
     pub async fn isrc_recordings_in_background(&self, isrc: &str) -> Result<IsrcLookup, MusicBrainzError> {
+        self.code_recordings_on(isrc, Lane::Background).await
+    }
+
+    /// [`Self::isrc_recordings_in_background`] for a heart: the same question and the same
+    /// remembered answer, asked on the heart lane with its retries.
+    pub async fn isrc_recordings_for_heart(&self, isrc: &str) -> Result<IsrcLookup, MusicBrainzError> {
+        self.code_recordings_on(isrc, Lane::Heart).await
+    }
+
+    /// The code lookup on one lane. A caller asking a code another caller is already asking
+    /// waits for that answer and takes it, unless it was busy on a lane that does not ask again
+    /// while this one does.
+    async fn code_recordings_on(&self, isrc: &str, lane: Lane) -> Result<IsrcLookup, MusicBrainzError> {
         let Some(code) = SongIdentity::normalize_isrc(isrc) else {
             return Ok(IsrcLookup::NotKnown);
         };
@@ -262,12 +384,38 @@ impl MusicBrainzClient {
         if let Some(Cached::Json(cached)) = self.cache.get(&key) {
             return Ok(IsrcLookup::Found(cached));
         }
+        let flight = Arc::clone(self.code_flights.lock().entry(key.clone()).or_default());
+        let mut shared = flight.lock().await;
+        if let Some(Cached::Json(cached)) = self.cache.get(&key) {
+            return Ok(IsrcLookup::Found(cached));
+        }
+        if let Some(earlier) = shared.as_ref()
+            && earlier.settles(lane)
+        {
+            return earlier.answer.clone().ok_or(MusicBrainzError::TimedOut);
+        }
+        let answer = self.ask_code(&code, key.clone(), lane).await;
+        *shared = Some(CodeFlight {
+            lane,
+            answer: answer.as_ref().ok().cloned(),
+        });
+        let mut flights = self.code_flights.lock();
+        if flights
+            .get(&key)
+            .is_some_and(|running| Arc::ptr_eq(running, &flight))
+        {
+            flights.remove(&key);
+        }
+        answer
+    }
+
+    async fn ask_code(&self, code: &str, key: String, lane: Lane) -> Result<IsrcLookup, MusicBrainzError> {
         let lookup = format!("isrc/{code}?inc=artist-credits&fmt=json");
-        let recordings = match self.ask_on(&lookup, "code lookup", true).await? {
+        let recordings = match self.ask_on(&lookup, "code lookup", lane).await? {
             Asked::Answer(doc) => recordings_of(&doc, |_| true),
             Asked::NotKnown => Vec::new(),
             Asked::Refused => return Ok(IsrcLookup::Refused),
-            Asked::Busy => return Ok(IsrcLookup::Unanswered),
+            Asked::Busy { .. } => return Ok(IsrcLookup::Unanswered),
         };
         if recordings.is_empty() {
             return Ok(IsrcLookup::NotKnown);
@@ -276,6 +424,63 @@ impl MusicBrainzClient {
         self.cache
             .set(key, Cached::Json(doc.clone()), 1, Self::SEARCH_TTL);
         Ok(IsrcLookup::Found(doc))
+    }
+
+    /// The id MusicBrainz files one recording under now, asked on the heart lane: a merged-away
+    /// id answers with the recording it became. Not known for an id that is not a MusicBrainz id,
+    /// a 404 or a refused question; busy when MusicBrainz did not answer after the heart lane's
+    /// retries. Answers are kept as a heart's rows are.
+    pub async fn current_recording(&self, recording_id: &str) -> MusicBrainzFact<String> {
+        let id = recording_id.trim().to_lowercase();
+        if !pure::is_mbid(&id) {
+            return MusicBrainzFact::NotKnown;
+        }
+        let key = format!("recording|{id}");
+        let kept = self.heart_rows.lock().get(&key);
+        if let Some(HeartRow::Recording(current)) = kept {
+            return MusicBrainzFact::Known(current);
+        }
+        let question = format!("recording/{id}?fmt=json");
+        match self.ask_on(&question, "recording lookup", Lane::Heart).await {
+            Ok(Asked::Answer(doc)) => {
+                let current = doc
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|current| current.trim().to_lowercase())
+                    .filter(|current| pure::is_mbid(current));
+                match current {
+                    Some(current) => {
+                        self.heart_rows
+                            .lock()
+                            .put(key, HeartRow::Recording(current.clone()), 1);
+                        MusicBrainzFact::Known(current)
+                    }
+                    None => MusicBrainzFact::NotKnown,
+                }
+            }
+            Ok(Asked::NotKnown | Asked::Refused) => MusicBrainzFact::NotKnown,
+            Ok(Asked::Busy { .. }) | Err(_) => MusicBrainzFact::Busy,
+        }
+    }
+
+    /// The recordings MusicBrainz files under one code, as AcoustID's answers carry theirs: id,
+    /// title, artists with their ids, length in seconds and the code, with no submissions. What a
+    /// file's ISRC label names when AcoustID has no answer for the file; the same question and
+    /// remembered answer as [`Self::isrc_recordings_for_heart`].
+    pub async fn isrc_songs_for_heart(&self, isrc: &str) -> MusicBrainzFact<Vec<AnswerRecording>> {
+        let Some(code) = SongIdentity::normalize_isrc(isrc) else {
+            return MusicBrainzFact::NotKnown;
+        };
+        match self.isrc_recordings_for_heart(&code).await {
+            Ok(IsrcLookup::Found(doc)) => MusicBrainzFact::Known(
+                release::read_code_recordings(&doc)
+                    .into_iter()
+                    .map(|recording| answer_recording(recording, &code))
+                    .collect(),
+            ),
+            Ok(IsrcLookup::NotKnown | IsrcLookup::Refused) => MusicBrainzFact::NotKnown,
+            Ok(IsrcLookup::Unanswered) | Err(_) => MusicBrainzFact::Busy,
+        }
     }
 
     async fn code_search(&self, isrc: &str) -> Result<IsrcLookup, MusicBrainzError> {
@@ -291,7 +496,7 @@ impl MusicBrainzClient {
             Asked::Answer(doc) => recordings_of(&doc, |recording| carries(recording, &code)),
             Asked::NotKnown => Vec::new(),
             Asked::Refused => return Ok(IsrcLookup::Refused),
-            Asked::Busy => return Ok(IsrcLookup::Unanswered),
+            Asked::Busy { .. } => return Ok(IsrcLookup::Unanswered),
         };
         if recordings.is_empty() {
             return Ok(IsrcLookup::NotKnown);
@@ -498,9 +703,9 @@ impl MusicBrainzClient {
         self.credits.lock().get(&id.trim().to_lowercase()).cloned()
     }
 
-    /// One request, spaced at least [`Self::MINIMUM_GAP`] after the last. None on any
-    /// failure, which every caller reads as "MusicBrainz had nothing to say"; the timeout is
-    /// the one error that reaches the caller.
+    /// One request, spaced at least the gap after the last. None on any failure, which every
+    /// caller reads as "MusicBrainz had nothing to say"; the timeout is the one error that
+    /// reaches the caller.
     async fn get(&self, relative: &str, what: &str) -> Result<Option<Value>, MusicBrainzError> {
         Ok(self.ask(relative, what).await?.found())
     }
@@ -510,12 +715,18 @@ impl MusicBrainzClient {
         Ok(self.ask_background(relative, what).await?.found())
     }
 
-    /// [`Self::ask`] or [`Self::ask_background`].
-    async fn ask_on(&self, relative: &str, what: &str, background: bool) -> Result<Asked, MusicBrainzError> {
-        if background {
-            self.ask_background(relative, what).await
-        } else {
-            self.ask(relative, what).await
+    /// [`Self::ask`], [`Self::ask_heart`] or [`Self::ask_background`]. What a held question came
+    /// to is the answer of the next ask of it, on any lane.
+    async fn ask_on(&self, relative: &str, what: &str, lane: Lane) -> Result<Asked, MusicBrainzError> {
+        if lane == Lane::Heart {
+            return Ok(self.ask_heart(what, |_| relative.to_string()).await.0);
+        }
+        if let Some(settled) = self.take_settled(relative) {
+            return Ok(settled);
+        }
+        match lane {
+            Lane::Background => self.ask_background(relative, what).await,
+            Lane::Foreground | Lane::Heart => self.ask(relative, what).await,
         }
     }
 
@@ -523,43 +734,115 @@ impl MusicBrainzClient {
     async fn ask(&self, relative: &str, what: &str) -> Result<Asked, MusicBrainzError> {
         let mut last_call = self.gate.lock().await;
         if let Some(last) = *last_call {
-            let due = last.at + Self::MINIMUM_GAP;
+            let due = last.at + self.gap;
             if due > Instant::now() {
                 tokio::time::sleep_until(due).await;
             }
         }
         *last_call = Some(LastCall {
             at: Instant::now(),
-            background: false,
+            lane: Lane::Foreground,
         });
         self.send(relative, what).await
     }
 
+    /// One heart question, asked again after a busy answer or a timeout, at most
+    /// [`HEART_RETRIES`] times, each at the gate's next turn once MusicBrainz's `Retry-After` has
+    /// passed. A `Retry-After` longer than [`LONGEST_HEART_WAIT`] makes it busy at once, as does
+    /// one still running from an earlier answer. Heart questions ask one at a time, in the order
+    /// they came. `question(timed_out)` is what to send, `timed_out` true once an attempt has
+    /// timed out, so a carriers page can ask a smaller page; the bool returned says whether one
+    /// did.
+    async fn ask_heart(&self, what: &str, question: impl Fn(bool) -> String) -> (Asked, bool) {
+        let _waiting = HeartWaiting::new(&self.hearts_waiting);
+        let _line = self.heart_line.lock().await;
+        let mut timed_out = false;
+        let mut retries = 0;
+        loop {
+            let asking = question(timed_out);
+            if let Some(settled) = self.take_settled(&asking) {
+                return (settled, timed_out);
+            }
+            if let Some(left) = self.retry_after_left() {
+                if left > LONGEST_HEART_WAIT {
+                    return (
+                        Asked::Busy {
+                            retry_after: Some(left),
+                        },
+                        timed_out,
+                    );
+                }
+                tokio::time::sleep(left).await;
+            }
+            self.heart_turn().await;
+            let asked = match self.send(&asking, what).await {
+                Ok(asked) => asked,
+                // The one error `send` gives is its timeout.
+                Err(_) => {
+                    timed_out = true;
+                    Asked::Busy { retry_after: None }
+                }
+            };
+            let wait_too_long =
+                matches!(asked, Asked::Busy { retry_after: Some(wait) } if wait > LONGEST_HEART_WAIT);
+            if !asked.is_busy() || wait_too_long || retries == HEART_RETRIES {
+                return (asked, timed_out);
+            }
+            retries += 1;
+        }
+    }
+
+    /// A heart question's turn at the gate. It waits out the gap without holding the gate, so a
+    /// download check that comes meanwhile takes the next turn, then holds the gate for the rest
+    /// of its wait, so the turn after that is its own. It lets go before it sends.
+    async fn heart_turn(&self) {
+        let mut last_call = self.gate.lock().await;
+        if let Some(last) = *last_call
+            && last.at + self.gap > Instant::now()
+        {
+            let due = last.at + self.gap;
+            drop(last_call);
+            tokio::time::sleep_until(due).await;
+            last_call = self.gate.lock().await;
+            if let Some(last) = *last_call {
+                tokio::time::sleep_until(last.at + self.gap).await;
+            }
+        }
+        *last_call = Some(LastCall {
+            at: Instant::now(),
+            lane: Lane::Heart,
+        });
+    }
+
     /// One request on the background lane, for work nobody is waiting on. It never queues on
-    /// the gate: while the gate is held, or a call that is not its own went out less than
-    /// [`Self::MINIMUM_GAP`] ago, it steps back for [`Self::BACKGROUND_BACKOFF`] and tries
-    /// again, so a download being verified goes first. It takes its turn and lets go of the gate
-    /// before it sends, so a caller arriving meanwhile waits one gap at most.
+    /// the gate: while a heart question waits, while the gate is held, or while a call that is
+    /// not its own went out less than the gap ago, it steps back for the background step-back and
+    /// tries again, so a download being verified and a heart go first. It takes its turn and lets
+    /// go of the gate before it sends, so a caller arriving meanwhile waits one gap at most.
     async fn ask_background(&self, relative: &str, what: &str) -> Result<Asked, MusicBrainzError> {
         loop {
-            let wait = match self.gate.try_lock() {
-                Err(_) => self.background_backoff,
-                Ok(mut last_call) => {
-                    let now = Instant::now();
-                    match *last_call {
-                        Some(last) if last.at + Self::MINIMUM_GAP > now => {
-                            if last.background {
-                                last.at + Self::MINIMUM_GAP - now
-                            } else {
-                                self.background_backoff
+            let wait = if self.hearts_waiting.load(Ordering::Acquire) > 0 {
+                self.background_backoff
+            } else {
+                match self.gate.try_lock() {
+                    Err(_) => self.background_backoff,
+                    Ok(mut last_call) => {
+                        let now = Instant::now();
+                        match *last_call {
+                            Some(last) if last.at + self.gap > now => {
+                                if last.lane == Lane::Background {
+                                    last.at + self.gap - now
+                                } else {
+                                    self.background_backoff
+                                }
                             }
-                        }
-                        _ => {
-                            *last_call = Some(LastCall {
-                                at: now,
-                                background: true,
-                            });
-                            break;
+                            _ => {
+                                *last_call = Some(LastCall {
+                                    at: now,
+                                    lane: Lane::Background,
+                                });
+                                break;
+                            }
                         }
                     }
                 }
@@ -571,7 +854,8 @@ impl MusicBrainzClient {
 
     /// The request itself, once its turn has come, and how MusicBrainz answered it. A refused
     /// question is one MusicBrainz does not take as Octo asked it, so it is logged as a warning
-    /// naming the question.
+    /// naming the question. A busy answer's `Retry-After` is kept for the heart lane, and every
+    /// definite answer is counted for the re-asker.
     async fn send(&self, relative: &str, what: &str) -> Result<Asked, MusicBrainzError> {
         let attempt = async {
             let url = resolve(&self.base, relative)?;
@@ -586,29 +870,215 @@ impl MusicBrainzClient {
                 404 => Asked::NotKnown,
                 // An id that is not a MusicBrainz id, such as a junk tag: nothing is known by it.
                 400 if said.contains("Invalid mbid") || asks_by_a_non_mbid(relative) => Asked::NotKnown,
-                429 => Asked::Busy,
+                429 => self.busy(answer.retry_after),
                 400..=499 => {
                     warn!("MusicBrainz refused the {what} question {relative} ({status}): {said}");
                     Asked::Refused
                 }
                 _ => {
                     debug!("musicbrainz {what} answered {status}");
-                    Asked::Busy
+                    self.busy(answer.retry_after)
                 }
             })
         };
-        match attempt.await {
-            Ok(asked) => Ok(asked),
+        let asked = match attempt.await {
+            Ok(asked) => asked,
             Err(e)
                 if e.downcast_ref::<reqwest::Error>()
                     .is_some_and(reqwest::Error::is_timeout) =>
             {
-                Err(MusicBrainzError::TimedOut)
+                return Err(MusicBrainzError::TimedOut);
             }
             Err(e) => {
                 debug!("musicbrainz {what} failed: {e}");
-                Ok(Asked::Busy)
+                Asked::Busy { retry_after: None }
             }
+        };
+        if !asked.is_busy() {
+            self.answers.send_modify(|answers| *answers += 1);
+        }
+        Ok(asked)
+    }
+
+    /// A busy answer, keeping MusicBrainz's `Retry-After` (at most a day) as the time before
+    /// which heart questions and the re-asker send nothing.
+    fn busy(&self, retry_after: Option<Duration>) -> Asked {
+        if let Some(wait) = retry_after {
+            let until = Instant::now() + wait.min(LONGEST_RETRY_AFTER);
+            let mut not_before = self.not_before.lock();
+            if not_before.is_none_or(|known| known < until) {
+                *not_before = Some(until);
+            }
+        }
+        Asked::Busy { retry_after }
+    }
+
+    /// What is left of MusicBrainz's last `Retry-After`; None once it has passed.
+    fn retry_after_left(&self) -> Option<Duration> {
+        let until = (*self.not_before.lock())?;
+        let left = until.saturating_duration_since(Instant::now());
+        (!left.is_zero()).then_some(left)
+    }
+
+    /// What a held question came to, taken by the next ask of that question.
+    fn take_settled(&self, relative: &str) -> Option<Asked> {
+        let mut settled = self.settled.lock();
+        let at = settled.iter().position(|(question, _)| question == relative)?;
+        settled.remove(at).map(|(_, asked)| asked)
+    }
+
+    /// Keeps what a held question came to for the next ask of it, the oldest dropped past
+    /// [`SETTLED_MAX`].
+    fn settle(&self, relative: &str, asked: Asked) {
+        let mut settled = self.settled.lock();
+        settled.retain(|(question, _)| question != relative);
+        if settled.len() >= SETTLED_MAX {
+            settled.pop_front();
+        }
+        settled.push_back((relative.to_string(), asked));
+    }
+
+    /// Holds one question that answered busy until MusicBrainz answers it: asked again at the
+    /// heart lane's next turn, oldest first, once any `Retry-After` has passed, one entry per
+    /// question (another `wake` for a held question joins it and asks again at once). `wake`
+    /// runs once, on the re-asker's task, with how it ended: [`ReAsked::Answered`], whose answer
+    /// is then the next ask's of that question, or [`ReAsked::GaveUp`] after [`HELD_FAILURES`]
+    /// failures while MusicBrainz answered other questions. While MusicBrainz answers nothing at
+    /// all, no failure counts and the question waits.
+    pub fn re_ask(self: &Arc<Self>, relative: &str, wake: Box<dyn FnOnce(ReAsked) + Send>) {
+        let seen = *self.answers.borrow();
+        let start = {
+            let mut held = self.held.lock();
+            match held.queue.iter_mut().find(|waiting| waiting.question == relative) {
+                Some(waiting) => waiting.wakes.push(wake),
+                None => held.queue.push_back(HeldQuestion {
+                    question: relative.to_string(),
+                    wakes: vec![wake],
+                    failures: 0,
+                    seen,
+                }),
+            }
+            !std::mem::replace(&mut held.running, true)
+        };
+        if start {
+            let this = Arc::clone(self);
+            tokio::spawn(async move { this.re_ask_held().await });
+        } else {
+            self.nudge.notify_one();
+        }
+    }
+
+    /// The re-asker: asks the held questions again until none is left. A question that fails
+    /// while MusicBrainz answered other questions since it was last asked counts a failure and
+    /// goes behind the others; when nothing else was answered, [`PROBE`] tells whether MusicBrainz
+    /// answers at all, and its answer counts as another. When the probe fails too, MusicBrainz
+    /// answers nothing: the re-asker waits for its next answer to any question, a question held
+    /// again, or the end of a `Retry-After`.
+    async fn re_ask_held(self: Arc<Self>) {
+        let mut answers = self.answers.subscribe();
+        loop {
+            let first = {
+                let mut held = self.held.lock();
+                let first = held
+                    .queue
+                    .front()
+                    .map(|waiting| (waiting.question.clone(), waiting.seen));
+                if first.is_none() {
+                    held.running = false;
+                }
+                first
+            };
+            let Some((question, seen)) = first else {
+                return;
+            };
+            let asked = self.ask_held(&question).await;
+            if !asked.is_busy() {
+                self.settle(&question, asked);
+                self.end_held(&question, ReAsked::Answered);
+                continue;
+            }
+            let answered_since = *answers.borrow_and_update() > seen;
+            let musicbrainz_answers = answered_since || !self.ask_held(PROBE).await.is_busy();
+            let now_seen = *answers.borrow_and_update();
+            if musicbrainz_answers {
+                if self.count_failure(&question, now_seen) {
+                    self.settle(&question, Asked::NotKnown);
+                    self.end_held(&question, ReAsked::GaveUp);
+                }
+            } else {
+                self.mark_seen(&question, now_seen);
+                self.wait_for_work(&mut answers).await;
+            }
+        }
+    }
+
+    /// One attempt at a held question, or at the probe, on the heart lane once any `Retry-After`
+    /// has passed. It asks MusicBrainz itself: no cache and no kept answer stands in for it.
+    async fn ask_held(&self, question: &str) -> Asked {
+        if let Some(left) = self.retry_after_left() {
+            tokio::time::sleep(left).await;
+        }
+        let _waiting = HeartWaiting::new(&self.hearts_waiting);
+        let _line = self.heart_line.lock().await;
+        self.heart_turn().await;
+        self.send(question, "held question")
+            .await
+            .unwrap_or(Asked::Busy { retry_after: None })
+    }
+
+    /// Counts a failure of a held question and puts it behind the others; true when that was its
+    /// last.
+    fn count_failure(&self, question: &str, seen: u64) -> bool {
+        let mut held = self.held.lock();
+        let Some(at) = held.queue.iter().position(|waiting| waiting.question == question) else {
+            return false;
+        };
+        let Some(mut waiting) = held.queue.remove(at) else {
+            return false;
+        };
+        waiting.failures += 1;
+        waiting.seen = seen;
+        let last = waiting.failures >= HELD_FAILURES;
+        held.queue.push_back(waiting);
+        last
+    }
+
+    /// Notes how many answers MusicBrainz had given when a held question was last asked.
+    fn mark_seen(&self, question: &str, seen: u64) {
+        let mut held = self.held.lock();
+        if let Some(waiting) = held.queue.iter_mut().find(|waiting| waiting.question == question) {
+            waiting.seen = seen;
+        }
+    }
+
+    /// Ends a held question for everyone waiting on it.
+    fn end_held(&self, question: &str, ended: ReAsked) {
+        let wakes = {
+            let mut held = self.held.lock();
+            let at = held.queue.iter().position(|waiting| waiting.question == question);
+            at.and_then(|at| held.queue.remove(at))
+                .map(|waiting| waiting.wakes)
+                .unwrap_or_default()
+        };
+        for wake in wakes {
+            wake(ended);
+        }
+    }
+
+    /// Waits for MusicBrainz to answer any question, for a question held again, or for the end of
+    /// MusicBrainz's `Retry-After`.
+    async fn wait_for_work(&self, answers: &mut watch::Receiver<u64>) {
+        let left = self.retry_after_left();
+        let retry_after_ends = async move {
+            match left {
+                Some(left) => tokio::time::sleep(left).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = answers.changed() => {}
+            () = self.nudge.notified() => {}
+            () = retry_after_ends => {}
         }
     }
 }
@@ -682,11 +1152,93 @@ fn is_dj_mix_segment(recording: &Value) -> bool {
         })
 }
 
-/// When the last request went out, and whether the background lane sent it.
+/// When the last request went out, and on which lane.
 #[derive(Debug, Clone, Copy)]
 struct LastCall {
     at: Instant,
-    background: bool,
+    lane: Lane,
+}
+
+/// The "musicbrainz" HTTP client with its request timeout.
+fn http_client(timeout: Duration) -> reqwest::Client {
+    client_builder()
+        .timeout(timeout)
+        .user_agent(octo_user_agent::value())
+        .build()
+        .expect("the MusicBrainz HTTP client builds")
+}
+
+/// One recording of a code lookup as AcoustID's answers carry recordings.
+fn answer_recording(recording: CodeRecording, code: &str) -> AnswerRecording {
+    AnswerRecording {
+        id: recording.id,
+        title: recording.title,
+        artists: recording
+            .credits
+            .into_iter()
+            .map(|credit| AnswerArtist {
+                id: Some(credit.artist_id).filter(|id| !id.is_empty()),
+                name: if credit.name.is_empty() {
+                    credit.artist_name
+                } else {
+                    credit.name
+                },
+            })
+            .collect(),
+        duration_seconds: recording.length_ms.map(|ms| f64::from(ms) / 1000.0),
+        isrcs: vec![code.to_string()],
+        sources: 0,
+    }
+}
+
+/// Counts one heart question as waiting for as long as it lives.
+struct HeartWaiting<'a>(&'a AtomicUsize);
+
+impl<'a> HeartWaiting<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        HeartWaiting(count)
+    }
+}
+
+impl Drop for HeartWaiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// What the first of the callers asking one code came to, for the others waiting on it.
+#[derive(Debug)]
+struct CodeFlight {
+    lane: Lane,
+    /// None when it timed out.
+    answer: Option<IsrcLookup>,
+}
+
+impl CodeFlight {
+    /// Whether a caller on `lane` takes this answer as its own: a definite one always, a busy one
+    /// unless the caller's lane asks again and this one's did not.
+    fn settles(&self, lane: Lane) -> bool {
+        let busy = matches!(self.answer, None | Some(IsrcLookup::Unanswered));
+        !busy || lane != Lane::Heart || self.lane == Lane::Heart
+    }
+}
+
+/// One question held until MusicBrainz answers it.
+struct HeldQuestion {
+    question: String,
+    wakes: Vec<Box<dyn FnOnce(ReAsked) + Send>>,
+    /// Its failures while MusicBrainz answered other questions.
+    failures: u32,
+    /// How many answers MusicBrainz had given when it was last asked.
+    seen: u64,
+}
+
+/// The re-asker's questions, oldest first, and whether its task is running.
+#[derive(Default)]
+struct HeldQuestions {
+    queue: VecDeque<HeldQuestion>,
+    running: bool,
 }
 
 /// The music database calls the release identifier makes. A timeout is the error the
@@ -733,6 +1285,410 @@ fn make_room<K, V>(map: &mut HashMap<K, V>, adding: usize, max: usize) {
     if map.len() + adding > max {
         map.clear();
     }
+}
+
+/// One of a heart's answers, kept as compact rows.
+#[derive(Debug, Clone)]
+enum HeartRow {
+    /// `album|<deezer id>`: the album, and a row per track.
+    Album(CatalogAlbum, Vec<CatalogTrack>),
+    /// `barcode|<upc>`: each looked-up release, and a row per track.
+    Releases(Vec<BarcodeRelease>),
+    /// `carriers|<recording id>`: a row per carrier release.
+    Carriers(Carriers),
+    /// `artist|<id>`: where the artist is from.
+    Country(String),
+    /// `recording|<id>`: the id MusicBrainz files the recording under now.
+    Recording(String),
+}
+
+/// A heart's answers by key, the least recently used first out, at most [`HEART_ROWS_MAX`] rows
+/// in all, never expiring.
+#[derive(Default)]
+struct HeartRows {
+    /// Each answer, its rows and when it was last used.
+    entries: HashMap<String, (HeartRow, usize, u64)>,
+    /// The keys by when they were last used.
+    by_use: BTreeMap<u64, String>,
+    rows: usize,
+    clock: u64,
+}
+
+impl HeartRows {
+    fn get(&mut self, key: &str) -> Option<HeartRow> {
+        self.clock += 1;
+        let clock = self.clock;
+        let (row, _, used) = self.entries.get_mut(key)?;
+        self.by_use.remove(&*used);
+        *used = clock;
+        self.by_use.insert(clock, key.to_string());
+        Some(row.clone())
+    }
+
+    /// Keeps an answer of `size` rows, dropping the least recently used until it fits. An answer
+    /// bigger than the whole cache is not kept.
+    fn put(&mut self, key: String, row: HeartRow, size: usize) {
+        let size = size.max(1);
+        if size > HEART_ROWS_MAX {
+            return;
+        }
+        if let Some((_, old_size, used)) = self.entries.remove(&key) {
+            self.by_use.remove(&used);
+            self.rows -= old_size;
+        }
+        while self.rows + size > HEART_ROWS_MAX {
+            let Some((_, oldest)) = self.by_use.pop_first() else {
+                break;
+            };
+            if let Some((_, old_size, _)) = self.entries.remove(&oldest) {
+                self.rows -= old_size;
+            }
+        }
+        self.clock += 1;
+        self.by_use.insert(self.clock, key.clone());
+        self.entries.insert(key, (row, size, self.clock));
+        self.rows += size;
+    }
+}
+
+/// Which service did not answer one of a heart's questions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeartBusy {
+    /// MusicBrainz did not answer this question (its address relative to the base address): the
+    /// one a hold re-asks through [`MusicBrainzClient::re_ask`].
+    MusicBrainz(String),
+    /// Deezer did not answer.
+    Deezer,
+}
+
+/// Deezer's side of a heart's questions: its album search, and one album with its tracks, each
+/// on Deezer's background lane for [`Lane::Background`].
+#[async_trait::async_trait]
+pub trait CatalogQuestions: Send + Sync {
+    /// The albums Deezer's album search finds for an artist and an album title.
+    async fn album_search(&self, artist: &str, album: &str, lane: Lane) -> DeezerAsked<Vec<CatalogAlbumHit>>;
+    /// One album and its tracks.
+    async fn album(&self, album_id: &str, lane: Lane) -> DeezerAsked<(CatalogAlbum, Vec<CatalogTrack>)>;
+}
+
+#[async_trait::async_trait]
+impl CatalogQuestions for DeezerMetadataService {
+    async fn album_search(&self, artist: &str, album: &str, lane: Lane) -> DeezerAsked<Vec<CatalogAlbumHit>> {
+        self.album_search_hits(artist, album, lane == Lane::Background)
+            .await
+    }
+
+    async fn album(&self, album_id: &str, lane: Lane) -> DeezerAsked<(CatalogAlbum, Vec<CatalogTrack>)> {
+        self.album_rows(album_id, lane == Lane::Background).await
+    }
+}
+
+/// A heart's questions to MusicBrainz and Deezer on one lane, each answer read into the compact
+/// rows `octo_core::fingerprint::heart_release` picks from and kept as those rows: at most 20,000
+/// rows on every lane together, found answers only, the least recently used first out, never
+/// expiring. Cheap to make: each caller makes one on its own lane, and every one reads and fills
+/// the client's rows. A busy answer names the question to hold; a question MusicBrainz could not
+/// answer three times answers with what is known without it.
+pub struct HeartQuestions {
+    music_brainz: Arc<MusicBrainzClient>,
+    catalog: Arc<dyn CatalogQuestions>,
+    lane: Lane,
+}
+
+impl HeartQuestions {
+    pub fn new(music_brainz: Arc<MusicBrainzClient>, catalog: Arc<dyn CatalogQuestions>, lane: Lane) -> Self {
+        Self {
+            music_brainz,
+            catalog,
+            lane,
+        }
+    }
+
+    /// The lane its questions wait in.
+    pub fn lane(&self) -> Lane {
+        self.lane
+    }
+
+    /// The recordings MusicBrainz files under the song's ISRC: none when it is not an ISRC, when
+    /// MusicBrainz knows no recording by it, or refused the question. Kept as the code lookup's
+    /// own answer is.
+    pub async fn code_recordings(&self, isrc: &str) -> Result<Vec<CodeRecording>, HeartBusy> {
+        let Some(question) = release::isrc_lookup_url(isrc) else {
+            return Ok(Vec::new());
+        };
+        match self.music_brainz.code_recordings_on(isrc, self.lane).await {
+            Ok(IsrcLookup::Found(doc)) => Ok(release::read_code_recordings(&doc)),
+            Ok(IsrcLookup::NotKnown | IsrcLookup::Refused) => Ok(Vec::new()),
+            Ok(IsrcLookup::Unanswered) | Err(_) => Err(HeartBusy::MusicBrainz(question)),
+        }
+    }
+
+    /// One Deezer album and its tracks: None when Deezer has no such album.
+    pub async fn catalog_album(
+        &self,
+        album_id: &str,
+    ) -> Result<Option<(CatalogAlbum, Vec<CatalogTrack>)>, HeartBusy> {
+        let id = album_id.trim();
+        if id.is_empty() {
+            return Ok(None);
+        }
+        let key = format!("album|{id}");
+        if let Some(HeartRow::Album(album, tracks)) = self.kept(&key) {
+            return Ok(Some((album, tracks)));
+        }
+        match self.catalog.album(id, self.lane).await {
+            DeezerAsked::Answer((album, tracks)) => {
+                let size = 1 + tracks.len();
+                self.keep(key, HeartRow::Album(album.clone(), tracks.clone()), size);
+                Ok(Some((album, tracks)))
+            }
+            DeezerAsked::NoData => Ok(None),
+            DeezerAsked::Busy => Err(HeartBusy::Deezer),
+        }
+    }
+
+    /// The albums Deezer's album search finds for an artist and an album title: none for a blank
+    /// title.
+    pub async fn catalog_album_hits(
+        &self,
+        artist: &str,
+        album: &str,
+    ) -> Result<Vec<CatalogAlbumHit>, HeartBusy> {
+        if dotnet::is_blank(album) {
+            return Ok(Vec::new());
+        }
+        match self.catalog.album_search(artist, album, self.lane).await {
+            DeezerAsked::Answer(hits) => Ok(hits),
+            DeezerAsked::NoData => Ok(Vec::new()),
+            DeezerAsked::Busy => Err(HeartBusy::Deezer),
+        }
+    }
+
+    /// The releases a catalog album's UPC names, each looked up: of the barcode search's first
+    /// results, those whose barcode is the UPC as a number, and of their lookups those that name
+    /// the release asked.
+    pub async fn barcode_releases(&self, upc: &str) -> Result<Vec<BarcodeRelease>, HeartBusy> {
+        let upc = upc.trim();
+        let Some(search) = release::barcode_search_url(upc) else {
+            return Ok(Vec::new());
+        };
+        let key = format!("barcode|{upc}");
+        if let Some(HeartRow::Releases(releases)) = self.kept(&key) {
+            return Ok(releases);
+        }
+        let Asked::Answer(doc) = self.ask(&search, "barcode search").await? else {
+            return Ok(Vec::new());
+        };
+        let mut releases = Vec::new();
+        for id in release::releases_to_look_up(&release::read_barcode_hits(&doc), upc) {
+            let Some(lookup) = release::release_lookup_url(&id) else {
+                continue;
+            };
+            if let Asked::Answer(doc) = self.ask(&lookup, "release lookup").await?
+                && let Some(found) = release::read_barcode_release(&doc)
+                && found.id == id
+            {
+                releases.push(found);
+            }
+        }
+        if !releases.is_empty() {
+            let size = releases
+                .iter()
+                .map(|found| {
+                    1 + found
+                        .media
+                        .iter()
+                        .map(|medium| medium.tracks.len())
+                        .sum::<usize>()
+                })
+                .sum();
+            self.keep(key, HeartRow::Releases(releases.clone()), size);
+        }
+        Ok(releases)
+    }
+
+    /// Where the artist with this MusicBrainz id is from: "" when MusicBrainz names no country,
+    /// does not know the artist, or the id is blank.
+    pub async fn home_country(&self, artist_id: &str) -> Result<String, HeartBusy> {
+        let Some(question) = pure::artist_lookup_url(artist_id) else {
+            return Ok(String::new());
+        };
+        let key = artist_key(artist_id);
+        if let Some(HeartRow::Country(country)) = self.kept(&key) {
+            return Ok(country);
+        }
+        let Asked::Answer(doc) = self.ask(&question, "artist lookup").await? else {
+            return Ok(String::new());
+        };
+        let country = pure::artist_country(&doc);
+        self.keep(key, HeartRow::Country(country.clone()), 1);
+        Ok(country)
+    }
+
+    /// Every official release that carries one recording, its pages asked in order to the end.
+    /// On the heart lane a page that timed out is asked again in pages of
+    /// `CARRIERS_PAGE_AFTER_TIMEOUT` from the same offset, and the pages after it keep that size.
+    /// A page MusicBrainz could not answer is left out. Kept only when every page answered.
+    pub async fn carriers(&self, recording_id: &str) -> Result<Carriers, HeartBusy> {
+        let id = recording_id.trim();
+        let mut carriers = Carriers {
+            recording_id: id.to_string(),
+            releases: Vec::new(),
+        };
+        if !pure::is_mbid(id) {
+            return Ok(carriers);
+        }
+        let key = carriers_key(id);
+        if let Some(HeartRow::Carriers(kept)) = self.kept(&key) {
+            return Ok(kept);
+        }
+        let mut offset = 0;
+        let mut limit = release::CARRIERS_PAGE;
+        let mut release_count = None;
+        let mut whole = true;
+        loop {
+            let page = |limit: u32| release::carriers_url(id, offset, limit).unwrap_or_default();
+            let (asked, timed_out) = match self.lane {
+                Lane::Heart => {
+                    self.music_brainz
+                        .ask_heart("carriers page", |timed_out| {
+                            page(if timed_out {
+                                release::CARRIERS_PAGE_AFTER_TIMEOUT
+                            } else {
+                                limit
+                            })
+                        })
+                        .await
+                }
+                lane => {
+                    let asked = self
+                        .music_brainz
+                        .ask_on(&page(limit), "carriers page", lane)
+                        .await;
+                    (asked.unwrap_or(Asked::Busy { retry_after: None }), false)
+                }
+            };
+            if timed_out {
+                limit = release::CARRIERS_PAGE_AFTER_TIMEOUT;
+            }
+            match asked {
+                Asked::Answer(doc) => {
+                    let read = release::read_carrier_page(&doc);
+                    release_count = Some(read.release_count);
+                    let next = release::next_carrier_offset(offset, &read);
+                    carriers.releases.extend(read.releases);
+                    match next {
+                        Some(next) => offset = next,
+                        None => break,
+                    }
+                }
+                Asked::Busy { .. } => return Err(HeartBusy::MusicBrainz(page(limit))),
+                Asked::NotKnown | Asked::Refused => {
+                    whole = false;
+                    match release_count {
+                        Some(count) if offset + limit < count => offset += limit,
+                        _ => break,
+                    }
+                }
+            }
+        }
+        if whole && !carriers.releases.is_empty() {
+            let size = carriers.releases.len();
+            self.keep(key, HeartRow::Carriers(carriers.clone()), size);
+        }
+        Ok(carriers)
+    }
+
+    /// What the song identifies as from one album context: the catalog album (its Deezer id,
+    /// else found from the album title, else none), the recordings its ISRC names, the release
+    /// its UPC names that the person listened from, and from those the recordings heard.
+    pub async fn identity(
+        &self,
+        song: &HeartSong,
+        catalog_album_id: Option<&str>,
+    ) -> Result<HeardIdentity, HeartBusy> {
+        let catalog = match catalog_album_id.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => self.catalog_album(id).await?,
+            None => self.catalog_album_by_title(song).await?,
+        };
+        let code_recordings = self.code_recordings(&song.isrc).await?;
+        let releases = match &catalog {
+            Some((album, _)) => self.barcode_releases(&album.upc).await?,
+            None => Vec::new(),
+        };
+        let listened = release::listened_release(song, &releases, &code_recordings);
+        Ok(release::identify(song, &code_recordings, listened))
+    }
+
+    /// The release groups Lidarr is asked for, in order: the artist's home country and the
+    /// carriers of every heard recording, then the walk. Its first entry is the listened
+    /// release's group when there is one, which needs none of these
+    /// (`HeardIdentity::listened_group`).
+    pub async fn walk(&self, song: &HeartSong, identity: &HeardIdentity) -> Result<Vec<String>, HeartBusy> {
+        let home = self.home_country(&identity.artist_id).await?;
+        let mut carriers = Vec::with_capacity(identity.recordings.len());
+        for id in &identity.recordings {
+            carriers.push(self.carriers(id).await?);
+        }
+        Ok(release::walk(song, identity, &home, &carriers))
+    }
+
+    /// The carriers of one recording when they are kept, without asking.
+    pub fn known_carriers(&self, recording_id: &str) -> Option<Carriers> {
+        match self.kept(&carriers_key(recording_id.trim())) {
+            Some(HeartRow::Carriers(carriers)) => Some(carriers),
+            _ => None,
+        }
+    }
+
+    /// Where an artist is from when it is kept, without asking.
+    pub fn known_home_country(&self, artist_id: &str) -> Option<String> {
+        match self.kept(&artist_key(artist_id)) {
+            Some(HeartRow::Country(country)) => Some(country),
+            _ => None,
+        }
+    }
+
+    /// The catalog album found from the song's album title: the first of the search's candidates
+    /// whose album and tracks fit the song.
+    async fn catalog_album_by_title(
+        &self,
+        song: &HeartSong,
+    ) -> Result<Option<(CatalogAlbum, Vec<CatalogTrack>)>, HeartBusy> {
+        let hits = self.catalog_album_hits(&song.artist, &song.album).await?;
+        for hit in release::catalog_album_candidates(song, &hits) {
+            if let Some((album, tracks)) = self.catalog_album(&hit.id).await?
+                && release::catalog_album_fits(song, Some(&album), &tracks)
+            {
+                return Ok(Some((album, tracks)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// One MusicBrainz question on this lane: its answer, or the question to hold.
+    async fn ask(&self, question: &str, what: &str) -> Result<Asked, HeartBusy> {
+        match self.music_brainz.ask_on(question, what, self.lane).await {
+            Ok(asked) if !asked.is_busy() => Ok(asked),
+            Ok(_) | Err(_) => Err(HeartBusy::MusicBrainz(question.to_string())),
+        }
+    }
+
+    fn kept(&self, key: &str) -> Option<HeartRow> {
+        self.music_brainz.heart_rows.lock().get(key)
+    }
+
+    fn keep(&self, key: String, row: HeartRow, size: usize) {
+        self.music_brainz.heart_rows.lock().put(key, row, size);
+    }
+}
+
+fn carriers_key(recording_id: &str) -> String {
+    format!("carriers|{}", recording_id.to_lowercase())
+}
+
+fn artist_key(artist_id: &str) -> String {
+    format!("artist|{}", dotnet::to_lower_invariant(artist_id.trim()))
 }
 
 #[cfg(test)]

@@ -1,9 +1,12 @@
 //! A buffered HTTP call: the whole body is read before the call returns, inside the client's
 //! timeout. [`HttpAnswer`] is that buffered response, and the helpers here read it as text or
-//! JSON.
+//! JSON, and read a `Retry-After`.
+
+use std::time::Duration;
 
 use bytes::Bytes;
 use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::Value;
 
 /// A response with its body read.
@@ -11,14 +14,21 @@ use serde_json::Value;
 pub struct HttpAnswer {
     pub status: StatusCode,
     pub body: Bytes,
+    /// The response's `Retry-After`, when it gave one in seconds.
+    pub retry_after: Option<Duration>,
 }
 
 impl HttpAnswer {
     /// Reads the whole body of a response.
     pub async fn read(response: reqwest::Response) -> reqwest::Result<HttpAnswer> {
         let status = response.status();
+        let retry_after = retry_after_delta(response.headers());
         let body = response.bytes().await?;
-        Ok(HttpAnswer { status, body })
+        Ok(HttpAnswer {
+            status,
+            body,
+            retry_after,
+        })
     }
 
     /// An answer the client made up itself, with no body (the limiters' 429).
@@ -26,6 +36,7 @@ impl HttpAnswer {
         HttpAnswer {
             status,
             body: Bytes::new(),
+            retry_after: None,
         }
     }
 
@@ -60,4 +71,37 @@ pub fn client_builder() -> reqwest::ClientBuilder {
 /// A relative request resolved against a client's base address.
 pub fn resolve(base: &url::Url, relative: &str) -> Result<url::Url, url::ParseError> {
     base.join(relative)
+}
+
+/// A `Retry-After` given in seconds. A date, or nothing readable, is None, and the caller's
+/// default cool-down applies.
+pub fn retry_after_delta(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value
+        .parse::<i32>()
+        .ok()
+        .map(|seconds| Duration::from_secs(seconds as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::header::HeaderValue;
+
+    use super::*;
+
+    #[test]
+    fn retry_after_is_read_only_in_seconds() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(retry_after_delta(&headers), None);
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("300"));
+        assert_eq!(retry_after_delta(&headers), Some(Duration::from_secs(300)));
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after_delta(&headers), None);
+    }
 }
