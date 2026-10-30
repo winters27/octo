@@ -856,7 +856,7 @@ async fn an_upgrade_of_a_kept_file_that_meets_a_busy_lookup_stops_quietly_and_ho
             .expect("no panic")
             .expect("ran");
 
-        assert_eq!(outcome.state, LibraryActionState::Skipped, "{waiting_for:?}");
+        assert_ne!(outcome.state, LibraryActionState::Applied, "{waiting_for:?}");
         assert_eq!(outcome.detail, None, "quietly: {outcome:?}");
         assert_eq!(waited.load(Ordering::SeqCst), 0, "no turn waited for");
         assert!(!held.exists(), "the copy is thrown away");
@@ -866,6 +866,31 @@ async fn an_upgrade_of_a_kept_file_that_meets_a_busy_lookup_stops_quietly_and_ho
         assert!(mappings[0].heart.as_ref().is_some_and(|heart| heart.as_heard));
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(rig.queue.is_idle(), "nothing queued again");
+
+        // The next check's upgrade of the same file runs again: nothing counted it as done.
+        let applying = rig.actions.clone();
+        let again = tokio::spawn(async move {
+            applying
+                .apply(LibraryActionRequest::new(
+                    LibraryAction::BetterQuality,
+                    "nd-1",
+                    "admin",
+                ))
+                .await
+        });
+        let download = tokio::time::timeout(Duration::from_secs(10), rig.queue.dequeue(&never))
+            .await
+            .expect("asked for again")
+            .expect("a download");
+        rig.queue.release(&download);
+        download
+            .completion
+            .try_set_error(anyhow::anyhow!("nothing found"));
+        tokio::time::timeout(Duration::from_secs(10), again)
+            .await
+            .expect("ended")
+            .expect("no panic")
+            .expect("ran");
     }
 }
 

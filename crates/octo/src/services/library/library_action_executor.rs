@@ -1259,9 +1259,10 @@ impl LibraryActionExecutor {
                         arrived: None,
                     };
                 }
+                // Not answered is not an answer: the action stays open for its next try.
                 OriginalSound::Busy => {
                     return Replaced {
-                        outcome: LibraryActionOutcome::said(LibraryActionState::Skipped, KEPT_BUSY),
+                        outcome: LibraryActionOutcome::said(LibraryActionState::Failed, KEPT_BUSY),
                         quarantine_path: None,
                         new_path: None,
                         arrived: None,
@@ -1294,8 +1295,14 @@ impl LibraryActionExecutor {
                     action_name(request.action),
                     original.absolute_path
                 );
+                // AcoustID not answering leaves the action open for its next try.
+                let state = if why == KEPT_BUSY {
+                    LibraryActionState::Failed
+                } else {
+                    LibraryActionState::Skipped
+                };
                 return Replaced {
-                    outcome: LibraryActionOutcome::said(LibraryActionState::Skipped, why),
+                    outcome: LibraryActionOutcome::said(state, why),
                     quarantine_path: None,
                     new_path: None,
                     arrived: None,
@@ -1518,8 +1525,9 @@ impl LibraryActionExecutor {
                     action_name(request.action),
                     original.absolute_path
                 );
+                // No words, and nothing that counts as done: the next check runs it again.
                 return Replaced {
-                    outcome: LibraryActionOutcome::new(LibraryActionState::Skipped, None),
+                    outcome: LibraryActionOutcome::new(LibraryActionState::Failed, None),
                     quarantine_path: None,
                     new_path: None,
                     arrived: None,
