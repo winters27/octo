@@ -3,6 +3,7 @@
 pub mod acquisition_activity;
 pub mod acquisition_tracker;
 pub mod acquisition_worker;
+pub mod album_gates;
 pub mod base_download_service;
 pub mod cache_cleanup_service;
 pub mod download_arrivals;
@@ -25,6 +26,7 @@ pub use acquisition_tracker::{
     AcquisitionEnd, AcquisitionSnapshot, AcquisitionState, AcquisitionTracker, TrackerServices, WatchSettings,
 };
 pub use acquisition_worker::AcquisitionWorker;
+pub use album_gates::{AlbumGate, AlbumGateTrack, AlbumGates};
 pub use base_download_service::{
     BaseDownloadService, CatalogBlanks, DownloadBackend, DownloadCore, DownloadOptions, DownloadServices,
     FileNotFoundException, LayoutChoice, MeterPreview, OperationCanceled, Placement, PlaylistTrackSync,

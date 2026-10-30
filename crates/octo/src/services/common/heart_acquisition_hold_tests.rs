@@ -1370,9 +1370,12 @@ async fn a_held_album_track_is_asked_again_after_a_restart() {
     let directory = tempfile::tempdir().expect("a temp dir");
     let file = directory.path().join("soulseek-holds.json");
     let line = "1 track waits: play it once, or keep it anyway";
+    let held_file = directory.path().join("help.flac");
+    std::fs::write(&held_file, b"the held track").expect("written");
     {
         let before = SoulseekHoldStore::new(Some(&file));
         before.hold(HeldAcquisition {
+            held_files: vec![held_file.to_string_lossy().to_string()],
             album_track: Some(crate::services::common::soulseek_hold_store::HeldAlbumTrack {
                 album_key: "soulseek:help-album".into(),
                 song_ids: vec!["help".into()],
@@ -1718,7 +1721,8 @@ async fn acoust_id_turning_on_or_off_runs_the_holds_that_wait_on_it_again() {
 }
 
 /// A held song streamed again brings its holder's new heard source to the hold, which runs again
-/// with it; a hold of another wait, or another person's play, changes nothing.
+/// with it. Another person's play only checks the hold again with what its holder heard: their
+/// own heard source is never taken into it.
 #[tokio::test]
 async fn a_held_song_streamed_again_runs_its_hold_with_what_was_heard_now() {
     let gates = Arc::new(ListedGates::default());
@@ -1742,11 +1746,25 @@ async fn a_held_song_streamed_again_runs_its_hold_with_what_was_heard_now() {
         sample_id: None,
     };
     rig.coordinator.heard_again("help", "anna", &played);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(gates.built.lock().is_empty(), "anna holds nothing here");
+    until(|| !gates.built.lock().is_empty()).await;
+    until(|| rig.coordinator.resuming.lock().is_empty()).await;
+    assert_eq!(
+        gates.built.lock().clone(),
+        [("brandon".to_string(), AcquisitionOrigin::Heart)],
+        "anna's play checks brandon's hold again, once"
+    );
+    let record = rig
+        .holds
+        .get("Track:soulseek:help:NotYetProven")
+        .expect("held again");
+    assert_eq!(users(&record), ["brandon"]);
+    assert_eq!(
+        record.holders[0].heard, None,
+        "anna's heard source is never taken"
+    );
 
     rig.coordinator.heard_again("help", "Brandon", &played);
-    until(|| !gates.built.lock().is_empty()).await;
+    until(|| gates.built.lock().len() == 2).await;
     until(|| rig.coordinator.resuming.lock().is_empty()).await;
     let record = rig
         .holds

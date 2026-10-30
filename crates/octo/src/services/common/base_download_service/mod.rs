@@ -72,8 +72,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::services::common::acquisition_tracker::{acquisition_event_kinds, key_of};
 use crate::services::common::{
-    AcquisitionPlace, AcquisitionState, AcquisitionTracker, DownloadArrivals, DownloadConcurrency,
-    DownloadPicks, GateLedger, SoundDeny, acquisition_key,
+    AcquisitionHeld, AcquisitionPlace, AcquisitionState, AcquisitionTracker, AlbumGates, DownloadArrivals,
+    DownloadConcurrency, DownloadPicks, GateLedger, SoundDeny, acquisition_key,
 };
 use crate::services::cover_art::DownloadCoverResolver;
 use crate::services::family::FamilyPlacement;
@@ -320,6 +320,9 @@ pub struct DownloadServices {
     pub arrivals: Option<Arc<DownloadArrivals>>,
     /// The songs fetched ahead of their play, which a heart takes instead of downloading again.
     pub prefetched: Option<Arc<dyn PrefetchedFiles>>,
+    /// The gates of the album chains that run now: a walk of a hearted album files each track by
+    /// its own sound against its own recording.
+    pub album_gates: Option<Arc<AlbumGates>>,
 }
 
 /// Everything a single download is asked with beyond its provider and id: the optional
@@ -1837,6 +1840,13 @@ impl BaseDownloadService {
             .cloned()
             .collect();
 
+        // Tracks a hearted album already holds wait where they are: no walk fetches them again.
+        let askers = requested_by.clone().unwrap_or_default();
+        if let Some(gates) = &self.services.album_gates {
+            tracks_to_download
+                .retain(|track| !gates.settled(&provider, album_external_id, &askers, external_id_of(track)));
+        }
+
         info!(
             "Found {} additional tracks to download for album '{}'",
             tracks_to_download.len(),
@@ -1951,6 +1961,7 @@ impl BaseDownloadService {
             suppress_summary,
             requested_by: &requested_by,
             cancellation_token,
+            album_external_id,
         };
 
         // Tracks whose file came from one peer's folder of the album, already queued in one
@@ -2023,6 +2034,15 @@ impl BaseDownloadService {
     async fn walk_track(&self, track: &Song, walk: &Walk<'_>) {
         let provider = self.provider_name();
         let track_id = external_id_of(track);
+        // Each person whose heart of the album is gated judges the track's file against the
+        // track's own recording, by the album's rule.
+        let askers = walk.requested_by.clone().unwrap_or_default();
+        let gates = self
+            .services
+            .album_gates
+            .as_ref()
+            .map(|gates| gates.track_gates(provider, walk.album_external_id, &askers, track_id))
+            .unwrap_or_default();
         let attempt: anyhow::Result<()> = async {
             self.backend.ensure_routing_registered(track);
 
@@ -2084,6 +2104,11 @@ impl BaseDownloadService {
                         source_override: walk.source_override,
                         requested_by: walk.requested_by.clone(),
                         album_context: Some(Arc::clone(walk.context)),
+                        place: AcquisitionPlace {
+                            origin: gates.first().map(|gate| gate.origin),
+                            gates: gates.clone(),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     },
                     walk.cancellation_token,
@@ -2102,6 +2127,18 @@ impl BaseDownloadService {
         }
         .await;
         if let Err(e) = attempt {
+            // Held in the one hold path for the album's hearts: their chain files it, and no later
+            // walk of the album fetches it again.
+            if let Some(held) = e.downcast_ref::<AcquisitionHeld>()
+                && let Some(album_gates) = &self.services.album_gates
+            {
+                info!(
+                    "Track {track_id} '{}' waits in the hold path: {}",
+                    track.title, held.line
+                );
+                album_gates.held(provider, walk.album_external_id, &askers, track_id, held.clone());
+                return;
+            }
             warn!("Failed to download track {track_id} '{}': {e:#}", track.title);
             walk.counters.failed.fetch_add(1, Ordering::SeqCst);
             // Same rule as the summary: a source with another after it stays quiet, and the next
@@ -2397,6 +2434,8 @@ struct Walk<'a> {
     suppress_summary: bool,
     requested_by: &'a Option<Vec<String>>,
     cancellation_token: &'a CancellationToken,
+    /// The album's id, which its hearts' gates are kept under.
+    album_external_id: &'a str,
 }
 
 #[derive(Default)]

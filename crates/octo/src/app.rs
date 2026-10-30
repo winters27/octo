@@ -57,6 +57,7 @@ use crate::services::charts::{AppleMusicPages, ChartCountryStore, ChartsWarmWork
 use crate::services::common::HeartGates;
 use crate::services::common::IAcquisitionActivity;
 use crate::services::common::TopSongsService;
+use crate::services::common::album_gates::AlbumGates;
 use crate::services::cover_art::{AnimatedArt, ArtworkHints, HintedArtwork};
 use crate::services::family::LibraryWriteGate as FamilyWriteGate;
 use crate::services::family::request_service::{
@@ -945,6 +946,9 @@ impl Acquisition {
         let lidarr_track_fetcher: Arc<dyn ILidarrTrackFetcher> = lidarr_fetcher.clone();
         let spotiflac = Arc::new(SpotiflacClient::new(settings.clone()));
 
+        // The gates of hearted albums' chains, which every source's check point files tracks by.
+        let album_gates = Arc::new(AlbumGates::new());
+
         // The download service: the base is built over the services above, and the Soulseek
         // backend's optional ones are the link and Lidarr's two. A handler test may swap in its
         // own.
@@ -982,6 +986,7 @@ impl Acquisition {
                         family: Some(navidrome.family_pool_service.clone() as Arc<dyn FamilyPlacement>),
                         arrivals: Some(stores.download_arrivals.clone()),
                         prefetched: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
+                        album_gates: Some(album_gates.clone()),
                     },
                     SoulseekDownloadParts {
                         slskd: downloads.soulseek_client.clone(),
@@ -1129,6 +1134,8 @@ impl Acquisition {
                     let acoust_id = clients.acoust_id.clone();
                     Arc::new(move || acoust_id.is_on())
                 }),
+                album_gates: Some(album_gates.clone()),
+                metadata: Some(music_metadata.clone()),
             },
         );
         // The shim's rounds resume a held heart once the shim answers for it, and show a hold
@@ -1185,6 +1192,25 @@ impl Acquisition {
                     }
                 },
             ));
+            // The holds a person waits on join kept files in the one order a heart's proof checks
+            // items in.
+            let (waiting, recheck) = (
+                Arc::downgrade(&heart_acquisition_coordinator),
+                Arc::downgrade(&heart_acquisition_coordinator),
+            );
+            kept_rechecks.use_holds(
+                Arc::new(move || {
+                    waiting
+                        .upgrade()
+                        .map(|coordinator| coordinator.rechecked_holds())
+                        .unwrap_or_default()
+                }),
+                Arc::new(move |key: &str| {
+                    if let Some(coordinator) = recheck.upgrade() {
+                        coordinator.resume_held(key);
+                    }
+                }),
+            );
         }
         // A kept file's checks ask MusicBrainz as the heart's gate does, and its replacements are
         // compared with its own print.
