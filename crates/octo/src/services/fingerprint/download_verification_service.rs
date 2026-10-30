@@ -125,6 +125,9 @@ pub struct DownloadVerificationService {
     resume: parking_lot::Mutex<Option<ResumeHold>>,
     /// Clip prints a gate took for a person, by song and person, until their hold keeps them.
     clip_prints: parking_lot::Mutex<HashMap<(String, String), ClipPrints>>,
+    /// The MusicBrainz question a file's label check met busy, by song and person, until the hold
+    /// it left is filed and asks it again.
+    file_questions: parking_lot::Mutex<HashMap<(String, String), String>>,
 }
 
 impl DownloadVerificationService {
@@ -153,6 +156,7 @@ impl DownloadVerificationService {
             heart: OnceLock::new(),
             resume: parking_lot::Mutex::new(None),
             clip_prints: parking_lot::Mutex::new(HashMap::new()),
+            file_questions: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -557,7 +561,7 @@ impl DownloadVerificationService {
     ) -> VerificationResult {
         let settings = self.settings.current().soulseek.clone();
         let fingerprint = self
-            .fingerprinter
+            .file_printer()
             .fingerprint(
                 Path::new(path),
                 settings.effective_fingerprint_seconds(),

@@ -24,7 +24,7 @@ use futures::{Stream, StreamExt};
 use octo_core::common::Clock;
 use octo_core::fingerprint::heart_gate::{HeardRecord, HeardSource, WaitingFor};
 use octo_core::settings::SettingsStore;
-use octo_media::audio::{AudioFingerprinter, FingerprintOutcome, RawFingerprint};
+use octo_media::audio::{AudioFingerprinter, FingerprintOutcome, FingerprintResult, RawFingerprint};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -162,10 +162,23 @@ pub trait Printer: Send + Sync {
         length_seconds: i32,
         timeout_seconds: i32,
     ) -> Option<(String, i32)>;
+
+    /// The compressed fingerprint with how the run went: a file whose audio could not be decoded
+    /// is told apart from a run that said nothing.
+    async fn fingerprint(&self, path: &Path, length_seconds: i32, timeout_seconds: i32) -> FingerprintResult {
+        match self.compressed(path, length_seconds, timeout_seconds).await {
+            Some((print, seconds)) => FingerprintResult::new(FingerprintOutcome::Ok, Some(print), seconds),
+            None => FingerprintResult::new(FingerprintOutcome::Unavailable, None, 0),
+        }
+    }
 }
 
 #[async_trait]
 impl Printer for AudioFingerprinter {
+    async fn fingerprint(&self, path: &Path, length_seconds: i32, timeout_seconds: i32) -> FingerprintResult {
+        AudioFingerprinter::fingerprint(self, path, length_seconds, timeout_seconds).await
+    }
+
     async fn raw(&self, path: &Path, length_seconds: i32, timeout_seconds: i32) -> Option<RawFingerprint> {
         self.raw_fingerprint(path, length_seconds, timeout_seconds).await
     }
@@ -521,7 +534,8 @@ impl HeardSamples {
         *self.row.lock() = Some(row);
     }
 
-    fn printer(&self) -> Arc<dyn Printer> {
+    /// What prints audio files: `fpcalc`, or a test's printer.
+    pub(crate) fn printer(&self) -> Arc<dyn Printer> {
         self.printer.lock().clone()
     }
 

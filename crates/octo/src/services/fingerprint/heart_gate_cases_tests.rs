@@ -242,3 +242,128 @@ fn every_real_case_is_decided_as_the_reference_decides_it() {
     );
     assert_eq!(decided, 31);
 }
+
+/// Every real case through Octo's own file check, `verify_for_heart`: the file printed in a heart's
+/// `fpcalc` place, its frozen answer asked of AcoustID on the heart's class, its ISRC read from its
+/// own tags, proof 2 against the heard print the samples keep, the heard master from a round over
+/// the heard video fetched again, and MusicBrainz asked for the current id of a merged one. Every
+/// case is decided as the reference decides it, and no file's code is asked of MusicBrainz while
+/// its answer can be read.
+#[tokio::test]
+async fn every_real_case_is_decided_so_by_octos_own_file_check() {
+    use crate::services::fingerprint::download_verification_service::{HeartCandidate, LabelSource};
+    use crate::services::fingerprint::heart_test_support::{
+        GateSetup, frozen_body, gate_rig, sound_bytes, sound_flac,
+    };
+    use crate::services::prefetch::heard_samples::HeardPrints;
+
+    let rs = catalog_rs();
+    let rig = gate_rig(GateSetup::default()).await;
+    for entry in std::fs::read_dir(gate_dir().join("answers")).expect("the answers") {
+        let name = entry
+            .expect("an answer")
+            .path()
+            .file_stem()
+            .expect("a name")
+            .to_string_lossy()
+            .to_string();
+        rig.answers.answer(&name, &frozen_body(&name));
+    }
+    let mut decided = 0;
+    let mut misses = Vec::new();
+    for (n, row) in rows("gate-cases-real.tsv").iter().enumerate() {
+        let [
+            case,
+            file,
+            heard,
+            r_from,
+            label,
+            identical,
+            heard_master,
+            expected,
+        ] = row.as_slice()
+        else {
+            panic!("a case has eight fields: {row:?}");
+        };
+        let catalog = rs
+            .get(r_from)
+            .unwrap_or_else(|| panic!("{case}: no R for {r_from}"));
+        let mut gate = gate_for(catalog, heard);
+        let heard_print = heard.trim_end_matches("!busy");
+        // What was heard: its own video, its whole print kept, and its audio the shim sends again.
+        if let Some(record) = gate.heard.as_mut() {
+            let video = format!("case-{n}-video");
+            record.source = HeardSource::Video {
+                id: video.clone(),
+                size: Some(4_000_000),
+                content_type: "audio/mp4".into(),
+                itag: Some(140),
+            };
+            let sample = format!("case-{n}-heard");
+            record.sample_id = Some(sample.clone());
+            if let Some(items) = print_items(&format!("{heard_print}-240")) {
+                rig.rig.samples.store(
+                    &sample,
+                    &HeardPrints {
+                        raw: items,
+                        compressed: format!("{heard_print}-240"),
+                        seconds: 240,
+                        whole: true,
+                        reaches_end: false,
+                    },
+                    Some(&video),
+                );
+            }
+            rig.shim_streams(&video, sound_bytes("-", &format!("{heard_print}-master"), "-"))
+                .await;
+        }
+        let print = format!("{file}-120");
+        rig.printer.register(
+            &print,
+            print_items(&print).unwrap_or_else(|| panic!("{case}: no print {print}")),
+        );
+        let master = match heard_master.as_str() {
+            "yes" => format!("{heard_print}-master"),
+            _ => format!("{file}-another-master-{n}"),
+        };
+        let path = rig.dir.path().join(format!("case-{n}.flac"));
+        sound_flac(
+            &path,
+            200,
+            &sound_bytes(&print, &master, &print),
+            (label != "none").then_some(label.as_str()),
+        );
+        let candidate = HeartCandidate {
+            labels: LabelSource::TheFile,
+            identity: (identical == "yes")
+                .then(|| gate.heard.as_ref().map(|heard| heard.source.clone()))
+                .flatten(),
+            acquisition_key: format!("soulseek:case-{n}"),
+        };
+        let check = rig.service.verify_for_heart(&path, &candidate, &gate).await;
+        let got = words(&check.verdict);
+        if &got != expected {
+            misses.push(format!("{case}: {got} (expected {expected})"));
+        }
+        decided += 1;
+    }
+    assert!(
+        misses.is_empty(),
+        "{} of {decided} missed:\n{}",
+        misses.len(),
+        misses.join("\n")
+    );
+    assert_eq!(decided, 31);
+    let codes: Vec<String> = rig
+        .music_brainz()
+        .asked()
+        .into_iter()
+        .filter(|path| path.starts_with("/ws/2/isrc/"))
+        .collect();
+    assert!(codes.is_empty(), "codes asked with answers to read: {codes:?}");
+    assert!(
+        rig.answers.asked().iter().all(|name| name.ends_with("-120")),
+        "only the files were looked up: {:?}",
+        rig.answers.asked()
+    );
+}

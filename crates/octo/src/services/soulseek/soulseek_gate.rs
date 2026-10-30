@@ -35,6 +35,14 @@ pub(crate) enum FileJudged {
     NotProven(String),
 }
 
+/// Whether a gate is a heart's or a play's, judged by its asker's own gate wherever it runs.
+fn personal(gate: &HeartGate) -> bool {
+    matches!(
+        gate.origin,
+        AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart | AcquisitionOrigin::Play
+    )
+}
+
 /// Whether a download is judged by its askers' own gates: a heart's or a play's with a gate.
 pub(crate) fn gated(download: &TrackDownload) -> bool {
     matches!(
@@ -125,8 +133,66 @@ impl SoulseekDownloadService {
         if gated(download) {
             return self.judge_by_gates(base, download, path, identity).await;
         }
-        self.judge_shipped(base, routing, download, path, length_known)
-            .await
+        let judged = self
+            .judge_shipped(base, routing, download, path, length_known)
+            .await;
+        if matches!(judged, FileJudged::Keep(_)) {
+            self.judge_joiners(download, path, identity).await;
+        }
+        judged
+    }
+
+    /// A heart or a play that joined another origin's download is judged by its own gate once the
+    /// download's own checks keep the file: the file lands for the download's own askers, and each
+    /// joiner counts it as theirs only when their own gate passes it.
+    pub(crate) async fn judge_joiners(
+        &self,
+        download: &TrackDownload,
+        path: &str,
+        identity: Option<HeardSource>,
+    ) {
+        let joiners: Vec<&HeartGate> = download.gates.iter().filter(|gate| personal(gate)).collect();
+        if gated(download) || joiners.is_empty() {
+            return;
+        }
+        let ledger = &download.ledger;
+        if let Some(origin) = download.origin {
+            let own = download
+                .gates
+                .iter()
+                .filter(|gate| gate.origin == origin)
+                .map(|gate| gate.user.clone())
+                .chain(download.requested_by.iter().cloned());
+            for user in own {
+                if ledger.outcome_for(&user, origin).is_none() {
+                    ledger.record(&user, origin, GateOutcome::Accepted);
+                }
+            }
+        }
+        let candidate = HeartCandidate {
+            labels: LabelSource::TheFile,
+            identity,
+            acquisition_key: download.acquisition_key.clone(),
+        };
+        for gate in joiners {
+            let check = self
+                .verification
+                .verify_for_heart(Path::new(path), &candidate, gate)
+                .await;
+            info!(
+                "The gate of {} ({}), who joined {}, for {path}: {:?}",
+                gate.user,
+                gate.origin.name(),
+                download.acquisition_key,
+                check.verdict
+            );
+            let outcome = match &check.verdict {
+                GateVerdict::Accept { .. } => GateOutcome::Accepted,
+                GateVerdict::Hold(waiting) => GateOutcome::Held(*waiting),
+                other => GateOutcome::NotAccepted(not_kept(verdict_words(other).1)),
+            };
+            ledger.record(&gate.user, gate.origin, outcome);
+        }
     }
 
     /// A heart's or a play's file, judged by each asker's own gate. Kept when one gate accepts it

@@ -19,3 +19,6 @@ pub use music_brainz_client::{IsrcLookup, MusicBrainzClient, MusicBrainzError};
 #[cfg(test)]
 #[path = "heart_gate_cases_tests.rs"]
 mod heart_gate_cases_tests;
+
+#[cfg(test)]
+pub(crate) mod heart_test_support;

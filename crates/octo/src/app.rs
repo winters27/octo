@@ -2619,6 +2619,23 @@ pub struct TestServices {
     /// The heart gate on hearts and plays. Off by default, so a test of what an endpoint does
     /// never asks the real AcoustID, MusicBrainz or Deezer hosts; a test of the gate turns it on.
     pub heart_gate: bool,
+    /// Where MusicBrainz is asked (a test's mock server, `<base>/ws/2/`), at a test's pace.
+    pub music_brainz_base_url: Option<String>,
+    /// Where AcoustID is asked (a test's mock server).
+    pub acoust_id_base_url: Option<String>,
+}
+
+/// MusicBrainz at a test's mock server, paced for a test that runs in seconds.
+fn test_music_brainz(base: &str) -> MusicBrainzClient {
+    let client =
+        MusicBrainzClient::with_base_url(url::Url::parse(base).expect("a test's MusicBrainz address"));
+    #[cfg(test)]
+    let client = client.with_pace(
+        Duration::from_millis(5),
+        Duration::from_secs(5),
+        Duration::from_millis(5),
+    );
+    client
 }
 
 /// The queues and sweeps: the upgrade queue's worker, the weekly quality upgrade, the
@@ -3593,7 +3610,20 @@ impl AppState {
         let stores = Stores::build_with(&settings, &config_dir, overrides.external_id_registry.clone());
         // The clients point at the real hosts but ask nothing until a test calls them, and
         // the iTunes matches stay in memory.
-        let clients = MetadataClients::build_with(&settings, None, overrides.deezer_base_url.as_deref());
+        let mut clients = MetadataClients::build_with(&settings, None, overrides.deezer_base_url.as_deref());
+        if let Some(base) = overrides.music_brainz_base_url.as_deref() {
+            clients.music_brainz = Arc::new(test_music_brainz(base));
+        }
+        if let Some(base) = overrides.acoust_id_base_url.as_deref() {
+            let base = url::Url::parse(base).expect("a test's AcoustID address");
+            clients.acoust_id = Arc::new(AcoustIdClient::new(
+                Arc::new(AcoustIdRateLimitHandler::with_base_url(
+                    Arc::clone(&clients.acoust_id_rate_limiter),
+                    base,
+                )),
+                Arc::clone(&settings),
+            ));
+        }
         let tagging = Tagging::build(&settings, &clients);
         let lyrics = Lyrics::build(&settings, None);
         // The Last.fm, ListenBrainz and notification clients point at the real hosts too, and

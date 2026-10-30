@@ -3141,3 +3141,6 @@ async fn the_remuxed_heard_stream_is_byte_identical_to_the_copy() {
     assert!(!original.is_empty());
     assert_eq!(packets(std::path::Path::new(&remuxed)), original);
 }
+
+#[path = "soulseek_gate_tests.rs"]
+mod gate;
