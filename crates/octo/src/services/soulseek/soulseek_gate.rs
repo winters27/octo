@@ -180,6 +180,9 @@ impl SoulseekDownloadService {
         {
             for (other, its) in &checks {
                 ledger.record(&other.user, other.origin, outcome_of(&its.verdict));
+                if let GateVerdict::Accept { by, .. } = its.verdict {
+                    ledger.record_accepted(&other.user, other.origin, by);
+                }
             }
             let kept = DownloadVerificationService::kept_verification(check, gate);
             if let GateVerdict::Accept {
@@ -602,6 +605,9 @@ impl SoulseekDownloadService {
                 other => GateOutcome::NotAccepted(not_kept(verdict_words(other).1)),
             };
             download.ledger.record(&other.user, other.origin, outcome);
+            if let GateVerdict::Accept { by, .. } = its.verdict {
+                download.ledger.record_accepted(&other.user, other.origin, by);
+            }
         }
         let verdict = DownloadVerificationService::kept_verification(check, gate);
         verdict.apply_tags_to(&mut download.song);
