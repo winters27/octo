@@ -193,6 +193,9 @@ impl SoulseekDownloadService {
                 other => GateOutcome::NotAccepted(not_kept(verdict_words(other).1)),
             };
             ledger.record(&gate.user, gate.origin, outcome);
+            if let GateVerdict::Accept { by, .. } = check.verdict {
+                ledger.record_accepted(&gate.user, gate.origin, by);
+            }
         }
     }
 

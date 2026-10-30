@@ -972,6 +972,10 @@ async fn a_heart_joining_an_import_is_judged_by_its_own_gate() {
         let heart = ledger.outcome_for("anna", AcquisitionOrigin::Heart);
         if accepted {
             assert_eq!(heart, Some(GateOutcome::Accepted), "{master}");
+            assert!(
+                ledger.acceptance_for("anna", AcquisitionOrigin::Heart).is_some(),
+                "{master}: which acceptance passed the joiner is recorded"
+            );
         } else {
             assert!(
                 matches!(heart, Some(GateOutcome::NotAccepted(_))),

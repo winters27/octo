@@ -1212,22 +1212,29 @@ async fn a_wrong_version_of_a_clustered_original_downloads_nothing_and_marks_the
         rig.journal
             .wrong_version_asked("nd-1", LibraryActionExecutor::WRONG_VERSION_FIND_SONGS)
     );
-    // An original AcoustID has no answer for at all is unknown too.
-    let unknown = r#"{"status":"ok","results":[{"id":"fp","score":0.97}]}"#;
-    let rig = wrong_rig(unknown, None).await.expect("a rig");
-    let outcome = rig
-        .until_download(LibraryActionRequest::new(
-            LibraryAction::WrongVersion,
-            "nd-1",
-            "admin",
-        ))
-        .await
-        .err()
-        .expect("no download");
-    assert_eq!(
-        outcome.detail.as_deref(),
-        Some(LibraryActionExecutor::WRONG_VERSION_FIND_SONGS)
-    );
+    // An original whose fingerprint AcoustID links to no recording is unknown too, and so is one
+    // AcoustID has no result for at all.
+    for answer in [
+        r#"{"status":"ok","results":[{"id":"fp","score":0.97}]}"#,
+        r#"{"status":"ok","results":[]}"#,
+    ] {
+        let rig = wrong_rig(answer, None).await.expect("a rig");
+        let outcome = rig
+            .until_download(LibraryActionRequest::new(
+                LibraryAction::WrongVersion,
+                "nd-1",
+                "admin",
+            ))
+            .await
+            .err()
+            .expect("no download");
+        assert_eq!(
+            outcome.detail.as_deref(),
+            Some(LibraryActionExecutor::WRONG_VERSION_FIND_SONGS),
+            "{answer}"
+        );
+        assert!(rig.queue.is_idle(), "{answer}: nothing downloaded");
+    }
 }
 
 /// A Wrong version or a Wrong song of an original AcoustID reads clearly refuses a file whose

@@ -1227,8 +1227,9 @@ impl LibraryActionExecutor {
     ) -> Replaced {
         // A Wrong song or a Wrong version is decided by what the original's own sound says, read
         // once before anything is downloaded: what it clearly is, or for a Wrong song the song it
-        // is, is refused again. A Wrong version AcoustID cannot tell apart from another mix
-        // downloads nothing; the person picks the copy they want in Find songs.
+        // is, is refused again. A Wrong version AcoustID cannot tell apart from another mix, or
+        // does not know at all, downloads nothing; the person picks the copy they want in Find
+        // songs.
         let mut deny = None;
         if matches!(
             request.action,
@@ -1240,7 +1241,7 @@ impl LibraryActionExecutor {
                 OriginalSound::Ambiguous(song) if request.action == LibraryAction::WrongSong => {
                     deny = Some(SoundDeny::Song(song));
                 }
-                OriginalSound::Ambiguous(_) | OriginalSound::Unknown
+                OriginalSound::Ambiguous(_) | OriginalSound::Unknown | OriginalSound::Empty
                     if request.action == LibraryAction::WrongVersion =>
                 {
                     info!(
