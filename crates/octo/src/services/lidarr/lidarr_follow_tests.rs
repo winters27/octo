@@ -769,6 +769,34 @@ async fn a_kept_copy_held_while_a_follow_is_open_waits_and_is_placed_when_it_end
     over(&f).await;
 }
 
+/// The late import of the hearted song fails Octo's checks: it is deleted through Lidarr, the pick
+/// is put back, and the kept copy is placed in the library.
+#[tokio::test]
+async fn a_late_import_that_fails_is_put_back_and_the_kept_copy_placed() {
+    let f = Fixture::new().await;
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!f.heart_teardrop(&service).await);
+    followed(&f, "dl-1").await;
+    let held = hold_kept_copy(&f);
+    f.refused.lock().insert("Teardrop".into());
+
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
+
+    until(|| f.placed.lock().len() == 1).await;
+    assert!(Path::new(&held.target).is_file());
+    over(&f).await;
+    assert!(f.taken().is_empty());
+    assert_eq!(
+        f.lidarr.deleted(),
+        [100],
+        "the refused import is deleted through Lidarr"
+    );
+    assert!(album_deleted(&f), "the album Octo's add created is put back");
+}
+
 /// A stalled torrent (qBittorrent's own warning) with a kept copy waiting: the follow ends, Octo's
 /// download is removed, and the kept copy is placed at once.
 #[tokio::test]
@@ -1045,6 +1073,50 @@ async fn a_restart_between_the_search_and_the_first_read_keeps_the_grab_octos() 
         ..Default::default()
     });
     f.lidarr.forget_command(search.id);
+
+    service.put_back_after_restart().await;
+
+    until(|| f.taken.lock().len() == 1).await;
+    assert_eq!(f.taken(), ["Teardrop"]);
+    over(&f).await;
+}
+
+/// A release picked in Find songs is grabbed by Lidarr within the call, with no command and so no
+/// window: the grab is Octo's by the picked release's guid, and its import is taken.
+#[tokio::test]
+async fn a_release_picked_in_find_songs_is_octos_by_its_guid() {
+    let f = Fixture::new().await;
+    f.lidarr.user_album(ALBUM_ID, false);
+    f.lidarr
+        .offer("guid-picked", 1, "Massive Attack - Mezzanine", 300_000_000);
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]).finished());
+    let service = f.service(None, 30);
+    let before = Utc::now() - TimeDelta::seconds(1);
+    let guid = f
+        .client()
+        .grab_picked(
+            7,
+            &octo_core::lidarr::LidarrReleasePick {
+                guid: "guid-picked".into(),
+                indexer_id: 1,
+                title: Some("Massive Attack - Mezzanine".into()),
+                size: Some(300_000_000),
+            },
+        )
+        .await
+        .expect("grabbed");
+    f.pending.remember(PendingAlbum {
+        foreign_album_id: ALBUM_ID.into(),
+        lidarr_album_id: 7,
+        lidarr_artist_id: 5,
+        artist: "Massive Attack".into(),
+        title: "Mezzanine".into(),
+        searched_at: Some(before),
+        picked_guid: Some(guid),
+        holders: vec!["alice".into()],
+        ..Default::default()
+    });
 
     service.put_back_after_restart().await;
 

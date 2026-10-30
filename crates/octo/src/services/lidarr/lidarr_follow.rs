@@ -744,6 +744,16 @@ impl Inner {
             if !entry.tracks_taken.contains(&track.id) {
                 entry.tracks_taken.push(track.id);
             }
+            // Saved at once: a read that fails later never hands the same file over twice.
+            let (file_id, track_id) = (file.id, track.id);
+            self.pending.update(&run.key, |saved| {
+                if !saved.files_handed.contains(&file_id) {
+                    saved.files_handed.push(file_id);
+                }
+                if !saved.tracks_taken.contains(&track_id) {
+                    saved.tracks_taken.push(track_id);
+                }
+            });
             if file.album_id != run.album_id {
                 info!(
                     "Lidarr imported Octo's download into another album ({}) of the artist of {}",
