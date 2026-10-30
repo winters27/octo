@@ -61,7 +61,9 @@ pub const SUBSONIC_VERSION: &str = "1.16.1";
 /// songs (findSongs, getFoundSongs, pickFoundSong). Version 3: pickFoundSong takes `anyway` and
 /// may answer `confirm`, asking before a library song is replaced by a copy no better than it.
 /// Version 4: a held row carries `keepAnyway` for a caller who may keep it and an album row
-/// `heldTracks`, and keepAcquisitionAnyway keeps a held row's audio anyway.
+/// `heldTracks`, and keepAcquisitionAnyway keeps a held row's audio anyway; a row whose kept copy
+/// waits for Lidarr carries `stopWaiting` for a caller whose heart kept it, and
+/// stopWaitingForLidarr lands that copy now.
 pub const ACQUISITIONS_EXTENSION: &str = "octoAcquisitions";
 pub const ACQUISITIONS_EXTENSION_VERSION: i32 = 4;
 

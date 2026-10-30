@@ -121,6 +121,9 @@ pub struct AcquisitionSnapshot {
     /// How many held tracks a hearted album's row holds, filled in from the holds when a person's
     /// list is read; None on every other row.
     pub held_tracks: Option<i32>,
+    /// The row's copy waits for an open Lidarr follow and the person may stop waiting for it. A
+    /// person's list sets it for them alone, when their heart kept that copy.
+    pub stop_waiting: bool,
 }
 
 /// How a row ended. `library_id` is set only for a song Navidrome showed; `album_keys` are
@@ -261,11 +264,23 @@ struct Entry {
 
     /// The line this run's row keeps once it is done: what was kept and why.
     done_line: Option<String>,
+
+    /// The line the row says over its own while its copy waits aside for Lidarr, and the last line
+    /// it keeps when that wait ended with something worth saying.
+    aside_line: Option<String>,
+
+    /// The row's copy waits aside: the row never expires and never falls to the cap meanwhile.
+    aside: bool,
 }
 
 impl Entry {
     fn finished(&self) -> bool {
         matches!(self.state, AcquisitionState::Done | AcquisitionState::Failed)
+    }
+
+    /// The row waits for work, so time never takes it: a hold, or a copy waiting aside.
+    fn waits(&self) -> bool {
+        self.held || self.aside
     }
 }
 
@@ -594,6 +609,56 @@ impl AcquisitionTracker {
             .entries
             .get(&key_of(provider, external_id))
             .is_some_and(|entry| entry.held)
+    }
+
+    /// The song's copy plays from where it waits aside (for Lidarr's download of its artist): the
+    /// row says `line` over its own, running or done, given these owners, and never expires while
+    /// the copy waits. A row a restart left out comes back done with that line.
+    pub fn wait_aside(&self, provider: &str, external_id: &str, owners: &[String], line: &str) {
+        if blank(provider) || blank(external_id) || blank(line) {
+            return;
+        }
+        let now = self.now();
+        let mut state = self.state.lock();
+        let fresh = state.entries.get(&key_of(provider, external_id)).is_none();
+        let entry = open(&mut state, provider, external_id, false, now);
+        if fresh {
+            entry.state = AcquisitionState::Done;
+        }
+        union_owners(&mut entry.owners, owners);
+        let line = line.trim().to_string();
+        if entry.aside_line.as_deref() != Some(line.as_str()) {
+            add(entry, now, acquisition_event_kinds::NOTE, &line, None, None);
+        }
+        entry.aside_line = Some(line);
+        entry.aside = true;
+        entry.updated_at = now;
+        prune(&mut state, now);
+    }
+
+    /// The song's copy no longer waits aside: the row says its own line again, or keeps `last`
+    /// as its last line (logged once), and goes back to the usual rules.
+    pub fn end_aside(&self, provider: &str, external_id: &str, last: Option<&str>) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let now = self.now();
+        let mut state = self.state.lock();
+        let Some(entry) = state.entries.get_mut(&key_of(provider, external_id)) else {
+            return;
+        };
+        if !entry.aside && last.is_none() {
+            return;
+        }
+        entry.aside = false;
+        entry.aside_line = last
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string);
+        if let Some(line) = entry.aside_line.clone() {
+            add(entry, now, acquisition_event_kinds::NOTE, &line, None, None);
+        }
+        entry.updated_at = now;
     }
 
     /// A star on an album was accepted. Its tracks are listed as the walk reaches them.
@@ -1430,6 +1495,8 @@ fn open<'a>(
         entry.already_there = false;
         entry.held = false;
         entry.keep_anyway = false;
+        entry.aside_line = None;
+        entry.aside = false;
     } else {
         state.entries.set(
             key.clone(),
@@ -1463,6 +1530,8 @@ fn open<'a>(
                 held: false,
                 keep_anyway: false,
                 done_line: None,
+                aside_line: None,
+                aside: false,
             },
         );
     }
@@ -1495,15 +1564,16 @@ fn end_of(state: &State, key: &str) -> Option<AcquisitionEnd> {
     })
 }
 
-/// Drop what has expired, then the oldest past the cap. A held row, and the album claim it is
-/// listed under, never goes: it waits for work, not for time. Caller holds the lock.
+/// Drop what has expired, then the oldest past the cap. A held row, one whose copy waits aside,
+/// and the album claim a held row is listed under, never go: they wait for work, not for time.
+/// Caller holds the lock.
 fn prune(state: &mut State, now: DateTime<Utc>) {
     let expired: Vec<String> = state
         .entries
         .iter()
         .filter(|(_, entry)| {
             let age = now - entry.updated_at;
-            if entry.held {
+            if entry.waits() {
                 false
             } else if entry.finished() {
                 age >= AcquisitionTracker::FINISHED_RETENTION
@@ -1540,7 +1610,7 @@ fn prune(state: &mut State, now: DateTime<Utc>) {
     let mut order: Vec<(bool, DateTime<Utc>, String)> = state
         .entries
         .iter()
-        .filter(|(_, entry)| !entry.held)
+        .filter(|(_, entry)| !entry.waits())
         .map(|(key, entry)| (!entry.finished(), entry.updated_at, key.clone()))
         .collect();
     order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -1606,7 +1676,7 @@ fn snapshot(entry: &Entry, ahead: Option<i32>, with_events: bool) -> Acquisition
         error: entry.error.clone(),
         library_id: entry.library_id.clone(),
         ahead,
-        note: entry.note.clone(),
+        note: entry.aside_line.clone().or_else(|| entry.note.clone()),
         key: key_of(&entry.provider, &entry.external_id),
         kind: entry.kind.clone(),
         quality: entry.quality.clone(),
@@ -1615,6 +1685,7 @@ fn snapshot(entry: &Entry, ahead: Option<i32>, with_events: bool) -> Acquisition
         events: with_events.then(|| entry.events.clone()),
         keep_anyway: entry.held && entry.keep_anyway,
         held_tracks: None,
+        stop_waiting: false,
     }
 }
 

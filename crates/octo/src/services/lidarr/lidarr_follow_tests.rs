@@ -134,9 +134,22 @@ fn hold_kept_copy(f: &Fixture) -> HeldPlacement {
             .into_owned(),
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
+        users: vec!["alice".into()],
     };
     f.pending.hold_placement(held.clone());
+    let (provider, id) = teardrop(f);
+    f.tracker.wait_aside(
+        &provider,
+        &id,
+        &held.users,
+        crate::services::lidarr::HELD_FOR_LIDARR,
+    );
     held
+}
+
+/// The line the song's row shows now.
+fn row_line(f: &Fixture) -> Option<String> {
+    f.tracker.detail(&teardrop_key(f), None).and_then(|row| row.note)
 }
 
 /// Lidarr fails Octo's grab and searches again on its own: the new grab, inside that search's
@@ -876,11 +889,15 @@ async fn another_hearts_proven_soulseek_file_ends_the_follow_and_lands() {
     let service = f.service(None, 1);
     assert!(!f.heart_teardrop(&service).await);
     followed(&f, "dl-1").await;
-    let held = hold_kept_copy(&f);
     let key = teardrop_key(&f);
     let (provider, id) = teardrop(&f);
     f.tracker
         .begin(&provider, &id, None, Some("alice"), None, None, None);
+    let held = hold_kept_copy(&f);
+    assert_eq!(
+        row_line(&f).as_deref(),
+        Some(crate::services::lidarr::HELD_FOR_LIDARR)
+    );
 
     // What the placement does for the proven Karmacoma: holds it for the follow and ends it.
     let folder = f.root.path().join(".octo-incoming/held/lidarr-follow-karmacoma");
@@ -898,6 +915,7 @@ async fn another_hearts_proven_soulseek_file_ends_the_follow_and_lands() {
             .into_owned(),
         kept: false,
         follows: vec![ALBUM_ID.into()],
+        users: Vec::new(),
     });
     assert!(f.pending.request_end(ALBUM_ID, FollowEnd::ProvenElsewhere));
 
@@ -911,6 +929,11 @@ async fn another_hearts_proven_soulseek_file_ends_the_follow_and_lands() {
     );
     assert!(removed(&f, 1));
     assert!(notes(&f, &key).iter().any(|(text, _)| text == PROVEN_ELSEWHERE));
+    assert_eq!(
+        row_line(&f).as_deref(),
+        Some(PROVEN_ELSEWHERE),
+        "the row's last line says why Octo stopped waiting"
+    );
     over(&f).await;
 }
 
@@ -927,6 +950,7 @@ async fn stop_waiting_for_lidarr_ends_the_follow_and_places_the_kept_copy() {
     let held = hold_kept_copy(&f);
     let (provider, id) = teardrop(&f);
     assert!(service.waits_for_lidarr(&provider, &id));
+    assert_eq!(service.stop_waiters(&provider, &id), ["alice"]);
 
     assert_eq!(
         service.stop_waiting_for_lidarr(&provider, &id).await,
@@ -937,11 +961,63 @@ async fn stop_waiting_for_lidarr_ends_the_follow_and_places_the_kept_copy() {
     assert!(Path::new(&held.target).is_file());
     assert!(removed(&f, 1));
     assert!(!service.waits_for_lidarr(&provider, &id));
+    assert!(service.stop_waiters(&provider, &id).is_empty());
+    assert_ne!(
+        row_line(&f).as_deref(),
+        Some(crate::services::lidarr::HELD_FOR_LIDARR),
+        "the row no longer says it waits"
+    );
     assert_eq!(
         service.stop_waiting_for_lidarr(&provider, &id).await,
         StopWaiting::NothingWaits
     );
     over(&f).await;
+}
+
+/// A restart forgets every downloads row, but a copy held for an open follow still waits: its row
+/// comes back saying so, for the people it was kept for, and offers them Stop waiting.
+#[tokio::test]
+async fn a_copy_held_for_an_open_follow_has_its_row_back_after_a_restart() {
+    let f = Fixture::new().await;
+    f.pending.remember(PendingAlbum {
+        foreign_album_id: ALBUM_ID.into(),
+        lidarr_album_id: 7,
+        artist: "Massive Attack".into(),
+        title: "Mezzanine".into(),
+        search_command: 3,
+        searched_at: Some(chrono::Utc::now()),
+        songs: vec![teardrop_key(&f)],
+        holders: vec!["alice".into()],
+        ..Default::default()
+    });
+    let folder = f.root.path().join(".octo-incoming/held/lidarr-follow-teardrop");
+    std::fs::create_dir_all(&folder).expect("made");
+    let held_path = folder.join("03 - Teardrop.m4a");
+    std::fs::write(&held_path, b"the version alice heard").expect("written");
+    f.pending.hold_placement(HeldPlacement {
+        song: teardrop_key(&f),
+        held_path: held_path.to_string_lossy().into_owned(),
+        target: "/music/Massive Attack/Mezzanine/03 - Teardrop.m4a".into(),
+        kept: true,
+        follows: vec![ALBUM_ID.to_string()],
+        users: vec!["alice".into()],
+    });
+    let service = f.service(None, 1);
+    assert!(f.tracker.for_user("alice").is_empty(), "nothing listed yet");
+
+    service.put_back_after_restart().await;
+
+    let rows = f.tracker.for_user("alice");
+    let row = rows
+        .iter()
+        .find(|row| row.key == teardrop_key(&f))
+        .expect("the row is back");
+    assert_eq!(
+        row.note.as_deref(),
+        Some(crate::services::lidarr::HELD_FOR_LIDARR)
+    );
+    let (provider, id) = teardrop(&f);
+    assert_eq!(service.stop_waiters(&provider, &id), ["alice"]);
 }
 
 /// "Stop waiting for Lidarr" while Lidarr does not answer: the kept copy is still placed at once;

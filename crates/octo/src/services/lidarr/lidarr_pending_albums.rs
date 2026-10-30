@@ -130,6 +130,16 @@ pub struct PendingAlbum {
     pub released: bool,
     /// The release picked in Find songs: its grab is Octo's by its guid.
     pub picked_guid: Option<String>,
+    /// The hearted albums this album was searched for, as `provider:id`: their gates file each
+    /// track of Octo's import by its own sound.
+    pub album_hearts: Vec<String>,
+    /// The songs of those albums a file of Octo's import was filed as, landed or held, as
+    /// `provider:id`: no later file is filed as one of them.
+    pub filed: Vec<String>,
+    /// A replacement's fetch searched the album: nothing of its import is the library's but the
+    /// song a fetch waits for, and a file nobody waits for is held out of the library and
+    /// deleted with the pick.
+    pub replacement: bool,
 }
 
 impl Default for PendingAlbum {
@@ -176,6 +186,9 @@ impl Default for PendingAlbum {
             ended: None,
             released: false,
             picked_guid: None,
+            album_hearts: Vec::new(),
+            filed: Vec::new(),
+            replacement: false,
         }
     }
 }
@@ -366,6 +379,9 @@ impl PendingAlbum {
         if self.picked_guid.is_none() {
             self.picked_guid = other.picked_guid;
         }
+        union(&mut self.album_hearts, other.album_hearts);
+        union(&mut self.filed, other.filed);
+        self.replacement |= other.replacement;
     }
 }
 
@@ -530,6 +546,10 @@ pub struct HeldPlacement {
     pub kept: bool,
     /// The follows it waits for, by foreign album id.
     pub follows: Vec<String>,
+    /// The people whose heart or play it was fetched or kept for: who may stop waiting for it,
+    /// and whose downloads list says it waits.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<String>,
 }
 
 /// What asking to stop waiting for Lidarr came to.
@@ -867,17 +887,27 @@ impl LidarrPendingAlbums {
 
     /// Whether a kept copy of the song waits for an open follow.
     pub fn kept_copy_waits(&self, song: &str) -> bool {
+        !self.kept_copies_waiting(song).is_empty()
+    }
+
+    /// The kept copies of the song that wait for an open follow.
+    pub fn kept_copies_waiting(&self, song: &str) -> Vec<HeldPlacement> {
         let listed = self.listed.lock();
-        listed.held.iter().any(|held| {
-            held.kept
-                && held.song == song
-                && held.follows.iter().any(|follow| {
-                    listed
-                        .albums
-                        .get(&key(follow))
-                        .is_some_and(PendingAlbum::following)
-                })
-        })
+        listed
+            .held
+            .iter()
+            .filter(|held| {
+                held.kept
+                    && held.song == song
+                    && held.follows.iter().any(|follow| {
+                        listed
+                            .albums
+                            .get(&key(follow))
+                            .is_some_and(PendingAlbum::following)
+                    })
+            })
+            .cloned()
+            .collect()
     }
 
     /// The follow lets go of what it held: each file no other open follow holds is taken off the
@@ -1268,9 +1298,11 @@ mod tests {
             target: "/music/Massive Attack/Mezzanine/01 - Angel.flac".into(),
             kept: true,
             follows: covering,
+            users: vec!["alice".into()],
         });
         assert!(pending.kept_waits("rg-1"));
         assert!(pending.kept_copy_waits("soulseek:angel"));
+        assert_eq!(pending.kept_copies_waiting("soulseek:angel")[0].users, ["alice"]);
 
         assert!(pending.request_end("rg-1", FollowEnd::Stopped));
         assert!(!pending.request_end("rg-1", FollowEnd::Stopped));

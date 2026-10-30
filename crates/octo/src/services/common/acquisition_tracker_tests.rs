@@ -634,6 +634,56 @@ fn a_held_row_is_let_go_only_once_no_hold_of_its_song_is_left() {
     assert!(tracker.all().is_empty(), "back to the usual rules");
 }
 
+/// A copy that waits aside for a Lidarr follow: the done row says so over its own line, never
+/// expires while it waits, and says its own line again once the wait ends, or keeps the line
+/// that says why it ended.
+#[test]
+fn a_row_whose_copy_waits_aside_says_so_outlives_a_day_and_ends_with_its_own_line() {
+    const WAITS: &str = "Plays now; joins your library when Lidarr's download for this artist finishes";
+    const PROVEN: &str = "Octo stopped waiting for Lidarr: another copy was proven";
+    let clock = ManualClock::new();
+    let tracker = tracker_at(&clock);
+    begin(&tracker, "kept", "alice");
+    tracker.done_line("soulseek", "kept", "Kept the version you heard");
+    tracker.complete("soulseek", "kept", None);
+    tracker.wait_aside("soulseek", "kept", &["alice".to_string()], WAITS);
+    assert_eq!(only(&tracker, "alice").note.as_deref(), Some(WAITS));
+    assert_eq!(only(&tracker, "alice").state, AcquisitionState::Done);
+
+    clock.advance(TimeDelta::hours(25));
+    assert_eq!(
+        only(&tracker, "alice").note.as_deref(),
+        Some(WAITS),
+        "still listed after a day"
+    );
+
+    tracker.end_aside("soulseek", "kept", None);
+    assert_eq!(
+        only(&tracker, "alice").note.as_deref(),
+        Some("Kept the version you heard"),
+        "its own line again"
+    );
+    clock.advance(TimeDelta::hours(4));
+    assert!(tracker.all().is_empty(), "back to the usual rules");
+
+    // A row a restart left out comes back, done, for the people the copy waits for; a proven
+    // copy that ended the wait is its last line.
+    tracker.wait_aside("soulseek", "again", &["bob".to_string()], WAITS);
+    let row = only(&tracker, "bob");
+    assert_eq!(row.state, AcquisitionState::Done);
+    assert_eq!(row.note.as_deref(), Some(WAITS));
+    tracker.end_aside("soulseek", "again", Some(PROVEN));
+    assert_eq!(only(&tracker, "bob").note.as_deref(), Some(PROVEN));
+    let lines: Vec<String> = tracker
+        .detail("soulseek:again", None)
+        .and_then(|row| row.events)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| event.text)
+        .collect();
+    assert_eq!(lines, [WAITS, PROVEN]);
+}
+
 // --- Seeing it in Navidrome ------------------------------------------------------------
 
 async fn wait_for(tracker: &AcquisitionTracker, user: &str, state: AcquisitionState) -> AcquisitionSnapshot {

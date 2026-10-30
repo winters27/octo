@@ -2,12 +2,13 @@
 
 use std::collections::HashMap;
 
+use octo_core::fingerprint::VerificationResult;
 use parking_lot::Mutex;
 
 use crate::services::fingerprint::download_verification_service::LabelSource;
 
 /// One file a Lidarr heart brought in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LidarrImport {
     /// Where Lidarr put the file, as Octo sees it, or where Octo holds it for its album.
     pub path: String,
@@ -20,6 +21,9 @@ pub struct LidarrImport {
     /// Where a file the checks refuse goes back to instead of being deleted: the album's hold
     /// folder, since a hearted song's refused candidate is still a track of the album.
     pub refused_to: Option<String>,
+    /// What the file's own sound proved when it was filed among a hearted album's tracks: it is
+    /// that track, and lands as this verdict says without being judged again.
+    pub filed: Option<Box<VerificationResult>>,
 }
 
 /// The files a Lidarr heart brought in, waiting for the download pipeline to take them by the
@@ -45,6 +49,7 @@ impl LidarrImportHandoff {
                 quiet,
                 labels: LabelSource::None,
                 refused_to: None,
+                filed: None,
             },
         );
     }
@@ -80,6 +85,7 @@ mod tests {
                 quiet: true,
                 labels: LabelSource::None,
                 refused_to: None,
+                filed: None,
             })
         );
         assert!(handoff.take("abc").is_none());

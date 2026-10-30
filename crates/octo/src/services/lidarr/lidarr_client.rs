@@ -22,7 +22,7 @@ use octo_core::lidarr::lidarr_client::{
 };
 use octo_core::lidarr::{
     LidarrAlbumCandidate, LidarrAlbumImportState, LidarrAlbumState, LidarrError, LidarrImportedTrack,
-    LidarrOptions, LidarrRelease, LidarrReleasePick, LidarrSearchStarted,
+    LidarrOptions, LidarrRelease, LidarrReleasePick,
 };
 use octo_core::settings::{LidarrSettings, SettingsStore};
 use reqwest::Method;
@@ -166,13 +166,6 @@ impl LidarrClient {
         Ok(None)
     }
 
-    pub async fn ensure_album_and_search(
-        &self,
-        candidate: &LidarrAlbumCandidate,
-    ) -> Result<i32, LidarrError> {
-        Ok(self.start_album_search(candidate, None).await?.album_id)
-    }
-
     /// The album as Lidarr has it now, or None when Lidarr does not have it yet.
     pub async fn find_album(&self, foreign_album_id: &str) -> Result<Option<LidarrAlbumState>, LidarrError> {
         let existing = self
@@ -188,17 +181,6 @@ impl LidarrClient {
                 monitored: nullable_bool(first, "monitored")?.unwrap_or(false),
             })),
         }
-    }
-
-    /// Monitor or unmonitor albums, leaving everything else about them alone.
-    pub async fn set_albums_monitored(&self, album_ids: &[i32], monitored: bool) -> Result<(), LidarrError> {
-        if album_ids.is_empty() {
-            return Ok(());
-        }
-        let body = json!({ "albumIds": album_ids, "monitored": monitored });
-        let request = self.request(Method::PUT, "/api/v1/album/monitor", Some(&body))?;
-        self.send(request).await?;
-        Ok(())
     }
 
     /// Delete one track file, from Lidarr and from disk (into Lidarr's recycle bin when it has one).
@@ -285,140 +267,12 @@ impl LidarrClient {
         }
     }
 
-    /// Adds the album when Lidarr lacks it, monitors it, and starts an AlbumSearch, or grabs the
-    /// release someone picked. Says whether the album was there before and monitored, so a
-    /// caller that only borrowed it can put it back.
-    pub async fn start_album_search(
-        &self,
-        candidate: &LidarrAlbumCandidate,
-        grab: Option<&LidarrReleasePick>,
-    ) -> Result<LidarrSearchStarted, LidarrError> {
-        let settings = self.require_settings(true)?;
-        let existing = self
-            .get_array(&format!(
-                "/api/v1/album?foreignAlbumId={}",
-                dotnet::escape_data_string(&candidate.foreign_album_id)
-            ))
-            .await?;
-
-        let album_id;
-        let artist_id;
-        let mut was_monitored = false;
-        if let Some(first) = existing.first() {
-            let mut resource = first.clone();
-            album_id = int_or_zero(&resource, "id")?;
-            artist_id = artist_id_of(&resource)?;
-            was_monitored = nullable_bool(&resource, "monitored")?.unwrap_or(false);
-            if !was_monitored {
-                resource.insert("monitored".into(), Value::Bool(true));
-                self.send_json(Method::PUT, &format!("/api/v1/album/{album_id}"), &resource)
-                    .await?;
-            }
-            self.ensure_artist_monitored(object(&resource, "artist")).await?;
-        } else {
-            let mut resource = candidate.resource.clone();
-            resource.shift_remove("id");
-            resource.insert("monitored".into(), Value::Bool(true));
-            resource.insert("addOptions".into(), json!({ "searchForNewAlbum": false }));
-
-            let artist = object(&resource, "artist").ok_or_else(|| {
-                LidarrError::InvalidOperation("Lidarr album lookup returned no artist resource.".into())
-            })?;
-            let foreign_artist_id = match nullable_str(artist, "foreignArtistId")? {
-                Some(id) => Some(id),
-                None => nullable_str(artist, "mbId")?,
-            };
-            let existing_artists = self.get_array("/api/v1/artist").await?;
-            let mut existing_artist = None;
-            if let Some(wanted) = foreign_artist_id.as_deref().filter(|id| !id.is_empty()) {
-                for a in &existing_artists {
-                    let id = match nullable_str(a, "foreignArtistId")? {
-                        Some(id) => Some(id),
-                        None => nullable_str(a, "mbId")?,
-                    };
-                    if id.as_deref().is_some_and(|id| dotnet::eq_ignore_case(id, wanted)) {
-                        existing_artist = Some(a);
-                        break;
-                    }
-                }
-            }
-            if let Some(existing_artist) = existing_artist {
-                resource.insert(
-                    "artistId".into(),
-                    Value::from(int_or_zero(existing_artist, "id")?),
-                );
-                resource.insert("artist".into(), Value::Object(existing_artist.clone()));
-            } else if let Some(Value::Object(artist)) = resource.get_mut("artist") {
-                artist.shift_remove("id");
-                artist.insert(
-                    "rootFolderPath".into(),
-                    settings
-                        .root_folder_path
-                        .clone()
-                        .map_or(Value::Null, Value::String),
-                );
-                artist.insert(
-                    "qualityProfileId".into(),
-                    Value::from(settings.quality_profile_id),
-                );
-                artist.insert(
-                    "metadataProfileId".into(),
-                    Value::from(settings.metadata_profile_id),
-                );
-                artist.insert("monitored".into(), Value::Bool(true));
-                artist.insert("monitorNewItems".into(), Value::from("none"));
-                artist.insert("tags".into(), json!([]));
-                // "none" would unmonitor the artist and, after its first refresh, this album too.
-                artist.insert(
-                    "addOptions".into(),
-                    json!({
-                        "monitor": "unknown",
-                        "albumsToMonitor": [candidate.foreign_album_id],
-                        "searchForMissingAlbums": false,
-                    }),
-                );
-            }
-
-            let added = self.send_json(Method::POST, "/api/v1/album", &resource).await?;
-            album_id = int_or_zero(&added, "id")?;
-            artist_id = artist_id_of(&added)?;
-            self.ensure_artist_monitored(existing_artist).await?;
-        }
-
-        if let Some(grab) = grab {
-            self.grab_picked(album_id, grab).await?;
-        } else {
-            self.wait_for_track_list(album_id, artist_id, &settings).await;
-            self.send_json(
-                Method::POST,
-                "/api/v1/command",
-                json!({ "name": "AlbumSearch", "albumIds": [album_id] })
-                    .as_object()
-                    .expect("an object literal"),
-            )
-            .await?;
-        }
-        Ok(LidarrSearchStarted {
-            album_id,
-            existed: !existing.is_empty(),
-            was_monitored,
-        })
-    }
-
-    /// How often [`LidarrClient::wait_for_track_list`] looks again.
+    /// How often [`LidarrClient::wait_for_tracks`] looks again.
     pub fn set_metadata_poll(&self, poll: Duration) {
         self.metadata_poll.store(
             poll.as_millis().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
         );
-    }
-
-    /// Waits for the album's track list as [`LidarrClient::wait_for_tracks`] does; the search
-    /// is started either way.
-    async fn wait_for_track_list(&self, album_id: i32, artist_id: i32, settings: &LidarrSettings) {
-        if !self.track_list(album_id, artist_id, settings).await {
-            warn!("Lidarr lists no tracks for album {album_id}; searching anyway");
-        }
     }
 
     /// Waits until Lidarr knows the album's tracks, so an AlbumSearch has something to match a
@@ -504,25 +358,6 @@ impl LidarrClient {
             return Ok(TrackListWait::Ready);
         }
         Ok(TrackListWait::Idle)
-    }
-
-    /// Lidarr neither upgrades nor re-searches albums of an unmonitored artist.
-    async fn ensure_artist_monitored(&self, artist: Option<&JsonObject>) -> Result<(), LidarrError> {
-        let Some(artist) = artist else {
-            return Ok(());
-        };
-        if nullable_bool(artist, "monitored")? != Some(false) {
-            return Ok(());
-        }
-        let id = int_or_zero(artist, "id")?;
-        let mut full = self.get_object(&format!("/api/v1/artist/{id}")).await?;
-        full.insert("monitored".into(), Value::Bool(true));
-        // Monitoring the artist again is for this album; it must not start fetching every
-        // release the artist puts out from now on.
-        full.insert("monitorNewItems".into(), Value::from("none"));
-        self.send_json(Method::PUT, &format!("/api/v1/artist/{id}"), &full)
-            .await?;
-        Ok(())
     }
 
     pub async fn get_album_tracks(&self, album_id: i32) -> Result<Vec<LidarrImportedTrack>, LidarrError> {

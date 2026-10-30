@@ -27,9 +27,11 @@ pub use lidarr_pending_albums::{
     PROVEN_ELSEWHERE, PendingAdd, PendingAlbum, REPLACED_YOURS, STOP_WAITING, SongGate, StopWaiting,
 };
 pub use lidarr_pick::{ALREADY_LOOKING, ArtistMusic, LidarrArtistMusic};
-pub use lidarr_track_fetcher::{ILidarrTrackFetcher, LidarrTrackFetcher};
+pub use lidarr_track_fetcher::{
+    ILidarrTrackFetcher, LidarrFetched, LidarrReplacements, LidarrTrackFetcher, OriginalSound,
+};
 pub use octo_core::lidarr::{
     LidarrAlbumCandidate, LidarrAlbumImportState, LidarrAlbumState, LidarrChoice, LidarrError,
-    LidarrImportedTrack, LidarrOptions, LidarrRelease, LidarrReleasePick, LidarrRootFolder,
-    LidarrSearchStarted, LidarrStep, LidarrTrackRequest,
+    LidarrImportedTrack, LidarrOptions, LidarrRelease, LidarrReleasePick, LidarrRootFolder, LidarrStep,
+    LidarrTrackRequest,
 };

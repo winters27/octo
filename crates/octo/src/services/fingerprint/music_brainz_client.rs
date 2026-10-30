@@ -1801,7 +1801,7 @@ impl HeartQuestions {
 
     /// The catalog album found from the song's album title: the first of the search's candidates
     /// whose album and tracks fit the song.
-    async fn catalog_album_by_title(
+    pub async fn catalog_album_by_title(
         &self,
         song: &HeartSong,
     ) -> Result<Option<(CatalogAlbum, Vec<CatalogTrack>)>, HeartBusy> {

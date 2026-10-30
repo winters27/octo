@@ -162,182 +162,6 @@ async fn connection_test_uses_entered_url_and_api_key_without_saving() {
 // octo_core::lidarr::lidarr_client's tests, with select_best_album.
 
 #[tokio::test]
-async fn new_album_uses_chosen_defaults_and_does_not_monitor_future_releases() {
-    let server = serve(|method, path| {
-        match (method, path) {
-            ("GET", "/api/v1/album") => "[]",
-            ("GET", "/api/v1/artist") => "[]",
-            ("POST", "/api/v1/album") => r#"{"id":42}"#,
-            ("GET", "/api/v1/track") => r#"[{"id":1}]"#,
-            ("POST", "/api/v1/command") => r#"{"id":9}"#,
-            _ => "[]",
-        }
-        .to_string()
-    })
-    .await;
-
-    let id = build(&server)
-        .ensure_album_and_search(&candidate("mbid", "Album", "Artist", Some(2020)))
-        .await
-        .expect("a search");
-
-    assert_eq!(id, 42);
-    let requests = requests(&server).await;
-    let adds: Vec<&Request> = requests
-        .iter()
-        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/api/v1/album")
-        .collect();
-    assert_eq!(adds.len(), 1);
-    let add = body(adds[0]);
-    assert_eq!(add["artist"]["rootFolderPath"], "/data/music");
-    assert_eq!(add["artist"]["qualityProfileId"], 3);
-    assert_eq!(add["artist"]["metadataProfileId"], 4);
-    assert_eq!(add["artist"]["monitorNewItems"], "none");
-    assert_eq!(add["artist"]["addOptions"]["monitor"], "unknown");
-    assert_eq!(add["artist"]["addOptions"]["albumsToMonitor"][0], "mbid");
-    let commands: Vec<&Request> = requests
-        .iter()
-        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/api/v1/command")
-        .collect();
-    assert_eq!(commands.len(), 1);
-    let command = String::from_utf8_lossy(&commands[0].body);
-    assert!(command.contains("AlbumSearch"));
-    assert!(command.contains("42"));
-}
-
-#[tokio::test]
-async fn existing_artist_settings_are_preserved_when_adding_album() {
-    let server = serve(|method, path| {
-        match (method, path) {
-            ("GET", "/api/v1/album") => "[]",
-            ("GET", "/api/v1/artist") => {
-                r#"[{"id":7,"foreignArtistId":"artist-mbid","path":"/existing/Artist","qualityProfileId":9,"metadataProfileId":10}]"#
-            }
-            ("POST", "/api/v1/album") => r#"{"id":42}"#,
-            ("GET", "/api/v1/track") => r#"[{"id":1}]"#,
-            ("POST", "/api/v1/command") => r#"{"id":9}"#,
-            _ => "[]",
-        }
-        .to_string()
-    })
-    .await;
-
-    build(&server)
-        .ensure_album_and_search(&candidate("mbid", "Album", "Artist", Some(2020)))
-        .await
-        .expect("a search");
-
-    let requests = requests(&server).await;
-    let adds: Vec<&Request> = requests
-        .iter()
-        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/api/v1/album")
-        .collect();
-    assert_eq!(adds.len(), 1);
-    let add = body(adds[0]);
-    assert_eq!(add["artistId"], 7);
-    assert_eq!(add["artist"]["path"], "/existing/Artist");
-    assert_eq!(add["artist"]["qualityProfileId"], 9);
-    assert_eq!(add["artist"]["metadataProfileId"], 10);
-}
-
-#[tokio::test]
-async fn unmonitored_existing_artist_is_monitored_and_otherwise_unchanged() {
-    let server = serve(|method, path| {
-        match (method, path) {
-            ("GET", "/api/v1/album") => {
-                r#"[{"id":12,"foreignAlbumId":"mbid","monitored":true,"artist":{"id":7,"monitored":false}}]"#
-            }
-            ("GET", "/api/v1/artist/7") => {
-                r#"{"id":7,"monitored":false,"monitorNewItems":"none","qualityProfileId":9}"#
-            }
-            ("PUT", "/api/v1/artist/7") => r#"{"id":7,"monitored":true}"#,
-            ("GET", "/api/v1/track") => r#"[{"id":1}]"#,
-            ("POST", "/api/v1/command") => r#"{"id":9}"#,
-            _ => "[]",
-        }
-        .to_string()
-    })
-    .await;
-
-    build(&server)
-        .ensure_album_and_search(&candidate("mbid", "Album", "Artist", Some(2020)))
-        .await
-        .expect("a search");
-
-    let requests = requests(&server).await;
-    let puts: Vec<&Request> = requests.iter().filter(|r| r.method.as_str() == "PUT").collect();
-    assert_eq!(puts.len(), 1);
-    let update = body(puts[0]);
-    assert_eq!(update["monitored"], true);
-    assert_eq!(update["monitorNewItems"], "none");
-    assert_eq!(update["qualityProfileId"], 9);
-}
-
-#[tokio::test]
-async fn a_remonitored_artist_does_not_start_following_new_releases() {
-    let server = serve(|method, path| {
-        match (method, path) {
-            ("GET", "/api/v1/album") => {
-                r#"[{"id":12,"foreignAlbumId":"mbid","monitored":true,"artist":{"id":7,"monitored":false}}]"#
-            }
-            ("GET", "/api/v1/artist/7") => {
-                r#"{"id":7,"monitored":false,"monitorNewItems":"all","qualityProfileId":9}"#
-            }
-            ("PUT", "/api/v1/artist/7") => r#"{"id":7,"monitored":true}"#,
-            ("GET", "/api/v1/track") => r#"[{"id":1}]"#,
-            ("POST", "/api/v1/command") => r#"{"id":9}"#,
-            _ => "[]",
-        }
-        .to_string()
-    })
-    .await;
-
-    build(&server)
-        .ensure_album_and_search(&candidate("mbid", "Album", "Artist", Some(2020)))
-        .await
-        .expect("a search");
-
-    let requests = requests(&server).await;
-    let puts: Vec<&Request> = requests.iter().filter(|r| r.method.as_str() == "PUT").collect();
-    assert_eq!(puts.len(), 1);
-    let update = body(puts[0]);
-    assert_eq!(update["monitored"], true);
-    assert_eq!(update["monitorNewItems"], "none");
-    assert_eq!(update["qualityProfileId"], 9);
-}
-
-#[tokio::test]
-async fn existing_album_is_monitored_without_changing_its_artist() {
-    let server = serve(|method, path| {
-        match (method, path) {
-            ("GET", "/api/v1/album") => {
-                r#"[{"id":12,"foreignAlbumId":"mbid","monitored":false,"artist":{"id":7,"qualityProfileId":9}}]"#
-            }
-            ("PUT", "/api/v1/album/12") => r#"{"id":12,"monitored":true}"#,
-            ("GET", "/api/v1/track") => r#"[{"id":1}]"#,
-            ("POST", "/api/v1/command") => r#"{"id":9}"#,
-            _ => "[]",
-        }
-        .to_string()
-    })
-    .await;
-
-    let id = build(&server)
-        .ensure_album_and_search(&candidate("mbid", "Album", "Artist", Some(2020)))
-        .await
-        .expect("a search");
-
-    assert_eq!(id, 12);
-    let requests = requests(&server).await;
-    let puts: Vec<&Request> = requests.iter().filter(|r| r.method.as_str() == "PUT").collect();
-    assert_eq!(puts.len(), 1);
-    let update = body(puts[0]);
-    assert_eq!(update["monitored"], true);
-    assert_eq!(update["artist"]["qualityProfileId"], 9);
-    assert!(!requests.iter().any(|r| r.url.path() == "/api/v1/artist"));
-}
-
-#[tokio::test]
 async fn album_tracks_join_track_files_returned_by_separate_endpoint() {
     let server = serve(|_, path| {
         match path {
@@ -456,8 +280,9 @@ async fn adding_an_album_needs_the_root_folder_and_both_profiles() {
     })));
     assert_eq!(
         client
-            .start_album_search(&candidate("mbid", "Album", "Artist", None), None)
-            .await,
+            .add_album(&candidate("mbid", "Album", "Artist", None), None)
+            .await
+            .map(|added| added.album_id),
         Err(LidarrError::InvalidOperation(
             "Choose a Lidarr root folder, quality profile, and metadata profile.".into()
         ))
@@ -563,14 +388,10 @@ async fn releases_are_listed_with_their_quality_and_why_lidarr_rejects_one() {
 }
 
 #[tokio::test]
-async fn a_picked_release_is_grabbed_instead_of_an_album_search() {
+async fn a_picked_release_is_grabbed_with_no_album_search() {
     let server = serve(|method, path| {
         match (method, path) {
-            ("GET", "/api/v1/album") => {
-                r#"[{"id":12,"foreignAlbumId":"mbid","monitored":true,"artist":{"id":7,"monitored":true}}]"#
-            }
             ("POST", "/api/v1/release") => r#"{"guid":"a1"}"#,
-            ("GET", "/api/v1/track") => r#"[{"id":1}]"#,
             ("POST", "/api/v1/command") => r#"{"id":9}"#,
             _ => "[]",
         }
@@ -584,12 +405,9 @@ async fn a_picked_release_is_grabbed_instead_of_an_album_search() {
         size: None,
     };
 
-    let started = build(&server)
-        .start_album_search(&candidate("mbid", "Album", "Artist", Some(2020)), Some(&pick))
-        .await
-        .expect("started");
+    let guid = build(&server).grab_picked(12, &pick).await.expect("grabbed");
 
-    assert_eq!(started.album_id, 12);
+    assert_eq!(guid, "a1");
     let requests = requests(&server).await;
     assert!(!requests.iter().any(|r| r.url.path() == "/api/v1/command"));
     let grabs: Vec<&Request> = requests
@@ -779,19 +597,21 @@ fn log_of(fake: &RefreshingLidarr) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn an_album_that_has_its_tracks_is_searched_without_waiting() {
+async fn an_album_that_has_its_tracks_needs_no_wait() {
     let (fake, server) = refreshing_lidarr(true, None, 0, false).await;
 
-    build_waiting(&server, 60)
-        .ensure_album_and_search(&candidate("mbid", "Album", "Artist", Some(2020)))
-        .await
-        .expect("a search");
+    assert!(
+        build_waiting(&server, 60)
+            .wait_for_tracks(12, 7)
+            .await
+            .expect("asked")
+    );
 
-    assert_eq!(log_of(&fake), ["tracks", "AlbumSearch"]);
+    assert_eq!(log_of(&fake), ["tracks"]);
 }
 
 #[tokio::test]
-async fn an_album_search_waits_for_the_artist_refresh_already_running() {
+async fn the_wait_for_tracks_waits_for_the_artist_refresh_already_running() {
     let (fake, server) = refreshing_lidarr(
         false,
         Some(("RefreshArtist", json!({ "artistIds": [7] }))),
@@ -800,30 +620,29 @@ async fn an_album_search_waits_for_the_artist_refresh_already_running() {
     )
     .await;
 
-    build_waiting(&server, 60)
-        .ensure_album_and_search(&candidate("mbid", "Album", "Artist", Some(2020)))
-        .await
-        .expect("a search");
+    assert!(
+        build_waiting(&server, 60)
+            .wait_for_tracks(12, 7)
+            .await
+            .expect("asked")
+    );
 
     let log = log_of(&fake);
-    assert_eq!(log.last().map(String::as_str), Some("AlbumSearch"));
+    assert_eq!(log.last().map(String::as_str), Some("tracks"));
     assert!(!log.iter().any(|step| step == "RefreshAlbum"), "{log:?}");
-    let searched_after = log
-        .iter()
-        .rposition(|step| step == "tracks")
-        .expect("tracks looked at");
-    assert_eq!(searched_after, log.len() - 2, "{log:?}");
     assert!(fake.state.lock().has_tracks);
 }
 
 #[tokio::test]
-async fn an_album_with_no_tracks_and_no_refresh_gets_one_refresh_album_first() {
+async fn an_album_with_no_tracks_and_no_refresh_gets_one_refresh_album() {
     let (fake, server) = refreshing_lidarr(false, None, 1, true).await;
 
-    build_waiting(&server, 60)
-        .ensure_album_and_search(&candidate("mbid", "Album", "Artist", Some(2020)))
-        .await
-        .expect("a search");
+    assert!(
+        build_waiting(&server, 60)
+            .wait_for_tracks(12, 7)
+            .await
+            .expect("asked")
+    );
 
     let requests = requests(&server).await;
     let refreshes: Vec<Value> = requests
@@ -834,27 +653,19 @@ async fn an_album_with_no_tracks_and_no_refresh_gets_one_refresh_album_first() {
         .collect();
     assert_eq!(refreshes.len(), 1);
     assert_eq!(refreshes[0]["albumId"], 12);
-    let log = log_of(&fake);
-    let refresh = log
-        .iter()
-        .position(|step| step == "RefreshAlbum")
-        .expect("a refresh");
-    let search = log
-        .iter()
-        .position(|step| step == "AlbumSearch")
-        .expect("a search");
-    assert!(refresh < search, "{log:?}");
     assert!(fake.state.lock().has_tracks);
 }
 
 #[tokio::test]
-async fn a_refresh_that_brings_no_tracks_is_asked_once_and_the_search_still_starts() {
+async fn a_refresh_that_brings_no_tracks_is_asked_once_and_says_so() {
     let (fake, server) = refreshing_lidarr(false, None, 1, false).await;
 
-    build_waiting(&server, 60)
-        .ensure_album_and_search(&candidate("mbid", "Album", "Artist", Some(2020)))
-        .await
-        .expect("a search");
+    assert!(
+        !build_waiting(&server, 60)
+            .wait_for_tracks(12, 7)
+            .await
+            .expect("asked")
+    );
 
     let log = log_of(&fake);
     assert_eq!(
@@ -862,11 +673,10 @@ async fn a_refresh_that_brings_no_tracks_is_asked_once_and_the_search_still_star
         1,
         "{log:?}"
     );
-    assert_eq!(log.last().map(String::as_str), Some("AlbumSearch"));
 }
 
 #[tokio::test]
-async fn a_refresh_that_never_ends_holds_the_search_only_until_the_import_timeout() {
+async fn a_refresh_that_never_ends_is_waited_for_only_until_the_import_timeout() {
     let (fake, server) = refreshing_lidarr(
         false,
         Some(("RefreshAlbum", json!({ "albumId": 12 }))),
@@ -876,14 +686,15 @@ async fn a_refresh_that_never_ends_holds_the_search_only_until_the_import_timeou
     .await;
 
     let started = std::time::Instant::now();
-    build_waiting(&server, 1)
-        .ensure_album_and_search(&candidate("mbid", "Album", "Artist", Some(2020)))
-        .await
-        .expect("a search");
+    assert!(
+        !build_waiting(&server, 1)
+            .wait_for_tracks(12, 7)
+            .await
+            .expect("asked")
+    );
 
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     let log = log_of(&fake);
-    assert_eq!(log.last().map(String::as_str), Some("AlbumSearch"));
     assert!(!log.iter().any(|step| step == "RefreshAlbum"), "{log:?}");
 }
 

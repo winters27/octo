@@ -19,7 +19,9 @@ use tracing::{debug, info, warn};
 
 use super::TrackAcquisitionQueue;
 use super::acquisition_tracker::key_of;
-use super::album_gates::{AlbumGate, AlbumGateHold, AlbumGateTrack, AlbumGates, tracks_wait_line};
+use super::album_gates::{
+    AlbumGate, AlbumGateHold, AlbumGateTrack, AlbumGates, TrackFiling, tracks_wait_line,
+};
 use super::soulseek_hold_store::{HeldAlbumTrack, Holder};
 use super::{
     AcquisitionHeld, AcquisitionState, AcquisitionTarget, AcquisitionTracker, HeldAcquisition, HeldKind,
@@ -28,7 +30,9 @@ use super::{
 use crate::services::family::{FamilyPool, LibraryScope, LibraryWriteGate, WriteDecision};
 use crate::services::fingerprint::MusicBrainzClient;
 use crate::services::fingerprint::acoust_id_rate_limiter::{AcoustIdRateLimiter, LookupClass};
-use crate::services::fingerprint::download_verification_service::{ANOTHER_SONG_PLAYED, NEVER_PLAYED};
+use crate::services::fingerprint::download_verification_service::{
+    ANOTHER_SONG_PLAYED, LabelSource, NEVER_PLAYED,
+};
 use crate::services::i_download_service::IDownloadService;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::imports::trickle_worker::{TrickleCheckLater, WAITING_FOR_ANSWER};
@@ -109,6 +113,24 @@ pub trait HeartGates: Send + Sync {
         _gates: &[HeartGate],
     ) -> Vec<GateVerdict> {
         Vec::new()
+    }
+
+    /// Files one file of a hearted album's whole import among the gate's `unfilled` tracks (their
+    /// places in its list) by its own sound, its labels read from `labels`: where it is filed and,
+    /// for a file that lands, the verdict it is tagged by. Without a way to judge it, nothing
+    /// proves it is any of them.
+    async fn file_album_file(
+        &self,
+        _path: &std::path::Path,
+        _labels: LabelSource,
+        _gate: &AlbumGate,
+        _unfilled: &[usize],
+        _acquisition_key: &str,
+    ) -> (TrackFiling, Option<octo_core::fingerprint::VerificationResult>) {
+        (
+            TrackFiling::Refuse(octo_core::fingerprint::heart_gate::Refusal::Unknown),
+            None,
+        )
     }
 }
 
@@ -1352,9 +1374,9 @@ impl HeartAcquisitionCoordinator {
         }
     }
 
-    /// The tracks a walk of a hearted album held, filed as held album tracks of `user`'s heart,
-    /// each with its files, and the album's row.
-    fn file_album_holds(
+    /// The tracks a walk (or Lidarr's import) of a hearted album held, filed as held album tracks
+    /// of `user`'s heart, each with its files, and the album's row.
+    pub(crate) fn file_album_holds(
         &self,
         provider: &str,
         album_external_id: &str,
@@ -3210,11 +3232,16 @@ impl HeartAcquisitionCoordinator {
         for (index, &step) in steps.iter().enumerate() {
             let is_last = index == steps.len() - 1;
             if step == HeartDownloadSource::Lidarr {
-                if self
+                let landed = self
                     .lidarr
                     .try_acquire_album(provider, album_external_id, is_last, requested_by, origin, &[])
-                    .await?
-                {
+                    .await;
+                // The tracks Lidarr's import held wait as held album tracks; the next walk leaves
+                // them.
+                if let Some(user) = user {
+                    self.file_album_holds(provider, album_external_id, user, origin);
+                }
+                if landed? {
                     return Ok(());
                 }
                 continue;

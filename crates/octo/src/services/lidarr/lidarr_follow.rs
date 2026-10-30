@@ -720,6 +720,8 @@ impl Inner {
 
         let octo_root = self.music.octo_root();
         let gated = job.gated();
+        let by_sound = !gated && job.files_by_sound() && self.gates.is_some();
+        let replacement_only = job.replacement_only();
         let mut held_any = false;
         let mut tracks: HashMap<i32, Vec<LidarrImportedTrack>> = HashMap::new();
         for file in mine {
@@ -774,6 +776,20 @@ impl Inner {
                 .get(&file.id)
                 .and_then(|row| row.dropped_path())
                 .and_then(|dropped| self.delivered(dropped, settings));
+            // A replacement's fetch waiting for this song takes it first.
+            if self
+                .deliver_fetched(&run.key, &track, &imported_path, dropped.clone())
+                .await
+            {
+                continue;
+            }
+            if replacement_only {
+                // Nothing else of a replacement's album is the library's: held out of it, and
+                // deleted with the pick once the follow ends.
+                self.hold_track(&run.key, &track, file.album_id, &imported_path, dropped)
+                    .await;
+                continue;
+            }
             if gated {
                 // A hearted song's album: every track waits in the hold folder until one passes.
                 if self
@@ -781,6 +797,17 @@ impl Inner {
                     .await
                 {
                     held_any = true;
+                }
+                continue;
+            }
+            if by_sound {
+                // A hearted album's import: each file is filed among the album's tracks by its own
+                // sound, never by where Lidarr put it.
+                if let Some(handoff) = self
+                    .file_album_import(job, &run.key, &track, imported_path, dropped)
+                    .await
+                {
+                    run.handed.push(handoff);
                 }
                 continue;
             }
@@ -1084,17 +1111,13 @@ impl Inner {
                 held.song, held.held_path
             ),
         }
-        if why == FollowEnd::ProvenElsewhere
-            && let Some(tracker) = &self.tracker
+        // The row stops saying it waits for Lidarr; a proven copy that ended the wait is its last
+        // line.
+        if let Some(tracker) = &self.tracker
             && let Some((provider, id)) = held.song.split_once(':')
         {
-            tracker.log(
-                provider,
-                id,
-                acquisition_event_kinds::NOTE,
-                PROVEN_ELSEWHERE,
-                None,
-            );
+            let last = (why == FollowEnd::ProvenElsewhere).then_some(PROVEN_ELSEWHERE);
+            tracker.end_aside(provider, id, last);
         }
     }
 
@@ -1159,6 +1182,8 @@ impl Inner {
             });
         }
         job.end();
+        // Nothing more is filed against the hearted albums' gates.
+        job.gate_holds.lock().clear();
         {
             let job_key = dotnet::ordinal_ignore_case_key(&key);
             let mut jobs = self.jobs.lock();

@@ -1766,6 +1766,8 @@ fn lidarr_request(target: &FindTarget) -> LidarrTrackRequest {
         original_path: target.owned_path.clone(),
         release: None,
         step: None,
+        song: None,
+        recordings: Vec::new(),
     }
 }
 

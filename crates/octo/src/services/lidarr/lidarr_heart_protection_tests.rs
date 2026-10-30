@@ -352,6 +352,8 @@ struct Options {
     /// none of the files lying in Lidarr's folders.
     octo_root: Option<PathBuf>,
     rounds: Option<PauseRounds>,
+    album_gates: Option<Arc<AlbumGates>>,
+    gates: Option<Arc<dyn HeartGates>>,
 }
 
 fn upgrades_on() -> LibraryActionSettings {
@@ -551,6 +553,8 @@ impl Fixture {
                 pending: Some(self.pending.clone()),
                 catalog: options.catalog,
                 rounds: options.rounds,
+                album_gates: options.album_gates,
+                gates: options.gates,
             },
         );
         service.set_poll_override(Some(Duration::from_millis(20)));
@@ -1907,6 +1911,12 @@ mod follow;
 
 #[path = "lidarr_hold_folder_tests.rs"]
 mod hold_folder;
+
+#[path = "lidarr_album_heart_tests.rs"]
+mod album_heart;
+
+#[path = "lidarr_track_fetcher_tests.rs"]
+mod fetcher;
 
 #[path = "lidarr_health_tests.rs"]
 mod health;

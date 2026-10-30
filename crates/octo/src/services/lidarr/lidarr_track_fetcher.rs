@@ -1,69 +1,82 @@
-//! One song fetched through Lidarr for a replacement. The request, the track match and the
-//! lossless test are `octo_core::lidarr::lidarr_track_fetcher`.
+//! One song fetched through Lidarr for a replacement. Lidarr fetches whole albums, so a
+//! replacement borrows one under the rules a heart's pick follows: Lidarr only for an artist with
+//! no music in the user's Lidarr, only an album that is unmonitored with no queue item, monitoring
+//! never turned on, and the search pinned to a release that carries the original's recording when
+//! that is known. Everything after the search is the heart service's own follow
+//! (`lidarr_heart_acquisition_service`): Octo's grabs by their search windows, each imported file
+//! Octo's only by its own row, a file of the user's making Octo step aside. The song's own file of
+//! Octo's import is handed to the replacement; every other file of Octo's is held out of the
+//! library and deleted, and the album is put back once Lidarr is done with Octo's downloads, the
+//! caller's wait or not. The request, the track match and the lossless test are
+//! `octo_core::lidarr::lidarr_track_fetcher`.
 
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use futures::FutureExt;
-use futures::future::{BoxFuture, Shared};
+use futures::future::BoxFuture;
 use octo_core::common::dotnet;
 use octo_core::lidarr::lidarr_track_fetcher::{is_lossless, match_track};
-use octo_core::lidarr::{
-    LidarrAlbumCandidate, LidarrError, LidarrImportedTrack, LidarrReleasePick, LidarrSearchStarted,
-    LidarrTrackRequest,
-};
+use octo_core::lidarr::{LidarrAlbumCandidate, LidarrError, LidarrImportedTrack, LidarrTrackRequest};
 use octo_core::settings::{LidarrSettings, SettingsStore};
-use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::lidarr_heart_acquisition_service::{same_path, translate_imported_path};
 use super::{LidarrAlbumClaims, LidarrClient};
+use crate::services::fingerprint::download_verification_service::LabelSource;
 use crate::services::library::UpgradeSources;
 use crate::services::subsonic::NavidromeIdentityService;
 
+/// A song Lidarr brought for a replacement: the copy, and where its own labels are read from
+/// (Lidarr's own matching is never one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LidarrFetched {
+    pub path: String,
+    pub labels: LabelSource,
+}
+
 #[async_trait]
 pub trait ILidarrTrackFetcher: Send + Sync {
-    /// Fetches one song through Lidarr and copies it into `destination_directory`, returning the
-    /// copy's path. [`LidarrError::FileNotFound`] when Lidarr has no album for it, or found no
-    /// good enough copy in time.
+    /// Fetches one song through Lidarr and moves it into `destination_directory`, answering the
+    /// copy. [`LidarrError::FileNotFound`] when Lidarr has no album for it or brought no good
+    /// enough copy in time; [`LidarrError::InvalidOperation`] when Lidarr is not used for it.
     async fn fetch(
         &self,
         request: &LidarrTrackRequest,
         destination_directory: &str,
         ct: &CancellationToken,
-    ) -> Result<String, LidarrError>;
+    ) -> Result<LidarrFetched, LidarrError>;
 }
 
-/// A task several callers await, which runs whether or not any of them still is.
-type SharedTask<T> = Shared<BoxFuture<'static, Result<T, LidarrError>>>;
+/// The heart service's side of a replacement's fetch: the pick under Lidarr's rules and its
+/// follow.
+#[async_trait]
+pub trait LidarrReplacements: Send + Sync {
+    /// Fetches the song from `album` as a pick does, its search followed until every download of
+    /// Octo's is accounted for, and answers the song's own file of Octo's import, moved into
+    /// `destination`, once it is in. The answer waits up to Lidarr's import timeout; the follow
+    /// goes on after.
+    async fn fetch_from(
+        &self,
+        album: LidarrAlbumCandidate,
+        request: &LidarrTrackRequest,
+        destination: &str,
+        ct: &CancellationToken,
+    ) -> Result<LidarrFetched, LidarrError>;
 
-fn spawn_shared<T: Clone + Send + Sync + 'static>(
-    work: impl Future<Output = Result<T, LidarrError>> + Send + 'static,
-) -> SharedTask<T> {
-    let handle = tokio::spawn(work);
-    async move {
-        handle
-            .await
-            .unwrap_or_else(|e| Err(LidarrError::InvalidOperation(e.to_string())))
-    }
-    .boxed()
-    .shared()
+    /// The walk's first pick for the request's recordings: the release group the walk asks Lidarr
+    /// for first.
+    async fn first_pick(&self, request: &LidarrTrackRequest) -> Option<String>;
 }
+
+/// The recordings a library file's own sound reads clear as (its path and length), or none.
+pub type OriginalSound = Arc<dyn Fn(String, Option<i32>) -> BoxFuture<'static, Vec<String>> + Send + Sync>;
 
 /// `ManagedText`: why a song Lidarr manages is left to it.
 pub const MANAGED_TEXT: &str = "Lidarr manages this file itself, so it was left to Lidarr: a quality profile that wants lossless upgrades it there.";
 
-/// One song through Lidarr, for a replacement. Lidarr only fetches whole albums, so this borrows
-/// the album: it searches it, copies out the one song asked for, then deletes every file that
-/// search brought in and puts the album's monitoring back the way it was, so nothing else lands
-/// in the library and Lidarr does not fetch the album again. The copy then goes through the same
-/// checks and the same swap as a Soulseek download.
-///
-/// Two songs of one album share one search; the clean up waits for the last of them.
+/// One song through Lidarr, for a replacement.
 #[derive(Clone)]
 pub struct LidarrTrackFetcher {
     inner: Arc<Inner>,
@@ -75,23 +88,10 @@ struct Inner {
     settings: Arc<SettingsStore>,
     nav_identity: NavidromeIdentityService,
     claims: Arc<LidarrAlbumClaims>,
-    poll: Mutex<Duration>,
-    /// By foreign album id, ignoring case; its lock also guards joining and leaving a session.
-    sessions: Mutex<HashMap<String, Arc<Session>>>,
-}
-
-struct Session {
-    candidate: LidarrAlbumCandidate,
-    state: Mutex<SessionState>,
-}
-
-#[derive(Default)]
-struct SessionState {
-    users: usize,
-    before: Option<SharedTask<Arc<Vec<LidarrImportedTrack>>>>,
-    search: Option<SharedTask<LidarrSearchStarted>>,
-    /// The release the album's search grabbed, when it was a pick.
-    grabbed: Option<LidarrReleasePick>,
+    /// The pick and its follow, set once the heart service is built.
+    replacements: OnceLock<Arc<dyn LidarrReplacements>>,
+    /// What an original's own sound reads as, set once what reads it is built.
+    original_sound: OnceLock<OriginalSound>,
 }
 
 impl LidarrTrackFetcher {
@@ -107,35 +107,31 @@ impl LidarrTrackFetcher {
                 settings,
                 nav_identity,
                 claims,
-                poll: Mutex::new(Duration::from_secs(10)),
-                sessions: Mutex::new(HashMap::new()),
+                replacements: OnceLock::new(),
+                original_sound: OnceLock::new(),
             }),
         }
     }
 
-    /// `Poll`: how often Lidarr is asked whether the song is in.
-    pub fn set_poll(&self, poll: Duration) {
-        *self.inner.poll.lock() = poll;
+    /// Who runs a fetch's pick and its follow: the heart service.
+    pub fn use_replacements(&self, replacements: Arc<dyn LidarrReplacements>) {
+        let _ = self.inner.replacements.set(replacements);
+    }
+
+    /// Who reads what a library file's own sound is.
+    pub fn use_original_sound(&self, sound: OriginalSound) {
+        let _ = self.inner.original_sound.set(sound);
     }
 
     /// The album a song is on, found as a fetch finds it: from the original's own release group
-    /// tag, then by its album name. Find songs lists that album's releases.
+    /// tag, then by its album name, then the walk's first pick for the recordings the request
+    /// names. Find songs lists that album's releases.
     pub async fn find_album(
         &self,
         request: &LidarrTrackRequest,
         ct: &CancellationToken,
     ) -> Result<Option<LidarrAlbumCandidate>, LidarrError> {
         self.inner.find_album(request, ct).await
-    }
-
-    /// How many fetches share the album's search now, for tests that start two.
-    #[cfg(test)]
-    pub(crate) fn users_of(&self, foreign_album_id: &str) -> usize {
-        self.inner
-            .sessions
-            .lock()
-            .get(&dotnet::ordinal_ignore_case_key(foreign_album_id))
-            .map_or(0, |s| s.state.lock().users)
     }
 }
 
@@ -146,9 +142,9 @@ impl ILidarrTrackFetcher for LidarrTrackFetcher {
         request: &LidarrTrackRequest,
         destination_directory: &str,
         ct: &CancellationToken,
-    ) -> Result<String, LidarrError> {
-        // Run as a task of its own, so the clean up in its finally always runs, even for a
-        // caller that stops waiting.
+    ) -> Result<LidarrFetched, LidarrError> {
+        // A task of its own, so the album's claim is always let go, even for a caller that stops
+        // waiting.
         let inner = self.inner.clone();
         let request = request.clone();
         let destination = destination_directory.to_string();
@@ -173,19 +169,28 @@ async fn cancellable<T>(
 
 impl Inner {
     async fn fetch(
-        self: &Arc<Self>,
+        &self,
         request: &LidarrTrackRequest,
         destination_directory: &str,
         ct: &CancellationToken,
-    ) -> Result<String, LidarrError> {
+    ) -> Result<LidarrFetched, LidarrError> {
         let current = self.settings.current().lidarr.clone();
         if !UpgradeSources::lidarr_set_up(&current) {
             return Err(LidarrError::InvalidOperation(
                 "Lidarr is not set up: it needs an address, a key, a root folder and both profiles.".into(),
             ));
         }
+        let Some(replacements) = self.replacements.get().cloned() else {
+            return Err(LidarrError::InvalidOperation(
+                "Lidarr is not available on this server.".into(),
+            ));
+        };
+        let mut request = request.clone();
+        if request.recordings.is_empty() {
+            request.recordings = self.original_recordings(&request).await;
+        }
 
-        let candidate = self.find_album(request, ct).await?.ok_or_else(|| {
+        let candidate = self.find_album(&request, ct).await?.ok_or_else(|| {
             LidarrError::FileNotFound(format!(
                 "Lidarr knows no album with '{} - {}' on it.",
                 request.artist, request.title
@@ -199,83 +204,39 @@ impl Inner {
         }
 
         self.claims.upgrade_started(&key);
-        let session_key = dotnet::ordinal_ignore_case_key(&key);
-        let session = {
-            let mut sessions = self.sessions.lock();
-            let session = sessions
-                .entry(session_key.clone())
-                .or_insert_with(|| {
-                    Arc::new(Session {
-                        candidate,
-                        state: Mutex::new(SessionState::default()),
-                    })
-                })
-                .clone();
-            let mut state = session.state.lock();
-            state.users += 1;
-            if state.before.is_none() {
-                let this = self.clone();
-                let candidate = session.candidate.clone();
-                state.before = Some(spawn_shared(async move { this.snapshot(&candidate).await }));
+        let result = match self.already_there(&candidate, &request, &current, ct).await {
+            Ok(()) => {
+                replacements
+                    .fetch_from(candidate, &request, destination_directory, ct)
+                    .await
             }
-            drop(state);
-            session
+            Err(e) => Err(e),
         };
-        let result = self
-            .fetch_from(&session, request, destination_directory, &current, ct)
-            .await;
-
-        // finally
-        let last = {
-            let mut sessions = self.sessions.lock();
-            let mut state = session.state.lock();
-            state.users -= 1;
-            let last = state.users == 0;
-            if last
-                && sessions
-                    .get(&session_key)
-                    .is_some_and(|s| Arc::ptr_eq(s, &session))
-            {
-                sessions.remove(&session_key);
-            }
-            last
-        };
-        if last {
-            self.clean_up(&session).await;
-        }
         self.claims.upgrade_ended(&key);
         result
     }
 
-    async fn fetch_from(
-        self: &Arc<Self>,
-        session: &Arc<Session>,
+    /// Refuses a song whose copy Lidarr already has in the library: one Lidarr manages itself
+    /// (the very file being replaced), or a lossless one.
+    async fn already_there(
+        &self,
+        candidate: &LidarrAlbumCandidate,
         request: &LidarrTrackRequest,
-        destination_directory: &str,
         current: &LidarrSettings,
         ct: &CancellationToken,
-    ) -> Result<String, LidarrError> {
+    ) -> Result<(), LidarrError> {
+        let Some(existing) = cancellable(ct, self.client.find_album(&candidate.foreign_album_id)).await?
+        else {
+            return Ok(());
+        };
+        let tracks = cancellable(ct, self.client.get_album_tracks(existing.id)).await?;
         let octo_root = self.nav_identity.effective_download_path(
             &self
                 .settings
                 .raw("Library:DownloadPath")
                 .unwrap_or_else(|| "/music".to_string()),
         );
-        let before_task = session
-            .state
-            .lock()
-            .before
-            .clone()
-            .expect("set when the session was joined");
-        let before = before_task.await?;
-        let before_ids: HashSet<i32> = before
-            .iter()
-            .filter(|t| t.track_file_id > 0)
-            .map(|t| t.track_file_id)
-            .collect();
-
-        // What Lidarr had for this song before anything was searched.
-        if let Some(had) = match_track(before.iter().filter(|t| t.has_file), request)
+        if let Some(had) = match_track(tracks.iter().filter(|t| t.has_file), request)
             && let Some(had_path) = visible(had, current, &octo_root)
         {
             if let Some(original) = &request.original_path
@@ -289,192 +250,43 @@ impl Inner {
                 )));
             }
         }
-
-        let (search, joined, grabbed) = {
-            let mut state = session.state.lock();
-            let joined = state.search.is_some();
-            if !joined {
-                state.grabbed = request.release.clone();
-                let client = self.client.clone();
-                let candidate = session.candidate.clone();
-                let grab = request.release.clone();
-                // No caller's token: the search is the album's, not this caller's.
-                state.search = Some(spawn_shared(async move {
-                    client.start_album_search(&candidate, grab.as_ref()).await
-                }));
-            }
-            (
-                state.search.clone().expect("just set"),
-                joined,
-                state.grabbed.clone(),
-            )
-        };
-        if let Some(pick) = &request.release {
-            if !joined || grabbed.as_ref().is_some_and(|g| g.guid == pick.guid) {
-                if let Some(step) = &request.step {
-                    step.tell("Grabbing the release you picked", pick.title.as_deref());
-                }
-            } else {
-                // One album, one search: the song comes from the one already running, not the
-                // pick.
-                info!(
-                    "Lidarr is already fetching '{} - {}', so the release picked for '{}' ({}) is not grabbed",
-                    session.candidate.artist,
-                    session.candidate.title,
-                    request.title,
-                    pick.title.as_deref().unwrap_or_default()
-                );
-                if let Some(step) = &request.step {
-                    step.tell(
-                        "Lidarr is already fetching this album, so the release you picked was not grabbed",
-                        Some("The song comes from the album's search already running"),
-                    );
-                }
-            }
-        }
-        let started = search.await?;
-        info!(
-            "Lidarr is searching '{} - {}' for a copy of '{}'",
-            session.candidate.artist, session.candidate.title, request.title
-        );
-
-        let timeout = Duration::from_secs(current.import_timeout_seconds.max(1) as u64);
-        let deadline = Instant::now() + timeout;
-        loop {
-            if ct.is_cancelled() {
-                return Err(LidarrError::operation_canceled());
-            }
-            let tracks = cancellable(ct, self.client.get_album_tracks(started.album_id)).await?;
-            let fresh = tracks.iter().filter(|t| {
-                t.has_file
-                    && t.track_file_id > 0
-                    && !before_ids.contains(&t.track_file_id)
-                    && (!request.lossless_only || is_lossless(t))
-            });
-            if let Some(found) = match_track(fresh, request)
-                && let Some(path) = visible(found, current, &octo_root)
-            {
-                tokio::fs::create_dir_all(destination_directory)
-                    .await
-                    .map_err(|e| LidarrError::Io(e.to_string()))?;
-                let copy = Path::new(destination_directory)
-                    .join(format!(
-                        "lidarr-{}{}",
-                        uuid::Uuid::new_v4().simple(),
-                        get_extension(&path)
-                    ))
-                    .to_string_lossy()
-                    .into_owned();
-                tokio::fs::copy(&path, &copy)
-                    .await
-                    .map_err(|e| LidarrError::Io(e.to_string()))?;
-                info!(
-                    "Lidarr brought '{} - {}' ({}); copied {path} for the replacement",
-                    request.artist,
-                    request.title,
-                    found.quality.as_deref().unwrap_or_else(|| get_extension(&path))
-                );
-                return Ok(copy);
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            let poll = *self.poll.lock();
-            cancellable(ct, async {
-                tokio::time::sleep(poll).await;
-                Ok(())
-            })
-            .await?;
-        }
-        Err(LidarrError::FileNotFound(format!(
-            "Lidarr found no {}copy of '{} - {}' within {} minutes.",
-            if request.lossless_only { "lossless " } else { "" },
-            request.artist,
-            request.title,
-            (timeout.as_secs() / 60).max(1)
-        )))
+        Ok(())
     }
 
-    /// Takes back what the borrowed search brought in: every file that is new since it started
-    /// (the copied songs are in the library under Octo's name by now), and the monitoring Octo
-    /// switched on. Best effort; whatever fails is logged.
-    async fn clean_up(&self, session: &Session) {
-        let (search, before) = {
-            let state = session.state.lock();
-            (state.search.clone(), state.before.clone())
+    /// The recordings the original is when the request names none: what its own sound reads clear
+    /// as, else its recording tag.
+    async fn original_recordings(&self, request: &LidarrTrackRequest) -> Vec<String> {
+        let Some(original) = request
+            .original_path
+            .clone()
+            .filter(|path| !path.is_empty() && Path::new(path).is_file())
+        else {
+            return Vec::new();
         };
-        let (Some(search), Some(before)) = (search, before) else {
-            return;
-        };
-        let tidied = async {
-            let started = search.await?;
-            let before: HashSet<i32> = before
-                .await?
-                .iter()
-                .filter(|t| t.track_file_id > 0)
-                .map(|t| t.track_file_id)
-                .collect();
-            let now = self.client.get_album_tracks(started.album_id).await?;
-            let mut added: Vec<i32> = Vec::new();
-            for t in &now {
-                if t.track_file_id > 0
-                    && !before.contains(&t.track_file_id)
-                    && !added.contains(&t.track_file_id)
-                {
-                    added.push(t.track_file_id);
-                }
+        if let Some(sound) = self.original_sound.get() {
+            let heard = sound(original.clone(), request.duration_seconds).await;
+            if !heard.is_empty() {
+                return heard;
             }
-            for id in &added {
-                if let Err(e) = self.client.delete_track_file(*id).await {
-                    warn!("Could not delete Lidarr track file {id}: {e}");
-                }
-            }
-            if !started.was_monitored {
-                self.client
-                    .set_albums_monitored(&[started.album_id], false)
-                    .await?;
-            }
-            info!(
-                "Lidarr album '{} - {}': removed {} files the search brought in{}",
-                session.candidate.artist,
-                session.candidate.title,
-                added.len(),
-                if started.was_monitored {
-                    ""
-                } else {
-                    ", and stopped monitoring it again"
-                }
-            );
-            Ok::<_, LidarrError>(())
         }
-        .await;
-        if let Err(e) = tidied {
-            warn!(
-                "Could not tidy Lidarr album '{} - {}' after an upgrade: {e}",
-                session.candidate.artist, session.candidate.title
-            );
-        }
+        tag_of(Some(&original), lofty::tag::ItemKey::MusicBrainzRecordingId)
+            .await
+            .into_iter()
+            .collect()
     }
 
-    async fn snapshot(
-        &self,
-        candidate: &LidarrAlbumCandidate,
-    ) -> Result<Arc<Vec<LidarrImportedTrack>>, LidarrError> {
-        Ok(Arc::new(
-            match self.client.find_album(&candidate.foreign_album_id).await? {
-                None => Vec::new(),
-                Some(existing) => self.client.get_album_tracks(existing.id).await?,
-            },
-        ))
-    }
-
-    /// The album: from the original's own release group tag, then by its album name.
+    /// The album: from the original's own release group tag, then by its album name, then the
+    /// walk's first pick for the recordings the request names.
     async fn find_album(
         &self,
         request: &LidarrTrackRequest,
         ct: &CancellationToken,
     ) -> Result<Option<LidarrAlbumCandidate>, LidarrError> {
-        if let Some(tagged) = release_group_of(request.original_path.as_deref()).await
+        if let Some(tagged) = tag_of(
+            request.original_path.as_deref(),
+            lofty::tag::ItemKey::MusicBrainzReleaseGroupId,
+        )
+        .await
             && let Some(by_tag) = cancellable(ct, self.client.resolve_album_by_foreign_id(&tagged)).await?
         {
             return Ok(Some(by_tag));
@@ -487,27 +299,32 @@ impl Inner {
                 Err(e) => return Err(e),
             }
         }
+        if let Some(replacements) = self.replacements.get()
+            && let Some(pick) = replacements.first_pick(request).await
+        {
+            info!(
+                "The walk for the recording of '{} - {}' picks release group {pick}",
+                request.artist, request.title
+            );
+            return cancellable(ct, self.client.resolve_album_by_foreign_id(&pick)).await;
+        }
         Ok(None)
     }
 }
 
-/// The MusicBrainz release group id in the file's tags (the first tag that has one), or None
-/// when there is no file, no such tag, or it does not read.
-async fn release_group_of(path: Option<&str>) -> Option<String> {
+/// One MusicBrainz id in the file's tags (the first tag that has one), or None when there is no
+/// file, no such tag, or it does not read.
+async fn tag_of(path: Option<&str>, key: lofty::tag::ItemKey) -> Option<String> {
     let path = path.filter(|p| !p.is_empty())?.to_string();
     if !Path::new(&path).is_file() {
         return None;
     }
     tokio::task::spawn_blocking(move || {
         use lofty::file::TaggedFileExt;
-        use lofty::tag::ItemKey;
         let file = lofty::read_from_path(&path).ok()?;
         file.tags()
             .iter()
-            .find_map(|tag| {
-                tag.get_string(ItemKey::MusicBrainzReleaseGroupId)
-                    .filter(|id| !id.is_empty())
-            })
+            .find_map(|tag| tag.get_string(key.clone()).filter(|id| !id.is_empty()))
             .map(str::to_string)
     })
     .await
@@ -528,17 +345,3 @@ fn visible(track: &LidarrImportedTrack, current: &LidarrSettings, octo_root: &st
     }
     Path::new(path).is_file().then(|| path.to_string())
 }
-
-/// The extension of the file name: its last dot and what follows, or empty when the name has
-/// no dot or ends with one.
-fn get_extension(path: &str) -> &str {
-    let name = &path[path.rfind('/').map_or(0, |i| i + 1)..];
-    match name.rfind('.') {
-        Some(dot) if dot + 1 < name.len() => &name[dot..],
-        _ => "",
-    }
-}
-
-#[cfg(test)]
-#[path = "lidarr_track_fetcher_tests.rs"]
-mod tests;

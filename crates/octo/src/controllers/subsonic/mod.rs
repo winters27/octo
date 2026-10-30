@@ -73,6 +73,8 @@ mod scrobble_tests;
 #[cfg(test)]
 mod search_album_ownership_tests;
 #[cfg(test)]
+mod stop_waiting_tests;
+#[cfg(test)]
 mod stream_length_tests;
 #[cfg(test)]
 mod transitions_tests;

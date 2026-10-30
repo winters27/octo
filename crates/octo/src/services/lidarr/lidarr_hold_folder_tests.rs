@@ -151,6 +151,7 @@ fn hold_kept_copy(f: &Fixture) -> HeldPlacement {
             .into_owned(),
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
+        users: vec!["alice".into()],
     };
     f.pending.hold_placement(held.clone());
     held

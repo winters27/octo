@@ -404,7 +404,6 @@ struct State {
     start_time: DateTime<Utc>,
     clock: DateTime<Utc>,
     on_search: Vec<(i32, String, String)>,
-    hold_imports: bool,
     searches: usize,
     deleted: Vec<i32>,
     monitor_changes: Vec<bool>,
@@ -473,7 +472,6 @@ impl FakeLidarr {
                 start_time: now - TimeDelta::hours(1),
                 clock: now,
                 on_search: Vec::new(),
-                hold_imports: false,
                 searches: 0,
                 deleted: Vec::new(),
                 monitor_changes: Vec::new(),
@@ -862,21 +860,6 @@ impl FakeLidarr {
                 .iter()
                 .map(|(id, title, quality)| (*id, title.to_string(), quality.to_string()))
                 .collect();
-        });
-    }
-
-    /// A search's quick imports wait until [`FakeLidarr::release_imports`].
-    pub fn hold_imports(&self) {
-        self.with(|state| state.hold_imports = true);
-    }
-
-    /// Lets the held quick imports in now.
-    pub fn release_imports(&self) {
-        self.with(|state| {
-            state.hold_imports = false;
-            for (track_id, title, quality) in state.on_search.clone() {
-                state.quick_import(track_id, &title, &quality);
-            }
         });
     }
 
@@ -1340,10 +1323,8 @@ impl State {
     /// held back where one is planned.
     fn search(&mut self, album_ids: &[i32], release_source: &str) {
         self.searches += 1;
-        if !self.hold_imports {
-            for (track_id, title, quality) in self.on_search.clone() {
-                self.quick_import(track_id, &title, &quality);
-            }
+        for (track_id, title, quality) in self.on_search.clone() {
+            self.quick_import(track_id, &title, &quality);
         }
         for album_id in album_ids {
             if let Some(position) = self.held_back.iter().position(|(album, _)| album == album_id) {

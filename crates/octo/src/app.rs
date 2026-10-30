@@ -1034,8 +1034,15 @@ impl Acquisition {
                     );
                     pause
                 }),
+                // A hearted album's import is filed track by track by its own sound.
+                album_gates: Some(album_gates.clone()),
+                gates: downloads
+                    .heart_gate
+                    .then(|| downloads.tagging.download_verification.clone() as Arc<dyn HeartGates>),
             },
         );
+        // A replacement's fetch is picked and followed as a heart's search is.
+        lidarr_fetcher.use_replacements(Arc::new(lidarr_heart_service.clone()));
         // A pick a restart cut short before its search is put back, and every search a restart
         // cut short is followed on.
         lidarr_heart_service.resume_after_restart();
@@ -1206,6 +1213,19 @@ impl Acquisition {
                         .any(|record| record.waiting_for == Some(WaitingFor::LidarrIndexers))
                 })),
             );
+            // The tracks a hearted album's Lidarr import held wait as held album tracks of the
+            // heart, whenever the import comes.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            lidarr_indexers.on_album_holds(Arc::new(
+                move |provider: &str,
+                      album: &str,
+                      user: &str,
+                      origin: octo_core::fingerprint::heart_gate::AcquisitionOrigin| {
+                    if let Some(coordinator) = coordinator.upgrade() {
+                        coordinator.file_album_holds(provider, album, user, origin);
+                    }
+                },
+            ));
             // A held song streamed again brings a new heard source to the holds that wait on one.
             let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
             stores.external_id_registry.on_heard(Arc::new(
@@ -1248,6 +1268,27 @@ impl Acquisition {
         // compared with its own print.
         kept_rechecks.use_music_brainz(clients.music_brainz.clone(), clients.deezer_metadata.clone());
         kept_rechecks.use_samples(stores.heard_samples.clone());
+        // What a replacement's original is by its own sound, which Lidarr's walk picks an album
+        // for when the original's tags and its album name find none.
+        {
+            let kept = kept_rechecks.clone();
+            lidarr_fetcher.use_original_sound(Arc::new(move |path: String, seconds: Option<i32>| {
+                let kept = kept.clone();
+                Box::pin(async move {
+                    match kept
+                        .original_sound(
+                            &path,
+                            seconds,
+                            crate::services::fingerprint::acoust_id_rate_limiter::LookupClass::Bulk,
+                        )
+                        .await
+                    {
+                        crate::services::library::upgrade_queue::OriginalSound::Clear(r) => r.ids,
+                        _ => Vec::new(),
+                    }
+                })
+            }));
+        }
         heart_acquisition_coordinator.use_family(FamilyHooks {
             gate: navidrome.family_write_gate.clone(),
             pool: navidrome.family_pool_service.clone(),
@@ -4263,6 +4304,8 @@ mod tests {
             original_path: None,
             release: None,
             step: None,
+            song: None,
+            recordings: Vec::new(),
         };
         let refused = state
             .lidarr_track_fetcher

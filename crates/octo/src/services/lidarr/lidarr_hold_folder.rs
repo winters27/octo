@@ -299,7 +299,7 @@ impl Inner {
                     }
                     entry.held_tracks.retain(|held| held.track_file_id != file_id);
                 });
-                job.add_landed(Some(&song), &track.imported(), &job.view());
+                job.add_landed(Some(&song), Some(&track.imported()), &job.view());
                 self.drop_kept_copies(song_key, &users).await;
             }
             Candidate::Refused { back } => {
@@ -393,6 +393,7 @@ impl Inner {
                 quiet: job.album_heart(),
                 labels,
                 refused_to: Some(track.path.clone()),
+                filed: None,
             },
         );
         let result = downloads
@@ -561,6 +562,11 @@ impl Inner {
         {
             if downloads.drop_held(&held, users).await {
                 self.pending.unhold(&held.held_path);
+                if let Some(tracker) = &self.tracker
+                    && let Some((provider, id)) = song_key.split_once(':')
+                {
+                    tracker.end_aside(provider, id, None);
+                }
                 info!(
                     "The kept copy of {song_key} gives way to its proven Lidarr file: {}",
                     held.held_path

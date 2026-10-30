@@ -90,7 +90,14 @@ impl Rig {
         let landed = self.landed(&format!("{}.flac", song.title));
         self.harness
             .service
-            .place_or_hold(song, requested, &landed, None, Some(source))
+            .place_or_hold(
+                song,
+                requested,
+                &landed,
+                None,
+                Some(source),
+                &["alice".to_string()],
+            )
             .await
     }
 }
@@ -167,15 +174,20 @@ async fn a_kept_copy_for_a_followed_artist_waits_in_the_hold_path_and_is_placed_
     assert_eq!(held[0].song, "soulseek:teardrop");
     assert_eq!(slashed(&held[0].target), slashed(&target));
     assert_eq!(held[0].follows, ["rg-mezzanine"]);
-    let notes: Vec<String> = rig
-        .tracker
-        .detail("soulseek:teardrop", None)
-        .and_then(|row| row.events)
+    assert_eq!(held[0].users, ["alice"], "who may stop waiting for it");
+    let row = rig.tracker.detail("soulseek:teardrop", None).expect("the row");
+    let notes: Vec<String> = row
+        .events
         .unwrap_or_default()
         .into_iter()
         .map(|event| event.text)
         .collect();
     assert!(notes.iter().any(|note| note == HELD_FOR_LIDARR), "{notes:?}");
+    assert_eq!(
+        row.note.as_deref(),
+        Some(HELD_FOR_LIDARR),
+        "the row says it while the copy waits"
+    );
     // Lyrics written beside the held file go along with it.
     let lyrics = Path::new(&placement.path).with_extension("lrc");
     std::fs::write(&lyrics, "[00:01.00] love, love is a verb").expect("written");

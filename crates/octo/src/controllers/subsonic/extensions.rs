@@ -86,11 +86,13 @@ pub async fn get_acquisitions(State(state): State<AppState>, req: Request) -> Ap
     let rows = if is_blank(&username) {
         Vec::new()
     } else {
-        // Keep anyway is offered only to someone who may keep the row, read from the holds.
+        // Keep anyway is offered only to someone who may keep the row, read from the holds, and
+        // Stop waiting for Lidarr only to someone whose heart kept the copy that waits.
         let marks = state.heart_acquisition_coordinator.keep_marks(&username);
         let mut rows = state.acquisition_tracker.for_user(&username);
         for row in &mut rows {
             marks.mark(row);
+            super::downloads::mark_stop_waiting(&state, &username, row);
         }
         rows
     };

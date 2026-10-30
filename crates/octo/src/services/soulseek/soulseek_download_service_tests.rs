@@ -1937,12 +1937,15 @@ impl ILidarrTrackFetcher for FakeFetcher {
         _request: &LidarrTrackRequest,
         destination_directory: &str,
         _ct: &CancellationToken,
-    ) -> Result<String, octo_core::lidarr::LidarrError> {
+    ) -> Result<crate::services::lidarr::LidarrFetched, octo_core::lidarr::LidarrError> {
         std::fs::create_dir_all(destination_directory).expect("made");
         let path = combine(destination_directory, "04 - Started.flac");
         std::fs::write(&path, self.audio.lock().clone()).expect("written");
         self.fetched.lock().push(path.clone());
-        Ok(path)
+        Ok(crate::services::lidarr::LidarrFetched {
+            path,
+            labels: crate::services::fingerprint::download_verification_service::LabelSource::None,
+        })
     }
 }
 

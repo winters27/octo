@@ -44,6 +44,7 @@ fn offer(imports: &LidarrImportHandoff, g: &Gated, held: &str, labels: LabelSour
             quiet: false,
             labels,
             refused_to: Some(held.to_string()),
+            filed: None,
         },
     );
 }

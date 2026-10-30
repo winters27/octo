@@ -20,7 +20,7 @@ use octo_core::fingerprint::heart_release::{HeardIdentity, HeartSong};
 use octo_core::lidarr::lidarr_client::LidarrAlbum;
 use octo_core::lidarr::lidarr_heart_acquisition_service::{IndexerHealth, match_song};
 use octo_core::lidarr::lidarr_track_fetcher::is_lossless;
-use octo_core::lidarr::{LidarrAlbumCandidate, LidarrError, LidarrImportedTrack};
+use octo_core::lidarr::{LidarrAlbumCandidate, LidarrError, LidarrImportedTrack, LidarrReleasePick};
 use octo_core::models::domain::{Album, Song};
 use octo_core::notifications::{NotificationEvent, NotificationEventType};
 use octo_core::settings::{DownloadSource, LidarrCompletionMode, LidarrSettings, SettingsStore};
@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use super::lidarr_pending_albums::{FollowEnd, SongGate, StopWaiting};
+use super::lidarr_pending_albums::{FollowEnd, HELD_FOR_LIDARR, SongGate, StopWaiting};
 use super::lidarr_pick::{
     ALREADY_LOOKING, LidarrArtistMusic, delete_moved_record, put_back_unsearched,
     put_back_unsearched_after_restart, users_queue_item, wait_for_rescans,
@@ -40,9 +40,10 @@ use super::{
     LidarrAlbumClaims, LidarrClient, LidarrImport, LidarrImportHandoff, LidarrPendingAlbums, PendingAdd,
     PendingAlbum,
 };
+use crate::services::common::album_gates::{AlbumGateHold, AlbumGates};
 use crate::services::common::song_finder::LIDARR_LEFT_ALONE;
 use crate::services::common::track_acquisition_queue::acquisition_key;
-use crate::services::common::{AcquisitionHeld, AcquisitionState, AcquisitionTracker};
+use crate::services::common::{AcquisitionHeld, AcquisitionState, AcquisitionTracker, HeartGates};
 use crate::services::fingerprint::MusicBrainzClient;
 use crate::services::fingerprint::download_verification_service::LabelSource;
 use crate::services::fingerprint::download_verification_service::{pick_contexts, song_in};
@@ -142,6 +143,12 @@ pub trait ILidarrHeartAcquisitionService: Send + Sync {
     fn waits_for_lidarr(&self, _provider: &str, _external_id: &str) -> bool {
         false
     }
+
+    /// The people who may stop waiting for Lidarr on the song: everyone a kept copy of it that
+    /// waits for an open follow was kept for, in the order they were listed.
+    fn stop_waiters(&self, _provider: &str, _external_id: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// What Lidarr's webhook says it imported.
@@ -216,7 +223,16 @@ pub struct LidarrHeartExtras {
     pub catalog: Option<Arc<dyn CatalogQuestions>>,
     /// Pauses a heart's heard-master rounds while it waits for a follow.
     pub rounds: Option<PauseRounds>,
+    /// The gates of hearted albums' chains: an album heart's import is filed track by track by
+    /// its own sound against them.
+    pub album_gates: Option<Arc<AlbumGates>>,
+    /// What files one file of a hearted album's import among its tracks by its own sound.
+    pub gates: Option<Arc<dyn HeartGates>>,
 }
+
+/// Files the tracks of a hearted album an import held (the album's provider and id, the person,
+/// the origin) as held album tracks of that person's heart.
+pub type AlbumHolds = Arc<dyn Fn(&str, &str, &str, AcquisitionOrigin) + Send + Sync>;
 
 /// Hearts through Lidarr. Lidarr only fetches whole albums, so a heart becomes an album search;
 /// what Lidarr imports of Octo's own downloads is handed, song by song, to the download pipeline a
@@ -252,6 +268,13 @@ struct Inner {
     pending: Arc<LidarrPendingAlbums>,
     catalog: Arc<dyn CatalogQuestions>,
     rounds: Option<PauseRounds>,
+    album_gates: Option<Arc<AlbumGates>>,
+    gates: Option<Arc<dyn HeartGates>>,
+    /// Who files the tracks an album heart's import held.
+    album_holds: Mutex<Option<AlbumHolds>>,
+    /// The replacements' fetches waiting for a song of an album, by foreign album id ignoring
+    /// case.
+    fetches: Mutex<HashMap<String, Vec<replacement::FetchWaiter>>>,
     /// What the user's Lidarr holds of an artist.
     music: LidarrArtistMusic,
     /// The songs whose last try left Lidarr alone, by provider and id ignoring case.
@@ -277,6 +300,16 @@ struct PinHint {
     listened_release: Option<String>,
     recordings: Vec<String>,
     lane: Option<Lane>,
+}
+
+/// What a pick asks of its album's search beyond the album: what its pin reads, and a release
+/// picked in Find songs that the search grabs instead of Lidarr's own search.
+#[derive(Default)]
+struct Ask {
+    hint: Option<PinHint>,
+    release: Option<LidarrReleasePick>,
+    /// The hearted album the album is searched for, as `provider:id`.
+    album_heart: Option<String>,
 }
 
 /// How one pick ended for a heart.
@@ -369,6 +402,11 @@ struct AlbumJob {
     accepted: Mutex<HashMap<String, Vec<String>>>,
     /// One look at the album's hold folder at a time.
     settling: tokio::sync::Mutex<()>,
+    /// The job's own hold on each hearted album's gate, so a late import is still filed against
+    /// it once the album's chain has ended; let go with the job.
+    gate_holds: Mutex<Vec<AlbumGateHold>>,
+    /// One file of an album heart's import filed at a time.
+    filing: tokio::sync::Mutex<()>,
 }
 
 /// A heart waiting on a song of a job, counted while it waits.
@@ -396,6 +434,12 @@ struct JobSongs {
     songs: Vec<Song>,
     match_by_number: bool,
     album_heart: bool,
+    /// A replacement's fetch asked for the album.
+    replacement: bool,
+    /// The release picked in Find songs that the album's search grabs instead.
+    release: Option<LidarrReleasePick>,
+    /// The hearted albums the album is searched for, as `provider:id`.
+    album_hearts: Vec<String>,
 }
 
 impl AlbumJob {
@@ -419,12 +463,19 @@ impl AlbumJob {
             held: Mutex::new(HashMap::new()),
             accepted: Mutex::new(HashMap::new()),
             settling: tokio::sync::Mutex::new(()),
+            gate_holds: Mutex::new(Vec::new()),
+            filing: tokio::sync::Mutex::new(()),
         }
     }
 
     /// A job over a follow a restart or Lidarr's webhook starts again: nothing to submit.
     fn resumed(candidate: LidarrAlbumCandidate, album: Album, entry: &PendingAlbum) -> Self {
         let job = AlbumJob::new(candidate, album);
+        {
+            let mut songs = job.songs.lock();
+            songs.replacement = entry.replacement;
+            songs.album_hearts = entry.album_hearts.clone();
+        }
         *job.requesters.lock() = entry.requested_by.clone();
         *job.holders.lock() = entry.holders.clone();
         *job.gates.lock() = entry.gates.clone();
@@ -437,6 +488,25 @@ impl AlbumJob {
     /// or a play's gate is on one of its songs. An album heart's tracks are each its own.
     fn gated(&self) -> bool {
         !self.album_heart() && self.gates.lock().iter().any(SongGate::personal)
+    }
+
+    /// Whether only replacements asked for the album: no heart's, play's or album heart's file
+    /// comes of its import, so a file no fetch waits for is the library's in no way.
+    fn replacement_only(&self) -> bool {
+        let asked = {
+            let songs = self.songs.lock();
+            songs.replacement && !songs.album_heart
+        };
+        asked && !self.gates.lock().iter().any(SongGate::personal)
+    }
+
+    /// Whether each file of the job's import is filed among a hearted album's tracks by its own
+    /// sound: an album heart's gate is on its tracks.
+    fn files_by_sound(&self) -> bool {
+        self.gates
+            .lock()
+            .iter()
+            .any(|gate| gate.gate.origin == AcquisitionOrigin::AlbumHeart)
     }
 
     /// Whether a heart waits on the song now.
@@ -469,6 +539,7 @@ impl AlbumJob {
             }
             known.match_by_number |= match_by_number;
             known.album_heart |= album_heart;
+            known.replacement |= origin == AcquisitionOrigin::Replacement;
         }
         if let Some(name) = requested_by.filter(|r| !dotnet::is_blank(r)) {
             let name = name.trim();
@@ -493,18 +564,22 @@ impl AlbumJob {
 
     /// What the job adds to its album's saved entry: its songs, people and gates.
     fn saved(&self) -> PendingAlbum {
+        let (songs, replacement, album_hearts) = {
+            let songs = self.songs.lock();
+            (
+                songs.songs.iter().filter_map(song_entry_key).collect(),
+                songs.replacement,
+                songs.album_hearts.clone(),
+            )
+        };
         PendingAlbum {
             foreign_album_id: self.candidate.foreign_album_id.clone(),
-            songs: self
-                .songs
-                .lock()
-                .songs
-                .iter()
-                .filter_map(song_entry_key)
-                .collect(),
+            songs,
             requested_by: self.requesters.lock().clone(),
             holders: self.holders.lock().clone(),
             gates: self.gates.lock().clone(),
+            replacement,
+            album_hearts,
             ..Default::default()
         }
     }
@@ -549,18 +624,21 @@ impl AlbumJob {
         *self.ended.lock()
     }
 
-    /// A song landed: the hearts waiting look.
-    fn add_landed(&self, song: Option<&Song>, track: &LidarrImportedTrack, album: &Album) {
+    /// A song landed: the hearts waiting look. `track` is Lidarr's match of the file, which names
+    /// a song too; None for a file its own sound filed, where only `song` landed.
+    fn add_landed(&self, song: Option<&Song>, track: Option<&LidarrImportedTrack>, album: &Album) {
         {
             let mut landed = self.landed.lock();
             if let Some(song) = song {
                 landed.insert(key_of(song));
                 landed.insert(title_key(Some(&song.artist), Some(&song.title)));
             }
-            landed.insert(title_key(
-                Some(track.artist.as_deref().unwrap_or(&album.artist)),
-                Some(&track.title),
-            ));
+            if let Some(track) = track {
+                landed.insert(title_key(
+                    Some(track.artist.as_deref().unwrap_or(&album.artist)),
+                    Some(&track.title),
+                ));
+            }
         }
         self.progress.send_modify(|n| *n += 1);
     }
@@ -834,6 +912,10 @@ impl LidarrHeartAcquisitionService {
                 .pending
                 .unwrap_or_else(|| Arc::new(LidarrPendingAlbums::new(None))),
             rounds: extras.rounds,
+            album_gates: extras.album_gates,
+            gates: extras.gates,
+            album_holds: Mutex::new(None),
+            fetches: Mutex::new(HashMap::new()),
             held_files: Mutex::new(HashMap::new()),
             indexers: health::IndexerWatch::default(),
             jobs: Mutex::new(HashMap::new()),
@@ -867,6 +949,12 @@ impl LidarrHeartAcquisitionService {
     /// who says whether any heart still waits for them (their health is read only while one does).
     pub fn on_indexers_back(&self, back: IndexersBack, awaited: Option<IndexersAwaited>) {
         *self.inner.indexers.back.lock() = Some((back, awaited));
+    }
+
+    /// Who files the tracks an album heart's import held as held album tracks of the person's
+    /// heart, whenever they come, the album's chain running or not.
+    pub fn on_album_holds(&self, holds: AlbumHolds) {
+        *self.inner.album_holds.lock() = Some(holds);
     }
 
     /// How often Lidarr is asked what it imported, instead of the timeout's thirtieth.
@@ -988,6 +1076,22 @@ impl ILidarrHeartAcquisitionService for LidarrHeartAcquisitionService {
             .kept_copy_waits(&format!("{provider}:{external_id}"))
     }
 
+    fn stop_waiters(&self, provider: &str, external_id: &str) -> Vec<String> {
+        let mut waiters: Vec<String> = Vec::new();
+        for held in self
+            .inner
+            .pending
+            .kept_copies_waiting(&format!("{provider}:{external_id}"))
+        {
+            for user in held.users.iter().map(|user| user.trim()) {
+                if !user.is_empty() && !waiters.iter().any(|known| dotnet::eq_ignore_case(known, user)) {
+                    waiters.push(user.to_string());
+                }
+            }
+        }
+        waiters
+    }
+
     async fn try_acquire_album(
         &self,
         provider: &str,
@@ -1060,7 +1164,10 @@ impl Inner {
                         songs: vec![song.clone()],
                         ..Default::default()
                     };
-                    let hint = walk.hint(&pick);
+                    let ask = Ask {
+                        hint: Some(walk.hint(&pick)),
+                        ..Default::default()
+                    };
                     let job = self
                         .queue_resolved_album(
                             &album,
@@ -1068,7 +1175,7 @@ impl Inner {
                             Some(candidate),
                             false,
                             false,
-                            Some(hint),
+                            ask,
                             origin,
                             &song_gates,
                         )
@@ -1101,7 +1208,7 @@ impl Inner {
                         None,
                         false,
                         false,
-                        None,
+                        Ask::default(),
                         origin,
                         &song_gates,
                     )
@@ -1451,23 +1558,86 @@ impl Inner {
                 .collect();
             tracker.announce(provider, Some(external_id), None, &listed);
         }
-        // An album's gates are on each of its songs.
-        let song_gates: Vec<SongGate> = album
-            .songs
-            .iter()
-            .filter_map(|song| song_entry_key(song).map(|key| (key, song)))
-            .flat_map(|(key, song)| {
-                gates.iter().map(move |gate| SongGate {
-                    song: key.clone(),
-                    title: song.title.clone(),
-                    artist: song.artist.clone(),
-                    gate: gate.clone(),
+        // The album the heart names, by its catalog album's barcode; by name only with neither a
+        // catalog id nor a catalog album its title finds.
+        let (resolved, hint) = match self.album_find(external_id, &album, origin).await {
+            AlbumFind::Group { group, release } => {
+                match self.client.resolve_album_by_foreign_id(&group).await? {
+                    Some(candidate) => {
+                        info!(
+                            "Album heart {provider}:{external_id} is release group {group}, pinned to its barcode release {release}"
+                        );
+                        let hint = PinHint {
+                            listened_release: Some(release),
+                            recordings: Vec::new(),
+                            lane: Some(lane_for(origin)),
+                        };
+                        (Some(candidate), Some(hint))
+                    }
+                    None => {
+                        info!(
+                            "Lidarr does not know release group {group} of album heart {provider}:{external_id}"
+                        );
+                        self.album_missed(&album, notify_failure, "Lidarr did not bring this song.");
+                        return Ok(false);
+                    }
+                }
+            }
+            AlbumFind::ByName => (None, None),
+            AlbumFind::Busy(busy) => {
+                warn!(
+                    "{busy:?} did not answer for album heart {provider}:{external_id}; Lidarr is not asked"
+                );
+                self.album_missed(&album, notify_failure, "Lidarr did not bring this song.");
+                return Ok(false);
+            }
+        };
+        // Each track of an album heart has its own gate, the track's own recording, from the
+        // album's gate; without one, the gates asked with are on every song.
+        let user = requested_by.map(str::trim).filter(|user| !user.is_empty());
+        let album_gate = match (user, &self.album_gates) {
+            (Some(user), Some(store)) if self.gates.is_some() => store.gate(provider, external_id, user),
+            _ => None,
+        };
+        let song_gates: Vec<SongGate> = match &album_gate {
+            Some(gate) => album_song_gates(provider, &album, gate),
+            None => album
+                .songs
+                .iter()
+                .filter_map(|song| song_entry_key(song).map(|key| (key, song)))
+                .flat_map(|(key, song)| {
+                    gates.iter().map(move |gate| SongGate {
+                        song: key.clone(),
+                        title: song.title.clone(),
+                        artist: song.artist.clone(),
+                        gate: gate.clone(),
+                    })
                 })
-            })
-            .collect();
+                .collect(),
+        };
+        let ask = Ask {
+            hint,
+            album_heart: album_gate.is_some().then(|| format!("{provider}:{external_id}")),
+            ..Default::default()
+        };
         let job = self
-            .queue_resolved_album(&album, requested_by, None, true, true, None, origin, &song_gates)
+            .queue_resolved_album(
+                &album,
+                requested_by,
+                resolved,
+                true,
+                true,
+                ask,
+                origin,
+                &song_gates,
+            )
             .await?;
+        // The job's own hold on the album's gate outlives the album's chain while its follow runs.
+        if let (Some(gate), Some(store)) = (album_gate, &self.album_gates) {
+            job.gate_holds
+                .lock()
+                .push(store.register(provider, external_id, gate, Vec::new()));
+        }
         if job.wait_for(&album.songs, self.import_deadline(), None).await == Waited::TimedOut {
             let missing: Vec<Song> = album
                 .songs
@@ -1510,7 +1680,7 @@ impl Inner {
         resolved: Option<LidarrAlbumCandidate>,
         match_by_number: bool,
         album_heart: bool,
-        hint: Option<PinHint>,
+        ask: Ask,
         origin: AcquisitionOrigin,
         gates: &[SongGate],
     ) -> anyhow::Result<Arc<AlbumJob>> {
@@ -1558,8 +1728,20 @@ impl Inner {
             origin,
             gates,
         );
-        if let Some(hint) = hint {
+        if let Some(hint) = ask.hint {
             job.hint.lock().get_or_insert(hint);
+        }
+        {
+            let mut songs = job.songs.lock();
+            // One album, one search: only the job's first asker picks the release it grabs.
+            if created && let Some(release) = ask.release {
+                songs.release = Some(release);
+            }
+            if let Some(heart) = ask.album_heart
+                && !songs.album_hearts.contains(&heart)
+            {
+                songs.album_hearts.push(heart);
+            }
         }
         if created {
             // Spawned: the submission runs whether or not anyone is still waiting.
@@ -1632,7 +1814,10 @@ impl Inner {
             jobs.insert(key, job.clone());
             job
         };
-        if let Some(claims) = &self.claims {
+        self.hold_album_gates(&job, &entry.album_hearts, &entry.gates);
+        if let Some(claims) = &self.claims
+            && !job.replacement_only()
+        {
             claims.heart_started(&entry.foreign_album_id);
         }
         tokio::spawn(self.clone().follow(job.clone(), entry.lidarr_album_id));
@@ -1651,12 +1836,23 @@ impl Inner {
     }
 
     /// After a restart: every pick cut short before its search is put back, a hold folder no
-    /// entry names goes, and every search is followed on, the tracks its album holds settled
-    /// again.
+    /// entry names goes, each copy held for an open follow has its row back, and every search is
+    /// followed on, the tracks its album holds settled again.
     async fn resume_all(self: &Arc<Self>) {
         let poll = self.poll(&self.settings.current().lidarr);
         put_back_unsearched_after_restart(&self.client, &self.pending, poll).await;
         self.sweep_hold_folders();
+        if let Some(tracker) = &self.tracker {
+            for held in self.pending.held() {
+                let open = held
+                    .follows
+                    .iter()
+                    .any(|follow| self.pending.get(follow).is_some_and(|entry| entry.following()));
+                if open && let Some((provider, id)) = held.song.split_once(':') {
+                    tracker.wait_aside(provider, id, &held.users, HELD_FOR_LIDARR);
+                }
+            }
+        }
         for entry in self.pending.entries() {
             if entry.searched() && !self.pending.is_running(&entry.foreign_album_id) {
                 let job = self.resume_job(&entry);
@@ -1670,9 +1866,12 @@ impl Inner {
     async fn submit(self: Arc<Self>, job: Arc<AlbumJob>) -> anyhow::Result<()> {
         let snapshot = self.settings.current().lidarr.clone();
         let key = job.candidate.foreign_album_id.clone();
-        // An upgrade borrowing this album deletes what its search brings in when it ends; the heart
-        // waits until it lets go rather than lose its songs to that clean up.
-        if let Some(claims) = &self.claims {
+        // An upgrade borrowing this album takes the files its search brings in; the heart waits
+        // until it lets go rather than lose its songs to it. A replacement's own pick is that
+        // upgrade's, and claims nothing of a heart's.
+        if let Some(claims) = &self.claims
+            && !job.replacement_only()
+        {
             if claims.upgrade_busy(&key) {
                 info!("An upgrade borrows Lidarr's album {key}; the heart waits until it lets go");
             }
@@ -1897,9 +2096,21 @@ impl Inner {
             }
         }
 
-        let command = self.client.album_search(album_id).await?;
-        entry.search_command = command.id;
-        entry.searched_at = Some(command.queued.unwrap_or_else(Utc::now));
+        // A release picked in Find songs is grabbed as it is: its grab is Octo's by its guid.
+        let release = job.songs.lock().release.clone();
+        match release {
+            Some(pick) => {
+                let posted = Utc::now();
+                let guid = self.client.grab_picked(album_id, &pick).await?;
+                entry.picked_guid = Some(guid);
+                entry.searched_at = Some(posted);
+            }
+            None => {
+                let command = self.client.album_search(album_id).await?;
+                entry.search_command = command.id;
+                entry.searched_at = Some(command.queued.unwrap_or_else(Utc::now));
+            }
+        }
         self.save(entry);
         Ok(Prepared::Searched { album_id })
     }
@@ -1992,6 +2203,22 @@ impl Inner {
                 }
             })
             .cloned();
+        self.take_import_as(job, track, imported_path, labels, song, None)
+            .await
+    }
+
+    /// [`Self::take_import`] as `song`, a hearted album's track its own sound already proved it
+    /// to be when `filed` carries that verdict.
+    async fn take_import_as(
+        self: &Arc<Self>,
+        job: &Arc<AlbumJob>,
+        track: &LidarrImportedTrack,
+        imported_path: String,
+        labels: LabelSource,
+        song: Option<Song>,
+        filed: album::Filed,
+    ) -> Option<JoinHandle<()>> {
+        let album = job.view();
         if let Some(drop) = self
             .should_drop(&album, track, song.as_ref(), &imported_path, job)
             .await
@@ -2006,7 +2233,7 @@ impl Inner {
             // Already in the library: in, as far as the heart is concerned, and its row
             // closes on the library's own copy.
             if let Some(owned) = drop.owned {
-                job.add_landed(song.as_ref(), track, &album);
+                job.add_landed(song.as_ref(), filed.is_none().then_some(track), &album);
                 if let (Some(song), Some(tracker)) = (&song, &self.tracker)
                     && let (Some(provider), Some(id)) =
                         (song.external_provider.as_deref(), song.external_id.as_deref())
@@ -2035,6 +2262,7 @@ impl Inner {
             album,
             imported_path,
             labels,
+            filed,
         )))
     }
 
@@ -2118,7 +2346,8 @@ impl Inner {
     /// One imported file through the download pipeline, as the song it is: a hearted song by its
     /// own id, so its progress row moves on, and any other track of the album by an id minted for
     /// it. Whatever the pipeline did not take is deleted through Lidarr, so nothing is left behind
-    /// in the library unchecked.
+    /// in the library unchecked. `filed`: what the file's own sound proved, so it lands as that.
+    #[allow(clippy::too_many_arguments)] // the file, the song it is, and what proved it
     async fn hand_to_pipeline(
         self: Arc<Self>,
         job: Arc<AlbumJob>,
@@ -2127,8 +2356,11 @@ impl Inner {
         album: Album,
         imported_path: String,
         labels: LabelSource,
+        filed: album::Filed,
     ) {
         let provider = SoulseekMetadataService::PROVIDER_NAME;
+        // A file its own sound filed is only the song it proved; Lidarr's match names nothing.
+        let by_sound = filed.is_some();
         let mut id = song.as_ref().and_then(|s| {
             let p = s.external_provider.as_deref()?;
             let e = s.external_id.as_deref().filter(|e| !e.is_empty())?;
@@ -2168,6 +2400,7 @@ impl Inner {
                 quiet: song.is_none() || job.album_heart(),
                 labels,
                 refused_to: None,
+                filed,
             },
         );
         // The song's own gates go with it (an import's, a request's), so the pipeline's check
@@ -2243,7 +2476,7 @@ impl Inner {
                     )
                     .await;
                 }
-                job.add_landed(song.as_ref(), &track, &album);
+                job.add_landed(song.as_ref(), (!by_sound).then_some(&track), &album);
             }
             Err(e) => {
                 self.imports.withdraw(&id);
@@ -2542,6 +2775,13 @@ mod hold;
 #[path = "lidarr_health.rs"]
 mod health;
 
+#[path = "lidarr_album_filing.rs"]
+mod album;
+
+#[path = "lidarr_replacement.rs"]
+mod replacement;
+
+use album::{AlbumFind, album_song_gates};
 pub use health::IndexersAwaited;
 
 #[cfg(test)]

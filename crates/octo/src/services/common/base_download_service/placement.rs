@@ -137,7 +137,8 @@ impl BaseDownloadService {
     /// the artist while Octo's own import is coming, and that import would then replace it. Such a
     /// file waits in the one hold path, plays from there, and is placed when the follow ends. A
     /// file another source proved by its sound ends the artist's follows instead (Lidarr's own
-    /// imports never do), and is placed as soon as Octo's items are out of Lidarr's queue.
+    /// imports never do), and is placed as soon as Octo's items are out of Lidarr's queue. `users`
+    /// are the people it was fetched or kept for.
     pub(super) async fn place_or_hold(
         &self,
         song: &Song,
@@ -145,9 +146,10 @@ impl BaseDownloadService {
         current_path: &str,
         root: Option<&str>,
         source: Option<DownloadSource>,
+        users: &[String],
     ) -> Placement {
         if let Some(held) = self
-            .hold_for_lidarr(song, requested, current_path, root, source)
+            .hold_for_lidarr(song, requested, current_path, root, source, users)
             .await
         {
             return held;
@@ -164,6 +166,7 @@ impl BaseDownloadService {
         current_path: &str,
         root: Option<&str>,
         source: Option<DownloadSource>,
+        users: &[String],
     ) -> Option<Placement> {
         let pending = self.services.lidarr_pending.as_ref()?;
         let download_path = self.download_path();
@@ -244,6 +247,7 @@ impl BaseDownloadService {
             target,
             kept: matches!(proof, RecordingProof::AsHeard { .. } | RecordingProof::KeptByYou),
             follows: follows.clone(),
+            users: users.to_vec(),
         });
         if proven {
             info!("{held_path} is proven: Octo stops following Lidarr for its artist and places it");
@@ -253,9 +257,7 @@ impl BaseDownloadService {
         } else {
             info!("Holding {held_path} back from the library while Lidarr's download for its artist runs");
             if let (Some(provider), Some(id)) = (provider, external_id) {
-                self.track(|tracker| {
-                    tracker.log(provider, id, acquisition_event_kinds::NOTE, HELD_FOR_LIDARR, None)
-                });
+                self.track(|tracker| tracker.wait_aside(provider, id, users, HELD_FOR_LIDARR));
             }
         }
         Some(Placement::new(held_path, false))

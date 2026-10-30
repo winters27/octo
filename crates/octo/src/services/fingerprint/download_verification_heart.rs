@@ -1119,6 +1119,18 @@ impl HeartGates for DownloadVerificationService {
         start_of(built)
     }
 
+    async fn file_album_file(
+        &self,
+        path: &std::path::Path,
+        labels: LabelSource,
+        gate: &AlbumGate,
+        unfilled: &[usize],
+        acquisition_key: &str,
+    ) -> (TrackFiling, Option<VerificationResult>) {
+        DownloadVerificationService::file_album_file(self, path, labels, gate, unfilled, acquisition_key)
+            .await
+    }
+
     async fn judge_held(&self, path: &str, acquisition_key: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
         let candidate = HeartCandidate {
             labels: LabelSource::TheFile,

@@ -1377,14 +1377,43 @@ impl BaseDownloadService {
             .and(family)
             .and_then(|family| family.pool_root());
         let ahead_folder = options.ahead_folder.as_deref().filter(|_| options.prefetch);
+        // The people a file held for a Lidarr follow waits for: those whose own gate it went
+        // through, else whoever asked.
+        let asked: Vec<&str> = if options.place.gates.is_empty() {
+            options
+                .requested_by
+                .iter()
+                .flatten()
+                .map(|user| user.trim())
+                .collect()
+        } else {
+            options.place.gates.iter().map(|gate| gate.user.trim()).collect()
+        };
+        let mut waiting_for_it: Vec<String> = Vec::new();
+        for user in asked {
+            if !user.is_empty()
+                && !waiting_for_it
+                    .iter()
+                    .any(|known| dotnet::eq_ignore_case(known, user))
+            {
+                waiting_for_it.push(user.to_string());
+            }
+        }
         let mut placement = match (&options.replacement, &pool_root, ahead_folder) {
             (_, _, Some(folder)) => Placement::new(
                 self.place_ahead(&landed_path, folder, external_provider, external_id)?,
                 false,
             ),
             (None, None, None) => {
-                self.place_or_hold(&song, &requested, &landed_path, None, options.source_override)
-                    .await
+                self.place_or_hold(
+                    &song,
+                    &requested,
+                    &landed_path,
+                    None,
+                    options.source_override,
+                    &waiting_for_it,
+                )
+                .await
             }
             (None, Some(root), None) => {
                 self.place_or_hold(
@@ -1393,6 +1422,7 @@ impl BaseDownloadService {
                     &landed_path,
                     Some(root),
                     options.source_override,
+                    &waiting_for_it,
                 )
                 .await
             }

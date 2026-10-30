@@ -317,16 +317,37 @@ impl SoulseekDownloadService {
         );
 
         let refused_to = import.refused_to.clone();
-        let verdict = self
-            .check_lidarr_file(
-                base,
-                routing,
-                download,
-                &local,
-                import.labels,
-                refused_to.as_deref(),
-            )
-            .await?;
+        let verdict = match import.filed {
+            // Filed among a hearted album's tracks by its own sound already: it is this track,
+            // proven by its clear reading for everyone whose album gate it was filed by.
+            Some(filed) => {
+                for gate in &download.gates {
+                    download.ledger.record(
+                        &gate.user,
+                        gate.origin,
+                        crate::services::common::GateOutcome::Accepted,
+                    );
+                    download.ledger.record_accepted(
+                        &gate.user,
+                        gate.origin,
+                        octo_core::fingerprint::heart_gate::Acceptance::Sound,
+                    );
+                }
+                self.mark_transcode(routing, download, &local).await;
+                *filed
+            }
+            None => {
+                self.check_lidarr_file(
+                    base,
+                    routing,
+                    download,
+                    &local,
+                    import.labels,
+                    refused_to.as_deref(),
+                )
+                .await?
+            }
+        };
         verdict.apply_tags_to(&mut download.song);
         download.song.verification = Some(Box::new(verdict));
         info!("Took Lidarr's import of '{artist} - {title}' into the pipeline: {local}");
@@ -417,6 +438,14 @@ impl SoulseekDownloadService {
                 verdict.heard(),
             );
         }
+        self.mark_transcode(routing, download, local).await;
+        Ok(verdict)
+    }
+
+    /// The lossless spectrum check on a Lidarr file its checks keep: a FLAC made from lossy audio
+    /// is kept, marked as a transcode.
+    async fn mark_transcode(&self, routing: &SoulseekRouting, download: &mut TrackDownload, local: &str) {
+        let (artist, title) = names(routing);
         let spectrum = self
             .verification
             .check_lossless(local, routing.artist.as_deref(), routing.title.as_deref())
@@ -428,7 +457,6 @@ impl SoulseekDownloadService {
             );
             download.song.transcoded_from = spectrum.estimate.clone();
         }
-        Ok(verdict)
     }
 
     /// One song through Lidarr, copied into a job folder under the incoming dot folder, which no
@@ -482,6 +510,14 @@ impl SoulseekDownloadService {
         let picked = taken.and_then(|pick| pick.release());
         let base_arc = base.arc();
         let step_id = external_id.clone();
+        // A kept file's own gate names the recording it is: the album is the walk's pick for it
+        // when its tags and its album name find none, and the search is pinned to a carrier of it.
+        let recordings: Vec<String> = download
+            .gates
+            .iter()
+            .find_map(|gate| gate.r.as_ref().filter(|r| !r.ids.is_empty()))
+            .map(|r| r.ids.clone())
+            .unwrap_or_default();
         let request = LidarrTrackRequest {
             artist: routing.artist.clone().unwrap_or_default(),
             title: routing.title.clone().unwrap_or_default(),
@@ -493,9 +529,16 @@ impl SoulseekDownloadService {
             step: Some(LidarrStep::new(move |text, detail| {
                 base_arc.log_step(&step_id, acquisition_event_kinds::TRY, text, detail)
             })),
+            song: song
+                .external_provider
+                .as_deref()
+                .filter(|provider| !provider.is_empty() && !external_id.is_empty())
+                .map(|provider| format!("{provider}:{external_id}")),
+            recordings,
         };
         download.fetched_from = Some("Lidarr".to_string());
-        let path = fetcher.fetch(&request, &job_dir, ct).await?;
+        let fetched = fetcher.fetch(&request, &job_dir, ct).await?;
+        let path = fetched.path;
         let (quality, _) = AudioSummary::describe(Some(&path));
         base.log_step(
             &external_id,
@@ -503,10 +546,10 @@ impl SoulseekDownloadService {
             "Lidarr brought a copy",
             quality.as_deref(),
         );
-        // Lidarr's import is never a label, and whether Lidarr rewrote this file's tags is not
-        // known here: the fetched file's own tags are not read.
+        // Lidarr's import is never a label: the file's own labels are read from the download as
+        // delivered, or from the file itself only when Lidarr writes no tags.
         let verdict = self
-            .check_lidarr_file(base, routing, download, &path, LabelSource::None, None)
+            .check_lidarr_file(base, routing, download, &path, fetched.labels, None)
             .await?;
         verdict.apply_tags_to(&mut download.song);
         download.song.verification = Some(Box::new(verdict));
