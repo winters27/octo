@@ -105,6 +105,8 @@ async fn family(enabled: bool, alex: Alex, configure: impl FnOnce(&mut AppSettin
         },
         ..Default::default()
     };
+    // AcoustID on, by a key of the user's own: a Wait for lossless play waits for its copy.
+    settings.soulseek.acoust_id_api_key = "user-key".into();
     configure(&mut settings);
     let state = AppState::for_tests_with(
         settings,
