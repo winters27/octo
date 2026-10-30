@@ -107,9 +107,9 @@ pub trait ILidarrHeartAcquisitionService: Send + Sync {
         false
     }
 
-    /// What the song's last Lidarr step, run last in the chain, waits on: MusicBrainz's question
-    /// or Deezer for its walk, or Lidarr's failing indexers, so the heart holds for it. Taken: a
-    /// second read answers None.
+    /// What the song's or the hearted album's last Lidarr step, run last in the chain, waits on:
+    /// MusicBrainz's question or Deezer for its walk or its album's barcode lookup, or Lidarr's
+    /// failing indexers, so the heart holds for it. Taken: a second read answers None.
     fn waits_on(&self, _provider: &str, _external_id: &str) -> Option<LidarrWaits> {
         None
     }
@@ -1584,6 +1584,17 @@ impl Inner {
                 }
             }
             AlbumFind::ByName => (None, None),
+            // With Lidarr last, the album heart holds for the answer, as a song heart's walk does:
+            // nothing is asked of Lidarr and no row fails. With a source after it, the step ends.
+            AlbumFind::Busy(busy) if notify_failure && waits_for_answers(origin) => {
+                info!(
+                    "Lidarr is the last source for album heart {provider}:{external_id} and {busy:?} did not answer for its album; the heart waits for an answer"
+                );
+                self.busy
+                    .lock()
+                    .insert(left_alone_key(provider, external_id), LidarrWaits::Answer(busy));
+                return Ok(false);
+            }
             AlbumFind::Busy(busy) => {
                 warn!(
                     "{busy:?} did not answer for album heart {provider}:{external_id}; Lidarr is not asked"
