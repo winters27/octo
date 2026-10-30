@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use octo_core::common::{SongIdentity, dotnet};
+use octo_core::fingerprint::heart_release::HeartSong;
 use octo_core::fingerprint::recording_identity::Identity;
 use octo_core::last_fm::last_fm_radio_recommendation_service::canonical_tag;
 use octo_core::metadata::deezer_metadata_service::FullTrackMeta;
@@ -32,6 +33,7 @@ use super::placement::{get_directory_name, get_file_name, is_audio_file};
 use super::{BaseDownloadService, RequestedIdentity, get_extension};
 use crate::services::common::acquisition_tracker::acquisition_event_kinds;
 use crate::services::cover_art::CoversOnHand;
+use crate::services::fingerprint::music_brainz_client::{HeartQuestions, Lane};
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::soulseek::soulseek_download_service::INCOMING_FOLDER_NAME;
 
@@ -41,6 +43,38 @@ impl BaseDownloadService {
     pub fn is_staged_upload(path: &str) -> bool {
         path.split(['/', '\\'])
             .any(|segment| dotnet::eq_ignore_case(segment, INCOMING_FOLDER_NAME))
+    }
+
+    /// A download asked for with no album and with an ISRC starts the no-album pick on the
+    /// Background lane, which fills `requested.album_pick` once it has an answer. Identifying
+    /// the file takes it only if it has finished by then, and never waits for it.
+    pub(super) fn start_album_pick(&self, song: &Song, requested: &RequestedIdentity) {
+        let Some(isrc) = song.isrc.as_deref().and_then(SongIdentity::normalize_isrc) else {
+            return;
+        };
+        let (Some(music_brainz), Some(deezer)) = (&self.services.music_brainz, &self.services.deezer) else {
+            return;
+        };
+        if !requested.album.trim().is_empty() {
+            return;
+        }
+        let questions = HeartQuestions::new(Arc::clone(music_brainz), deezer.clone(), Lane::Background);
+        let heart = HeartSong {
+            artist: song.artist.clone(),
+            title: song.title.clone(),
+            isrc,
+            seconds: song
+                .duration
+                .and_then(|seconds| u32::try_from(seconds).ok())
+                .unwrap_or(0),
+            ..Default::default()
+        };
+        let pick = Arc::clone(&requested.album_pick);
+        tokio::spawn(async move {
+            if let Some(group) = questions.no_album_pick(&heart).await {
+                let _ = pick.set(group);
+            }
+        });
     }
 
     /// Works out what the file is and sets the Song from it. Every candidate release the
@@ -65,12 +99,15 @@ impl BaseDownloadService {
         let query_title = song.title.clone();
         let settings = self.settings.current().metadata.clone();
 
-        let request = ReleaseIdentifier::request_for(
-            song,
-            &song.artist,
-            &query_title,
-            Some(&requested.album),
-            requested.track,
+        let request = ReleaseIdentifier::with_album_group(
+            ReleaseIdentifier::request_for(
+                song,
+                &song.artist,
+                &query_title,
+                Some(&requested.album),
+                requested.track,
+            ),
+            requested.album_pick.get(),
         );
         let identified = self
             .identifier()

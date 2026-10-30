@@ -158,6 +158,20 @@ impl ReleaseDistance {
                     Self::album_penalty(album, candidate_album),
                     Self::ALBUM_WEIGHT,
                 );
+            } else if let Some(group) = request.album_group_id.as_deref() {
+                let same_group = candidate
+                    .release_group_id
+                    .as_deref()
+                    .is_some_and(|id| eq_ignore_case(id, group));
+                let penalty = if same_group {
+                    0.0
+                } else {
+                    Self::album_penalty(
+                        request.album_group_title.as_deref().unwrap_or(""),
+                        candidate_album,
+                    )
+                };
+                distance.add("album", penalty, Self::ALBUM_WEIGHT);
             } else if file.tags_are_evidence
                 && let Some(file_album) = file.album.as_deref().filter(|album| !is_blank(album))
             {

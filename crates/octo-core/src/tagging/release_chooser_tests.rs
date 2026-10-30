@@ -10,6 +10,7 @@ use crate::metadata::deezer_metadata_service::FullTrackMeta;
 use crate::models::domain::song::Song;
 use crate::tagging::candidate_sources::CandidateSources;
 use crate::tagging::release_details::ReleaseDetails;
+use crate::tagging::release_identifier::ReleaseIdentifier;
 use crate::tagging::tag_evidence::{FileFacts, IgnoreCaseSet, TagRequest, TagSource};
 use crate::tagging::tag_plan::TagReport;
 
@@ -35,6 +36,8 @@ fn request(
         catalog_track_id: None,
         version_markers: SongIdentity::distinct_versions(&SongIdentity::parse_title(title, None), None),
         whole_album: false,
+        album_group_id: None,
+        album_group_title: None,
     }
 }
 
@@ -1103,4 +1106,58 @@ fn a_track_of_a_whole_album_takes_no_facts_from_a_larger_edition_of_it() {
             "{whole_album}"
         );
     }
+}
+
+// ---- a request with no album takes the group its ISRC picked ------------------------------
+
+#[test]
+fn a_request_with_no_album_is_filed_under_the_group_its_isrc_picked() {
+    let candidates = vec![
+        Fp::new(
+            "rec-yesterday",
+            "Yesterday",
+            "The Beatles",
+            "Yesterday and Today",
+            "g-yesterday-and-today",
+            "Album",
+            "1966-06-20",
+        )
+        .length(125)
+        .build(),
+        ReleaseCandidate {
+            release_title: Some("ヘルプ!".into()),
+            ..Fp::new(
+                "rec-yesterday",
+                "Yesterday",
+                "The Beatles",
+                "Help!",
+                "g-help",
+                "Album",
+                "1965-08-06",
+            )
+            .secondary(&["Soundtrack"])
+            .length(125)
+            .build()
+        },
+    ];
+    let picked = ("g-help".to_string(), "Help!".to_string());
+    for (pick, group) in [(None, "g-yesterday-and-today"), (Some(&picked), "g-help")] {
+        let request = ReleaseIdentifier::with_album_group(plain("The Beatles", "Yesterday", 125), pick);
+        let evidence = evidence(
+            request.clone(),
+            peer(125, "Yesterday", "The Beatles"),
+            &["rec-yesterday"],
+        );
+
+        let plan = ReleaseChooser::choose(&evidence, &candidates, &MatchingSettings::default(), THIS_YEAR);
+
+        assert_eq!(chosen(&plan).release_group_id.as_deref(), Some(group), "{pick:?}");
+    }
+
+    // A request that named its album keeps it whatever was picked.
+    let named = ReleaseIdentifier::with_album_group(
+        request("The Beatles", "Yesterday", Some("1"), None, None, Some(125)),
+        Some(&picked),
+    );
+    assert_eq!((named.album_group_id, named.album_group_title), (None, None));
 }

@@ -200,7 +200,18 @@ impl ReleaseIdentifier {
             catalog_track_id: song.external_id.clone(),
             version_markers: SongIdentity::distinct_versions(&parsed, None),
             whole_album: false,
+            album_group_id: None,
+            album_group_title: None,
         }
+    }
+
+    /// The request with the group a no-album pick chose, when it asked for no album.
+    pub fn with_album_group(mut request: TagRequest, group: Option<&(String, String)>) -> TagRequest {
+        if let Some((id, title)) = group.filter(|_| !request.owns_album()) {
+            request.album_group_id = Some(id.clone());
+            request.album_group_title = Some(title.clone());
+        }
+        request
     }
 
     /// "ext-deezer-album-123456" is the catalog's 123456.

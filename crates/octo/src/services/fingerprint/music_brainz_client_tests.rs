@@ -1040,6 +1040,72 @@ async fn yesterday_from_help_through_the_whole_sequence_gives_help() {
 }
 
 #[tokio::test]
+async fn a_song_with_no_album_takes_the_walks_first_pick_once_its_carriers_are_kept() {
+    for (folder, artist, title, code, seconds, group, album) in [
+        (
+            "rows/beatles-yesterday_1",
+            "The Beatles",
+            "Yesterday (Remastered 2009)",
+            YESTERDAY_CODE,
+            123,
+            HELP_GROUP,
+            "Help!",
+        ),
+        (
+            "rows/celine-my-heart-will-go-on_0",
+            "Céline Dion",
+            "My Heart Will Go On (Love Theme from \"Titanic\")",
+            "CAC229700120",
+            280,
+            "d90d5240-d510-3d82-95ba-13c6624ea28c",
+            "Let’s Talk About Love",
+        ),
+    ] {
+        let server = MockServer::builder().start().await;
+        Mock::given(any())
+            .respond_with(Recorded(recorded_folder(folder)))
+            .mount(&server)
+            .await;
+        let client = Arc::new(quick(&server, Duration::from_secs(5)));
+        let background = HeartQuestions::new(Arc::clone(&client), RecordedCatalog::open(), Lane::Background);
+        let song = HeartSong {
+            artist: artist.into(),
+            title: title.into(),
+            isrc: code.into(),
+            seconds,
+            ..Default::default()
+        };
+
+        // Nothing kept: no pick, and only the code lookup was asked.
+        assert_eq!(background.no_album_pick(&song).await, None, "{folder}");
+        let sent = asked(&server).await;
+        assert!(
+            sent.iter().all(|question| question.starts_with("isrc/")),
+            "{sent:?}"
+        );
+
+        // A heart's walk keeps the carriers and the artist's country.
+        let heart = HeartQuestions::new(Arc::clone(&client), RecordedCatalog::open(), Lane::Heart);
+        let codes = heart.code_recordings(code).await.expect("answered");
+        let identity = release::identify(&song, &codes, None);
+        let walk = heart.walk(&song, &identity).await.expect("answered");
+        let before = asked(&server).await.len();
+
+        let pick = background.no_album_pick(&song).await;
+
+        assert_eq!(pick, Some((group.to_string(), album.to_string())), "{folder}");
+        assert_eq!(walk.first().map(String::as_str), Some(group), "{folder}");
+        let after = asked(&server).await;
+        assert!(
+            after[before..]
+                .iter()
+                .all(|question| question.starts_with("isrc/")),
+            "{after:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_heart_question_answered_503_is_asked_again_and_answered() {
     let server = MockServer::builder().start().await;
     Mock::given(path("/ws/2/isrc/GBAYE0601477"))

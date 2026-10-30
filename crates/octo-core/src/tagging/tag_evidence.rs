@@ -54,6 +54,11 @@ pub struct TagRequest {
     /// One track of a whole album being fetched: only a release that is that album by name
     /// lends its facts, never a larger edition holding the same recording.
     pub whole_album: bool,
+    /// For a request with no album: the release group the song's ISRC picks among the releases
+    /// carrying its recordings, weighed as the album asked for. None when nothing was picked.
+    pub album_group_id: Option<String>,
+    /// That group's title, which weighs a release that names no group.
+    pub album_group_title: Option<String>,
 }
 
 impl TagRequest {

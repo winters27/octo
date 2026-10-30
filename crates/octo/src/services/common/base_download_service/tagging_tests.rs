@@ -21,7 +21,7 @@ use octo_media::audio::{ILoudnessMeter, Loudness, ReplayGainTags};
 use octo_media::tags::{KeptIdentityTags, TagField, TagFile, tag_writer_extras};
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use wiremock::matchers::any;
+use wiremock::matchers::{any, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use super::placement_tests::{vorbis, vorbis_all};
@@ -1608,4 +1608,128 @@ async fn a_flac_named_mp3_is_renamed_before_tagging_and_the_log_and_report_say_s
             && e.detail.as_deref() == Some("It arrived named .mp3")),
         "{log:?}"
     );
+}
+
+// ---- a download with no album and the no-album pick ---------------------------------------
+
+const YESTERDAY_LOOKUP: &str = r#"
+{"status": "ok", "results": [{"id": "acoustid-1", "score": 0.97, "recordings": [{
+  "id": "rec-yesterday", "title": "Yesterday", "duration": 125.0, "sources": 40, "isrcs": ["GBAYE0601477"],
+  "artists": [{"id": "a-beatles", "name": "The Beatles"}],
+  "releasegroups": [
+    {"id": "g-yesterday-and-today", "title": "Yesterday and Today", "type": "Album",
+     "artists": [{"id": "a-beatles", "name": "The Beatles"}],
+     "releases": [{"id": "r-yt", "date": {"year": 1966, "month": 6, "day": 20}, "country": "US",
+       "mediums": [{"position": 1, "track_count": 11, "tracks": [{"id": "t-yt", "position": 5}]}]}]},
+    {"id": "g-help", "title": "Help!", "type": "Album", "secondarytypes": ["Soundtrack"],
+     "artists": [{"id": "a-beatles", "name": "The Beatles"}],
+     "releases": [{"id": "r-help", "date": {"year": 1965, "month": 8, "day": 6}, "country": "GB",
+       "mediums": [{"position": 1, "track_count": 14, "tracks": [{"id": "t-help", "position": 13}]}]}]}
+  ]}]}]}
+"#;
+
+/// Yesterday asked for with no album, its ISRC known and its sound confirmed.
+fn yesterday() -> Song {
+    let mut song = Song {
+        artist: "The Beatles".into(),
+        title: "Yesterday".into(),
+        isrc: Some("GBAYE0601477".into()),
+        duration: Some(125),
+        ..Default::default()
+    };
+    confirm(&mut song, confirmed_by(YESTERDAY_LOOKUP));
+    song.album = String::new();
+    song
+}
+
+fn landed_yesterday(root: &Path) -> String {
+    landed_flac(root, "peer share", |file| {
+        file.set_title(Some("Yesterday"));
+        file.set_performers(&["The Beatles".to_string()]);
+    })
+}
+
+#[tokio::test]
+async fn a_download_with_no_album_is_filed_under_the_group_its_finished_pick_chose() {
+    let routes = vec![("/search?q=", r#"{"data":[]}"#.to_string())];
+    let tagging = build_with(vec![], serve(routes).await, Options::default()).await;
+    let path = landed_yesterday(tagging.root());
+
+    for (pick, group, album) in [
+        (None, "g-yesterday-and-today", "Yesterday and Today"),
+        (Some("g-help"), "g-help", "Help!"),
+    ] {
+        let mut song = yesterday();
+        let requested = RequestedIdentity::new(&song.artist, &song.title, "", None);
+        if let Some(pick) = pick {
+            requested
+                .album_pick
+                .set((pick.to_string(), "Help!".to_string()))
+                .expect("not picked yet");
+        }
+
+        tagging
+            .harness
+            .service
+            .identify(&mut song, &requested, &path, None)
+            .await;
+
+        let plan = song.tag_plan.as_deref().expect("a plan");
+        let asked = &plan.evidence.as_ref().expect("the evidence").request;
+        assert_eq!(asked.album_group_id.as_deref(), pick, "{pick:?}");
+        let chosen = plan.chosen.as_ref().expect("a choice");
+        assert_eq!(
+            chosen.candidate.release_group_id.as_deref(),
+            Some(group),
+            "{pick:?}"
+        );
+        assert_eq!(song.album, album, "{pick:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_busy_music_brainz_never_holds_up_tagging_and_its_pick_is_left_out() {
+    let server = MockServer::builder().start().await;
+    Mock::given(path_regex("^/ws/2/isrc/"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    Mock::given(path_regex("^/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":[]}"#))
+        .mount(&server)
+        .await;
+    let tagging = build_with(vec![], server, Options::default()).await;
+    let path = landed_yesterday(tagging.root());
+    let mut song = yesterday();
+    let requested = RequestedIdentity::new(&song.artist, &song.title, "", None);
+
+    tagging.harness.service.start_album_pick(&song, &requested);
+    for _ in 0..400 {
+        let sent = tagging._server.received_requests().await.unwrap_or_default();
+        if sent
+            .iter()
+            .any(|request| request.url.path().starts_with("/ws/2/isrc/"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let sent = tagging._server.received_requests().await.unwrap_or_default();
+    assert!(
+        sent.iter()
+            .any(|request| request.url.path() == "/ws/2/isrc/GBAYE0601477"),
+        "the pick asked the code lookup"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tagging
+            .harness
+            .service
+            .identify(&mut song, &requested, &path, None),
+    )
+    .await
+    .expect("tagged without waiting for the pick");
+
+    assert!(requested.album_pick.get().is_none());
+    assert_eq!(song.album, "Yesterday and Today");
 }

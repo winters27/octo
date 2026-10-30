@@ -1761,6 +1761,31 @@ impl HeartQuestions {
         Ok(release::walk(song, identity, &home, &carriers))
     }
 
+    /// The release group a song with no album is filed under, with its title: the walk's first
+    /// pick for the song's ISRC alone. Only the code lookup is asked; the carriers and the
+    /// artist's country are read from what is kept, so with nothing kept there is no pick. None
+    /// when the song has no ISRC, MusicBrainz is busy, or the walk picks no titled group.
+    pub async fn no_album_pick(&self, song: &HeartSong) -> Option<(String, String)> {
+        let codes = self.code_recordings(&song.isrc).await.ok()?;
+        let identity = release::identify(song, &codes, None);
+        let home = self.known_home_country(&identity.artist_id).unwrap_or_default();
+        let carriers: Vec<Carriers> = identity
+            .recordings
+            .iter()
+            .filter_map(|id| self.known_carriers(id))
+            .collect();
+        let group = release::walk(song, &identity, &home, &carriers)
+            .into_iter()
+            .next()?;
+        let title = carriers
+            .iter()
+            .flat_map(|carried| &carried.releases)
+            .find(|carrier| dotnet::eq_ignore_case(&carrier.group.id, &group))
+            .map(|carrier| carrier.group.title.trim().to_string())
+            .filter(|title| !title.is_empty())?;
+        Some((group, title))
+    }
+
     /// The carriers of one recording when they are kept, without asking.
     pub fn known_carriers(&self, recording_id: &str) -> Option<Carriers> {
         match self.kept(&carriers_key(recording_id.trim())) {

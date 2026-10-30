@@ -103,6 +103,9 @@ pub struct RequestedIdentity {
     pub title: String,
     pub album: String,
     pub track: Option<i32>,
+    /// For a download asked for with no album: the release group's id and title its ISRC
+    /// picked, set once the pick has finished.
+    pub album_pick: Arc<OnceLock<(String, String)>>,
 }
 
 impl RequestedIdentity {
@@ -112,6 +115,7 @@ impl RequestedIdentity {
             title: title.to_string(),
             album: album.to_string(),
             track,
+            album_pick: Arc::default(),
         }
     }
 }
@@ -1029,6 +1033,7 @@ impl BaseDownloadService {
         // Snapshot before anything can correct it: with NameFromMatch off this is still what
         // names the file, which is how every existing library was built.
         let requested = RequestedIdentity::new(&song.artist, &song.title, &song.album, song.track);
+        self.start_album_pick(&song, &requested);
 
         // A song fetched ahead earlier is taken from its folder instead of downloaded again, with
         // what its download learned, and finalized exactly as a fresh download.
