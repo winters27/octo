@@ -1104,9 +1104,12 @@ pub(crate) async fn star(answer: Answer, services: DownloadServices) -> Star {
     };
     let verification = Arc::new(DownloadVerificationService::new(
         Arc::new(AudioFingerprinter::new()),
-        Arc::new(AcoustIdClient::new(Arc::new(AcoustIdRateLimitHandler::new(
-            Arc::new(AcoustIdRateLimiter::new()),
-        )))),
+        Arc::new(AcoustIdClient::new(
+            Arc::new(AcoustIdRateLimitHandler::new(
+                Arc::new(AcoustIdRateLimiter::new()),
+            )),
+            Arc::clone(&settings),
+        )),
         Arc::clone(&settings),
         None,
         None,

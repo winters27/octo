@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use super::library_tag_edits::song_tag_fields as fields;
-use crate::services::fingerprint::acoust_id_rate_limiter::AcoustIdRateLimiter;
+use crate::services::fingerprint::acoust_id_rate_limiter::{AcoustIdRateLimiter, LookupClass};
 use crate::services::fingerprint::{AcoustIdClient, MusicBrainzClient};
 use crate::services::metadata::DeezerMetadataService;
 
@@ -101,10 +101,14 @@ impl VersionSources for OnlineVersionSources {
 
     async fn tracks_of(&self, recording_id: &str) -> Option<Vec<String>> {
         let settings = self.settings.current().soulseek.clone();
-        AcoustIdRateLimiter::in_background(self.acoust_id.tracks_of_recording(
-            &settings.acoust_id_api_key,
-            recording_id,
-            settings.effective_acoust_id_timeout_seconds(),
+        let key = self.acoust_id.key_for(LookupClass::Bulk)?;
+        AcoustIdRateLimiter::in_background(AcoustIdRateLimiter::with_class(
+            LookupClass::Bulk,
+            self.acoust_id.tracks_of_recording(
+                &key,
+                recording_id,
+                settings.effective_acoust_id_timeout_seconds(),
+            ),
         ))
         .await
     }
@@ -123,11 +127,15 @@ impl VersionSources for OnlineVersionSources {
         let fingerprint = print
             .fingerprint
             .filter(|f| print.outcome == FingerprintOutcome::Ok && !f.is_empty())?;
-        AcoustIdRateLimiter::in_background(self.acoust_id.lookup(
-            &settings.acoust_id_api_key,
-            &fingerprint,
-            print.decoded_seconds,
-            settings.effective_acoust_id_timeout_seconds(),
+        let key = self.acoust_id.key_for(LookupClass::Bulk)?;
+        AcoustIdRateLimiter::in_background(AcoustIdRateLimiter::with_class(
+            LookupClass::Bulk,
+            self.acoust_id.lookup(
+                &key,
+                &fingerprint,
+                print.decoded_seconds,
+                settings.effective_acoust_id_timeout_seconds(),
+            ),
         ))
         .await
         .filter(|lookup| lookup.is_ok)

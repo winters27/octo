@@ -393,10 +393,14 @@ impl NoticePlaylistWorker {
 
         for batch in ready.chunks(Self::SUBMISSION_BATCH) {
             let items: Vec<AcoustIdSubmission> = batch.iter().map(|(_, item)| item.clone()).collect();
+            // The user's own application key only: a submission never uses Octo's shared one.
+            let Some(client_key) = soulseek.acoust_id_key_for_bulk() else {
+                break;
+            };
             if !self
                 .acoust_id
                 .submit(
-                    &soulseek.acoust_id_api_key,
+                    &client_key,
                     &soulseek.acoust_id_user_api_key,
                     &items,
                     soulseek.effective_acoust_id_timeout_seconds(),
@@ -412,11 +416,12 @@ impl NoticePlaylistWorker {
         Ok(())
     }
 
-    /// Consent and both keys, and never in a dry run.
+    /// Consent and both of the user's own keys (never Octo's shared one, and never with AcoustID
+    /// `off`), and never in a dry run.
     pub fn may_submit(settings: &LibraryActionSettings, soulseek: &SoulseekSettings) -> bool {
         soulseek.submit_confirmed_fingerprints
             && !settings.dry_run
-            && !dotnet::is_blank(&soulseek.acoust_id_api_key)
+            && soulseek.acoust_id_key_for_bulk().is_some()
             && !dotnet::is_blank(&soulseek.acoust_id_user_api_key)
     }
 

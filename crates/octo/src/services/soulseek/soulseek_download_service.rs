@@ -59,6 +59,7 @@ use crate::services::common::{
     OperationCanceled, TrackDownload,
 };
 use crate::services::fingerprint::DownloadVerificationService;
+use crate::services::fingerprint::acoust_id_rate_limiter::{AcoustIdRateLimiter, LookupClass};
 use crate::services::fingerprint::download_verification_service::trustworthy;
 use crate::services::fingerprint::preview_check::{
     self, Heard, PreviewFacts, PreviewOutcome, PreviewRequest,
@@ -2311,15 +2312,18 @@ impl SoulseekDownloadService {
 
     /// What take a file already in the library is, by its audio: the studio take, a live take,
     /// an instrumental. None when fingerprinting is off or nothing was decided. A link to the song
-    /// one person's submissions make still says which take the file is.
+    /// one person's submissions make still says which take the file is. Its lookup is work nobody
+    /// waits on, so it never goes ahead of a heart's.
     pub async fn take_of_file(&self, path: &str, artist: &str, title: &str) -> Option<RecordingKind> {
         if !self.verification.is_fingerprinting_enabled() {
             return None;
         }
-        let verdict = self
-            .verification
-            .verify_in_background(path, Some(artist), Some(title))
-            .await;
+        let verdict = AcoustIdRateLimiter::with_class(
+            LookupClass::Bulk,
+            self.verification
+                .verify_in_background(path, Some(artist), Some(title)),
+        )
+        .await;
         take_of(&verdict)
     }
 

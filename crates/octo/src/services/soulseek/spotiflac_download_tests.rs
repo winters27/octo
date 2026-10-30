@@ -319,9 +319,12 @@ impl Setup {
         };
         let verification = Arc::new(DownloadVerificationService::new(
             Arc::new(AudioFingerprinter::new()),
-            Arc::new(AcoustIdClient::new(Arc::new(AcoustIdRateLimitHandler::new(
-                Arc::new(AcoustIdRateLimiter::new()),
-            )))),
+            Arc::new(AcoustIdClient::new(
+                Arc::new(AcoustIdRateLimitHandler::new(
+                    Arc::new(AcoustIdRateLimiter::new()),
+                )),
+                Arc::clone(&settings),
+            )),
             Arc::clone(&settings),
             None,
             None,

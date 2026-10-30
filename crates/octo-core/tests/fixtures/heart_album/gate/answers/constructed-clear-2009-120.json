@@ -1,0 +1,21 @@
+{
+  "note": "Constructed, not a real AcoustID answer: a file whose answer reads clear for the 2009 Help! recording alone (4416d38e, 50 sources, no other recording of the song). Recorded shape as the real answers. Its print is help-2009's.",
+  "answer": {
+    "status": "ok",
+    "results": [
+      {
+        "id": "c0ffee00-0000-4000-8000-00000000a002",
+        "score": 0.98,
+        "recordings": [
+          {
+            "id": "4416d38e-0f68-4c75-93b9-c1a793fccb49",
+            "title": "Help!",
+            "artists": [{"id": "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d", "name": "The Beatles"}],
+            "sources": 50,
+            "isrcs": ["GBAYE0601465"]
+          }
+        ]
+      }
+    ]
+  }
+}

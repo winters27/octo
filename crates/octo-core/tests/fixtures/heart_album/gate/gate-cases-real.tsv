@@ -1,0 +1,32 @@
+# case	file print	heard print (- none)	heart's R from print	file's labels (ISRC or none)	identical	heard master (yes, no, - when nothing was heard)	expected
+Help! 2009 file for a 2009 heart, tagged, the master heard	help-2009	help-2009	help-2009	GBAYE0601465	no	yes	accept: the heard master, as heard
+Help! 2009 file for a 2009 heart, tagged, another master of the mix	help-2009	help-2009	help-2009	GBAYE0601465	no	no	undecided: keep the heard copy
+Help! 2009 file for a 2009 heart, untagged, the master heard	help-2009	help-2009	help-2009	none	no	yes	accept: the heard master, as heard
+Help! 2009 file for a 2009 heart, untagged, another master of the mix	help-2009	help-2009	help-2009	none	no	no	undecided: keep the heard copy
+Help! 2015 mix for a 2009 heart, tagged as the 2015 mix	help-2015	help-2009	help-2009	GBUM71505900	no	no	refuse: a label names another recording
+Help! 2015 mix for a 2009 heart, untagged	help-2015	help-2009	help-2009	none	no	no	undecided: keep the heard copy
+Help! 2015 mix for a 2015 heart, tagged, the master heard	help-2015	help-2015	help-2015	GBUM71505900	no	yes	accept: the heard master, as heard
+Help! 2015 mix for a 2015 heart, untagged, the master heard	help-2015	help-2015	help-2015	none	no	yes	accept: the heard master, as heard
+Help! 2009 file for a 2015 heart, tagged as 2009	help-2009	help-2015	help-2015	GBAYE0601465	no	no	refuse: a label names another recording
+Help! 2015 mix for a 2009 heart, mislabeled with the 2009 ISRC (v6.2's case 9)	help-2015	help-2009	help-2009	GBAYE0601465	no	no	undecided: keep the heard copy
+Yesterday 2015 mix for a 2009 heart, tagged as 2015	yesterday-2015	yesterday-2009	yesterday-2009	GBUM71505917	no	no	refuse: a label names another recording
+Yesterday 2009 file for a 2009 heart, tagged, the master heard	yesterday-2009	yesterday-2009	yesterday-2009	GBAYE0601477	no	yes	accept: the heard master, as heard
+Walrus 2023 mix for a 2023 heart, untagged, the master heard	walrus-2023	walrus-2023	walrus-2023	none	no	yes	accept: the heard master, as heard
+Walrus 2023 mix for a 2023 heart, untagged, another master of the mix	walrus-2023	walrus-2023	walrus-2023	none	no	no	undecided: keep the heard copy
+Walrus 2023 mix for an original-mix heart, untagged	walrus-2023	walrus-2009	walrus-2009	none	no	no	refuse: AcoustID names another recording
+Walrus original for a 2023 heart, tagged with a code MusicBrainz lists on both mixes	walrus-2009	walrus-2023	walrus-2023	GBAYE0601638	no	no	refuse: AcoustID names another recording
+Taylor's Version for a 2008 heart, untagged	lovestory-tv	lovestory-2008	lovestory-2008	none	no	no	refuse: proof 2
+Taylor's Version for a 2008 heart, tagged as Taylor's Version	lovestory-tv	lovestory-2008	lovestory-2008	USUG12100342	no	no	refuse: proof 2
+Taylor's Version for a Taylor's Version heart, tagged, the master heard	lovestory-tv-chapter	lovestory-tv	lovestory-tv	USUG12100342	no	yes	accept: the heard master, as heard
+Central Park live for a studio heart, untagged	mrsrobinson-live	mrsrobinson-studio	mrsrobinson-studio	none	no	no	refuse: proof 2
+Studio take for a studio heart, tagged, the master heard	mrsrobinson-studio	mrsrobinson-studio	mrsrobinson-studio	USSM16800249	no	yes	accept: the heard master, as heard
+The heard video's own stream copy, untagged	walrus-2009	walrus-2009	walrus-2009	none	yes	yes	accept A0
+A never-played heart (no heard audio): Help! 2015 mix for a 2009 catalog R, untagged	help-2015	-	help-2009	none	no	-	undecided: not yet proven
+A never-played heart (no heard audio): Help! 2009 file for a 2009 catalog R, tagged	help-2009	-	help-2009	GBAYE0601465	no	-	undecided: not yet proven
+The stream played the 2023 Walrus mix for an original-mix catalog row; the file is that master	walrus-2023	walrus-2023	walrus-2009	none	no	yes	accept: the heard master, as heard
+The stream played the 2023 Walrus mix for an original-mix catalog row; the file is the original mix	walrus-2009	walrus-2023	walrus-2009	none	no	no	refuse: AcoustID names another recording
+The stream played the 2015 Help! mix for a catalog row whose recording AcoustID barely names; the file is that master	help-2015	help-2015	help-catalog-1967-1970	none	no	yes	accept: the heard master, as heard
+AcoustID has not answered for the heard audio yet; the file is the heard master	help-2009	help-2009!busy	help-2009	none	no	yes	hold: waiting for AcoustID to read what played
+Constructed: the stream played another song by another artist at 90% while R holds 2%; the file is that stream's master	help-2009	constructed-another-song	help-2009	none	no	yes	undecided: not yet proven
+AcoustID has not answered for the heard audio yet; the file is another master	help-2009	help-2009!busy	help-2009	none	no	no	hold: waiting for AcoustID to read what played
+Constructed: the 2015 Help! stream for a row AcoustID barely names makes R the 2009 recording on an unclear reading; a file reading clear for 2009 is not the mix heard	constructed-clear-2009	help-2015	help-catalog-1967-1970	none	no	no	undecided: keep the heard copy

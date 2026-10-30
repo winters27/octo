@@ -429,3 +429,138 @@ fn artist_credit_joins_with_the_phrases_or_the_usual_ones() {
     assert_eq!(AcoustIdRecording::default().artist_credit(), "");
     assert_eq!(AcoustIdRecording::default().primary_artist(), None);
 }
+
+fn answer_of(json: &str) -> Result<AcoustIdAnswer, AnswerError> {
+    let doc: Value = serde_json::from_str(json).expect("test JSON parses");
+    parse_answer(&doc).expect("the answer reads")
+}
+
+/// The whole answer keeps every result and every recording, while the shipped reading still
+/// keeps 10 results of 25 recordings for its own readers.
+#[test]
+fn parse_answer_keeps_every_result_and_recording() {
+    let recordings: Vec<String> = (0..30)
+        .map(|n| format!(r#"{{"id": "rec-{n}", "title": "Help!", "sources": 1}}"#))
+        .collect();
+    let results: Vec<String> = (0..12)
+        .map(|n| {
+            format!(
+                r#"{{"id": "fp-{n}", "score": 0.9, "recordings": [{}]}}"#,
+                recordings.join(", ")
+            )
+        })
+        .collect();
+    let json = format!(r#"{{"status": "ok", "results": [{}]}}"#, results.join(", "));
+    let whole = answer_of(&json).expect("the status is ok");
+    assert_eq!(whole.results.len(), 12);
+    assert!(whole.results.iter().all(|result| result.recordings.len() == 30));
+    assert_eq!(whole.results[11].id.as_deref(), Some("fp-11"));
+    assert_eq!(whole.results[11].recordings[29].id, "rec-29");
+    let cut = parse(&json);
+    assert_eq!(cut.results.len(), 10);
+    assert_eq!(cut.results[0].recordings.len(), 25);
+}
+
+/// Each linked recording keeps its id, title, artists with their ids, length, normalized ISRCs
+/// and submissions as AcoustID sent them; a recording with no id links nothing.
+#[test]
+fn parse_answer_reads_each_linked_recording() {
+    let whole = answer_of(
+        r#"
+        {"status": "ok", "results": [
+          {"id": "fp-1", "score": 0.97, "recordings": [
+            {"id": "rec-1", "title": "Human", "duration": 172.253, "sources": 5,
+             "isrcs": ["QMCE32000213", "qm-ce3-20-00213", "bad"],
+             "artists": [{"id": "a1", "name": "$NOT"}, {"name": "Night Lovell"}, {"id": "a3"},
+                         {"joinphrase": " & "}]},
+            {"title": "No id", "sources": 9},
+            {"id": "rec-2", "duration": 0, "sources": -2}
+          ]},
+          {"score": null, "recordings": null},
+          {}
+        ]}
+        "#,
+    )
+    .expect("the status is ok");
+    assert_eq!(whole.results.len(), 3);
+    let first = &whole.results[0];
+    assert_eq!(first.id.as_deref(), Some("fp-1"));
+    assert!((first.score - 0.97).abs() < 1e-12);
+    assert_eq!(first.recordings.len(), 2);
+    let human = &first.recordings[0];
+    assert_eq!(
+        (
+            human.id.as_str(),
+            human.title.as_str(),
+            human.duration_seconds,
+            human.sources
+        ),
+        ("rec-1", "Human", Some(172.253), 5)
+    );
+    assert_eq!(human.isrcs, ["QMCE32000213"]);
+    assert_eq!(
+        human.artists,
+        [
+            AnswerArtist {
+                id: Some("a1".into()),
+                name: "$NOT".into()
+            },
+            AnswerArtist {
+                id: None,
+                name: "Night Lovell".into()
+            },
+            AnswerArtist {
+                id: Some("a3".into()),
+                name: String::new()
+            },
+        ]
+    );
+    let bare = &first.recordings[1];
+    assert_eq!(
+        (
+            bare.id.as_str(),
+            bare.title.as_str(),
+            bare.duration_seconds,
+            bare.sources
+        ),
+        ("rec-2", "", None, -2)
+    );
+    assert!(bare.artists.is_empty() && bare.isrcs.is_empty());
+    assert_eq!(whole.results[1], AnswerResult::default());
+    assert_eq!(whole.results[2], AnswerResult::default());
+}
+
+/// A refusal is AcoustID's own error code and message, never an empty answer, so it can never be
+/// read as "no entry".
+#[test]
+fn parse_answer_reads_a_status_error_as_its_code() {
+    assert_eq!(
+        answer_of(r#"{"status": "error", "error": {"code": 3, "message": "invalid fingerprint"}}"#),
+        Err(AnswerError {
+            code: Some(3),
+            message: Some("invalid fingerprint".into()),
+        })
+    );
+    assert_eq!(answer_of(r#"{"status": "error"}"#), Err(AnswerError::default()));
+    assert_eq!(answer_of(r#"{"results": []}"#), Err(AnswerError::default()));
+    assert_eq!(answer_of(r#"{"status": "ok"}"#), Ok(AcoustIdAnswer::default()));
+}
+
+/// A field of the wrong kind ends the whole read with an error, which the client reads as an
+/// answer it could not read rather than half an answer.
+#[test]
+fn a_field_of_the_wrong_kind_fails_the_whole_answer() {
+    for json in [
+        "[]",
+        r#"{"status": 1}"#,
+        r#"{"status": "ok", "results": {}}"#,
+        r#"{"status": "ok", "results": [{"score": "high"}]}"#,
+        r#"{"status": "ok", "results": [{"recordings": [{"id": 5}]}]}"#,
+        r#"{"status": "ok", "results": [{"recordings": [{"id": "r", "sources": 2.5}]}]}"#,
+        r#"{"status": "ok", "results": [{"recordings": [{"id": "r", "artists": ["The Beatles"]}]}]}"#,
+        r#"{"status": "error", "error": {"code": "3"}}"#,
+    ] {
+        let doc: Value = serde_json::from_str(json).expect("test JSON parses");
+        assert!(parse_answer(&doc).is_err(), "{json}");
+    }
+}

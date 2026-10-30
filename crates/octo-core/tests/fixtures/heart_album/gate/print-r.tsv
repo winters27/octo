@@ -1,0 +1,14 @@
+# print	row (rows-v3.tsv) or source	R (recording ids)
+help-2009	R1(a)-(b) by hand, 2026-10-25: Deezer track 116348342 "Help! (Remastered 2009)", ISRC GBAYE0601465, album 12047944 UPC 602547670052; the barcode release 94acd741 track 1 is recording 4416d38e ("1987 remix", which the 2009 stereo remaster carries); the ISRC lists 4416d38e and be4ce82b (no note, the 2015 mix's GBUM71505900); their notes differ, so R1(b) keeps the heard track's recording	4416d38e-0f68-4c75-93b9-c1a793fccb49
+help-2015	beatles-help#0	01b6e4de-ff48-4ec0-862e-cd623c924d7b
+yesterday-2009	beatles-yesterday#1	c05194a3-f6f0-4f52-b78a-13fb5580bc0f
+yesterday-2015	beatles-yesterday#0	71f1c2a7-17b1-4b57-95a1-1d3282f4bd08
+walrus-2009	beatles-i-am-the-walrus#0	3eb7efbb-8717-4034-a698-109c70798524
+walrus-2023	R1(a) by hand, 2026-10-25: Deezer "I Am The Walrus (2023 Mix)", ISRC GBUM72306578; the MusicBrainz isrc lookup lists one recording, 21ca4704 ("2023 mix")	21ca4704-2263-4e9f-ae4b-412af5d13e1e
+lovestory-2008	swift-love-story#2008	9086b742-358b-4f73-9a14-84cb1a9ce4ce
+lovestory-tv	swift-love-story#0	93484aa2-0ce6-4356-9ff4-9db61e07acd5
+lovestory-tv-chapter	swift-love-story#0	93484aa2-0ce6-4356-9ff4-9db61e07acd5
+lovestory-tv-more	swift-love-story#0	93484aa2-0ce6-4356-9ff4-9db61e07acd5
+mrsrobinson-live	sg-mrs-robinson#0	047e8a87-af7b-4bd9-aecf-1d2028b519e7
+mrsrobinson-studio	R1(a) by hand, 2026-10-25: the print is the 238 s studio take (the Bookends / Graduate stereo mix), not row sg-mrs-robinson#1 (the 216 s soundtrack edit cdf59a99, USSM11904318, an earlier mapping corrected here); its ISRC USSM16800249 lists one recording, df569676 ("original stereo mix", 238.3 s)	df569676-9c08-4bec-8137-daa122c04ca9
+help-catalog-1967-1970	the catalog row of a 2023 compilation's Help! (ISRC GBUM72306558): its recording b7ecb9fc holds 6 of about 10,500 submissions in the 2015 mix's heard answer	b7ecb9fc-94e5-430d-83b1-d8987a1ad75b

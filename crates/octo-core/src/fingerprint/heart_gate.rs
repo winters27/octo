@@ -6,8 +6,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::fingerprint::acoust_id_client::{AcoustIdOutcome, AnswerRecording};
-use crate::fingerprint::verification::WeighedRecording;
+use crate::fingerprint::acoust_id_client::{AcoustIdAnswer, AcoustIdOutcome, AnswerRecording};
+use crate::fingerprint::clip_check;
+use crate::fingerprint::heart_release::MOST_HEARD_RECORDINGS;
+use crate::fingerprint::verification::{
+    AnswerReading, MIN_SHARE, MIN_SOURCES_TO_CONFIRM, Reading, SongName, WeighedRecording,
+    believed_other_song, is_same_song, length_fits, one_recording, r_song, read_answer, same_song,
+};
 
 /// The client an album context opened through Navidrome's own API is filed under: that API sends
 /// no client name.
@@ -515,6 +520,583 @@ pub enum ImportJudgement {
     Stands { proven: bool },
 }
 
+/// Reads the heard sample's AcoustID outcome against the catalog R, the first match winning:
+///
+/// - AcoustID has not answered: [`HeardAnswerReading::Busy`];
+/// - AcoustID is off or could not read the sample: [`HeardAnswerReading::NeedsClip`], since only
+///   the catalog's clip can then say what played;
+/// - the answer's dominant recording is a believed different song (another song at most of the
+///   weight wins over R's sliver of it): [`HeardAnswerReading::AnotherSong`];
+/// - the reading is clear or ambiguous, or R's recordings hold at least [`MIN_SHARE`] of the
+///   weight: R stays, tagged with the dominant recording only when the reading is clear;
+/// - R holds less and the dominant recording is R's song at half the weight or more: the stream
+///   stood in with another version of the song, and R becomes it;
+/// - anything else, an empty or unknown answer included: nothing proves which recording played.
+pub fn read_heard_answer(
+    outcome: &AcoustIdOutcome,
+    r: &HeardRecording,
+    min_score: f64,
+) -> HeardAnswerReading {
+    let answer = match outcome {
+        AcoustIdOutcome::Busy => return HeardAnswerReading::Busy,
+        AcoustIdOutcome::Off | AcoustIdOutcome::Unreadable { .. } => return HeardAnswerReading::NeedsClip,
+        AcoustIdOutcome::Answered(answer) => answer,
+    };
+    let reading = read_answer(answer, r, min_score);
+    let Some(dominant) = reading.dominant() else {
+        return HeardAnswerReading::OnlyHeardOrMaster;
+    };
+    if believed_other_song(&reading, r, dominant) {
+        return HeardAnswerReading::AnotherSong;
+    }
+    match reading.reading {
+        Reading::Clear => HeardAnswerReading::RStays {
+            tag: Some(dominant.id.clone()),
+        },
+        Reading::Ambiguous => HeardAnswerReading::RStays { tag: None },
+        Reading::Another if reading.r_share >= MIN_SHARE => HeardAnswerReading::RStays { tag: None },
+        Reading::Another
+            if same_song(&reading, r, dominant) && 2 * dominant.weight >= reading.total_weight() =>
+        {
+            HeardAnswerReading::Becomes(dominant.clone())
+        }
+        _ => HeardAnswerReading::OnlyHeardOrMaster,
+    }
+}
+
+/// The R a heard answer's dominant recording D makes: D first, then the recordings MusicBrainz
+/// files under D's codes with D's note (`duplicates`, as the caller fetched them), at most
+/// [`MOST_HEARD_RECORDINGS`] ids, with every one of them kept as R's duplicates. R's ISRCs and
+/// artist ids become D's; its title and artist stay the catalog's, which say what the same song is.
+/// The answer is read again against that R, and D's id is the tag a file kept as heard may carry
+/// only when that reading is clear and D carries at least [`MIN_SOURCES_TO_CONFIRM`] submissions
+/// of its own. Otherwise R may be another mix than the one heard, so it is marked `from_unclear`
+/// and no clear reading against it ever accepts a file.
+pub fn became(
+    answer: &AcoustIdAnswer,
+    dominant: &WeighedRecording,
+    duplicates: &[String],
+    catalog: &HeardRecording,
+    min_score: f64,
+) -> (HeardRecording, Option<String>) {
+    let mut every = vec![dominant.id.clone()];
+    for id in duplicates.iter().map(|id| id.trim()).filter(|id| !id.is_empty()) {
+        if !every.iter().any(|known| known.eq_ignore_ascii_case(id)) {
+            every.push(id.to_string());
+        }
+    }
+    let mut artist_ids: Vec<String> = Vec::new();
+    for id in dominant.artists.iter().filter_map(|artist| artist.id.as_ref()) {
+        if !artist_ids.contains(id) {
+            artist_ids.push(id.clone());
+        }
+    }
+    let mut r = HeardRecording {
+        ids: every.iter().take(MOST_HEARD_RECORDINGS).cloned().collect(),
+        duplicates: every,
+        isrcs: dominant.isrcs.clone(),
+        title: catalog.title.clone(),
+        artist: catalog.artist.clone(),
+        artist_ids,
+        from_unclear: false,
+    };
+    let again = read_answer(answer, &r, min_score);
+    let tag = (again.reading == Reading::Clear && dominant.weight >= i64::from(MIN_SOURCES_TO_CONFIRM))
+        .then(|| dominant.id.clone());
+    r.from_unclear = tag.is_none();
+    (r, tag)
+}
+
+/// What a never-played heart's stand-in (the pinned video, fetched only to help find R) says.
+/// With a catalog R, the stand-in may only narrow R to the one recording its answer gives, and
+/// only when that recording is already R's; its print is the reference a download is compared
+/// with only when its answer reads clear or ambiguous against R. With no catalog R (no ids), the
+/// one recording its answer gives becomes R when its length fits the song's, and the stand-in is
+/// then the reference.
+pub fn read_stand_in(
+    answer: &AcoustIdAnswer,
+    r: &HeardRecording,
+    heard_seconds: Option<i32>,
+    min_score: f64,
+) -> StandInReading {
+    let reading = read_answer(answer, r, min_score);
+    let one = one_recording(&reading, r);
+    if !r.ids.is_empty() {
+        return StandInReading {
+            recording: one.filter(|found| r.holds(&found.id)).cloned(),
+            is_reference: matches!(reading.reading, Reading::Clear | Reading::Ambiguous),
+        };
+    }
+    let fits = one.filter(|found| match (found.duration_seconds, heard_seconds) {
+        (Some(length), Some(heard)) if heard > 0 => length_fits(length, f64::from(heard)),
+        _ => true,
+    });
+    StandInReading {
+        is_reference: fits.is_some(),
+        recording: fits.cloned(),
+    }
+}
+
+/// Whether a candidate is the very audio that played, by identity alone: a prefetched copy under
+/// the heard key that is still the copy that played (the same ready time and source file, so a
+/// later fetch under the key is another copy); a copy of the heard video's own stream with the
+/// confirmed byte size and content type that played, and its format when both sides know it; or
+/// the library or acquired file that played, by its path.
+pub fn is_heard_audio(heard: &HeardSource, candidate: &HeardSource) -> bool {
+    match (heard, candidate) {
+        (
+            HeardSource::Copy {
+                key,
+                ready_at,
+                source_file,
+            },
+            HeardSource::Copy {
+                key: other_key,
+                ready_at: other_ready_at,
+                source_file: other_source_file,
+            },
+        ) => {
+            key == other_key
+                && ready_at.is_some()
+                && ready_at == other_ready_at
+                && source_file == other_source_file
+        }
+        (
+            HeardSource::Video {
+                id,
+                size,
+                content_type,
+                itag,
+            },
+            HeardSource::Video {
+                id: other_id,
+                size: other_size,
+                content_type: other_content_type,
+                itag: other_itag,
+            },
+        ) => {
+            id == other_id
+                && size.is_some()
+                && size == other_size
+                && content_type.eq_ignore_ascii_case(other_content_type)
+                && match (itag, other_itag) {
+                    (Some(itag), Some(other_itag)) => itag == other_itag,
+                    _ => true,
+                }
+        }
+        (
+            HeardSource::Library { path } | HeardSource::Acquired { path },
+            HeardSource::Library { path: other } | HeardSource::Acquired { path: other },
+        ) => !path.is_empty() && path == other,
+        _ => false,
+    }
+}
+
+/// What a file's own labels say against R. Labels can only refuse a file, never accept one.
+///
+/// - An ISRC label names R when it is one of R's ISRCs, or when in the file's answer R's
+///   recordings carry it (one carried by R's and another recording too is neutral, since
+///   MusicBrainz files one code under more than one mix); otherwise it names another recording,
+///   another song when no recording of R's song in the answer carries it. With no answer that
+///   links anything, a code other than R's is asked of MusicBrainz, and names another recording
+///   unless one it lists is R's, another song when every one it lists is.
+/// - A `MUSICBRAINZ_TRACKID` label is asked of MusicBrainz first, unless it is already R's or one
+///   of R's duplicates (MusicBrainz answers a merged id with the recording it became), and names
+///   another recording when the recording it now is is neither; another song when the answer
+///   shows that recording as another song.
+///
+/// A label that names another song wins; then the first fact still to be asked
+/// ([`LabelCheck::Needs`]); then a MusicBrainz that did not answer ([`LabelCheck::Busy`]).
+pub fn check_labels(reading: Option<&AnswerReading>, facts: &FileFacts, r: &HeardRecording) -> LabelCheck {
+    combine(&label_findings(reading, facts, r))
+}
+
+/// How a file of an origin that keeps the shipped checks fares against its AcoustID reading:
+/// refused when the reading names another recording or one of its labels does, the shipped
+/// verdict standing otherwise, proven only by a clear reading. A label MusicBrainz has not
+/// settled refuses nothing.
+pub fn import_judgement(reading: &AnswerReading, facts: &FileFacts, r: &HeardRecording) -> ImportJudgement {
+    let refused_by_label = label_findings(Some(reading), facts, r)
+        .iter()
+        .any(|finding| matches!(finding, LabelCheck::NamesAnother { .. }));
+    if reading.reading == Reading::Another || refused_by_label {
+        ImportJudgement::Refuse
+    } else {
+        ImportJudgement::Stands {
+            proven: reading.reading == Reading::Clear,
+        }
+    }
+}
+
+impl HeartGate {
+    /// Judges one downloaded file, or names the next fact it needs before it can. The first match
+    /// wins:
+    ///
+    /// 1. Proof 2: a file whose print is over the match line against the heard audio's is refused
+    ///    (never when the stream stood in with another song, and for a never-played heart only
+    ///    against a stand-in that is its reference).
+    /// 2. What played is not settled yet: the heard lookup is busy, or with AcoustID off the
+    ///    catalog's clip did not read "this song". The file waits for that, whatever else it is.
+    /// 3. A0: the file is the very audio that played.
+    /// 4. A2: the file is the master that played, unless its own reading names another recording
+    ///    or a label names another song. Only then is the heard master asked for.
+    /// 5. A label naming another recording refuses it.
+    /// 6. When nothing proves which recording played, only A0 or A2 could have kept it.
+    /// 7. A1, the file's own reading: clear accepts (never against an R built on a reading that was
+    ///    not clear), ambiguous leaves it undecided, another recording, no entry and an unlinked
+    ///    fingerprint refuse it. A busy lookup holds; a file AcoustID cannot read is refused; with
+    ///    AcoustID off the file is undecided.
+    ///
+    /// Before the file's reading names another recording, a dominant recording of R's song
+    /// outside R is asked of MusicBrainz, since AcoustID never follows MusicBrainz's merges.
+    /// Undecided keeps the heard copy when something was heard, else holds "not yet proven".
+    pub fn judge(&self, facts: &FileFacts, min_score: f64) -> Judgement {
+        let catalog = self.r.clone().unwrap_or_default();
+        let heard = self.heard_usable();
+        if self.proof_two_applies()
+            && facts
+                .heard_distance
+                .is_some_and(|distance| distance > clip_check::MATCH_AT_MOST)
+        {
+            return refuse(Refusal::DiffersFromHeard);
+        }
+        match &self.reading {
+            HeardReading::Busy => return hold(WaitingFor::AcoustId),
+            HeardReading::Clip(ClipReading::Busy(wait)) => return hold(*wait),
+            HeardReading::Clip(
+                ClipReading::AnotherSongOrTake | ClipReading::Unclear | ClipReading::NoClip,
+            ) => {
+                return hold(WaitingFor::AcoustIdOff);
+            }
+            _ => {}
+        }
+        if heard && facts.identical {
+            return accept(Acceptance::HeardAudio, self.heard_tag(&catalog));
+        }
+
+        let (reading, r) = match &facts.answer {
+            AcoustIdOutcome::Answered(answer) => match file_reading(answer, &catalog, facts, min_score) {
+                Ok((reading, r)) => (Some(reading), r),
+                Err(judgement) => return judgement,
+            },
+            _ => (None, catalog),
+        };
+        let findings = label_findings(reading.as_ref(), facts, &r);
+
+        let master_may_accept = heard && reading.as_ref().is_none_or(|f| f.reading != Reading::Another);
+        let names_other_song = findings.contains(&LabelCheck::NamesAnother { other_song: true });
+        if master_may_accept && !names_other_song {
+            if let Some(waiting) = unsettled(&findings) {
+                return waiting;
+            }
+            match facts.heard_master {
+                None => return Judgement::Needs(Need::HeardMaster),
+                Some(HeardMaster::Same) => return accept(Acceptance::HeardMaster, self.heard_tag(&r)),
+                Some(HeardMaster::Busy) => return hold(WaitingFor::Shim),
+                Some(HeardMaster::Differs | HeardMaster::Undecided | HeardMaster::HeardGone) => {}
+            }
+        }
+
+        if findings
+            .iter()
+            .any(|finding| matches!(finding, LabelCheck::NamesAnother { .. }))
+        {
+            return refuse(Refusal::Label);
+        }
+        if let Some(waiting) = unsettled(&findings) {
+            return waiting;
+        }
+        let undecided = Judgement::Verdict(GateVerdict::Undecided(if heard {
+            Undecided::KeepHeardCopy
+        } else {
+            Undecided::NotYetProven
+        }));
+        if self.reading == HeardReading::OnlyHeardOrMaster {
+            return Judgement::Verdict(GateVerdict::Undecided(Undecided::KeepHeardCopy));
+        }
+        let Some(reading) = reading else {
+            return match facts.answer {
+                AcoustIdOutcome::Busy => hold(WaitingFor::AcoustId),
+                AcoustIdOutcome::Unreadable { .. } => refuse(Refusal::Unreadable),
+                AcoustIdOutcome::Off | AcoustIdOutcome::Answered(_) => undecided,
+            };
+        };
+        match reading.reading {
+            Reading::Clear if r.from_unclear => undecided,
+            Reading::Clear => match reading.dominant() {
+                Some(dominant) => accept(
+                    Acceptance::Sound,
+                    TagClaim::Recording {
+                        id: current_id(facts, &dominant.id),
+                        isrcs: r.isrcs.clone(),
+                    },
+                ),
+                None => undecided,
+            },
+            Reading::Ambiguous => undecided,
+            Reading::Another => refuse(Refusal::AnotherRecording),
+            Reading::Empty => refuse(Refusal::NoEntry),
+            Reading::Unknown => refuse(Refusal::Unknown),
+        }
+    }
+
+    /// Something was heard that may be the song: not a heart never played, and not a stream that
+    /// stood in with another song.
+    fn heard_usable(&self) -> bool {
+        !matches!(self.reading, HeardReading::NotHeard | HeardReading::AnotherSong)
+    }
+
+    /// Whether a file's distance from the reference print can refuse it: not when what played was
+    /// another song (or, with AcoustID off, may have been), and for a heart never played only when
+    /// its stand-in is the reference.
+    fn proof_two_applies(&self) -> bool {
+        match &self.reading {
+            HeardReading::AnotherSong | HeardReading::Clip(ClipReading::AnotherSongOrTake) => false,
+            HeardReading::NotHeard => self
+                .stand_in
+                .as_ref()
+                .is_some_and(|stand_in| stand_in.is_reference),
+            _ => true,
+        }
+    }
+
+    /// The tags a file kept as the heard audio or the heard master may carry: the recording the
+    /// heard answer read clear, with R's ISRCs, else none ("as heard").
+    fn heard_tag(&self, r: &HeardRecording) -> TagClaim {
+        match &self.reading {
+            HeardReading::RStays { tag: Some(id) } | HeardReading::RBecame { tag: Some(id) } => {
+                TagClaim::Recording {
+                    id: id.clone(),
+                    isrcs: r.isrcs.clone(),
+                }
+            }
+            _ => TagClaim::AsHeard,
+        }
+    }
+}
+
+/// The file's own reading against R. When it names another recording because a recording of R's
+/// song outside R dominates, MusicBrainz is asked what that recording is now, and a merged-away id
+/// of one of R's recordings counts as R's (the R returned holds it).
+fn file_reading(
+    answer: &AcoustIdAnswer,
+    r: &HeardRecording,
+    facts: &FileFacts,
+    min_score: f64,
+) -> Result<(AnswerReading, HeardRecording), Judgement> {
+    let reading = read_answer(answer, r, min_score);
+    let Some(dominant) = reading
+        .dominant()
+        .filter(|_| reading.reading == Reading::Another)
+        .filter(|dominant| !r.holds(&dominant.id) && same_song(&reading, r, dominant))
+    else {
+        return Ok((reading, r.clone()));
+    };
+    match current_recording(facts, &dominant.id) {
+        None => Err(Judgement::Needs(Need::CurrentRecording(dominant.id.clone()))),
+        Some(MusicBrainzFact::Busy) => Err(hold(WaitingFor::MusicBrainz)),
+        Some(MusicBrainzFact::Known(current)) if r.holds(current) => {
+            let mut merged = r.clone();
+            merged.ids.push(dominant.id.clone());
+            Ok((read_answer(answer, &merged, min_score), merged))
+        }
+        Some(_) => Ok((reading, r.clone())),
+    }
+}
+
+/// What each of a file's labels says, the recording id first, then each ISRC.
+fn label_findings(reading: Option<&AnswerReading>, facts: &FileFacts, r: &HeardRecording) -> Vec<LabelCheck> {
+    let reading = reading.filter(|reading| !reading.recordings.is_empty());
+    let mut findings = Vec::new();
+    if let Some(id) = facts
+        .labels
+        .recording_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        findings.push(recording_label(id, reading, facts, r));
+    }
+    for code in facts
+        .labels
+        .isrcs
+        .iter()
+        .map(|code| code.trim())
+        .filter(|code| !code.is_empty())
+    {
+        findings.push(isrc_label(code, reading, facts, r));
+    }
+    findings
+}
+
+fn recording_label(
+    id: &str,
+    reading: Option<&AnswerReading>,
+    facts: &FileFacts,
+    r: &HeardRecording,
+) -> LabelCheck {
+    if r.holds(id) || is_duplicate(r, id) {
+        return LabelCheck::Clean;
+    }
+    match current_recording(facts, id) {
+        None => LabelCheck::Needs(Need::CurrentRecording(id.to_string())),
+        Some(MusicBrainzFact::Busy) => LabelCheck::Busy,
+        Some(MusicBrainzFact::NotKnown) => LabelCheck::NamesAnother { other_song: false },
+        Some(MusicBrainzFact::Known(current)) if r.holds(current) || is_duplicate(r, current) => {
+            LabelCheck::Clean
+        }
+        Some(MusicBrainzFact::Known(current)) => LabelCheck::NamesAnother {
+            other_song: reading.is_some_and(|reading| {
+                reading
+                    .recordings
+                    .iter()
+                    .find(|found| found.id.eq_ignore_ascii_case(current) || found.id.eq_ignore_ascii_case(id))
+                    .is_some_and(|found| !same_song(reading, r, found))
+            }),
+        },
+    }
+}
+
+fn isrc_label(
+    code: &str,
+    reading: Option<&AnswerReading>,
+    facts: &FileFacts,
+    r: &HeardRecording,
+) -> LabelCheck {
+    if r.isrcs.iter().any(|own| own.eq_ignore_ascii_case(code)) {
+        return LabelCheck::Clean;
+    }
+    if let Some(reading) = reading {
+        let carriers: Vec<&WeighedRecording> = reading
+            .recordings
+            .iter()
+            .filter(|found| found.isrcs.iter().any(|isrc| isrc.eq_ignore_ascii_case(code)))
+            .collect();
+        if carriers.iter().any(|found| r.holds(&found.id)) {
+            return LabelCheck::Clean;
+        }
+        return LabelCheck::NamesAnother {
+            other_song: !carriers.is_empty() && !carriers.iter().any(|found| same_song(reading, r, found)),
+        };
+    }
+    match facts
+        .isrc_recordings
+        .iter()
+        .find(|(asked, _)| asked.eq_ignore_ascii_case(code))
+        .map(|(_, fact)| fact)
+    {
+        None => LabelCheck::Needs(Need::IsrcRecordings(code.to_string())),
+        Some(MusicBrainzFact::Busy) => LabelCheck::Busy,
+        Some(MusicBrainzFact::NotKnown) => LabelCheck::NamesAnother { other_song: false },
+        Some(MusicBrainzFact::Known(listed)) => {
+            if listed
+                .iter()
+                .any(|found| r.holds(&found.id) || is_duplicate(r, &found.id))
+            {
+                return LabelCheck::Clean;
+            }
+            let nothing_read = AnswerReading {
+                reading: Reading::Empty,
+                recordings: Vec::new(),
+                r_share: 0.0,
+            };
+            let song = r_song(&nothing_read, r);
+            LabelCheck::NamesAnother {
+                other_song: !listed.is_empty()
+                    && song
+                        .is_some_and(|song| listed.iter().all(|found| !is_same_song(&song_of(found), &song))),
+            }
+        }
+    }
+}
+
+/// Every label's findings as one: another song first, then a fact still to ask, then a busy
+/// MusicBrainz, then another recording.
+fn combine(findings: &[LabelCheck]) -> LabelCheck {
+    if findings.contains(&LabelCheck::NamesAnother { other_song: true }) {
+        return LabelCheck::NamesAnother { other_song: true };
+    }
+    if let Some(need) = findings.iter().find_map(|finding| match finding {
+        LabelCheck::Needs(need) => Some(need.clone()),
+        _ => None,
+    }) {
+        return LabelCheck::Needs(need);
+    }
+    if findings.contains(&LabelCheck::Busy) {
+        return LabelCheck::Busy;
+    }
+    if findings.contains(&LabelCheck::NamesAnother { other_song: false }) {
+        return LabelCheck::NamesAnother { other_song: false };
+    }
+    LabelCheck::Clean
+}
+
+/// The label fact still to ask, or MusicBrainz's busy answer, when one label has either.
+fn unsettled(findings: &[LabelCheck]) -> Option<Judgement> {
+    if let Some(need) = findings.iter().find_map(|finding| match finding {
+        LabelCheck::Needs(need) => Some(need.clone()),
+        _ => None,
+    }) {
+        return Some(Judgement::Needs(need));
+    }
+    findings
+        .contains(&LabelCheck::Busy)
+        .then(|| hold(WaitingFor::MusicBrainz))
+}
+
+fn current_recording<'a>(facts: &'a FileFacts, id: &str) -> Option<&'a MusicBrainzFact<String>> {
+    facts
+        .current_recordings
+        .iter()
+        .find(|(asked, _)| asked.eq_ignore_ascii_case(id))
+        .map(|(_, fact)| fact)
+}
+
+/// The id MusicBrainz files a recording under now, when it was asked; the id itself otherwise.
+fn current_id(facts: &FileFacts, id: &str) -> String {
+    match current_recording(facts, id) {
+        Some(MusicBrainzFact::Known(current)) => current.clone(),
+        _ => id.to_string(),
+    }
+}
+
+fn is_duplicate(r: &HeardRecording, id: &str) -> bool {
+    r.duplicates.iter().any(|known| known.eq_ignore_ascii_case(id))
+}
+
+/// A recording MusicBrainz lists, as two songs are compared.
+fn song_of(recording: &AnswerRecording) -> SongName {
+    SongName {
+        title: recording.title.clone(),
+        artists: recording
+            .artists
+            .iter()
+            .map(|artist| artist.name.clone())
+            .collect(),
+        artist_ids: recording
+            .artists
+            .iter()
+            .filter_map(|artist| artist.id.clone())
+            .collect(),
+    }
+}
+
+fn accept(by: Acceptance, tags: TagClaim) -> Judgement {
+    Judgement::Verdict(GateVerdict::Accept { by, tags })
+}
+
+fn refuse(why: Refusal) -> Judgement {
+    Judgement::Verdict(GateVerdict::Refuse(why))
+}
+
+fn hold(wait: WaitingFor) -> Judgement {
+    Judgement::Verdict(GateVerdict::Hold(wait))
+}
+
 #[cfg(test)]
 #[path = "heart_gate_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "heart_gate_judge_tests.rs"]
+mod judge_tests;

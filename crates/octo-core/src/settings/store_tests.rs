@@ -122,7 +122,8 @@ fn null_in_settings_json_falls_back_for_typed_settings_and_shadows_strings() {
     );
     let s = store.current();
     assert_eq!(s.soulseek.search_wait_seconds, 45);
-    assert!(!s.soulseek.verify_downloads);
+    // appsettings.json's own value, beneath the cleared one.
+    assert!(s.soulseek.verify_downloads);
     assert_eq!(s.soulseek.preferred_extension, "");
     assert_eq!(store.raw("Soulseek:SearchWaitSeconds").as_deref(), Some(""));
 }
