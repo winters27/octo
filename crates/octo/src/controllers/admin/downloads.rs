@@ -136,18 +136,15 @@ impl FromBody for HeldRequest {
     );
 }
 
-/// The row key and the person a Keep anyway or Stop waiting names, trimmed, or the answer that
-/// says which is missing (`unnamed` when it is the person).
-fn held_request(request: Option<HeldRequest>, unnamed: &str) -> Result<(String, String), Response> {
+/// The row key and the person a Keep anyway or Stop waiting names, trimmed, or the words that say
+/// which is missing (`unnamed` when it is the person).
+fn held_request(request: Option<HeldRequest>, unnamed: &str) -> Result<(String, String), &str> {
     let (key, user) = request.map_or((None, None), |r| (r.key, r.user));
     let Some(key) = key.filter(|key| !is_blank(key)) else {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "Which download? The key is missing.",
-        ));
+        return Err("Which download? The key is missing.");
     };
     let Some(user) = user.filter(|user| !is_blank(user)) else {
-        return Err(error(StatusCode::BAD_REQUEST, unnamed));
+        return Err(unnamed);
     };
     Ok((key.trim().to_string(), user.trim().to_string()))
 }
@@ -186,7 +183,7 @@ pub async fn keep_anyway(State(state): State<AppState>, request: Request) -> Res
     };
     let (key, user) = match held_request(request, NAME_THE_PERSON) {
         Ok(named) => named,
-        Err(answer) => return answer,
+        Err(missing) => return error(StatusCode::BAD_REQUEST, missing),
     };
     match state.heart_acquisition_coordinator.keep_anyway(&key, &user) {
         KeepAnyway::Keeping => {
@@ -212,7 +209,7 @@ pub async fn stop_waiting(State(state): State<AppState>, request: Request) -> Re
     };
     let (key, user) = match held_request(request, STOP_NAME_THE_PERSON) {
         Ok(named) => named,
-        Err(answer) => return answer,
+        Err(missing) => return error(StatusCode::BAD_REQUEST, missing),
     };
     let Some((provider, id)) = key.split_once(':') else {
         return error(StatusCode::CONFLICT, NOTHING_WAITS_FOR_LIDARR);
