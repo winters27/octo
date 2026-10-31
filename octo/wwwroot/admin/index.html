@@ -2604,6 +2604,22 @@
           <div class="acq-list" id="health-run" aria-live="polite"></div>
         </div>
 
+        <div class="set-section">
+          <div class="set-head">
+            <h3 class="set-title">How a song was fetched</h3>
+            <p class="set-desc">Look up a song Octo downloaded to see how it was tagged: the release that won, its distance, the candidates it beat, where each tag came from, and the download log.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row stack">
+              <form class="set-inline" id="health-fetched-form" role="search">
+                <input class="set-input" id="health-fetched-q" type="search" placeholder="Title, artist or both" aria-label="Fetched song to look up" autocomplete="off" spellcheck="false" />
+                <button class="btn" type="submit"><svg class="icon" aria-hidden="true"><use href="#i-magnifying-glass"/></svg><span>Look up</span></button>
+              </form>
+              <div id="health-fetched-results" class="dl-list" aria-live="polite" hidden></div>
+            </div>
+          </div>
+        </div>
+
         <div id="health-body">
           <div class="state state-loading"><svg class="icon" aria-hidden="true"><use href="#i-circle-notch"/></svg><span>Checking your library…</span></div>
         </div>
