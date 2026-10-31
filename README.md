@@ -696,30 +696,47 @@ the copies are on purpose and stops Octo asking about them. The library is walke
 `LIBRARY_ACTIONS_DUPLICATES_SCAN_HOURS` (default 24) with Octo's Navidrome admin credential,
 and the dashboard can start a walk at once.
 
-`SLSKD_VERIFY_DOWNLOADS` fingerprints each finished Soulseek download with Chromaprint and
-identifies it through AcoustID before it joins the library, using the free key in
-`ACOUSTID_API_KEY`. A file identified as a different recording is deleted and its peer and
-filename are remembered in `/app/config/rejected-peers.json`, so that exact file is never
-downloaded again; entries lapse after 30 days and the Soulseek admin page can forget them all
-at once. `SLSKD_MIN_MATCH_SCORE` (50-99, default 85) is how sure AcoustID must be before its
-answer may reject anything, so raising it makes Octo *more* permissive, because weaker matches
-are ignored rather than acted on. A track with no AcoustID entry at all is always accepted.
+`SLSKD_VERIFY_DOWNLOADS` (on by default) fingerprints each finished download with Chromaprint
+and identifies it through AcoustID before it joins the library. Octo brings its own AcoustID
+key; your own key in `ACOUSTID_API_KEY` (or Settings) takes its place, and
+`ACOUSTID_API_KEY=off` turns AcoustID off. A file identified as a different recording is
+deleted and its peer and filename are remembered in `/app/config/rejected-peers.json`, so that
+exact file is never downloaded again; entries lapse after 30 days and the Soulseek admin page
+can forget them all at once. `SLSKD_MIN_MATCH_SCORE` (50-99, default 85) is how sure AcoustID
+must be before its answer may reject anything, so raising it makes Octo *more* permissive,
+because weaker matches are ignored rather than acted on. For hearts and plays, a file is kept
+only when its sound proves it is the recording you heard; otherwise Octo keeps the version you
+heard. For other downloads, a track AcoustID has never heard of is kept and marked not proven.
 `SLSKD_TAG_FROM_MUSICBRAINZ` writes the matched recording's MusicBrainz title, artist, album
 and year over the peer's own tags. `NAME_FROM_MATCH` goes one step further and names the file
 from the match as well (artist folder, title, album and track number), so the path and the
 tags come from one decision; it is off by default because a canonical name is not always the
-one you file under, and it only ever names files Octo downloads and confirms. YouTube
-downloads are identified too, but never rejected: YouTube has no second candidate, so a
-disagreement is kept and, with the Review playlist on, asked about. Verification needs
-`fpcalc` in the runtime image (`libchromaprint-tools`); without it the feature logs once and
-accepts everything. A song asked for with an ISRC (an album track Deezer listed) is also held
-to that code: a file whose own tags carry it is confirmed even with no AcoustID key or entry,
-and a fingerprint that names a recording spelled differently (a title in its own script, or
-translated) is confirmed when MusicBrainz lists the ISRC on it. A different ISRC never rejects
-a file, since re-releases are often given new codes. A recording only one person ever linked to
-the sound is not proof on its own: it is confirmed when the song's YouTube preview sounds like
-the file, refused when a preview that can be believed sounds nothing like it, and asked about
-otherwise.
+one you file under, and it only ever names files Octo downloads and confirms. A YouTube
+download that AcoustID names as another recording is thrown away, that video is never used for
+the song again, and the next video is tried. Verification needs `fpcalc` in the runtime image
+(`libchromaprint-tools`); without it the feature logs once and accepts everything. For hearts
+and plays none of this decides: a heart's file is kept only when AcoustID is certain it is the
+recording you heard, or when it is the very master you played, moment by moment; a file's own
+tags can only rule it out. A song asked for with an ISRC (an album track Deezer listed) is also
+held to that code: a file whose own tags carry it is confirmed even with no AcoustID key or
+entry, and a fingerprint that names a recording spelled differently (a title in its own script,
+or translated) is confirmed when MusicBrainz lists the ISRC on it. A different ISRC never
+rejects a file, since re-releases are often given new codes. A recording only one person ever
+linked to the sound is not proof on its own: it is confirmed when the song's own YouTube stream
+sounds like the file, refused when a stream that can be believed sounds nothing like it, and
+asked about otherwise.
+
+The dashboard's Status page says when a check cannot run, in its Downloads card: "Octo is not
+checking imported downloads by their sound. Turn it on" while verification is off, with a
+switch that turns it on (an install whose `.env` was written from an older example may still
+say `SLSKD_VERIFY_DOWNLOADS=false`); "AcoustID is off: Octo checks what played against the
+catalog's own clip of each song, and keeps a copy only when it is the very master you played";
+"AcoustID is not answering; hearts wait for it" while a heart holds for it; and "AcoustID
+refused your submission key" once `ACOUSTID_USER_KEY` is refused, until the settings change. The
+yt-dlp shim's card says "Update the yt-dlp shim so Octo can check YouTube" for a shim too old to
+answer the fresh lookups hearts check what played with, and Lidarr's card says "Waiting for
+Lidarr's indexers" while hearts hold for them, and "Lidarr has no indexer that can search" when
+none has automatic search on.
 
 "Catch fake lossless files" on the Soulseek admin page (on by default) checks every download
 that claims to be lossless for a lossy file converted to it. Octo decodes a few seconds from
@@ -906,7 +923,11 @@ Set `LIDARR_URL` and `LIDARR_API_KEY`, restart Octo, then open the **Lidarr** ad
 
 The selected Lidarr root and Octo's effective Navidrome library root must expose the same underlying files. Their container paths may differ: Octo translates the imported path relative to the selected Lidarr root. For example, Lidarr `/data/music/Artist/Album/file.flac` can map to Octo `/music/Artist/Album/file.flac` when both mounts point at the same host directory.
 
-A heart through Lidarr keeps the same promises as one through Soulseek. Lidarr brings the whole album, so a song already in your library is deleted from what it brought (an MP3 you own is queued for Better quality instead), a song removed with a library action stays removed, and an album Octo had Lidarr monitor goes back to unmonitored once it lands, so Lidarr does not fetch the songs Octo moved into its own layout again. Every song Lidarr imports then goes through the same pipeline as a Soulseek download: AcoustID (a wrong recording, or a live take you did not ask for, is deleted), the spectrum check, release matching, tags, ReplayGain, lyrics and your folder layout.
+A heart downloads the song you heard. When the artist has no music in your Lidarr yet, Octo asks Lidarr for the album you were listening from; otherwise your other sources look for it. A download is kept only when its sound proves it is the recording you heard: AcoustID must be certain, or it must be the very master you played, moment by moment. A file's own tags can rule it out but never prove it. When nothing can be proven yet, Octo keeps the version you heard and keeps looking for a better copy it can prove. A song you heart without playing waits for one play. Hearting a whole album keeps the tracks Octo can prove and holds the rest until you play them, or until you choose Keep these anyway. Octo brings its own AcoustID key; your own key in Settings takes its place. Tick On Grab and On Health Restored in Lidarr's webhook.
+
+Those two webhook events (beside On Release Import, in Lidarr's Settings, Connect, on the webhook pointed at Octo) let a heart waiting for Lidarr's indexers go on the moment they search again; without them Octo still reads Lidarr's health at the import poll pace. A heart held this way, a kept copy waiting for Lidarr's download, and a hearted album's held tracks are listed under In progress on the dashboard's Fetched songs page, with Keep anyway, Keep these anyway or Stop waiting for Lidarr for the person they wait for.
+
+A heart through Lidarr keeps the same promises as one through Soulseek. Lidarr brings the whole album, so a song already in your library is deleted from what it brought (an MP3 you own is queued for Better quality instead), a song removed with a library action stays removed, and what Octo adds to Lidarr stays unmonitored, so Lidarr does not fetch the songs Octo moved into its own layout again; when Octo's search brings nothing it keeps, what Octo added is taken back out of Lidarr, never off the disk. Every song Lidarr imports then goes through the same pipeline as a Soulseek download: the checks by sound above, the spectrum check, release matching, tags, ReplayGain, lyrics and your folder layout.
 
 A heart waits for Lidarr's import, up to `LIDARR_IMPORT_TIMEOUT_SECONDS` (default 1800), and any song that did not land (Lidarr found nothing in time, or the file failed a check) goes to the next source in **Heart download priority**, which skips the songs that did. The wait never blocks playback or later hearts. `LIDARR_COMPLETION_MODE=Accepted` (default) sends a notice when Lidarr accepts the search and one for the album when an album heart lands; `Imported` also sends one when a track heart's album lands, and one when an import fails or times out.
 
@@ -1016,15 +1037,16 @@ Octo hijacks these endpoints; everything else proxies to Navidrome unchanged:
 | `getLyricsBySongId`, `getLyrics` | lyrics for outside songs and for library songs Navidrome has none for; chosen or hidden lyrics for every client; word cues with `enhanced=true` |
 | `getLyricsCandidates`, `setLyricsChoice` | the `octoLyrics` extension: every lyrics entry for a song, and pinning one, hiding lyrics, or going back to automatic |
 | `getLibraryActions`, `libraryAction`, `getLibraryTrash` | the `octoLibraryActions` extension: what the caller may do to library files, removing one song the way the Delete playlist does, putting it back, and the tag, album and cover fixes of Library health |
-| `getAcquisitions`, `getAcquisition`, `clearAcquisitions` | the `octoAcquisitions` extension: the caller's downloads; version 2 adds each one's log and clearing finished ones |
-| `findSongs`, `getFoundSongs`, `pickFoundSong` | `octoAcquisitions` 2: a song's search run again on the caller's download sources, every copy found, and fetching the one picked |
+| `getAcquisitions`, `getAcquisition`, `clearAcquisitions` | the `octoAcquisitions` extension: the caller's downloads; version 2 adds each one's log and clearing finished ones; version 4 adds `keepAnyway: true` on a row the caller may keep anyway (a song held while AcoustID is off, or a hearted album's held tracks; only for someone waiting in its hold, and dropped once they asked), `heldTracks` (how many tracks a hearted album's row holds: the button reads Keep these anyway at 2 or more, else Keep anyway) and `stopWaiting: true` on a row whose song's copy, kept for the caller, waits for Lidarr's download; each is left out otherwise |
+| `keepAcquisitionAnyway`, `stopWaitingForLidarr` | `octoAcquisitions` 4, by the row's `key`: Keep anyway keeps a held row for the caller (a song keeps the version they heard, a hearted album lands its held tracks, each marked "kept by you, version not proven", and a copy proven later still replaces it); Stop waiting for Lidarr ends the wait for Lidarr's download, so the caller's kept copy lands now. Both answer a plain `ok`, a keep only once it is saved, so a restart in the middle still finishes it. An admin may add `user` to act for someone. Errors: 10 for a missing `key`, and "Name the person whose copy to keep" or "Name the person whose copy should stop waiting" for an admin who waits in nothing and named nobody; 50 "Only someone who hearted this can keep it" or "Only someone who hearted this can stop waiting for Lidarr"; 70 "Nothing is waiting to be kept" or "Nothing is waiting for Lidarr" |
+| `findSongs`, `getFoundSongs`, `pickFoundSong` | `octoAcquisitions` 2: a song's search run again on the caller's download sources, every copy found, and fetching the one picked; version 3 adds `anyway` to `pickFoundSong`, so a pick asked about first can replace the library song anyway |
 | `getImports`, `getImport`, `importAction` | the `octoImports` extension: the caller's imported lists with what the library has of each, and the trickle |
 | `getTopSongs` | the standard top songs of an artist (by name, or by id as Navidrome's `topSongsByArtistId`), for every app: ranked as `getArtistTopSongs` ranks them, songs you have as your library's own and the rest as outside songs (only yours while search discovery is off); Navidrome's answer when Octo has none |
 | `getArtistTopSongs`, `getTopChart`, `getCharts` | the `octoTopSongs` extension: an artist's most played songs and the chart of the moment, each marked in the caller's library or playable from outside it, and the charts a country has; `getTopChart` and `getCharts` take `country` (any Apple Music country, the caller's own when not sent or `auto`; error 10 for one Apple does not have, error 0 "Still loading your other countries. Try again in a moment." while two other countries are already loading for the caller; it frees as they finish) |
 | `setChartCountry`, `pinChartCountry` | `octoTopSongs` 3: the caller's own chart country (`country`, or `auto` to follow the server's), and pinning (`pinned=true` or `1`) or unpinning (`pinned=false` or `0`) one more `country`, at most 3; error 10 for a country Apple does not have, error 0 while two other countries are already loading for the caller, which frees as they finish; each answers like `getCharts`, which then says the caller's `setting`, `pinned`, the `serverCountry`, Apple's `countries` and `maxPinned` |
 | `getPlace` | the `octoPlaces` extension, for the apps' Live radio near you: a postal code (`code` and `country`, any case or spacing, `UK` for `GB`; a full UK, Canadian or Dutch code finds the part GeoNames keeps, and a ZIP+4 its five digits), a city (`name`, optional `state` by name or code, and `country`; of the towns with that name, and that state when one is sent, the one with the most postal codes, at the postal code nearest its others) or a coordinate (`latitude` and `longitude` in decimal degrees: the nearest place within 30 km), in that order when several are sent, answered as `place` with `code`, `name`, `state` (when known), `country`, `latitude` and `longitude` (2 decimals). Error 70 for a place Octo does not know, error 10 for missing parameters or coordinates that are not decimal degrees. Answered from GeoNames' postal codes, built into the image; nothing is sent anywhere |
 | `/api/artist/{id}`, `/api/album?artist_id=` | Navidrome's own API, for clients that use it (Feishin): an outside artist's page and its albums |
-| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 and 2, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` 1 to 3 (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`), `octoPlaces` (while the place data can be read, so an app without it keeps to its own lookup) and `songLyrics` 1 and 2 |
+| `getOpenSubsonicExtensions` | Navidrome's list plus `octoAcquisitions` 1 to 4, `octoLyrics` (while lyrics lookups are on), `octoLibraryActions` (while library actions are on), `octoTopSongs` 1 to 3 (while search discovery is on), `octoImports`, `octoRadioSources` (while radio can answer: radio songs carry `octoSuggestedBy`), `octoPlaces` (while the place data can be read, so an app without it keeps to its own lookup) and `songLyrics` 1 and 2 |
 
 ### Soulseek download details
 
