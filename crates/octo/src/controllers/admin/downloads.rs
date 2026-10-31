@@ -1,7 +1,8 @@
 //! The download log and Find songs routes: the dashboard's side of what the Octo apps already
 //! do, for admins whose listeners use other Subsonic apps. A download's full log on Fetched
-//! songs, and Find songs (a search run again by hand, every copy listed, one picked). Recently
-//! removed and Put back (`trash`, `trash/restore`) are the library edits' (see `trash`).
+//! songs, Find songs (a search run again by hand, every copy listed, one picked), and a held
+//! download's Keep anyway and Stop waiting for Lidarr for one of the people it was held for.
+//! Recently removed and Put back (`trash`, `trash/restore`) are the library edits' (see `trash`).
 //!
 //! Everything here names peers, files or people, or changes the library, so every call needs a
 //! Navidrome admin's own dashboard sign-in (never the recovery code) and acts as that person:
@@ -26,9 +27,14 @@ use super::json_body::{FromBody, Kind, Member, Shape, text_record};
 use super::plumbing::{BROWSE_COOKIE_NAME, BROWSE_TOKEN_HEADER, request_cookie};
 use super::request_binding::{error, ok, query, sign_in, split};
 use crate::app::AppState;
+use crate::controllers::subsonic::downloads::{
+    NAME_THE_PERSON, NOTHING_WAITING, NOTHING_WAITS_FOR_LIDARR, STOP_NAME_THE_PERSON,
+};
 use crate::http::error::problem;
 use crate::http::routes::RouteSet;
 use crate::services::common::acquisition_tracker::AcquisitionSnapshot;
+use crate::services::common::heart_acquisition_coordinator::KeepAnyway;
+use crate::services::lidarr::StopWaiting;
 use crate::services::local::DownloadHistoryService;
 use crate::services::soulseek::SoulseekMetadataService;
 use crate::services::subsonic::subsonic_response_builder::{
@@ -43,6 +49,9 @@ const COVER_SIDE: u32 = 160;
 pub fn routes() -> RouteSet {
     RouteSet::new()
         .route("/api/admin/downloads/log", get(download_log))
+        .route("/api/admin/acquisitions/holders", get(held_for))
+        .route("/api/admin/acquisitions/keep", post(keep_anyway))
+        .route("/api/admin/acquisitions/stop-waiting", post(stop_waiting))
         .route("/api/admin/find", post(start_find))
         .route("/api/admin/find/outside", get(outside_songs))
         .route("/api/admin/find/cover", get(find_cover))
@@ -107,6 +116,122 @@ pub async fn download_log(State(state): State<AppState>, request: Request) -> Re
         return ok(&json!({ "key": key, "kept": "live", "row": json, "event": lines }));
     }
     ok(&json!({ "key": key, "kept": "none", "row": null, "event": [] }))
+}
+
+// ---- Keep anyway and Stop waiting for Lidarr ------------------------------------------------
+
+/// `HeldRequest(string? Key, string? User)`: a held download's row key and the person to act for.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct HeldRequest {
+    key: Option<String>,
+    user: Option<String>,
+}
+
+impl FromBody for HeldRequest {
+    const SHAPE: &'static Shape = text_record!(
+        "Octo.Controllers.AdminDownloadsController+HeldRequest",
+        "key",
+        "user"
+    );
+}
+
+/// The row key and the person a Keep anyway or Stop waiting names, trimmed, or the answer that
+/// says which is missing (`unnamed` when it is the person).
+fn held_request(request: Option<HeldRequest>, unnamed: &str) -> Result<(String, String), Response> {
+    let (key, user) = request.map_or((None, None), |r| (r.key, r.user));
+    let Some(key) = key.filter(|key| !is_blank(key)) else {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Which download? The key is missing.",
+        ));
+    };
+    let Some(user) = user.filter(|user| !is_blank(user)) else {
+        return Err(error(StatusCode::BAD_REQUEST, unnamed));
+    };
+    Ok((key.trim().to_string(), user.trim().to_string()))
+}
+
+/// The holder menus of one held row: who may keep it anyway now (`keepers`) and whose kept copy
+/// of its song waits for Lidarr (`stopWaiters`), each in the order they joined.
+pub async fn held_for(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, _) = split(request).await;
+    if admin(&state, &parts.headers).is_none() {
+        return sign_in();
+    }
+    let Some(key) = query(&parts.uri, "key").filter(|k| !is_blank(k)) else {
+        return error(StatusCode::BAD_REQUEST, "Which download? The key is missing.");
+    };
+    let key = key.trim().to_string();
+    let keepers = state.heart_acquisition_coordinator.keepers(&key);
+    let stop_waiters = key
+        .split_once(':')
+        .map(|(provider, id)| state.lidarr_hearts.stop_waiters(provider, id))
+        .unwrap_or_default();
+    ok(&json!({ "key": key, "keepers": keepers, "stopWaiters": stop_waiters }))
+}
+
+/// Keep anyway (Keep these anyway on a hearted album's row) for one person waiting in the row's
+/// holds, the admin's own way to what keepAcquisitionAnyway does for the apps with `user`: the
+/// keep is saved with the holds before this answers a plain ok, then carried out. A conflict when
+/// nothing of the row waits to be kept for that person.
+pub async fn keep_anyway(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, body) = split(request).await;
+    let request: Option<HeldRequest> = match bind_optional_body(&parts.headers, &body) {
+        Ok(request) => request,
+        Err(answer) => return answer,
+    };
+    let Some(admin) = admin(&state, &parts.headers) else {
+        return sign_in();
+    };
+    let (key, user) = match held_request(request, NAME_THE_PERSON) {
+        Ok(named) => named,
+        Err(answer) => return answer,
+    };
+    match state.heart_acquisition_coordinator.keep_anyway(&key, &user) {
+        KeepAnyway::Keeping => {
+            info!("{admin} kept {key} anyway for {user} from the dashboard");
+            ok(&json!({ "status": "ok" }))
+        }
+        _ => error(StatusCode::CONFLICT, NOTHING_WAITING),
+    }
+}
+
+/// Stop waiting for Lidarr for one person whose kept copy of the row's song waits for an open
+/// Lidarr follow, the admin's own way to what stopWaitingForLidarr does for the apps with `user`:
+/// every follow that copy waits for ends and it lands now. A conflict when no copy of that
+/// person's waits.
+pub async fn stop_waiting(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, body) = split(request).await;
+    let request: Option<HeldRequest> = match bind_optional_body(&parts.headers, &body) {
+        Ok(request) => request,
+        Err(answer) => return answer,
+    };
+    let Some(admin) = admin(&state, &parts.headers) else {
+        return sign_in();
+    };
+    let (key, user) = match held_request(request, STOP_NAME_THE_PERSON) {
+        Ok(named) => named,
+        Err(answer) => return answer,
+    };
+    let Some((provider, id)) = key.split_once(':') else {
+        return error(StatusCode::CONFLICT, NOTHING_WAITS_FOR_LIDARR);
+    };
+    let hearts = &state.lidarr_hearts;
+    let waits = hearts
+        .stop_waiters(provider, id)
+        .iter()
+        .any(|waiter| dotnet::eq_ignore_case(waiter.trim(), &user));
+    if !waits {
+        return error(StatusCode::CONFLICT, NOTHING_WAITS_FOR_LIDARR);
+    }
+    match hearts.stop_waiting_for_lidarr(provider, id).await {
+        StopWaiting::Stopped => {
+            info!("{admin} stopped waiting for Lidarr on {key} for {user} from the dashboard");
+            ok(&json!({ "status": "ok" }))
+        }
+        StopWaiting::NothingWaits => error(StatusCode::CONFLICT, NOTHING_WAITS_FOR_LIDARR),
+    }
 }
 
 // ---- Find songs ---------------------------------------------------------------------------

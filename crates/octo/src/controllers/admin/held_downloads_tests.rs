@@ -1,0 +1,432 @@
+//! A held download on the dashboard: the In progress rows say when someone may keep one anyway
+//! (with an album's count of held tracks, for "Keep these anyway") or stop its wait for Lidarr,
+//! from the holds, never the row's own flag; the holder menus read who; and the admin keeps or
+//! stops for the person they pick, the same action as the apps' keepAcquisitionAnyway and
+//! stopWaitingForLidarr with `user`. Every one of these needs a Navidrome admin's own sign-in.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use axum::http::{Method, StatusCode};
+use chrono::Utc;
+use octo_core::fingerprint::heart_gate::{
+    AcquisitionOrigin, HeardRecord, HeardRecording, HeardSource, HeartGate, WaitingFor,
+};
+use octo_core::settings::{AppSettings, SoulseekSettings, SubsonicSettings};
+use parking_lot::Mutex;
+use serde_json::{Map, Value, json};
+
+use super::test_app::{Reply, app, send};
+use crate::app::{AppState, TestServices};
+use crate::controllers::subsonic::downloads::{
+    NAME_THE_PERSON, NOTHING_WAITING, NOTHING_WAITS_FOR_LIDARR, STOP_NAME_THE_PERSON,
+};
+use crate::http::pipeline::App;
+use crate::services::common::album_gates::tracks_wait_line;
+use crate::services::common::soulseek_hold_store::HeldAlbumTrack;
+use crate::services::common::{HeldAcquisition, HeldKind, Holder};
+use crate::services::lidarr::{ILidarrHeartAcquisitionService, StopWaiting};
+use crate::services::test_support::refused_address;
+
+/// Lidarr's hearts as far as Stop waiting goes: alice's and carol's kept copies of Teardrop wait
+/// for a follow until someone stops it.
+#[derive(Default)]
+struct Waits {
+    waiting: Mutex<Vec<String>>,
+    stopped: Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait]
+impl ILidarrHeartAcquisitionService for Waits {
+    async fn try_acquire_track(
+        &self,
+        _: &str,
+        _: &str,
+        _: bool,
+        _: Option<&str>,
+        _: AcquisitionOrigin,
+        _: &[HeartGate],
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn try_acquire_album(
+        &self,
+        _: &str,
+        _: &str,
+        _: bool,
+        _: Option<&str>,
+        _: AcquisitionOrigin,
+        _: &[HeartGate],
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn stop_waiting_for_lidarr(&self, provider: &str, external_id: &str) -> StopWaiting {
+        self.stopped
+            .lock()
+            .push((provider.to_string(), external_id.to_string()));
+        let mut waiting = self.waiting.lock();
+        if waiting.is_empty() {
+            return StopWaiting::NothingWaits;
+        }
+        waiting.clear();
+        StopWaiting::Stopped
+    }
+
+    fn waits_for_lidarr(&self, provider: &str, external_id: &str) -> bool {
+        !self.stop_waiters(provider, external_id).is_empty()
+    }
+
+    fn stop_waiters(&self, provider: &str, external_id: &str) -> Vec<String> {
+        if (provider, external_id) == ("soulseek", "teardrop") {
+            self.waiting.lock().clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+struct Dashboard {
+    state: AppState,
+    app: App,
+    waits: Arc<Waits>,
+    files: tempfile::TempDir,
+}
+
+impl Dashboard {
+    fn new() -> Dashboard {
+        let files = tempfile::tempdir().expect("a temp dir");
+        let closed = format!("http://{}", refused_address());
+        let settings = AppSettings {
+            subsonic: SubsonicSettings {
+                url: Some(closed.clone()),
+                auto_detect_download_path: false,
+                record_requested_by: false,
+                ..Default::default()
+            },
+            soulseek: SoulseekSettings {
+                base_url: Some(closed.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut state = AppState::for_tests_with(
+            settings,
+            TestServices {
+                sign_in: Some("required".into()),
+                config_dir: Some(files.path().to_path_buf()),
+                raw_settings: vec![
+                    ("Soulseek:BaseUrl".into(), closed.clone()),
+                    ("YouTube:ShimUrl".into(), closed),
+                ],
+                ..Default::default()
+            },
+        );
+        let waits = Arc::new(Waits::default());
+        Arc::get_mut(&mut state.inner)
+            .expect("nothing else holds a fresh test state")
+            .lidarr_hearts = waits.clone();
+        Dashboard {
+            app: app(state.clone()),
+            state,
+            waits,
+            files,
+        }
+    }
+
+    fn token(&self, who: &str) -> String {
+        match who {
+            "recovery" => self.state.browse_sessions.create_recovery(),
+            user => self.state.browse_sessions.create(user),
+        }
+    }
+
+    async fn get(&self, who: &str, path: &str) -> Reply {
+        let token = self.token(who);
+        send(
+            &self.app,
+            Method::GET,
+            path,
+            &[("X-Octo-Browse-Token", &token)],
+            None,
+        )
+        .await
+    }
+
+    async fn post(&self, who: Option<&str>, path: &str, body: &Value) -> Reply {
+        let token = who.map(|who| self.token(who));
+        let mut headers = vec![("X-Octo-Admin", "1")];
+        if let Some(token) = token.as_deref() {
+            headers.push(("X-Octo-Browse-Token", token));
+        }
+        send(&self.app, Method::POST, path, &headers, Some(&body.to_string())).await
+    }
+
+    /// The In progress rows the dashboard reads, by key.
+    async fn rows(&self) -> Map<String, Value> {
+        self.get("admin", "/api/admin/acquisitions").await.json()["acquisitions"]
+            .as_array()
+            .expect("the rows")
+            .iter()
+            .map(|row| (row["key"].as_str().expect("a key").to_string(), row.clone()))
+            .collect()
+    }
+
+    async fn holders(&self, key: &str) -> Value {
+        self.get("admin", &format!("/api/admin/acquisitions/holders?key={key}"))
+            .await
+            .json()
+    }
+
+    /// The song "help" held while AcoustID is off for alice and bob, who each heard a video of it.
+    fn hold_song(&self) -> HeldAcquisition {
+        let heard = |video: &str| HeardRecord {
+            heard_at: Utc::now(),
+            source: HeardSource::Video {
+                id: video.into(),
+                size: Some(1000),
+                content_type: "audio/mp4".into(),
+                itag: Some(140),
+            },
+            sample_id: None,
+        };
+        let record = self.state.soulseek_holds.hold(HeldAcquisition {
+            kind: HeldKind::Track,
+            provider: "soulseek".into(),
+            external_id: "help".into(),
+            requested_by: Some("alice".into()),
+            held_since_utc: Utc::now(),
+            origin: Some(AcquisitionOrigin::Heart),
+            waiting_for: Some(WaitingFor::AcoustIdOff),
+            holders: ["alice", "bob"]
+                .iter()
+                .map(|user| Holder {
+                    user: (*user).into(),
+                    heard: Some(heard(&format!("{}VIDEO01", user.to_uppercase()))),
+                    ..Default::default()
+                })
+                .collect(),
+            line: Some("AcoustID is off, so Octo cannot check what played".into()),
+            ..Default::default()
+        });
+        self.state.heart_acquisition_coordinator.hold_row_for(&record);
+        record
+    }
+
+    /// The held track `id` of alice's hearted album "help-album", its row and its album's held.
+    fn hold_track(&self, id: &str, held: usize) -> HeldAcquisition {
+        let file: PathBuf = self.files.path().join(format!("{id}.flac"));
+        std::fs::write(&file, b"a held track").expect("written");
+        let record = self.state.soulseek_holds.hold(HeldAcquisition {
+            kind: HeldKind::Track,
+            provider: "soulseek".into(),
+            external_id: id.into(),
+            requested_by: Some("alice".into()),
+            held_since_utc: Utc::now(),
+            origin: Some(AcquisitionOrigin::AlbumHeart),
+            waiting_for: Some(WaitingFor::NotYetProven),
+            holders: vec![Holder {
+                user: "alice".into(),
+                ..Default::default()
+            }],
+            held_files: vec![file.to_string_lossy().to_string()],
+            album_track: Some(HeldAlbumTrack {
+                album_key: "soulseek:help-album".into(),
+                song_ids: vec![id.into()],
+                artist: "The Beatles".into(),
+                title: id.into(),
+                duration_seconds: Some(139),
+                r: HeardRecording::default(),
+            }),
+            line: Some(tracks_wait_line(held)),
+            ..Default::default()
+        });
+        self.state.heart_acquisition_coordinator.hold_row_for(&record);
+        record
+    }
+}
+
+/// The holder menus and both actions refuse no sign-in and the recovery code: they name people
+/// and land files in the library.
+#[tokio::test]
+async fn the_holder_menus_and_their_actions_need_a_navidrome_admins_own_sign_in() {
+    let dash = Dashboard::new();
+    let holders = "/api/admin/acquisitions/holders?key=soulseek:help";
+    assert_eq!(
+        send(&dash.app, Method::GET, holders, &[], None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        dash.get("recovery", holders).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    for who in [None, Some("recovery")] {
+        for path in [
+            "/api/admin/acquisitions/keep",
+            "/api/admin/acquisitions/stop-waiting",
+        ] {
+            let body = json!({ "key": "soulseek:help", "user": "alice" });
+            assert_eq!(
+                dash.post(who, path, &body).await.status,
+                StatusCode::UNAUTHORIZED,
+                "{path} as {who:?}"
+            );
+        }
+    }
+}
+
+/// The rows say Keep anyway from the holds: a song held while AcoustID is off, and a hearted
+/// album holding two tracks with its count, so its button reads "Keep these anyway"; a row with
+/// nothing to keep says nothing. The menu lists who may keep each, and keeping for one person
+/// saves their keep with the holds before a plain ok, the other holder still waiting.
+#[tokio::test]
+async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_names() {
+    let dash = Dashboard::new();
+    let song = dash.hold_song();
+    let night = dash.hold_track("night", 2);
+    dash.hold_track("day", 2);
+    dash.state.acquisition_tracker.begin(
+        "soulseek",
+        "angel",
+        None,
+        Some("alice"),
+        Some("Massive Attack"),
+        Some("Angel"),
+        None,
+    );
+
+    let rows = dash.rows().await;
+    assert_eq!(rows["soulseek:help"]["keepAnyway"], true);
+    assert!(rows["soulseek:help"].get("heldTracks").is_none(), "a song row");
+    assert_eq!(rows["soulseek:help-album"]["keepAnyway"], true);
+    assert_eq!(rows["soulseek:help-album"]["heldTracks"], 2);
+    assert!(
+        rows["soulseek:angel"].get("keepAnyway").is_none(),
+        "nothing of it is held"
+    );
+    assert!(
+        rows.values()
+            .all(|row| row.get("keepers").is_none() && row.get("requestedBy").is_none()),
+        "the list names nobody while Record who asked is off"
+    );
+
+    assert_eq!(
+        dash.holders("soulseek:help").await,
+        json!({ "key": "soulseek:help", "keepers": ["alice", "bob"], "stopWaiters": [] })
+    );
+    assert_eq!(
+        dash.holders("soulseek:help-album").await["keepers"],
+        json!(["alice"])
+    );
+
+    let board = &dash;
+    let keep = |body: Value| async move {
+        board
+            .post(Some("admin"), "/api/admin/acquisitions/keep", &body)
+            .await
+    };
+    let unnamed = keep(json!({ "key": "soulseek:help" })).await;
+    assert_eq!(unnamed.status, StatusCode::BAD_REQUEST);
+    assert_eq!(unnamed.json()["error"], NAME_THE_PERSON);
+    let stranger = keep(json!({ "key": "soulseek:help", "user": "carol" })).await;
+    assert_eq!(stranger.status, StatusCode::CONFLICT);
+    assert_eq!(stranger.json()["error"], NOTHING_WAITING);
+
+    let kept = keep(json!({ "key": "soulseek:help", "user": " bob " })).await;
+    assert_eq!(kept.status, StatusCode::OK, "{}", kept.text());
+    assert_eq!(kept.json(), json!({ "status": "ok" }));
+    let saved = dash
+        .state
+        .soulseek_holds
+        .get(&song.key())
+        .expect("held while it is carried out");
+    assert_eq!(saved.keep_requested, ["bob"], "saved before the answer");
+    assert_eq!(dash.holders("soulseek:help").await["keepers"], json!(["alice"]));
+    let again = keep(json!({ "key": "soulseek:help", "user": "bob" })).await;
+    assert_eq!(again.status, StatusCode::CONFLICT, "bob asked already");
+
+    let album = keep(json!({ "key": "soulseek:help-album", "user": "alice" })).await;
+    assert_eq!(album.status, StatusCode::OK, "{}", album.text());
+    assert_eq!(
+        dash.state
+            .soulseek_holds
+            .get(&night.key())
+            .expect("held")
+            .keep_requested,
+        ["alice"]
+    );
+    assert!(
+        dash.rows().await["soulseek:help-album"]
+            .get("keepAnyway")
+            .is_none(),
+        "the album's keep is asked, so its row offers it no more"
+    );
+}
+
+/// A row whose song's kept copies wait for Lidarr says so, and its menu lists whose; stopping for
+/// someone who kept nothing, or for nobody, stops nothing; stopping for alice ends the wait
+/// through the same call the apps use, and the row offers it no more.
+#[tokio::test]
+async fn the_dashboard_stops_waiting_for_lidarr_for_the_person_it_names() {
+    let dash = Dashboard::new();
+    *dash.waits.waiting.lock() = vec!["alice".into(), "carol".into()];
+    for user in ["alice", "bob"] {
+        dash.state.acquisition_tracker.begin(
+            "soulseek",
+            "teardrop",
+            None,
+            Some(user),
+            Some("Massive Attack"),
+            Some("Teardrop"),
+            Some("Mezzanine"),
+        );
+    }
+    dash.state.acquisition_tracker.begin(
+        "soulseek",
+        "angel",
+        None,
+        Some("alice"),
+        Some("Massive Attack"),
+        Some("Angel"),
+        None,
+    );
+
+    let rows = dash.rows().await;
+    assert_eq!(rows["soulseek:teardrop"]["stopWaiting"], true);
+    assert!(rows["soulseek:angel"].get("stopWaiting").is_none());
+    assert_eq!(
+        dash.holders("soulseek:teardrop").await,
+        json!({ "key": "soulseek:teardrop", "keepers": [], "stopWaiters": ["alice", "carol"] })
+    );
+
+    let board = &dash;
+    let stop = |body: Value| async move {
+        board
+            .post(Some("admin"), "/api/admin/acquisitions/stop-waiting", &body)
+            .await
+    };
+    let unnamed = stop(json!({ "key": "soulseek:teardrop" })).await;
+    assert_eq!(unnamed.status, StatusCode::BAD_REQUEST);
+    assert_eq!(unnamed.json()["error"], STOP_NAME_THE_PERSON);
+    let bob = stop(json!({ "key": "soulseek:teardrop", "user": "bob" })).await;
+    assert_eq!(bob.status, StatusCode::CONFLICT);
+    assert_eq!(bob.json()["error"], NOTHING_WAITS_FOR_LIDARR);
+    assert!(dash.waits.stopped.lock().is_empty(), "nothing stopped for bob");
+
+    let stopped = stop(json!({ "key": "soulseek:teardrop", "user": "Alice" })).await;
+    assert_eq!(stopped.status, StatusCode::OK, "{}", stopped.text());
+    assert_eq!(stopped.json(), json!({ "status": "ok" }));
+    assert_eq!(
+        *dash.waits.stopped.lock(),
+        [("soulseek".to_string(), "teardrop".to_string())]
+    );
+    assert!(
+        dash.rows().await["soulseek:teardrop"]
+            .get("stopWaiting")
+            .is_none()
+    );
+    let again = stop(json!({ "key": "soulseek:teardrop", "user": "carol" })).await;
+    assert_eq!(again.status, StatusCode::CONFLICT, "nothing waits for anyone now");
+}
