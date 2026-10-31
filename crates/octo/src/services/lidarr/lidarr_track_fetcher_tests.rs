@@ -358,8 +358,88 @@ async fn the_pin_points_at_a_carrier_of_the_original_and_its_release_choice_is_r
     );
 }
 
-/// An original whose tags name no release group and whose album name finds nothing, but whose
-/// recording is known: the album is the walk's first pick for it, a carrier of it.
+/// A Wrong song or a Wrong version through Lidarr names no recording: the original is the
+/// recording the person rejected, so the fetch never asks what it sounds like and sends no pin
+/// for it. The album its own release group tag names is searched with Lidarr's own choice of
+/// release, and its release choice is never touched.
+#[tokio::test]
+async fn a_fetch_that_names_no_recording_is_never_pinned_to_the_originals() {
+    let f = Fixture::new().await;
+    let mut mezzanine = CatalogAlbum::new(
+        "rg-mezzanine-2",
+        "Mezzanine",
+        ARTIST_ID,
+        9,
+        &[(91, "Angel", 1), (93, "Teardrop", 3)],
+    );
+    mezzanine.releases = vec![(900, "m2-uk".into()), (901, "m2-us".into())];
+    f.lidarr.catalog_album(mezzanine);
+    f.lidarr.user_album("rg-mezzanine-2", false);
+    f.lidarr.plan_grab(
+        9,
+        Grab::of("dl-1", &[(93, "Teardrop", "FLAC")])
+            .into_album(9)
+            .finished(),
+    );
+    let (music_brainz, _server) = carriers_of_teardrop("rg-mezzanine-2", "m2-us").await;
+    let service = f.service_with(Options {
+        timeout_seconds: 30,
+        music_brainz: Some(music_brainz),
+        ..Default::default()
+    });
+    let fetcher = fetcher(&f, &service, 30);
+    // The original names its album's release group, and its own sound reads clear as the
+    // recording the person rejected.
+    let original = f.root.path().join("owned/Teardrop.flac");
+    std::fs::create_dir_all(original.parent().expect("a folder")).expect("made");
+    std::fs::write(
+        &original,
+        crate::services::fingerprint::heart_test_support::flac_header(330),
+    )
+    .expect("written");
+    let mut tags = octo_media::tags::TagFile::open(&original).expect("the FLAC opens");
+    octo_media::tags::tag_writer_extras::set_text(
+        &mut tags,
+        octo_media::tags::TagFields::RELEASE_GROUP_ID,
+        Some("rg-mezzanine-2"),
+    );
+    tags.save().expect("the tag is saved");
+    let asked = Arc::new(Mutex::new(0));
+    let counted = asked.clone();
+    fetcher.use_original_sound(Arc::new(
+        move |_: String, _: Option<i32>| -> futures::future::BoxFuture<'static, Vec<String>> {
+            *counted.lock() += 1;
+            Box::pin(async { vec![TEARDROP_RECORDING.to_string()] })
+        },
+    ));
+
+    fetch(
+        &f,
+        &fetcher,
+        LidarrTrackRequest {
+            album: None,
+            ..teardrop(false, Some(original.to_string_lossy().into_owned()))
+        },
+    )
+    .await
+    .expect("a copy");
+
+    until(|| f.pending.get("rg-mezzanine-2").is_none()).await;
+    assert_eq!(*asked.lock(), 0, "the original's sound is never asked");
+    let puts: Vec<String> = f
+        .lidarr
+        .changes()
+        .into_iter()
+        .filter(|r| r.method == "PUT" && r.path == "/api/v1/album/9")
+        .map(|r| r.path)
+        .collect();
+    assert!(puts.is_empty(), "no pin and nothing to restore: {puts:?}");
+    assert_eq!(f.searched_albums(), [9]);
+}
+
+/// A Better quality of an original whose tags name no release group and whose album name finds
+/// nothing, but whose recording is known: its caller asks what the original is, and the album is
+/// the walk's first pick for that recording, a carrier of it.
 #[tokio::test]
 async fn a_replacement_with_an_identifiable_original_picks_a_carrier_of_it() {
     let f = Fixture::new().await;
@@ -381,16 +461,13 @@ async fn a_replacement_with_an_identifiable_original_picks_a_carrier_of_it() {
         },
     ));
 
-    let fetched = fetch(
-        &f,
-        &fetcher,
-        LidarrTrackRequest {
-            album: None,
-            ..teardrop(true, Some(original.to_string_lossy().into_owned()))
-        },
-    )
-    .await
-    .expect("a copy");
+    let mut request = LidarrTrackRequest {
+        album: None,
+        ..teardrop(true, Some(original.to_string_lossy().into_owned()))
+    };
+    request.recordings = fetcher.original_recordings(&request).await;
+    assert_eq!(request.recordings, [TEARDROP_RECORDING]);
+    let fetched = fetch(&f, &fetcher, request).await.expect("a copy");
 
     assert_eq!(
         std::fs::read_to_string(&fetched.path).expect("the copy"),

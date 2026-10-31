@@ -385,12 +385,14 @@ impl SoulseekDownloadService {
         let length_known = routing.duration.is_some_and(|s| s > 0)
             && TagFile::open(local).is_ok_and(|file| file.duration_seconds() > 0);
         let judged = self
-            .judge_file_labeled(base, routing, download, local, None, length_known, labels)
+            .judge_file_labeled(base, routing, download, local, None, length_known, labels.clone())
             .await;
         let verdict = match judged {
             FileJudged::Keep(verdict) => verdict,
             FileJudged::Hold(held) => {
                 info!("Lidarr's file for '{artist} - {title}' waits: {}", held.line);
+                // Judged again later by the same labels, wherever that judgment runs.
+                self.verification.hold_lidarr_files(&held.files, &labels);
                 return Err(held.into());
             }
             FileJudged::NotProven(why) => {
@@ -518,7 +520,7 @@ impl SoulseekDownloadService {
             .find_map(|gate| gate.r.as_ref().filter(|r| !r.ids.is_empty()))
             .map(|r| r.ids.clone())
             .unwrap_or_default();
-        let request = LidarrTrackRequest {
+        let mut request = LidarrTrackRequest {
             artist: routing.artist.clone().unwrap_or_default(),
             title: routing.title.clone().unwrap_or_default(),
             album: routing.album.clone(),
@@ -536,6 +538,11 @@ impl SoulseekDownloadService {
                 .map(|provider| format!("{provider}:{external_id}")),
             recordings,
         };
+        // Otherwise a Better quality (taken anyway too) aims at what the original is. A Wrong
+        // song or a Wrong version never does: its original is the recording the person rejected.
+        if request.recordings.is_empty() && download.upgrade_search {
+            request.recordings = fetcher.original_recordings(&request).await;
+        }
         download.fetched_from = Some("Lidarr".to_string());
         let fetched = fetcher.fetch(&request, &job_dir, ct).await?;
         let path = fetched.path;
@@ -2545,8 +2552,10 @@ impl SoulseekDownloadService {
 impl SoulseekDownloadService {
     /// The first of a resumed hold's files that is still there and passes the checks a fresh
     /// download's file meets (a heart's or a play's by its askers' own gates); each one that fails
-    /// is thrown away. None when none is left; an error when one holds again, still in the hold
-    /// path.
+    /// is thrown away. A file Lidarr brought meets the check every Lidarr file meets, its labels
+    /// read as they were at delivery, never from the tags Lidarr wrote. None when none is left; an
+    /// error when one holds again, still in the hold path, or when Lidarr's own check refused the
+    /// file of a download from Lidarr, which is the end of that download as it is in time.
     async fn take_held_file(
         &self,
         base: &BaseDownloadService,
@@ -2558,8 +2567,42 @@ impl SoulseekDownloadService {
             return Ok(None);
         }
         let length_known = routing.duration.is_some_and(|s| s > 0);
+        let mut refused_by_lidarr = None;
         let mut left = held.into_iter().filter(|file| file_exists(file));
         while let Some(file) = left.next() {
+            if let Some(labels) = self.verification.held_lidarr_labels(&file) {
+                match self
+                    .check_lidarr_file(base, routing, download, &file, labels, None)
+                    .await
+                {
+                    Ok(verdict) => {
+                        info!("Resumed with Lidarr's held file: {file}");
+                        self.verification.forget_held_lidarr_file(&file);
+                        download.fetched_from = Some("Lidarr".to_string());
+                        verdict.apply_tags_to(&mut download.song);
+                        download.song.verification = Some(Box::new(verdict));
+                        for other in left {
+                            let _ = std::fs::remove_file(&other);
+                        }
+                        return Ok(Some(file));
+                    }
+                    Err(e) => match e.downcast::<AcquisitionHeld>() {
+                        Ok(mut again) => {
+                            again.files.extend(left);
+                            return Err(again.into());
+                        }
+                        Err(e) => {
+                            info!(
+                                "Lidarr's held file of '{}' failed its checks again ({e}); thrown away: {file}",
+                                download.song.title
+                            );
+                            self.verification.forget_held_lidarr_file(&file);
+                            refused_by_lidarr = Some(e);
+                            continue;
+                        }
+                    },
+                }
+            }
             match self
                 .judge_file(base, routing, download, &file, None, length_known)
                 .await
@@ -2586,6 +2629,12 @@ impl SoulseekDownloadService {
                     let _ = std::fs::remove_file(&file);
                 }
             }
+        }
+        // Lidarr is not searched again for a download its own copy failed.
+        if download.source_override == Some(DownloadSource::Lidarr)
+            && let Some(refused) = refused_by_lidarr
+        {
+            return Err(refused);
         }
         Ok(None)
     }

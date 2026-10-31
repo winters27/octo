@@ -449,10 +449,13 @@ impl SoulseekDownloadService {
         );
         let isrc = download.song.isrc.clone().or(routing.isrc.clone());
         let takes = self.verification.takes_for_routing(routing);
+        // The tags the shipped checks hold the file to are its own labels, never what Lidarr's
+        // import wrote.
         let asked = AcoustIdRateLimiter::with_class(
             class,
-            self.verification.verify(
+            self.verification.verify_labeled(
                 path,
+                labels,
                 routing.artist.as_deref(),
                 routing.title.as_deref(),
                 isrc.as_deref(),
@@ -794,6 +797,7 @@ impl SoulseekDownloadService {
         for other in left {
             let _ = std::fs::remove_file(&other);
         }
+        self.verification.forget_held_lidarr_file(&file);
         let settings = base.current_soulseek_settings();
         let printed = self
             .verification

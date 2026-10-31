@@ -133,6 +133,11 @@ pub trait HeartGates: Send + Sync {
             None,
         )
     }
+
+    /// Notes files Lidarr brought that now wait in the one hold path, with where their labels
+    /// were read from, so a later judgment of them reads the same labels. Nothing without a way
+    /// to judge them.
+    fn held_from_lidarr(&self, _files: &[String], _labels: &LabelSource) {}
 }
 
 /// The coordinator's optional collaborators, each `None` by default.

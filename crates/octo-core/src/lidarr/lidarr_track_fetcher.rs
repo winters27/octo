@@ -27,10 +27,11 @@ pub struct LidarrTrackRequest {
     pub step: Option<LidarrStep>,
     /// The download's own song, as `provider:id`.
     pub song: Option<String>,
-    /// The recordings the original is: a kept file's own, else what its own sound reads clear
-    /// as, else its recording tag. Only a hint: the album is the walk's first pick for them when
-    /// the original's release group tag and its album name find none, and the search is pinned to
-    /// a release that carries them.
+    /// The recordings a Better quality's original is: a kept file's own, else what its own sound
+    /// reads clear as, else its recording tag; none for a Wrong song or a Wrong version, whose
+    /// original is not the recording wanted. Only a hint: the album is the walk's first pick for
+    /// them when the original's release group tag and its album name find none, and the search
+    /// is pinned to a release that carries them.
     pub recordings: Vec<String>,
 }
 
