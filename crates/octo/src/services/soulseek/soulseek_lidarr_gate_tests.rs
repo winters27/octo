@@ -289,7 +289,7 @@ async fn a_held_album_track_lidarr_brought_is_checked_again_with_its_downloads_l
             .judge_held(
                 &held,
                 &acquisition_key("soulseek", &g.started(), false),
-                &[gate.clone()],
+                std::slice::from_ref(&gate),
             )
             .await;
 
