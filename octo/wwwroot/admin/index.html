@@ -541,7 +541,7 @@
             <div class="set-row" data-stream-source="Lossless" hidden>
               <div class="set-info">
                 <div class="set-info-t">Lossless wait <span class="set-opt">seconds</span></div>
-                <div class="set-info-d">How long to wait before playing the YouTube preview instead. 0 waits as long as it takes.</div>
+                <div class="set-info-d">How long to wait before playing the song straight from YouTube instead. 0 waits as long as it takes.</div>
                 <div class="set-info-more">The lossless download carries on either way.</div>
               </div>
               <input class="set-input" id="f-lossless-wait-timeout" name="Subsonic.LosslessWaitTimeoutSeconds" type="number" min="0" />
@@ -735,8 +735,8 @@
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t">Keep playlists ready</div>
-                <div class="set-info-d">Picked playlists start right away in any app. Every song's preview is kept here, and the first few also download as FLAC.</div>
-                <div class="set-info-more">Checked every hour. Previews are kept even while nothing plays; the FLAC downloads follow Pause when nothing plays. Kept songs count toward Space to use.</div>
+                <div class="set-info-d">Picked playlists start right away in any app. Every song's YouTube stream is kept here, and the first few also download as FLAC.</div>
+                <div class="set-info-more">Checked every hour. The YouTube streams are kept even while nothing plays; the FLAC downloads follow Pause when nothing plays. Kept songs count toward Space to use.</div>
               </div>
               <div class="set-ctrl" id="keep-ready-person-wrap" hidden>
                 <select class="set-input kr-person" id="keep-ready-person" aria-label="Whose playlists"></select>
@@ -838,7 +838,7 @@
               <div class="set-info">
                 <div class="set-info-t">Discovery for offline-search apps</div>
                 <div class="set-info-d">Adds your stations' songs you don't own yet to apps that search their own copy of your library.</div>
-                <div class="set-info-more">Apps like Symfonium copy your library to the phone and search only that copy, so their searches never reach Octo. With this on, the copy also holds your radio stations' songs you don't own yet: they show up in search, play as previews, and download when hearted. Run a full sync in the app to pick up changes.</div>
+                <div class="set-info-more">Apps like Symfonium copy your library to the phone and search only that copy, so their searches never reach Octo. With this on, the copy also holds your radio stations' songs you don't own yet: they show up in search, play straight from YouTube, and download when hearted. Run a full sync in the app to pick up changes.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-sync-catalog" name="Subsonic.EnableSyncCatalog" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -931,7 +931,7 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title">Scrobbling</h3>
-            <p class="set-desc">Sends plays to each listener's own Last.fm: outside songs, such as previews and Continuous Radio, and your library songs too.</p>
+            <p class="set-desc">Sends plays to each listener's own Last.fm: outside songs, such as songs streamed from YouTube and Continuous Radio, and your library songs too.</p>
           </div>
           <form data-section="lastfm-scrobble" class="set-card">
             <div class="set-row">
@@ -1002,7 +1002,7 @@
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t">Radio loudness target (LUFS)</div>
-                <div class="set-info-d">Every radio track is brought to this EBU R128 loudness before it joins the stream, so local files and previews play at one level. -16 suits headphones and speakers; -14 is what most streaming services use. 0 turns it off.</div>
+                <div class="set-info-d">Every radio track is brought to this EBU R128 loudness before it joins the stream, so local files and songs streamed from YouTube play at one level. -16 suits headphones and speakers; -14 is what most streaming services use. 0 turns it off.</div>
               </div>
               <input class="set-input" name="LastFm.RadioLoudnessTargetLufs" type="number" min="-23" max="0" />
             </div>
@@ -1605,7 +1605,7 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title">Sending plays</h3>
-            <p class="set-desc">Navidrome already sends plays from your own library. This covers previews and Continuous Radio.</p>
+            <p class="set-desc">Navidrome already sends plays from your own library. This covers songs streamed from YouTube and Continuous Radio.</p>
           </div>
           <form data-section="listenbrainz" class="set-card">
             <div class="set-row">
@@ -2470,7 +2470,7 @@
         <div class="set-section">
           <div class="set-head">
             <h3 class="set-title" id="imp-lists-title">Your lists</h3>
-            <p class="set-desc">Open a list to see its songs. <strong>Stream without downloading</strong> shows the saved snapshot as a private playlist in Octo, including previews of missing songs. Heart a song to keep it. <strong>Keep as playlist</strong> makes a Navidrome playlist of the songs you have. <strong>Get missing songs</strong> separately queues downloads. Streaming snapshots are not updated from their source automatically.</p>
+            <p class="set-desc">Open a list to see its songs. <strong>Stream without downloading</strong> shows the saved snapshot as a private playlist in Octo, its missing songs streamed from YouTube. Heart a song to keep it. <strong>Keep as playlist</strong> makes a Navidrome playlist of the songs you have. <strong>Get missing songs</strong> separately queues downloads. Streaming snapshots are not updated from their source automatically.</p>
           </div>
           <div class="set-card imp-card imp-lists-card">
             <div id="imp-lists" aria-live="polite"></div>
@@ -2712,7 +2712,7 @@
               <input class="set-input" name="LibraryActions.ReviewSweepAutoReplacePerDay" type="number" min="1" max="100" data-number="true" />
             </div>
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Also replace a song that sounds nothing like its YouTube preview</div><div class="set-info-d">For a sound AcoustID has never heard. Octo fetches the right song through Wrong song instead of asking. Off by default.</div><div class="set-info-more"><p>Only when the preview is a YouTube Music row with the song's title, artist and length, from the same album as the file and not a live album, and at least 42% of the file differs from it. A song with no tags, an ISRC tag, a star or a rating, anything the preview cannot settle, anything AcoustID does hear and the re-check of Octo's own downloads stay questions in Review.</p><p>Needs Wrong song on, dry run off, Keep the original after a replacement on and a download source other than YouTube alone (with Soulseek then YouTube, the replacement comes from Soulseek only), and counts toward the same limit a day as the replacing above. The new file is checked like any download, against the song's YouTube preview, and Review keeps a note of what was replaced.</p></div></div>
+              <div class="set-info"><div class="set-info-t">Also replace a song that sounds nothing like its YouTube stream</div><div class="set-info-d">For a sound AcoustID has never heard. Octo fetches the right song through Wrong song instead of asking. Off by default.</div><div class="set-info-more"><p>Only when the video is a YouTube Music row with the song's title, artist and length, from the same album as the file and not a live album, and at least 42% of the file differs from it. A song with no tags, an ISRC tag, a star or a rating, anything the YouTube stream cannot settle, anything AcoustID does hear and the re-check of Octo's own downloads stay questions in Review.</p><p>Needs Wrong song on, dry run off, Keep the original after a replacement on and a download source other than YouTube alone (with Soulseek then YouTube, the replacement comes from Soulseek only), and counts toward the same limit a day as the replacing above. The new file is checked like any download, against the song's YouTube stream, and Review keeps a note of what was replaced.</p></div></div>
               <label class="switch"><input type="checkbox" name="LibraryActions.ReviewSweepAutoReplacePreview" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
@@ -2731,7 +2731,7 @@
               <input class="set-input" name="LibraryActions.YoutubeCheckPerHour" type="number" min="0" max="360" data-number="true" />
             </div>
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Check every song against YouTube</div><div class="set-info-d" id="youtube-check-status">Compares the songs AcoustID cannot vouch for with their YouTube preview, once.</div><div class="set-info-more"><p>The same comparison a new download gets: songs AcoustID already vouches for are passed over quickly, and the rest are compared with their YouTube preview. A song that sounds nothing like a preview with its title, artist and length becomes a question in Review, or is added to a question AcoustID left open. Nothing is changed or removed, and nothing is uploaded.</p><p>Songs with no preview, or one that may be another version, are left alone, and a song is never asked twice. If the YouTube shim stops answering, the check rests an hour and carries on. Press the button again to forget the answers and compare everything anew.</p></div></div>
+              <div class="set-info"><div class="set-info-t">Check every song against YouTube</div><div class="set-info-d" id="youtube-check-status">Compares the songs AcoustID cannot vouch for with their YouTube stream, once.</div><div class="set-info-more"><p>The same comparison a new download gets: songs AcoustID already vouches for are passed over quickly, and the rest are compared with their YouTube stream. A song that sounds nothing like a YouTube video with its title, artist and length becomes a question in Review, or is added to a question AcoustID left open. Nothing is changed or removed, and nothing is uploaded.</p><p>Songs with no YouTube video, or one that may be another version, are left alone, and a song is never asked twice. If the YouTube shim stops answering, the check rests an hour and carries on. Press the button again to forget the answers and compare everything anew.</p></div></div>
               <div class="set-buttons">
                 <button class="btn btn-ghost" type="button" id="youtube-check-pause" hidden><span>Pause</span></button>
                 <button class="btn btn-ghost" type="button" id="youtube-check-start"><span>Check</span></button>
@@ -3213,7 +3213,7 @@
         </header>
 
         <div class="info-card">
-          <p>Octo sits in front of your Navidrome library and adds discovery and downloads to it. Search shows songs you don't own beside your own. Radio on any song finds more through Last.fm and plays previews from YouTube. Heart a song you don't own and Octo fetches it through Soulseek, YouTube or your own Lidarr.</p>
+          <p>Octo sits in front of your Navidrome library and adds discovery and downloads to it. Search shows songs you don't own beside your own. Radio on any song finds more through Last.fm and plays them straight from YouTube. Heart a song you don't own and Octo fetches it through Soulseek, YouTube or your own Lidarr.</p>
         </div>
 
         <div class="info-card" id="update-card" tabindex="-1">

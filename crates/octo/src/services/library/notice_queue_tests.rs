@@ -281,7 +281,7 @@ fn a_preview_question_is_kept_under_a_cause_every_release_reads() {
     let entry = only(&reopened, "alice");
     assert_eq!(entry.cause, InconclusiveReason::SoundsLikeAnother);
     assert!(
-        entry.reason.contains("YouTube preview (47% of its bits differ)"),
+        entry.reason.contains("YouTube stream (47% of its bits differ)"),
         "{}",
         entry.reason
     );

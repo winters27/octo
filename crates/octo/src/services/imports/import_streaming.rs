@@ -24,7 +24,7 @@ pub fn playlist_fields(list: &ImportList) -> Map<String, Value> {
         "readonly": true,
         "songCount": list.tracks.len(),
         "duration": list.tracks.iter().map(|t| i64::from(t.seconds.unwrap_or(0).max(0))).sum::<i64>(),
-        "comment": "Imported snapshot. Missing songs stream as previews; heart a song to keep it.",
+        "comment": "Imported snapshot. Missing songs stream from YouTube; heart a song to keep it.",
         "created": list.read_utc.to_rfc3339(),
         "changed": list.matched_utc.unwrap_or(list.read_utc).max(list.read_utc).to_rfc3339(),
     })

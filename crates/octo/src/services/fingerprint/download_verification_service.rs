@@ -1196,7 +1196,7 @@ impl DownloadVerificationService {
         VerificationResult {
             verdict: VerificationVerdict::Confirmed,
             reason: InconclusiveReason::None,
-            evidence: Some("the song's YouTube preview agrees".into()),
+            evidence: Some("the song's YouTube stream agrees".into()),
             ..verdict
         }
     }

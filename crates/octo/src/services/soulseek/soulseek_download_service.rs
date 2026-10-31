@@ -1005,7 +1005,7 @@ impl SoulseekDownloadService {
                 base.log_step(
                     track_key,
                     acquisition_event_kinds::CHECK,
-                    "Sounds like its YouTube preview",
+                    "Sounds like its YouTube stream",
                     None,
                 );
                 if trusted {
@@ -1023,7 +1023,7 @@ impl SoulseekDownloadService {
                     track_key,
                     acquisition_event_kinds::CHECK,
                     "Did not sound like the song",
-                    Some("Nothing in it sounds like the song's YouTube preview; thrown away"),
+                    Some("Nothing in it sounds like the song's YouTube stream; thrown away"),
                 );
                 PreviewSays::Refuse("did not sound like the song".to_string())
             }

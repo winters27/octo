@@ -2426,7 +2426,7 @@ async fn a_never_heard_sound_that_sounds_nothing_like_its_preview_is_asked_about
     assert_eq!(entries[0].cause, InconclusiveReason::SoundsLikeAnother);
     assert_eq!(entries[0].state, NoticeState::Waiting);
     assert!(
-        entries[0].reason.contains("YouTube preview"),
+        entries[0].reason.contains("YouTube stream"),
         "{}",
         entries[0].reason
     );
@@ -2749,7 +2749,7 @@ async fn a_song_the_preview_says_is_another_is_replaced_and_leaves_a_note_when_s
     assert_eq!(entries[0].state, NoticeState::Acted);
     assert_eq!(entries[0].cause, InconclusiveReason::SoundsLikeAnother);
     assert!(
-        entries[0].reason.contains("YouTube preview"),
+        entries[0].reason.contains("YouTube stream"),
         "{}",
         entries[0].reason
     );
@@ -3041,7 +3041,7 @@ async fn a_lone_link_its_preview_calls_another_song_is_asked_never_replaced() {
     assert_eq!(entries[0].cause, InconclusiveReason::BelowThreshold);
     assert_eq!(
         entries[0].reason,
-        "Only one person ever told AcoustID this is 'Massive Attack - Teardrop', and 50% of its bits differ from its YouTube preview"
+        "Only one person ever told AcoustID this is 'Massive Attack - Teardrop', and 50% of its bits differ from its YouTube stream"
     );
 }
 

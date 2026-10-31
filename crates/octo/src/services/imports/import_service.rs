@@ -271,7 +271,7 @@ impl ImportService {
             return ImportActionResult::failed("There is no such list.");
         }
         ImportActionResult::ok(if on {
-            "This snapshot is now a playlist in Octo. Missing songs stream as previews; heart a song to keep it. Get missing songs remains a separate choice."
+            "This snapshot is now a playlist in Octo. Missing songs stream from YouTube; heart a song to keep it. Get missing songs remains a separate choice."
         } else {
             "The streaming playlist is no longer shown in Octo."
         })

@@ -1263,7 +1263,7 @@ fn confirmed_by_preview_turns_a_lone_link_into_a_confirmation_and_leaves_the_res
     assert_eq!(confirmed.r#match, lone.r#match);
     assert_eq!(
         confirmed.evidence.as_deref(),
-        Some("the song's YouTube preview agrees")
+        Some("the song's YouTube stream agrees")
     );
     assert!(!confirmed.needs_review());
 

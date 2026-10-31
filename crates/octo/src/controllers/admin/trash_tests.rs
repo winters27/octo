@@ -554,7 +554,7 @@ async fn the_sweep_s_note_reads_as_put_back_and_still_keeps_the_sweep_away() {
         },
         &octo_core::fingerprint::verification::VerificationResult::default(),
         "nd-16",
-        "Octo replaced this: it sounded nothing like its YouTube preview (50% of its bits differ)".into(),
+        "Octo replaced this: it sounded nothing like its YouTube stream (50% of its bits differ)".into(),
         None,
     ));
 
@@ -586,7 +586,7 @@ async fn the_sweep_s_note_reads_as_replaced_again_after_a_second_swap() {
     dash.state.library_action_journal.record(entry);
     let notices = &dash.state.notice_queue;
     let path = slash_root(&song);
-    let first = "Octo replaced this: it sounded nothing like its YouTube preview (50% of its bits differ)";
+    let first = "Octo replaced this: it sounded nothing like its YouTube stream (50% of its bits differ)";
     assert!(notices.add_replaced_because(
         "admin",
         &path,
