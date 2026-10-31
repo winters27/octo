@@ -256,6 +256,15 @@
           <div id="setup-checklist"></div>
         </details>
 
+        <!-- ─── Downloads: what Octo's checks by sound cannot do right now ─── -->
+        <div class="set-section download-checks" id="download-checks" hidden>
+          <div class="set-head">
+            <h3 class="set-title">Downloads</h3>
+            <p class="set-desc">How Octo checks a download by its sound before it keeps it.</p>
+          </div>
+          <div class="set-card" id="download-checks-list" aria-live="polite"></div>
+        </div>
+
         <div class="callout callout-accent" id="point-at-octo">
           <div class="callout-title">Point your music apps here</div>
           <p>In your Subsonic app, set the <strong>server address</strong> to Octo rather than to Navidrome.</p>
@@ -332,7 +341,7 @@
               <span class="status-dot pending"></span>
             </div>
             <div class="status-card-body">Checking…</div>
-            <div class="status-card-foot">Previews from YouTube</div>
+            <div class="status-card-foot">Songs from YouTube</div>
           </article>
           <article class="status-card" data-svc="sonic">
             <div class="status-card-head">
@@ -1963,8 +1972,8 @@
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-acoustid"/></svg>Verify downloads</div>
-                <div class="set-info-d">Fingerprints each Soulseek and YouTube download and asks AcoustID what it really is. Off by default.</div>
-                <div class="set-info-more"><p>Catches covers, karaoke versions, live takes and mislabelled compilation tracks, which all pass the length check. A peer that sends a different recording has that file remembered and never tried again.</p><p>A song AcoustID has never heard of is always kept. YouTube downloads are identified too but never rejected, since there is no second copy to try.</p></div>
+                <div class="set-info-d">Fingerprints each download and asks AcoustID what it really is. On by default.</div>
+                <div class="set-info-more"><p>Hearts and plays are always checked by their sound: a file that is not the recording you heard is refused, and Octo keeps the version you heard instead.</p><p>Other downloads: covers, karaoke versions, live takes and mislabeled compilation tracks are refused, a peer that sends a different recording is never tried again, a YouTube video AcoustID names as another recording is never used for that song again, and a song AcoustID has never heard of is kept and marked not proven.</p></div>
               </div>
               <label class="switch"><input type="checkbox" name="Soulseek.VerifyDownloads" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
@@ -1980,7 +1989,7 @@
               <div class="set-info">
                 <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-acoustid"/></svg>AcoustID API key</div>
                 <div class="set-info-d">Free from <a href="https://acoustid.org/new-application" target="_blank" rel="noopener">acoustid.org/new-application</a>.</div>
-                <div class="set-info-more">Without a key the fingerprint lookup is skipped; the length check and its memory of rejected files still work.</div>
+                <div class="set-info-more">Left blank, Octo uses its own key; your own key takes its place. Type off to turn AcoustID off; the length check and its memory of rejected files still work.</div>
               </div>
               <input class="set-input" type="password" name="Soulseek.AcoustIdApiKey" autocomplete="new-password" />
             </div>
@@ -2989,7 +2998,7 @@
               <div class="set-info">
                 <label class="set-info-t" for="f-lidarr-webhook">Webhook password <span class="set-opt">optional</span></label>
                 <div class="set-info-d">Lets Lidarr tell Octo the moment it imports an album. Leave it blank to keep the webhook off.</div>
-                <div class="set-info-more">In Lidarr, open Settings, then Connect, and add a Webhook. Paste the address below as its URL, keep the method POST, type any user name and this password, and turn on On Release Import. A heart then hears about the import at once, and an album Lidarr imports after Octo stopped waiting for it is still added to your library.</div>
+                <div class="set-info-more">In Lidarr, open Settings, then Connect, and add a Webhook. Paste the address below as its URL, keep the method POST, type any user name and this password, and tick On Release Import, On Grab and On Health Restored. A heart then hears about the import at once, an album Lidarr imports after Octo stopped waiting for it is still added to your library, and a heart waiting for Lidarr's indexers goes on as soon as they can search again.</div>
               </div>
               <input class="set-input" id="f-lidarr-webhook" name="Lidarr.WebhookSecret" type="password" autocomplete="new-password" />
               <div class="callout-address">

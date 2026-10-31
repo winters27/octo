@@ -505,6 +505,7 @@ async function refreshStatus() {
 
     setStatusCard('octo', data.octo);
     Object.entries(data.services || {}).forEach(([k, v]) => setStatusCard(k, v));
+    renderDownloadChecks(data.downloads);
 
     // Update sidebar badge with bad count, if any. An optional service nobody set up reports
     // ok, so it never counts here.
@@ -551,6 +552,59 @@ function setStatusCard(svc, probe) {
   if (dot)  dot.className  = `status-dot ${state}`;
   if (body) body.textContent = probe.detail || (probe.ok ? 'online' : 'unreachable');
 }
+
+// The downloads card: what Octo's checks of downloads by their sound cannot do right now, one
+// line each, from the status read. A line that names a setting (imported downloads going
+// unchecked) carries a switch that saves it on, as the Verify downloads card's switch does.
+function renderDownloadChecks(lines) {
+  const wrap = document.getElementById('download-checks');
+  const list = document.getElementById('download-checks-list');
+  if (!wrap || !list) return;
+  const shown = Array.isArray(lines) ? lines.filter(line => line?.text) : [];
+  const markup = shown.map(line => `<div class="set-row${line.warning ? ' is-warning' : ''}" data-check="${escapeHtml(line.id || '')}">
+      <div class="set-info"><div class="set-info-t">${icon(line.warning ? 'i-warning-circle' : 'i-info')}<span>${escapeHtml(line.text)}</span></div></div>
+      ${line.turnOn ? `<label class="switch"><input type="checkbox" data-turn-on="${escapeHtml(line.turnOn)}" aria-label="${escapeHtml(line.text)}" /><span class="sw-track"></span><span class="sw-thumb"></span></label>` : ''}
+    </div>`).join('');
+  // Only when something changed, so a refresh does not undo a switch being turned.
+  if (list.dataset.rendered !== markup) {
+    list.innerHTML = markup;
+    list.dataset.rendered = markup;
+  }
+  wrap.hidden = shown.length === 0;
+}
+
+// The switch on a line: saves its setting on, then reads the status again, which drops the line.
+async function turnOnDownloadCheck(input) {
+  const [section, key] = String(input.dataset.turnOn || '').split('.');
+  if (!section || !key) return;
+  input.disabled = true;
+  let error = null;
+  try {
+    const r = await api('/api/admin/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [section]: { [key]: true } }),
+    });
+    const result = await r.json().catch(() => ({}));
+    if (!r.ok) error = result.error || `HTTP ${r.status}`;
+  } catch (e) {
+    error = e?.message || 'no answer';
+  }
+  if (error) {
+    input.checked = false;
+    input.disabled = false;
+    note(input.closest('.set-row') || input, `Not saved: ${error}`, 'error');
+    return;
+  }
+  if (currentSettings) currentSettings[section] = { ...(currentSettings[section] || {}), [key]: true };
+  // The settings page's own switch for it says the same.
+  document.querySelectorAll(`[name="${section}.${key}"]`).forEach(box => { box.checked = true; });
+  await refreshStatus();
+}
+document.getElementById('download-checks-list')?.addEventListener('change', event => {
+  const input = event.target.closest?.('[data-turn-on]');
+  if (input?.checked) turnOnDownloadCheck(input);
+});
 
 document.getElementById('status-refresh')?.addEventListener('click', refreshStatus);
 ready.then(refreshStatus);
@@ -1002,6 +1056,8 @@ document.querySelectorAll('form[data-section]').forEach(form => {
       if (form.dataset.section === 'soulseek-verify' || form.dataset.section?.startsWith('library-actions')) {
         setTimeout(loadReviewSweep, 700);
       }
+      // The Status page's downloads card follows the Verify card's switch and key.
+      if (form.dataset.section === 'soulseek-verify') refreshStatus();
       form.querySelector('.form-actions')?.classList.remove('dirty');
       // A saved admin password is only ever shown as the placeholder; the typed value should
       // not stay in the page after it has been saved.
@@ -4915,13 +4971,15 @@ async function dlogLoad(cacheKey, key, at, holder) {
   });
 }
 
-// In progress: Log and Find songs under each card, and the log across the panel when open.
+// In progress: Log and Find songs under each card, a held one's Keep anyway and Stop waiting for
+// Lidarr, and the log across the panel when open.
 function acqActions(a) {
   if (!a.key) return '';
   const open = dlogIsOpen(a.key);
   return `<div class="acq-actions">
     <button type="button" class="btn btn-ghost btn-sm" data-dlog-toggle="${escapeHtml(a.key)}" aria-expanded="${open}" data-focus-id="log:${escapeHtml(a.key)}">${icon(open ? 'i-caret-down' : 'i-caret-right')}<span>Log${a.logLines ? ` (${a.logLines})` : ''}</span></button>
     <button type="button" class="btn btn-ghost btn-sm" data-find-id="${escapeHtml(a.key)}" data-find-title="${escapeHtml(a.title || '')}" data-find-artist="${escapeHtml(a.artist || '')}" data-focus-id="find:${escapeHtml(a.key)}">${icon('i-magnifying-glass')}<span>Find songs</span></button>
+    ${acqHeldMenus(a)}
   </div>`;
 }
 function acqLog(a) {
@@ -4956,6 +5014,125 @@ document.getElementById('acq-list')?.addEventListener('click', event => {
   const open = dlog.open.has(key);
   toggle.setAttribute('aria-expanded', String(open));
   toggle.querySelector('use')?.setAttribute('href', `#${open ? 'i-caret-down' : 'i-caret-right'}`);
+});
+
+// ── A held download: Keep anyway and Stop waiting for Lidarr ────────────────
+// A held card offers Keep anyway (Keep these anyway on an album holding two or more tracks) and,
+// while a kept copy of its song waits for a Lidarr download, Stop waiting for Lidarr. Each acts
+// for one person: its menu lists who may, read when it opens (people are named only to a
+// Navidrome admin's own sign-in), and a name picked runs the action the apps' keepAcquisitionAnyway
+// and stopWaitingForLidarr run, with that person as user. What each menu shows is kept here, so
+// the list's redraw every few seconds leaves an open menu as it was.
+const ACQ_MENUS = {
+  keep: { people: 'keepers', path: '/api/admin/acquisitions/keep', caption: 'Whose copy to keep', none: 'Nothing is waiting to be kept' },
+  stop: { people: 'stopWaiters', path: '/api/admin/acquisitions/stop-waiting', caption: 'Whose copy should stop waiting', none: 'Nothing is waiting for Lidarr' },
+};
+const acqMenu = { open: new Set(), people: new Map(), error: new Map(), busy: new Set() };
+const acqMenuId = (kind, key) => `${kind}|${key}`;
+
+function acqKeepLabel(a) {
+  return a.heldTracks >= 2 ? 'Keep these anyway' : 'Keep anyway';
+}
+
+function acqHeldMenus(a) {
+  return (a.keepAnyway ? acqMenuMarkup(a.key, 'keep', acqKeepLabel(a)) : '')
+    + (a.stopWaiting ? acqMenuMarkup(a.key, 'stop', 'Stop waiting for Lidarr') : '');
+}
+
+function acqMenuMarkup(key, kind, label) {
+  const id = acqMenuId(kind, key);
+  const open = acqMenu.open.has(id);
+  return `<details class="acq-menu" data-acq-menu="${kind}" data-acq-key="${escapeHtml(key)}"${open ? ' open' : ''}>
+    <summary class="btn btn-ghost btn-sm" data-focus-id="${escapeHtml(id)}"><span>${escapeHtml(label)}</span>${icon('i-caret-down')}</summary>
+    <div class="acq-menu-body" data-acq-menu-body="${kind}" data-acq-key="${escapeHtml(key)}">${open ? acqMenuBody(key, kind) : ''}</div>
+  </details>`;
+}
+
+function acqMenuBody(key, kind) {
+  const menu = ACQ_MENUS[kind];
+  const id = acqMenuId(kind, key);
+  const people = acqMenu.people.get(key);
+  if (!people) return stateBlock('loading', 'Reading who is waiting…');
+  if (people.error) return stateBlock('error', people.error);
+  const names = Array.isArray(people[menu.people]) ? people[menu.people] : [];
+  const error = acqMenu.error.get(id);
+  const busy = acqMenu.busy.has(id);
+  const list = names.length
+    ? `<div class="acq-menu-caption">${escapeHtml(menu.caption)}</div>
+      <div class="acq-menu-people">${names.map(user => `<button type="button" class="btn btn-ghost btn-sm" data-acq-act="${kind}" data-acq-key="${escapeHtml(key)}" data-acq-user="${escapeHtml(user)}" data-focus-id="${escapeHtml(`${id}|${user}`)}"${busy ? ' disabled' : ''}>${escapeHtml(user)}</button>`).join('')}</div>`
+    : stateBlock('empty', menu.none);
+  return `${list}${error ? `<div class="acq-error" role="alert">${escapeHtml(error)}</div>` : ''}`;
+}
+
+// Every open body of the row's menus drawn again from what is kept.
+function acqMenuFill(key) {
+  document.querySelectorAll('[data-acq-menu-body]').forEach(body => {
+    const kind = body.dataset.acqMenuBody;
+    if (body.dataset.acqKey === key && acqMenu.open.has(acqMenuId(kind, key))) body.innerHTML = acqMenuBody(key, kind);
+  });
+}
+
+// Who may keep the row, and whose kept copy of its song waits for Lidarr, read fresh.
+async function acqMenuLoad(key, holder) {
+  acqMenu.people.delete(key);
+  acqMenuFill(key);
+  let people;
+  try {
+    const response = await parityFetch(`/api/admin/acquisitions/holders?key=${encodeURIComponent(key)}`, {}, holder);
+    people = response.ok ? await response.json() : { error: await parityError(response) };
+  } catch (error) {
+    people = { error: `Could not read who is waiting: ${error.message}` };
+  }
+  acqMenu.people.set(key, people);
+  acqMenuFill(key);
+}
+
+// A menu opened or closed by hand. A redraw of an open menu opens it again too, which reads
+// nothing new.
+function acqMenuToggled(details) {
+  const kind = details.dataset.acqMenu;
+  const key = details.dataset.acqKey;
+  const id = acqMenuId(kind, key);
+  if (!details.open) {
+    acqMenu.open.delete(id);
+    acqMenu.error.delete(id);
+    return;
+  }
+  if (acqMenu.open.has(id)) return;
+  acqMenu.open.add(id);
+  acqMenuLoad(key, details.querySelector('[data-acq-menu-body]') || details);
+}
+
+// A person picked: their copy is kept, or stops waiting. The card is drawn again either way: a
+// done row offers it no more, and a refusal shows its words in the menu.
+async function acqMenuAct(button) {
+  const kind = button.dataset.acqAct;
+  const key = button.dataset.acqKey;
+  const user = button.dataset.acqUser;
+  const id = acqMenuId(kind, key);
+  if (!ACQ_MENUS[kind] || acqMenu.busy.has(id)) return;
+  acqMenu.busy.add(id);
+  acqMenu.error.delete(id);
+  acqMenuFill(key);
+  try {
+    const response = await parityFetch(ACQ_MENUS[kind].path, parityJson({ key, user }), button.closest('[data-acq-menu-body]') || button);
+    if (!response.ok) throw new Error(await parityError(response));
+    acqMenu.open.delete(id);
+    acqMenu.people.delete(key);
+  } catch (error) {
+    acqMenu.error.set(id, error.message);
+  } finally {
+    acqMenu.busy.delete(id);
+  }
+  await loadAcquisitions();
+}
+
+document.getElementById('acq-list')?.addEventListener('toggle', event => {
+  if (event.target.matches?.('details.acq-menu')) acqMenuToggled(event.target);
+}, true);
+document.getElementById('acq-list')?.addEventListener('click', event => {
+  const button = event.target.closest?.('[data-acq-act]');
+  if (button && !button.disabled) acqMenuAct(button);
 });
 
 // Fetched songs: the log folds under the row, read when it is first opened.
@@ -5913,7 +6090,8 @@ function heartSourceReachable() {
   const reachable = enabled.filter(source => {
     if (source === 'Soulseek') return services.slskd?.ok && !services.slskd?.warning;
     if (source === 'YouTube') return services.ytDlpShim?.ok;
-    if (source === 'Lidarr') return services.lidarr?.ok && services.lidarr?.configured !== false && !services.lidarr?.warning;
+    // A warning about Lidarr's indexers is not its setup: it answers, and its card says the rest.
+    if (source === 'Lidarr') return services.lidarr?.ok && services.lidarr?.configured !== false && (!services.lidarr?.warning || services.lidarr?.indexers);
     return false;
   });
   return reachable.length
