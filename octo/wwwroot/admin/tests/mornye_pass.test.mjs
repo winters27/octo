@@ -153,6 +153,12 @@ test('failing extensions, an unreported check and a missing token each get their
   ]);
 });
 
+test("a helper that refuses the token says so, not that it is missing", () => {
+  const card = mornyeCard({ ...paused, helper: 'refused', passable: false }, now);
+  assert.ok(card.lines.some(line => line.text === "Octo's helper beside Mornye refused the web token. Octo and Mornye must share SPOTIFLAC_WEB_TOKEN."), JSON.stringify(card.lines));
+  assert.ok(!card.lines.some(line => line.text.includes('spotiflac service')));
+});
+
 test("Pass shows exactly when the server says it can help, the status grid's rule too", () => {
   assert.equal(mornyeCard(paused, now).canPass, true);
   assert.equal(mornyeCard({ ...paused, passable: false }, now).canPass, false);

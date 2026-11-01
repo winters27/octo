@@ -3450,6 +3450,7 @@ function mornyeCard(status, now = new Date()) {
 
   const checkSongs = Number(status.checkSongs) || 0;
   if (status.helper === 'no token') add('info', 'Set a web token for Mornye (SPOTIFLAC_WEB_TOKEN) to pass its check from Octo');
+  if (status.helper === 'refused') add('info', "Octo's helper beside Mornye refused the web token. Octo and Mornye must share SPOTIFLAC_WEB_TOKEN");
   if (paused.length && status.helper === 'absent') add('info', "Passing the check from here needs the spotiflac service in Octo's compose file");
   if (paused.length && status.helper === 'ok' && checkSongs === 0) {
     add('info', 'No song has asked Mornye since its check paused. Once one has, you can pass the check here');
@@ -3674,6 +3675,8 @@ function openPass() {
 }
 
 function closePass() {
+  // A run still opening or live is stopped on the server too: its song's job is cancelled.
+  if (passState.view?.polls) api('/api/admin/spotiflac/assist/stop', { method: 'POST' }).catch(() => {});
   passState.open = false;
   passState.run += 1;
   clearTimeout(passState.pollTimer);
@@ -8918,7 +8921,7 @@ function renderTrickle() {
   const parts = [];
   if (t.state === 'yielding') parts.push('Someone\'s own downloads come first; it goes on once they finish.');
   if (t.state === 'waitingForSoulseek') parts.push('slskd is not logged in to Soulseek; it goes on once it is back.');
-  if (t.state === 'waitingForMornyeCheck') parts.push("Mornye could not pass its check and Soulseek cannot be used; it goes on once Mornye passes. You can pass it on the Mornye page.");
+  if (t.state === 'waitingForMornyeCheck') parts.push("Mornye could not pass its check and Soulseek cannot be used; it goes on when Mornye may try its check again, or once you pass it on the Mornye page.");
   if (t.state === 'waitingForMusicDatabase') parts.push('MusicBrainz is not answering; songs it has to check go on once it is back.');
   if (t.state === 'off') parts.push('Songs an hour is 0, so nothing starts. Change it above.');
   else parts.push(`Up to ${t.perHour}\u00a0${t.perHour === 1 ? 'song' : 'songs'} an hour.`);
