@@ -3406,7 +3406,9 @@ function mornyeCard(status, now = new Date()) {
     : status.problem ? `${name} answers.`
     : `${name} is ready.`;
   const tone = paused.length || unpassed.length || failing.length || status.problem ? 'warn' : 'ok';
-  return { tone, title, lines, canPass: paused.length > 0 && status.helper === 'ok' && checkSongs > 0, webUrl };
+  // The server decides when Pass can help (a pause Mornye made, the helper answering, a song to
+  // ask with), the same rule the status grid's link follows.
+  return { tone, title, lines, canPass: status.passable === true, webUrl };
 }
 
 // The card's findings as list items, each Mornye word escaped.
@@ -8728,12 +8730,14 @@ function renderTrickle() {
     off: 'Off',
     yielding: 'Waiting for other downloads',
     waitingForSoulseek: 'Waiting for Soulseek',
+    waitingForMornyeCheck: "Waiting for Mornye's check",
     waitingForMusicDatabase: 'Waiting for MusicBrainz',
   };
   impEl('imp-trickle-title').textContent = t.label || words[t.state] || t.state;
   const parts = [];
   if (t.state === 'yielding') parts.push('Someone\'s own downloads come first; it goes on once they finish.');
   if (t.state === 'waitingForSoulseek') parts.push('slskd is not logged in to Soulseek; it goes on once it is back.');
+  if (t.state === 'waitingForMornyeCheck') parts.push("Mornye could not pass its check and Soulseek cannot be used; it goes on once Mornye passes. You can pass it on the Mornye page.");
   if (t.state === 'waitingForMusicDatabase') parts.push('MusicBrainz is not answering; songs it has to check go on once it is back.');
   if (t.state === 'off') parts.push('Songs an hour is 0, so nothing starts. Change it above.');
   else parts.push(`Up to ${t.perHour}\u00a0${t.perHour === 1 ? 'song' : 'songs'} an hour.`);

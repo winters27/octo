@@ -67,6 +67,8 @@ const paused = {
     gatewayAsked: false,
   }],
   checkSongs: 2,
+  paused: true,
+  passable: true,
 };
 
 test('times read the time alone today, the date on another day, the year in another year', () => {
@@ -151,13 +153,11 @@ test('failing extensions, an unreported check and a missing token each get their
   ]);
 });
 
-test('Pass shows only with a paused check, the helper answering and a song to ask with', () => {
+test("Pass shows exactly when the server says it can help, the status grid's rule too", () => {
   assert.equal(mornyeCard(paused, now).canPass, true);
-  assert.equal(mornyeCard({ ...paused, checks: [{ ...paused.checks[0], pausedUntilUtc: null }] }, now).canPass, false);
-  assert.equal(mornyeCard({ ...paused, helper: 'no token' }, now).canPass, false);
-  assert.equal(mornyeCard({ ...paused, helper: 'absent' }, now).canPass, false);
-  assert.equal(mornyeCard({ ...paused, checkSongs: 0 }, now).canPass, false);
-  assert.ok(mornyeCard({ ...paused, checkSongs: 0 }, now).lines.some(line => line.text.startsWith('No song has asked Mornye')));
+  assert.equal(mornyeCard({ ...paused, passable: false }, now).canPass, false);
+  assert.equal(mornyeCard({ ...paused, passable: undefined }, now).canPass, false, 'an older server offers no Pass');
+  assert.ok(mornyeCard({ ...paused, checkSongs: 0, passable: false }, now).lines.some(line => line.text.startsWith('No song has asked Mornye')));
   assert.ok(mornyeCard({ ...paused, helper: 'absent' }, now).lines.some(line => line.text.includes('spotiflac service')));
 });
 
