@@ -18,6 +18,7 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 use super::caller_checks::is_first_byte_request;
 use super::media::draws_its_own_marks_in;
 use super::test_app::*;
+use crate::services::test_audio::audio_or_skip;
 
 /// Navidrome accepting every sign-in: these tests are about what plays, not who.
 async fn ping_ok() -> MockServer {
@@ -114,6 +115,75 @@ async fn an_outside_song_downloads_as_it_streams() {
         assert_eq!(response.header("content-type"), Some("audio/mp4"), "{uri}");
     }
     assert_eq!(downloads.stream_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn an_external_mp3_request_transcodes_only_the_octo_stream() {
+    let source = audio_or_skip!("m4a");
+    let source: &'static [u8] = Box::leak(source.into_boxed_slice());
+    let navidrome = ping_ok().await;
+    let downloads = Arc::new(FakeStreams::streaming(
+        "soulseek",
+        "track-id",
+        source,
+        "audio/mp4",
+    ));
+    let library = Arc::new(FakeLibrary::with_external(
+        "external-track",
+        "soulseek",
+        "track-id",
+    ));
+    let state = state_with(playback_settings(&navidrome.uri(), false, false), |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = library;
+    });
+    let response = get(
+        &app(&state),
+        "/rest/stream?id=external-track&format=mp3&maxBitRate=64&u=alice&t=good&s=salt&v=1.16.1&c=test",
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.header("content-type"), Some("audio/mpeg"));
+    assert!(response.body.len() > 100);
+    assert_eq!(response.body[0], 0xff);
+    assert_eq!(response.body[1] & 0xe0, 0xe0);
+    assert_ne!(response.body.as_ref(), source);
+    assert_eq!(downloads.stream_calls().len(), 1);
+    let requests = navidrome.received_requests().await.unwrap_or_default();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path().ends_with("/rest/ping"))
+    );
+}
+
+#[tokio::test]
+async fn an_external_stream_is_not_transcoded_without_an_explicit_mp3_request() {
+    let navidrome = ping_ok().await;
+    let downloads = Arc::new(FakeStreams::streaming(
+        "soulseek",
+        "track-id",
+        &[1, 2, 3],
+        "audio/mp4",
+    ));
+    let library = Arc::new(FakeLibrary::with_external(
+        "external-track",
+        "soulseek",
+        "track-id",
+    ));
+    let state = state_with(playback_settings(&navidrome.uri(), false, false), |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = library;
+    });
+    for uri in [
+        "/rest/stream?id=external-track&maxBitRate=64&u=alice&t=good&s=salt&v=1.16.1&c=test",
+        "/rest/stream?id=external-track&format=raw&maxBitRate=64&u=alice&t=good&s=salt&v=1.16.1&c=test",
+    ] {
+        let response = get(&app(&state), uri).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body.as_ref(), [1, 2, 3]);
+        assert_eq!(response.header("content-type"), Some("audio/mp4"));
+    }
 }
 
 #[tokio::test]
@@ -281,7 +351,7 @@ async fn head_on_a_library_song_is_relayed_to_navidrome() {
     let reply = send(
         &app(&state),
         Method::HEAD,
-        "/rest/stream?id=library-track&u=alice&t=good&s=salt&v=1.16.1&c=test",
+        "/rest/stream?id=library-track&format=mp3&maxBitRate=128&u=alice&t=good&s=salt&v=1.16.1&c=test",
         &[],
         Body::empty(),
     )
