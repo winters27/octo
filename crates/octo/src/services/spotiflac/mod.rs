@@ -50,6 +50,10 @@ pub const SPOTIFLAC_FOLDER: &str = ".octo-incoming/spotiflac";
 /// How long one call to Mornye's API may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What a read says when Mornye answers that it has no such call (an older Mornye or SpotiFLAC).
+const NO_CHECK_CALL: &str = "this Mornye does not report its check";
+const NO_SERVICES_CALL: &str = "this Mornye does not list its download services";
+
 /// A call to Mornye that did not work, in words a person can act on.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SpotiflacError {
@@ -192,13 +196,11 @@ impl SpotiflacClient {
             bounded(bound, self.signed_sessions(&connection, read_utc)),
             bounded(bound, self.download_services(&connection)),
         );
-        let view = Arc::new(CheckView::new(
-            connection.clone(),
-            started,
-            read_utc,
-            rows,
-            services,
-        ));
+        let no_such_call = matches!(&rows, Reading::CannotTell(why) if why == NO_CHECK_CALL)
+            || matches!(&services, Reading::CannotTell(why) if why == NO_SERVICES_CALL);
+        let mut view = CheckView::new(connection.clone(), started, read_utc, rows, services);
+        view.reached |= no_such_call;
+        let view = Arc::new(view);
         if Connection::of(&self.settings()) == connection && self.check.keep(&view) {
             let all = self.settings.current();
             let meanwhile = Meanwhile::of(&all);
@@ -347,7 +349,7 @@ impl SpotiflacClient {
             .await
         {
             Ok(Some(answer)) => check_rows(&answer, read_utc),
-            Ok(None) => Reading::CannotTell("this Mornye does not report its check".into()),
+            Ok(None) => Reading::CannotTell(NO_CHECK_CALL.into()),
             Err(e) => Reading::CannotTell(e.to_string()),
         }
     }
@@ -359,8 +361,20 @@ impl SpotiflacClient {
             .await
         {
             Ok(Some(answer)) => service_rows(&answer),
-            Ok(None) => Reading::CannotTell("this Mornye does not list its download services".into()),
+            Ok(None) => Reading::CannotTell(NO_SERVICES_CALL.into()),
             Err(e) => Reading::CannotTell(e.to_string()),
+        }
+    }
+
+    /// Mornye can stand in for Soulseek now: on, answering, and able to download, from the kept
+    /// read of its check.
+    pub async fn stands_in(&self) -> bool {
+        if !self.is_on() {
+            return false;
+        }
+        match self.check_view(None).await {
+            Some(view) => view.stands_in(&self.settings().effective_services()),
+            None => false,
         }
     }
 

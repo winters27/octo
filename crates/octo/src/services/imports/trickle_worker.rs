@@ -115,6 +115,28 @@ fn soulseek_step_alone(settings: &SettingsStore) -> bool {
     steps.contains(&HeartDownloadSource::Soulseek) && !steps.contains(&HeartDownloadSource::Lidarr)
 }
 
+/// slskd is logged out on a Soulseek step with nothing after it, and Mornye cannot stand in for
+/// it (off, not answering, or unable to download). A Mornye that only waits for its check stands
+/// in: that wait is [`mornye_keeps_the_step`].
+pub(crate) async fn soulseek_keeps_the_step(
+    settings: &SettingsStore,
+    soulseek: &dyn ISoulseekLink,
+    mornye: Option<&SpotiflacClient>,
+) -> bool {
+    if !soulseek_step_alone(settings) {
+        return false;
+    }
+    if let Some(client) = mornye
+        && client.stands_in().await
+    {
+        return false;
+    }
+    soulseek
+        .read(false)
+        .await
+        .is_some_and(|reading| reading.link == SoulseekLinkState::NotLoggedIn)
+}
+
 /// Mornye is the lossless source left on a Soulseek step with nothing after it (slskd off,
 /// unreachable or logged out), and its check keeps it from every extension a song could use.
 pub(crate) async fn mornye_keeps_the_step(
@@ -125,7 +147,7 @@ pub(crate) async fn mornye_keeps_the_step(
     let Some(client) = mornye.filter(|client| client.is_on()) else {
         return false;
     };
-    if !soulseek_step_alone(settings) {
+    if !soulseek_step_alone(settings) || !client.stands_in().await {
         return false;
     }
     // slskd still fetches: Mornye's check keeps nothing from the step.
@@ -359,17 +381,7 @@ impl TrickleWorker {
                 let (settings, soulseek, mornye) =
                     (out_settings.clone(), soulseek.clone(), spotiflac.clone());
                 Box::pin(async move {
-                    if !soulseek_step_alone(&settings) {
-                        return false;
-                    }
-                    // Mornye on stands in for Soulseek on its step; its own wait is mornye_out.
-                    if mornye.as_ref().is_some_and(|client| client.is_on()) {
-                        return false;
-                    }
-                    soulseek
-                        .read(false)
-                        .await
-                        .is_some_and(|reading| reading.link == SoulseekLinkState::NotLoggedIn)
+                    soulseek_keeps_the_step(&settings, soulseek.as_ref(), mornye.as_deref()).await
                 })
             }),
             mornye_out: Arc::new(move || {

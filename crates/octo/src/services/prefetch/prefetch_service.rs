@@ -633,8 +633,10 @@ impl PrefetchService {
         let Some(view) = client.check_view(None).await else {
             return false;
         };
-        view.pause(&client.settings().effective_services(), chrono::Utc::now())
-            .is_some()
+        view.stands_in(&client.settings().effective_services())
+            && view
+                .pause(&client.settings().effective_services(), chrono::Utc::now())
+                .is_some()
     }
 
     /// Nobody played anything lately, and nothing new starts then (PauseWhenStopped).
@@ -648,9 +650,14 @@ impl PrefetchService {
     }
 
     /// Soulseek is the only lossless source and cannot be used: it is off, slskd cannot be
-    /// reached, or slskd is not logged in.
+    /// reached, or slskd is not logged in, and Mornye cannot stand in for it (off, not
+    /// answering, or unable to download).
     async fn soulseek_down(&self) -> bool {
-        if self.parts.settings.current().spotiflac.is_on() {
+        let mornye_stands_in = match &self.parts.spotiflac {
+            Some(client) => client.stands_in().await,
+            None => self.parts.settings.current().spotiflac.is_on(),
+        };
+        if mornye_stands_in {
             return false;
         }
         self.soulseek_unusable().await
@@ -840,16 +847,16 @@ impl PrefetchService {
             Err(e) => {
                 let words = format!("{e:#}");
                 info!("Could not download {key} ahead: {words}");
-                // A source that could not be reached, or Mornye's check, says nothing about the song.
-                let unreachable =
-                    unreachable(&e) || mornye_waited(&e).is_some() || self.soulseek_down().await;
+                // A source that could not be reached says nothing about the song. Mornye's check
+                // keeping it says only that Mornye was not asked: the song rests until Mornye may
+                // try its check again, so the other sources are not asked again in the meantime.
+                let rest = match mornye_waited(&e) {
+                    Some(wait) => (wait.pause.until_utc - now).max(RETRY_UNREACHABLE_AFTER),
+                    None if unreachable(&e) || self.soulseek_down().await => RETRY_UNREACHABLE_AFTER,
+                    None => RETRY_AFTER,
+                };
                 let named = self.view(job);
                 let mut state = self.state.lock();
-                let rest = if unreachable {
-                    RETRY_UNREACHABLE_AFTER
-                } else {
-                    RETRY_AFTER
-                };
                 state.resting.insert(key, now + rest);
                 let line = match (named.artist, named.title) {
                     (Some(artist), Some(title)) => format!("{artist} - {title}: {words}"),

@@ -221,6 +221,7 @@ pub async fn mornye_status(state: &AppState, dashboard_host: &str) -> serde_json
     let helper_word = match &helper {
         Ok(_) => "ok",
         Err(_) if connection.token.is_empty() => "no token",
+        Err(why) if why.0 == crate::services::spotiflac::assist::HELPER_REFUSED_TOKEN => "refused",
         Err(_) => "absent",
     };
     // Paused: the check keeps every extension a song could use. Pass helps only with a pause
@@ -302,6 +303,17 @@ pub async fn assist_start(State(state): State<AppState>) -> Response {
                 object.insert("why".into(), serde_json::Value::String(why.0));
             }
         }
+    }
+    ok(&answer)
+}
+
+/// `POST /api/admin/spotiflac/assist/stop`: stops the live Pass run (its song's job is cancelled
+/// and its folder removed), and answers the run as it stands.
+pub async fn assist_stop(State(state): State<AppState>) -> Response {
+    let stopped = state.spotiflac.stop_pass();
+    let mut answer = assist_json(&state).await;
+    if let Some(object) = answer.as_object_mut() {
+        object.insert("stopped".into(), serde_json::Value::Bool(stopped));
     }
     ok(&answer)
 }

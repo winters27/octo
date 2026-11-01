@@ -52,6 +52,11 @@ impl UpgradeSources {
         view.pause(&client.settings().effective_services(), chrono::Utc::now())
     }
 
+    /// Mornye's check keeps it from every extension a song could use now.
+    pub async fn mornye_kept(&self) -> bool {
+        self.mornye_pause().await.is_some()
+    }
+
     /// slskd can take a search: it is set up and not known to be logged out.
     async fn slskd_usable(&self) -> bool {
         if !Self::soulseek_set_up(&self.settings.current().soulseek) {
@@ -149,12 +154,16 @@ impl UpgradeSources {
         }
     }
 
-    /// The Soulseek step can take a search: slskd can, or Mornye is on and not kept by its check.
+    /// The Soulseek step can take a search: slskd can, or Mornye answers, can download, and is
+    /// not kept by its check.
     async fn soulseek_step_usable(&self) -> bool {
         if self.slskd_usable().await {
             return true;
         }
-        self.spotiflac.as_ref().is_some_and(|client| client.is_on()) && self.mornye_pause().await.is_none()
+        let Some(client) = self.spotiflac.as_ref() else {
+            return false;
+        };
+        client.stands_in().await && self.mornye_pause().await.is_none()
     }
 
     /// Why the request has nothing to search, when the Soulseek step is what is out.
@@ -446,6 +455,17 @@ mod tests {
                 other => panic!("waits for Mornye's check, not {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_mornye_that_does_not_answer_carries_nothing() {
+        let sources = with_mornye(
+            "http://127.0.0.1:1",
+            Some(slskd()),
+            SoulseekLinkState::NotLoggedIn,
+        );
+        assert!(sources.available().await.is_empty());
+        assert_eq!(sources.waiting_for().await, Some(SourcesOut::Soulseek));
     }
 
     #[tokio::test]

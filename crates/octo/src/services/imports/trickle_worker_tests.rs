@@ -378,6 +378,32 @@ async fn mornye_keeps_the_step_only_when_it_is_the_source_left_and_its_check_is_
         !keeps(store(&paused.uri(), true), Arc::new(OffLink)).await,
         "Lidarr comes after"
     );
+    assert!(
+        !keeps(store("http://127.0.0.1:1", false), Arc::new(OffLink)).await,
+        "Mornye does not answer"
+    );
+}
+
+#[tokio::test]
+async fn a_mornye_that_cannot_download_does_not_stand_in_for_a_logged_out_slskd() {
+    use crate::services::common::test_fakes::OfflineLink;
+    let clear = mornye("active").await;
+    let soulseek_keeps = |url: String| async move {
+        let mut all = AppSettings::default();
+        all.spotiflac.enabled = true;
+        all.spotiflac.url = url;
+        let settings = Arc::new(SettingsStore::for_tests(all));
+        let client = SpotiflacClient::new(Arc::clone(&settings));
+        soulseek_keeps_the_step(&settings, &OfflineLink, Some(&client)).await
+    };
+    assert!(
+        !soulseek_keeps(clear.uri()).await,
+        "an answering Mornye stands in"
+    );
+    assert!(
+        soulseek_keeps("http://127.0.0.1:1".into()).await,
+        "one that does not answer leaves the wait for Soulseek"
+    );
 }
 
 #[tokio::test]

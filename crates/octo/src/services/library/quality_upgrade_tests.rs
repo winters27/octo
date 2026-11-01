@@ -331,6 +331,34 @@ async fn during_a_soulseek_outage_no_song_is_tried_and_the_run_is_not_spent() {
 }
 
 #[tokio::test]
+async fn a_song_mornyes_check_kept_is_not_put_off_for_four_weeks() {
+    let store = Arc::new(QualityUpgradeStore::new());
+    let (w, calls) = worker(7, true, Some(store.clone()));
+    let applied = calls.clone();
+    w.configure(|s| {
+        s.apply = Arc::new(move |_| {
+            applied.apply.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok(LibraryActionOutcome {
+                    code: Some(LibraryActionCodes::MORNYE_KEPT.to_string()),
+                    ..LibraryActionOutcome::new(
+                        LibraryActionState::Failed,
+                        Some("Waiting for Mornye's check.".into()),
+                    )
+                })
+            }
+            .boxed()
+        })
+    });
+
+    assert_eq!(w.tick().await, Tick::Offline);
+    assert_eq!(calls.apply.load(Ordering::SeqCst), 1);
+    let state = store.snapshot();
+    assert!(state.attempts.is_empty(), "the song is not stamped");
+    assert_eq!(state.last_outcome.as_deref(), Some("Waiting for Mornye's check"));
+}
+
+#[tokio::test]
 async fn when_navidrome_cannot_list_the_library_the_weeks_run_is_not_spent() {
     let store = Arc::new(QualityUpgradeStore::new());
     let (w, calls) = worker(7, true, Some(store.clone()));

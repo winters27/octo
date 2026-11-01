@@ -453,14 +453,7 @@ pub fn failure_words(facts: &FailureFacts<'_>) -> FailureWords {
         || names_missing_utilities(facts.reason)
         || last_error.as_deref().is_some_and(names_missing_utilities)
     {
-        return FailureWords {
-            shown: "Mornye needs its utilities extension, which your registry does not list.".into(),
-            detail: Some(
-                "Mornye 1.1 moved its search and its check into an extension named utilities. Use a registry \
-                 that lists it, or set SPOTIFLAC_IMAGE back to Mornye 1.0.5."
-                    .into(),
-            ),
-        };
+        return utilities_words();
     }
     let their_dir = facts.their_dir.trim().trim_end_matches('/');
     if facts.own_job
@@ -470,8 +463,9 @@ pub fn failure_words(facts: &FailureFacts<'_>) -> FailureWords {
         && is_write_refusal(error)
     {
         return FailureWords {
-            shown: "Mornye could not write the song into Octo's music folder.".into(),
-            detail: Some(format!("{error}. The Test on the Mornye page checks the folder.")),
+            shown: "Mornye could not write the song into Octo's music folder; the Test on the Mornye page checks that folder."
+                .into(),
+            detail: Some(error.clone()),
         };
     }
     if let (Some(provider), Some(error)) = (facts.provider, &last_error) {
@@ -505,6 +499,19 @@ pub fn failure_words(facts: &FailureFacts<'_>) -> FailureWords {
         (reason, _) => reason.to_string(),
     };
     FailureWords { shown, detail: None }
+}
+
+/// The words for a Mornye whose utilities extension is missing: it can neither search nor pass
+/// its check.
+pub fn utilities_words() -> FailureWords {
+    FailureWords {
+        shown: "Mornye needs its utilities extension, which your registry does not list.".into(),
+        detail: Some(
+            "Mornye 1.1 moved its search and its check into an extension named utilities. Use a registry \
+             that lists it, or set SPOTIFLAC_IMAGE back to Mornye 1.0.5."
+                .into(),
+        ),
+    }
 }
 
 /// Whether an error says the operating system refused a write, in Python's words or Node's.

@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::duplicate_scan_worker::is_lossless_file;
-use super::library_action_executor::{LibraryActionExecutor, LibraryActionRequest};
+use super::library_action_executor::{LibraryActionCodes, LibraryActionExecutor, LibraryActionRequest};
 use super::upgrade_queue::{ApplyFn, OfflineFn, apply_with, soulseek_offline_with};
 use super::{LibraryActionOutcome, LibraryActionState, NavidromePlaylistApi, UpgradeQueue, UpgradeSources};
 use crate::services::common::IAcquisitionActivity;
@@ -543,6 +543,17 @@ impl QualityUpgradeWorker {
             Ok(outcome) => outcome,
             Err(e) => LibraryActionOutcome::new(LibraryActionState::Failed, Some(e.to_string())),
         };
+        // Mornye's check kept the song from Mornye: nothing was tried, so it is not stamped for
+        // four weeks, and the next run comes back to it first.
+        if LibraryActionCodes::waits_on_mornye(outcome.code.as_deref()) {
+            info!(
+                "Quality upgrade: '{} - {}' waits for Mornye's check",
+                pick.artist, pick.title
+            );
+            self.store
+                .update(|s| s.last_outcome = Some("Waiting for Mornye's check".to_string()));
+            return Tick::Offline;
+        }
 
         let key = Self::key_of(&pick);
         let at = seams.clock.now();

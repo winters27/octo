@@ -567,7 +567,8 @@ async fn songs_are_fetched_while_mornyes_check_passes() {
 }
 
 #[tokio::test]
-async fn a_song_mornyes_check_kept_is_tried_again_soon_not_in_hours() {
+async fn a_song_mornyes_check_kept_rests_until_mornye_may_try_again() {
+    // The wait says Mornye allows its next try in 15 minutes (the stand-in's pause).
     let w = world(|s| s.prefetch.count = 1);
     *w.downloads.mornye_waits.lock() = true;
     w.save_queue("alice", 0);
@@ -575,11 +576,28 @@ async fn a_song_mornyes_check_kept_is_tried_again_soon_not_in_hours() {
     w.run_jobs().await;
     assert_eq!(w.asked(), w.ids_of(&[2]));
     *w.downloads.mornye_waits.lock() = false;
+    let again = |w: &World| {
+        let (service, ids) = (w.service.clone(), w.ids.clone());
+        async move {
+            service.on_playing("alice", &ids[1], None).await;
+            service.on_playing("alice", &ids[0], None).await;
+        }
+    };
     w.later(Duration::minutes(11));
-    w.service.on_playing("alice", &w.ids[1], None).await;
-    w.service.on_playing("alice", &w.ids[0], None).await;
+    again(&w).await;
     w.run_jobs().await;
-    assert!(w.service.store().is_ready("soulseek", &w.ids[2]), "tried again");
+    assert_eq!(
+        w.downloads.asked.lock().len(),
+        1,
+        "not asked again before Mornye may try"
+    );
+    w.later(Duration::minutes(5));
+    again(&w).await;
+    w.run_jobs().await;
+    assert!(
+        w.service.store().is_ready("soulseek", &w.ids[2]),
+        "tried again once Mornye may"
+    );
 }
 
 #[tokio::test]

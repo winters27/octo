@@ -22,7 +22,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use super::*;
 use crate::services::common::test_fakes::FakeMetadata;
-use crate::services::common::{DownloadConcurrency, DownloadCore, DownloadServices};
+use crate::services::common::{AcquisitionTracker, DownloadConcurrency, DownloadCore, DownloadServices};
 use crate::services::fingerprint::{AcoustIdClient, AcoustIdRateLimitHandler, AcoustIdRateLimiter};
 use crate::services::i_download_service::IDownloadService;
 use crate::services::local::DownloadHistoryService;
@@ -83,6 +83,8 @@ struct FakeSpotiflac {
     extensions_read: Arc<AtomicUsize>,
     /// The extension a failed job's item names.
     provider: Option<&'static str>,
+    /// Every search answers 500, as Mornye 1.1 does without its utilities extension.
+    search_fails: bool,
 }
 
 /// The answer for read number `read` of `answers`: the last one repeats.
@@ -113,6 +115,12 @@ impl Respond for FakeSpotiflac {
         }
         if path == "/api/v1/extensions" {
             return in_turn(&self.extensions, &self.extensions_read);
+        }
+        if path == "/api/v1/search" && self.search_fails {
+            return json_answer(
+                &json!({"error": "internal_error", "detail": "search failed"}),
+                500,
+            );
         }
         if path == "/api/v1/search" {
             let query = request
@@ -211,7 +219,7 @@ impl Respond for EmptySlskd {
 
 /// Every notification sent, by its kind.
 #[derive(Default)]
-struct SentNotifications(Mutex<Vec<NotificationEventType>>);
+struct SentNotifications(Mutex<Vec<NotificationEventType>>, Mutex<Vec<String>>);
 
 #[async_trait::async_trait]
 impl INotificationSink for SentNotifications {
@@ -225,6 +233,7 @@ impl INotificationSink for SentNotifications {
 
     async fn send(&self, message: &octo_core::notifications::NotificationMessage) -> anyhow::Result<()> {
         self.0.lock().push(message.r#type);
+        self.1.lock().push(message.body.clone());
         Ok(())
     }
 }
@@ -237,6 +246,7 @@ struct Fetch {
     root: tempfile::TempDir,
     spotiflac: Arc<SpotiflacClient>,
     sent: Arc<SentNotifications>,
+    tracker: Arc<AcquisitionTracker>,
     _spotiflac: MockServer,
     _slskd: MockServer,
 }
@@ -249,6 +259,8 @@ struct Setup {
     title: &'static str,
     seconds: i32,
     isrc: Option<&'static str>,
+    /// How long a read of Mornye's check stays fresh (zero reads it again at every look).
+    check_fresh_for: Duration,
 }
 
 const ISRC: &str = "USCM51100524";
@@ -286,11 +298,13 @@ impl Setup {
                 extensions: Vec::new(),
                 extensions_read: Arc::default(),
                 provider: None,
+                search_fails: false,
             },
             artist: "Drake",
             title: "Take Care",
             seconds: 277,
             isrc: Some(ISRC),
+            check_fresh_for: Duration::from_secs(60),
         }
     }
 
@@ -360,6 +374,7 @@ impl Setup {
             spotiflac: self.spotiflac.clone(),
             notifications: octo_core::settings::NotificationSettings {
                 notify_download_started: true,
+                notify_lossless_fallback: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -392,8 +407,21 @@ impl Setup {
                 None,
             )),
         };
+        let tracker = Arc::new(AcquisitionTracker::new(None, octo_core::common::Clock::system()));
+        // The song's row, so its download log lines are kept.
+        let row_id = song.external_id.clone().expect("an id");
+        tracker.begin(
+            "soulseek",
+            &row_id,
+            Some(&row_id),
+            Some("alice"),
+            None,
+            None,
+            None,
+        );
         let services = DownloadServices {
             concurrency: Some(Arc::new(DownloadConcurrency::new(Arc::clone(&settings)))),
+            tracker: Some(Arc::clone(&tracker)),
             ..Default::default()
         };
         let verification = Arc::new(DownloadVerificationService::new(
@@ -412,7 +440,7 @@ impl Setup {
         let check = crate::services::spotiflac::MornyeCheck::new(
             Arc::new(crate::services::spotiflac::MornyeCheckStore::new(None)),
             crate::services::spotiflac::CheckTimes {
-                fresh_for: Duration::from_secs(60),
+                fresh_for: self.check_fresh_for,
                 call_bound: Duration::from_millis(200),
             },
             None,
@@ -442,6 +470,7 @@ impl Setup {
             root,
             spotiflac,
             sent,
+            tracker,
             _spotiflac: spotiflac_server,
             _slskd: slskd_server,
         }
@@ -450,6 +479,10 @@ impl Setup {
 
 impl Fetch {
     async fn acquire(&self) -> anyhow::Result<String> {
+        self.acquire_from(DownloadSource::Soulseek).await
+    }
+
+    async fn acquire_from(&self, source: DownloadSource) -> anyhow::Result<String> {
         tokio::time::timeout(
             Duration::from_secs(60),
             self.service.execute_acquisition(
@@ -457,7 +490,7 @@ impl Fetch {
                 self.song.external_id.as_deref().expect("an id"),
                 false,
                 true,
-                Some(DownloadSource::Soulseek),
+                Some(source),
                 &CancellationToken::new(),
                 None,
                 false,
@@ -466,6 +499,18 @@ impl Fetch {
         )
         .await
         .expect("within a minute")
+    }
+
+    /// The song's download log, as text and detail.
+    fn log_lines(&self) -> Vec<(String, Option<String>)> {
+        let key = format!("soulseek:{}", self.song.external_id.as_deref().expect("an id"));
+        self.tracker
+            .detail(&key, None)
+            .and_then(|row| row.events)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|line| (line.text, line.detail))
+            .collect()
     }
 
     fn events(&self) -> Vec<String> {
@@ -984,5 +1029,147 @@ async fn a_check_read_that_hangs_never_holds_a_song_up() {
         started.elapsed() < Duration::from_secs(20),
         "{:?}",
         started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn the_check_is_looked_at_again_once_the_song_has_its_turn() {
+    // Every look reads Mornye again: clear before the turn, paused once the song has it, as when
+    // a song ahead of it ran into the check meanwhile.
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.check_fresh_for = Duration::ZERO;
+    setup.fake.sessions = vec![gateway("active"), gateway("unverified")];
+    setup.fake.services = Some(example_service());
+    let fetch = setup.build(events).await;
+
+    let error = fetch.acquire().await.expect_err("the second look refuses");
+
+    assert!(mornye_waited(&error).is_some_and(|wait| !wait.asked), "{error:#}");
+    assert!(
+        !fetch.spotiflac_events().iter().any(|e| e.contains("download")),
+        "{:?}",
+        fetch.events()
+    );
+    assert!(
+        !fetch
+            .sent()
+            .await
+            .contains(&NotificationEventType::DownloadStarted)
+    );
+}
+
+#[tokio::test]
+async fn the_download_log_says_why_mornye_was_not_asked() {
+    // Plays turn every failure into "not proven", so the log is where the reason shows.
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.fake.sessions = vec![gateway("unverified")];
+    setup.fake.services = Some(example_service());
+    let fetch = setup.build(events).await;
+
+    fetch.acquire().await.expect_err("Mornye's check is paused");
+
+    let lines = fetch.log_lines();
+    let wait = lines
+        .iter()
+        .find(|(text, _)| {
+            text == "Mornye could not pass its check for Example, so Octo did not ask it for this song."
+        })
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(
+        wait.1
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("It allows its next try at ")),
+        "{wait:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_jobs_own_error_reaches_the_download_log_without_server_paths() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.fake.sessions = vec![gateway("active")];
+    setup.fake.services = Some(example_service());
+    setup.fake.file = None;
+    setup.fake.status = "failed";
+    setup.fake.error = Some("download_failed");
+    setup.fake.provider = Some("example-ext");
+    setup.fake.extensions = vec![
+        health(3, 1, "old"),
+        health(
+            4,
+            2,
+            "the catalog has no FLAC of this. It looked in /srv/mornye/cache/x",
+        ),
+    ];
+    let fetch = setup.build(events).await;
+
+    fetch.acquire().await.expect_err("failed");
+
+    let lines = fetch.log_lines();
+    let note = lines
+        .iter()
+        .find(|(text, _)| text == "Mornye brought no file")
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    let detail = note.1.clone().unwrap_or_default();
+    assert!(
+        detail.starts_with(
+            "Mornye's example-ext extension could not get the song: the catalog has no FLAC of this"
+        ),
+        "{detail}"
+    );
+    assert!(!detail.contains("/srv/"), "{detail}");
+}
+
+#[tokio::test]
+async fn the_mp3_fallback_says_soulseek_brought_none_and_mornyes_check_kept_it() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.soulseek_on = true;
+    setup.fake.sessions = vec![gateway("unverified")];
+    setup.fake.services = Some(example_service());
+    let fetch = setup.build(events).await;
+
+    // YouTube is not reachable in the test: only the fallback's words matter here.
+    let _ = fetch.acquire_from(DownloadSource::SoulseekThenYouTube).await;
+
+    let bodies = {
+        let _ = fetch.sent().await;
+        fetch.sent.1.lock().clone()
+    };
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body
+                .contains("Soulseek brought no FLAC and Mornye could not pass its check for Example")),
+        "{bodies:?}"
+    );
+}
+
+#[tokio::test]
+async fn mornye_1_1_without_its_utilities_says_so_when_its_search_fails() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.fake.sessions = vec![
+        json!({"result": {"sessions": [], "error": "The optional utilities extension is not installed; 'mornye.core.signed_session_status' requires 'utilities.sflx' to be available."}}),
+    ];
+    setup.fake.services = Some(json!({"result": {"services": []}}));
+    setup.fake.search_fails = true;
+    let fetch = setup.build(events).await;
+
+    let error = fetch.acquire().await.expect_err("Mornye cannot search");
+
+    assert!(
+        format!("{error:#}")
+            .contains("Mornye needs its utilities extension, which your registry does not list."),
+        "{error:#}"
+    );
+    assert!(
+        fetch.log_lines().iter().any(|(_, detail)| detail
+            .as_deref()
+            .is_some_and(|d| d.contains("SPOTIFLAC_IMAGE back to Mornye 1.0.5"))),
+        "{:?}",
+        fetch.log_lines()
     );
 }

@@ -196,9 +196,15 @@ fn a_refused_write_into_the_job_folder_is_named_only_for_this_job() {
         their_dir: THEIR_DIR,
         utilities_missing: false,
     };
+    let words = failure_words(&facts);
     assert_eq!(
-        failure_words(&facts).shown,
-        "Mornye could not write the song into Octo's music folder."
+        words.shown,
+        "Mornye could not write the song into Octo's music folder; the Test on the Mornye page checks that folder."
+    );
+    assert_eq!(
+        words.detail.as_deref(),
+        Some(format!("EACCES: permission denied, open '{THEIR_DIR}/x.flac'").as_str()),
+        "the system's own words go to the log's detail"
     );
     let python = health(
         "example-ext",
@@ -211,7 +217,7 @@ fn a_refused_write_into_the_job_folder_is_named_only_for_this_job() {
             ..facts
         })
         .shown,
-        "Mornye could not write the song into Octo's music folder."
+        "Mornye could not write the song into Octo's music folder; the Test on the Mornye page checks that folder."
     );
     let other = failure_words(&FailureFacts {
         own_job: false,

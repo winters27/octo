@@ -117,6 +117,16 @@ fn clear_forgets_only_finished_jobs() {
 type Apply = Arc<dyn Fn(LibraryActionRequest) -> BoxFuture<'static, LibraryActionOutcome> + Send + Sync>;
 
 fn seams(width: i32, apply: Apply, offline: Arc<AtomicBool>) -> UpgradeWorkerSeams {
+    seams_with_mornye(width, apply, offline, Arc::default())
+}
+
+/// The same, with Mornye's check keeping it from every extension while `kept` is set.
+fn seams_with_mornye(
+    width: i32,
+    apply: Apply,
+    offline: Arc<AtomicBool>,
+    kept: Arc<AtomicBool>,
+) -> UpgradeWorkerSeams {
     UpgradeWorkerSeams {
         apply: Arc::new(move |request| {
             let apply = apply.clone();
@@ -127,6 +137,10 @@ fn seams(width: i32, apply: Apply, offline: Arc<AtomicBool>) -> UpgradeWorkerSea
         soulseek_offline: Arc::new(move || {
             let offline = offline.load(Ordering::SeqCst);
             async move { offline }.boxed()
+        }),
+        mornye_kept: Arc::new(move || {
+            let kept = kept.load(Ordering::SeqCst);
+            async move { kept }.boxed()
         }),
         source_name: Arc::new(|| "Soulseek".to_string()),
     }
@@ -251,6 +265,51 @@ async fn a_job_waiting_for_mornyes_check_says_so() {
     assert_eq!(job.detail.as_deref(), Some(words));
 }
 
+#[tokio::test]
+async fn a_job_mornyes_check_kept_runs_again_only_once_mornye_may_try_again() {
+    // slskd is up the whole time: Soulseek had no copy, and Mornye's check kept the song.
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a"]), "alice", "app");
+    let tries = Arc::new(AtomicUsize::new(0));
+    let tried = tries.clone();
+    let apply: Apply = Arc::new(move |_| {
+        tried.fetch_add(1, Ordering::SeqCst);
+        let answer = LibraryActionOutcome {
+            code: Some(LibraryActionCodes::MORNYE_KEPT.to_string()),
+            ..outcome(LibraryActionState::Failed, "Waiting for Mornye's check.")
+        };
+        async move { answer }.boxed()
+    });
+    let kept = Arc::new(AtomicBool::new(true));
+    let worker = Arc::new(UpgradeWorker::with_seams(
+        queue.clone(),
+        seams_with_mornye(1, apply, Arc::default(), kept.clone()),
+        None,
+        None,
+        None,
+    ));
+    let ct = CancellationToken::new();
+    for _ in 0..3 {
+        worker.tick(&ct).await;
+        worker.drain().await;
+    }
+    assert_eq!(
+        tries.load(Ordering::SeqCst),
+        1,
+        "never again while the check keeps it"
+    );
+    let job = queue.snapshot().remove(0);
+    assert_eq!(
+        (job.state.as_str(), job.wait.as_deref()),
+        (UpgradeStates::WAITING, Some(LibraryActionCodes::MORNYE_KEPT))
+    );
+
+    kept.store(false, Ordering::SeqCst);
+    worker.tick(&ct).await;
+    worker.drain().await;
+    assert_eq!(tries.load(Ordering::SeqCst), 2, "once Mornye may try again");
+}
+
 #[test]
 fn outcomes_map_on_the_code_not_the_words() {
     let cases = [
@@ -264,6 +323,11 @@ fn outcomes_map_on_the_code_not_the_words() {
         (
             LibraryActionState::Failed,
             Some(LibraryActionCodes::MORNYE_CHECK),
+            UpgradeStates::WAITING,
+        ),
+        (
+            LibraryActionState::Failed,
+            Some(LibraryActionCodes::MORNYE_KEPT),
             UpgradeStates::WAITING,
         ),
         (

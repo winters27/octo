@@ -56,6 +56,16 @@ async fn world(
     helper_state: serde_json::Value,
     job: serde_json::Value,
 ) -> World {
+    world_with(sessions_after_arm, helper_state, job, None).await
+}
+
+/// The same, with one song's time fixed.
+async fn world_with(
+    sessions_after_arm: serde_json::Value,
+    helper_state: serde_json::Value,
+    job: serde_json::Value,
+    song_timeout: Option<Duration>,
+) -> World {
     let mornye = MockServer::builder().start().await;
     let helper = MockServer::builder().start().await;
     Mock::given(method("POST"))
@@ -110,10 +120,12 @@ async fn world(
         },
         ..Default::default()
     }));
-    let client = Arc::new(
-        SpotiflacClient::with_poll_interval(settings, Duration::from_millis(5))
-            .with_assist_look_every(Duration::from_millis(20)),
-    );
+    let mut client = SpotiflacClient::with_poll_interval(settings, Duration::from_millis(5))
+        .with_assist_look_every(Duration::from_millis(20));
+    if let Some(timeout) = song_timeout {
+        client = client.with_song_timeout(timeout);
+    }
+    let client = Arc::new(client);
     client.check.store.remember(CheckSong {
         link: "https://open.spotify.com/track/a".into(),
         artist: "Artist".into(),
@@ -345,4 +357,94 @@ async fn pointer_events_carry_a_number_the_server_counts() {
         })
         .collect();
     assert_eq!(seqs, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn two_starts_at_once_arm_once_and_share_the_run() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let folder = w.music.path().to_string_lossy().into_owned();
+    let (first, second) = tokio::join!(w.client.start_pass(&folder), w.client.start_pass(&folder));
+    let (first, second) = (first.expect("starts"), second.expect("answers the same run"));
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(requests_to(&w.helper, "/assist/arm").await, 1);
+}
+
+#[tokio::test]
+async fn a_run_stopped_from_the_dashboard_cancels_its_song() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let run = w
+        .client
+        .start_pass(&w.music.path().to_string_lossy())
+        .await
+        .expect("starts");
+    // Once Mornye has the song, as a person who closes the panel finds it.
+    for _ in 0..200 {
+        if requests_to(&w.mornye, "/api/v1/downloads").await > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(w.client.stop_pass());
+    assert_eq!(until_finished(&run).await, RunState::Unavailable);
+    assert_eq!(run.state().1.as_deref(), Some("Stopped from the dashboard."));
+    assert_eq!(requests_to(&w.mornye, "/api/v1/downloads/job-1/cancel").await, 1);
+    assert!(!w.client.stop_pass(), "nothing live to stop");
+}
+
+#[tokio::test]
+async fn a_run_ends_once_the_song_takes_longer_than_a_song_may() {
+    let w = world_with(
+        sessions("unverified", 900.0),
+        no_browser(),
+        running_job(),
+        Some(Duration::from_millis(150)),
+    )
+    .await;
+    let run = w
+        .client
+        .start_pass(&w.music.path().to_string_lossy())
+        .await
+        .expect("starts");
+    assert_eq!(until_finished(&run).await, RunState::Unavailable);
+    assert!(
+        run.state()
+            .1
+            .unwrap_or_default()
+            .starts_with("Mornye took longer than")
+    );
+    assert_eq!(requests_to(&w.mornye, "/api/v1/downloads/job-1/cancel").await, 1);
+}
+
+#[tokio::test]
+async fn a_song_is_not_counted_as_tried_when_the_helper_missed_a_look() {
+    let w = world(
+        sessions("unverified", 900.0),
+        no_browser(),
+        json!({"id": "job-1", "status": "failed", "error": "download_failed"}),
+    )
+    .await;
+    w.helper.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/assist/arm"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ended": [".gateway-v2-abc-b97a94207d0a.auth-backoff.json"], "gatewayAsked": []
+        })))
+        .mount(&w.helper)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/assist"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&w.helper)
+        .await;
+    let run = w
+        .client
+        .start_pass(&w.music.path().to_string_lossy())
+        .await
+        .expect("starts");
+    assert_eq!(until_finished(&run).await, RunState::Unavailable);
+    assert_eq!(
+        w.client.check_songs_left(),
+        1,
+        "the song can still open the check"
+    );
 }

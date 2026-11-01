@@ -25,6 +25,10 @@ use super::{CheckSong, Connection, SPOTIFLAC_FOLDER, SpotiflacClient, TOKEN_COOK
 /// How often a run looks at Mornye, its helper and the song's job.
 pub const RUN_LOOK_EVERY: Duration = Duration::from_secs(2);
 
+/// What the helper's refusal of the web token reads as.
+pub const HELPER_REFUSED_TOKEN: &str =
+    "Octo's helper beside Mornye refused the web token. Octo and Mornye must share SPOTIFLAC_WEB_TOKEN.";
+
 /// Failed looks in a row that end a run as "Mornye stopped answering".
 const LOOKS_THAT_MAY_FAIL: u32 = 5;
 
@@ -112,6 +116,8 @@ pub struct AssistRun {
     browser: Mutex<Option<HelperBrowser>>,
     browser_seen: AtomicBool,
     seq: AtomicU64,
+    /// Cancelled when a person stops the run from the dashboard.
+    stop: tokio_util::sync::CancellationToken,
 }
 
 impl AssistRun {
@@ -150,6 +156,8 @@ pub struct CannotPass(pub String);
 pub struct Assist {
     run: Mutex<Option<Arc<AssistRun>>>,
     tried: Mutex<BTreeSet<String>>,
+    /// One start at a time: a second start waits, then answers the run the first one made.
+    starting: tokio::sync::Mutex<()>,
 }
 
 impl SpotiflacClient {
@@ -232,6 +240,18 @@ impl SpotiflacClient {
         (run.connection == Connection::of(&self.settings())).then_some(run)
     }
 
+    /// Stops the live run: its song's job is cancelled and its folder removed. Answers whether
+    /// one was live.
+    pub fn stop_pass(&self) -> bool {
+        match self.assist_run().filter(|run| !run.finished()) {
+            Some(run) => {
+                run.stop.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// How many refused songs a run could still ask for.
     pub fn check_songs_left(&self) -> usize {
         let tried = self.assist.tried.lock();
@@ -248,6 +268,9 @@ impl SpotiflacClient {
     /// Octo's music folder, where the song's job folder goes.
     pub async fn start_pass(self: &Arc<Self>, download_path: &str) -> Result<Arc<AssistRun>, CannotPass> {
         let (_, connection) = self.helper()?;
+        // Two starts at once (two tabs, Close then Pass) never arm twice: the second waits here
+        // and answers the run the first made.
+        let _starting = self.assist.starting.lock().await;
         if let Some(run) = self.assist_run().filter(|run| !run.finished()) {
             return Ok(run);
         }
@@ -317,6 +340,7 @@ impl SpotiflacClient {
             browser: Mutex::new(None),
             browser_seen: AtomicBool::new(false),
             seq: AtomicU64::new(0),
+            stop: tokio_util::sync::CancellationToken::new(),
         });
         *self.assist.run.lock() = Some(Arc::clone(&run));
         info!(
@@ -332,7 +356,13 @@ impl SpotiflacClient {
 
     /// Asks Mornye for the run's song and follows it until the run ends, then cleans up.
     async fn follow_pass(self: Arc<Self>, run: Arc<AssistRun>, download_path: String) {
-        let _slot = self.slot().await;
+        let _slot = tokio::select! {
+            slot = self.slot() => slot,
+            _ = run.stop.cancelled() => {
+                run.end(RunState::Unavailable, Some("Stopped from the dashboard.".into()));
+                return;
+            }
+        };
         self.count_job();
         let settings = self.settings();
         let job_dir = format!(
@@ -391,13 +421,33 @@ impl SpotiflacClient {
     /// Looks at the helper, the song's job and Mornye's check until the run's outcome shows.
     async fn watch_pass(&self, run: &AssistRun, job: &Job) -> (RunState, Option<String>) {
         let mut failures = 0;
+        // A look the helper did not answer: a job that then ends with no browser seen may have
+        // opened one Octo could not see, so its song is not counted as tried.
+        let mut helper_missed = false;
+        let started = Instant::now();
+        let bound = self.song_timeout();
         loop {
-            tokio::time::sleep(self.run_look_every()).await;
+            tokio::select! {
+                _ = run.stop.cancelled() => {
+                    return (RunState::Unavailable, Some("Stopped from the dashboard.".into()));
+                }
+                _ = tokio::time::sleep(self.run_look_every()) => {}
+            }
             if Connection::of(&self.settings()) != run.connection || !self.settings().is_on() {
                 return (RunState::Unavailable, Some("Mornye's settings changed.".into()));
             }
+            if started.elapsed() >= bound {
+                return (
+                    RunState::Unavailable,
+                    Some(format!(
+                        "Mornye took longer than {} seconds for the song, so Octo stopped.",
+                        bound.as_secs()
+                    )),
+                );
+            }
             let look_started = Instant::now();
             let helper = self.helper_state().await;
+            helper_missed |= helper.is_err();
             let job_now = if job.is_pollable() {
                 self.job(&run.connection, &job.id).await
             } else {
@@ -449,6 +499,11 @@ impl SpotiflacClient {
             if ended {
                 return if run.browser_seen.load(Ordering::SeqCst) {
                     (RunState::Closed, None)
+                } else if helper_missed {
+                    (
+                        RunState::Unavailable,
+                        Some("Octo's helper beside Mornye did not answer while the song was asked.".into()),
+                    )
                 } else {
                     (RunState::NoCheck, None)
                 };
@@ -555,8 +610,7 @@ fn is_browser_id(id: &str) -> bool {
 /// The helper's refusal, in words.
 fn helper_refusal(status: reqwest::StatusCode) -> String {
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        "Octo's helper beside Mornye refused the web token. Octo and Mornye must share SPOTIFLAC_WEB_TOKEN."
-            .into()
+        HELPER_REFUSED_TOKEN.into()
     } else {
         format!("Octo's helper beside Mornye answered {}.", status.as_u16())
     }

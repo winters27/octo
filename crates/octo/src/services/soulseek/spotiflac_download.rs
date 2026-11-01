@@ -74,8 +74,9 @@ impl SoulseekDownloadService {
                         .download_via_soulseek(base, routing, download, profile, ct)
                         .await
                     {
-                        // Soulseek had none either: the song is still one Mornye's check keeps.
-                        Err(other) if !ct.is_cancelled() => match waited {
+                        // Soulseek had none either: the song is still one Mornye's check keeps. A
+                        // file that waits in the hold path, or a play nothing proved, keeps its own.
+                        Err(other) if !ct.is_cancelled() && goes_on(&other) => match waited {
                             Some(wait) => Err(wait.over(other)),
                             None => Err(other),
                         },
@@ -155,16 +156,36 @@ impl SoulseekDownloadService {
                 &format!("Asking Mornye for \"{query}\""),
                 None,
             );
-            let tracks = with_query_isrc(
-                or_canceled(ct, async {
-                    client
-                        .search(&connection, &query)
+            let found = or_canceled(ct, async {
+                client
+                    .search(&connection, &query)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
+            let found = match found {
+                Err(e) if e.downcast_ref::<OperationCanceled>().is_none() => {
+                    // Mornye 1.1 without its utilities extension cannot search: say that, with
+                    // its fix, rather than the search's own failure.
+                    if client
+                        .check_view(None)
                         .await
-                        .map_err(anyhow::Error::from)
-                })
-                .await?,
-                &query,
-            );
+                        .is_some_and(|view| view.utilities_missing)
+                    {
+                        let words = octo_core::spotiflac::check::utilities_words();
+                        base.log_step(
+                            &track_key,
+                            acquisition_event_kinds::NOTE,
+                            &words.shown,
+                            words.detail.as_deref(),
+                        );
+                        return Err(file_not_found(words.shown));
+                    }
+                    Err(e)
+                }
+                other => other,
+            };
+            let tracks = with_query_isrc(found?, &query);
             match pick_track(&tracks, &want) {
                 Pick::Track { index, why } => {
                     chosen = Some((tracks[index].clone(), why));
@@ -269,14 +290,15 @@ impl SoulseekDownloadService {
                     client.cancel(&connection, &job.id).await;
                 }
                 let _ = std::fs::remove_dir_all(&job_dir);
-                let (words, shown) = match e {
+                // The log line, the sentence a row shows, and what the download log adds to it.
+                let (words, shown, more) = match e {
                     Waited::Canceled => return Err(OperationCanceled.into()),
                     Waited::TimedOut(timeout) => {
                         let words = format!(
                             "Mornye took longer than {} seconds for '{artist} - {title}', so Octo stopped waiting",
                             timeout.as_secs()
                         );
-                        (words.clone(), words)
+                        (words.clone(), words, None)
                     }
                     Waited::Failed { reason, provider } => {
                         let explained = self
@@ -306,8 +328,17 @@ impl SoulseekDownloadService {
                                 return Err(wait.into_error());
                             }
                             Explained::Words(words) => (
-                                format!("Mornye could not download '{artist} - {title}': {}", words.shown),
+                                format!(
+                                    "Mornye could not download '{artist} - {title}': {}{}",
+                                    words.shown,
+                                    words
+                                        .detail
+                                        .as_deref()
+                                        .map(|d| format!(" ({d})"))
+                                        .unwrap_or_default()
+                                ),
                                 words.shown,
+                                words.detail,
                             ),
                         }
                     }
@@ -316,19 +347,25 @@ impl SoulseekDownloadService {
                             "Mornye said it saved '{artist} - {title}', but nothing arrived in {job_dir}. \
                              Mornye must save into the same folder Octo reads; see the Music folder setting on the Mornye page"
                         );
-                        (words.clone(), words)
+                        (words.clone(), words, None)
                     }
                     Waited::Unreachable(reason) => {
                         let words = format!("Mornye stopped answering: {reason}");
-                        (words.clone(), words)
+                        (words.clone(), words, None)
                     }
                 };
                 warn!("{words}");
+                // Each part through user_safe: the first sentence, no server paths.
+                let detail = [user_safe(Some(&shown)), user_safe(more.as_deref())]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(". ");
                 base.log_step(
                     &track_key,
                     acquisition_event_kinds::NOTE,
                     "Mornye brought no file",
-                    user_safe(Some(&shown)).as_deref(),
+                    (!detail.is_empty()).then_some(detail.as_str()),
                 );
                 return Err(file_not_found(shown));
             }
@@ -705,15 +742,30 @@ impl SoulseekDownloadService {
                 return Explained::Waiting(MornyeWaiting::new(pause, true, now));
             }
         }
-        if let Some(until) = octo_core::spotiflac::check::next_try_from_words(reason, now) {
+        let after = bounded_extensions(client, connection).await;
+        let health = provider.and_then(|name| after.as_ref().and_then(|answer| answer.row(name)));
+        // Mornye's own "verification paused ... next try in" words, in the job's reason or in
+        // the extension's last error (where Mornye 1.1 keeps them) when that error is new since
+        // the job began.
+        let failed_since = |name: &str| {
+            let failures = |answer: &Option<ExtensionsAnswer>| {
+                answer.as_ref().and_then(|a| a.row(name)).map(|row| row.failures)
+            };
+            matches!((failures(before), failures(&after)), (Some(was), Some(is)) if is > was)
+        };
+        let paused_words = octo_core::spotiflac::check::next_try_from_words(reason, now).or_else(|| {
+            health
+                .filter(|row| row.last_outcome.eq_ignore_ascii_case("failure"))
+                .filter(|_| provider.is_some_and(failed_since))
+                .and_then(|row| octo_core::spotiflac::check::next_try_from_words(&row.last_error, now))
+        });
+        if let Some(until) = paused_words {
             let pause = octo_core::spotiflac::check::CheckPause {
                 until_utc: until,
                 labels: provider.map(|name| vec![name.to_string()]).unwrap_or_default(),
             };
             return Explained::Waiting(MornyeWaiting::new(pause, true, now));
         }
-        let after = bounded_extensions(client, connection).await;
-        let health = provider.and_then(|name| after.as_ref().and_then(|answer| answer.row(name)));
         // Octo asked Mornye for this song alone, from the health read before it to the one after.
         let own_job = at_start.0 == 1
             && client.activity() == at_start

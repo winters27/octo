@@ -310,6 +310,21 @@ async fn a_pause_the_gateway_asked_for_offers_no_pass() {
 }
 
 #[tokio::test]
+async fn a_helper_that_refuses_the_token_reads_as_refused_not_absent() {
+    let (mornye, _) = mornye_and_helper("unverified", false).await;
+    let helper = MockServer::builder().start().await;
+    Mock::given(method("GET"))
+        .and(path("/assist"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&helper)
+        .await;
+    let state = mornye_state(&mornye, Some(&helper));
+    let status = get(&app(state), "/api/admin/spotiflac/status").await.json();
+    assert_eq!(status["helper"], "refused");
+    assert_eq!(status["passable"], Value::Bool(false));
+}
+
+#[tokio::test]
 async fn a_passing_check_reads_as_mornye_and_its_version() {
     let (mornye, helper) = mornye_and_helper("active", false).await;
     let state = mornye_state(&mornye, Some(&helper));

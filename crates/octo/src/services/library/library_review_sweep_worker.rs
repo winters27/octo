@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -185,6 +185,11 @@ pub trait SweepReplacer: Send + Sync {
         let _ = song_id;
         false
     }
+
+    /// Whether Mornye's check keeps it from every extension a song could use now.
+    async fn mornye_kept(&self) -> bool {
+        false
+    }
 }
 
 /// The people besides the admin who can star or rate songs, whose marks the admin's own sign-in
@@ -326,6 +331,10 @@ impl SweepReplacer for ExecutorSweepReplacer {
         tokio::spawn(async move { executor.apply(request).await })
             .await
             .map_err(|e| anyhow::anyhow!("the replacement stopped: {e}"))?
+    }
+
+    async fn mornye_kept(&self) -> bool {
+        self.executor.mornye_kept().await
     }
 
     async fn wrong_version_asked(&self, song_id: &str) -> bool {
@@ -736,6 +745,9 @@ enum Replacing {
     Declined,
     /// Soulseek is out and the replacement may come from nowhere else: the song stays unchecked.
     Waits,
+    /// Mornye's check kept the replacement from Mornye: the song stays unchecked until Mornye may
+    /// try its check again.
+    WaitsForMornye,
     /// The person said the song is the wrong version and Octo could not tell it apart by sound:
     /// the copy is theirs to pick, so the file stays a question that says so.
     PickInFindSongs,
@@ -827,6 +839,9 @@ pub struct LibraryReviewSweepWorker {
     /// library-relative path, stamp, verdict.
     retry_verdict: Mutex<Option<(String, String, VerificationResult)>>,
     unfingerprinted: AtomicI32,
+    /// The last replacement waited because Mornye's check kept the song: the sweep asks again
+    /// only once Mornye may try its check again.
+    kept_by_mornye: AtomicBool,
     hold: Mutex<(String, Option<String>)>,
     /// With Family on, the sweep keeps to the shared library: a member's own songs are never
     /// asked about.
@@ -875,6 +890,7 @@ impl LibraryReviewSweepWorker {
             lookup_failures: AtomicI32::new(0),
             retry_verdict: Mutex::new(None),
             unfingerprinted: AtomicI32::new(0),
+            kept_by_mornye: AtomicBool::new(false),
             hold: Mutex::new(("Off".to_string(), None)),
             scope: None,
             replacer: None,
@@ -1427,6 +1443,18 @@ impl LibraryReviewSweepWorker {
                         interval,
                     );
                 }
+                Replacing::WaitsForMornye => {
+                    if pick.passed != pick.cursor {
+                        self.record(generation, |s| set_cursor(s, lane, &pick.passed));
+                    }
+                    return self.hold(
+                        "Waiting",
+                        Some(
+                            "Mornye could not pass its check; trying that song again once Mornye may try it.",
+                        ),
+                        interval,
+                    );
+                }
             }
         } else {
             false
@@ -1494,6 +1522,13 @@ impl LibraryReviewSweepWorker {
         let Some(replacer) = self.replacer.clone() else {
             return Replacing::Declined;
         };
+        // Mornye's check kept the last replacement and still does: nothing to search yet.
+        if self.kept_by_mornye.load(Ordering::SeqCst) {
+            if replacer.mornye_kept().await {
+                return Replacing::WaitsForMornye;
+            }
+            self.kept_by_mornye.store(false, Ordering::SeqCst);
+        }
         let song = &file.song;
         if let Some(isrc) = file.isrc.as_deref() {
             let why = match self.verifier.isrc_agrees(question, isrc).await {
@@ -1593,17 +1628,22 @@ impl LibraryReviewSweepWorker {
                 );
                 Replacing::Done
             }
-            Ok(outcome)
-                if matches!(
-                    outcome.code.as_deref(),
-                    Some(LibraryActionCodes::SOULSEEK_OFFLINE | LibraryActionCodes::MORNYE_CHECK)
-                ) =>
-            {
+            Ok(outcome) if outcome.code.as_deref() == Some(LibraryActionCodes::SOULSEEK_OFFLINE) => {
                 info!(
-                    "Library review sweep: '{} - {}' waits, because Soulseek or Mornye's check is out and the replacement may come from nowhere else",
+                    "Library review sweep: '{} - {}' waits, because Soulseek is out and the replacement may come from nowhere else",
                     song.artist, song.title
                 );
                 Replacing::Waits
+            }
+            Ok(outcome) if LibraryActionCodes::waits_on_mornye(outcome.code.as_deref()) => {
+                info!(
+                    "Library review sweep: '{} - {}' waits, because Mornye could not pass its check and the replacement may come from nowhere else",
+                    song.artist, song.title
+                );
+                if outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_KEPT) {
+                    self.kept_by_mornye.store(true, Ordering::SeqCst);
+                }
+                Replacing::WaitsForMornye
             }
             Ok(outcome) => {
                 if outcome.state == LibraryActionState::Failed {

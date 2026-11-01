@@ -46,6 +46,8 @@ pub struct CheckView {
     pub services: Reading<Vec<ServiceRow>>,
     /// A call answered that Mornye's utilities extension is missing.
     pub utilities_missing: bool,
+    /// Mornye answered the read (even "no such call"), so it is up.
+    pub reached: bool,
 }
 
 impl CheckView {
@@ -58,6 +60,7 @@ impl CheckView {
     ) -> CheckView {
         let says_missing = |reading: Option<&str>| reading.is_some_and(names_missing_utilities);
         let utilities_missing = says_missing(cannot_tell(&rows)) || says_missing(cannot_tell(&services));
+        let reached = utilities_missing || rows.known().is_some() || services.known().is_some();
         CheckView {
             connection,
             read_started,
@@ -65,6 +68,20 @@ impl CheckView {
             rows,
             services,
             utilities_missing,
+            reached,
+        }
+    }
+
+    /// Whether Mornye can stand in for Soulseek: it answered, has its utilities extension, and
+    /// offers a download service a song could use (an older Mornye that lists none is taken at
+    /// its word).
+    pub fn stands_in(&self, setting: &[String]) -> bool {
+        if !self.reached || self.utilities_missing {
+            return false;
+        }
+        match &self.services {
+            Reading::Known(_) => !usable(setting, &self.services).is_empty(),
+            Reading::CannotTell(_) => true,
         }
     }
 
@@ -218,6 +235,13 @@ impl MornyeCheckStore {
     /// Keeps a song Mornye refused while its check was paused, newest first.
     pub fn remember(&self, song: CheckSong) {
         self.update(|state| {
+            if state
+                .check_songs
+                .first()
+                .is_some_and(|first| first.link == song.link)
+            {
+                return ((), false);
+            }
             state.check_songs.retain(|kept| kept.link != song.link);
             state.check_songs.insert(0, song);
             state.check_songs.truncate(CHECK_SONGS_KEPT);

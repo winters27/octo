@@ -117,6 +117,11 @@ pub struct UpgradeJob {
     /// The copy someone picked in Find songs, fetched instead of searching; None to search.
     #[serde(default)]
     pub pick: Option<crate::services::common::download_picks::PickedCopy>,
+
+    /// What a waiting job waits for, as its outcome's code: `mornyeKept` goes back in the queue
+    /// once Mornye may try its check again, any other wait once a source can search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<String>,
 }
 
 fn default_origin() -> String {
@@ -146,6 +151,7 @@ impl Default for UpgradeJob {
             started_utc: None,
             result: None,
             pick: None,
+            wait: None,
         }
     }
 }
@@ -436,11 +442,17 @@ impl UpgradeQueue {
 
     /// Waiting jobs back in the queue, once Soulseek is back.
     pub fn requeue(&self) -> usize {
+        self.requeue_where(|_| true)
+    }
+
+    /// The waiting jobs `ready` lets go back in the queue, each by what it waits for.
+    pub fn requeue_where(&self, ready: impl Fn(&UpgradeJob) -> bool) -> usize {
         let mut jobs = self.jobs.lock();
         let mut count = 0;
         for job in jobs.values_mut() {
-            if job.state == UpgradeStates::WAITING {
+            if job.state == UpgradeStates::WAITING && ready(job) {
                 job.state = UpgradeStates::QUEUED.to_string();
+                job.wait = None;
                 job.updated_utc = self.clock.now();
                 count += 1;
             }
@@ -544,7 +556,23 @@ pub struct UpgradeWorkerSeams {
     pub describe: DescribeFn,
     pub width: Arc<dyn Fn() -> i32 + Send + Sync>,
     pub soulseek_offline: OfflineFn,
+    /// Whether Mornye's check keeps it from every extension now.
+    pub mornye_kept: OfflineFn,
     pub source_name: Arc<dyn Fn() -> String + Send + Sync>,
+}
+
+/// The default `mornye_kept` seam: Mornye on and its check paused for every usable extension.
+pub(crate) fn mornye_kept_with(sources: Option<Arc<UpgradeSources>>) -> OfflineFn {
+    Arc::new(move || {
+        let sources = sources.clone();
+        async move {
+            match sources {
+                Some(sources) => sources.mornye_kept().await,
+                None => false,
+            }
+        }
+        .boxed()
+    })
 }
 
 /// What the worker is built from besides the queue, the optional services as `Option`.
@@ -590,7 +618,8 @@ impl UpgradeWorker {
                 async move { resolver.resolve(&id).await }.boxed()
             }),
             width: Arc::new(move || concurrency.as_ref().map_or(1, |c| c.current()).max(1)),
-            soulseek_offline: soulseek_offline_with(parts.sources, parts.soulseek),
+            soulseek_offline: soulseek_offline_with(parts.sources.clone(), parts.soulseek),
+            mornye_kept: mornye_kept_with(parts.sources),
             source_name: Arc::new(move || {
                 name_sources
                     .as_ref()
@@ -634,11 +663,20 @@ impl UpgradeWorker {
             .count()
     }
 
-    /// One pass: waiting jobs back in the queue when Soulseek is back, then queued jobs started
-    /// while there is room. Answers how many it started.
+    /// One pass: waiting jobs back in the queue once what each waits for is over (a source that
+    /// can search, or Mornye free to try its check again), then queued jobs started while there
+    /// is room. Answers how many it started.
     pub async fn tick(self: &Arc<Self>, ct: &CancellationToken) -> usize {
-        if self.queue.any_waiting() && !(self.seams.soulseek_offline)().await {
-            self.queue.requeue();
+        if self.queue.any_waiting() {
+            let sources_back = !(self.seams.soulseek_offline)().await;
+            let check_free = !(self.seams.mornye_kept)().await;
+            self.queue.requeue_where(|job| {
+                if job.wait.as_deref() == Some(LibraryActionCodes::MORNYE_KEPT) {
+                    check_free
+                } else {
+                    sources_back
+                }
+            });
         }
         let mut started = 0;
         self.running.lock().retain(|task| !task.is_finished());
@@ -775,7 +813,7 @@ impl UpgradeWorker {
 
         let state = Self::state_for(&outcome);
         let result = (state == UpgradeStates::UPGRADED).then(|| self.report(&outcome, job));
-        let mornye_check = outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_CHECK);
+        let mornye_check = LibraryActionCodes::waits_on_mornye(outcome.code.as_deref());
         let detail = match state {
             UpgradeStates::WAITING if mornye_check => outcome.detail.clone(),
             UpgradeStates::WAITING => Some("Waiting for Soulseek".to_string()),
@@ -853,6 +891,7 @@ impl UpgradeWorker {
             j.state = state.to_string();
             j.result = result;
             j.detail = detail;
+            j.wait = outcome.code.clone().filter(|_| state == UpgradeStates::WAITING);
         });
         if state == UpgradeStates::NOT_FOUND
             && let (Some(key), Some(attempts)) = (&job.attempt_key, &self.attempts)
@@ -955,9 +994,14 @@ impl UpgradeWorker {
         match (outcome.state, outcome.code.as_deref()) {
             (LibraryActionState::Applied, _) => UpgradeStates::UPGRADED,
             (LibraryActionState::Rehearsed, _) => UpgradeStates::REHEARSED,
-            (_, Some(LibraryActionCodes::SOULSEEK_OFFLINE | LibraryActionCodes::MORNYE_CHECK)) => {
-                UpgradeStates::WAITING
-            }
+            (
+                _,
+                Some(
+                    LibraryActionCodes::SOULSEEK_OFFLINE
+                    | LibraryActionCodes::MORNYE_CHECK
+                    | LibraryActionCodes::MORNYE_KEPT,
+                ),
+            ) => UpgradeStates::WAITING,
             (_, Some(LibraryActionCodes::NO_REPLACEMENT)) => UpgradeStates::NOT_FOUND,
             (LibraryActionState::Skipped, _) => UpgradeStates::SKIPPED,
             _ => UpgradeStates::FAILED,

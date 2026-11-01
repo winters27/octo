@@ -168,8 +168,17 @@ impl LibraryActionCodes {
     pub const NO_REPLACEMENT: &'static str = "noReplacement";
 
     /// Mornye's check keeps it from every extension (and slskd cannot be used either), so the
-    /// request waits like an outage.
+    /// request waits like an outage, until a source can be asked again.
     pub const MORNYE_CHECK: &'static str = "mornyeCheck";
+
+    /// The sources that were asked had no copy and Mornye's check kept the song from Mornye, so
+    /// the request waits until Mornye may try its check again.
+    pub const MORNYE_KEPT: &'static str = "mornyeKept";
+
+    /// The request waits on Mornye's check, either way.
+    pub fn waits_on_mornye(code: Option<&str>) -> bool {
+        matches!(code, Some(Self::MORNYE_CHECK | Self::MORNYE_KEPT))
+    }
 }
 
 /// The words of a request waiting for Mornye's check.
@@ -1357,6 +1366,9 @@ impl LibraryActionExecutor {
         });
         // What each source tried before the last one said, for the words when all of them miss.
         let mut misses: Vec<String> = Vec::new();
+        // Mornye's check keeping the song on a source before the last: the request still waits
+        // for it when the last source has no copy either.
+        let mut kept_by_mornye: Option<crate::services::spotiflac::MornyeWaiting> = None;
         let earlier = |misses: &[String]| {
             if misses.is_empty() {
                 String::new()
@@ -1511,14 +1523,24 @@ impl LibraryActionExecutor {
                         let why = is_rejected(&e)
                             .map(|rejected| rejected.problem.clone())
                             .unwrap_or_else(|| e.to_string());
-                        let word = UpgradeSources::word(source.unwrap_or(DownloadSource::Soulseek));
+                        if let Some(wait) = crate::services::spotiflac::mornye_waited(&e) {
+                            kept_by_mornye = Some(wait.clone());
+                        }
+                        let word_of = |source: Option<DownloadSource>| {
+                            let source = source.unwrap_or(DownloadSource::Soulseek);
+                            match &self.sources {
+                                Some(sources) => sources.step_word(source),
+                                None => UpgradeSources::word(source),
+                            }
+                        };
+                        let word = word_of(source);
                         misses.push(format!("{word}: {why}"));
                         info!(
                             "Library action {}: {word} had no copy of '{} - {}' ({why}); trying {}",
                             action_name(request.action),
                             original.artist,
                             original.title,
-                            UpgradeSources::word(sources[attempt + 1].unwrap_or(DownloadSource::Soulseek))
+                            word_of(sources[attempt + 1])
                         );
                         attempt += 1;
                     }
@@ -1589,16 +1611,20 @@ impl LibraryActionExecutor {
                         arrived: handoff.as_ref().and_then(|h| h.arrived()),
                     };
                 }
-                // Mornye's check kept the copy from Mornye: the request waits for it, like an
-                // outage, instead of reading as "no copy found".
+                // Mornye's check kept the copy from Mornye, on this source or one before it, and no
+                // source had one: the request waits for Mornye's next try instead of reading as
+                // "no copy found".
+                let wait = crate::services::spotiflac::mornye_waited(&e)
+                    .cloned()
+                    .or_else(|| kept_by_mornye.clone().filter(|_| is_file_not_found(&e)));
                 if quarantine_path().is_none()
-                    && let Some(wait) = crate::services::spotiflac::mornye_waited(&e)
+                    && let Some(wait) = wait
                 {
                     return Replaced {
                         outcome: LibraryActionOutcome::coded(
                             LibraryActionState::Failed,
                             mornye_wait_text(&wait.pause),
-                            Some(LibraryActionCodes::MORNYE_CHECK),
+                            Some(LibraryActionCodes::MORNYE_KEPT),
                         ),
                         quarantine_path: None,
                         new_path: None,
@@ -1894,6 +1920,14 @@ impl LibraryActionExecutor {
         match &self.sources {
             Some(sources) => sources.waiting_for_soulseek().await,
             None => self.soulseek_out().await,
+        }
+    }
+
+    /// Whether Mornye's check keeps it from every extension a song could use now.
+    pub async fn mornye_kept(&self) -> bool {
+        match &self.sources {
+            Some(sources) => sources.mornye_kept().await,
+            None => false,
         }
     }
 
