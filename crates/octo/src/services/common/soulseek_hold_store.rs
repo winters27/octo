@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use tracing::warn;
 
+use crate::services::fingerprint::download_verification_service::LabelSource;
 use crate::services::soulseek::soulseek_download_service::INCOMING_FOLDER_NAME;
 use crate::services::state_file;
 
@@ -101,6 +102,29 @@ pub struct HeldLidarrFile {
     /// The download as delivered, which holds its labels; with none, it has no labels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered: Option<String>,
+}
+
+impl HeldLidarrFile {
+    /// The file Lidarr brought that waits at `path`, with the labels it was judged by: a judgment
+    /// of it later reads the download as delivered when that is where they came from, and no
+    /// labels otherwise, never the held file's own tags.
+    pub fn of(path: &str, labels: &LabelSource) -> Self {
+        HeldLidarrFile {
+            path: path.to_string(),
+            delivered: match labels {
+                LabelSource::Delivered(delivered) => Some(delivered.to_string_lossy().into_owned()),
+                LabelSource::TheFile | LabelSource::None => None,
+            },
+        }
+    }
+
+    /// Where its labels are read from when it is judged again.
+    pub fn labels(&self) -> LabelSource {
+        match &self.delivered {
+            Some(delivered) => LabelSource::Delivered(PathBuf::from(delivered)),
+            None => LabelSource::None,
+        }
+    }
 }
 
 /// A held acquisition: a heart waiting out a Soulseek outage, or a heart, a play's file or an
@@ -227,6 +251,20 @@ impl HeldAcquisition {
         }
     }
 
+    /// Keeps the labels of the Lidarr files it still holds, one per file: a file that left the
+    /// record takes its labels with it.
+    fn tidy_lidarr_files(&mut self) {
+        let held = &self.held_files;
+        let mut seen: Vec<String> = Vec::new();
+        self.lidarr_files.retain(|file| {
+            let keep = held.contains(&file.path) && !seen.contains(&file.path);
+            if keep {
+                seen.push(file.path.clone());
+            }
+            keep
+        });
+    }
+
     /// Whether `holders` says more than `requested_by` already does, so the file must carry it.
     fn writes_holders(&self) -> bool {
         !self.holders.is_empty() && self.holders != Self::seeded_holders(self.requested_by.as_deref())
@@ -337,6 +375,7 @@ impl SoulseekHoldStore {
                 Ok(list) => {
                     for mut h in list {
                         h.seed_holders();
+                        h.tidy_lidarr_files();
                         held.set(h.key(), h);
                     }
                 }
@@ -363,6 +402,7 @@ impl SoulseekHoldStore {
     /// later. Answers the hold as kept.
     pub fn hold(&self, mut held: HeldAcquisition) -> HeldAcquisition {
         held.seed_holders();
+        held.tidy_lidarr_files();
         let mut map = self.held.lock();
         let key = held.key();
         if let Some(existing) = map.get(&key) {
@@ -463,12 +503,14 @@ impl SoulseekHoldStore {
     }
 
     /// Changes the hold `key` in place (who asked to keep it, its prints, the shim's tries, its
-    /// held files) and saves it. A change of what it waits for files it under its new key.
-    /// Answers the hold as kept, or None when there is no such hold.
+    /// held files) and saves it; a held file it no longer holds takes its Lidarr labels with it.
+    /// A change of what it waits for files it under its new key. Answers the hold as kept, or None
+    /// when there is no such hold.
     pub fn update(&self, key: &str, change: impl FnOnce(&mut HeldAcquisition)) -> Option<HeldAcquisition> {
         let mut map = self.held.lock();
         let mut kept = map.get(key)?.clone();
         change(&mut kept);
+        kept.tidy_lidarr_files();
         let new_key = kept.key();
         if new_key != key {
             map.remove(key);
@@ -906,5 +948,70 @@ mod tests {
             .join(HELD_FOLDER_NAME)
             .join("Track_soulseek_a_b_c");
         assert_eq!(folder, expected);
+    }
+
+    /// A held file Lidarr brought keeps where its labels are read from on its hold, across a
+    /// restart; the labels end with the file whenever it leaves the hold (kept, refused or thrown
+    /// away), and with the hold itself when it ends.
+    #[test]
+    fn a_held_lidarr_files_labels_live_and_end_with_its_place_on_the_hold() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("soulseek-holds.json");
+        let store = SoulseekHoldStore::new(Some(&path));
+        let (lidarr, other) = (
+            "/downloads/.octo-incoming/held/Track_soulseek_x/a.flac",
+            "/downloads/.octo-incoming/held/Track_soulseek_x/b.flac",
+        );
+        let brought = HeldLidarrFile::of(
+            lidarr,
+            &LabelSource::Delivered(PathBuf::from("/downloads/complete/a.flac")),
+        );
+        let mut record = held(HeldKind::Track, "x", 1);
+        record.waiting_for = Some(WaitingFor::AcoustId);
+        record.held_files = vec![lidarr.into(), other.into()];
+        // One file the hold no longer holds, and one Lidarr label named twice.
+        record.lidarr_files = vec![
+            brought.clone(),
+            brought.clone(),
+            HeldLidarrFile::of("/gone.flac", &LabelSource::None),
+        ];
+        let key = store.hold(record).key();
+
+        assert_eq!(store.get(&key).expect("held").lidarr_files, [brought.clone()]);
+        let reopened = SoulseekHoldStore::new(Some(&path));
+        let read = reopened.get(&key).expect("held after a restart");
+        assert_eq!(read.lidarr_files, [brought.clone()]);
+        assert_eq!(
+            read.lidarr_files[0].labels(),
+            LabelSource::Delivered(PathBuf::from("/downloads/complete/a.flac"))
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("written")).expect("JSON");
+        assert_eq!(written[0]["LidarrFiles"][0]["Path"], lidarr);
+
+        let left = reopened
+            .update(&key, |kept| kept.held_files.retain(|file| file != lidarr))
+            .expect("updated");
+        assert!(left.lidarr_files.is_empty(), "{left:?}");
+        assert_eq!(left.held_files, [other]);
+
+        reopened.update(&key, |kept| {
+            kept.held_files.push(lidarr.into());
+            kept.lidarr_files.push(brought.clone());
+        });
+        reopened.release(&key);
+        assert!(reopened.snapshot().is_empty());
+        assert!(SoulseekHoldStore::new(Some(&path)).snapshot().is_empty());
+    }
+
+    /// A file Lidarr brought with Lidarr writing its tags, or whose delivered copy was not read,
+    /// has no labels when it is judged again: never the held file's own tags.
+    #[test]
+    fn a_held_lidarr_file_without_a_delivered_copy_reads_as_no_labels() {
+        for labels in [LabelSource::TheFile, LabelSource::None] {
+            let brought = HeldLidarrFile::of("/held/a.flac", &labels);
+            assert_eq!(brought.delivered, None, "{labels:?}");
+            assert_eq!(brought.labels(), LabelSource::None, "{labels:?}");
+        }
     }
 }

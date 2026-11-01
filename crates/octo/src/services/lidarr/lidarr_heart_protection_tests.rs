@@ -238,6 +238,7 @@ impl IDownloadService for Pipeline {
                     waiting_for: octo_core::fingerprint::heart_gate::WaitingFor::AcoustId,
                     line: "Waiting for AcoustID".into(),
                     files: vec![held.to_string_lossy().into_owned()],
+                    lidarr: Vec::new(),
                     users: place.gates.iter().map(|gate| gate.user.clone()).collect(),
                 }
                 .into());

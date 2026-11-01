@@ -505,7 +505,7 @@ impl HeartAcquisitionCoordinator {
             WaitingFor::Shim,
             vec![holder.clone()],
             KEEP_WAITS_FOR_YOUTUBE,
-            Vec::new(),
+            None,
             None,
             &mut Vec::new(),
         );

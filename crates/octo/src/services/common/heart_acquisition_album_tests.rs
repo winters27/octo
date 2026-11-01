@@ -316,6 +316,7 @@ async fn an_album_heart_files_what_its_walk_held_and_no_later_source_fetches_it_
                     waiting_for: WaitingFor::NotYetProven,
                     line: tracks_wait_line(1),
                     files: vec![file.lock().clone()],
+                    lidarr: Vec::new(),
                     users: Vec::new(),
                 },
             );
@@ -753,11 +754,17 @@ impl HeartGates for Watching {
         self.inner.build_for_track(provider, id, holder, origin, r).await
     }
 
-    async fn judge_held(&self, path: &str, acquisition_key: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
+    async fn judge_held(
+        &self,
+        path: &str,
+        labels: crate::services::fingerprint::download_verification_service::LabelSource,
+        acquisition_key: &str,
+        gates: &[HeartGate],
+    ) -> Vec<GateVerdict> {
         self.places
             .lock()
             .push(AcoustIdRateLimiter::floored(LookupClass::Heart));
-        self.inner.judge_held(path, acquisition_key, gates).await
+        self.inner.judge_held(path, labels, acquisition_key, gates).await
     }
 
     fn open_rounds(&self, acquisition_key: &str, gates: &[HeartGate]) -> Box<dyn Send> {

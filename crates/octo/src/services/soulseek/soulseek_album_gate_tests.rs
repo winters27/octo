@@ -417,8 +417,14 @@ impl crate::services::common::HeartGates for CatalogGates {
         })
     }
 
-    async fn judge_held(&self, path: &str, acquisition_key: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
-        self.inner.judge_held(path, acquisition_key, gates).await
+    async fn judge_held(
+        &self,
+        path: &str,
+        labels: crate::services::fingerprint::download_verification_service::LabelSource,
+        acquisition_key: &str,
+        gates: &[HeartGate],
+    ) -> Vec<GateVerdict> {
+        self.inner.judge_held(path, labels, acquisition_key, gates).await
     }
 }
 

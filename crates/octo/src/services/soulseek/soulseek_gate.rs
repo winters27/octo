@@ -384,6 +384,7 @@ impl SoulseekDownloadService {
                 waiting_for,
                 line,
                 files: vec![moved],
+                lidarr: Vec::new(),
                 users: holding.iter().map(|(gate, _)| gate.user.clone()).collect(),
             });
         }
@@ -476,6 +477,7 @@ impl SoulseekDownloadService {
                         waiting_for: WaitingFor::AcoustId,
                         line: file_line(WaitingFor::AcoustId).to_string(),
                         files: vec![moved],
+                        lidarr: Vec::new(),
                         users: Vec::new(),
                     })
                 }
@@ -494,6 +496,7 @@ impl SoulseekDownloadService {
                 waiting_for: WaitingFor::AcoustId,
                 line: ACOUST_ID_BUSY.to_string(),
                 files: Vec::new(),
+                lidarr: Vec::new(),
                 users: Vec::new(),
             });
         }
@@ -775,6 +778,7 @@ impl SoulseekDownloadService {
                 waiting_for: WaitingFor::Shim,
                 line: KEEP_WAITS_FOR_YOUTUBE.to_string(),
                 files: Vec::new(),
+                lidarr: Vec::new(),
                 users: download.gates.iter().map(|gate| gate.user.clone()).collect(),
             }
             .into()));
@@ -797,7 +801,6 @@ impl SoulseekDownloadService {
         for other in left {
             let _ = std::fs::remove_file(&other);
         }
-        self.verification.forget_held_lidarr_file(&file);
         let settings = base.current_soulseek_settings();
         let printed = self
             .verification

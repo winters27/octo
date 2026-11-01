@@ -22,7 +22,7 @@ use super::acquisition_tracker::key_of;
 use super::album_gates::{
     AlbumGate, AlbumGateHold, AlbumGateTrack, AlbumGates, TrackFiling, tracks_wait_line,
 };
-use super::soulseek_hold_store::{HeldAlbumTrack, Holder};
+use super::soulseek_hold_store::{HeldAlbumTrack, HeldLidarrFile, Holder};
 use super::{
     AcquisitionHeld, AcquisitionState, AcquisitionTarget, AcquisitionTracker, HeldAcquisition, HeldKind,
     SoulseekHoldStore, StarOnArrival,
@@ -104,12 +104,14 @@ pub trait HeartGates: Send + Sync {
         self.build(provider, external_id, holder, origin).await
     }
 
-    /// Judges one held file of a hearted album's track with these gates by the album's rule,
-    /// fetching nothing else: one verdict per gate. `acquisition_key` finds each person's open
-    /// heard-master round. Without a way to judge it, no gate judges it and it stays held.
+    /// Judges one held file of a hearted album's track with these gates by the album's rule, its
+    /// labels read from `labels`, fetching nothing else: one verdict per gate. `acquisition_key`
+    /// finds each person's open heard-master round. Without a way to judge it, no gate judges it
+    /// and it stays held.
     async fn judge_held(
         &self,
         _path: &str,
+        _labels: LabelSource,
         _acquisition_key: &str,
         _gates: &[HeartGate],
     ) -> Vec<GateVerdict> {
@@ -133,11 +135,6 @@ pub trait HeartGates: Send + Sync {
             None,
         )
     }
-
-    /// Notes files Lidarr brought that now wait in the one hold path, with where their labels
-    /// were read from, so a later judgment of them reads the same labels. Nothing without a way
-    /// to judge them.
-    fn held_from_lidarr(&self, _files: &[String], _labels: &LabelSource) {}
 }
 
 /// The coordinator's optional collaborators, each `None` by default.
@@ -1414,7 +1411,7 @@ impl HeartAcquisitionCoordinator {
                 held.waiting_for,
                 vec![holder],
                 &held.line,
-                held.files.clone(),
+                Some(&held),
                 None,
                 &mut Vec::new(),
             );
@@ -1804,7 +1801,7 @@ impl HeartAcquisitionCoordinator {
                     &target,
                     origin,
                     record.holders.clone(),
-                    record.held_files.clone(),
+                    (record.held_files.clone(), record.lidarr_files.clone()),
                     &mut filed,
                 )
                 .await
@@ -1922,7 +1919,13 @@ impl HeartAcquisitionCoordinator {
             let acquisition = super::acquisition_key(&record.provider, &record.external_id, false);
             let _rounds = builder.open_rounds(&acquisition, &gates);
             for file in files.clone() {
-                let verdicts = builder.judge_held(&file, &acquisition, &gates).await;
+                // A file Lidarr brought is judged by the labels of its download.
+                let labels = record
+                    .lidarr_files
+                    .iter()
+                    .find(|brought| brought.path == file)
+                    .map_or(LabelSource::TheFile, HeldLidarrFile::labels);
+                let verdicts = builder.judge_held(&file, labels, &acquisition, &gates).await;
                 if verdicts
                     .iter()
                     .any(|verdict| matches!(verdict, GateVerdict::Accept { .. }))
@@ -1966,6 +1969,12 @@ impl HeartAcquisitionCoordinator {
             Some(origin),
             gates.to_vec(),
             vec![file.to_string()],
+            record
+                .lidarr_files
+                .iter()
+                .filter(|brought| brought.path == file)
+                .cloned()
+                .collect(),
             target,
             false,
             &record.provider,
@@ -2236,7 +2245,7 @@ impl HeartAcquisitionCoordinator {
             target,
             origin,
             holders,
-            Vec::new(),
+            (Vec::new(), Vec::new()),
             &mut Vec::new(),
         )
         .await
@@ -2306,7 +2315,7 @@ impl HeartAcquisitionCoordinator {
             WaitingFor::NotYetProven,
             holders,
             line,
-            Vec::new(),
+            None,
             None,
             &mut Vec::new(),
         );
@@ -2433,7 +2442,7 @@ impl HeartAcquisitionCoordinator {
                         waiting_for,
                         vec![holder.clone()],
                         &line,
-                        Vec::new(),
+                        None,
                         question,
                         filed,
                     );
@@ -2447,9 +2456,10 @@ impl HeartAcquisitionCoordinator {
     }
 
     /// Files `holders` in a hold of this song waiting for `waiting_for`, joining one already
-    /// there, with the files it keeps; holds its downloads row with `line`; and, for a
-    /// MusicBrainz question, asks it again until it answers, which resumes the hold. Nothing for
-    /// an origin that never holds so.
+    /// there, with the files a download held (`held`), the labels of those Lidarr brought saved
+    /// beside them in the same write; holds its downloads row with `line`; and, for a MusicBrainz
+    /// question, asks it again until it answers, which resumes the hold. Nothing for an origin
+    /// that never holds so.
     #[allow(clippy::too_many_arguments)] // the song, who holds, what for, and where it went
     fn file_hold(
         &self,
@@ -2460,7 +2470,7 @@ impl HeartAcquisitionCoordinator {
         waiting_for: WaitingFor,
         holders: Vec<Holder>,
         line: &str,
-        files: Vec<String>,
+        held: Option<&AcquisitionHeld>,
         question: Option<String>,
         filed: &mut Vec<(String, String)>,
     ) {
@@ -2511,9 +2521,15 @@ impl HeartAcquisitionCoordinator {
         let key = kept.key();
         let kept = holds
             .update(&key, |record| {
-                for file in files {
-                    if !record.held_files.contains(&file) {
-                        record.held_files.push(file);
+                if let Some(held) = held {
+                    for file in &held.files {
+                        if !record.held_files.contains(file) {
+                            record.held_files.push(file.clone());
+                        }
+                    }
+                    for file in &held.lidarr {
+                        record.lidarr_files.retain(|known| known.path != file.path);
+                        record.lidarr_files.push(file.clone());
                     }
                 }
                 if !line.trim().is_empty() {
@@ -2593,7 +2609,7 @@ impl HeartAcquisitionCoordinator {
             held.waiting_for,
             holding,
             &held.line,
-            held.files.clone(),
+            Some(held),
             None,
             filed,
         );
@@ -2636,7 +2652,7 @@ impl HeartAcquisitionCoordinator {
                         waiting,
                         vec![holder.clone()],
                         waiting_line(waiting),
-                        Vec::new(),
+                        None,
                         None,
                         filed,
                     );
@@ -2663,9 +2679,9 @@ impl HeartAcquisitionCoordinator {
     }
 
     /// The song chain for these holders: their gates first, then the sources in order, every
-    /// file judged with every ready gate. `held_files` are what a resumed hold held: the first
-    /// direct source checks them before it fetches anything. `filed` says which holders were
-    /// filed under which hold.
+    /// file judged with every ready gate. `held` is what a resumed hold held, with the labels of
+    /// the files Lidarr brought: the first direct source checks them before it fetches anything.
+    /// `filed` says which holders were filed under which hold.
     #[allow(clippy::too_many_arguments)] // the chain's facts, who holds it and where they went
     async fn track_chain(
         &self,
@@ -2676,10 +2692,10 @@ impl HeartAcquisitionCoordinator {
         target: &AcquisitionTarget,
         origin: AcquisitionOrigin,
         holders: Vec<Holder>,
-        held_files: Vec<String>,
+        held: (Vec<String>, Vec<HeldLidarrFile>),
         filed: &mut Vec<(String, String)>,
     ) -> anyhow::Result<TrackOutcome> {
-        let mut held_files = held_files;
+        let (mut held_files, mut held_lidarr) = held;
         let scope = match target {
             AcquisitionTarget::Shared => LibraryScope::Shared,
             AcquisitionTarget::Member(user) => LibraryScope::Viewer(user.clone()),
@@ -2765,6 +2781,7 @@ impl HeartAcquisitionCoordinator {
                 Some(origin),
                 gates.clone(),
                 std::mem::take(&mut held_files),
+                std::mem::take(&mut held_lidarr),
                 target,
                 false,
                 provider,
@@ -2880,7 +2897,7 @@ impl HeartAcquisitionCoordinator {
                             waiting_for,
                             holders.clone(),
                             waiting_line(waiting_for),
-                            Vec::new(),
+                            None,
                             question,
                             filed,
                         );
@@ -2914,6 +2931,7 @@ impl HeartAcquisitionCoordinator {
                     Some(origin),
                     gates.clone(),
                     std::mem::take(&mut held_files),
+                    std::mem::take(&mut held_lidarr),
                     target,
                     false,
                     provider,
@@ -3089,7 +3107,7 @@ impl HeartAcquisitionCoordinator {
                 WaitingFor::NotYetProven,
                 vec![holder_of(gate)],
                 line,
-                Vec::new(),
+                None,
                 None,
                 filed,
             );
@@ -3174,6 +3192,7 @@ impl HeartAcquisitionCoordinator {
         let completion = self.direct_queue.enqueue_holding(
             Some(origin),
             keep_gates(gates),
+            Vec::new(),
             Vec::new(),
             target,
             false,

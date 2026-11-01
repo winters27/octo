@@ -55,6 +55,7 @@ use super::soulseek_metadata_service::SoulseekMetadataService;
 use crate::services::common::acquisition_tracker::acquisition_event_kinds;
 use crate::services::common::base_download_service::AheadBusy;
 use crate::services::common::download_picks::{LIDARR_SOURCE, SOULSEEK_SOURCE};
+use crate::services::common::soulseek_hold_store::HeldLidarrFile;
 use crate::services::common::{
     AcquisitionHeld, AcquisitionState, BaseDownloadService, DownloadBackend, DownloadCore, DownloadServices,
     OperationCanceled, TrackDownload,
@@ -389,10 +390,15 @@ impl SoulseekDownloadService {
             .await;
         let verdict = match judged {
             FileJudged::Keep(verdict) => verdict,
-            FileJudged::Hold(held) => {
+            FileJudged::Hold(mut held) => {
                 info!("Lidarr's file for '{artist} - {title}' waits: {}", held.line);
-                // Judged again later by the same labels, wherever that judgment runs.
-                self.verification.hold_lidarr_files(&held.files, &labels);
+                // The hold carries the labels beside the file, so wherever it is judged again it
+                // is by the same labels, and they end with the hold.
+                held.lidarr = held
+                    .files
+                    .iter()
+                    .map(|file| HeldLidarrFile::of(file, &labels))
+                    .collect();
                 return Err(held.into());
             }
             FileJudged::NotProven(why) => {
@@ -808,6 +814,7 @@ impl SoulseekDownloadService {
                     waiting_for: octo_core::fingerprint::heart_gate::WaitingFor::AcoustId,
                     line: "Waiting for AcoustID".to_string(),
                     files: vec![moved],
+                    lidarr: Vec::new(),
                     users: Vec::new(),
                 }
                 .into());
@@ -2553,9 +2560,10 @@ impl SoulseekDownloadService {
     /// The first of a resumed hold's files that is still there and passes the checks a fresh
     /// download's file meets (a heart's or a play's by its askers' own gates); each one that fails
     /// is thrown away. A file Lidarr brought meets the check every Lidarr file meets, its labels
-    /// read as they were at delivery, never from the tags Lidarr wrote. None when none is left; an
-    /// error when one holds again, still in the hold path, or when Lidarr's own check refused the
-    /// file of a download from Lidarr, which is the end of that download as it is in time.
+    /// read as the hold carried them from delivery, never from the tags Lidarr wrote. None when
+    /// none is left; an error when one holds again, still in the hold path with the labels of the
+    /// files waiting with it, or when Lidarr's own check refused the file of a download from
+    /// Lidarr, which is the end of that download as it is in time.
     async fn take_held_file(
         &self,
         base: &BaseDownloadService,
@@ -2563,21 +2571,29 @@ impl SoulseekDownloadService {
         download: &mut TrackDownload,
     ) -> anyhow::Result<Option<String>> {
         let held = std::mem::take(&mut download.held_files);
+        let lidarr = std::mem::take(&mut download.held_lidarr);
         if held.is_empty() {
             return Ok(None);
         }
+        // The files that wait on with a hold, with the labels of those Lidarr brought.
+        let waiting_on = |mut again: AcquisitionHeld, rest: Vec<String>| {
+            again
+                .lidarr
+                .extend(lidarr.iter().filter(|file| rest.contains(&file.path)).cloned());
+            again.files.extend(rest);
+            again
+        };
         let length_known = routing.duration.is_some_and(|s| s > 0);
         let mut refused_by_lidarr = None;
         let mut left = held.into_iter().filter(|file| file_exists(file));
         while let Some(file) = left.next() {
-            if let Some(labels) = self.verification.held_lidarr_labels(&file) {
+            if let Some(brought) = lidarr.iter().find(|known| known.path == file) {
                 match self
-                    .check_lidarr_file(base, routing, download, &file, labels, None)
+                    .check_lidarr_file(base, routing, download, &file, brought.labels(), None)
                     .await
                 {
                     Ok(verdict) => {
                         info!("Resumed with Lidarr's held file: {file}");
-                        self.verification.forget_held_lidarr_file(&file);
                         download.fetched_from = Some("Lidarr".to_string());
                         verdict.apply_tags_to(&mut download.song);
                         download.song.verification = Some(Box::new(verdict));
@@ -2587,16 +2603,12 @@ impl SoulseekDownloadService {
                         return Ok(Some(file));
                     }
                     Err(e) => match e.downcast::<AcquisitionHeld>() {
-                        Ok(mut again) => {
-                            again.files.extend(left);
-                            return Err(again.into());
-                        }
+                        Ok(again) => return Err(waiting_on(again, left.collect()).into()),
                         Err(e) => {
                             info!(
                                 "Lidarr's held file of '{}' failed its checks again ({e}); thrown away: {file}",
                                 download.song.title
                             );
-                            self.verification.forget_held_lidarr_file(&file);
                             refused_by_lidarr = Some(e);
                             continue;
                         }
@@ -2616,10 +2628,9 @@ impl SoulseekDownloadService {
                     }
                     return Ok(Some(file));
                 }
-                FileJudged::Hold(mut again) => {
+                FileJudged::Hold(again) => {
                     // Still waiting: the rest wait with it.
-                    again.files.extend(left);
-                    return Err(again.into());
+                    return Err(waiting_on(again, left.collect()).into());
                 }
                 FileJudged::NotProven(_) | FileJudged::Refuse { .. } => {
                     info!(

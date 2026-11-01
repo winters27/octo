@@ -378,6 +378,7 @@ async fn a_download_that_waits_for_a_bulk_turn_moves_to_the_hold_path_and_its_jo
             waiting_for: WaitingFor::AcoustId,
             line: "Waiting for AcoustID".into(),
             files: vec![file.into()],
+            lidarr: Vec::new(),
             users: Vec::new(),
         }));
     import
@@ -396,6 +397,78 @@ async fn a_download_that_waits_for_a_bulk_turn_moves_to_the_hold_path_and_its_jo
     assert_eq!(row.state, AcquisitionState::Searching);
     assert_eq!(row.note.as_deref(), Some("Waiting for AcoustID"));
     assert!(rig.tracker.is_held("soulseek", "imported"));
+}
+
+/// A file Lidarr brought that waits for AcoustID is filed on its hold with where its labels are
+/// read from, in the same write as the file; the resumed hold hands both to its download; and once
+/// the hold ends, nothing of them is left anywhere.
+#[tokio::test]
+async fn a_held_lidarr_files_labels_are_filed_with_it_handed_back_on_resume_and_end_with_the_hold() {
+    use crate::services::common::soulseek_hold_store::HeldLidarrFile;
+
+    let rig = rig(Arc::new(ListedGates::default()), None, memory_holds());
+    let running = rig.coordinator.clone();
+    let import = tokio::spawn(async move {
+        running
+            .acquire_track_for(
+                "soulseek",
+                "imported",
+                Some("brandon"),
+                None,
+                &AcquisitionTarget::Shared,
+                AcquisitionOrigin::Import,
+            )
+            .await
+    });
+    let request = rig
+        .queue
+        .dequeue(&CancellationToken::new())
+        .await
+        .expect("a request");
+    rig.queue.release(&request);
+    let file = "/downloads/.octo-incoming/held/Track_soulseek_imported/a.flac";
+    let brought = HeldLidarrFile {
+        path: file.into(),
+        delivered: Some("/downloads/complete/a.flac".into()),
+    };
+    request
+        .completion
+        .try_set_error(anyhow::Error::new(AcquisitionHeld {
+            waiting_for: WaitingFor::AcoustId,
+            line: "Waiting for AcoustID".into(),
+            files: vec![file.into()],
+            lidarr: vec![brought.clone()],
+            users: Vec::new(),
+        }));
+    import
+        .await
+        .expect("joined")
+        .expect("the job ends without an error");
+    let key = "Track:soulseek:imported:AcoustId";
+    let record = rig.holds.get(key).expect("held for AcoustID");
+    assert_eq!(record.held_files, [file]);
+    assert_eq!(record.lidarr_files, [brought.clone()]);
+
+    rig.coordinator.resume_held(key);
+    let again = tokio::time::timeout(
+        Duration::from_secs(10),
+        rig.queue.dequeue(&CancellationToken::new()),
+    )
+    .await
+    .expect("the chain runs again")
+    .expect("a request");
+    assert_eq!(again.place().held_files, [file]);
+    assert_eq!(again.place().held_lidarr, [brought]);
+    rig.queue.release(&again);
+    again.completion.try_set_result("/music/imported.flac");
+
+    until(|| rig.holds.snapshot().is_empty()).await;
+    assert!(
+        rig.holds
+            .snapshot()
+            .iter()
+            .all(|record| record.lidarr_files.is_empty())
+    );
 }
 
 #[tokio::test]

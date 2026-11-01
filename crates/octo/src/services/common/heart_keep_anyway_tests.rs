@@ -512,6 +512,7 @@ async fn a_busy_shim_holds_the_keep_with_its_line_until_its_round_keeps_it() {
                 waiting_for: WaitingFor::Shim,
                 line: KEEP_WAITS_FOR_YOUTUBE.into(),
                 files: Vec::new(),
+                lidarr: Vec::new(),
                 users: vec!["brandon".into()],
             }
             .into());

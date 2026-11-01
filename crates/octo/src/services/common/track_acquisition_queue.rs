@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::services::common::soulseek_hold_store::HeldLidarrFile;
 use crate::services::library::ReplacementHandoff;
 
 /// How an acquisition ended: the path of the file on disk and fully registered, or why not.
@@ -33,14 +34,16 @@ pub enum PlayOutcome {
 }
 
 /// A download that holds instead of landing: what it waits for, the line its row shows, the
-/// files it keeps in the one hold path, and whose gates hold (empty for everyone who asked). A
-/// verify step resolves the request's completion with it, and the heart chain files the hold.
+/// files it keeps in the one hold path, those of them Lidarr brought with where their labels are
+/// read from, and whose gates hold (empty for everyone who asked). A verify step resolves the
+/// request's completion with it, and the heart chain files the hold.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{line}")]
 pub struct AcquisitionHeld {
     pub waiting_for: WaitingFor,
     pub line: String,
     pub files: Vec<String>,
+    pub lidarr: Vec<HeldLidarrFile>,
     pub users: Vec<String>,
 }
 
@@ -301,6 +304,8 @@ pub struct AcquisitionPlace {
     pub gates: Vec<HeartGate>,
     /// The files a resumed hold held in the one hold path, which the download checks first.
     pub held_files: Vec<String>,
+    /// Those of `held_files` Lidarr brought, each with where its labels are read from.
+    pub held_lidarr: Vec<HeldLidarrFile>,
     /// Where each gate's verdict on the file is written, for everyone who waits on it.
     pub ledger: GateLedger,
     /// What a replacement refuses by its original's sound.
@@ -354,6 +359,8 @@ pub struct AcquisitionRequest {
     gates: Mutex<Vec<HeartGate>>,
     /// The files a resumed hold held, which the download checks before any source.
     held_files: Mutex<Vec<String>>,
+    /// Those of the held files Lidarr brought, with where their labels are read from.
+    held_lidarr: Mutex<Vec<HeldLidarrFile>>,
     /// Hearts and plays that joined with a gate of their own: their library, their name and their
     /// claim on the outcome are recorded only once their own gate passes the landed file.
     joiners: Mutex<Vec<GatedJoiner>>,
@@ -408,6 +415,7 @@ impl AcquisitionRequest {
             origin: None,
             gates: Mutex::new(Vec::new()),
             held_files: Mutex::new(Vec::new()),
+            held_lidarr: Mutex::new(Vec::new()),
             joiners: Mutex::new(Vec::new()),
             deny: None,
             keep_anyway: AtomicBool::new(false),
@@ -459,12 +467,19 @@ impl AcquisitionRequest {
         }
     }
 
-    /// Adds files a resumed hold held, which the download checks before any source.
-    pub fn add_held_files(&self, files: &[String]) {
+    /// Adds files a resumed hold held, which the download checks before any source, with the
+    /// labels of those Lidarr brought.
+    pub fn add_held_files(&self, files: &[String], lidarr: &[HeldLidarrFile]) {
         let mut held = self.held_files.lock();
         for file in files {
             if !held.contains(file) {
                 held.push(file.clone());
+            }
+        }
+        let mut labeled = self.held_lidarr.lock();
+        for file in lidarr {
+            if files.contains(&file.path) && !labeled.iter().any(|known| known.path == file.path) {
+                labeled.push(file.clone());
             }
         }
     }
@@ -543,6 +558,7 @@ impl AcquisitionRequest {
             origin: self.origin,
             gates: self.gates(),
             held_files: self.held_files.lock().clone(),
+            held_lidarr: self.held_lidarr.lock().clone(),
             ledger: self.completion.ledger().clone(),
             deny: self.deny.clone(),
             keep_anyway: self.keep_anyway.load(Ordering::SeqCst),
@@ -892,6 +908,7 @@ impl TrackAcquisitionQueue {
             origin,
             gates,
             Vec::new(),
+            Vec::new(),
             target,
             flac_only,
             provider,
@@ -908,13 +925,14 @@ impl TrackAcquisitionQueue {
     }
 
     /// [`Self::enqueue_as`] for a resumed hold: `held_files` are the files it held, which the
-    /// download checks before any source.
+    /// download checks before any source, and `held_lidarr` the labels of those Lidarr brought.
     #[allow(clippy::too_many_arguments)] // enqueue_as's arguments and the held files
     pub fn enqueue_holding(
         &self,
         origin: Option<AcquisitionOrigin>,
         gates: Vec<HeartGate>,
         held_files: Vec<String>,
+        held_lidarr: Vec<HeldLidarrFile>,
         target: &AcquisitionTarget,
         flac_only: bool,
         provider: &str,
@@ -933,6 +951,7 @@ impl TrackAcquisitionQueue {
             origin,
             gates,
             held_files,
+            held_lidarr,
             target,
             flac_only,
             provider,
@@ -957,6 +976,7 @@ impl TrackAcquisitionQueue {
         origin: Option<AcquisitionOrigin>,
         gates: Vec<HeartGate>,
         held_files: Vec<String>,
+        held_lidarr: Vec<HeldLidarrFile>,
         target: &AcquisitionTarget,
         flac_only: bool,
         provider: &str,
@@ -988,7 +1008,7 @@ impl TrackAcquisitionQueue {
         self.queue_request(
             request,
             gates,
-            held_files,
+            (held_files, held_lidarr),
             target,
             requested_by,
             upgrade_search,
@@ -1024,17 +1044,27 @@ impl TrackAcquisitionQueue {
             None,
         )
         .with_origin(origin);
-        self.queue_request(request, gates, held_files, target, requested_by, false, true)
+        // A keep lands a held file as it is: nothing reads its labels.
+        self.queue_request(
+            request,
+            gates,
+            (held_files, Vec::new()),
+            target,
+            requested_by,
+            false,
+            true,
+        )
     }
 
-    /// Queues `request` with its askers, or joins the one already in flight for its song. True
-    /// with the completion when it joined.
+    /// Queues `request` with its askers, or joins the one already in flight for its song. `held`:
+    /// the files a hold held, and the labels of those Lidarr brought. True with the completion
+    /// when it joined.
     #[allow(clippy::too_many_arguments)] // the request and what each asker brings to it
     fn queue_request(
         &self,
         request: AcquisitionRequest,
         gates: Vec<HeartGate>,
-        held_files: Vec<String>,
+        (held_files, held_lidarr): (Vec<String>, Vec<HeldLidarrFile>),
         target: &AcquisitionTarget,
         requested_by: Option<&str>,
         upgrade_search: bool,
@@ -1048,7 +1078,7 @@ impl TrackAcquisitionQueue {
         for gate in &gates {
             request.add_gate(gate.clone());
         }
-        request.add_held_files(&held_files);
+        request.add_held_files(&held_files, &held_lidarr);
         if upgrade_search {
             request.ask_for_upgrade_search();
         }
@@ -1084,7 +1114,7 @@ impl TrackAcquisitionQueue {
                 // passes it.
                 existing.join_gated(&gates, requested_by, target, heart);
             }
-            existing.add_held_files(&held_files);
+            existing.add_held_files(&held_files, &held_lidarr);
             if upgrade_search {
                 existing.ask_for_upgrade_search();
             }

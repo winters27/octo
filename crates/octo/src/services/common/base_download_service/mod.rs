@@ -161,6 +161,8 @@ pub struct TrackDownload {
     pub ahead: bool,
     /// The files a resumed hold held: checked first, as a fresh download's file is.
     pub held_files: Vec<String>,
+    /// Those of `held_files` Lidarr brought, each with where its labels are read from.
+    pub held_lidarr: Vec<crate::services::common::soulseek_hold_store::HeldLidarrFile>,
     /// Why the acquisition runs; None for one queued without an origin (the shipped checks).
     pub origin: Option<AcquisitionOrigin>,
     /// The gate of each heart or play that asked: a file is judged against each on its own.
@@ -1197,6 +1199,7 @@ impl BaseDownloadService {
             flac_only,
             ahead: options.prefetch,
             held_files: options.place.held_files.clone(),
+            held_lidarr: options.place.held_lidarr.clone(),
             origin: options.place.origin,
             gates: options.place.gates.clone(),
             acquisition_key: acquisition_key(external_provider, external_id, flac_only),
