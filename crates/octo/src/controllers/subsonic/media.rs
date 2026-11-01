@@ -3,6 +3,7 @@
 use std::io::SeekFrom;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use futures::FutureExt;
+use futures::{FutureExt, TryStreamExt};
 use octo_core::common::dotnet::{self, is_blank};
 use octo_core::common::{SongIdentity, playlist_id_helper};
 use octo_core::models::radio::{LastFmRadioStation, LastFmRadioStationKind};
@@ -22,7 +23,8 @@ use octo_subsonic::SubsonicCredential;
 use octo_subsonic::subsonic_request_parser::Parameters;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
+use tokio::process::Command;
+use tokio_util::io::{ReaderStream, StreamReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -524,6 +526,18 @@ async fn play_external(
     }
 
     if let Some(direct) = try_direct_stream(state, call, provider, external_id, id).await? {
+        if call.method() == "GET"
+            && direct.status() == StatusCode::OK
+            && call.param("format").eq_ignore_ascii_case("mp3")
+        {
+            let bitrate = call
+                .param("maxBitRate")
+                .parse::<u32>()
+                .ok()
+                .unwrap_or(256)
+                .clamp(32, 320);
+            return transcode_external_preview(direct, bitrate).await;
+        }
         return Ok(direct);
     }
 
@@ -535,6 +549,65 @@ async fn play_external(
         .create_error(format, 70, "No playable source found for this track")
         .into_response();
     *response.status_mut() = StatusCode::NOT_FOUND;
+    Ok(response)
+}
+
+async fn transcode_external_preview(direct: Response, bitrate: u32) -> anyhow::Result<Response> {
+    let upstream = direct
+        .into_body()
+        .into_data_stream()
+        .map_err(std::io::Error::other);
+    let mut reader = StreamReader::new(upstream);
+    let bitrate = format!("{bitrate}k");
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-vn",
+            "-map_metadata",
+            "-1",
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            &bitrate,
+            "-write_xing",
+            "0",
+            "-id3v2_version",
+            "0",
+            "-f",
+            "mp3",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("ffmpeg stdin unavailable"))?;
+    let output = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("ffmpeg stdout unavailable"))?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::io::copy(&mut reader, &mut input) => {
+                drop(input);
+                let _ = child.wait().await;
+            }
+            _ = child.wait() => {}
+        }
+    });
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(output)));
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/mpeg"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
     Ok(response)
 }
 
