@@ -3584,27 +3584,59 @@ function passViewerShown(store, viewer, shown) {
   } catch { /* a blocked store marks nothing */ }
 }
 
+// What the page does as it leaves and comes back. Leaving: its tab's open mark goes (so a reload
+// finds the same tab), and an open panel closes, its stop sent by the leaving sender. Brought back
+// from the browser's page cache: its seat went as it left and a copy of this tab may hold the old
+// name, so it takes a tab of its own and marks it open.
+function passLifecycle(target, { store, viewer, makeId, isOpen, close }) {
+  target.addEventListener('pagehide', () => {
+    passViewerShown(store, viewer, false);
+    if (isOpen()) close();
+  });
+  target.addEventListener('pageshow', event => {
+    if (!event.persisted) return;
+    viewer.tab = makeId();
+    try { store.setItem(PASS_TAB_KEY, viewer.tab); } catch { /* a blocked store keeps nothing */ }
+    passViewerShown(store, viewer, true);
+  });
+}
+
 // The Pass panel's starts and stops, in order. A start waits for the stop sent before it, so a
-// Pass right after a Close opens a new check instead of joining the one being stopped. Each stop
-// names the run its page was on (null while the start had not answered) and the page itself.
+// Pass right after a Close opens a new check instead of joining the one being stopped, and a
+// Close while it waits ends it before it is sent. Each stop names the run its page was on (null
+// while the start had not answered, or when its answer never came) and the page itself.
 // `send(call, body)` posts to .../assist/<call> and answers the parsed reply; a stop may go by
 // another sender (the page's leaving one).
 function passCalls(send, viewer) {
   let run = null;
   let turn = 0;
   let stopping = null;
+  let owed = false;
   return {
     async start() {
+      const entered = turn;
       const before = stopping;
       stopping = null;
       if (before) await before;
+      if (turn !== entered) return { started: false, stopped: true };
       const asked = ++turn;
-      const answer = await send('start', { tab: viewer.tab, page: viewer.page });
+      owed = true;
+      let answer;
+      try {
+        answer = await send('start', { tab: viewer.tab, page: viewer.page });
+      } catch (error) {
+        if (asked === turn) run = null;
+        throw error;
+      }
       if (asked === turn) run = typeof answer?.run === 'string' ? answer.run : null;
       return answer;
     },
+    // Whether a start went out since the last stop: Octo may hold its seat even when the
+    // start's answer never came.
+    owesStop: () => owed,
     stop(by = send) {
       turn += 1;
+      owed = false;
       const body = { run, tab: viewer.tab, page: viewer.page };
       run = null;
       // Sent before this returns, so a page that is leaving still gets it out.
@@ -3725,12 +3757,12 @@ const passLeaveSend = (call, body) => fetch(`/api/admin/spotiflac/assist/${call}
 
 const passLine = passCalls(passSend, passPage);
 
-window.addEventListener('pagehide', () => {
-  passViewerShown(passStore, passPage, false);
-  if (passState.open) closePass(passLeaveSend);
-});
-window.addEventListener('pageshow', event => {
-  if (event.persisted) passViewerShown(passStore, passPage, true);
+passLifecycle(window, {
+  store: passStore,
+  viewer: passPage,
+  makeId: passId,
+  isOpen: () => passState.open,
+  close: () => closePass(passLeaveSend),
 });
 
 function passQueue() {
@@ -3776,9 +3808,10 @@ function openPass() {
 
 // `by` sends the stop another way (the leaving page's).
 function closePass(by = undefined) {
-  // A run still opening or live is left on the server too (stopped once no other page is on
-  // it, its song's job cancelled); a Pass right after waits for that first.
-  if (passState.view?.polls) passLine.stop(by);
+  // The run this page started or joined is left on the server too (stopped once no other page
+  // is on it, its song's job cancelled), whatever the panel shows; a Pass right after waits for
+  // that first.
+  if (passLine.owesStop()) passLine.stop(by);
   passState.open = false;
   passState.run += 1;
   clearTimeout(passState.pollTimer);

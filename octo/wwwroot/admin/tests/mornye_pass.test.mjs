@@ -23,9 +23,9 @@ const rules = new Function(
   'esc',
   'icon',
   `${slice('function mornyeWhen', 'let mornyeNowLoad')}
-   return { mornyeWhen, mornyeCard, mornyeLinesHtml, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passCalls };`,
+   return { mornyeWhen, mornyeCard, mornyeLinesHtml, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passLifecycle, passCalls };`,
 )(esc, icon);
-const { mornyeWhen, mornyeCard, mornyeLinesHtml, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passCalls } = rules;
+const { mornyeWhen, mornyeCard, mornyeLinesHtml, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passLifecycle, passCalls } = rules;
 
 const heartSourceReachable = new Function(
   'lastStatus',
@@ -394,6 +394,76 @@ test('a Close while the start is on its way names no run, and the late answer is
   answerStart({ run: 'run-old', state: 'opening' });
   await starting;
   assert.equal(line.run(), null, "the run being stopped is not this page's any more");
+});
+
+test('a Close while a Pass waits for the stop before it ends that Pass before it is sent', async () => {
+  const sent = [];
+  let answerFirstStop;
+  let stops = 0;
+  const send = (call, body) => {
+    sent.push([call, body]);
+    if (call === 'stop' && ++stops === 1) return new Promise(resolve => { answerFirstStop = resolve; });
+    return Promise.resolve({ run: 'run-new', state: 'opening' });
+  };
+  const line = passCalls(send, { tab: 't', page: 'p' });
+  line.stop();
+  const starting = line.start();
+  line.stop();
+  answerFirstStop({});
+  const answer = await starting;
+  assert.deepEqual(sent.map(([call]) => call), ['stop', 'stop'], 'no start goes out after the stops');
+  assert.equal(answer.started, false);
+  assert.equal(line.owesStop(), false);
+});
+
+test('a start whose answer never came still owes its stop, which names no run', async () => {
+  const sent = [];
+  let fail = false;
+  const send = (call, body) => {
+    sent.push([call, body]);
+    if (call === 'start' && fail) return Promise.reject(new Error('the network dropped'));
+    return Promise.resolve({ run: 'run-1', state: 'live' });
+  };
+  const line = passCalls(send, { tab: 't', page: 'p' });
+  assert.equal(line.owesStop(), false, 'nothing started yet');
+  await line.start();
+  assert.equal(line.run(), 'run-1');
+  // Try again after run-1 ended: Octo may have seated the page on a new run whose name never came.
+  fail = true;
+  await assert.rejects(line.start());
+  assert.equal(line.owesStop(), true);
+  line.stop();
+  assert.deepEqual(sent.at(-1), ['stop', { run: null, tab: 't', page: 'p' }]);
+  assert.equal(line.owesStop(), false);
+});
+
+test('leaving clears the tab mark and closes an open panel; coming back from the page cache takes a tab of its own', () => {
+  const store = memoryStore();
+  const viewer = passViewer(store, ids());
+  const target = new EventTarget();
+  let open = true;
+  let closes = 0;
+  let n = 0;
+  passLifecycle(target, { store, viewer, makeId: () => `new-${++n}`, isOpen: () => open, close: () => { closes += 1; } });
+  const before = viewer.tab;
+
+  target.dispatchEvent(new Event('pagehide'));
+  assert.equal(store.getItem('octo.passTabOpen'), null, 'a reload now finds the same tab');
+  assert.equal(closes, 1);
+  open = false;
+  target.dispatchEvent(new Event('pagehide'));
+  assert.equal(closes, 1, 'a closed panel sends nothing');
+
+  // A fresh load's pageshow changes nothing.
+  target.dispatchEvent(new Event('pageshow'));
+  assert.equal(viewer.tab, before);
+
+  const back = new Event('pageshow');
+  Object.defineProperty(back, 'persisted', { value: true });
+  target.dispatchEvent(back);
+  assert.equal(viewer.tab, 'new-1');
+  assert.equal(store.getItem('octo.passTab'), 'new-1');
+  assert.equal(store.getItem('octo.passTabOpen'), 'new-1');
 });
 
 test("a leaving page's stop goes by the leaving sender, before stop returns", () => {

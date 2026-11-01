@@ -515,23 +515,119 @@ fn a_finished_run_moves_the_holds_it_shares_a_check_with_and_leaves_the_rest() {
     assert_eq!(hold("c"), Some(early), "c waits on another check");
 }
 
+/// Holds job `id` on Mornye's check `label` until `until`.
+fn hold_on(queue: &UpgradeQueue, id: &str, label: &str, until: chrono::DateTime<Utc>) {
+    queue.update(id, |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+        job.mornye_hold = Some(MornyeHold {
+            until_utc: until,
+            labels: vec![label.to_string()],
+        });
+    });
+}
+
 #[test]
-fn the_job_sent_back_alone_carries_the_scout_mark_and_the_others_do_not() {
+fn one_ended_job_goes_back_as_the_scout_and_passing_ones_go_back_unmarked() {
     let queue = UpgradeQueue::new();
-    queue.add(asks(&["a", "b"]), "alice", "app");
-    for id in ["a", "b"] {
-        queue.update(id, |job| job.state = UpgradeStates::WAITING.to_string());
-    }
-    assert_eq!(queue.requeue_where(|_| true, Some("a")), 2);
+    queue.add(asks(&["a", "b", "c"]), "alice", "app");
+    let now = Utc::now();
+    hold_on(&queue, "a", "A", now - chrono::Duration::seconds(1));
+    hold_on(&queue, "b", "A", now - chrono::Duration::seconds(1));
+    hold_on(&queue, "c", "B", now + chrono::Duration::minutes(30));
+    let passing: HashSet<String> = ["c".to_string()].into();
+
+    assert_eq!(queue.release_mornye(&passing, now), 2);
     let jobs = queue.snapshot();
-    let scout = |id: &str| {
+    let job = |id: &str| {
         jobs.iter()
             .find(|job| job.navidrome_id == id)
-            .map(|job| job.mornye_scout)
+            .cloned()
+            .expect("a job")
     };
-    assert_eq!(scout("a"), Some(true));
-    assert_eq!(scout("b"), Some(false));
+    assert_eq!(
+        (job("a").state.as_str(), job("a").mornye_scout),
+        (UpgradeStates::QUEUED, true)
+    );
+    assert_eq!(
+        (job("c").state.as_str(), job("c").mornye_scout),
+        (UpgradeStates::QUEUED, false)
+    );
+    assert_eq!(job("b").state, UpgradeStates::WAITING);
+
+    // While a is on its way, b's ended pause sends nothing more.
+    assert_eq!(queue.release_mornye(&HashSet::new(), now), 0);
     assert!(queue.mornye_scout_on_its_way());
+}
+
+#[tokio::test]
+async fn a_scout_that_finishes_while_the_checks_are_read_sends_no_second_one_on_the_old_end() {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a", "b"]), "alice", "app");
+    let ended = Utc::now() - chrono::Duration::seconds(1);
+    let next = Utc::now() + chrono::Duration::minutes(45);
+    // a is the scout, running; b waits on the same check's pause, which has ended.
+    queue.update("a", |job| {
+        job.state = UpgradeStates::WORKING.to_string();
+        job.mornye_scout = true;
+    });
+    hold_on(&queue, "b", "A", ended);
+    // While b's checks are read, a's try comes back held again on a later pause.
+    let finishing = queue.clone();
+    let passed: ChecksPassFn = Arc::new(move |_| {
+        finishing.finish_run("a", |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(MornyeHold {
+                until_utc: next,
+                labels: vec!["A".to_string()],
+            });
+        });
+        async { false }.boxed()
+    });
+    let tries = Arc::new(AtomicUsize::new(0));
+    let tried = tries.clone();
+    let apply: Apply = Arc::new(move |_| {
+        tried.fetch_add(1, Ordering::SeqCst);
+        async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed()
+    });
+    let worker = Arc::new(UpgradeWorker::with_seams(
+        queue.clone(),
+        seams_with_mornye(2, apply, Arc::default(), passed),
+        None,
+        None,
+        None,
+    ));
+
+    worker.tick(&CancellationToken::new()).await;
+    worker.drain().await;
+
+    assert_eq!(tries.load(Ordering::SeqCst), 0, "b waits for a's new pause");
+    let b = queue
+        .snapshot()
+        .into_iter()
+        .find(|job| job.navidrome_id == "b")
+        .expect("b");
+    assert_eq!(b.state, UpgradeStates::WAITING);
+    assert_eq!(b.mornye_hold.map(|hold| hold.until_utc), Some(next));
+}
+
+#[test]
+fn soulseek_coming_back_leaves_the_jobs_mornyes_check_kept() {
+    let queue = UpgradeQueue::new();
+    queue.add(asks(&["a", "b"]), "alice", "app");
+    queue.update("a", |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::SOULSEEK_OFFLINE.to_string());
+    });
+    hold_on(&queue, "b", "A", Utc::now() - chrono::Duration::seconds(1));
+    assert_eq!(queue.requeue(), 1);
+    let b = queue
+        .snapshot()
+        .into_iter()
+        .find(|job| job.navidrome_id == "b")
+        .expect("b");
+    assert_eq!(b.state, UpgradeStates::WAITING);
 }
 
 #[test]

@@ -190,15 +190,55 @@ impl AssistRun {
 }
 
 /// Ends its run as unavailable when the task following the run stops before ending it (a panic),
-/// so a later Pass opens a new run instead of joining one nothing follows.
-struct EndsTheRun(Arc<AssistRun>);
+/// so a later Pass opens a new run instead of joining one nothing follows. What the run made goes
+/// first: its folder at once, and its song's job cancelled in a task of its own, which ends the
+/// run once the cancel has answered (or as it is dropped, when no runtime is left to run it).
+struct EndsTheRun {
+    run: Arc<AssistRun>,
+    client: Arc<SpotiflacClient>,
+    /// The song's job folder, once made.
+    dir: Option<String>,
+    /// The song's job at Mornye, once it took one Octo can cancel.
+    job: Option<String>,
+}
+
+impl EndsTheRun {
+    fn new(run: &Arc<AssistRun>, client: &Arc<SpotiflacClient>) -> Self {
+        Self {
+            run: Arc::clone(run),
+            client: Arc::clone(client),
+            dir: None,
+            job: None,
+        }
+    }
+}
 
 impl Drop for EndsTheRun {
     fn drop(&mut self) {
-        self.0.end(
-            RunState::Unavailable,
-            Some("Octo stopped following Mornye's check.".into()),
-        );
+        if self.run.finished() {
+            return;
+        }
+        if let Some(dir) = self.dir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let Some(job) = self.job.take() else {
+            self.run.end(
+                RunState::Unavailable,
+                Some("Octo stopped following Mornye's check.".into()),
+            );
+            return;
+        };
+        // Holds no job of its own, so dropping it ends the run.
+        let ends = EndsTheRun::new(&self.run, &self.client);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    ends.client.cancel(&ends.run.connection, &job).await;
+                    drop(ends);
+                });
+            }
+            Err(_) => drop(ends),
+        }
     }
 }
 
@@ -442,7 +482,7 @@ impl SpotiflacClient {
 
     /// Asks Mornye for the run's song and follows it until the run ends, then cleans up.
     async fn follow_pass(self: Arc<Self>, run: Arc<AssistRun>, download_path: String) {
-        let _ends = EndsTheRun(Arc::clone(&run));
+        let mut ends = EndsTheRun::new(&run, &self);
         let _slot = tokio::select! {
             slot = self.slot() => slot,
             _ = run.stop.cancelled() => {
@@ -464,6 +504,7 @@ impl SpotiflacClient {
             );
             return;
         }
+        ends.dir = Some(job_dir.clone());
         let their_dir = octo_core::spotiflac::path_for_spotiflac(
             &job_dir,
             &download_path,
@@ -483,6 +524,9 @@ impl SpotiflacClient {
                 return;
             }
         };
+        if job.is_pollable() {
+            ends.job = Some(job.id.clone());
+        }
         let outcome = self.watch_pass(&run, &job).await;
         if job.is_pollable() {
             self.cancel(&run.connection, &job.id).await;

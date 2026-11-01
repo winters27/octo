@@ -524,19 +524,73 @@ async fn a_stop_for_an_earlier_run_leaves_the_run_open_now() {
 }
 
 #[tokio::test]
-async fn a_run_its_follower_left_unfinished_ends_so_a_new_pass_can_open() {
+async fn a_follower_that_stops_partway_cancels_its_job_then_ends_the_run() {
     let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
     let folder = w.music.path().to_string_lossy().into_owned();
     let run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
-    assert!(!run.finished());
-    // As when the task following the run stops partway (a panic).
-    drop(EndsTheRun(Arc::clone(&run)));
-    assert!(run.finished());
-    assert_eq!(run.state().0, RunState::Unavailable);
+    let dir = tempfile::tempdir().expect("a folder");
+    let job_dir = dir.path().join("octo-check-guard");
+    std::fs::create_dir_all(&job_dir).expect("made");
+    let mut ends = EndsTheRun::new(&run, &w.client);
+    ends.dir = Some(job_dir.to_string_lossy().into_owned());
+    ends.job = Some("job-guard".to_string());
+
+    // As when the task following the run panics partway through.
+    drop(ends);
+
+    assert!(!job_dir.exists(), "its folder goes at once");
+    assert_eq!(until_finished(&run).await, RunState::Unavailable);
+    assert_eq!(
+        requests_to(&w.mornye, "/api/v1/downloads/job-guard/cancel").await,
+        1,
+        "the job was cancelled before the run read as ended"
+    );
     assert_eq!(
         run.state().1.as_deref(),
         Some("Octo stopped following Mornye's check.")
     );
+}
+
+#[test]
+fn a_run_whose_follower_is_dropped_partway_ends_and_leaves_no_folder() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let (w, run) = runtime.block_on(async {
+        let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+        let folder = w.music.path().to_string_lossy().into_owned();
+        let run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
+        // Once Mornye has the song, so the follower has made its folder and holds the job.
+        for _ in 0..200 {
+            if requests_to(&w.mornye, "/api/v1/downloads").await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (w, run)
+    });
+    assert!(!run.finished());
+
+    // The runtime goes, and the follower's task with it, partway through the run.
+    drop(runtime);
+
+    assert!(run.finished(), "{:?}", run.state());
+    assert_eq!(
+        run.state().1.as_deref(),
+        Some("Octo stopped following Mornye's check.")
+    );
+    let folders = std::fs::read_dir(w.music.path().join(SPOTIFLAC_FOLDER))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("octo-check-"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(folders, 0, "the job folder is removed");
+    // A new Pass would not join it.
+    assert!(w.client.assist_run().is_none_or(|run| run.finished()));
 }
 
 #[tokio::test]

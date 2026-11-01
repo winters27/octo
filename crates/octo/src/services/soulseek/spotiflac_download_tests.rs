@@ -950,7 +950,7 @@ async fn mornyes_own_paused_words_are_a_wait_when_it_does_not_report_its_check()
 }
 
 #[tokio::test]
-async fn mornyes_own_paused_words_name_the_checks_its_read_shows_for_the_extension() {
+async fn a_wait_from_mornyes_words_is_not_let_go_by_the_working_read_it_was_made_beside() {
     let events: Events = Arc::default();
     let mut setup = Setup::new(&events);
     // The read shows the extension's gateway working; only Mornye's words say it is paused.
@@ -966,7 +966,33 @@ async fn mornyes_own_paused_words_name_the_checks_its_read_shows_for_the_extensi
     let error = fetch.acquire().await.expect_err("paused");
 
     let wait = mornye_waited(&error).expect("a Mornye wait");
-    // The gateway row's label, which a Pass turning it active releases.
+    assert!(wait.pause.labels.is_empty(), "{:?}", wait.pause.labels);
+    // The same working read, asked again as a waiting job asks it each tick: not a pass.
+    assert!(!fetch.spotiflac.checks_pass(&wait.pause.labels).await);
+}
+
+#[tokio::test]
+async fn a_wait_from_mornyes_words_names_the_extensions_gateway_that_is_not_working() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    // Working when the song is asked for; when the failure is read the gateway needs its check
+    // but shows no pause of its own, so only Mornye's words carry the wait.
+    let unverified = json!({"result": {"sessions": [
+        {"key": "gateway-v2-abc-6836abb49bb0e8c9", "kind": "gateway", "label": "Example",
+         "extensions": ["example-ext"], "state": "unverified", "auth_paused_s": 0.0}
+    ]}});
+    setup.fake.sessions = vec![gateway("active"), unverified];
+    setup.fake.services = Some(example_service());
+    setup.fake.file = None;
+    setup.fake.status = "failed";
+    setup.fake.error =
+        Some("RuntimeError: verification paused after a failed attempt \u{2014} next try in 4 min");
+    setup.fake.provider = Some("ext:example-ext");
+    let fetch = setup.build(events).await;
+
+    let error = fetch.acquire().await.expect_err("paused");
+
+    let wait = mornye_waited(&error).expect("a Mornye wait");
     assert_eq!(wait.pause.labels, vec!["Example".to_string()]);
 }
 
