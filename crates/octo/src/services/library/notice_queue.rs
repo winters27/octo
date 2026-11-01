@@ -424,7 +424,7 @@ impl NoticeQueue {
                 )
             ),
             InconclusiveReason::DiffersFromYouTube => format!(
-                "AcoustID has never heard this recording, and it sounds nothing like its YouTube preview ({})",
+                "AcoustID has never heard this recording, and it sounds nothing like its YouTube stream ({})",
                 verdict.evidence.as_deref().unwrap_or("not the same song")
             ),
             InconclusiveReason::LoneLink => {

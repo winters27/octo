@@ -1,8 +1,8 @@
 //! One song fetched through Lidarr for a replacement. Lidarr fetches whole albums, so a
 //! replacement borrows one under the rules a heart's pick follows: Lidarr only for an artist with
 //! no music in the user's Lidarr, only an album that is unmonitored with no queue item, monitoring
-//! never turned on, and the search pinned to a release that carries the original's recording when
-//! that is known. Everything after the search is the heart service's own follow
+//! never turned on, and the search pinned to a release that carries the recordings the request
+//! names (for a Better quality, the original's own, when that is known). Everything after the search is the heart service's own follow
 //! (`lidarr_heart_acquisition_service`): Octo's grabs by their search windows, each imported file
 //! Octo's only by its own row, a file of the user's making Octo step aside. The song's own file of
 //! Octo's import is handed to the replacement; every other file of Octo's is held out of the
@@ -47,6 +47,13 @@ pub trait ILidarrTrackFetcher: Send + Sync {
         destination_directory: &str,
         ct: &CancellationToken,
     ) -> Result<LidarrFetched, LidarrError>;
+
+    /// The recordings the library file a request replaces is: what its own sound reads clear as,
+    /// else its recording tag; none without one. Only a Better quality asks: a Wrong song or a
+    /// Wrong version replaces a file that is not the recording wanted.
+    async fn original_recordings(&self, _request: &LidarrTrackRequest) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// The heart service's side of a replacement's fetch: the pick under Lidarr's rules and its
@@ -153,6 +160,10 @@ impl ILidarrTrackFetcher for LidarrTrackFetcher {
             .await
             .unwrap_or_else(|e| Err(LidarrError::InvalidOperation(e.to_string())))
     }
+
+    async fn original_recordings(&self, request: &LidarrTrackRequest) -> Vec<String> {
+        self.inner.original_recordings(request).await
+    }
 }
 
 /// `await` on a call made with the caller's token: the token wins when it fires first.
@@ -185,12 +196,9 @@ impl Inner {
                 "Lidarr is not available on this server.".into(),
             ));
         };
-        let mut request = request.clone();
-        if request.recordings.is_empty() {
-            request.recordings = self.original_recordings(&request).await;
-        }
-
-        let candidate = self.find_album(&request, ct).await?.ok_or_else(|| {
+        // The walk and the pin aim only at the recordings the request names: what the original
+        // is counts only for a Better quality, whose caller names it.
+        let candidate = self.find_album(request, ct).await?.ok_or_else(|| {
             LidarrError::FileNotFound(format!(
                 "Lidarr knows no album with '{} - {}' on it.",
                 request.artist, request.title
@@ -204,10 +212,10 @@ impl Inner {
         }
 
         self.claims.upgrade_started(&key);
-        let result = match self.already_there(&candidate, &request, &current, ct).await {
+        let result = match self.already_there(&candidate, request, &current, ct).await {
             Ok(()) => {
                 replacements
-                    .fetch_from(candidate, &request, destination_directory, ct)
+                    .fetch_from(candidate, request, destination_directory, ct)
                     .await
             }
             Err(e) => Err(e),
@@ -253,8 +261,7 @@ impl Inner {
         Ok(())
     }
 
-    /// The recordings the original is when the request names none: what its own sound reads clear
-    /// as, else its recording tag.
+    /// The recordings the original is: what its own sound reads clear as, else its recording tag.
     async fn original_recordings(&self, request: &LidarrTrackRequest) -> Vec<String> {
         let Some(original) = request
             .original_path

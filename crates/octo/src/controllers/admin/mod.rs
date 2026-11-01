@@ -203,3 +203,11 @@ mod admin_secret_tests;
 #[cfg(test)]
 #[path = "admin_downloads_tests.rs"]
 mod admin_downloads_tests;
+
+#[cfg(test)]
+#[path = "download_checks_tests.rs"]
+mod download_checks_tests;
+
+#[cfg(test)]
+#[path = "held_downloads_tests.rs"]
+mod held_downloads_tests;

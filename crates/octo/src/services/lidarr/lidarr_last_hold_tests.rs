@@ -11,7 +11,7 @@ use std::time::Duration;
 use octo_core::common::Clock;
 use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, WaitingFor};
 use octo_core::settings::{
-    AppSettings, HeartDownloadSource, HeartDownloadStep, SettingsStore, SubsonicSettings,
+    AppSettings, DownloadSource, HeartDownloadSource, HeartDownloadStep, SettingsStore, SubsonicSettings,
 };
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -22,7 +22,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::services::common::test_fakes::{FakeDownloads, FakeLidarr, until};
 use crate::services::common::{
     AcquisitionRequest, AcquisitionTarget, AcquisitionTracker, HeartAcquisitionCoordinator,
-    HeartCoordinatorExtras, SoulseekHoldResumer, SoulseekHoldStore, TrackAcquisitionQueue, TrackOutcome,
+    HeartCoordinatorExtras, HeldKind, SoulseekHoldResumer, SoulseekHoldStore, TrackAcquisitionQueue,
+    TrackOutcome,
 };
 use crate::services::fingerprint::MusicBrainzClient;
 use crate::services::fingerprint::music_brainz_client::HeartBusy;
@@ -56,11 +57,13 @@ struct Rig {
     holds: Arc<SoulseekHoldStore>,
     tracker: Arc<AcquisitionTracker>,
     lidarr: Arc<FakeLidarr>,
+    downloads: Arc<FakeDownloads>,
     _server: MockServer,
 }
 
-/// The coordinator over these sources, a Lidarr whose first walk got no answer from MusicBrainz
-/// and whose next try lands, and a MusicBrainz that answers the question when asked again.
+/// The coordinator over these sources, a Lidarr whose first walk (or album lookup) got no answer
+/// from MusicBrainz and whose next try lands, and a MusicBrainz that answers the question when
+/// asked again.
 async fn rig(steps: &[HeartDownloadSource]) -> Rig {
     let server = MockServer::builder().start().await;
     Mock::given(path("/ws/2/recording/0d7b6ba8-6ff0-4a5c-a6f9-cc9c6b8c3c37"))
@@ -72,19 +75,29 @@ async fn rig(steps: &[HeartDownloadSource]) -> Rig {
     let music_brainz =
         Arc::new(MusicBrainzClient::with_base_url(base).with_pace(quick, Duration::from_secs(5), quick));
     let calls = Arc::new(Mutex::new(0));
-    let lidarr = Arc::new(FakeLidarr::default().tracks(move |_, _, _| {
-        let mut calls = calls.lock();
-        *calls += 1;
-        Ok(*calls > 1)
-    }));
+    let album_calls = Arc::new(Mutex::new(0));
+    let lidarr = Arc::new(
+        FakeLidarr::default()
+            .tracks(move |_, _, _| {
+                let mut calls = calls.lock();
+                *calls += 1;
+                Ok(*calls > 1)
+            })
+            .albums(move |_, _, _| {
+                let mut calls = album_calls.lock();
+                *calls += 1;
+                Ok(*calls > 1)
+            }),
+    );
     *lidarr.waits.lock() = Some(LidarrWaits::Answer(HeartBusy::MusicBrainz(QUESTION.into())));
     let queue = Arc::new(TrackAcquisitionQueue::new());
     let holds = Arc::new(SoulseekHoldStore::new(None::<PathBuf>));
     let tracker = Arc::new(AcquisitionTracker::new(None, Clock::system()));
+    let downloads = Arc::new(FakeDownloads::default());
     let coordinator = HeartAcquisitionCoordinator::new(
         sources(steps),
         queue.clone(),
-        Arc::new(FakeDownloads::default()),
+        downloads.clone(),
         lidarr.clone(),
         HeartCoordinatorExtras {
             tracker: Some(tracker.clone()),
@@ -99,6 +112,7 @@ async fn rig(steps: &[HeartDownloadSource]) -> Rig {
         holds,
         tracker,
         lidarr,
+        downloads,
         _server: server,
     }
 }
@@ -291,5 +305,120 @@ async fn with_lidarr_last_an_imports_unanswered_walk_goes_back_on_its_trickle() 
     assert!(
         rig.holds.snapshot().is_empty(),
         "an import never holds for MusicBrainz"
+    );
+}
+
+// ---- Album hearts --------------------------------------------------------------------------
+
+/// The hearted album.
+const ALBUM: &str = "rocky-iv";
+
+/// brandon's heart of the album, through its chain.
+async fn heart_the_album(rig: &Rig) {
+    rig.coordinator
+        .acquire_album_as(
+            "soulseek",
+            ALBUM,
+            Some("brandon"),
+            None,
+            AcquisitionOrigin::AlbumHeart,
+        )
+        .await
+        .expect("ran");
+}
+
+/// The notes the album's row was given.
+fn album_notes(rig: &Rig) -> Vec<String> {
+    rig.tracker
+        .detail(&format!("soulseek:{ALBUM}"), None)
+        .and_then(|row| row.events)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| event.text)
+        .collect()
+}
+
+/// With Lidarr last, an album heart whose album lookup MusicBrainz did not answer holds as one,
+/// "Waiting for MusicBrainz", and the answer to the held question runs it again: Lidarr takes it
+/// this time, and the hold and its row's hold end.
+#[tokio::test]
+async fn with_lidarr_last_an_album_heart_whose_lookup_got_no_answer_holds_and_resumes_on_the_answer() {
+    let rig = rig(&[HeartDownloadSource::Lidarr]).await;
+
+    heart_the_album(&rig).await;
+
+    until(|| rig.lidarr.album_calls.lock().len() == 2 && rig.holds.snapshot().is_empty()).await;
+    until(|| !rig.tracker.is_held("soulseek", ALBUM)).await;
+    let notes = album_notes(&rig);
+    assert!(
+        notes.iter().any(|note| note == "Waiting for MusicBrainz"),
+        "{notes:?}"
+    );
+    assert!(rig.downloads.album_sources().is_empty());
+}
+
+/// An album heart of the album whose Lidarr step, run last, got no answer from Deezer for its
+/// album: held as one, saved, "Waiting for Deezer".
+async fn album_held_for_deezer(rig: &Rig) {
+    *rig.lidarr.waits.lock() = Some(LidarrWaits::Answer(HeartBusy::Deezer));
+    heart_the_album(rig).await;
+    let held = rig.holds.snapshot();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].kind, HeldKind::Album);
+    assert_eq!(held[0].waiting_for, Some(WaitingFor::Deezer));
+    assert_eq!(held[0].holders.len(), 1);
+    assert_eq!(held[0].holders[0].user, "brandon");
+    assert!(rig.tracker.is_held("soulseek", ALBUM));
+    assert_eq!(
+        rig.tracker.note_of("soulseek", ALBUM).as_deref(),
+        Some("Waiting for Deezer")
+    );
+}
+
+/// The same with Deezer not answering: held, and a restart runs it again; Lidarr takes it this
+/// time, and the hold ends.
+#[tokio::test]
+async fn with_lidarr_last_an_album_heart_whose_lookup_deezer_did_not_answer_holds_until_it_runs_again() {
+    let rig = rig(&[HeartDownloadSource::Lidarr]).await;
+    album_held_for_deezer(&rig).await;
+
+    Arc::new(SoulseekHoldResumer::new(
+        rig.holds.clone(),
+        rig.coordinator.clone(),
+    ))
+    .run(CancellationToken::new())
+    .await
+    .expect("ran");
+
+    until(|| rig.lidarr.album_calls.lock().len() == 2 && rig.holds.snapshot().is_empty()).await;
+    until(|| !rig.tracker.is_held("soulseek", ALBUM)).await;
+}
+
+/// Taking the album heart back ends its hold for an answer, as it ends a song heart's.
+#[tokio::test]
+async fn taking_the_album_heart_back_ends_its_hold_for_an_answer() {
+    let rig = rig(&[HeartDownloadSource::Lidarr]).await;
+    album_held_for_deezer(&rig).await;
+
+    assert_eq!(rig.coordinator.leave_album_holds("soulseek", ALBUM, "brandon"), 1);
+
+    assert!(rig.holds.snapshot().is_empty());
+    assert!(!rig.tracker.is_held("soulseek", ALBUM));
+    assert_eq!(rig.lidarr.album_calls.lock().len(), 1, "nothing runs again");
+}
+
+/// With a source after Lidarr, an album heart's Lidarr step just ends: what it waited on is never
+/// asked, nothing holds, and the next source walks the album.
+#[tokio::test]
+async fn with_a_source_after_lidarr_an_album_hearts_chain_goes_on() {
+    let rig = rig(&[HeartDownloadSource::Lidarr, HeartDownloadSource::YouTube]).await;
+
+    heart_the_album(&rig).await;
+
+    assert_eq!(rig.downloads.album_sources(), [DownloadSource::YouTube]);
+    assert!(rig.holds.snapshot().is_empty());
+    assert!(
+        rig.lidarr.waits.lock().is_some(),
+        "what a step with a source after it waited on is never asked"
     );
 }

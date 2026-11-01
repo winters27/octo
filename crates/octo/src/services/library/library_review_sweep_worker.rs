@@ -1277,7 +1277,7 @@ impl LibraryReviewSweepWorker {
                         Outcome::Ask,
                         VerificationResult {
                             evidence: Some(format!(
-                                "{}% of its bits differ from its YouTube preview",
+                                "{}% of its bits differ from its YouTube stream",
                                 (comparison.bit_error * 100.0).round()
                             )),
                             ..question
@@ -1543,7 +1543,7 @@ impl LibraryReviewSweepWorker {
         let by_preview = question.reason == InconclusiveReason::DiffersFromYouTube;
         let replacing = if by_preview {
             format!(
-                "Replacing '{} - {}', which sounds nothing like its YouTube preview.",
+                "Replacing '{} - {}', which sounds nothing like its YouTube stream.",
                 song.artist, song.title
             )
         } else {
@@ -1574,7 +1574,7 @@ impl LibraryReviewSweepWorker {
                 let needs = self.settings.current().soulseek.effective_min_match_score();
                 let note = if by_preview {
                     format!(
-                        "Octo replaced this: it sounded nothing like its YouTube preview ({})",
+                        "Octo replaced this: it sounded nothing like its YouTube stream ({})",
                         question.evidence.as_deref().unwrap_or("not the same song")
                     )
                 } else {

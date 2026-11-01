@@ -91,6 +91,18 @@ pub struct HeldAlbumTrack {
     pub r: HeardRecording,
 }
 
+/// A held file Lidarr brought, and where its own labels are read from when it is judged again:
+/// the download as delivered, or nowhere. Lidarr's own matching is never a label.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct HeldLidarrFile {
+    /// Where it waits in the one hold path.
+    pub path: String,
+    /// The download as delivered, which holds its labels; with none, it has no labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<String>,
+}
+
 /// A held acquisition: a heart waiting out a Soulseek outage, or a heart, a play's file or an
 /// album track waiting for an answer, a proof or the person. HeldSinceUtc survives a restart, so
 /// a Soulseek wait is the setting's length in total, not that long again after every restart.
@@ -119,6 +131,8 @@ pub struct HeldAcquisition {
     pub clip_print: Option<Vec<u32>>,
     /// The files this record holds in the one hold path.
     pub held_files: Vec<String>,
+    /// Those of `held_files` Lidarr brought, each with where its labels are read from.
+    pub lidarr_files: Vec<HeldLidarrFile>,
     /// The album row and catalog track of a held album track.
     pub album_track: Option<HeldAlbumTrack>,
     /// The line its downloads row shows while it waits.
@@ -139,6 +153,7 @@ impl Default for HeldAcquisition {
             keep_requested: Vec::new(),
             clip_print: None,
             held_files: Vec::new(),
+            lidarr_files: Vec::new(),
             album_track: None,
             line: None,
         }
@@ -249,6 +264,7 @@ impl Serialize for HeldAcquisition {
             !self.keep_requested.is_empty(),
             self.clip_print.is_some(),
             !self.held_files.is_empty(),
+            !self.lidarr_files.is_empty(),
             self.album_track.is_some(),
             self.line.is_some(),
         ]
@@ -278,6 +294,9 @@ impl Serialize for HeldAcquisition {
         }
         if !self.held_files.is_empty() {
             s.serialize_field("HeldFiles", &self.held_files)?;
+        }
+        if !self.lidarr_files.is_empty() {
+            s.serialize_field("LidarrFiles", &self.lidarr_files)?;
         }
         if let Some(track) = &self.album_track {
             s.serialize_field("AlbumTrack", track)?;

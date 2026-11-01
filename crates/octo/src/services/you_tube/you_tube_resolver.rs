@@ -101,7 +101,7 @@ fn is_busy_body(body: &str) -> bool {
 
 /// The header every answer to a fresh request carries. An older shim ignores `fresh=1` and never
 /// sends it.
-const FRESH_HEADER: &str = "x-octo-fresh";
+pub(crate) const FRESH_HEADER: &str = "x-octo-fresh";
 
 /// What a fresh `/facts` or `/stream` the shim did not fulfil came to, by its status, whether the
 /// answer said it is fresh, and the error its body names. Without the echo it proves nothing,

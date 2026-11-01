@@ -33,11 +33,12 @@ use crate::services::fingerprint::acoust_id_rate_limiter::{AcoustIdRateLimiter, 
 use crate::services::fingerprint::download_verification_service::{
     ANOTHER_SONG_PLAYED, LabelSource, NEVER_PLAYED,
 };
+use crate::services::fingerprint::music_brainz_client::HeartBusy;
 use crate::services::i_download_service::IDownloadService;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::imports::trickle_worker::{TrickleCheckLater, WAITING_FOR_ANSWER};
 use crate::services::library::{HeartOwnership, OwnedCopy};
-use crate::services::lidarr::ILidarrHeartAcquisitionService;
+use crate::services::lidarr::{ILidarrHeartAcquisitionService, LidarrWaits};
 use crate::services::prefetch::{HeardSamples, PrefetchedFiles};
 use crate::services::soulseek::soulseek_link::SoulseekLinkState;
 use crate::services::soulseek::{ExternalIdRegistry, ISoulseekLink};
@@ -132,6 +133,11 @@ pub trait HeartGates: Send + Sync {
             None,
         )
     }
+
+    /// Notes files Lidarr brought that now wait in the one hold path, with where their labels
+    /// were read from, so a later judgment of them reads the same labels. Nothing without a way
+    /// to judge them.
+    fn held_from_lidarr(&self, _files: &[String], _labels: &LabelSource) {}
 }
 
 /// The coordinator's optional collaborators, each `None` by default.
@@ -1210,7 +1216,14 @@ impl HeartAcquisitionCoordinator {
                     question,
                     ..
                 } => {
-                    self.hold_album(provider, album_external_id, user, origin, waiting_for, question);
+                    self.hold_album(
+                        provider,
+                        album_external_id,
+                        Some(user),
+                        origin,
+                        waiting_for,
+                        question,
+                    );
                     return Err(());
                 }
             };
@@ -1252,13 +1265,14 @@ impl HeartAcquisitionCoordinator {
         Ok(Some(store.register(provider, album_external_id, gate, settled)))
     }
 
-    /// A hearted album whose tracks' recordings the catalog or MusicBrainz could not answer for
-    /// holds as one, its row saying what it waits for, and runs again once that answers.
+    /// A hearted album whose tracks' recordings the catalog or MusicBrainz could not answer for,
+    /// or whose album a Lidarr step run last could not look up, holds as one, its row saying what
+    /// it waits for, and runs again once that answers.
     fn hold_album(
         &self,
         provider: &str,
         album_external_id: &str,
-        user: &str,
+        user: Option<&str>,
         origin: AcquisitionOrigin,
         waiting_for: WaitingFor,
         question: Option<String>,
@@ -1266,19 +1280,23 @@ impl HeartAcquisitionCoordinator {
         let Some(holds) = self.extras.holds.as_ref() else {
             return;
         };
+        let user = user.map(str::trim).filter(|user| !user.is_empty());
         let line = waiting_line(waiting_for);
         let kept = holds.hold(HeldAcquisition {
             kind: HeldKind::Album,
             provider: provider.to_string(),
             external_id: album_external_id.to_string(),
-            requested_by: Some(user.trim().to_string()),
+            requested_by: user.map(str::to_string),
             held_since_utc: Utc::now(),
             origin: Some(origin),
             waiting_for: Some(waiting_for),
-            holders: vec![Holder {
-                user: user.trim().to_string(),
-                ..Default::default()
-            }],
+            holders: user
+                .map(|user| Holder {
+                    user: user.to_string(),
+                    ..Default::default()
+                })
+                .into_iter()
+                .collect(),
             line: Some(line.to_string()),
             ..Default::default()
         });
@@ -2846,8 +2864,6 @@ impl HeartAcquisitionCoordinator {
                 // Lidarr last, and its walk got no answer or its indexers are failing: a heart
                 // holds until that changes, an import goes back on its trickle.
                 if is_last && let Some(busy) = self.lidarr.waits_on(provider, external_id) {
-                    use crate::services::fingerprint::music_brainz_client::HeartBusy;
-                    use crate::services::lidarr::LidarrWaits;
                     let (waiting_for, question) = match busy {
                         LidarrWaits::Answer(HeartBusy::MusicBrainz(question)) => {
                             (WaitingFor::MusicBrainz, Some(question))
@@ -3243,6 +3259,20 @@ impl HeartAcquisitionCoordinator {
                 }
                 if landed? {
                     return Ok(());
+                }
+                // Lidarr last, and the album's lookup got no answer: the album heart holds until
+                // it does, saved and asked again, as a song heart's walk does.
+                if is_last
+                    && let Some(LidarrWaits::Answer(busy)) = self.lidarr.waits_on(provider, album_external_id)
+                {
+                    let (waiting_for, question) = match busy {
+                        HeartBusy::MusicBrainz(question) => (WaitingFor::MusicBrainz, Some(question)),
+                        HeartBusy::Deezer => (WaitingFor::Deezer, None),
+                    };
+                    if files_hold(origin, waiting_for) {
+                        self.hold_album(provider, album_external_id, user, origin, waiting_for, question);
+                        return Ok(());
+                    }
                 }
                 continue;
             }

@@ -30,7 +30,8 @@ use super::catalog_clip::{CatalogClip, ClipPrints};
 use super::heard_master_check::HeardMasterCheck;
 use super::music_brainz_client::{CatalogQuestions, MusicBrainzClient, MusicBrainzError};
 use super::preview_check::{self, PreviewOutcome, PreviewRequest, PreviewSource};
-use crate::services::common::SoulseekHoldStore;
+use crate::services::common::soulseek_hold_store::HeldLidarrFile;
+use crate::services::common::{HeldAcquisition, SoulseekHoldStore};
 use crate::services::prefetch::HeardSamples;
 use crate::services::prefetch::heard_samples::ResumeHold;
 use crate::services::soulseek::ExternalIdRegistry;
@@ -128,6 +129,10 @@ pub struct DownloadVerificationService {
     /// The MusicBrainz question a file's label check met busy, by song and person, until the hold
     /// it left is filed and asks it again.
     file_questions: parking_lot::Mutex<HashMap<(String, String), String>>,
+    /// The files Lidarr brought that wait in the one hold path, by held path, each with the
+    /// download as delivered its labels are read from (none when there is no such copy). The hold
+    /// that keeps one saves it, so a restart judges it by the same labels.
+    held_lidarr: parking_lot::Mutex<HashMap<String, Option<String>>>,
 }
 
 impl DownloadVerificationService {
@@ -157,7 +162,67 @@ impl DownloadVerificationService {
             resume: parking_lot::Mutex::new(None),
             clip_prints: parking_lot::Mutex::new(HashMap::new()),
             file_questions: parking_lot::Mutex::new(HashMap::new()),
+            held_lidarr: parking_lot::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Notes files Lidarr brought that now wait in the one hold path, with where their labels
+    /// were read from at delivery: a judgment of them later reads the download as delivered when
+    /// that is where they came from, and no labels otherwise, never the held file's own tags.
+    pub fn hold_lidarr_files(&self, files: &[String], labels: &LabelSource) {
+        let delivered = match labels {
+            LabelSource::Delivered(path) => Some(path.to_string_lossy().into_owned()),
+            LabelSource::TheFile | LabelSource::None => None,
+        };
+        let mut held = self.held_lidarr.lock();
+        for file in files {
+            held.insert(file.clone(), delivered.clone());
+        }
+    }
+
+    /// Where the labels of a held file Lidarr brought are read from when it is judged again: the
+    /// download as delivered, else none. None for a held file Lidarr did not bring.
+    pub fn held_lidarr_labels(&self, path: &str) -> Option<LabelSource> {
+        let noted = self.held_lidarr.lock().get(path).cloned();
+        let delivered = match noted {
+            Some(delivered) => delivered,
+            None => {
+                self.heart
+                    .get()?
+                    .holds
+                    .snapshot()
+                    .into_iter()
+                    .flat_map(|record| record.lidarr_files)
+                    .find(|file| file.path == path)?
+                    .delivered
+            }
+        };
+        Some(match delivered {
+            Some(delivered) => LabelSource::Delivered(PathBuf::from(delivered)),
+            None => LabelSource::None,
+        })
+    }
+
+    /// A held file Lidarr brought no longer waits: it was kept or thrown away.
+    pub fn forget_held_lidarr_file(&self, path: &str) {
+        self.held_lidarr.lock().remove(path);
+    }
+
+    /// The held files of a hold Lidarr brought that it does not list yet, with their labels'
+    /// source, for the hold to keep beside them.
+    pub(crate) fn lidarr_files_of(&self, record: &HeldAcquisition) -> Vec<HeldLidarrFile> {
+        let held = self.held_lidarr.lock();
+        record
+            .held_files
+            .iter()
+            .filter(|file| !record.lidarr_files.iter().any(|known| &known.path == *file))
+            .filter_map(|file| {
+                held.get(file).map(|delivered| HeldLidarrFile {
+                    path: file.clone(),
+                    delivered: delivered.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Whether a file that claims to be lossless really is, by its spectrum. Unknown, and no
@@ -276,8 +341,31 @@ impl DownloadVerificationService {
         requested_isrc: Option<&str>,
         takes: &Takes,
     ) -> VerificationResult {
+        self.verify_labeled(
+            path,
+            &LabelSource::TheFile,
+            requested_artist,
+            requested_title,
+            requested_isrc,
+            takes,
+        )
+        .await
+    }
+
+    /// [`Self::verify`] for a file whose own labels are read from `labels`: a Lidarr file's tags
+    /// that Lidarr wrote from its own matching never confirm or refuse it.
+    pub async fn verify_labeled(
+        &self,
+        path: &str,
+        labels: &LabelSource,
+        requested_artist: Option<&str>,
+        requested_title: Option<&str>,
+        requested_isrc: Option<&str>,
+        takes: &Takes,
+    ) -> VerificationResult {
         self.verify_on(
             path,
+            labels,
             requested_artist,
             requested_title,
             requested_isrc,
@@ -296,13 +384,23 @@ impl DownloadVerificationService {
         requested_artist: Option<&str>,
         requested_title: Option<&str>,
     ) -> VerificationResult {
-        self.verify_on(path, requested_artist, requested_title, None, &Takes::Any, true)
-            .await
+        self.verify_on(
+            path,
+            &LabelSource::TheFile,
+            requested_artist,
+            requested_title,
+            None,
+            &Takes::Any,
+            true,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)] // verify's inputs, where the labels are, and the lane
     async fn verify_on(
         &self,
         path: &str,
+        labels: &LabelSource,
         requested_artist: Option<&str>,
         requested_title: Option<&str>,
         requested_isrc: Option<&str>,
@@ -313,13 +411,18 @@ impl DownloadVerificationService {
             return VerificationResult::inconclusive();
         }
 
+        // The file whose tags are the file's own labels, when it has any.
+        let tags = match labels {
+            LabelSource::TheFile => Some(path.to_string()),
+            LabelSource::Delivered(delivered) => Some(delivered.to_string_lossy().into_owned()),
+            LabelSource::None => None,
+        };
         // What the file's own tags say it is, when the request named an ISRC to hold them to.
         // A header read, and it needs no API key: with no key it is the only question asked.
         let isrc = requested_isrc.and_then(SongIdentity::normalize_isrc);
-        let tagged = if isrc.is_none() {
-            Vec::new()
-        } else {
-            Self::read_isrcs(path)
+        let tagged = match (&isrc, tags.as_deref()) {
+            (Some(_), Some(tags)) => Self::read_isrcs(tags),
+            _ => Vec::new(),
         };
         let tagged_match = isrc.as_ref().is_some_and(|isrc| tagged.contains(isrc));
 
@@ -339,13 +442,16 @@ impl DownloadVerificationService {
         };
 
         let verdict = Self::with_tagged_isrc(verdict, isrc.as_deref(), tagged_match);
-        let verdict =
-            if verdict.verdict == VerificationVerdict::Inconclusive && matches!(takes, Takes::Only(_)) {
-                self.with_tagged_recording(verdict, path, requested_title, background)
+        let verdict = match tags.as_deref() {
+            Some(tags)
+                if verdict.verdict == VerificationVerdict::Inconclusive
+                    && matches!(takes, Takes::Only(_)) =>
+            {
+                self.with_tagged_recording(verdict, tags, requested_title, background)
                     .await
-            } else {
-                verdict
-            };
+            }
+            _ => verdict,
+        };
         let (artist, title) = (requested_artist.unwrap_or(""), requested_title.unwrap_or(""));
         let isrc_text = isrc.as_deref().unwrap_or("");
         match (&verdict.verdict, &verdict.evidence) {
@@ -1090,7 +1196,7 @@ impl DownloadVerificationService {
         VerificationResult {
             verdict: VerificationVerdict::Confirmed,
             reason: InconclusiveReason::None,
-            evidence: Some("the song's YouTube preview agrees".into()),
+            evidence: Some("the song's YouTube stream agrees".into()),
             ..verdict
         }
     }

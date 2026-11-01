@@ -1131,9 +1131,14 @@ impl HeartGates for DownloadVerificationService {
             .await
     }
 
+    fn held_from_lidarr(&self, files: &[String], labels: &LabelSource) {
+        self.hold_lidarr_files(files, labels);
+    }
+
     async fn judge_held(&self, path: &str, acquisition_key: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
+        // A held file Lidarr brought keeps the labels of its download.
         let candidate = HeartCandidate {
-            labels: LabelSource::TheFile,
+            labels: self.held_lidarr_labels(path).unwrap_or(LabelSource::TheFile),
             identity: None,
             acquisition_key: acquisition_key.to_string(),
         };
@@ -1170,6 +1175,18 @@ impl HeartGates for DownloadVerificationService {
         let song = (record.base_key(), user.trim().to_lowercase());
         if let Some(prints) = self.clip_prints.lock().remove(&song) {
             prints.save_to(&parts.holds, &key, user);
+        }
+        // Each held file Lidarr brought is saved with where its labels come from, so a restart
+        // judges it again by the same labels.
+        let lidarr = self.lidarr_files_of(record);
+        if !lidarr.is_empty() {
+            parts.holds.update(&key, |kept| {
+                for file in lidarr {
+                    if !kept.lidarr_files.iter().any(|known| known.path == file.path) {
+                        kept.lidarr_files.push(file);
+                    }
+                }
+            });
         }
         match record.waiting_for {
             Some(WaitingFor::Shim) => {

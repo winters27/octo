@@ -72,6 +72,10 @@ struct Options {
     library: Option<Arc<dyn crate::services::local::ILocalLibraryService>>,
     /// The files a Lidarr heart brought in, offered to the download by song id.
     lidarr_imports: Option<Arc<LidarrImportHandoff>>,
+    /// What fetches a replacement's song through Lidarr.
+    lidarr_fetcher: Option<Arc<dyn ILidarrTrackFetcher>>,
+    /// MusicBrainz, which the shipped checks ask what a file's own recording tag names.
+    music_brainz: Option<Arc<crate::services::fingerprint::MusicBrainzClient>>,
 }
 
 /// A 180 s FLAC whose sound is named, with `isrc` as its own tag.
@@ -297,7 +301,7 @@ async fn gated_with(root: &Root, source: DownloadSource, peers: Vec<Peer>, optio
         Arc::new(AudioFingerprinter::new()),
         Arc::new(acoust_id_client),
         Arc::clone(&settings),
-        None,
+        options.music_brainz.clone(),
         None,
     ));
     let dir = tempfile::tempdir().expect("the heard samples' folder");
@@ -334,7 +338,7 @@ async fn gated_with(root: &Root, source: DownloadSource, peers: Vec<Peer>, optio
         id_registry: registry.clone(),
         soulseek_link: None,
         lidarr_imports: options.lidarr_imports.clone(),
-        lidarr_fetcher: None,
+        lidarr_fetcher: options.lidarr_fetcher.clone(),
         spotiflac: None,
         preview_copies: Some(rig.copies.clone()),
     };

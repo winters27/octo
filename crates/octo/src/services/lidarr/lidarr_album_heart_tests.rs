@@ -8,11 +8,13 @@ use std::collections::{HashMap, HashSet};
 
 use octo_core::fingerprint::VerificationResult;
 use octo_core::fingerprint::heart_gate::{Acceptance, HeardRecording, Refusal, TagClaim, WaitingFor};
+use octo_core::fingerprint::heart_release::{CatalogAlbum as DeezerAlbum, CatalogAlbumHit, CatalogTrack};
 
 use super::*;
 use crate::services::common::album_gates::{AlbumGate, AlbumGateTrack, TrackFiling};
 use crate::services::common::soulseek_hold_store::held_root;
 use crate::services::common::{GateStart, Holder};
+use crate::services::metadata::deezer_metadata_service::DeezerAsked;
 
 /// The Beatles, as MusicBrainz and Lidarr know them.
 const BEATLES: &str = "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d";
@@ -433,4 +435,108 @@ async fn with_no_track_proven_nothing_lands_lidarr_is_put_back_and_the_tracks_wa
         "the album Octo's add created is put back: {:?}",
         f.changes()
     );
+}
+
+// ---- Lidarr last, and MusicBrainz or Deezer does not answer --------------------------------
+
+/// A Deezer that answers no question.
+struct BusyCatalog;
+
+#[async_trait]
+impl CatalogQuestions for BusyCatalog {
+    async fn album_search(&self, _: &str, _: &str, _: Lane) -> DeezerAsked<Vec<CatalogAlbumHit>> {
+        DeezerAsked::Busy
+    }
+
+    async fn album(&self, _: &str, _: Lane) -> DeezerAsked<(DeezerAlbum, Vec<CatalogTrack>)> {
+        DeezerAsked::Busy
+    }
+}
+
+/// The service asking this Deezer and a MusicBrainz that answers 503 to everything.
+async fn busy_service(
+    f: &Fixture,
+    catalog: Arc<dyn CatalogQuestions>,
+) -> (LidarrHeartAcquisitionService, MockServer) {
+    let server = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(wiremock::ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let service = f.service_with(Options {
+        timeout_seconds: 1,
+        music_brainz: Some(Arc::new(quick(&server, Duration::from_secs(5)))),
+        catalog: Some(catalog),
+        ..Default::default()
+    });
+    (service, server)
+}
+
+/// alice's heart of Help!, with Lidarr last when `last`.
+async fn heart_help(service: &LidarrHeartAcquisitionService, id: &str, last: bool) -> bool {
+    within(service.try_acquire_album(
+        "soulseek",
+        id,
+        last,
+        Some("alice"),
+        AcquisitionOrigin::AlbumHeart,
+        &[],
+    ))
+    .await
+}
+
+/// Whether Help!'s Yesterday row failed.
+fn yesterday_failed(f: &Fixture) -> bool {
+    f.tracker
+        .detail("soulseek:help-13", None)
+        .is_some_and(|row| row.state == AcquisitionState::Failed)
+}
+
+/// With Lidarr last, an album heart whose barcode lookup MusicBrainz does not answer leaves the
+/// question it waits on, so the heart holds for it: Lidarr is not asked and no track's row fails.
+/// With a source after Lidarr, the step just ends.
+#[tokio::test]
+async fn a_barcode_lookup_musicbrainz_does_not_answer_leaves_what_the_album_heart_waits_on() {
+    let f = Fixture::new().await;
+    beatles_albums(&f);
+    let id = help_album(&f, Some(HELP_CATALOG));
+    let (service, _server) = busy_service(&f, RecordedCatalog::open() as Arc<dyn CatalogQuestions>).await;
+
+    assert!(!heart_help(&service, &id, true).await);
+
+    assert!(matches!(
+        service.waits_on("soulseek", &id),
+        Some(LidarrWaits::Answer(HeartBusy::MusicBrainz(question))) if question.contains("barcode")
+    ));
+    assert_eq!(service.waits_on("soulseek", &id), None, "read once");
+    assert!(!yesterday_failed(&f));
+    assert!(f.searched_albums().is_empty());
+    assert!(!looked_up_by_name(&f));
+
+    // A source after Lidarr: the step ends, and the chain goes on.
+    assert!(!heart_help(&service, &id, false).await);
+    assert_eq!(service.waits_on("soulseek", &id), None);
+    assert!(f.searched_albums().is_empty());
+}
+
+/// The same when Deezer does not answer for the album's catalog album.
+#[tokio::test]
+async fn a_catalog_album_deezer_does_not_answer_leaves_what_the_album_heart_waits_on() {
+    let f = Fixture::new().await;
+    beatles_albums(&f);
+    let id = help_album(&f, Some(HELP_CATALOG));
+    let (service, _server) = busy_service(&f, Arc::new(BusyCatalog) as Arc<dyn CatalogQuestions>).await;
+
+    assert!(!heart_help(&service, &id, true).await);
+
+    assert_eq!(
+        service.waits_on("soulseek", &id),
+        Some(LidarrWaits::Answer(HeartBusy::Deezer))
+    );
+    assert!(!yesterday_failed(&f));
+    assert!(f.searched_albums().is_empty());
+
+    assert!(!heart_help(&service, &id, false).await);
+    assert_eq!(service.waits_on("soulseek", &id), None);
+    assert!(f.searched_albums().is_empty());
 }

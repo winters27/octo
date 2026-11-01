@@ -314,7 +314,7 @@ async fn the_sweep_replaces_a_song_its_preview_says_is_another_and_put_back_rest
     let notes = notices.for_user("admin", NoticeKind::Review);
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert_eq!(notes[0].state, NoticeState::Acted);
-    assert!(notes[0].reason.contains("YouTube preview"), "{notes:?}");
+    assert!(notes[0].reason.contains("YouTube stream"), "{notes:?}");
     assert_eq!(worker.store().read(|s| s.replaced), 1);
     // Navidrome kept the song: the action's last word is in before Put back reads it.
     until(|| {
