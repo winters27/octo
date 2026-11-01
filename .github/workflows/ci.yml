@@ -1,7 +1,7 @@
 name: CI
 
 # Every check a commit must pass: the Rust server (format, clippy, tests, cargo-deny), the shim,
-# octo-sonic, the update helper and the installer, and the C# app that stays in octo/ until it
+# Octo's Mornye helper, octo-sonic, the update helper and the installer, and the C# app that stays in octo/ until it
 # is removed after the Rust release (the migration plan's cleanup). docker.yml calls this before
 # it publishes any image, with the C# job left out: no image holds the C# app.
 on:
@@ -165,6 +165,34 @@ jobs:
       - name: Shim tests
         run: pytest yt-dlp-shim/tests -q
 
+  # Octo's Mornye image (mornye/) adds a launcher and an assist helper to Mornye's published
+  # image; compose builds it on the server. The helper's rules (the token, which of Mornye's
+  # pauses it ends, which browsers it shows, the order of pointer events) and the launcher are
+  # tested here, with the library versions the pinned image ships.
+  mornye:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Syntax check
+        run: python -m compileall -q mornye
+
+      - name: Install test dependencies
+        run: pip install -r mornye/requirements-dev.txt
+
+      - name: Helper tests
+        run: pytest mornye/tests -q
+
+      - name: Launcher tests
+        run: bash mornye/tests/test_launcher.sh
+
   # octo-sonic, the Sounds alike reader (Rust, bliss-rs over FFmpeg). Nothing else builds its
   # image, so the image build is checked here too.
   sonic:
@@ -208,7 +236,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Shellcheck
-        run: shellcheck -S warning install.sh scripts/*.sh scripts/updater/*.sh
+        run: shellcheck -S warning install.sh scripts/*.sh scripts/updater/*.sh mornye/octo-start mornye/octo-chromium mornye/tests/*.sh
 
       - name: Update helper tests
         run: bash scripts/updater/test-updater.sh

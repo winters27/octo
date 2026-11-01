@@ -8,6 +8,8 @@
 #     (Octo and its sidecars) and restarts. An image that will not pull is built
 #     from the folder instead, and the log and the dashboard say so.
 #   - Anywhere else (docker-compose.yml copied by hand), it pulls and restarts.
+#   - Either way, once Octo runs, it removes the Mornye images (octo-mornye) the release no
+#     longer runs.
 # Version 1 chose by whether docker-compose.yml built Octo. Once Octo was pulled,
 # that read every clone as copied by hand, so it pulled the release its old compose
 # file named, again and again, and never moved; version 2 chooses by the folder.
@@ -162,10 +164,11 @@ published_services() {
 # and this list lacks is still pulled, by `up -d`, because it is missing.
 IMAGES=(octo yt-dlp-shim octo-sonic)
 
-# Optional services that are not Octo's own: today only spotiflac (Mornye, built here), present
-# only when its profile is on. Each is made ready before Octo restarts: built from its pinned
-# build: section (cached after the first time), else kept as the image already here. One that is none of these is left as
-# it was, so it never holds Octo back. Without the profile none of this runs.
+# Optional services that are not Octo's own: today only spotiflac (Mornye, its image got ready
+# here from Octo's repository at the release), present only when its profile is on. Each is made
+# ready before Octo restarts: from its build: section (cached after the first time), else kept
+# as the image already here. One that is none of these is left as it was, so it never holds
+# Octo back. Without the profile none of this runs.
 OPTIONAL=(spotiflac)
 left_out=()
 
@@ -179,12 +182,35 @@ ready_optional() {
     run docker compose build "$service" && continue
     image="$({ docker compose config --images "$service" 2>/dev/null || true; } | head -n 1)"
     if [ -n "$image" ] && run docker image inspect "$image"; then
-      log "$service could not be built, so it keeps the image it has"
+      log "$service did not get ready, so it keeps the image it has"
       continue
     fi
-    log "$service could not be built, so it is left as it was and Octo starts without it"
+    log "$service did not get ready, so it is left as it was and Octo starts without it"
     left_out+=("$service")
   done
+}
+
+# Octo's Mornye images (the spotiflac service): every octo-mornye tag but the one the release
+# names, and the untagged ones its earlier builds left (labeled app.octo.mornye=1). Run once Octo
+# runs, whether or not the spotiflac profile is on. An image a container still uses stays, and
+# nothing here can fail the update.
+remove_old_mornye() {
+  local current image
+  current="$({ docker compose --profile spotiflac config --images spotiflac 2>/dev/null || true; } | head -n 1)"
+  [ -n "$current" ] || return 0
+  for image in $({ docker image ls --format '{{.Repository}}:{{.Tag}}' octo-mornye 2>/dev/null || true; }); do
+    case "$image" in "$current" | *:"<none>") continue ;; esac
+    run docker image rm "$image" || log "$image is still in use, so it stays"
+  done
+  run docker image prune -f --filter label=app.octo.mornye=1 || log "Pruning old Mornye images failed; they stay"
+}
+
+# SPOTIFLAC_BUILD_REF once chose the Mornye commit compose built; nothing reads it now, so a .env
+# that still sets it is told what to use instead.
+note_build_ref() {
+  local ref
+  ref="$({ sed -n 's/^SPOTIFLAC_BUILD_REF=//p' "$OCTO_DIR/.env" 2>/dev/null || true; } | tail -n 1 | tr -d '"\r ')"
+  [ -z "$ref" ] || log "SPOTIFLAC_BUILD_REF is no longer read; Octo's Mornye is 1.0.5. To run another Mornye, set SPOTIFLAC_IMAGE."
 }
 
 # Every active service but the optional ones left out.
@@ -294,6 +320,7 @@ log "Update request $id for ${tag:-nothing}"
 mode="$(install_kind)"
 describe "$mode"
 write_status accepted "Starting the update to $tag"
+note_build_ref
 
 if [ "$mode" = image ]; then
   # Not a clone, so there is no release to check out: the images are all it can move.
@@ -312,6 +339,7 @@ if [ "$mode" = image ]; then
     write_status restarting "Restarting Octo"
     run docker compose up -d "${services[@]}" || fail "docker compose up failed. The log has the details." "Restarting Octo"
     wait_until_running || fail "Octo was started but did not stay running. 'docker compose logs octo' says why." "Restarting Octo"
+    remove_old_mornye
   fi
   write_status "done" "$([ "$DRYRUN" = 1 ] && echo "Dry run: nothing was changed" || echo "Octo restarted on the new images")"
   exit 0
@@ -381,7 +409,7 @@ fi
 
 ready_optional
 if [ "${#left_out[@]}" -gt 0 ]; then
-  built="$built. Mornye (the ${left_out[*]} service) could not be built, so it was left as it was"
+  built="$built. Mornye (the ${left_out[*]} service) did not get ready, so it was left as it was"
 fi
 
 write_status restarting "Restarting Octo"
@@ -396,6 +424,7 @@ if ! compose_all up -d || ! wait_until_running; then
   fail "Octo $tag did not stay running, and going back to ${from:-the old version} failed too. 'docker compose logs octo' on the host says why." "Restarting Octo"
 fi
 
+remove_old_mornye
 write_status "done" "Octo now runs $tag$built"
 log "Done: $from to $tag$built"
 refresh_helper

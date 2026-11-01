@@ -502,21 +502,43 @@ if [ "${#build[@]}" -gt 0 ]; then
   docker compose --profile source build "${build[@]}"
 fi
 
+# Octo's Mornye images (the spotiflac service): every octo-mornye tag but the one this folder's
+# docker-compose.yml names, and the untagged ones earlier builds left (labeled
+# app.octo.mornye=1), whether or not the spotiflac profile is on. An image a container still
+# uses stays, and nothing here stops the install.
+remove_old_mornye() {
+  local current image
+  current="$({ docker compose --profile spotiflac config --images spotiflac 2>/dev/null || true; } | head -n 1)"
+  [ -n "$current" ] || return 0
+  for image in $({ docker image ls --format '{{.Repository}}:{{.Tag}}' octo-mornye 2>/dev/null || true; }); do
+    case "$image" in "$current" | *:"<none>") continue ;; esac
+    if docker image rm "$image" > /dev/null 2>&1; then
+      dim "  removed $image, which this release no longer runs"
+    fi
+  done
+  docker image prune -f --filter label=app.octo.mornye=1 > /dev/null 2>&1 || true
+}
+
 echo
 bold "─── Starting stack ─────────────────────────────────────────"
-# Mornye (the spotiflac service) is not Octo's: one that cannot be built is
+# SPOTIFLAC_BUILD_REF once chose the Mornye commit compose built; nothing reads it now.
+if [ -n "$(existing SPOTIFLAC_BUILD_REF)" ]; then
+  yellow "  ⚠ SPOTIFLAC_BUILD_REF is no longer read; Octo's Mornye is 1.0.5. To run another Mornye, set SPOTIFLAC_IMAGE."
+fi
+# Mornye (the spotiflac service) is not Octo's: one whose image does not get ready is
 # left out, so Octo still starts. Without its profile this is the plain up -d it always was.
 case ",${COMPOSE_PROFILES// /}," in
   *,spotiflac,*)
     if docker compose build spotiflac || docker image inspect "$(docker compose config --images spotiflac | head -n 1)" > /dev/null 2>&1; then
       docker compose up -d
     else
-      yellow "  ⚠ Mornye (spotiflac) could not be built, so Octo starts without it. Run docker compose build spotiflac later."
+      yellow "  ⚠ Mornye (spotiflac) did not get ready, so Octo starts without it. Run docker compose build spotiflac later."
       read -r -a keep <<< "$({ docker compose config --services || true; } | { grep -vx spotiflac || true; } | tr '\n' ' ')"
       docker compose up -d "${keep[@]}"
     fi ;;
   *) docker compose up -d ;;
 esac
+remove_old_mornye
 
 # ─────────────────────────────────────────────────────────────────
 # Wait for Octo + verify each backend

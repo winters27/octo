@@ -12,27 +12,43 @@ mkdir -p "$work/bin" "$work/music"
 failures=0
 
 # docker only logs, and fails the pull of any service FAKE_NO_IMAGE names (no network to
-# ghcr.io) and the build of any FAKE_NO_BUILD names; its compose config lists FAKE_SERVICES. curl answers 200 to every status code probe and a Last.fm track to the key check,
+# ghcr.io) and the build of any FAKE_NO_BUILD names; its compose config lists FAKE_SERVICES, and
+# names the spotiflac service's image octo-mornye:2026.10.28 (FAKE_MORNYE_IMAGE another, none for
+# nothing). The local octo-mornye tags are FAKE_MORNYE_TAGS, and FAKE_IN_USE names ones a
+# container uses. curl answers 200 to every status code probe and a Last.fm track to the key check,
 # so each question takes the default and Octo looks healthy straight away; with
 # FAKE_SLOW_SLSKD=N, Octo's status says slskd is not ok for its first N answers, and with
 # FAKE_SONIC_DOWN it says octo-sonic is not ok (an empty music folder) every time.
 cat > "$work/bin/docker" <<EOF
 #!/usr/bin/env bash
 echo "docker \$*" >> "$work/docker.log"
-if [ "\$2" = pull ]; then
-  for service in \${FAKE_NO_IMAGE:-}; do [ "\$3" = "\$service" ] && exit 1; done
-fi
-if [ "\$2" = build ]; then
-  for service in \${FAKE_NO_BUILD:-}; do [ "\$3" = "\$service" ] && exit 1; done
-fi
-if [ "\$2" = config ] && [ "\$3" = --services ]; then
-  printf '%s\n' \${FAKE_SERVICES:-}
-fi
-if [ "\$2" = config ] && [ "\$3" = --images ] && [ "\$4" = spotiflac ]; then
-  echo octo-mornye:5660533bf12592e9de68508cef506f173f58d14f
+if [ "\$1" = compose ]; then
+  shift
+  # The global --profile flag comes before the verb.
+  while [ "\${1:-}" = --profile ]; do shift 2; done
+  if [ "\${1:-}" = pull ]; then
+    for service in \${FAKE_NO_IMAGE:-}; do [ "\${2:-}" = "\$service" ] && exit 1; done
+  fi
+  if [ "\${1:-}" = build ]; then
+    for service in \${FAKE_NO_BUILD:-}; do [ "\${2:-}" = "\$service" ] && exit 1; done
+  fi
+  if [ "\${1:-}" = config ] && [ "\${2:-}" = --services ]; then
+    printf '%s\n' \${FAKE_SERVICES:-}
+  fi
+  if [ "\${1:-}" = config ] && [ "\${2:-}" = --images ] && [ "\${3:-}" = spotiflac ]; then
+    image="\${FAKE_MORNYE_IMAGE-octo-mornye:2026.10.28}"
+    [ "\$image" = none ] || echo "\$image"
+  fi
+  exit 0
 fi
 if [ "\$1" = image ] && [ "\$2" = inspect ] && [ -n "\${FAKE_NO_LOCAL:-}" ]; then
   exit 1
+fi
+if [ "\$1" = image ] && [ "\$2" = ls ]; then
+  for image in \${FAKE_MORNYE_TAGS:-}; do echo "\$image"; done
+fi
+if [ "\$1" = image ] && [ "\$2" = rm ]; then
+  for image in \${FAKE_IN_USE:-}; do [ "\$3" = "\$image" ] && { echo "conflict: \$3 is in use" >&2; exit 1; }; done
 fi
 exit 0
 EOF
@@ -177,7 +193,7 @@ FAKE_NO_BUILD=spotiflac FAKE_NO_LOCAL=1 FAKE_SERVICES="octo octo-sonic slskd spo
   && pass "the installer finishes without a Mornye it cannot get" || fail "the installer stopped on Mornye"
 grep -qx 'docker compose up -d octo octo-sonic slskd yt-dlp-shim' "$work/docker.log" \
   && pass "Octo starts without Mornye when it can not be built" || fail "Octo was not started without Mornye: $(grep 'up -d' "$work/docker.log")"
-grep -q 'Mornye (spotiflac) could not be built' "$work/out.log" \
+grep -q 'Mornye (spotiflac) did not get ready, so Octo starts without it' "$work/out.log" \
   && pass "the installer says Mornye was left out" || fail "the installer did not say Mornye was left out"
 
 run
@@ -211,7 +227,8 @@ grep -qx 'LIDARR_COMPLETION_MODE=Accepted' "$work/octo/.env" && grep -qx 'SLSKD_
 fresh
 run
 expect_images "Octo and the sidecars are pulled, nothing is built" "octo yt-dlp-shim octo-sonic | "
-grep -q spotiflac "$work/docker.log" && fail "without its profile something asked about Mornye" || pass "without its profile nothing about Mornye runs"
+grep -Eq 'compose (build|pull) spotiflac|image inspect' "$work/docker.log" \
+  && fail "without its profile Mornye was got ready" || pass "without its profile Mornye is never got ready"
 grep -q 'compose up -d' "$work/docker.log" && pass "the stack is started" || fail "the stack was not started"
 FAKE_NO_IMAGE=octo run
 expect_images "Octo that will not pull is built from the folder" "octo yt-dlp-shim octo-sonic | octo-source"
@@ -289,6 +306,39 @@ printf 'SUBSONIC_URL=http://navidrome:4533\nDOWNLOAD_PATH=%s\nCOMPOSE_PROFILES=s
 run
 grep -qx 'COMPOSE_PROFILES=sonic,navidrome' "$work/octo/.env" \
   && pass "a starter stack keeps its profiles" || fail "starter profiles: $(grep COMPOSE_PROFILES "$work/octo/.env")"
+
+# Old Mornye images go once the stack starts, whether or not the spotiflac profile is on: every
+# octo-mornye tag but the one docker-compose.yml names, then the untagged ones Octo's builds left.
+MORNYE_103=octo-mornye:5660533bf12592e9de68508cef506f173f58d14f
+removed() { sed -n 's/^docker image rm //p' "$work/docker.log" | paste -sd ' ' -; }
+fresh
+FAKE_MORNYE_TAGS="$MORNYE_103 octo-mornye:2026.10.22 octo-mornye:2026.10.28" run \
+  && pass "the installer finishes while removing old Mornye images" || fail "the installer stopped removing old Mornye images"
+[ "$(removed)" = "$MORNYE_103 octo-mornye:2026.10.22" ] \
+  && pass "every octo-mornye tag but this release's is removed, without the profile too" || fail "removed: $(removed)"
+grep -qx 'docker image prune -f --filter label=app.octo.mornye=1' "$work/docker.log" \
+  && pass "untagged images Octo's Mornye builds left are pruned" || fail "the untagged Mornye images were not pruned"
+[ "$(grep -n -e '^docker compose up -d' -e '^docker image ls' "$work/docker.log" | cut -d: -f2- | head -n 1)" = "docker compose up -d" ] \
+  && pass "the removal comes after the stack starts" || fail "the removal came before the start"
+FAKE_MORNYE_TAGS="$MORNYE_103" FAKE_IN_USE="$MORNYE_103" run \
+  && pass "an old Mornye image still in use never stops the installer" || fail "an image in use stopped the installer"
+FAKE_MORNYE_TAGS="" run && [ -z "$(removed)" ] \
+  && pass "with no old Mornye images nothing is removed" || fail "with no old images: removed $(removed)"
+FAKE_MORNYE_IMAGE=none FAKE_MORNYE_TAGS="$MORNYE_103" run && ! grep -q '^docker image' "$work/docker.log" \
+  && pass "a compose file that names no Mornye removes nothing" || fail "it removed images without knowing the current one"
+
+# SPOTIFLAC_BUILD_REF is no longer read; a .env that sets it is told, and the line is kept.
+fresh
+printf 'SUBSONIC_URL=http://192.168.1.20:4533\nDOWNLOAD_PATH=%s\nSPOTIFLAC_BUILD_REF=5660533b\n' "$work/music" > "$work/octo/.env"
+run
+grep -q "SPOTIFLAC_BUILD_REF is no longer read; Octo's Mornye is 1.0.5. To run another Mornye, set SPOTIFLAC_IMAGE." "$work/out.log" \
+  && pass "a set SPOTIFLAC_BUILD_REF is said to be no longer read" || fail "the installer said nothing about SPOTIFLAC_BUILD_REF"
+grep -qx 'SPOTIFLAC_BUILD_REF=5660533b' "$work/octo/.env" \
+  && pass "and its line stays in .env" || fail "the SPOTIFLAC_BUILD_REF line was dropped"
+printf 'SUBSONIC_URL=http://192.168.1.20:4533\nDOWNLOAD_PATH=%s\nSPOTIFLAC_BUILD_REF=\n' "$work/music" > "$work/octo/.env"
+run
+grep -q 'SPOTIFLAC_BUILD_REF' "$work/out.log" \
+  && fail "a blank SPOTIFLAC_BUILD_REF was mentioned" || pass "a blank SPOTIFLAC_BUILD_REF is not mentioned"
 
 echo
 [ "$failures" = 0 ] && echo "All installer tests passed." || echo "$failures installer test(s) failed."
