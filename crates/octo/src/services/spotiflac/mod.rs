@@ -189,6 +189,8 @@ impl SpotiflacClient {
         if let Some(view) = self.check.cached(&connection, after) {
             return Some(view);
         }
+        // Each fresh read first cancels a song job a stopped Pass run left at Mornye.
+        self.cancel_left_pass_job().await;
         let started = Instant::now();
         let read_utc = chrono::Utc::now();
         let bound = self.check.times.call_bound;
@@ -464,14 +466,25 @@ impl SpotiflacClient {
 
     /// `POST /api/v1/downloads/{id}/cancel`. A failure is only logged: the job folder is
     /// removed either way.
-    pub async fn cancel(&self, connection: &Connection, id: &str) {
+    /// Asks Mornye to cancel job `id`. Answers whether Mornye answered at all: a job it no
+    /// longer runs answers with an error, and needs no cancel again.
+    pub async fn cancel(&self, connection: &Connection, id: &str) -> bool {
         let request = self.request(
             connection,
             reqwest::Method::POST,
             &format!("/api/v1/downloads/{}/cancel", escape_data_string(id)),
         );
-        if let Err(e) = self.send::<serde_json::Value>(connection, request).await {
-            tracing::debug!("Mornye did not cancel job {id}: {e}");
+        match reach(connection, request).await {
+            Ok(response) => {
+                if let Err(e) = read_answer::<serde_json::Value>(connection, response).await {
+                    tracing::debug!("Mornye did not cancel job {id}: {e}");
+                }
+                true
+            }
+            Err(e) => {
+                tracing::debug!("Mornye did not cancel job {id}: {e}");
+                false
+            }
         }
     }
 

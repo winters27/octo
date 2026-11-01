@@ -1,7 +1,7 @@
 //! The songs asked to be found in higher quality (`<config>/upgrades.json`), the worker that runs
 //! them, and `AudioSummary`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -142,8 +142,13 @@ pub struct UpgradeJob {
 pub struct MornyeHold {
     #[serde(default = "datetime::min_value", with = "datetime::utc")]
     pub until_utc: DateTime<Utc>,
+    /// The checks whose passing lets the job go early.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// The checks it shares with other held jobs, when they are not `labels` (see
+    /// `CheckPause::holding`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holding: Vec<String>,
 }
 
 impl MornyeHold {
@@ -151,13 +156,32 @@ impl MornyeHold {
         MornyeHold {
             until_utc: pause.until_utc,
             labels: pause.labels.clone(),
+            holding: pause.holding.clone(),
         }
     }
 
+    /// A hold Octo knows only the end of.
+    pub fn until(until_utc: DateTime<Utc>) -> MornyeHold {
+        MornyeHold {
+            until_utc,
+            labels: Vec::new(),
+            holding: Vec::new(),
+        }
+    }
+
+    fn shared(&self) -> &[String] {
+        if self.holding.is_empty() {
+            &self.labels
+        } else {
+            &self.holding
+        }
+    }
+
+    /// Whether the two wait on a check in common. A hold that names no check at all may wait on
+    /// any of them.
     fn shares_a_check(&self, other: &MornyeHold) -> bool {
-        self.labels.is_empty()
-            || other.labels.is_empty()
-            || self.labels.iter().any(|label| other.labels.contains(label))
+        let (mine, theirs) = (self.shared(), other.shared());
+        mine.is_empty() || theirs.is_empty() || mine.iter().any(|label| theirs.contains(label))
     }
 }
 
@@ -510,17 +534,23 @@ impl UpgradeQueue {
     }
 
     /// Sends back the jobs Mornye's check kept that may try again, from the queue as it is now:
-    /// each in `passing` (a read showed its checks passing), and, unless the job sent back alone
-    /// is still queued or running, the oldest whose pause has ended by `now`, marked as that one
-    /// (the scout). One lock: a scout that finished while the checks were read, and moved the
-    /// others' pause, is seen here. Answers how many went back.
-    pub fn release_mornye(&self, passing: &HashSet<String>, now: DateTime<Utc>) -> usize {
+    /// each in `passing` (a read showed the checks of that hold passing) whose hold is still the
+    /// one the read judged, and, unless the job sent back alone is still queued or running, the
+    /// oldest whose pause has ended by `now`, marked as that one (the scout). One lock: a scout
+    /// that finished while the checks were read, and moved the others' pause, is seen here.
+    /// Answers how many went back.
+    pub fn release_mornye(&self, passing: &HashMap<String, MornyeHold>, now: DateTime<Utc>) -> usize {
         let mut jobs = self.jobs.lock();
+        let passes = |job: &UpgradeJob| {
+            passing
+                .get(&job.navidrome_id)
+                .is_some_and(|judged| job.mornye_hold.as_ref() == Some(judged))
+        };
         let scout = if Self::scout_on_its_way(&jobs) {
             None
         } else {
             jobs.values()
-                .filter(|job| Self::kept_by_mornye(job) && !passing.contains(&job.navidrome_id))
+                .filter(|job| Self::kept_by_mornye(job) && !passes(job))
                 .filter(|job| {
                     job.mornye_hold
                         .as_ref()
@@ -538,7 +568,7 @@ impl UpgradeQueue {
         let mut count = 0;
         for job in jobs.values_mut() {
             let is_scout = scout.as_deref() == Some(job.navidrome_id.as_str());
-            if Self::kept_by_mornye(job) && (is_scout || passing.contains(&job.navidrome_id)) {
+            if Self::kept_by_mornye(job) && (is_scout || passes(job)) {
                 job.state = UpgradeStates::QUEUED.to_string();
                 job.wait = None;
                 job.mornye_hold = None;
@@ -561,10 +591,10 @@ impl UpgradeQueue {
             .filter(|job| job.state == UpgradeStates::WAITING)
             .filter(|job| job.wait.as_deref() == Some(LibraryActionCodes::MORNYE_KEPT))
             .map(|job| {
-                let hold = job.mornye_hold.clone().unwrap_or(MornyeHold {
-                    until_utc: job.updated_utc,
-                    labels: Vec::new(),
-                });
+                let hold = job
+                    .mornye_hold
+                    .clone()
+                    .unwrap_or_else(|| MornyeHold::until(job.updated_utc));
                 (job.queued_utc, job.navidrome_id.clone(), hold)
             })
             .collect();
@@ -850,11 +880,12 @@ impl UpgradeWorker {
         started
     }
 
-    /// The jobs Mornye's check kept whose checks a read shows passing now. Which of the others
-    /// goes back alone once its pause ends is decided by the queue as it stands after this read.
-    async fn mornye_passing(&self) -> HashSet<String> {
+    /// The jobs Mornye's check kept whose checks a read shows passing now, each with the hold the
+    /// read judged. Which of the others goes back alone once its pause ends is decided by the
+    /// queue as it stands after this read.
+    async fn mornye_passing(&self) -> HashMap<String, MornyeHold> {
         let holds = self.queue.mornye_holds();
-        let mut released = HashSet::new();
+        let mut released = HashMap::new();
         if holds.is_empty() {
             return released;
         }
@@ -874,7 +905,7 @@ impl UpgradeWorker {
                 }
             };
             if pass {
-                released.insert(id.clone());
+                released.insert(id.clone(), hold.clone());
             }
         }
         released

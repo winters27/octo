@@ -103,31 +103,45 @@ impl CheckView {
         Some(CheckPause {
             until_utc: until,
             labels,
+            holding: Vec::new(),
         })
     }
+}
 
-    /// The checks a wait read from Mornye's own words names: the rows holding extension
-    /// `provider` that are not working in this read, so only a change after the wait (one of them
-    /// passing) lets it go early. None when every row holding it already works: that read cannot
-    /// tell a pass, so the wait lasts until its own end. The extension's id when no row holds it,
-    /// which a later read's rows can still name.
-    pub fn labels_of(&self, provider: &str) -> Vec<String> {
-        let id = octo_core::spotiflac::check::extension_id(provider);
-        let Some(rows) = self.rows.known() else {
-            return vec![id];
+/// A wait read from Mornye's own words for extension `provider`, until `until`, beside `view`
+/// (None when Octo could not read Mornye's check). It watches the rows holding the extension that
+/// are not working in that read, so only a change after the wait (one of them passing) lets it
+/// go early; none when every one already works (that read cannot tell a pass, so the wait lasts
+/// until its own end). It shares every row holding the extension with other waits. With no row
+/// holding it, the extension's id, which a later read's rows can still name.
+pub fn words_pause(view: Option<&CheckView>, provider: &str, until: DateTime<Utc>) -> CheckPause {
+    let id = octo_core::spotiflac::check::extension_id(provider);
+    let holding: Vec<&CheckRow> = view
+        .and_then(|view| view.rows.known())
+        .map(|rows| rows.iter().filter(|row| row.extensions.contains(&id)).collect())
+        .unwrap_or_default();
+    if holding.is_empty() {
+        return CheckPause {
+            until_utc: until,
+            labels: vec![id],
+            holding: Vec::new(),
         };
-        let holding: Vec<&CheckRow> = rows.iter().filter(|row| row.extensions.contains(&id)).collect();
-        if holding.is_empty() {
-            return vec![id];
-        }
-        let mut labels: Vec<String> = holding
-            .iter()
-            .filter(|row| !row.working())
-            .map(|row| row.label.clone())
-            .collect();
+    }
+    let sorted = |mut labels: Vec<String>| {
         labels.sort();
         labels.dedup();
         labels
+    };
+    CheckPause {
+        until_utc: until,
+        labels: sorted(
+            holding
+                .iter()
+                .filter(|row| !row.working())
+                .map(|row| row.label.clone())
+                .collect(),
+        ),
+        holding: sorted(holding.iter().map(|row| row.label.clone()).collect()),
     }
 }
 
@@ -160,6 +174,19 @@ pub struct CheckFile {
     #[serde(flatten)]
     pub episodes: Episodes,
     pub check_songs: Vec<CheckSong>,
+    /// The song job a Pass run asked Mornye for, until the run has cancelled it. A run Octo
+    /// stopped following (a restart) leaves it here, and the next look at Mornye cancels it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass_job: Option<PassJob>,
+}
+
+/// A Pass run's song job at Mornye: the address it was asked at, its id and its folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PassJob {
+    pub url: String,
+    pub id: String,
+    pub dir: String,
 }
 
 /// `mornye-check.json`: Mornye's episodes and check songs. A missing, damaged or unwritable file
@@ -276,6 +303,31 @@ impl MornyeCheckStore {
     /// Since when the check of any of `labels` has not passed.
     pub fn since(&self, labels: &[String]) -> Option<DateTime<Utc>> {
         self.state.lock().episodes.since(labels)
+    }
+
+    /// The song job a Pass run asked Mornye for and has not cancelled yet, if any.
+    pub fn pass_job(&self) -> Option<PassJob> {
+        self.state.lock().pass_job.clone()
+    }
+
+    /// Keeps the song job a Pass run just asked Mornye for.
+    pub fn keep_pass_job(&self, job: PassJob) {
+        self.update(|state| {
+            let changed = state.pass_job.as_ref() != Some(&job);
+            state.pass_job = Some(job);
+            ((), changed)
+        })
+    }
+
+    /// Forgets `job` once it is cancelled, unless another has been kept since.
+    pub fn forget_pass_job(&self, job: &PassJob) {
+        self.update(|state| {
+            let same = state.pass_job.as_ref() == Some(job);
+            if same {
+                state.pass_job = None;
+            }
+            ((), same)
+        })
     }
 }
 

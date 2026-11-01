@@ -330,12 +330,12 @@ test('a reload is the same tab on a new page; a duplicated tab is a tab of its o
 
   // A reload: the page leaves (its mark cleared), the next load finds the tab.
   passViewerShown(store, first, false);
-  const reloaded = passViewer(store, () => 'page-again');
+  const reloaded = passViewer(store, () => 'page-again', true);
   assert.deepEqual(reloaded, { tab: first.tab, page: 'page-again' });
 
-  // Duplicate tab while this one is open: the copy finds the mark still set.
+  // Duplicate tab while this one is open: the copy finds the mark still set, even as a reload.
   const copy = store.copy();
-  const duplicated = passViewer(copy, () => 'other');
+  const duplicated = passViewer(copy, () => 'other', true);
   assert.notEqual(duplicated.tab, reloaded.tab);
   // The first tab keeps its own name.
   assert.equal(store.getItem('octo.passTab'), reloaded.tab);
@@ -343,7 +343,14 @@ test('a reload is the same tab on a new page; a duplicated tab is a tab of its o
   // Brought back from the browser's page cache: the mark is set again.
   passViewerShown(store, reloaded, false);
   passViewerShown(store, reloaded, true);
-  assert.notEqual(passViewer(store.copy(), () => 'third').tab, reloaded.tab);
+  assert.notEqual(passViewer(store.copy(), () => 'third', true).tab, reloaded.tab);
+});
+
+test('a load that is not a reload takes a tab of its own, even with a stored name and no mark', () => {
+  // A tab copied while it showed another site, then Back in it: the stored name, no mark.
+  const store = memoryStore({ 'octo.passTab': 'shared-tab' });
+  assert.notEqual(passViewer(store, () => 'fresh').tab, 'shared-tab');
+  assert.equal(store.getItem('octo.passTab'), 'fresh');
 });
 
 test('a blocked store still names the tab and page', () => {
@@ -406,12 +413,15 @@ test('a Close while a Pass waits for the stop before it ends that Pass before it
     return Promise.resolve({ run: 'run-new', state: 'opening' });
   };
   const line = passCalls(send, { tab: 't', page: 'p' });
-  line.stop();
+  // The panel's Close, as closePass sends it: only a stop the page owes.
+  const close = () => { if (line.owesStop()) line.stop(); };
+  await line.start();
+  close();
   const starting = line.start();
-  line.stop();
+  close();
   answerFirstStop({});
   const answer = await starting;
-  assert.deepEqual(sent.map(([call]) => call), ['stop', 'stop'], 'no start goes out after the stops');
+  assert.deepEqual(sent.map(([call]) => call), ['start', 'stop', 'stop'], 'no start goes out after the stops');
   assert.equal(answer.started, false);
   assert.equal(line.owesStop(), false);
 });
@@ -442,9 +452,12 @@ test('leaving clears the tab mark and closes an open panel; coming back from the
   const viewer = passViewer(store, ids());
   const target = new EventTarget();
   let open = true;
+  let owed = false;
   let closes = 0;
   let n = 0;
-  passLifecycle(target, { store, viewer, makeId: () => `new-${++n}`, isOpen: () => open, close: () => { closes += 1; } });
+  passLifecycle(target, {
+    store, viewer, makeId: () => `new-${++n}`, isOpen: () => open, owesStop: () => owed, close: () => { closes += 1; },
+  });
   const before = viewer.tab;
 
   target.dispatchEvent(new Event('pagehide'));
@@ -452,7 +465,10 @@ test('leaving clears the tab mark and closes an open panel; coming back from the
   assert.equal(closes, 1);
   open = false;
   target.dispatchEvent(new Event('pagehide'));
-  assert.equal(closes, 1, 'a closed panel sends nothing');
+  assert.equal(closes, 1, 'a closed panel that owes nothing sends nothing');
+  owed = true;
+  target.dispatchEvent(new Event('pagehide'));
+  assert.equal(closes, 2, 'a start that still owes its stop gets it as the page leaves');
 
   // A fresh load's pageshow changes nothing.
   target.dispatchEvent(new Event('pageshow'));

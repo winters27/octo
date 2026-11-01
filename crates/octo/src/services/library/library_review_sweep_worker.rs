@@ -1682,10 +1682,7 @@ impl LibraryReviewSweepWorker {
                         .mornye_wait
                         .as_deref()
                         .map(MornyeHold::of)
-                        .unwrap_or(MornyeHold {
-                            until_utc: now,
-                            labels: Vec::new(),
-                        });
+                        .unwrap_or_else(|| MornyeHold::until(now));
                     self.mornye_holds.lock().insert(path.to_string(), hold);
                     return Replacing::SkipsForMornye;
                 }

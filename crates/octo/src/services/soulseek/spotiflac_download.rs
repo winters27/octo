@@ -760,15 +760,13 @@ impl SoulseekDownloadService {
                 .and_then(|row| octo_core::spotiflac::check::next_try_from_words(&row.last_error, now))
         });
         if let Some(until) = paused_words {
-            let labels = provider
-                .map(|name| match &view {
-                    Some(view) => view.labels_of(name),
-                    None => vec![octo_core::spotiflac::check::extension_id(name)],
-                })
-                .unwrap_or_default();
-            let pause = octo_core::spotiflac::check::CheckPause {
-                until_utc: until,
-                labels,
+            let pause = match provider {
+                Some(name) => crate::services::spotiflac::check::words_pause(view.as_deref(), name, until),
+                None => octo_core::spotiflac::check::CheckPause {
+                    until_utc: until,
+                    labels: Vec::new(),
+                    holding: Vec::new(),
+                },
             };
             return Explained::Waiting(MornyeWaiting::new(pause, true, now));
         }

@@ -71,6 +71,7 @@ mod tests {
         CheckPause {
             until_utc: Utc.with_ymd_and_hms(2026, 10, 30, 14, 5, 0).unwrap(),
             labels: vec!["example-ext".into()],
+            holding: Vec::new(),
         }
     }
 

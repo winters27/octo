@@ -615,6 +615,7 @@ fn kept_by_mornye() -> anyhow::Error {
     let pause = octo_core::spotiflac::check::CheckPause {
         until_utc: chrono::Utc::now() + chrono::Duration::minutes(15),
         labels: vec!["Example".into()],
+        holding: Vec::new(),
     };
     crate::services::spotiflac::MornyeWaiting::new(pause, false, chrono::Utc::now()).into_error()
 }

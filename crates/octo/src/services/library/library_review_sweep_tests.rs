@@ -1069,6 +1069,7 @@ impl SweepReplacer for FakeReplacer {
                     Box::new(octo_core::spotiflac::check::CheckPause {
                         until_utc: chrono::Utc::now() + chrono::Duration::days(30),
                         labels: vec!["Example".into()],
+                        holding: Vec::new(),
                     })
                 }),
                 ..LibraryActionOutcome::new(*self.state.lock(), Some("done".into()))

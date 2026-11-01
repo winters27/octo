@@ -379,6 +379,7 @@ async fn a_kept_song_is_passed_over_so_the_next_run_tries_the_next_song() {
                         mornye_wait: Some(Box::new(octo_core::spotiflac::check::CheckPause {
                             until_utc: until,
                             labels: vec!["Example".into()],
+                            holding: Vec::new(),
                         })),
                         ..LibraryActionOutcome::new(
                             LibraryActionState::Failed,
@@ -424,6 +425,7 @@ fn the_weekly_runs_holds_survive_a_restart() {
     let hold = MornyeHold {
         until_utc: chrono::Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap(),
         labels: vec!["Example".into()],
+        holding: vec!["Example".into(), "Example two".into()],
     };
     state.mornye_holds.set("A/a.mp3".to_string(), hold.clone());
     let text = serde_json::to_string(&state).expect("writes");

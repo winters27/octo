@@ -585,10 +585,7 @@ impl QualityUpgradeWorker {
                 .mornye_wait
                 .as_deref()
                 .map(MornyeHold::of)
-                .unwrap_or(MornyeHold {
-                    until_utc: seams.clock.now(),
-                    labels: Vec::new(),
-                });
+                .unwrap_or_else(|| MornyeHold::until(seams.clock.now()));
             let key = Self::key_of(&pick);
             self.store.update(|s| {
                 s.last_outcome = Some("Waiting for Mornye's check".to_string());

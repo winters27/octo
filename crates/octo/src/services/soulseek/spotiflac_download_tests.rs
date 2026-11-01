@@ -967,6 +967,8 @@ async fn a_wait_from_mornyes_words_is_not_let_go_by_the_working_read_it_was_made
 
     let wait = mornye_waited(&error).expect("a Mornye wait");
     assert!(wait.pause.labels.is_empty(), "{:?}", wait.pause.labels);
+    // It still shares the extension's gateway with other waits on it.
+    assert_eq!(wait.pause.holding, vec!["Example".to_string()]);
     // The same working read, asked again as a waiting job asks it each tick: not a pass.
     assert!(!fetch.spotiflac.checks_pass(&wait.pause.labels).await);
 }

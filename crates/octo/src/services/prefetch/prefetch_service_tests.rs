@@ -103,6 +103,7 @@ impl IDownloadService for AheadDownloads {
             let pause = octo_core::spotiflac::check::CheckPause {
                 until_utc: Utc::now() + Duration::minutes(15),
                 labels: vec!["Example".into()],
+                holding: Vec::new(),
             };
             return Err(crate::services::spotiflac::MornyeWaiting::new(pause, true, Utc::now()).into_error());
         }

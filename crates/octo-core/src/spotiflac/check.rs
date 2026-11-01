@@ -204,7 +204,23 @@ pub fn usable(setting: &[String], services: &Reading<Vec<ServiceRow>>) -> BTreeS
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckPause {
     pub until_utc: DateTime<Utc>,
+    /// The checks whose passing lets the wait go early.
     pub labels: Vec<String>,
+    /// The checks other waits on the same extensions share, when they are not `labels`: a wait
+    /// read from Mornye's own words beside a read that shows those checks working names none to
+    /// watch, yet shares the checks that hold its extension. Empty when they are `labels`.
+    pub holding: Vec<String>,
+}
+
+impl CheckPause {
+    /// The checks this wait shares with other waits.
+    pub fn shared(&self) -> &[String] {
+        if self.holding.is_empty() {
+            &self.labels
+        } else {
+            &self.holding
+        }
+    }
 }
 
 /// Whether Mornye's check keeps every usable extension at `now`. None when Octo cannot tell, when
@@ -231,6 +247,7 @@ pub fn paused_for(
     Some(CheckPause {
         until_utc: until?,
         labels: labels.into_iter().filter(|label| !label.is_empty()).collect(),
+        holding: Vec::new(),
     })
 }
 

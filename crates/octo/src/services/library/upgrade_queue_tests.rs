@@ -153,6 +153,7 @@ fn kept_on(label: &str, until: chrono::DateTime<chrono::Utc>) -> LibraryActionOu
         mornye_wait: Some(Box::new(octo_core::spotiflac::check::CheckPause {
             until_utc: until,
             labels: vec![label.to_string()],
+            holding: Vec::new(),
         })),
         ..outcome(LibraryActionState::Failed, "Waiting for Mornye's check.")
     }
@@ -440,8 +441,8 @@ async fn a_restart_while_a_scout_is_on_its_way_sends_no_second_one() {
             job.state = UpgradeStates::WAITING.to_string();
             job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
             job.mornye_hold = Some(MornyeHold {
-                until_utc: ended,
                 labels: vec!["A".to_string()],
+                ..MornyeHold::until(ended)
             });
         });
     }
@@ -487,8 +488,8 @@ fn a_finished_run_moves_the_holds_it_shares_a_check_with_and_leaves_the_rest() {
             job.state = UpgradeStates::WAITING.to_string();
             job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
             job.mornye_hold = Some(MornyeHold {
-                until_utc: early,
                 labels: vec![label.to_string()],
+                ..MornyeHold::until(early)
             });
         });
     }
@@ -498,8 +499,8 @@ fn a_finished_run_moves_the_holds_it_shares_a_check_with_and_leaves_the_rest() {
         job.state = UpgradeStates::WAITING.to_string();
         job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
         job.mornye_hold = Some(MornyeHold {
-            until_utc: later,
             labels: vec!["A".to_string()],
+            ..MornyeHold::until(later)
         });
     });
 
@@ -521,10 +522,41 @@ fn hold_on(queue: &UpgradeQueue, id: &str, label: &str, until: chrono::DateTime<
         job.state = UpgradeStates::WAITING.to_string();
         job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
         job.mornye_hold = Some(MornyeHold {
-            until_utc: until,
             labels: vec![label.to_string()],
+            ..MornyeHold::until(until)
         });
     });
+}
+
+#[test]
+fn a_wait_read_from_mornyes_words_moves_the_holds_on_its_extensions_checks_only() {
+    let queue = UpgradeQueue::new();
+    queue.add(asks(&["a", "b", "c"]), "alice", "app");
+    let early = Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap();
+    let later = Utc.with_ymd_and_hms(2026, 11, 1, 13, 0, 0).unwrap();
+    hold_on(&queue, "b", "Qobuz", early);
+    hold_on(&queue, "c", "Tidal", early);
+
+    // Mornye's words kept a's song on the Qobuz extension while its gateway read as working:
+    // nothing to watch, but it shares Qobuz's check.
+    queue.finish_run("a", |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+        job.mornye_hold = Some(MornyeHold {
+            holding: vec!["Qobuz".to_string()],
+            ..MornyeHold::until(later)
+        });
+    });
+
+    let jobs = queue.snapshot();
+    let hold = |id: &str| {
+        jobs.iter()
+            .find(|job| job.navidrome_id == id)
+            .and_then(|job| job.mornye_hold.as_ref())
+            .map(|hold| hold.until_utc)
+    };
+    assert_eq!(hold("b"), Some(later), "b waits on the same check");
+    assert_eq!(hold("c"), Some(early), "Tidal's own pause is left alone");
 }
 
 #[test]
@@ -535,7 +567,13 @@ fn one_ended_job_goes_back_as_the_scout_and_passing_ones_go_back_unmarked() {
     hold_on(&queue, "a", "A", now - chrono::Duration::seconds(1));
     hold_on(&queue, "b", "A", now - chrono::Duration::seconds(1));
     hold_on(&queue, "c", "B", now + chrono::Duration::minutes(30));
-    let passing: HashSet<String> = ["c".to_string()].into();
+    let judged = queue
+        .snapshot()
+        .into_iter()
+        .find(|job| job.navidrome_id == "c")
+        .and_then(|job| job.mornye_hold)
+        .expect("c's hold");
+    let passing: HashMap<String, MornyeHold> = [("c".to_string(), judged)].into();
 
     assert_eq!(queue.release_mornye(&passing, now), 2);
     let jobs = queue.snapshot();
@@ -556,8 +594,57 @@ fn one_ended_job_goes_back_as_the_scout_and_passing_ones_go_back_unmarked() {
     assert_eq!(job("b").state, UpgradeStates::WAITING);
 
     // While a is on its way, b's ended pause sends nothing more.
-    assert_eq!(queue.release_mornye(&HashSet::new(), now), 0);
+    assert_eq!(queue.release_mornye(&HashMap::new(), now), 0);
     assert!(queue.mornye_scout_on_its_way());
+}
+
+#[tokio::test]
+async fn a_pass_read_before_a_hold_moved_does_not_let_that_job_go() {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a", "b"]), "alice", "app");
+    let next = Utc::now() + chrono::Duration::minutes(45);
+    queue.update("a", |job| {
+        job.state = UpgradeStates::WORKING.to_string();
+        job.mornye_scout = true;
+    });
+    hold_on(&queue, "b", "A", Utc::now() + chrono::Duration::minutes(5));
+    // The read says A passes, and while it is read a's try comes back held on A's new pause.
+    let finishing = queue.clone();
+    let passed: ChecksPassFn = Arc::new(move |_| {
+        finishing.finish_run("a", |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(MornyeHold {
+                labels: vec!["A".to_string()],
+                ..MornyeHold::until(next)
+            });
+        });
+        async { true }.boxed()
+    });
+    let tries = Arc::new(AtomicUsize::new(0));
+    let tried = tries.clone();
+    let apply: Apply = Arc::new(move |_| {
+        tried.fetch_add(1, Ordering::SeqCst);
+        async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed()
+    });
+    let worker = Arc::new(UpgradeWorker::with_seams(
+        queue.clone(),
+        seams_with_mornye(2, apply, Arc::default(), passed),
+        None,
+        None,
+        None,
+    ));
+
+    worker.tick(&CancellationToken::new()).await;
+    worker.drain().await;
+
+    assert_eq!(tries.load(Ordering::SeqCst), 0, "b's hold changed after the read");
+    let b = queue
+        .snapshot()
+        .into_iter()
+        .find(|job| job.navidrome_id == "b")
+        .expect("b");
+    assert_eq!(b.state, UpgradeStates::WAITING);
 }
 
 #[tokio::test]
@@ -579,8 +666,8 @@ async fn a_scout_that_finishes_while_the_checks_are_read_sends_no_second_one_on_
             job.state = UpgradeStates::WAITING.to_string();
             job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
             job.mornye_hold = Some(MornyeHold {
-                until_utc: next,
                 labels: vec!["A".to_string()],
+                ..MornyeHold::until(next)
             });
         });
         async { false }.boxed()
@@ -636,8 +723,9 @@ fn a_kept_jobs_hold_and_scout_mark_survive_a_restart() {
     let path = dir.path().join("upgrades.json");
     let until = Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap();
     let hold = MornyeHold {
-        until_utc: until,
         labels: vec!["A".to_string()],
+        holding: vec!["A".to_string(), "A two".to_string()],
+        ..MornyeHold::until(until)
     };
     {
         let before = UpgradeQueue::with_path(Some(path.clone()));

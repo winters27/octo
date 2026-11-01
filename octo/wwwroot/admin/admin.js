@@ -3555,18 +3555,19 @@ function passInputQueue(send, { now = () => Date.now(), sleep = ms => new Promis
 const PASS_TAB_KEY = 'octo.passTab';
 const PASS_TAB_OPEN_KEY = 'octo.passTabOpen';
 
-// Which tab and page this load is, as Octo counts the pages on a Pass run. The tab is kept in
-// sessionStorage, so a reload is the same tab and takes its old seat back; the page is new on
-// every load, so a stop sent by the page before never gives up the seat of the page after it.
-// While a page of the tab is open its mark is set, and leaving clears it: a tab that starts with
-// the mark set was copied from an open one (Duplicate tab copies sessionStorage) and takes a tab
-// of its own.
-function passViewer(store, makeId) {
+// Which tab and page this load is, as Octo counts the pages on a Pass run. A reload (`reload`)
+// keeps the tab kept in sessionStorage, so it takes its old seat back; any other load (a new
+// visit, Back or Forward, a copied tab) takes a tab of its own, since another tab may carry the
+// same stored name. The page is new on every load, so a stop sent by the page before never gives
+// up the seat of the page after it. While a page of the tab is open its mark is set, and leaving
+// clears it: a reload that finds the mark set was copied from an open tab (Duplicate tab copies
+// sessionStorage) and takes a tab of its own too.
+function passViewer(store, makeId, reload = false) {
   const page = makeId();
   let tab = null;
   try {
     const kept = store.getItem(PASS_TAB_KEY);
-    tab = kept && store.getItem(PASS_TAB_OPEN_KEY) !== kept ? kept : makeId();
+    tab = reload && kept && store.getItem(PASS_TAB_OPEN_KEY) !== kept ? kept : makeId();
     store.setItem(PASS_TAB_KEY, tab);
     store.setItem(PASS_TAB_OPEN_KEY, tab);
   } catch {
@@ -3585,13 +3586,14 @@ function passViewerShown(store, viewer, shown) {
 }
 
 // What the page does as it leaves and comes back. Leaving: its tab's open mark goes (so a reload
-// finds the same tab), and an open panel closes, its stop sent by the leaving sender. Brought back
-// from the browser's page cache: its seat went as it left and a copy of this tab may hold the old
-// name, so it takes a tab of its own and marks it open.
-function passLifecycle(target, { store, viewer, makeId, isOpen, close }) {
+// finds the same tab), and an open panel, or a start that still owes its stop, closes with the
+// stop sent by the leaving sender. Brought back from the browser's page cache: its seat went as it
+// left and a copy of this tab may hold the old name, so it takes a tab of its own and marks it
+// open.
+function passLifecycle(target, { store, viewer, makeId, isOpen, owesStop, close }) {
   target.addEventListener('pagehide', () => {
     passViewerShown(store, viewer, false);
-    if (isOpen()) close();
+    if (isOpen() || owesStop()) close();
   });
   target.addEventListener('pageshow', event => {
     if (!event.persisted) return;
@@ -3614,13 +3616,14 @@ function passCalls(send, viewer) {
   let owed = false;
   return {
     async start() {
+      // Owed from the moment it is asked, so a Close while it waits stops it.
+      owed = true;
       const entered = turn;
       const before = stopping;
       stopping = null;
       if (before) await before;
       if (turn !== entered) return { started: false, stopped: true };
       const asked = ++turn;
-      owed = true;
       let answer;
       try {
         answer = await send('start', { tab: viewer.tab, page: viewer.page });
@@ -3733,7 +3736,16 @@ const passEl = id => document.getElementById(id);
 let passStore = null;
 try { passStore = window.sessionStorage; } catch { /* a blocked store: each load is its own tab */ }
 const passId = () => Array.from(crypto.getRandomValues(new Uint8Array(12)), b => b.toString(16).padStart(2, '0')).join('');
-const passPage = passViewer(passStore, passId);
+// How this page was loaded, from the browser's own navigation entry.
+const passReloaded = (() => {
+  try {
+    const entry = performance.getEntriesByType?.('navigation')?.[0];
+    return entry ? entry.type === 'reload' : performance.navigation?.type === 1;
+  } catch {
+    return false;
+  }
+})();
+const passPage = passViewer(passStore, passId, passReloaded);
 
 async function passSend(call, body) {
   const r = await api(`/api/admin/spotiflac/assist/${call}`, {
@@ -3762,6 +3774,7 @@ passLifecycle(window, {
   viewer: passPage,
   makeId: passId,
   isOpen: () => passState.open,
+  owesStop: () => passLine.owesStop(),
   close: () => closePass(passLeaveSend),
 });
 

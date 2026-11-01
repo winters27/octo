@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
 
+use super::check::PassJob;
 use super::{CheckSong, Connection, SPOTIFLAC_FOLDER, SpotiflacClient, TOKEN_COOKIES, make_shared_folder};
 
 /// How often a run looks at Mornye, its helper and the song's job.
@@ -199,7 +200,7 @@ struct EndsTheRun {
     /// The song's job folder, once made.
     dir: Option<String>,
     /// The song's job at Mornye, once it took one Octo can cancel.
-    job: Option<String>,
+    job: Option<PassJob>,
 }
 
 impl EndsTheRun {
@@ -218,6 +219,8 @@ impl Drop for EndsTheRun {
         if self.run.finished() {
             return;
         }
+        // A Pass from now on waits for this run to end and opens a new one.
+        self.run.stop.cancel();
         if let Some(dir) = self.dir.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
@@ -228,17 +231,42 @@ impl Drop for EndsTheRun {
             );
             return;
         };
-        // Holds no job of its own, so dropping it ends the run.
+        // Holds no job of its own, so dropping it ends the run. A job whose cancel goes unanswered,
+        // or never goes, stays kept for the next look at Mornye to cancel.
         let ends = EndsTheRun::new(&self.run, &self.client);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    ends.client.cancel(&ends.run.connection, &job).await;
+                    if ends.client.cancel(&ends.run.connection, &job.id).await {
+                        ends.client.check.store.forget_pass_job(&job);
+                    }
                     drop(ends);
                 });
             }
             Err(_) => drop(ends),
         }
+    }
+}
+
+impl SpotiflacClient {
+    /// Cancels the song job a Pass run left at Mornye when Octo stopped following it (a
+    /// restart), and removes its folder, unless a run is still on it. A Mornye that does not
+    /// answer keeps the job for the next look; one now at another address cannot be asked, so
+    /// the job is let go.
+    pub(super) async fn cancel_left_pass_job(&self) {
+        let Some(left) = self.check.store.pass_job() else {
+            return;
+        };
+        if self.assist.run.lock().as_ref().is_some_and(|run| !run.finished()) {
+            return;
+        }
+        let connection = Connection::of(&self.settings());
+        if connection.url == left.url && !self.cancel(&connection, &left.id).await {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&left.dir);
+        self.check.store.forget_pass_job(&left);
+        info!("Pass Mornye's check: cancelled the song job a stopped run left at Mornye");
     }
 }
 
@@ -254,6 +282,9 @@ pub struct Assist {
     tried: Mutex<BTreeSet<String>>,
     /// One start at a time: a second start waits, then answers the run the first one made.
     starting: tokio::sync::Mutex<()>,
+    /// Tests stop the follower partway, right after Mornye took the song.
+    #[cfg(test)]
+    stop_after_queue: AtomicBool,
 }
 
 impl SpotiflacClient {
@@ -525,11 +556,23 @@ impl SpotiflacClient {
             }
         };
         if job.is_pollable() {
-            ends.job = Some(job.id.clone());
+            let kept = PassJob {
+                url: run.connection.url.clone(),
+                id: job.id.clone(),
+                dir: job_dir.clone(),
+            };
+            self.check.store.keep_pass_job(kept.clone());
+            ends.job = Some(kept);
+        }
+        #[cfg(test)]
+        if self.assist.stop_after_queue.load(Ordering::SeqCst) {
+            panic!("a test stops the follower here");
         }
         let outcome = self.watch_pass(&run, &job).await;
-        if job.is_pollable() {
-            self.cancel(&run.connection, &job.id).await;
+        if let Some(kept) = &ends.job
+            && self.cancel(&run.connection, &job.id).await
+        {
+            self.check.store.forget_pass_job(kept);
         }
         let _ = std::fs::remove_dir_all(&job_dir);
         match outcome.0 {

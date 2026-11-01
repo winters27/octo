@@ -311,6 +311,7 @@ fn the_gate_says_who_and_when() {
     let pause = CheckPause {
         until_utc: at(14, 4, 30),
         labels: vec!["gateway-v2-abc".into(), "gateway-v2-def".into()],
+        holding: Vec::new(),
     };
     let (shown, detail) = gate_words(&pause, at(12, 0, 0));
     assert_eq!(
