@@ -57,8 +57,9 @@ SCHEDULE_FACTOR = 3
 SCHEDULE_MAX_S = 4 * 3600
 SCHEDULE_SLACK_S = 5
 
-# An extension's last error that names an HTTP refusal: the gateway asked Mornye to wait.
-REFUSAL = re.compile(r"(?<![0-9])(?:429|403)(?![0-9])|retry-after", re.IGNORECASE)
+# An extension's last error that names a request to wait: a 429 or a Retry-After. A 403 is the
+# gateway refusing a grant, which is the failed check a person can pass, not a wait.
+REFUSAL = re.compile(r"(?<![0-9])429(?![0-9])|retry-after", re.IGNORECASE)
 
 PAUSE_SUFFIX = ".auth-backoff.json"
 
@@ -144,7 +145,7 @@ def last_errors(cache_dir: Path) -> dict[str, list[str]]:
 
 
 def names_refusal(text: str) -> bool:
-    """Whether an error names an HTTP refusal: a 429, a 403, or a Retry-After."""
+    """Whether an error names a request to wait: a 429 or a Retry-After."""
     return bool(REFUSAL.search(text or ""))
 
 
@@ -436,6 +437,11 @@ class Helper:
             return self._armed_file().stat().st_mtime
         return now
 
+    def mark_armed(self) -> None:
+        """Marks an arm now, kept on disk across a restart: browsers launched from now on are
+        shown, and the ones before are let go."""
+        self.armed_at = self._mark_armed()
+
     # ----- background work, whose errors are always logged -----
 
     def spawn(self, coroutine, name: str) -> asyncio.Task:
@@ -574,8 +580,9 @@ class Helper:
         return rows
 
     def arm(self, ids: set[str]) -> dict:
-        """Ends the pauses of the named extensions' gateways that keep Mornye's own schedule, and
-        marks the arm: browsers launched from now on are shown."""
+        """Ends the pauses of the named extensions' gateways that keep Mornye's own schedule, and,
+        when it ended one, marks the arm: browsers launched from now on are shown. An arm that
+        ends nothing leaves the mark as it was, so a run already open keeps its browser."""
         now = time.time()
         names = gateways(self.config.extensions)
         errors = last_errors(self.config.cache)
@@ -593,7 +600,8 @@ class Helper:
                 continue
             if end_pause(path, now):
                 ended.append(file)
-        self.armed_at = self._mark_armed()
+        if ended:
+            self.mark_armed()
         log.info("armed: ended %s, kept %s", ended, [row["gateway"] for row in asked])
         return {"ended": ended, "gatewayAsked": asked}
 

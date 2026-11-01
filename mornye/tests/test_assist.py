@@ -257,7 +257,8 @@ def test_a_pause_longer_than_mornyes_schedule_was_asked_for(tmp_path, failures, 
     ("text", "refusal"),
     [
         ("HTTP 429 Too Many Requests", True),
-        ("Client error '403 Forbidden' for url", True),
+        # A refused grant after a failed check: the person can pass it.
+        ("Client error '403 Forbidden' for url", False),
         ("retry-after: 60", True),
         ("The gateway said Retry-After 3600", True),
         ("track 14290 not found", False),
@@ -335,6 +336,32 @@ def test_arm_keeps_a_pause_after_a_refusal_even_on_mornyes_schedule(tmp_path):
     assert path.read_bytes() == before
 
 
+def test_arm_ends_a_pause_after_a_refused_grant(tmp_path):
+    # A 403 is the gateway refusing a grant after a failed check: the failure Pass is for.
+    config = make_config(tmp_path)
+    install(config, "example-ext")
+    path = pause(config, failures=1, length=300)
+    health(config, {"provider:ext:example-ext": {"last_error": "Client error '403 Forbidden' for url"}})
+
+    answer = assist.Helper(config).arm({"example-ext"})
+
+    assert answer == {"ended": [path.name], "gatewayAsked": []}
+
+
+def test_an_arm_that_ends_nothing_keeps_the_mark_of_the_run_already_open(tmp_path):
+    config = make_config(tmp_path)
+    install(config, "example-ext")
+    pause(config, failures=1, length=300)
+    helper = assist.Helper(config)
+    helper.arm({"example-ext"})
+    first = helper.armed_at
+
+    again = helper.arm({"example-ext"})
+
+    assert again["ended"] == []
+    assert helper.armed_at == first, "a browser the first run's song opens stays shown"
+
+
 def test_arm_leaves_a_pause_that_already_ended_and_files_it_cannot_read(tmp_path):
     config = make_config(tmp_path)
     install(config, "example-ext")
@@ -356,8 +383,9 @@ def test_the_state_lists_pauses_that_hold_and_which_were_stamped_after_the_arm(t
     install(config, "example-ext")
     install(config, "other-ext", namespace=OTHER_NS, base=OTHER_BASE)
     kept = pause(config, failures=1, length=3 * 3600, namespace=OTHER_NS, base=OTHER_BASE, stamped=time.time() - 60)
+    pause(config, failures=1, length=300, stamped=time.time() - 10)
     helper = assist.Helper(config)
-    helper.arm({"example-ext"})
+    assert helper.arm({"example-ext"})["ended"], "the arm ends example-ext's own pause"
     # Mornye tries again after the arm, fails, and pauses that gateway once more.
     stamped = pause(config, failures=2, length=900, stamped=helper.armed_at + 1)
 
@@ -400,7 +428,7 @@ def test_the_arm_answers_over_http_and_refuses_a_body_that_is_not_a_list(tmp_pat
 def test_the_arm_survives_a_restart_of_the_helper(tmp_path):
     config = make_config(tmp_path)
     first = assist.Helper(config)
-    first.arm(set())
+    first.mark_armed()
     assert assist.Helper(config).armed_at == first.armed_at
 
 
@@ -415,7 +443,7 @@ def test_only_browsers_launched_after_the_latest_arm_are_shown(tmp_path):
     helper.look()
     assert helper.browsers == {}
 
-    helper.arm(set())
+    helper.mark_armed()
     browser_file(config, 102, 9002, launched=helper.armed_at + 0.01)
     helper.look()
     assert list(helper.browsers) == ["102"]
@@ -423,7 +451,7 @@ def test_only_browsers_launched_after_the_latest_arm_are_shown(tmp_path):
 
     # A new arm lets go of the browsers launched before it.
     time.sleep(0.05)
-    helper.arm(set())
+    helper.mark_armed()
     helper.look()
     assert helper.browsers == {}
     assert (config.ports / "browser-102.port").exists()
@@ -432,7 +460,7 @@ def test_only_browsers_launched_after_the_latest_arm_are_shown(tmp_path):
 def test_a_port_file_is_removed_only_when_its_process_is_gone(tmp_path):
     config = make_config(tmp_path)
     helper = assist.Helper(config)
-    helper.arm(set())
+    helper.mark_armed()
     later = helper.armed_at + 2
     alive = browser_file(config, 201, 9001, launched=later)
     gone = browser_file(config, 202, 9002, launched=later, alive=False)
@@ -580,7 +608,7 @@ def test_only_the_posted_mouse_events_reach_the_browser_in_order(tmp_path):
         fake = await FakeBrowser().start()
         helper = assist.Helper(config)
         try:
-            helper.arm(set())
+            helper.mark_armed()
             browser_file(config, 301, fake.port, launched=helper.armed_at + 2)
             async with client(helper) as http:
                 listed = (await http.get("/assist")).json()["browsers"]
@@ -648,7 +676,7 @@ def test_the_screen_is_cast_only_while_frames_are_asked(tmp_path):
         fake = await FakeBrowser().start()
         helper = assist.Helper(config, idle_seconds=0.5)
         try:
-            helper.arm(set())
+            helper.mark_armed()
             browser_file(config, 401, fake.port, launched=helper.armed_at + 2)
             async with client(helper) as http:
                 await http.get("/assist")
@@ -683,7 +711,7 @@ def test_an_event_waits_for_the_connection_and_never_starts_the_cast(tmp_path):
         fake = await FakeBrowser().start()
         helper = assist.Helper(config, idle_seconds=0.5)
         try:
-            helper.arm(set())
+            helper.mark_armed()
             browser_file(config, 501, fake.port, launched=helper.armed_at + 2)
             helper.look()
             helper.browsers["501"].width, helper.browsers["501"].height = 100, 100

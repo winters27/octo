@@ -628,10 +628,12 @@ services:
   spotiflac:
     # This release's number, here and in the build source below: a release bumps both with
     # VERSION (CI checks it), so every release gets its own Mornye image ready.
+    # SPOTIFLAC_BUILD_CONTEXT builds it from somewhere else, such as ./mornye in a checkout
+    # that is not a release yet.
     image: octo-mornye:2026.10.28
     pull_policy: never
     build:
-      context: https://github.com/winters27/octo.git#2026.10.28:mornye
+      context: ${SPOTIFLAC_BUILD_CONTEXT:-https://github.com/winters27/octo.git#2026.10.28:mornye}
       args:
         # Blank: the Mornye image mornye/Dockerfile pins.
         MORNYE_IMAGE: ${SPOTIFLAC_IMAGE:-}

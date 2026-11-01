@@ -95,7 +95,7 @@ jobs:
           # The spotiflac service gets Octo's Mornye image ready from this repository at the
           # release, under a tag of its own: both name the number itself, never OCTO_IMAGE_TAG.
           if ! grep -Fqx "    image: octo-mornye:$version" docker-compose.yml \
-            || ! grep -Fqx "      context: https://github.com/winters27/octo.git#$version:mornye" docker-compose.yml; then
+            || ! grep -Fqx "      context: \${SPOTIFLAC_BUILD_CONTEXT:-https://github.com/winters27/octo.git#$version:mornye}" docker-compose.yml; then
             echo "::error::docker-compose.yml's spotiflac service does not get Octo's Mornye ready at $version. Bump its image tag and build source with VERSION."
             exit 1
           fi
