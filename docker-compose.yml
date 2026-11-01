@@ -169,6 +169,13 @@ services:
       Spotiflac__Placement: ${SPOTIFLAC_PLACEMENT:-AfterSoulseek}
       Spotiflac__TimeoutSeconds: ${SPOTIFLAC_TIMEOUT_SECONDS:-600}
       Spotiflac__AtOnce: ${SPOTIFLAC_AT_ONCE:-2}
+      # Mornye's own page as your browser reaches it, for the dashboard's Open Mornye. Blank:
+      # this machine at SPOTIFLAC_PORT with the spotiflac service, else the address above.
+      Spotiflac__WebUrl: ${SPOTIFLAC_WEB_URL:-}
+      Spotiflac__WebPort: ${SPOTIFLAC_PORT:-8010}
+      # Octo's helper beside Mornye, which lets you pass Mornye's check from the dashboard.
+      # Blank: http://spotiflac:8011 with the spotiflac service.
+      Spotiflac__AssistUrl: ${SPOTIFLAC_ASSIST_URL:-}
 
       # ----- get upcoming songs ahead (off by default) -----
       # The next songs of what is playing, downloaded as FLAC before they play, into a folder
@@ -364,6 +371,9 @@ services:
       Notifications__NotifyLosslessFallback: ${NOTIFY_LOSSLESS_FALLBACK:-true}
       Notifications__NotifyDownloadFailed: ${NOTIFY_DOWNLOAD_FAILED:-true}
       Notifications__NotifyAlbumCompleted: ${NOTIFY_ALBUM_COMPLETED:-true}
+      # When Mornye could not pass its check (once, until it passes again), with a link to
+      # pass it on the dashboard.
+      Notifications__NotifyMornyeCheck: ${NOTIFY_MORNYE_CHECK:-true}
       # ----- Updates -----
       # Ask GitHub every 6 hours whether a newer Octo release is out, and say so on
       # the dashboard. With the update helper on the host, the dashboard can also
@@ -601,10 +611,14 @@ services:
 
   # Your own Mornye (the SpotiFLAC Python module before its rename), for the optional
   # download source. It starts only with spotiflac in COMPOSE_PROFILES (.env).
-  # Compose builds Mornye here from its own repository at SPOTIFLAC_BUILD_REF (a pinned
-  # commit, so every install runs the same Mornye) and never pulls it: the first build takes
-  # a few minutes and about 2 GB, later ones are cached. Octo includes no Mornye, no
-  # extensions and no places to download from.
+  # It runs Mornye's own published 1.0.5 image (Mornye's release with its dependencies
+  # pinned), fixed by its digest in mornye/Dockerfile, with Octo's launcher and helper added
+  # so you can pass Mornye's check from Octo's dashboard; nothing of Mornye's is changed.
+  # Compose gets that small image ready here from Octo's own repository at this release (its
+  # mornye folder) and never pulls it: the first time downloads Mornye's image, about 2 GB,
+  # later ones are cached. SPOTIFLAC_IMAGE runs another Mornye image with the same additions
+  # (then docker compose build spotiflac && docker compose up -d spotiflac). Octo includes
+  # no extensions and no places to download from.
   # Mornye downloads nothing until you give it the extension registry you choose
   # (SPOTIFLAC_REGISTRIES); it installs every extension the registry lists by itself, when
   # it starts and again every hour. Its own page is on the port below. It
@@ -612,18 +626,23 @@ services:
   # Octo checks the file and files it like any download. Then set SPOTIFLAC_ENABLED=true
   # and SPOTIFLAC_URL=http://spotiflac:8000, or use the dashboard's Mornye page.
   spotiflac:
-    image: octo-mornye:${SPOTIFLAC_BUILD_REF:-5660533bf12592e9de68508cef506f173f58d14f}
+    # This release's number, here and in the build source below: a release bumps both with
+    # VERSION (CI checks it), so every release gets its own Mornye image ready.
+    image: octo-mornye:2026.10.28
     pull_policy: never
-    # 5660533b is Mornye 1.0.3. The image is built here and never pulled.
     build:
-      context: https://github.com/mornyeapp/Mornye-Python.git#${SPOTIFLAC_BUILD_REF:-5660533bf12592e9de68508cef506f173f58d14f}
+      context: https://github.com/winters27/octo.git#2026.10.28:mornye
+      args:
+        # Blank: the Mornye image mornye/Dockerfile pins.
+        MORNYE_IMAGE: ${SPOTIFLAC_IMAGE:-}
     container_name: spotiflac
     restart: unless-stopped
     logging: *logging
     profiles: ["spotiflac"]
     command: ["--web", "--host", "0.0.0.0", "--port", "8000"]
     # Mornye's own page (it installs the registry's extensions by itself). SPOTIFLAC_WEB_TOKEN
-    # keeps it yours: without one, anyone who reaches the port can use it.
+    # keeps it yours: without one, anyone who reaches the port can use it, and Octo cannot
+    # pass Mornye's check. Octo's helper answers Octo on port 8011 inside this network only.
     ports:
       - "${SPOTIFLAC_PORT:-8010}:8000"
     # Starts as root only to hand its data folder to PUID:PGID, then runs as that user.
