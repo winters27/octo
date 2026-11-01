@@ -85,6 +85,8 @@ struct FakeSpotiflac {
     provider: Option<&'static str>,
     /// Every search answers 500, as Mornye 1.1 does without its utilities extension.
     search_fails: bool,
+    /// After the first health read, example-ext's last try failed writing into the job's folder.
+    write_refused: bool,
 }
 
 /// The answer for read number `read` of `answers`: the last one repeats.
@@ -112,6 +114,22 @@ impl Respond for FakeSpotiflac {
                 .services
                 .as_ref()
                 .map_or_else(|| ResponseTemplate::new(404), |answer| json_answer(answer, 200));
+        }
+        if path == "/api/v1/extensions" && self.write_refused {
+            let read = self.extensions_read.fetch_add(1, Ordering::SeqCst);
+            let folder = self.job_folder.lock().clone();
+            return if read == 0 {
+                json_answer(&health(3, 1, "old"), 200)
+            } else {
+                json_answer(
+                    &health(
+                        4,
+                        2,
+                        &format!("EACCES: permission denied, open '{folder}/x.flac'"),
+                    ),
+                    200,
+                )
+            };
         }
         if path == "/api/v1/extensions" {
             return in_turn(&self.extensions, &self.extensions_read);
@@ -299,6 +317,7 @@ impl Setup {
                 extensions_read: Arc::default(),
                 provider: None,
                 search_fails: false,
+                write_refused: false,
             },
             artist: "Drake",
             title: "Take Care",
@@ -1120,6 +1139,39 @@ async fn a_failed_jobs_own_error_reaches_the_download_log_without_server_paths()
         "{detail}"
     );
     assert!(!detail.contains("/srv/"), "{detail}");
+}
+
+#[tokio::test]
+async fn a_refused_write_into_octos_folder_names_the_test_and_logs_the_systems_words() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.fake.sessions = vec![gateway("active")];
+    setup.fake.services = Some(example_service());
+    setup.fake.file = None;
+    setup.fake.status = "failed";
+    setup.fake.error = Some("download_failed");
+    setup.fake.provider = Some("example-ext");
+    setup.fake.write_refused = true;
+    let fetch = setup.build(events).await;
+
+    let error = fetch.acquire().await.expect_err("failed");
+
+    assert!(
+        format!("{error:#}").contains(
+            "Mornye could not write the song into Octo's music folder; the Test on the Mornye page checks that folder."
+        ),
+        "{error:#}"
+    );
+    let lines = fetch.log_lines();
+    let note = lines
+        .iter()
+        .find(|(text, _)| text == "Mornye brought no file")
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    let detail = note.1.clone().unwrap_or_default();
+    assert!(
+        detail.contains("EACCES: permission denied"),
+        "the system's own words: {detail}"
+    );
 }
 
 #[tokio::test]

@@ -981,6 +981,8 @@ struct FakeReplacer {
     sources: Mutex<Vec<Option<DownloadSource>>>,
     /// The code every outcome carries.
     code: Option<&'static str>,
+    /// Whether Mornye's check keeps it from every extension now.
+    mornye_kept: Mutex<bool>,
 }
 
 impl FakeReplacer {
@@ -992,6 +994,7 @@ impl FakeReplacer {
             requests: Mutex::new(Vec::new()),
             sources: Mutex::new(Vec::new()),
             code: None,
+            mornye_kept: Mutex::new(false),
         })
     }
 
@@ -1004,6 +1007,20 @@ impl FakeReplacer {
             requests: Mutex::new(Vec::new()),
             sources: Mutex::new(Vec::new()),
             code: Some(LibraryActionCodes::SOULSEEK_OFFLINE),
+            mornye_kept: Mutex::new(false),
+        })
+    }
+
+    /// Wrong song whose sources had no copy and whose Mornye was kept by its check.
+    fn kept_by_mornye() -> Arc<Self> {
+        Arc::new(FakeReplacer {
+            shown: true,
+            marked: Some(false),
+            state: Mutex::new(LibraryActionState::Failed),
+            requests: Mutex::new(Vec::new()),
+            sources: Mutex::new(Vec::new()),
+            code: Some(LibraryActionCodes::MORNYE_KEPT),
+            mornye_kept: Mutex::new(true),
         })
     }
 
@@ -1016,6 +1033,7 @@ impl FakeReplacer {
             requests: Mutex::new(Vec::new()),
             sources: Mutex::new(Vec::new()),
             code: None,
+            mornye_kept: Mutex::new(false),
         })
     }
 
@@ -1051,6 +1069,10 @@ impl SweepReplacer for FakeReplacer {
             },
             None => LibraryActionOutcome::new(*self.state.lock(), Some("done".into())),
         })
+    }
+
+    async fn mornye_kept(&self) -> bool {
+        *self.mornye_kept.lock()
     }
 }
 
@@ -1290,6 +1312,38 @@ async fn a_replacement_that_finds_soulseek_out_waits_without_counting() {
     assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
     assert_eq!(worker.status().found, 0);
     assert_eq!(worker.status().fine, 0);
+}
+
+#[tokio::test]
+async fn a_replacement_mornyes_check_kept_waits_without_searching_again_until_mornye_may_try() {
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let replacer = FakeReplacer::kept_by_mornye();
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            source: Some(DownloadSource::SoulseekThenYouTube),
+            ..Default::default()
+        },
+    );
+
+    worker.tick().await;
+    worker.tick().await;
+    assert_eq!(
+        replacer.requests().len(),
+        1,
+        "no second search while the check keeps it"
+    );
+    assert_eq!(worker.status().today.failed, 0);
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+
+    *replacer.mornye_kept.lock() = false;
+    worker.tick().await;
+    assert_eq!(replacer.requests().len(), 2, "asked again once Mornye may try");
 }
 
 /// Off, a dry run, a keeper off the allowlist, Wrong song off, the day's cap and the breaker each
@@ -1780,6 +1834,7 @@ async fn a_file_navidrome_does_not_show_is_asked_about() {
         requests: Mutex::new(Vec::new()),
         sources: Mutex::new(Vec::new()),
         code: None,
+        mornye_kept: Mutex::new(false),
     });
     sweep
         .worker(
