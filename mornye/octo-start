@@ -1,0 +1,19 @@
+#!/bin/sh
+# Octo's start for its Mornye image. With --web, Octo's assist helper runs in the background as
+# the user Mornye runs as (PUID:PGID when started as root with them, as Mornye's own entrypoint
+# does), restarted if it stops; then Mornye's own entrypoint takes over with the same arguments.
+# The data folder is chosen the way Mornye's entrypoint chooses it, so both read the same one.
+: "${MORNYE_DATA_DIR:=${HOME:-/home/mornye}/.mornye}"
+export MORNYE_DATA_DIR
+
+case " $* " in
+  *" --web "*)
+    if [ "$(id -u)" = "0" ] && [ -n "${PUID:-}${PGID:-}" ] && [ "${PUID:-1000}" != "0" ]; then
+      setpriv --reuid "${PUID:-1000}" --regid "${PGID:-1000}" --clear-groups \
+        sh -c 'while :; do python /octo/assist.py; sleep 2; done' &
+    else
+      sh -c 'while :; do python /octo/assist.py; sleep 2; done' &
+    fi
+    ;;
+esac
+exec /usr/local/bin/docker-entrypoint.sh "$@"

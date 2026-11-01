@@ -1,0 +1,7 @@
+# Test dependencies for the assist helper: pytest, plus what assist.py imports, at the versions
+# Mornye's pinned image ships (1.0.5 and 1.1.0 both), so the tests run the libraries it runs.
+pytest
+starlette==1.10.0
+uvicorn==0.54.0
+websockets==16.1.1
+httpx
