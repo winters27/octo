@@ -116,6 +116,11 @@ pub fn admin_controller_routes() -> RouteSet {
         .route("/api/admin/lidarr/options", get(system::get_lidarr_options))
         .route("/api/admin/lidarr/test", post(system::test_lidarr_connection))
         .route("/api/admin/spotiflac/test", post(spotiflac::test_spotiflac))
+        .route("/api/admin/spotiflac/status", get(spotiflac::spotiflac_status))
+        .route("/api/admin/spotiflac/assist", get(spotiflac::assist_state))
+        .route("/api/admin/spotiflac/assist/start", post(spotiflac::assist_start))
+        .route("/api/admin/spotiflac/assist/frame", get(spotiflac::assist_frame))
+        .route("/api/admin/spotiflac/assist/input", post(spotiflac::assist_input))
         .route("/api/admin/restart", post(system::restart))
         .route(
             "/api/admin/soulseek/rejected-peers/clear",

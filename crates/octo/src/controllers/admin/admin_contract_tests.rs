@@ -193,6 +193,135 @@ async fn effective_document_keeps_spotiflac() {
     assert_eq!(missing_from(&document), Vec::<String>::new());
 }
 
+/// A Mornye 1.0.5 whose one gateway session is in `state`, and Octo's helper beside it, whose
+/// pause file the gateway itself asked for when `gateway_asked`.
+async fn mornye_and_helper(state: &str, gateway_asked: bool) -> (MockServer, MockServer) {
+    let mornye = MockServer::builder().start().await;
+    let paused_s = if state == "active" { 0.0 } else { 900.0 };
+    let answers = [
+        (
+            "GET",
+            "/api/v1/info",
+            serde_json::json!({"name": "Mornye", "version": "1.0.5", "api_version": "v1", "multiuser": false, "authenticated": true}),
+        ),
+        (
+            "GET",
+            "/api/v1/extensions",
+            serde_json::json!({"providers": [{"provider": "ext:example-ext", "installed": true}]}),
+        ),
+        (
+            "POST",
+            "/api/get_signed_sessions",
+            serde_json::json!({"result": {"sessions": [
+            {"key": "gateway-v2-abc-6836abb49bb0e8c9", "kind": "gateway", "label": "Example",
+             "extensions": ["example-ext"], "state": state, "auth_paused_s": paused_s}]}}),
+        ),
+        (
+            "POST",
+            "/api/get_download_services",
+            serde_json::json!({"result": {"services": [
+            {"id": "ext:example-ext", "label": "Example", "extensions": ["example-ext"]}]}}),
+        ),
+    ];
+    for (verb, at, body) in answers {
+        Mock::given(method(verb))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&mornye)
+            .await;
+    }
+    let helper = MockServer::builder().start().await;
+    Mock::given(method("GET"))
+        .and(path("/assist"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"browsers": [], "paused": [
+            {"file": ".gateway-v2-abc-b97a94207d0a.auth-backoff.json", "gateway": "gateway-v2-abc", "seconds": 900,
+             "gatewayAsked": gateway_asked, "stampedAfterArm": false}]})))
+        .mount(&helper)
+        .await;
+    (mornye, helper)
+}
+
+fn mornye_state(mornye: &MockServer, helper: Option<&MockServer>) -> AppState {
+    let mut settings = factory_settings();
+    settings.spotiflac.enabled = true;
+    settings.spotiflac.url = mornye.uri();
+    settings.spotiflac.token = "t".into();
+    settings.spotiflac.assist_url = helper.map(MockServer::uri).unwrap_or_default();
+    AppState::for_tests(settings)
+}
+
+fn remember_a_song(state: &AppState) {
+    state
+        .spotiflac
+        .check
+        .store
+        .remember(crate::services::spotiflac::CheckSong {
+            link: "https://open.spotify.com/track/a".into(),
+            artist: "Artist".into(),
+            title: "Title".into(),
+            utc: chrono::Utc::now(),
+        });
+}
+
+#[tokio::test]
+async fn mornyes_status_offers_pass_only_when_pass_can_help() {
+    let (mornye, helper) = mornye_and_helper("unverified", false).await;
+
+    // No helper beside Mornye, and no song yet.
+    let alone = mornye_state(&mornye, None);
+    let status = get(&app(alone.clone()), "/api/admin/spotiflac/status")
+        .await
+        .json();
+    assert_eq!(status["paused"], Value::Bool(true));
+    assert_eq!(status["checks"][0]["label"], "Example");
+    assert_eq!(status["helper"], "absent");
+    assert_eq!(status["passable"], Value::Bool(false));
+    assert!(super::system::probe_mornye(&alone).await.get("action").is_none());
+
+    // The helper answers and a song is kept: Pass is offered, on the card and in the status.
+    let ready = mornye_state(&mornye, Some(&helper));
+    remember_a_song(&ready);
+    let status = get(&app(ready.clone()), "/api/admin/spotiflac/status")
+        .await
+        .json();
+    assert_eq!(status["passable"], Value::Bool(true), "{status}");
+    let probe = super::system::probe_mornye(&ready).await;
+    assert_eq!(probe["action"], "pass", "{probe}");
+    assert!(
+        probe["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Check paused; next try "),
+        "{probe}"
+    );
+}
+
+#[tokio::test]
+async fn a_pause_the_gateway_asked_for_offers_no_pass() {
+    let (mornye, helper) = mornye_and_helper("unverified", true).await;
+    let state = mornye_state(&mornye, Some(&helper));
+    remember_a_song(&state);
+    let status = get(&app(state.clone()), "/api/admin/spotiflac/status")
+        .await
+        .json();
+    assert_eq!(status["checks"][0]["gatewayAsked"], Value::Bool(true));
+    assert_eq!(status["passable"], Value::Bool(false));
+    assert!(super::system::probe_mornye(&state).await.get("action").is_none());
+}
+
+#[tokio::test]
+async fn a_passing_check_reads_as_mornye_and_its_version() {
+    let (mornye, helper) = mornye_and_helper("active", false).await;
+    let state = mornye_state(&mornye, Some(&helper));
+    let status = get(&app(state.clone()), "/api/admin/spotiflac/status")
+        .await
+        .json();
+    assert_eq!(status["paused"], Value::Bool(false));
+    let probe = super::system::probe_mornye(&state).await;
+    assert_eq!(probe["detail"], "Mornye 1.0.5", "{probe}");
+    assert_eq!(probe["ok"], Value::Bool(true), "{probe}");
+}
+
 /// With Prefetch at its defaults neither document lists it, so the settings answers stay as they
 /// were; once it is on (or saved in settings.json) both list every Prefetch property.
 #[tokio::test]
@@ -870,8 +999,9 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // replacing two: LibraryActions:ReviewSweepAutoReplace and :ReviewSweepAutoReplacePerDay,
     // then LibraryActions:KeepRatedCopies, Subsonic:DownloadAlbumOnSongStar,
     // Metadata:AnimatedArt and Subsonic:CoverBadge, then LibraryActions:YoutubeCheckPerHour and
-    // the sweep's preview replacing, LibraryActions:ReviewSweepAutoReplacePreview, listed last.
-    assert_eq!(rows.len(), 206);
+    // the sweep's preview replacing, LibraryActions:ReviewSweepAutoReplacePreview, then
+    // Notifications:NotifyMornyeCheck, listed last.
+    assert_eq!(rows.len(), 207);
     assert!(!rows.iter().any(|r| {
         r["Key"]
             .as_str()
@@ -888,6 +1018,8 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     assert_eq!(rows[204]["Key"], "LibraryActions:YoutubeCheckPerHour");
     assert_eq!(row("LibraryActions:YoutubeCheckPerHour")["IsSecret"], false);
     assert_eq!(rows[205]["Key"], "LibraryActions:ReviewSweepAutoReplacePreview");
+    assert_eq!(rows[206]["Key"], "Notifications:NotifyMornyeCheck");
+    assert_eq!(row("Notifications:NotifyMornyeCheck")["IsSecret"], false);
     assert_eq!(
         row("LibraryActions:ReviewSweepAutoReplacePreview")["IsSecret"],
         false

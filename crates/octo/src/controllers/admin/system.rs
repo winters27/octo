@@ -363,11 +363,91 @@ pub async fn get_status(State(state): State<AppState>, caller: Caller) -> Respon
     if !caller_of(&caller).is_some_and(AdminCaller::is_admin) {
         return json_ok(&anonymous_status(&state).await);
     }
+    let (mut services, mornye) = tokio::join!(probe_all(&state), probe_mornye(&state));
+    // Only for an admin: a signed-out caller never learns that a Mornye exists.
+    services.insert("mornye".to_string(), mornye);
     json_ok(&json!({
         "octo": ServiceProbe::new(true, "Octo is responding"),
-        "services": probe_all(&state).await,
+        "services": services,
         "time": round_trip_offset(Utc::now()),
     }))
+}
+
+/// Mornye's row: off (optional), unreachable, its check paused (with "pass" when the dashboard can
+/// pass it), its utilities extension missing, or its name and version.
+pub(super) async fn probe_mornye(state: &AppState) -> serde_json::Value {
+    if !state.spotiflac.settings().is_on() {
+        return json!(ServiceProbe::new(true, "Off. Optional.").unconfigured());
+    }
+    let status = match tokio::time::timeout(PROBE_TIMEOUT, super::spotiflac::mornye_status(state, "")).await {
+        Ok(status) => status,
+        Err(_) => {
+            return json!(ServiceProbe::new(
+                false,
+                "Mornye did not answer within 5 seconds."
+            ));
+        }
+    };
+    let text = |key: &str| {
+        status
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    if !status.get("reachable").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return json!(ServiceProbe::new(false, text("problem")));
+    }
+    if status
+        .get("utilitiesMissing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return json!(
+            ServiceProbe::new(
+                true,
+                "Mornye needs its utilities extension, which your registry does not list."
+            )
+            .warning(true)
+        );
+    }
+    let now = Utc::now();
+    let next_try = status
+        .get("checks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|check| check.get("pausedUntilUtc").and_then(|v| v.as_str()))
+        .filter_map(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|t| t.with_timezone(&Utc))
+        .min();
+    let flag = |key: &str| status.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    if flag("paused") {
+        let detail = match next_try {
+            Some(until) => format!(
+                "Check paused; next try {}",
+                octo_core::spotiflac::check::until_words(until, now)
+            ),
+            None => "Check paused".to_string(),
+        };
+        let mut row = json!(ServiceProbe::new(true, detail).warning(true));
+        // The same rule as the dashboard's Pass button, decided once in the status.
+        if flag("passable")
+            && let Some(object) = row.as_object_mut()
+        {
+            object.insert("action".to_string(), json!("pass"));
+        }
+        return row;
+    }
+    let version = text("version");
+    json!(ServiceProbe::new(
+        true,
+        if version.is_empty() {
+            "Mornye".to_string()
+        } else {
+            format!("Mornye {version}")
+        }
+    ))
 }
 
 /// Every service's probe, by name. They run in parallel: the total is the slowest, not the sum.

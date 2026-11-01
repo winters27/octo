@@ -161,7 +161,7 @@ use crate::services::soulseek::{
     SoulseekLink, SoulseekMetadataService, SoulseekPortCheck, SoulseekShareSwitch, SoulseekSharing,
     SoulseekStartupValidator,
 };
-use crate::services::spotiflac::SpotiflacClient;
+use crate::services::spotiflac::{CheckTimes, MornyeCheck, MornyeCheckStore, SpotiflacClient};
 use crate::services::subsonic::{
     CredentialCheck, NavidromeIdentityService, RecentScrobbles, RequestIdentity, SearchSongOrderCache,
     SubsonicDiscoveryService, SubsonicProxyService, SyncCatalogService,
@@ -173,6 +173,7 @@ use crate::services::validation::{
 };
 use crate::services::you_tube::{PinRecheck, StreamSizeWarmer, YouTubeMusicClient, YouTubeResolver};
 use crate::workers::WorkerSupervisor;
+use octo_core::notifications::{NotificationEvent, NotificationEventType};
 
 /// Cheap to clone; handlers and workers receive it by value.
 #[derive(Clone)]
@@ -742,6 +743,7 @@ fn prefetch_service(
         concurrency: Some(stores.download_concurrency.clone()),
         names: Some(stores.external_id_registry.clone()),
         soulseek: Some(soulseek_link),
+        spotiflac: Some(acquisition.spotiflac.clone()),
         clock: Clock::system(),
     })
 }
@@ -918,7 +920,24 @@ impl Acquisition {
             Clock::system(),
         );
         let upgrade_queue = stores.upgrade_queue.clone();
-        let upgrade_sources = Arc::new(UpgradeSources::new(settings.clone(), Some(soulseek_link.clone())));
+        // Mornye: its check is kept in mornye-check.json and pushes once per stretch of failing.
+        let check_notifications = integrations.notifications.clone();
+        let spotiflac = Arc::new(
+            SpotiflacClient::new(settings.clone()).with_check(MornyeCheck::new(
+                stores.mornye_check.clone(),
+                CheckTimes::default(),
+                Some(Arc::new(move |words: String| {
+                    check_notifications.notify(NotificationEvent {
+                        detail: Some(words),
+                        ..NotificationEvent::new(NotificationEventType::MornyeCheck)
+                    });
+                })),
+            )),
+        );
+        let upgrade_sources = Arc::new(
+            UpgradeSources::new(settings.clone(), Some(soulseek_link.clone()))
+                .with_spotiflac(spotiflac.clone()),
+        );
         let library_ownership = Arc::new(LibraryOwnership::new(
             settings.clone(),
             Some(OwnershipNavidrome {
@@ -943,7 +962,6 @@ impl Acquisition {
             lidarr_album_claims.clone(),
         ));
         let lidarr_track_fetcher: Arc<dyn ILidarrTrackFetcher> = lidarr_fetcher.clone();
-        let spotiflac = Arc::new(SpotiflacClient::new(settings.clone()));
 
         // The gates of hearted albums' chains, which every source's check point files tracks by.
         let album_gates = Arc::new(AlbumGates::new());
@@ -1586,6 +1604,8 @@ struct Stores {
     download_concurrency: Arc<DownloadConcurrency>,
     download_picks: Arc<DownloadPicks>,
     soulseek_holds: Arc<SoulseekHoldStore>,
+    /// Mornye's check episodes and the songs it refused while paused, `mornye-check.json`.
+    mornye_check: Arc<MornyeCheckStore>,
     you_tube_resolver: Arc<YouTubeResolver>,
     stream_size_warmer: Arc<StreamSizeWarmer>,
     local_cover_cache: Arc<LocalCoverCache>,
@@ -1697,6 +1717,7 @@ impl Stores {
             download_concurrency: Arc::new(DownloadConcurrency::new(settings.clone())),
             download_picks: Arc::new(DownloadPicks::default()),
             soulseek_holds,
+            mornye_check: Arc::new(MornyeCheckStore::new(Some(config_dir.join("mornye-check.json")))),
             you_tube_resolver,
             subsonic_response_builder: Arc::new(SubsonicResponseBuilder::new(
                 stream_size_warmer.clone(),
@@ -2224,6 +2245,7 @@ impl Imports {
                 downloads: acquisition.track_acquisition_queue.clone(),
                 tracker: acquisition.acquisition_tracker.clone(),
                 soulseek: soulseek_link,
+                spotiflac: Some(acquisition.spotiflac.clone()),
             },
         );
         let service = ImportService::new(ImportParts {
