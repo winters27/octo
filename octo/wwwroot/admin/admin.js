@@ -3628,6 +3628,7 @@ const passState = {
   pointer: null,      // the pointer held down on the picture, if any
   frameUrl: null,
   pollTimer: null,
+  stopping: null,     // the stop a Close sent, which the next Pass waits for
   queue: null,
 };
 
@@ -3675,8 +3676,11 @@ function openPass() {
 }
 
 function closePass() {
-  // A run still opening or live is stopped on the server too: its song's job is cancelled.
-  if (passState.view?.polls) api('/api/admin/spotiflac/assist/stop', { method: 'POST' }).catch(() => {});
+  // A run still opening or live is left on the server too (stopped once no other page is on
+  // it, its song's job cancelled); a Pass right after waits for that first.
+  if (passState.view?.polls) {
+    passState.stopping = api('/api/admin/spotiflac/assist/stop', { method: 'POST' }).catch(() => {});
+  }
   passState.open = false;
   passState.run += 1;
   clearTimeout(passState.pollTimer);
@@ -3699,6 +3703,10 @@ async function startPass() {
   drawPass(passView({ state: 'opening' }));
   let answer = null;
   try {
+    // A Close just before has left the old run first, so this one is new.
+    const stopping = passState.stopping;
+    passState.stopping = null;
+    if (stopping) await stopping;
     const r = await api('/api/admin/spotiflac/assist/start', { method: 'POST' });
     answer = await r.json().catch(() => ({}));
     if (!r.ok && !answer.state) answer = { started: false, why: answer.error || `Octo answered HTTP ${r.status}.` };
