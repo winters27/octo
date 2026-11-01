@@ -1067,7 +1067,7 @@ impl SweepReplacer for FakeReplacer {
                 code: Some(code.to_string()),
                 mornye_wait: (code == LibraryActionCodes::MORNYE_KEPT).then(|| {
                     Box::new(octo_core::spotiflac::check::CheckPause {
-                        until_utc: chrono::Utc::now() + chrono::Duration::hours(1),
+                        until_utc: chrono::Utc::now() + chrono::Duration::days(30),
                         labels: vec!["Example".into()],
                     })
                 }),
@@ -1327,6 +1327,8 @@ async fn a_replacement_mornyes_check_kept_is_passed_over_and_the_sweep_goes_on()
     sweep.teardrop("b.flac");
     let queue = Arc::new(NoticeQueue::new());
     let replacer = FakeReplacer::kept_by_mornye();
+    let now = Arc::new(Mutex::new(Utc::now()));
+    let reading = now.clone();
     let worker = sweep.worker(
         FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
         Options {
@@ -1334,6 +1336,7 @@ async fn a_replacement_mornyes_check_kept_is_passed_over_and_the_sweep_goes_on()
             settings: Some(replacing_by_preview(60)),
             replacer: Some(replacer.clone()),
             source: Some(DownloadSource::SoulseekThenYouTube),
+            clock: Some(Clock::new(move || *reading.lock())),
             ..Default::default()
         },
     );
@@ -1341,14 +1344,34 @@ async fn a_replacement_mornyes_check_kept_is_passed_over_and_the_sweep_goes_on()
     worker.tick().await;
     worker.tick().await;
     worker.tick().await;
-    let asked: Vec<String> = replacer.requests().into_iter().map(|(_, id, _)| id).collect();
+    let asked = || -> Vec<String> { replacer.requests().into_iter().map(|(_, id, _)| id).collect() };
     assert_eq!(
-        asked,
+        asked(),
         vec!["nd-a.flac".to_string(), "nd-b.flac".to_string()],
         "a is not searched again while its pause holds, and b is next"
     );
     assert_eq!(worker.status().today.failed, 0);
     assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+
+    // The next pass, while both pauses still hold: both are passed over, nothing is searched.
+    *now.lock() += LibraryReviewSweepWorker::PASS_INTERVAL + TimeDelta::minutes(1);
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+    assert_eq!(asked().len(), 2, "{:?}", asked());
+
+    // Someone passes the check: the pass after asks for a again.
+    *replacer.mornye_kept.lock() = false;
+    *now.lock() += LibraryReviewSweepWorker::PASS_INTERVAL + TimeDelta::minutes(1);
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+    assert_eq!(
+        asked().get(2).map(String::as_str),
+        Some("nd-a.flac"),
+        "{:?}",
+        asked()
+    );
 }
 
 /// Off, a dry run, a keeper off the allowlist, Wrong song off, the day's cap and the breaker each

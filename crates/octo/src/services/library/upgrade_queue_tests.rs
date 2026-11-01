@@ -423,6 +423,142 @@ async fn once_a_pause_ends_one_kept_job_tries_and_the_others_follow_its_answer()
     );
 }
 
+#[tokio::test]
+async fn a_restart_while_a_scout_is_on_its_way_sends_no_second_one() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("upgrades.json");
+    let ended = chrono::Utc::now() - chrono::Duration::seconds(1);
+    {
+        let before = UpgradeQueue::with_path(Some(path.clone()));
+        before.add(asks(&["a", "b"]), "alice", "app");
+        // a went back alone when its pause ended and was running at the restart; b still waits.
+        before.update("a", |job| {
+            job.state = UpgradeStates::WORKING.to_string();
+            job.mornye_scout = true;
+        });
+        before.update("b", |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(MornyeHold {
+                until_utc: ended,
+                labels: vec!["A".to_string()],
+            });
+        });
+    }
+    let queue = Arc::new(UpgradeQueue::with_path(Some(path)));
+    let tries = Arc::new(AtomicUsize::new(0));
+    let tried = tries.clone();
+    let apply: Apply = Arc::new(move |_| {
+        tried.fetch_add(1, Ordering::SeqCst);
+        async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed()
+    });
+    let worker = worker(&queue, 3, apply, None);
+    let ct = CancellationToken::new();
+
+    worker.tick(&ct).await;
+    worker.drain().await;
+    assert_eq!(
+        tries.load(Ordering::SeqCst),
+        1,
+        "only the scout from before the restart"
+    );
+    let b = queue
+        .snapshot()
+        .into_iter()
+        .find(|job| job.navidrome_id == "b")
+        .expect("b");
+    assert_eq!(b.state, UpgradeStates::WAITING);
+
+    // The scout's try is known, so b is the next one to go.
+    worker.tick(&ct).await;
+    worker.drain().await;
+    assert_eq!(tries.load(Ordering::SeqCst), 2);
+    assert!(queue.snapshot().iter().all(|job| !job.mornye_scout));
+}
+
+#[test]
+fn a_finished_run_moves_the_holds_it_shares_a_check_with_and_leaves_the_rest() {
+    let queue = UpgradeQueue::new();
+    queue.add(asks(&["a", "b", "c"]), "alice", "app");
+    let early = Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap();
+    let later = Utc.with_ymd_and_hms(2026, 11, 1, 13, 0, 0).unwrap();
+    for (id, label) in [("b", "A"), ("c", "B")] {
+        queue.update(id, |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(MornyeHold {
+                until_utc: early,
+                labels: vec![label.to_string()],
+            });
+        });
+    }
+    queue.update("a", |job| job.mornye_scout = true);
+
+    queue.finish_run("a", |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+        job.mornye_hold = Some(MornyeHold {
+            until_utc: later,
+            labels: vec!["A".to_string()],
+        });
+    });
+
+    let jobs = queue.snapshot();
+    let hold = |id: &str| {
+        jobs.iter()
+            .find(|job| job.navidrome_id == id)
+            .and_then(|job| job.mornye_hold.as_ref())
+            .map(|hold| hold.until_utc)
+    };
+    assert_eq!(hold("b"), Some(later), "b shares check A");
+    assert_eq!(hold("c"), Some(early), "c waits on another check");
+    assert!(jobs.iter().all(|job| !job.mornye_scout), "a's try is known");
+}
+
+#[test]
+fn the_job_sent_back_alone_carries_the_scout_mark_and_the_others_do_not() {
+    let queue = UpgradeQueue::new();
+    queue.add(asks(&["a", "b"]), "alice", "app");
+    for id in ["a", "b"] {
+        queue.update(id, |job| job.state = UpgradeStates::WAITING.to_string());
+    }
+    assert_eq!(queue.requeue_where(|_| true, Some("a")), 2);
+    let jobs = queue.snapshot();
+    let scout = |id: &str| {
+        jobs.iter()
+            .find(|job| job.navidrome_id == id)
+            .map(|job| job.mornye_scout)
+    };
+    assert_eq!(scout("a"), Some(true));
+    assert_eq!(scout("b"), Some(false));
+    assert!(queue.mornye_scout_on_its_way());
+}
+
+#[test]
+fn a_kept_jobs_hold_and_scout_mark_survive_a_restart() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("upgrades.json");
+    let until = Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap();
+    let hold = MornyeHold {
+        until_utc: until,
+        labels: vec!["A".to_string()],
+    };
+    {
+        let before = UpgradeQueue::with_path(Some(path.clone()));
+        before.add(asks(&["a"]), "alice", "app");
+        before.update("a", |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(hold.clone());
+            job.mornye_scout = true;
+        });
+    }
+    let job = UpgradeQueue::with_path(Some(path)).snapshot().remove(0);
+    assert_eq!(job.mornye_hold, Some(hold));
+    assert_eq!(job.wait.as_deref(), Some(LibraryActionCodes::MORNYE_KEPT));
+    assert!(job.mornye_scout);
+}
+
 #[test]
 fn outcomes_map_on_the_code_not_the_words() {
     let cases = [

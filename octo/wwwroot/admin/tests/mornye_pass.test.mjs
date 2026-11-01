@@ -23,9 +23,9 @@ const rules = new Function(
   'esc',
   'icon',
   `${slice('function mornyeWhen', 'let mornyeNowLoad')}
-   return { mornyeWhen, mornyeCard, mornyeLinesHtml, passZoomDefault, passPoint, passView, passInputQueue };`,
+   return { mornyeWhen, mornyeCard, mornyeLinesHtml, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passCalls };`,
 )(esc, icon);
-const { mornyeWhen, mornyeCard, mornyeLinesHtml, passZoomDefault, passPoint, passView, passInputQueue } = rules;
+const { mornyeWhen, mornyeCard, mornyeLinesHtml, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passCalls } = rules;
 
 const heartSourceReachable = new Function(
   'lastStatus',
@@ -307,6 +307,104 @@ test("the panel's words follow the run's state", () => {
   assert.equal(passView({ state: 'unavailable', why: 'Set a web token.' }, now).retry, null);
   assert.deepEqual(passView({ state: 'live', gatewayAsked: [{ gateway: 'g', until: local(2026, 10, 1, 16, 0, 0) }] }, now).notes.map(plain),
     ['The gateway asked Mornye to wait until 4:00 PM.']);
+});
+
+// A sessionStorage stand-in. `copy` is what Duplicate tab does: the new tab starts with the old
+// one's entries.
+function memoryStore(entries = {}) {
+  const map = new Map(Object.entries(entries));
+  return {
+    getItem: key => (map.has(key) ? map.get(key) : null),
+    setItem: (key, value) => { map.set(key, String(value)); },
+    removeItem: key => { map.delete(key); },
+    copy: () => memoryStore(Object.fromEntries(map)),
+  };
+}
+const ids = () => { let n = 0; return () => `id-${++n}`; };
+
+test('a reload is the same tab on a new page; a duplicated tab is a tab of its own', () => {
+  const store = memoryStore();
+  const first = passViewer(store, ids());
+  assert.equal(first.tab, 'id-2');
+  assert.equal(first.page, 'id-1');
+
+  // A reload: the page leaves (its mark cleared), the next load finds the tab.
+  passViewerShown(store, first, false);
+  const reloaded = passViewer(store, () => 'page-again');
+  assert.deepEqual(reloaded, { tab: first.tab, page: 'page-again' });
+
+  // Duplicate tab while this one is open: the copy finds the mark still set.
+  const copy = store.copy();
+  const duplicated = passViewer(copy, () => 'other');
+  assert.notEqual(duplicated.tab, reloaded.tab);
+  // The first tab keeps its own name.
+  assert.equal(store.getItem('octo.passTab'), reloaded.tab);
+
+  // Brought back from the browser's page cache: the mark is set again.
+  passViewerShown(store, reloaded, false);
+  passViewerShown(store, reloaded, true);
+  assert.notEqual(passViewer(store.copy(), () => 'third').tab, reloaded.tab);
+});
+
+test('a blocked store still names the tab and page', () => {
+  const blocked = { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); }, removeItem() { throw new Error('blocked'); } };
+  const viewer = passViewer(blocked, ids());
+  assert.equal(viewer.page, 'id-1');
+  assert.equal(viewer.tab, 'id-1');
+  passViewerShown(blocked, viewer, false);
+  assert.deepEqual(passViewer(null, () => 'p'), { tab: 'p', page: 'p' });
+});
+
+test('a Pass after a Close waits for the stop, and each stop names its run and page', async () => {
+  const sent = [];
+  let answerStop;
+  const send = (call, body) => {
+    sent.push([call, body]);
+    if (call === 'stop') return new Promise(resolve => { answerStop = resolve; });
+    return Promise.resolve({ run: `run-${sent.length}`, state: 'opening' });
+  };
+  const line = passCalls(send, { tab: 't', page: 'p' });
+  await line.start();
+  assert.equal(line.run(), 'run-1');
+
+  line.stop();
+  assert.deepEqual(sent[1], ['stop', { run: 'run-1', tab: 't', page: 'p' }]);
+  const starting = line.start();
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(sent.length, 2, 'the start waits for the stop to answer');
+  answerStop({});
+  await starting;
+  assert.deepEqual(sent[2], ['start', { tab: 't', page: 'p' }]);
+  assert.equal(line.run(), 'run-3');
+});
+
+test('a Close while the start is on its way names no run, and the late answer is not kept', async () => {
+  const sent = [];
+  let answerStart;
+  const send = (call, body) => {
+    sent.push([call, body]);
+    if (call === 'start') return new Promise(resolve => { answerStart = resolve; });
+    return Promise.resolve({});
+  };
+  const line = passCalls(send, { tab: 't', page: 'p' });
+  const starting = line.start();
+  await Promise.resolve();
+  line.stop();
+  assert.deepEqual(sent[1], ['stop', { run: null, tab: 't', page: 'p' }]);
+  answerStart({ run: 'run-old', state: 'opening' });
+  await starting;
+  assert.equal(line.run(), null, "the run being stopped is not this page's any more");
+});
+
+test("a leaving page's stop goes by the leaving sender, before stop returns", () => {
+  const normal = [];
+  const leaving = [];
+  const line = passCalls((call, body) => { normal.push(call); return Promise.resolve({}); }, { tab: 't', page: 'p' });
+  line.stop((call, body) => { leaving.push([call, body]); return Promise.resolve(); });
+  assert.deepEqual(leaving, [['stop', { run: null, tab: 't', page: 'p' }]]);
+  assert.deepEqual(normal, []);
+  // A sender that throws is a stop that failed, never an error out of stop.
+  assert.doesNotThrow(() => line.stop(() => { throw new Error('gone'); }));
 });
 
 test("the heart source step counts slskd or Mornye only when set up, answering and not warning", () => {

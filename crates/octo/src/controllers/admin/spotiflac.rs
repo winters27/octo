@@ -11,6 +11,7 @@ use serde::Deserialize;
 use super::plumbing::{SECRET_PLACEHOLDER, error_json, ok};
 use crate::app::AppState;
 use crate::services::spotiflac::Connection;
+use crate::services::spotiflac::assist::Viewer;
 
 /// What the page sends: its fields as they are.
 #[derive(Debug, Default, Deserialize)]
@@ -264,6 +265,7 @@ async fn assist_json(state: &AppState) -> serde_json::Value {
         Some(run) => {
             let (run_state, why) = run.state();
             serde_json::json!({
+                "run": run.id,
                 "state": run_state,
                 "why": why,
                 "browser": run.browser().map(|b| serde_json::json!({
@@ -289,9 +291,39 @@ pub async fn assist_state(State(state): State<AppState>) -> Response {
     ok(&assist_json(&state).await)
 }
 
+/// The dashboard page a Pass start or stop comes from, and for a stop the run it was on (null
+/// while its start had not answered).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PassPage {
+    pub tab: String,
+    pub page: String,
+    pub run: Option<String>,
+}
+
+impl PassPage {
+    /// An empty body is a page with no name, which still has one seat.
+    fn read(body: &[u8]) -> Option<Self> {
+        if body.iter().all(u8::is_ascii_whitespace) {
+            return Some(Self::default());
+        }
+        serde_json::from_slice(body).ok()
+    }
+
+    fn viewer(&self) -> Viewer {
+        Viewer::new(&self.tab, &self.page)
+    }
+}
+
 /// `POST /api/admin/spotiflac/assist/start`: starts "Pass Mornye's check", or answers why not.
-pub async fn assist_start(State(state): State<AppState>) -> Response {
-    let started = state.spotiflac.start_pass(&download_path(&state)).await;
+pub async fn assist_start(State(state): State<AppState>, body: Bytes) -> Response {
+    let Some(page) = PassPage::read(&body) else {
+        return error_json(StatusCode::BAD_REQUEST, "Send tab and page.");
+    };
+    let started = state
+        .spotiflac
+        .start_pass(&download_path(&state), &page.viewer())
+        .await;
     let mut answer = assist_json(&state).await;
     if let Some(object) = answer.as_object_mut() {
         match started {
@@ -307,10 +339,17 @@ pub async fn assist_start(State(state): State<AppState>) -> Response {
     ok(&answer)
 }
 
-/// `POST /api/admin/spotiflac/assist/stop`: stops the live Pass run (its song's job is cancelled
-/// and its folder removed), and answers the run as it stands.
-pub async fn assist_stop(State(state): State<AppState>) -> Response {
-    let stopped = state.spotiflac.stop_pass().await;
+/// `POST /api/admin/spotiflac/assist/stop`: the page leaves the live Pass run, which stops once no
+/// page is left on it (its song's job is cancelled and its folder removed), and answers the run
+/// as it stands.
+pub async fn assist_stop(State(state): State<AppState>, body: Bytes) -> Response {
+    let Some(page) = PassPage::read(&body) else {
+        return error_json(StatusCode::BAD_REQUEST, "Send run, tab and page.");
+    };
+    let stopped = state
+        .spotiflac
+        .stop_pass(page.run.as_deref(), &page.viewer())
+        .await;
     let mut answer = assist_json(&state).await;
     if let Some(object) = answer.as_object_mut() {
         object.insert("stopped".into(), serde_json::Value::Bool(stopped));

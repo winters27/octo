@@ -7,7 +7,7 @@
 //! (passed), every armed gateway is paused again after the press (closed), the song's job ends
 //! with no browser ever opened (no check), or Mornye stops answering or its settings change.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -31,6 +31,27 @@ pub const HELPER_REFUSED_TOKEN: &str =
 
 /// Failed looks in a row that end a run as "Mornye stopped answering".
 const LOOKS_THAT_MAY_FAIL: u32 = 5;
+
+/// The longest tab or page name a dashboard may give; longer ones are cut to this.
+const VIEWER_NAME_MAX: usize = 64;
+
+/// One dashboard page on a Pass run: its tab, which stays the same across a reload, and the page
+/// load itself, which is new each time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Viewer {
+    pub tab: String,
+    pub page: String,
+}
+
+impl Viewer {
+    pub fn new(tab: &str, page: &str) -> Self {
+        let cut = |name: &str| name.trim().chars().take(VIEWER_NAME_MAX).collect::<String>();
+        Self {
+            tab: cut(tab),
+            page: cut(page),
+        }
+    }
+}
 
 /// A browser the helper sees, opened after the latest arm.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -102,6 +123,8 @@ pub enum RunState {
 
 /// One "Pass Mornye's check".
 pub struct AssistRun {
+    /// This run's name, which each stop from the dashboard names.
+    pub id: String,
     pub connection: Connection,
     pub started: DateTime<Utc>,
     /// The usable extensions the paused checks kept, which the arm asked to free.
@@ -118,8 +141,9 @@ pub struct AssistRun {
     seq: AtomicU64,
     /// Cancelled when the last person watching stops the run from the dashboard.
     stop: tokio_util::sync::CancellationToken,
-    /// The open dashboard panels on this run: each Pass joins it, each Close leaves.
-    viewers: Mutex<usize>,
+    /// The dashboard pages on this run, as tab to page: each Pass takes its tab's seat (a reload
+    /// takes the old page's seat over), each Close or page leaving gives up only its own.
+    viewers: Mutex<HashMap<String, String>>,
     /// Woken when the run ends.
     ended: tokio::sync::Notify,
 }
@@ -162,6 +186,19 @@ impl AssistRun {
     /// The next pointer event's number: minted here, so a reloaded page never starts over.
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+}
+
+/// Ends its run as unavailable when the task following the run stops before ending it (a panic),
+/// so a later Pass opens a new run instead of joining one nothing follows.
+struct EndsTheRun(Arc<AssistRun>);
+
+impl Drop for EndsTheRun {
+    fn drop(&mut self) {
+        self.0.end(
+            RunState::Unavailable,
+            Some("Octo stopped following Mornye's check.".into()),
+        );
     }
 }
 
@@ -260,17 +297,25 @@ impl SpotiflacClient {
     }
 
     /// One page leaves the live run; the last one to leave stops it (its song's job cancelled
-    /// and its folder removed). Answers whether this stopped it.
-    pub async fn stop_pass(&self) -> bool {
+    /// and its folder removed). `run` is the run the page was on, or None while its start had not
+    /// answered yet. A stop for another run, or from a page whose tab a newer page has taken
+    /// over, leaves the run as it is. Answers whether this stopped it.
+    pub async fn stop_pass(&self, run: Option<&str>, viewer: &Viewer) -> bool {
         // After a start still on its way, so a Close while opening stops the run it makes.
         let _starting = self.assist.starting.lock().await;
+        let named = run;
         let Some(run) = self.assist_run().filter(|run| !run.finished()) else {
             return false;
         };
+        if named.is_some_and(|id| id != run.id) {
+            return false;
+        }
         let left = {
             let mut viewers = run.viewers.lock();
-            *viewers = viewers.saturating_sub(1);
-            *viewers
+            if viewers.get(&viewer.tab) == Some(&viewer.page) {
+                viewers.remove(&viewer.tab);
+            }
+            viewers.len()
         };
         if left > 0 {
             // Someone else is still passing it from another page.
@@ -293,16 +338,20 @@ impl SpotiflacClient {
     }
 
     /// Starts "Pass Mornye's check", or answers the run that is already live. `download_path` is
-    /// Octo's music folder, where the song's job folder goes.
-    pub async fn start_pass(self: &Arc<Self>, download_path: &str) -> Result<Arc<AssistRun>, CannotPass> {
+    /// Octo's music folder, where the song's job folder goes; `viewer` is the page that asked.
+    pub async fn start_pass(
+        self: &Arc<Self>,
+        download_path: &str,
+        viewer: &Viewer,
+    ) -> Result<Arc<AssistRun>, CannotPass> {
         let (_, connection) = self.helper()?;
         // Two starts at once (two tabs, Close then Pass) never arm twice: the second waits here
         // and answers the run the first made.
         let _starting = self.assist.starting.lock().await;
         if let Some(run) = self.assist_run().filter(|run| !run.finished()) {
             if !run.stop.is_cancelled() {
-                // Another page joins the run already open.
-                *run.viewers.lock() += 1;
+                // Another page joins the run already open, or a reloaded one takes its seat back.
+                run.viewers.lock().insert(viewer.tab.clone(), viewer.page.clone());
                 return Ok(run);
             }
             // A run just stopped is still cleaning up: a new one starts once it has.
@@ -363,6 +412,7 @@ impl SpotiflacClient {
         // The pause is gone from Mornye's disk: the next read lets the song through.
         let _ = self.check_view(Some(Instant::now())).await;
         let run = Arc::new(AssistRun {
+            id: uuid::Uuid::new_v4().simple().to_string(),
             connection,
             started: now,
             extensions,
@@ -375,7 +425,7 @@ impl SpotiflacClient {
             browser_seen: AtomicBool::new(false),
             seq: AtomicU64::new(0),
             stop: tokio_util::sync::CancellationToken::new(),
-            viewers: Mutex::new(1),
+            viewers: Mutex::new(HashMap::from([(viewer.tab.clone(), viewer.page.clone())])),
             ended: tokio::sync::Notify::new(),
         });
         *self.assist.run.lock() = Some(Arc::clone(&run));
@@ -392,6 +442,7 @@ impl SpotiflacClient {
 
     /// Asks Mornye for the run's song and follows it until the run ends, then cleans up.
     async fn follow_pass(self: Arc<Self>, run: Arc<AssistRun>, download_path: String) {
+        let _ends = EndsTheRun(Arc::clone(&run));
         let _slot = tokio::select! {
             slot = self.slot() => slot,
             _ = run.stop.cancelled() => {

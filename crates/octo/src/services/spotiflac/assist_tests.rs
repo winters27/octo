@@ -20,6 +20,16 @@ fn sessions(state: &str, paused_s: f64) -> serde_json::Value {
     ]}})
 }
 
+/// The dashboard page most tests pass from.
+fn tab_a() -> Viewer {
+    Viewer::new("tab-a", "page-1")
+}
+
+/// A second tab on the same dashboard.
+fn tab_b() -> Viewer {
+    Viewer::new("tab-b", "page-2")
+}
+
 fn services() -> serde_json::Value {
     json!({"result": {"services": [{"id": "ext:example-ext", "label": "Example", "extensions": ["example-ext"]}]}})
 }
@@ -173,7 +183,7 @@ async fn a_session_of_an_armed_gateway_turning_active_is_a_pass() {
     let w = world(sessions("active", 0.0), no_browser(), running_job()).await;
     let run = w
         .client
-        .start_pass(&w.music.path().to_string_lossy())
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
         .await
         .expect("starts");
     assert_eq!(run.extensions, vec!["example-ext"]);
@@ -201,7 +211,7 @@ async fn another_session_already_active_on_the_gateway_is_not_a_pass() {
     .await;
     let run = w
         .client
-        .start_pass(&w.music.path().to_string_lossy())
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
         .await
         .expect("starts");
     assert_eq!(until_finished(&run).await, RunState::NoCheck);
@@ -214,7 +224,7 @@ async fn every_ended_pause_stamped_again_after_the_press_is_a_closed_check() {
     let w = world(sessions("unverified", 900.0), stamped, running_job()).await;
     let run = w
         .client
-        .start_pass(&w.music.path().to_string_lossy())
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
         .await
         .expect("starts");
     assert_eq!(until_finished(&run).await, RunState::Closed);
@@ -231,12 +241,15 @@ async fn a_job_that_ends_with_no_browser_never_reached_the_check_and_its_song_is
     assert_eq!(w.client.check_songs_left(), 1);
     let run = w
         .client
-        .start_pass(&w.music.path().to_string_lossy())
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
         .await
         .expect("starts");
     assert_eq!(until_finished(&run).await, RunState::NoCheck);
     assert_eq!(w.client.check_songs_left(), 0);
-    let again = w.client.start_pass(&w.music.path().to_string_lossy()).await;
+    let again = w
+        .client
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
+        .await;
     assert!(again.is_err(), "no song left to ask for");
 }
 
@@ -248,7 +261,7 @@ async fn pass_needs_a_paused_check_a_song_and_a_token() {
     let _ = w.client.check_view(Some(Instant::now())).await;
     let refused = w
         .client
-        .start_pass(&w.music.path().to_string_lossy())
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
         .await
         .err()
         .expect("refused");
@@ -272,7 +285,7 @@ async fn pass_needs_a_paused_check_a_song_and_a_token() {
         ..Default::default()
     }));
     let open = Arc::new(SpotiflacClient::new(settings));
-    let refused = open.start_pass("/music").await.err().expect("refused");
+    let refused = open.start_pass("/music", &tab_a()).await.err().expect("refused");
     assert_eq!(
         refused.0,
         "Set a web token for Mornye (SPOTIFLAC_WEB_TOKEN) to pass its check from Octo."
@@ -292,7 +305,7 @@ async fn a_pause_the_gateway_asked_for_is_left_alone() {
         .await;
     let refused = w
         .client
-        .start_pass(&w.music.path().to_string_lossy())
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
         .await
         .err()
         .expect("refused");
@@ -325,7 +338,7 @@ async fn pointer_events_carry_a_number_the_server_counts() {
     );
     let _run = w
         .client
-        .start_pass(&w.music.path().to_string_lossy())
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
         .await
         .expect("starts");
     w.client
@@ -363,7 +376,8 @@ async fn pointer_events_carry_a_number_the_server_counts() {
 async fn two_starts_at_once_arm_once_and_share_the_run() {
     let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
     let folder = w.music.path().to_string_lossy().into_owned();
-    let (first, second) = tokio::join!(w.client.start_pass(&folder), w.client.start_pass(&folder));
+    let (a, b) = (tab_a(), tab_b());
+    let (first, second) = tokio::join!(w.client.start_pass(&folder, &a), w.client.start_pass(&folder, &b));
     let (first, second) = (first.expect("starts"), second.expect("answers the same run"));
     assert!(Arc::ptr_eq(&first, &second));
     assert_eq!(requests_to(&w.helper, "/assist/arm").await, 1);
@@ -374,7 +388,7 @@ async fn a_run_stopped_from_the_dashboard_cancels_its_song() {
     let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
     let run = w
         .client
-        .start_pass(&w.music.path().to_string_lossy())
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
         .await
         .expect("starts");
     // Once Mornye has the song, as a person who closes the panel finds it.
@@ -384,11 +398,14 @@ async fn a_run_stopped_from_the_dashboard_cancels_its_song() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(w.client.stop_pass().await);
+    assert!(w.client.stop_pass(Some(&run.id), &tab_a()).await);
     assert_eq!(until_finished(&run).await, RunState::Unavailable);
     assert_eq!(run.state().1.as_deref(), Some("Stopped from the dashboard."));
     assert_eq!(requests_to(&w.mornye, "/api/v1/downloads/job-1/cancel").await, 1);
-    assert!(!w.client.stop_pass().await, "nothing live to stop");
+    assert!(
+        !w.client.stop_pass(Some(&run.id), &tab_a()).await,
+        "nothing live to stop"
+    );
 }
 
 #[tokio::test]
@@ -414,11 +431,12 @@ async fn a_close_while_the_check_is_opening_stops_the_run_it_makes() {
         .await;
     let folder = w.music.path().to_string_lossy().into_owned();
     let client = Arc::clone(&w.client);
-    let starting = tokio::spawn(async move { client.start_pass(&folder).await });
+    let starting = tokio::spawn(async move { client.start_pass(&folder, &tab_a()).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    // The page has no run name yet: its start has not answered.
     assert!(
-        w.client.stop_pass().await,
+        w.client.stop_pass(None, &tab_a()).await,
         "the stop waits for the start, then stops its run"
     );
     let run = starting.await.expect("ran").expect("started");
@@ -429,10 +447,15 @@ async fn a_close_while_the_check_is_opening_stops_the_run_it_makes() {
 async fn a_pass_right_after_a_close_opens_a_new_run() {
     let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
     let folder = w.music.path().to_string_lossy().into_owned();
-    let first = w.client.start_pass(&folder).await.expect("starts");
-    assert!(w.client.stop_pass().await);
-    let second = w.client.start_pass(&folder).await.expect("starts again");
+    let first = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
+    assert!(w.client.stop_pass(Some(&first.id), &tab_a()).await);
+    let second = w
+        .client
+        .start_pass(&folder, &tab_a())
+        .await
+        .expect("starts again");
     assert!(!Arc::ptr_eq(&first, &second), "not the run being stopped");
+    assert_ne!(first.id, second.id);
     assert!(first.finished());
     assert_eq!(requests_to(&w.helper, "/assist/arm").await, 2);
 }
@@ -441,13 +464,79 @@ async fn a_pass_right_after_a_close_opens_a_new_run() {
 async fn a_close_on_one_page_leaves_the_run_another_page_is_passing() {
     let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
     let folder = w.music.path().to_string_lossy().into_owned();
-    let run = w.client.start_pass(&folder).await.expect("starts");
-    let joined = w.client.start_pass(&folder).await.expect("joins");
+    let run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
+    let joined = w.client.start_pass(&folder, &tab_b()).await.expect("joins");
     assert!(Arc::ptr_eq(&run, &joined));
-    assert!(!w.client.stop_pass().await, "the other page is still on it");
+    assert!(
+        !w.client.stop_pass(Some(&run.id), &tab_a()).await,
+        "the other page is still on it"
+    );
     assert!(!run.finished());
-    assert!(w.client.stop_pass().await, "the last page leaves");
+    assert!(
+        w.client.stop_pass(Some(&run.id), &tab_b()).await,
+        "the last page leaves"
+    );
     assert_eq!(until_finished(&run).await, RunState::Unavailable);
+}
+
+#[tokio::test]
+async fn a_reloaded_page_takes_its_old_seat_so_its_close_still_stops_the_run() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let folder = w.music.path().to_string_lossy().into_owned();
+    let run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
+    // The page reloads and its leaving stop never reaches Octo; the new page passes again.
+    let reloaded = Viewer::new("tab-a", "page-1-reloaded");
+    let joined = w.client.start_pass(&folder, &reloaded).await.expect("joins");
+    assert!(Arc::ptr_eq(&run, &joined));
+    assert!(
+        w.client.stop_pass(Some(&run.id), &reloaded).await,
+        "one tab, one seat: its Close stops the run"
+    );
+    assert_eq!(until_finished(&run).await, RunState::Unavailable);
+}
+
+#[tokio::test]
+async fn a_late_stop_from_the_page_before_a_reload_leaves_the_new_page_on() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let folder = w.music.path().to_string_lossy().into_owned();
+    let run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
+    let reloaded = Viewer::new("tab-a", "page-1-reloaded");
+    w.client.start_pass(&folder, &reloaded).await.expect("joins");
+    // The old page's leaving stop arrives after the new page passed.
+    assert!(!w.client.stop_pass(Some(&run.id), &tab_a()).await);
+    assert!(!run.finished(), "the new page is still on it");
+}
+
+#[tokio::test]
+async fn a_stop_for_an_earlier_run_leaves_the_run_open_now() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let folder = w.music.path().to_string_lossy().into_owned();
+    let first = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
+    assert!(w.client.stop_pass(Some(&first.id), &tab_a()).await);
+    let second = w
+        .client
+        .start_pass(&folder, &tab_a())
+        .await
+        .expect("starts again");
+    // The first Close, sent again late, names the first run.
+    assert!(!w.client.stop_pass(Some(&first.id), &tab_a()).await);
+    assert!(!second.finished(), "the run open now goes on");
+}
+
+#[tokio::test]
+async fn a_run_its_follower_left_unfinished_ends_so_a_new_pass_can_open() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let folder = w.music.path().to_string_lossy().into_owned();
+    let run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
+    assert!(!run.finished());
+    // As when the task following the run stops partway (a panic).
+    drop(EndsTheRun(Arc::clone(&run)));
+    assert!(run.finished());
+    assert_eq!(run.state().0, RunState::Unavailable);
+    assert_eq!(
+        run.state().1.as_deref(),
+        Some("Octo stopped following Mornye's check.")
+    );
 }
 
 #[tokio::test]
@@ -461,7 +550,7 @@ async fn a_run_ends_once_the_song_takes_longer_than_a_song_may() {
     .await;
     let run = w
         .client
-        .start_pass(&w.music.path().to_string_lossy())
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
         .await
         .expect("starts");
     assert_eq!(until_finished(&run).await, RunState::Unavailable);
@@ -497,7 +586,7 @@ async fn a_song_is_not_counted_as_tried_when_the_helper_missed_a_look() {
         .await;
     let run = w
         .client
-        .start_pass(&w.music.path().to_string_lossy())
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
         .await
         .expect("starts");
     assert_eq!(until_finished(&run).await, RunState::Unavailable);

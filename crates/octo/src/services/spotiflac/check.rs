@@ -105,6 +105,29 @@ impl CheckView {
             labels,
         })
     }
+
+    /// The labels of the rows that hold extension `provider`, paused or not, so a wait read from
+    /// Mornye's own words names the same checks a pause from the read would; the extension's id
+    /// when no row holds it, which a later read's rows can still name.
+    pub fn labels_of(&self, provider: &str) -> Vec<String> {
+        let id = octo_core::spotiflac::check::extension_id(provider);
+        let mut labels: Vec<String> = self
+            .rows
+            .known()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| row.extensions.contains(&id))
+                    .map(|row| row.label.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        labels.sort();
+        labels.dedup();
+        if labels.is_empty() {
+            labels.push(id);
+        }
+        labels
+    }
 }
 
 fn cannot_tell<T>(reading: &Reading<T>) -> Option<&str> {

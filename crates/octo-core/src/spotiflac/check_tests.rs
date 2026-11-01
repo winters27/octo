@@ -182,6 +182,16 @@ fn a_missing_utilities_extension_is_named_first() {
 }
 
 #[test]
+fn the_utilities_fix_reaches_the_download_log_whole() {
+    let detail = utilities_words().detail.expect("a fix");
+    assert_eq!(
+        crate::common::acquisition_tracker::user_safe(Some(&detail)).as_deref(),
+        Some(detail.trim_end_matches('.')),
+        "the log keeps the first sentence only, so the fix is one sentence under the cap"
+    );
+}
+
+#[test]
 fn a_refused_write_into_the_job_folder_is_named_only_for_this_job() {
     let row = health(
         "example-ext",

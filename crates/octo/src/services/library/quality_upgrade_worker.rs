@@ -575,7 +575,7 @@ impl QualityUpgradeWorker {
             Err(e) => LibraryActionOutcome::new(LibraryActionState::Failed, Some(e.to_string())),
         };
         // Mornye's check kept the song from Mornye: nothing was tried, so it is not stamped for
-        // four weeks, and the next run comes back to it first.
+        // four weeks; it is passed over until its pause ends or its checks pass.
         if LibraryActionCodes::waits_on_mornye(outcome.code.as_deref()) {
             info!(
                 "Quality upgrade: '{} - {}' waits for Mornye's check",

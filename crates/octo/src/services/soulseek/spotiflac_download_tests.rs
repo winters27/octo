@@ -950,6 +950,27 @@ async fn mornyes_own_paused_words_are_a_wait_when_it_does_not_report_its_check()
 }
 
 #[tokio::test]
+async fn mornyes_own_paused_words_name_the_checks_its_read_shows_for_the_extension() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    // The read shows the extension's gateway working; only Mornye's words say it is paused.
+    setup.fake.sessions = vec![gateway("active")];
+    setup.fake.services = Some(example_service());
+    setup.fake.file = None;
+    setup.fake.status = "failed";
+    setup.fake.error =
+        Some("RuntimeError: verification paused after a failed attempt \u{2014} next try in 4 min");
+    setup.fake.provider = Some("ext:example-ext");
+    let fetch = setup.build(events).await;
+
+    let error = fetch.acquire().await.expect_err("paused");
+
+    let wait = mornye_waited(&error).expect("a Mornye wait");
+    // The gateway row's label, which a Pass turning it active releases.
+    assert_eq!(wait.pause.labels, vec!["Example".to_string()]);
+}
+
+#[tokio::test]
 async fn a_failure_of_this_song_alone_is_said_from_the_extensions_health() {
     let events: Events = Arc::default();
     let mut setup = Setup::new(&events);

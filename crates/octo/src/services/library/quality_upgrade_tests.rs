@@ -408,6 +408,27 @@ async fn a_kept_song_is_passed_over_so_the_next_run_tries_the_next_song() {
             .mornye_holds
             .contains_key(&QualityUpgradeWorker::key_of(&row("a", "A/a.mp3")))
     );
+
+    // Once a's pause has ended, the next run picks a again.
+    *now.lock() += chrono::TimeDelta::days(31);
+    w.tick().await;
+    assert_eq!(
+        *asked.lock(),
+        vec!["a".to_string(), "b".to_string(), "a".to_string()]
+    );
+}
+
+#[test]
+fn the_weekly_runs_holds_survive_a_restart() {
+    let mut state = QualityUpgradeState::default();
+    let hold = MornyeHold {
+        until_utc: chrono::Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap(),
+        labels: vec!["Example".into()],
+    };
+    state.mornye_holds.set("A/a.mp3".to_string(), hold.clone());
+    let text = serde_json::to_string(&state).expect("writes");
+    let back: QualityUpgradeState = serde_json::from_str(&text).expect("reads");
+    assert_eq!(back.mornye_holds.get("A/a.mp3"), Some(&hold));
 }
 
 #[tokio::test]

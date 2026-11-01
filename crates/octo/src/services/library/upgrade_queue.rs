@@ -126,6 +126,12 @@ pub struct UpgradeJob {
     /// For a job Mornye's check kept: when that pause ends and the checks it named.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mornye_hold: Option<MornyeHold>,
+
+    /// The job that went back alone when its Mornye pause ended: while it is queued or running,
+    /// the others held on Mornye's check wait for what its try shows. Kept on disk, so a restart
+    /// does not send a second one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mornye_scout: bool,
 }
 
 /// The Mornye pause a job waits on: it goes back once the pause ends (one job at a time, the
@@ -183,6 +189,7 @@ impl Default for UpgradeJob {
             pick: None,
             wait: None,
             mornye_hold: None,
+            mornye_scout: false,
         }
     }
 }
@@ -473,11 +480,12 @@ impl UpgradeQueue {
 
     /// Waiting jobs back in the queue, once Soulseek is back.
     pub fn requeue(&self) -> usize {
-        self.requeue_where(|_| true)
+        self.requeue_where(|_| true, None)
     }
 
-    /// The waiting jobs `ready` lets go back in the queue, each by what it waits for.
-    pub fn requeue_where(&self, ready: impl Fn(&UpgradeJob) -> bool) -> usize {
+    /// The waiting jobs `ready` lets go back in the queue, each by what it waits for. `scout` is
+    /// the one going back alone because its Mornye pause ended, marked so until its try is known.
+    pub fn requeue_where(&self, ready: impl Fn(&UpgradeJob) -> bool, scout: Option<&str>) -> usize {
         let mut jobs = self.jobs.lock();
         let mut count = 0;
         for job in jobs.values_mut() {
@@ -485,6 +493,7 @@ impl UpgradeQueue {
                 job.state = UpgradeStates::QUEUED.to_string();
                 job.wait = None;
                 job.mornye_hold = None;
+                job.mornye_scout = scout == Some(job.navidrome_id.as_str());
                 job.updated_utc = self.clock.now();
                 count += 1;
             }
@@ -514,32 +523,42 @@ impl UpgradeQueue {
         held.into_iter().map(|(_, id, hold)| (id, hold)).collect()
     }
 
-    /// The other jobs held on a pause that shares a check with `hold` wait for its new end too:
-    /// one try of that check is known to have failed.
-    pub fn move_mornye_holds(&self, hold: &MornyeHold) {
-        let mut jobs = self.jobs.lock();
-        let mut moved = false;
-        for job in jobs.values_mut() {
-            if job.state == UpgradeStates::WAITING
-                && let Some(held) = job.mornye_hold.as_mut()
-                && held.shares_a_check(hold)
-                && held.until_utc < hold.until_utc
-            {
-                held.until_utc = hold.until_utc;
-                moved = true;
-            }
-        }
-        if moved {
-            self.save(&jobs);
-        }
+    /// Whether the job sent back alone when its Mornye pause ended is still queued or running.
+    pub fn mornye_scout_on_its_way(&self) -> bool {
+        self.jobs.lock().values().any(|job| {
+            job.mornye_scout && matches!(job.state.as_str(), UpgradeStates::QUEUED | UpgradeStates::WORKING)
+        })
     }
 
-    /// Whether the job is queued or running now.
-    pub fn is_on_its_way(&self, navidrome_id: &str) -> bool {
-        self.jobs
-            .lock()
-            .get(navidrome_id)
-            .is_some_and(|job| matches!(job.state.as_str(), UpgradeStates::QUEUED | UpgradeStates::WORKING))
+    /// Ends a job's run: `change` sets what it found, and its scout mark goes (its try is known).
+    /// When it waits on a Mornye pause again, the other jobs held on a pause that shares a check
+    /// wait for that pause's new end too. One lock for all of it, so no tick sees the job's new
+    /// hold before the others have moved.
+    pub fn finish_run(&self, navidrome_id: &str, change: impl FnOnce(&mut UpgradeJob)) {
+        let mut jobs = self.jobs.lock();
+        let Some(job) = jobs.get_mut(navidrome_id) else {
+            return;
+        };
+        change(job);
+        job.mornye_scout = false;
+        job.updated_utc = self.clock.now();
+        let hold = job
+            .mornye_hold
+            .clone()
+            .filter(|_| job.state == UpgradeStates::WAITING);
+        if let Some(hold) = &hold {
+            for other in jobs.values_mut() {
+                if other.navidrome_id != navidrome_id
+                    && other.state == UpgradeStates::WAITING
+                    && let Some(held) = other.mornye_hold.as_mut()
+                    && held.shares_a_check(hold)
+                    && held.until_utc < hold.until_utc
+                {
+                    held.until_utc = hold.until_utc;
+                }
+            }
+        }
+        self.save(&jobs);
     }
 
     pub fn any_waiting(&self) -> bool {
@@ -684,9 +703,6 @@ pub struct UpgradeWorker {
     running: Mutex<Vec<JoinHandle<()>>>,
     /// Copies picked in Find songs, handed to the replacement's download.
     picks: Option<Arc<DownloadPicks>>,
-    /// The one job Mornye's check kept that went back when its pause ended: the others wait for
-    /// what its try shows.
-    mornye_scout: Mutex<Option<String>>,
 }
 
 impl UpgradeWorker {
@@ -736,7 +752,6 @@ impl UpgradeWorker {
             seams,
             running: Mutex::new(Vec::new()),
             picks: None,
-            mornye_scout: Mutex::new(None),
         }
     }
 
@@ -755,14 +770,17 @@ impl UpgradeWorker {
     pub async fn tick(self: &Arc<Self>, ct: &CancellationToken) -> usize {
         if self.queue.any_waiting() {
             let sources_back = !(self.seams.soulseek_offline)().await;
-            let mornye_released = self.mornye_released().await;
-            self.queue.requeue_where(|job| {
-                if job.wait.as_deref() == Some(LibraryActionCodes::MORNYE_KEPT) {
-                    mornye_released.contains(&job.navidrome_id)
-                } else {
-                    sources_back
-                }
-            });
+            let (mornye_released, scout) = self.mornye_released().await;
+            self.queue.requeue_where(
+                |job| {
+                    if job.wait.as_deref() == Some(LibraryActionCodes::MORNYE_KEPT) {
+                        mornye_released.contains(&job.navidrome_id)
+                    } else {
+                        sources_back
+                    }
+                },
+                scout.as_deref(),
+            );
         }
         let mut started = 0;
         self.running.lock().retain(|task| !task.is_finished());
@@ -788,11 +806,12 @@ impl UpgradeWorker {
     /// The jobs Mornye's check kept that go back now, each by its own pause: every one whose
     /// checks a read shows passing, and, once a pause has ended, its oldest job alone (the
     /// scout), unless a scout is still on its way. The others follow what the scout's try shows.
-    async fn mornye_released(&self) -> std::collections::HashSet<String> {
+    /// Answers them with the scout, if one goes.
+    async fn mornye_released(&self) -> (std::collections::HashSet<String>, Option<String>) {
         let holds = self.queue.mornye_holds();
         let mut released = std::collections::HashSet::new();
         if holds.is_empty() {
-            return released;
+            return (released, None);
         }
         let mut passing: Vec<(Vec<String>, bool)> = Vec::new();
         for (id, hold) in &holds {
@@ -813,19 +832,18 @@ impl UpgradeWorker {
                 released.insert(id.clone());
             }
         }
-        let mut scout = self.mornye_scout.lock();
-        if scout.as_ref().is_some_and(|id| self.queue.is_on_its_way(id)) {
-            return released;
+        if self.queue.mornye_scout_on_its_way() {
+            return (released, None);
         }
         let now = Utc::now();
-        *scout = holds
+        let scout = holds
             .iter()
             .find(|(id, hold)| !released.contains(id) && hold.until_utc <= now)
             .map(|(id, _)| id.clone());
-        if let Some(id) = scout.as_ref() {
+        if let Some(id) = &scout {
             released.insert(id.clone());
         }
-        released
+        (released, scout)
     }
 
     /// Waits for every job started so far. Only tests need it.
@@ -1021,24 +1039,16 @@ impl UpgradeWorker {
             .as_deref()
             .filter(|_| state == UpgradeStates::WAITING)
             .map(MornyeHold::of);
-        self.queue.update(&job.navidrome_id, |j| {
+        // A scout's try is known: it failed again (the others now wait for its new pause), or it
+        // ended any other way (the others go back once a read shows the check passing, or their
+        // pause ends with the next scout).
+        self.queue.finish_run(&job.navidrome_id, |j| {
             j.state = state.to_string();
             j.result = result;
             j.detail = detail;
             j.wait = outcome.code.clone().filter(|_| state == UpgradeStates::WAITING);
-            j.mornye_hold = hold.clone();
+            j.mornye_hold = hold;
         });
-        // A scout's try is known: it failed again (the others now wait for its new pause), or it
-        // ended any other way (the others go back once a read shows the check passing, or their
-        // pause ends with the next scout).
-        let mut scout = self.mornye_scout.lock();
-        if scout.as_deref() == Some(job.navidrome_id.as_str()) {
-            *scout = None;
-        }
-        drop(scout);
-        if let Some(hold) = &hold {
-            self.queue.move_mornye_holds(hold);
-        }
         if state == UpgradeStates::NOT_FOUND
             && let (Some(key), Some(attempts)) = (&job.attempt_key, &self.attempts)
         {

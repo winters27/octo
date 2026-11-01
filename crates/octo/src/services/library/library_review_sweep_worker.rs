@@ -1671,13 +1671,13 @@ impl LibraryReviewSweepWorker {
                 Replacing::Waits
             }
             Ok(outcome) if LibraryActionCodes::waits_on_mornye(outcome.code.as_deref()) => {
-                info!(
-                    "Library review sweep: '{} - {}' waits, because Mornye could not pass its check and the replacement may come from nowhere else",
-                    song.artist, song.title
-                );
                 if outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_KEPT) {
                     // The sources that were asked had none: the song is passed over until
                     // Mornye may try again, and the sweep goes on.
+                    info!(
+                        "Library review sweep: '{} - {}' is passed over while Mornye's check keeps it; the sweep goes on",
+                        song.artist, song.title
+                    );
                     let hold = outcome
                         .mornye_wait
                         .as_deref()
@@ -1689,6 +1689,10 @@ impl LibraryReviewSweepWorker {
                     self.mornye_holds.lock().insert(path.to_string(), hold);
                     return Replacing::SkipsForMornye;
                 }
+                info!(
+                    "Library review sweep: '{} - {}' waits, because Mornye could not pass its check and the replacement may come from nowhere else",
+                    song.artist, song.title
+                );
                 Replacing::WaitsForMornye
             }
             Ok(outcome) => {

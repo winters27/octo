@@ -3552,6 +3552,71 @@ function passInputQueue(send, { now = () => Date.now(), sleep = ms => new Promis
   };
 }
 
+const PASS_TAB_KEY = 'octo.passTab';
+const PASS_TAB_OPEN_KEY = 'octo.passTabOpen';
+
+// Which tab and page this load is, as Octo counts the pages on a Pass run. The tab is kept in
+// sessionStorage, so a reload is the same tab and takes its old seat back; the page is new on
+// every load, so a stop sent by the page before never gives up the seat of the page after it.
+// While a page of the tab is open its mark is set, and leaving clears it: a tab that starts with
+// the mark set was copied from an open one (Duplicate tab copies sessionStorage) and takes a tab
+// of its own.
+function passViewer(store, makeId) {
+  const page = makeId();
+  let tab = null;
+  try {
+    const kept = store.getItem(PASS_TAB_KEY);
+    tab = kept && store.getItem(PASS_TAB_OPEN_KEY) !== kept ? kept : makeId();
+    store.setItem(PASS_TAB_KEY, tab);
+    store.setItem(PASS_TAB_OPEN_KEY, tab);
+  } catch {
+    tab = tab || page;
+  }
+  return { tab, page };
+}
+
+// The tab's mark while one of its pages is open: cleared as the page leaves, set again when the
+// browser brings the same page back.
+function passViewerShown(store, viewer, shown) {
+  try {
+    if (shown) store.setItem(PASS_TAB_OPEN_KEY, viewer.tab);
+    else store.removeItem(PASS_TAB_OPEN_KEY);
+  } catch { /* a blocked store marks nothing */ }
+}
+
+// The Pass panel's starts and stops, in order. A start waits for the stop sent before it, so a
+// Pass right after a Close opens a new check instead of joining the one being stopped. Each stop
+// names the run its page was on (null while the start had not answered) and the page itself.
+// `send(call, body)` posts to .../assist/<call> and answers the parsed reply; a stop may go by
+// another sender (the page's leaving one).
+function passCalls(send, viewer) {
+  let run = null;
+  let turn = 0;
+  let stopping = null;
+  return {
+    async start() {
+      const before = stopping;
+      stopping = null;
+      if (before) await before;
+      const asked = ++turn;
+      const answer = await send('start', { tab: viewer.tab, page: viewer.page });
+      if (asked === turn) run = typeof answer?.run === 'string' ? answer.run : null;
+      return answer;
+    },
+    stop(by = send) {
+      turn += 1;
+      const body = { run, tab: viewer.tab, page: viewer.page };
+      run = null;
+      // Sent before this returns, so a page that is leaving still gets it out.
+      let sent;
+      try { sent = Promise.resolve(by('stop', body)); } catch (error) { sent = Promise.reject(error); }
+      stopping = sent.then(() => {}, () => {});
+      return stopping;
+    },
+    run: () => run,
+  };
+}
+
 let mornyeNowLoad = null;
 let mornyeNowView = null;
 
@@ -3628,11 +3693,45 @@ const passState = {
   pointer: null,      // the pointer held down on the picture, if any
   frameUrl: null,
   pollTimer: null,
-  stopping: null,     // the stop a Close sent, which the next Pass waits for
   queue: null,
 };
 
 const passEl = id => document.getElementById(id);
+
+let passStore = null;
+try { passStore = window.sessionStorage; } catch { /* a blocked store: each load is its own tab */ }
+const passId = () => Array.from(crypto.getRandomValues(new Uint8Array(12)), b => b.toString(16).padStart(2, '0')).join('');
+const passPage = passViewer(passStore, passId);
+
+async function passSend(call, body) {
+  const r = await api(`/api/admin/spotiflac/assist/${call}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const answer = await r.json().catch(() => ({}));
+  if (!r.ok && !answer.state) return { started: false, why: answer.error || `Octo answered HTTP ${r.status}.` };
+  return answer;
+}
+
+// A stop sent as the page leaves: the browser still delivers it once the page has gone.
+const passLeaveSend = (call, body) => fetch(`/api/admin/spotiflac/assist/${call}`, {
+  method: 'POST',
+  keepalive: true,
+  credentials: 'same-origin',
+  headers: { 'Content-Type': 'application/json', 'X-Octo-Admin': '1' },
+  body: JSON.stringify(body),
+});
+
+const passLine = passCalls(passSend, passPage);
+
+window.addEventListener('pagehide', () => {
+  passViewerShown(passStore, passPage, false);
+  if (passState.open) closePass(passLeaveSend);
+});
+window.addEventListener('pageshow', event => {
+  if (event.persisted) passViewerShown(passStore, passPage, true);
+});
 
 function passQueue() {
   if (passState.queue) return passState.queue;
@@ -3675,12 +3774,11 @@ function openPass() {
   startPass();
 }
 
-function closePass() {
+// `by` sends the stop another way (the leaving page's).
+function closePass(by = undefined) {
   // A run still opening or live is left on the server too (stopped once no other page is on
   // it, its song's job cancelled); a Pass right after waits for that first.
-  if (passState.view?.polls) {
-    passState.stopping = api('/api/admin/spotiflac/assist/stop', { method: 'POST' }).catch(() => {});
-  }
+  if (passState.view?.polls) passLine.stop(by);
   passState.open = false;
   passState.run += 1;
   clearTimeout(passState.pollTimer);
@@ -3704,12 +3802,7 @@ async function startPass() {
   let answer = null;
   try {
     // A Close just before has left the old run first, so this one is new.
-    const stopping = passState.stopping;
-    passState.stopping = null;
-    if (stopping) await stopping;
-    const r = await api('/api/admin/spotiflac/assist/start', { method: 'POST' });
-    answer = await r.json().catch(() => ({}));
-    if (!r.ok && !answer.state) answer = { started: false, why: answer.error || `Octo answered HTTP ${r.status}.` };
+    answer = await passLine.start();
   } catch (error) {
     answer = { started: false, why: `Octo did not answer: ${error.message}` };
   }
@@ -3879,7 +3972,7 @@ function relayPointer(type, event) {
 })();
 
 passEl('mornye-pass-open')?.addEventListener('click', openPass);
-passEl('mornye-pass-close')?.addEventListener('click', closePass);
+passEl('mornye-pass-close')?.addEventListener('click', () => closePass());
 passEl('mornye-pass-retry')?.addEventListener('click', startPass);
 passEl('mornye-pass-zoom')?.addEventListener('click', event => {
   const button = event.target.closest('button[data-zoom]');
