@@ -3028,7 +3028,7 @@ impl DownloadBackend for SoulseekDownloadService {
                             let why = match crate::services::spotiflac::mornye_waited(&e) {
                                 Some(wait) if self.slskd.is_on() => format!(
                                     "Soulseek brought no FLAC and Mornye could not pass its check for {}",
-                                    octo_core::spotiflac::check::names_list(&wait.pause.labels)
+                                    octo_core::spotiflac::check::names_list(wait.pause.shared())
                                 ),
                                 _ => e.to_string(),
                             };

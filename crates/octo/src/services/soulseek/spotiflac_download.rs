@@ -17,7 +17,7 @@ use octo_core::spotiflac::{
 use super::*;
 use crate::services::spotiflac::{
     CheckSong, Connection, MornyeWaiting, SPOTIFLAC_FOLDER, SpotiflacClient, make_shared_folder,
-    mornye_waited,
+    mornye_waited, octo_folder_name,
 };
 use octo_core::spotiflac::ExtensionsAnswer;
 use octo_core::spotiflac::check::{FailureFacts, failure_words, named_provider};
@@ -831,12 +831,6 @@ pub(super) fn sweep_spotiflac_folders(download_path: &str) {
     if let Err(e) = sweep() {
         debug!("Could not sweep {jobs}: {e}");
     }
-}
-
-/// A folder name Octo gives: a job id (32 hex characters), or a folder check's `octo-check-<id>`.
-pub(crate) fn octo_folder_name(name: &str) -> bool {
-    let id = name.strip_prefix("octo-check-").unwrap_or(name);
-    id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]

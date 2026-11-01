@@ -206,9 +206,9 @@ pub struct CheckPause {
     pub until_utc: DateTime<Utc>,
     /// The checks whose passing lets the wait go early.
     pub labels: Vec<String>,
-    /// The checks other waits on the same extensions share, when they are not `labels`: a wait
-    /// read from Mornye's own words beside a read that shows those checks working names none to
-    /// watch, yet shares the checks that hold its extension. Empty when they are `labels`.
+    /// The checks this wait shares with other waits on the same extensions; empty means
+    /// `labels`. A wait read from Mornye's own words beside a read that shows those checks
+    /// working watches none, yet shares the checks that hold its extension.
     pub holding: Vec<String>,
 }
 
@@ -420,7 +420,7 @@ pub fn gate_words(pause: &CheckPause, now: DateTime<Utc>) -> (String, String) {
     (
         format!(
             "Mornye could not pass its check for {}, so Octo did not ask it for this song.",
-            names_list(&pause.labels)
+            names_list(pause.shared())
         ),
         format!(
             "It allows its next try at {}; the next song after that lets it try.",

@@ -21,6 +21,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use super::check::PassJob;
+use super::octo_folder_name;
 use super::{CheckSong, Connection, SPOTIFLAC_FOLDER, SpotiflacClient, TOKEN_COOKIES, make_shared_folder};
 
 /// How often a run looks at Mornye, its helper and the song's job.
@@ -147,6 +148,8 @@ pub struct AssistRun {
     viewers: Mutex<HashMap<String, String>>,
     /// Woken when the run ends.
     ended: tokio::sync::Notify,
+    /// The song job the run's follower took at Mornye, once it took one.
+    job: Mutex<Option<PassJob>>,
 }
 
 impl AssistRun {
@@ -237,7 +240,11 @@ impl Drop for EndsTheRun {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    if ends.client.cancel(&ends.run.connection, &job.id).await {
+                    let bound = ends.client.check.times.call_bound;
+                    let over = tokio::time::timeout(bound, ends.client.cancel(&ends.run.connection, &job.id))
+                        .await
+                        .unwrap_or(false);
+                    if over {
                         ends.client.check.store.forget_pass_job(&job);
                     }
                     drop(ends);
@@ -249,24 +256,53 @@ impl Drop for EndsTheRun {
 }
 
 impl SpotiflacClient {
-    /// Cancels the song job a Pass run left at Mornye when Octo stopped following it (a
-    /// restart), and removes its folder, unless a run is still on it. A Mornye that does not
-    /// answer keeps the job for the next look; one now at another address cannot be asked, so
-    /// the job is let go.
-    pub(super) async fn cancel_left_pass_job(&self) {
-        let Some(left) = self.check.store.pass_job() else {
-            return;
-        };
-        if self.assist.run.lock().as_ref().is_some_and(|run| !run.finished()) {
+    /// Cancels the song jobs Pass runs left at Mornye when Octo stopped following them (a
+    /// restart, or a cancel Mornye did not take), and removes their folders; the live run's own
+    /// job is left to it. Each cancel takes no longer than one read of Mornye's check may. A job
+    /// whose cancel does not reach Mornye stays kept for a later read; one kept for a Mornye now
+    /// at another address cannot be asked, so it is let go.
+    pub(super) async fn cancel_left_pass_jobs(&self) {
+        let kept = self.check.store.pass_jobs();
+        if kept.is_empty() {
             return;
         }
+        let live = self
+            .assist
+            .run
+            .lock()
+            .as_ref()
+            .filter(|run| !run.finished())
+            .map(|run| run.job.lock().clone());
         let connection = Connection::of(&self.settings());
-        if connection.url == left.url && !self.cancel(&connection, &left.id).await {
-            return;
+        for left in kept {
+            if live.as_ref().is_some_and(|job| job.as_ref() == Some(&left)) {
+                continue;
+            }
+            if connection.url == left.url {
+                let bound = self.check.times.call_bound;
+                let over = tokio::time::timeout(bound, self.cancel(&connection, &left.id))
+                    .await
+                    .unwrap_or(false);
+                if !over {
+                    continue;
+                }
+            }
+            remove_check_folder(&left.dir);
+            self.check.store.forget_pass_job(&left);
+            info!("Pass Mornye's check: cancelled a song job a stopped run left at Mornye");
         }
-        let _ = std::fs::remove_dir_all(&left.dir);
-        self.check.store.forget_pass_job(&left);
-        info!("Pass Mornye's check: cancelled the song job a stopped run left at Mornye");
+    }
+}
+
+/// Removes a Pass run's song folder, and only one Octo names that way (`octo-check-<id>`), so a
+/// damaged file never removes anything else.
+fn remove_check_folder(dir: &str) {
+    let named_by_octo = std::path::Path::new(dir)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("octo-check-") && octo_folder_name(name));
+    if named_by_octo {
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 
@@ -498,6 +534,7 @@ impl SpotiflacClient {
             stop: tokio_util::sync::CancellationToken::new(),
             viewers: Mutex::new(HashMap::from([(viewer.tab.clone(), viewer.page.clone())])),
             ended: tokio::sync::Notify::new(),
+            job: Mutex::new(None),
         });
         *self.assist.run.lock() = Some(Arc::clone(&run));
         info!(
@@ -561,6 +598,7 @@ impl SpotiflacClient {
                 id: job.id.clone(),
                 dir: job_dir.clone(),
             };
+            *run.job.lock() = Some(kept.clone());
             self.check.store.keep_pass_job(kept.clone());
             ends.job = Some(kept);
         }

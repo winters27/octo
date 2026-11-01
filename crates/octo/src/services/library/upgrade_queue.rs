@@ -145,10 +145,18 @@ pub struct MornyeHold {
     /// The checks whose passing lets the job go early.
     #[serde(default)]
     pub labels: Vec<String>,
-    /// The checks it shares with other held jobs, when they are not `labels` (see
+    /// The checks it shares with other held jobs; empty means `labels` (see
     /// `CheckPause::holding`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub holding: Vec<String>,
+    /// How many times another job's try on a shared check has reached this hold, so a pass
+    /// read before such a try never lets the job go.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub moved: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 impl MornyeHold {
@@ -157,6 +165,7 @@ impl MornyeHold {
             until_utc: pause.until_utc,
             labels: pause.labels.clone(),
             holding: pause.holding.clone(),
+            moved: 0,
         }
     }
 
@@ -166,6 +175,7 @@ impl MornyeHold {
             until_utc,
             labels: Vec::new(),
             holding: Vec::new(),
+            moved: 0,
         }
     }
 
@@ -615,8 +625,9 @@ impl UpgradeQueue {
 
     /// Ends a job's run: `change` sets what it found, and its scout mark goes (its try is known).
     /// When it waits on a Mornye pause again, the other jobs held on a pause that shares a check
-    /// wait for that pause's new end too. One lock for all of it, so no tick sees the job's new
-    /// hold before the others have moved.
+    /// wait at least until that pause's new end, and a pass read before this try no longer lets
+    /// them go. One lock for all of it, so no tick sees the job's new hold before the others have
+    /// moved.
     pub fn finish_run(&self, navidrome_id: &str, change: impl FnOnce(&mut UpgradeJob)) {
         let mut jobs = self.jobs.lock();
         let Some(job) = jobs.get_mut(navidrome_id) else {
@@ -635,9 +646,10 @@ impl UpgradeQueue {
                     && other.state == UpgradeStates::WAITING
                     && let Some(held) = other.mornye_hold.as_mut()
                     && held.shares_a_check(hold)
-                    && held.until_utc < hold.until_utc
                 {
-                    held.until_utc = hold.until_utc;
+                    // A try on this check just failed: a pass read before it says nothing now.
+                    held.moved = held.moved.saturating_add(1);
+                    held.until_utc = held.until_utc.max(hold.until_utc);
                 }
             }
         }

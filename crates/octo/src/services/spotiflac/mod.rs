@@ -47,6 +47,12 @@ pub const TOKEN_COOKIES: [&str; 2] = ["mornye_web_token", "spotiflac_web_token"]
 /// scanner skips.
 pub const SPOTIFLAC_FOLDER: &str = ".octo-incoming/spotiflac";
 
+/// A folder name Octo gives: a job id (32 hex characters), or a folder check's `octo-check-<id>`.
+pub(crate) fn octo_folder_name(name: &str) -> bool {
+    let id = name.strip_prefix("octo-check-").unwrap_or(name);
+    id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// How long one call to Mornye's API may take.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -189,8 +195,6 @@ impl SpotiflacClient {
         if let Some(view) = self.check.cached(&connection, after) {
             return Some(view);
         }
-        // Each fresh read first cancels a song job a stopped Pass run left at Mornye.
-        self.cancel_left_pass_job().await;
         let started = Instant::now();
         let read_utc = chrono::Utc::now();
         let bound = self.check.times.call_bound;
@@ -219,6 +223,12 @@ impl SpotiflacClient {
                     .min();
                 push_words(labels, until, meanwhile, &public_url, now)
             });
+        }
+        // A read that reached Mornye then cancels the song jobs stopped Pass runs left there,
+        // after the read's turn is over so other readers do not wait on it.
+        drop(_turn);
+        if view.reached {
+            self.cancel_left_pass_jobs().await;
         }
         Some(view)
     }
@@ -466,8 +476,9 @@ impl SpotiflacClient {
 
     /// `POST /api/v1/downloads/{id}/cancel`. A failure is only logged: the job folder is
     /// removed either way.
-    /// Asks Mornye to cancel job `id`. Answers whether Mornye answered at all: a job it no
-    /// longer runs answers with an error, and needs no cancel again.
+    /// Asks Mornye to cancel job `id`. Answers whether the job is over at Mornye: cancelled, or
+    /// one Mornye does not know (404, 410). A refusal (401, 403), a busy or failing Mornye (5xx)
+    /// or no answer leaves it running, to be asked again.
     pub async fn cancel(&self, connection: &Connection, id: &str) -> bool {
         let request = self.request(
             connection,
@@ -476,10 +487,14 @@ impl SpotiflacClient {
         );
         match reach(connection, request).await {
             Ok(response) => {
-                if let Err(e) = read_answer::<serde_json::Value>(connection, response).await {
-                    tracing::debug!("Mornye did not cancel job {id}: {e}");
+                let status = response.status();
+                let over = status.is_success()
+                    || status == reqwest::StatusCode::NOT_FOUND
+                    || status == reqwest::StatusCode::GONE;
+                if !over {
+                    tracing::debug!("Mornye did not cancel job {id}: it answered {status}");
                 }
-                true
+                over
             }
             Err(e) => {
                 tracing::debug!("Mornye did not cancel job {id}: {e}");

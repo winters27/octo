@@ -552,8 +552,8 @@ async fn a_follower_that_panics_cancels_the_job_it_took_then_ends_the_run() {
     assert!(cancelled, "the job the follower took is cancelled");
     assert!(!run.finished(), "the run ends only once the cancel has answered");
     assert_eq!(octo_check_folders(&w), 0, "its folder went at once");
-    let first = w.client.check.store.pass_job();
-    assert!(first.is_some(), "kept until the cancel is answered");
+    let first = w.client.check.store.pass_jobs();
+    assert_eq!(first.len(), 1, "kept until the cancel is answered");
 
     // A Pass while that cancel is on its way waits, then opens a run of its own.
     w.client.assist.stop_after_queue.store(false, Ordering::SeqCst);
@@ -568,26 +568,66 @@ async fn a_follower_that_panics_cancels_the_job_it_took_then_ends_the_run() {
         run.state().1.as_deref(),
         Some("Octo stopped following Mornye's check.")
     );
-    assert_ne!(
-        w.client.check.store.pass_job(),
-        first,
+    assert!(
+        !w.client.check.store.pass_jobs().contains(&first[0]),
         "the cancelled job is no longer kept"
     );
+    assert_eq!(
+        requests_to(&w.mornye, "/api/v1/downloads/job-1/cancel").await,
+        1,
+        "the guard's cancel was taken, so no read asks again"
+    );
+}
+
+#[tokio::test]
+async fn a_guard_whose_cancel_mornye_refuses_keeps_the_job_for_a_later_read() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/downloads/job-1/cancel"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(&w.mornye)
+        .await;
+    w.client.assist.stop_after_queue.store(true, Ordering::SeqCst);
+    let folder = w.music.path().to_string_lossy().into_owned();
+    let run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
+
+    assert_eq!(until_finished(&run).await, RunState::Unavailable);
+    assert_eq!(
+        w.client
+            .check
+            .store
+            .pass_jobs()
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["job-1"]
+    );
+}
+
+/// A Pass run's song folder name, as Octo makes them.
+fn check_folder_name() -> String {
+    format!("octo-check-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The song job a restart in the middle of a Pass leaves in mornye-check.json, for `client`'s
+/// Mornye, in a folder made under `dir`.
+fn left_job(client: &SpotiflacClient, dir: &std::path::Path) -> PassJob {
+    let job_dir = dir.join(check_folder_name());
+    std::fs::create_dir_all(&job_dir).expect("made");
+    PassJob {
+        url: Connection::of(&client.settings()).url,
+        id: "left-job".into(),
+        dir: job_dir.to_string_lossy().into_owned(),
+    }
 }
 
 #[tokio::test]
 async fn a_song_job_a_stopped_run_left_is_cancelled_at_the_next_read_of_mornye() {
     let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
     let dir = tempfile::tempdir().expect("a folder");
-    let job_dir = dir.path().join("octo-check-left");
-    std::fs::create_dir_all(&job_dir).expect("made");
-    // What a restart in the middle of a Pass leaves in mornye-check.json.
-    let left = PassJob {
-        url: Connection::of(&w.client.settings()).url,
-        id: "left-job".into(),
-        dir: job_dir.to_string_lossy().into_owned(),
-    };
-    w.client.check.store.keep_pass_job(left);
+    let left = left_job(&w.client, dir.path());
+    w.client.check.store.keep_pass_job(left.clone());
 
     let _ = w.client.check_view(Some(Instant::now())).await;
 
@@ -595,8 +635,191 @@ async fn a_song_job_a_stopped_run_left_is_cancelled_at_the_next_read_of_mornye()
         requests_to(&w.mornye, "/api/v1/downloads/left-job/cancel").await,
         1
     );
-    assert!(!job_dir.exists());
-    assert_eq!(w.client.check.store.pass_job(), None);
+    assert!(!std::path::Path::new(&left.dir).exists());
+    assert!(w.client.check.store.pass_jobs().is_empty());
+}
+
+#[tokio::test]
+async fn a_cancel_mornye_refuses_keeps_the_left_job_and_one_for_a_gone_job_forgets_it() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/downloads/left-job/cancel"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&w.mornye)
+        .await;
+    let dir = tempfile::tempdir().expect("a folder");
+    let left = left_job(&w.client, dir.path());
+    w.client.check.store.keep_pass_job(left.clone());
+
+    let _ = w.client.check_view(Some(Instant::now())).await;
+    assert_eq!(
+        w.client.check.store.pass_jobs(),
+        vec![left.clone()],
+        "a busy Mornye is asked again"
+    );
+    assert!(std::path::Path::new(&left.dir).exists());
+
+    // Mornye no longer knows the job (404): it is over.
+    let _ = w.client.check_view(Some(Instant::now())).await;
+    assert!(w.client.check.store.pass_jobs().is_empty());
+    assert!(!std::path::Path::new(&left.dir).exists());
+}
+
+#[tokio::test]
+async fn a_left_job_mornye_will_not_cancel_yet_stays_kept_beside_a_new_runs_job() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/downloads/left-job/cancel"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(&w.mornye)
+        .await;
+    let dir = tempfile::tempdir().expect("a folder");
+    let left = left_job(&w.client, dir.path());
+    w.client.check.store.keep_pass_job(left.clone());
+    let folder = w.music.path().to_string_lossy().into_owned();
+
+    let _run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
+    let mut kept = Vec::new();
+    for _ in 0..200 {
+        kept = w.client.check.store.pass_jobs();
+        if kept.len() > 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(kept.contains(&left), "{kept:?}");
+    assert!(kept.iter().any(|job| job.id == "job-1"), "{kept:?}");
+}
+
+#[tokio::test]
+async fn a_left_job_for_a_mornye_now_elsewhere_is_let_go_without_a_cancel() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let dir = tempfile::tempdir().expect("a folder");
+    let left = PassJob {
+        url: "http://old-mornye:8010".into(),
+        ..left_job(&w.client, dir.path())
+    };
+    w.client.check.store.keep_pass_job(left.clone());
+
+    let _ = w.client.check_view(Some(Instant::now())).await;
+
+    assert_eq!(
+        requests_to(&w.mornye, "/api/v1/downloads/left-job/cancel").await,
+        0
+    );
+    assert!(w.client.check.store.pass_jobs().is_empty());
+    assert!(!std::path::Path::new(&left.dir).exists());
+}
+
+#[tokio::test]
+async fn a_left_job_naming_a_folder_octo_did_not_make_leaves_that_folder() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let dir = tempfile::tempdir().expect("a folder");
+    let theirs = dir.path().join("my-music");
+    std::fs::create_dir_all(&theirs).expect("made");
+    let left = PassJob {
+        dir: theirs.to_string_lossy().into_owned(),
+        ..left_job(&w.client, dir.path())
+    };
+    w.client.check.store.keep_pass_job(left);
+
+    let _ = w.client.check_view(Some(Instant::now())).await;
+
+    assert!(w.client.check.store.pass_jobs().is_empty(), "the job is over");
+    assert!(theirs.exists(), "a folder Octo did not name stays");
+}
+
+/// A Mornye whose check reads answer after `read_delay` and whose cancel of `left-job` answers
+/// after `cancel_delay`, and a client that waits at most a fifth of a second for either.
+async fn slow_mornye(read_delay: Duration, cancel_delay: Duration) -> (MockServer, Arc<SpotiflacClient>) {
+    let mornye = MockServer::builder().start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/get_signed_sessions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(sessions("active", 0.0))
+                .set_delay(read_delay),
+        )
+        .mount(&mornye)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/get_download_services"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(services())
+                .set_delay(read_delay),
+        )
+        .mount(&mornye)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/downloads/left-job/cancel"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({}))
+                .set_delay(cancel_delay),
+        )
+        .mount(&mornye)
+        .await;
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+        spotiflac: SpotiflacSettings {
+            enabled: true,
+            url: mornye.uri(),
+            token: "probe-token".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let check = crate::services::spotiflac::MornyeCheck::new(
+        Arc::new(crate::services::spotiflac::MornyeCheckStore::new(None)),
+        crate::services::spotiflac::CheckTimes {
+            fresh_for: Duration::ZERO,
+            call_bound: Duration::from_millis(200),
+        },
+        None,
+    );
+    (mornye, Arc::new(SpotiflacClient::new(settings).with_check(check)))
+}
+
+#[tokio::test]
+async fn a_left_jobs_slow_cancel_keeps_it_and_never_holds_a_read_past_its_bound() {
+    let (mornye, client) = slow_mornye(Duration::ZERO, Duration::from_secs(2)).await;
+    let dir = tempfile::tempdir().expect("a folder");
+    let left = left_job(&client, dir.path());
+    client.check.store.keep_pass_job(left.clone());
+
+    let started = Instant::now();
+    let view = client.check_view(Some(Instant::now())).await.expect("a read");
+
+    assert!(view.reached);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(requests_to(&mornye, "/api/v1/downloads/left-job/cancel").await, 1);
+    assert_eq!(
+        client.check.store.pass_jobs(),
+        vec![left],
+        "asked again by a later read"
+    );
+}
+
+#[tokio::test]
+async fn a_read_mornye_does_not_answer_asks_no_cancel() {
+    let (mornye, client) = slow_mornye(Duration::from_secs(1), Duration::ZERO).await;
+    let dir = tempfile::tempdir().expect("a folder");
+    let left = left_job(&client, dir.path());
+    client.check.store.keep_pass_job(left.clone());
+
+    let view = client.check_view(Some(Instant::now())).await.expect("a read");
+
+    assert!(!view.reached);
+    assert_eq!(requests_to(&mornye, "/api/v1/downloads/left-job/cancel").await, 0);
+    assert_eq!(client.check.store.pass_jobs(), vec![left]);
 }
 
 #[tokio::test]
@@ -606,7 +829,7 @@ async fn the_song_job_of_a_live_run_is_kept_and_left_alone_by_reads() {
     let run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
     let mut kept = None;
     for _ in 0..200 {
-        kept = w.client.check.store.pass_job();
+        kept = w.client.check.store.pass_jobs().into_iter().next();
         if kept.is_some() {
             break;
         }

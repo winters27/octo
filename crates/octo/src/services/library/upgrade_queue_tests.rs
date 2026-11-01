@@ -600,6 +600,19 @@ fn one_ended_job_goes_back_as_the_scout_and_passing_ones_go_back_unmarked() {
 
 #[tokio::test]
 async fn a_pass_read_before_a_hold_moved_does_not_let_that_job_go() {
+    // b's pause ends before the scout's new one, so the scout's try moves its end.
+    a_pass_read_before_a_scouts_try_leaves_b_waiting(5).await;
+}
+
+#[tokio::test]
+async fn a_pass_read_before_a_scouts_try_on_the_same_check_does_not_let_a_later_ending_job_go() {
+    // b's pause ends after the scout's new one: its end stays, the scout's try still counts.
+    a_pass_read_before_a_scouts_try_leaves_b_waiting(60).await;
+}
+
+/// A read finds check A passing while scout a's try comes back held on A until 45 minutes from
+/// now; b, held on A until `b_ends_in` minutes from now, stays waiting.
+async fn a_pass_read_before_a_scouts_try_leaves_b_waiting(b_ends_in: i64) {
     let queue = Arc::new(UpgradeQueue::new());
     queue.add(asks(&["a", "b"]), "alice", "app");
     let next = Utc::now() + chrono::Duration::minutes(45);
@@ -607,7 +620,12 @@ async fn a_pass_read_before_a_hold_moved_does_not_let_that_job_go() {
         job.state = UpgradeStates::WORKING.to_string();
         job.mornye_scout = true;
     });
-    hold_on(&queue, "b", "A", Utc::now() + chrono::Duration::minutes(5));
+    hold_on(
+        &queue,
+        "b",
+        "A",
+        Utc::now() + chrono::Duration::minutes(b_ends_in),
+    );
     // The read says A passes, and while it is read a's try comes back held on A's new pause.
     let finishing = queue.clone();
     let passed: ChecksPassFn = Arc::new(move |_| {

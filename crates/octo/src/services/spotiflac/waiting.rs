@@ -26,7 +26,7 @@ impl MornyeWaiting {
         let shown = if asked {
             format!(
                 "Mornye could not pass its check for {}, so it could not get this song.",
-                names_list(&pause.labels)
+                names_list(pause.shared())
             )
         } else {
             gate

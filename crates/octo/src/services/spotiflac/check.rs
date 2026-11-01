@@ -174,10 +174,11 @@ pub struct CheckFile {
     #[serde(flatten)]
     pub episodes: Episodes,
     pub check_songs: Vec<CheckSong>,
-    /// The song job a Pass run asked Mornye for, until the run has cancelled it. A run Octo
-    /// stopped following (a restart) leaves it here, and the next look at Mornye cancels it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pass_job: Option<PassJob>,
+    /// The song jobs Pass runs asked Mornye for, until a cancel of each has reached Mornye. A run
+    /// Octo stopped following (a restart) leaves its job here, and a later read that reaches
+    /// Mornye cancels it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pass_jobs: Vec<PassJob>,
 }
 
 /// A Pass run's song job at Mornye: the address it was asked at, its id and its folder.
@@ -305,28 +306,28 @@ impl MornyeCheckStore {
         self.state.lock().episodes.since(labels)
     }
 
-    /// The song job a Pass run asked Mornye for and has not cancelled yet, if any.
-    pub fn pass_job(&self) -> Option<PassJob> {
-        self.state.lock().pass_job.clone()
+    /// The song jobs Pass runs asked Mornye for that no cancel has reached yet.
+    pub fn pass_jobs(&self) -> Vec<PassJob> {
+        self.state.lock().pass_jobs.clone()
     }
 
-    /// Keeps the song job a Pass run just asked Mornye for.
+    /// Keeps the song job a Pass run just asked Mornye for, beside any still waiting for a cancel.
     pub fn keep_pass_job(&self, job: PassJob) {
         self.update(|state| {
-            let changed = state.pass_job.as_ref() != Some(&job);
-            state.pass_job = Some(job);
-            ((), changed)
+            if state.pass_jobs.contains(&job) {
+                return ((), false);
+            }
+            state.pass_jobs.push(job);
+            ((), true)
         })
     }
 
-    /// Forgets `job` once it is cancelled, unless another has been kept since.
+    /// Forgets `job` once a cancel of it has reached Mornye.
     pub fn forget_pass_job(&self, job: &PassJob) {
         self.update(|state| {
-            let same = state.pass_job.as_ref() == Some(job);
-            if same {
-                state.pass_job = None;
-            }
-            ((), same)
+            let before = state.pass_jobs.len();
+            state.pass_jobs.retain(|kept| kept != job);
+            ((), state.pass_jobs.len() != before)
         })
     }
 }

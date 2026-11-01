@@ -189,7 +189,7 @@ impl LibraryActionCodes {
 fn mornye_wait_text(pause: &octo_core::spotiflac::check::CheckPause) -> String {
     format!(
         "Waiting for Mornye's check, which it could not pass for {}; it allows its next try at {}.",
-        octo_core::spotiflac::check::names_list(&pause.labels),
+        octo_core::spotiflac::check::names_list(pause.shared()),
         octo_core::spotiflac::check::until_words(pause.until_utc, Utc::now())
     )
 }
