@@ -501,13 +501,28 @@ pub fn failure_words(facts: &FailureFacts<'_>) -> FailureWords {
     FailureWords { shown, detail: None }
 }
 
+/// Whether the checks a wait named pass in a read: every row of those labels (or of those
+/// extensions) is working, and there is at least one. A read Mornye did not answer cannot tell,
+/// so it is not a pass.
+pub fn labels_pass(rows: &Reading<Vec<CheckRow>>, labels: &[String]) -> bool {
+    let Some(rows) = rows.known() else {
+        return false;
+    };
+    let named: Vec<&CheckRow> = rows
+        .iter()
+        .filter(|row| labels.contains(&row.label) || row.extensions.iter().any(|id| labels.contains(id)))
+        .collect();
+    !named.is_empty() && named.iter().all(|row| row.working())
+}
+
 /// The words for a Mornye whose utilities extension is missing: it can neither search nor pass
 /// its check.
 pub fn utilities_words() -> FailureWords {
     FailureWords {
         shown: "Mornye needs its utilities extension, which your registry does not list.".into(),
+        // One sentence, so the download log keeps the fix whole.
         detail: Some(
-            "Mornye 1.1 moved its search and its check into an extension named utilities. Use a registry \
+            "Mornye 1.1 moved its search and its check into an extension named utilities: use a registry \
              that lists it, or set SPOTIFLAC_IMAGE back to Mornye 1.0.5."
                 .into(),
         ),

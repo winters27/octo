@@ -2,9 +2,9 @@
 //! check it asks. With the switch on, a file AcoustID clearly hears as another song is replaced
 //! through Wrong song, and Octo's own downloads can be checked again in one pass.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -40,6 +40,7 @@ use super::navidrome_playlist_api::{NavidromePlaylistApi, SongMarks};
 use super::navidrome_song_path_resolver::get_full_path;
 use super::notice_queue::{NoticeOrigin, NoticeQueue, set_aside};
 use super::quality_upgrade_worker::compare_ordinal;
+use super::upgrade_queue::MornyeHold;
 use crate::services::common::IAcquisitionActivity;
 use crate::services::family::family_store::FamilyStore;
 use crate::services::family::{LibraryScope, NavidromeAdmin, ScopeResolver, ScopeView};
@@ -186,8 +187,9 @@ pub trait SweepReplacer: Send + Sync {
         false
     }
 
-    /// Whether Mornye's check keeps it from every extension a song could use now.
-    async fn mornye_kept(&self) -> bool {
+    /// Whether the Mornye checks a held song's pause named pass now.
+    async fn mornye_passed(&self, labels: &[String]) -> bool {
+        let _ = labels;
         false
     }
 }
@@ -333,8 +335,8 @@ impl SweepReplacer for ExecutorSweepReplacer {
             .map_err(|e| anyhow::anyhow!("the replacement stopped: {e}"))?
     }
 
-    async fn mornye_kept(&self) -> bool {
-        self.executor.mornye_kept().await
+    async fn mornye_passed(&self, labels: &[String]) -> bool {
+        self.executor.mornye_passed(labels).await
     }
 
     async fn wrong_version_asked(&self, song_id: &str) -> bool {
@@ -745,9 +747,12 @@ enum Replacing {
     Declined,
     /// Soulseek is out and the replacement may come from nowhere else: the song stays unchecked.
     Waits,
-    /// Mornye's check kept the replacement from Mornye: the song stays unchecked until Mornye may
-    /// try its check again.
+    /// Every source is out because of Mornye's check: the song stays unchecked and the sweep
+    /// waits, as for an outage.
     WaitsForMornye,
+    /// The sources asked had no copy and Mornye's check kept the song: it stays unchecked, is
+    /// passed over until that pause ends or its checks pass, and the sweep goes on.
+    SkipsForMornye,
     /// The person said the song is the wrong version and Octo could not tell it apart by sound:
     /// the copy is theirs to pick, so the file stays a question that says so.
     PickInFindSongs,
@@ -839,9 +844,9 @@ pub struct LibraryReviewSweepWorker {
     /// library-relative path, stamp, verdict.
     retry_verdict: Mutex<Option<(String, String, VerificationResult)>>,
     unfingerprinted: AtomicI32,
-    /// The last replacement waited because Mornye's check kept the song: the sweep asks again
-    /// only once Mornye may try its check again.
-    kept_by_mornye: AtomicBool,
+    /// Songs whose replacement Mornye's check kept, by path, with that pause: passed over until
+    /// it ends or its checks pass, so the sweep goes on with the other files.
+    mornye_holds: Mutex<HashMap<String, MornyeHold>>,
     hold: Mutex<(String, Option<String>)>,
     /// With Family on, the sweep keeps to the shared library: a member's own songs are never
     /// asked about.
@@ -890,7 +895,7 @@ impl LibraryReviewSweepWorker {
             lookup_failures: AtomicI32::new(0),
             retry_verdict: Mutex::new(None),
             unfingerprinted: AtomicI32::new(0),
-            kept_by_mornye: AtomicBool::new(false),
+            mornye_holds: Mutex::new(HashMap::new()),
             hold: Mutex::new(("Off".to_string(), None)),
             scope: None,
             replacer: None,
@@ -1073,8 +1078,10 @@ impl LibraryReviewSweepWorker {
             return Duration::ZERO;
         };
         let octo_files = self.octo_files.lock().clone();
+        let mut skip = (*octo_files).clone();
+        skip.extend(self.mornye_held().await);
         let cursor = self.store.read(|s| s.cursor.clone());
-        let pick = self.next_target(&files, &root, cursor, &octo_files);
+        let pick = self.next_target(&files, &root, cursor, &skip);
 
         let Some(target) = pick.target.clone() else {
             let present: HashSet<&str> = files.iter().map(String::as_str).collect();
@@ -1135,7 +1142,8 @@ impl LibraryReviewSweepWorker {
                 .map(|recheck| recheck.cursor.clone())
                 .unwrap_or_default()
         });
-        let pick = self.next_target(&files, step.root, cursor, &HashSet::new());
+        let held = self.mornye_held().await;
+        let pick = self.next_target(&files, step.root, cursor, &held);
         let Some(target) = pick.target.clone() else {
             let now = step.now;
             self.record(step.generation, |s| {
@@ -1153,6 +1161,34 @@ impl LibraryReviewSweepWorker {
             return self.hold("Done", Some(Self::RECHECKED), Self::IDLE_CHECK);
         };
         self.check(step, &target, pick).await
+    }
+
+    /// The songs Mornye's check still keeps: each one whose pause has not ended and whose checks
+    /// do not pass yet. The others are let go.
+    async fn mornye_held(&self) -> HashSet<String> {
+        let holds: Vec<(String, MornyeHold)> = self
+            .mornye_holds
+            .lock()
+            .iter()
+            .map(|(path, hold)| (path.clone(), hold.clone()))
+            .collect();
+        if holds.is_empty() {
+            return HashSet::new();
+        }
+        let now = self.clock.now();
+        let mut held = HashSet::new();
+        for (path, hold) in holds {
+            let passed = match &self.replacer {
+                Some(replacer) if !hold.labels.is_empty() => replacer.mornye_passed(&hold.labels).await,
+                _ => false,
+            };
+            if now < hold.until_utc && !passed {
+                held.insert(path);
+            } else {
+                self.mornye_holds.lock().remove(&path);
+            }
+        }
+        held
     }
 
     /// The next file after `cursor` to check, and the last one passed over on the way. A file
@@ -1450,10 +1486,16 @@ impl LibraryReviewSweepWorker {
                     return self.hold(
                         "Waiting",
                         Some(
-                            "Mornye could not pass its check; trying that song again once Mornye may try it.",
+                            "Mornye could not pass its check and no other source can be asked; trying that song again once one can.",
                         ),
                         interval,
                     );
+                }
+                // Left unchecked and passed over while its pause holds: the sweep goes on past it
+                // and comes back to it in a later pass.
+                Replacing::SkipsForMornye => {
+                    self.record(generation, |s| set_cursor(s, lane, target));
+                    return self.hold("Running", running, interval);
                 }
             }
         } else {
@@ -1522,13 +1564,6 @@ impl LibraryReviewSweepWorker {
         let Some(replacer) = self.replacer.clone() else {
             return Replacing::Declined;
         };
-        // Mornye's check kept the last replacement and still does: nothing to search yet.
-        if self.kept_by_mornye.load(Ordering::SeqCst) {
-            if replacer.mornye_kept().await {
-                return Replacing::WaitsForMornye;
-            }
-            self.kept_by_mornye.store(false, Ordering::SeqCst);
-        }
         let song = &file.song;
         if let Some(isrc) = file.isrc.as_deref() {
             let why = match self.verifier.isrc_agrees(question, isrc).await {
@@ -1641,7 +1676,18 @@ impl LibraryReviewSweepWorker {
                     song.artist, song.title
                 );
                 if outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_KEPT) {
-                    self.kept_by_mornye.store(true, Ordering::SeqCst);
+                    // The sources that were asked had none: the song is passed over until
+                    // Mornye may try again, and the sweep goes on.
+                    let hold = outcome
+                        .mornye_wait
+                        .as_deref()
+                        .map(MornyeHold::of)
+                        .unwrap_or(MornyeHold {
+                            until_utc: now,
+                            labels: Vec::new(),
+                        });
+                    self.mornye_holds.lock().insert(path.to_string(), hold);
+                    return Replacing::SkipsForMornye;
                 }
                 Replacing::WaitsForMornye
             }

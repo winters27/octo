@@ -4,7 +4,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -597,6 +597,77 @@ async fn a_song_mornyes_check_kept_rests_until_mornye_may_try_again() {
     assert!(
         w.service.store().is_ready("soulseek", &w.ids[2]),
         "tried again once Mornye may"
+    );
+}
+
+#[tokio::test]
+async fn a_pass_ends_the_rest_of_a_song_mornyes_check_kept() {
+    use wiremock::matchers::path;
+    use wiremock::{Mock, ResponseTemplate};
+    struct Sessions(Arc<AtomicBool>);
+    impl wiremock::Respond for Sessions {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let (state, paused) = if self.0.load(Ordering::SeqCst) {
+                ("unverified", 900.0)
+            } else {
+                ("active", 0.0)
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": {"sessions": [
+                {"key": "gateway-v2-abc-1", "kind": "gateway", "label": "Example",
+                 "extensions": ["example-ext"], "state": state, "auth_paused_s": paused}
+            ]}}))
+        }
+    }
+    let paused = Arc::new(AtomicBool::new(true));
+    let server = wiremock::MockServer::builder().start().await;
+    Mock::given(path("/api/get_signed_sessions"))
+        .respond_with(Sessions(paused.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/get_download_services"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": {"services": [
+                {"id": "ext:example-ext", "label": "Example", "extensions": ["example-ext"]}
+            ]}})),
+        )
+        .mount(&server)
+        .await;
+    let probe = AppSettings {
+        spotiflac: octo_core::settings::SpotiflacSettings {
+            enabled: true,
+            url: server.uri(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let check = crate::services::spotiflac::MornyeCheck::new(
+        Arc::new(crate::services::spotiflac::MornyeCheckStore::new(None)),
+        crate::services::spotiflac::CheckTimes {
+            fresh_for: std::time::Duration::ZERO,
+            call_bound: std::time::Duration::from_secs(5),
+        },
+        None,
+    );
+    let client = Arc::new(
+        SpotiflacClient::new(Arc::new(octo_core::settings::SettingsStore::for_tests(probe)))
+            .with_check(check),
+    );
+    let w = world_full(|s| s.prefetch.count = 1, None, Some(client));
+    *w.downloads.mornye_waits.lock() = true;
+    w.save_queue("alice", 0);
+    w.service.on_playing("alice", &w.ids[0], None).await;
+    w.run_jobs().await;
+    assert_eq!(w.asked(), w.ids_of(&[2]));
+
+    // Someone passes the check: the song goes again at once, before its pause's end.
+    *w.downloads.mornye_waits.lock() = false;
+    paused.store(false, Ordering::SeqCst);
+    w.service.on_playing("alice", &w.ids[1], None).await;
+    w.service.on_playing("alice", &w.ids[0], None).await;
+    w.run_jobs().await;
+    assert!(
+        w.service.store().is_ready("soulseek", &w.ids[2]),
+        "tried again after the Pass"
     );
 }
 

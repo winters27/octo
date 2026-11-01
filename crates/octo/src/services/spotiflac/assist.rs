@@ -116,8 +116,12 @@ pub struct AssistRun {
     browser: Mutex<Option<HelperBrowser>>,
     browser_seen: AtomicBool,
     seq: AtomicU64,
-    /// Cancelled when a person stops the run from the dashboard.
+    /// Cancelled when the last person watching stops the run from the dashboard.
     stop: tokio_util::sync::CancellationToken,
+    /// The open dashboard panels on this run: each Pass joins it, each Close leaves.
+    viewers: Mutex<usize>,
+    /// Woken when the run ends.
+    ended: tokio::sync::Notify,
 }
 
 impl AssistRun {
@@ -137,6 +141,21 @@ impl AssistRun {
         let mut slot = self.state.lock();
         if matches!(slot.0, RunState::Opening | RunState::Live) {
             *slot = (state, why);
+        }
+        drop(slot);
+        self.ended.notify_waiters();
+    }
+
+    /// Waits for the run to end (its job cancelled and its folder removed).
+    async fn finish(&self) {
+        loop {
+            let ended = self.ended.notified();
+            tokio::pin!(ended);
+            ended.as_mut().enable();
+            if self.finished() {
+                return;
+            }
+            ended.await;
         }
     }
 
@@ -240,16 +259,25 @@ impl SpotiflacClient {
         (run.connection == Connection::of(&self.settings())).then_some(run)
     }
 
-    /// Stops the live run: its song's job is cancelled and its folder removed. Answers whether
-    /// one was live.
-    pub fn stop_pass(&self) -> bool {
-        match self.assist_run().filter(|run| !run.finished()) {
-            Some(run) => {
-                run.stop.cancel();
-                true
-            }
-            None => false,
+    /// One page leaves the live run; the last one to leave stops it (its song's job cancelled
+    /// and its folder removed). Answers whether this stopped it.
+    pub async fn stop_pass(&self) -> bool {
+        // After a start still on its way, so a Close while opening stops the run it makes.
+        let _starting = self.assist.starting.lock().await;
+        let Some(run) = self.assist_run().filter(|run| !run.finished()) else {
+            return false;
+        };
+        let left = {
+            let mut viewers = run.viewers.lock();
+            *viewers = viewers.saturating_sub(1);
+            *viewers
+        };
+        if left > 0 {
+            // Someone else is still passing it from another page.
+            return false;
         }
+        run.stop.cancel();
+        true
     }
 
     /// How many refused songs a run could still ask for.
@@ -272,7 +300,13 @@ impl SpotiflacClient {
         // and answers the run the first made.
         let _starting = self.assist.starting.lock().await;
         if let Some(run) = self.assist_run().filter(|run| !run.finished()) {
-            return Ok(run);
+            if !run.stop.is_cancelled() {
+                // Another page joins the run already open.
+                *run.viewers.lock() += 1;
+                return Ok(run);
+            }
+            // A run just stopped is still cleaning up: a new one starts once it has.
+            run.finish().await;
         }
         if download_path.trim().is_empty() {
             return Err(CannotPass("Octo has no music folder yet.".into()));
@@ -341,6 +375,8 @@ impl SpotiflacClient {
             browser_seen: AtomicBool::new(false),
             seq: AtomicU64::new(0),
             stop: tokio_util::sync::CancellationToken::new(),
+            viewers: Mutex::new(1),
+            ended: tokio::sync::Notify::new(),
         });
         *self.assist.run.lock() = Some(Arc::clone(&run));
         info!(

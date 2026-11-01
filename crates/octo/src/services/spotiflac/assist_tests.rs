@@ -384,11 +384,70 @@ async fn a_run_stopped_from_the_dashboard_cancels_its_song() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(w.client.stop_pass());
+    assert!(w.client.stop_pass().await);
     assert_eq!(until_finished(&run).await, RunState::Unavailable);
     assert_eq!(run.state().1.as_deref(), Some("Stopped from the dashboard."));
     assert_eq!(requests_to(&w.mornye, "/api/v1/downloads/job-1/cancel").await, 1);
-    assert!(!w.client.stop_pass(), "nothing live to stop");
+    assert!(!w.client.stop_pass().await, "nothing live to stop");
+}
+
+#[tokio::test]
+async fn a_close_while_the_check_is_opening_stops_the_run_it_makes() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    // The helper takes a while to arm.
+    w.helper.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/assist/arm"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(
+                    json!({"ended": [".gateway-v2-abc-b97a94207d0a.auth-backoff.json"], "gatewayAsked": []}),
+                )
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(&w.helper)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/assist"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(no_browser()))
+        .mount(&w.helper)
+        .await;
+    let folder = w.music.path().to_string_lossy().into_owned();
+    let client = Arc::clone(&w.client);
+    let starting = tokio::spawn(async move { client.start_pass(&folder).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        w.client.stop_pass().await,
+        "the stop waits for the start, then stops its run"
+    );
+    let run = starting.await.expect("ran").expect("started");
+    assert_eq!(until_finished(&run).await, RunState::Unavailable);
+}
+
+#[tokio::test]
+async fn a_pass_right_after_a_close_opens_a_new_run() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let folder = w.music.path().to_string_lossy().into_owned();
+    let first = w.client.start_pass(&folder).await.expect("starts");
+    assert!(w.client.stop_pass().await);
+    let second = w.client.start_pass(&folder).await.expect("starts again");
+    assert!(!Arc::ptr_eq(&first, &second), "not the run being stopped");
+    assert!(first.finished());
+    assert_eq!(requests_to(&w.helper, "/assist/arm").await, 2);
+}
+
+#[tokio::test]
+async fn a_close_on_one_page_leaves_the_run_another_page_is_passing() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let folder = w.music.path().to_string_lossy().into_owned();
+    let run = w.client.start_pass(&folder).await.expect("starts");
+    let joined = w.client.start_pass(&folder).await.expect("joins");
+    assert!(Arc::ptr_eq(&run, &joined));
+    assert!(!w.client.stop_pass().await, "the other page is still on it");
+    assert!(!run.finished());
+    assert!(w.client.stop_pass().await, "the last page leaves");
+    assert_eq!(until_finished(&run).await, RunState::Unavailable);
 }
 
 #[tokio::test]

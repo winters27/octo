@@ -310,7 +310,7 @@ pub async fn assist_start(State(state): State<AppState>) -> Response {
 /// `POST /api/admin/spotiflac/assist/stop`: stops the live Pass run (its song's job is cancelled
 /// and its folder removed), and answers the run as it stands.
 pub async fn assist_stop(State(state): State<AppState>) -> Response {
-    let stopped = state.spotiflac.stop_pass();
+    let stopped = state.spotiflac.stop_pass().await;
     let mut answer = assist_json(&state).await;
     if let Some(object) = answer.as_object_mut() {
         object.insert("stopped".into(), serde_json::Value::Bool(stopped));

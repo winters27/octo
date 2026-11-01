@@ -21,7 +21,9 @@ use tracing::{debug, error, info, warn};
 
 use super::duplicate_scan_worker::is_lossless_file;
 use super::library_action_executor::{LibraryActionCodes, LibraryActionExecutor, LibraryActionRequest};
-use super::upgrade_queue::{ApplyFn, OfflineFn, apply_with, soulseek_offline_with};
+use super::upgrade_queue::{
+    ApplyFn, ChecksPassFn, MornyeHold, OfflineFn, apply_with, mornye_passed_with, soulseek_offline_with,
+};
 use super::{LibraryActionOutcome, LibraryActionState, NavidromePlaylistApi, UpgradeQueue, UpgradeSources};
 use crate::services::common::IAcquisitionActivity;
 use crate::services::framework::DotnetDictionary;
@@ -130,6 +132,14 @@ pub struct QualityUpgradeState {
     pub last_outcome: Option<String>,
     #[serde(default, with = "super::state_dictionary")]
     pub attempts: DotnetDictionary<QualityUpgradeAttempt>,
+    /// Songs Mornye's check kept, by file, with that pause: passed over until it ends or its
+    /// checks pass, so the run goes on with the other songs.
+    #[serde(
+        default,
+        with = "super::state_dictionary",
+        skip_serializing_if = "DotnetDictionary::is_empty"
+    )]
+    pub mornye_holds: DotnetDictionary<MornyeHold>,
 }
 
 /// What the Better quality page shows of the weekly run.
@@ -219,6 +229,8 @@ pub struct QualityUpgradeSeams {
     pub apply: ApplyFn,
     pub list_songs: ListSongsFn,
     pub soulseek_offline: OfflineFn,
+    /// Whether the Mornye checks a held song's pause named pass now.
+    pub mornye_passed: ChecksPassFn,
     pub source_ready: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
@@ -235,6 +247,7 @@ impl QualityUpgradeSeams {
             }),
             list_songs: Arc::new(|| async { (Vec::new(), true) }.boxed()),
             soulseek_offline: Arc::new(|| async { false }.boxed()),
+            mornye_passed: Arc::new(|_| async { false }.boxed()),
             source_ready: Arc::new(|| true),
         }
     }
@@ -297,7 +310,8 @@ impl QualityUpgradeWorker {
                 async move { Self::walk(&navidrome).await }.boxed()
             }),
             // Out only when every source is: a Soulseek outage leaves Lidarr when it is set up.
-            soulseek_offline: soulseek_offline_with(sources, soulseek),
+            soulseek_offline: soulseek_offline_with(sources.clone(), soulseek),
+            mornye_passed: mornye_passed_with(sources),
             source_ready: Arc::new(move || ready_sources.as_ref().is_none_or(|s| s.ready())),
         };
         Self::with_seams(store, settings, upgrades, seams)
@@ -437,6 +451,7 @@ impl QualityUpgradeWorker {
         let mut candidates: Vec<(&LibrarySongRow, Option<&QualityUpgradeAttempt>, String)> = songs
             .iter()
             .filter(|song| !is_lossless_file(&song.suffix, song.bit_rate))
+            .filter(|song| !state.mornye_holds.contains_key(&Self::key_of(song)))
             .map(|song| {
                 let key = Self::key_of(song);
                 let tried = state
@@ -469,7 +484,7 @@ impl QualityUpgradeWorker {
             return Tick::Off;
         }
         let now = seams.clock.now();
-        let state = self.store.snapshot();
+        let mut state = self.store.snapshot();
         if let (Some(last), Some(interval)) = (
             state.last_run_utc,
             Self::interval(settings.effective_upgrade_per_week()),
@@ -503,6 +518,22 @@ impl QualityUpgradeWorker {
                 debug!("Quality upgrade: Navidrome still did not list the library");
             }
             return Tick::Unreachable;
+        }
+        // A song Mornye's check kept is passed over until that pause ends or its checks pass.
+        let mut over: Vec<String> = Vec::new();
+        for (key, hold) in state.mornye_holds.iter() {
+            let passed = !hold.labels.is_empty() && (seams.mornye_passed)(hold.labels.clone()).await;
+            if now >= hold.until_utc || passed {
+                over.push(key.clone());
+            }
+        }
+        if !over.is_empty() {
+            self.store.update(|s| {
+                for key in &over {
+                    s.mornye_holds.remove(key);
+                }
+            });
+            state = self.store.snapshot();
         }
         let pick = Self::pick(&songs, &state, now, settings.dry_run).cloned();
         self.store.update(|s| {
@@ -550,8 +581,19 @@ impl QualityUpgradeWorker {
                 "Quality upgrade: '{} - {}' waits for Mornye's check",
                 pick.artist, pick.title
             );
-            self.store
-                .update(|s| s.last_outcome = Some("Waiting for Mornye's check".to_string()));
+            let hold = outcome
+                .mornye_wait
+                .as_deref()
+                .map(MornyeHold::of)
+                .unwrap_or(MornyeHold {
+                    until_utc: seams.clock.now(),
+                    labels: Vec::new(),
+                });
+            let key = Self::key_of(&pick);
+            self.store.update(|s| {
+                s.last_outcome = Some("Waiting for Mornye's check".to_string());
+                s.mornye_holds.set(key, hold);
+            });
             return Tick::Offline;
         }
 

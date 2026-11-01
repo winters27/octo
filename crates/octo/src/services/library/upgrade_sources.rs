@@ -57,6 +57,15 @@ impl UpgradeSources {
         self.mornye_pause().await.is_some()
     }
 
+    /// Whether the checks a wait named (`labels`) pass now: a Pass, or Mornye's own next try that
+    /// passed. A Mornye that cannot be read says no.
+    pub async fn mornye_passed(&self, labels: &[String]) -> bool {
+        match self.spotiflac.as_ref() {
+            Some(client) => client.checks_pass(labels).await,
+            None => false,
+        }
+    }
+
     /// slskd can take a search: it is set up and not known to be logged out.
     async fn slskd_usable(&self) -> bool {
         if !Self::soulseek_set_up(&self.settings.current().soulseek) {

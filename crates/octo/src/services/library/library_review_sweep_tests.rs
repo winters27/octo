@@ -1065,14 +1065,20 @@ impl SweepReplacer for FakeReplacer {
         Ok(match self.code {
             Some(code) => LibraryActionOutcome {
                 code: Some(code.to_string()),
+                mornye_wait: (code == LibraryActionCodes::MORNYE_KEPT).then(|| {
+                    Box::new(octo_core::spotiflac::check::CheckPause {
+                        until_utc: chrono::Utc::now() + chrono::Duration::hours(1),
+                        labels: vec!["Example".into()],
+                    })
+                }),
                 ..LibraryActionOutcome::new(*self.state.lock(), Some("done".into()))
             },
             None => LibraryActionOutcome::new(*self.state.lock(), Some("done".into())),
         })
     }
 
-    async fn mornye_kept(&self) -> bool {
-        *self.mornye_kept.lock()
+    async fn mornye_passed(&self, _: &[String]) -> bool {
+        !*self.mornye_kept.lock()
     }
 }
 
@@ -1315,9 +1321,10 @@ async fn a_replacement_that_finds_soulseek_out_waits_without_counting() {
 }
 
 #[tokio::test]
-async fn a_replacement_mornyes_check_kept_waits_without_searching_again_until_mornye_may_try() {
+async fn a_replacement_mornyes_check_kept_is_passed_over_and_the_sweep_goes_on() {
     let sweep = Sweep::new();
     sweep.teardrop("a.flac");
+    sweep.teardrop("b.flac");
     let queue = Arc::new(NoticeQueue::new());
     let replacer = FakeReplacer::kept_by_mornye();
     let worker = sweep.worker(
@@ -1333,17 +1340,15 @@ async fn a_replacement_mornyes_check_kept_waits_without_searching_again_until_mo
 
     worker.tick().await;
     worker.tick().await;
+    worker.tick().await;
+    let asked: Vec<String> = replacer.requests().into_iter().map(|(_, id, _)| id).collect();
     assert_eq!(
-        replacer.requests().len(),
-        1,
-        "no second search while the check keeps it"
+        asked,
+        vec!["nd-a.flac".to_string(), "nd-b.flac".to_string()],
+        "a is not searched again while its pause holds, and b is next"
     );
     assert_eq!(worker.status().today.failed, 0);
     assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
-
-    *replacer.mornye_kept.lock() = false;
-    worker.tick().await;
-    assert_eq!(replacer.requests().len(), 2, "asked again once Mornye may try");
 }
 
 /// Off, a dry run, a keeper off the allowlist, Wrong song off, the day's cap and the breaker each

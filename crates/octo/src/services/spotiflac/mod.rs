@@ -366,6 +366,15 @@ impl SpotiflacClient {
         }
     }
 
+    /// Whether the checks a wait named (`labels`) pass now, from the kept read: a Pass, or
+    /// Mornye's own next try that passed.
+    pub async fn checks_pass(&self, labels: &[String]) -> bool {
+        match self.check_view(None).await {
+            Some(view) => octo_core::spotiflac::check::labels_pass(&view.rows, labels),
+            None => false,
+        }
+    }
+
     /// Mornye can stand in for Soulseek now: on, answering, and able to download, from the kept
     /// read of its check.
     pub async fn stands_in(&self) -> bool {

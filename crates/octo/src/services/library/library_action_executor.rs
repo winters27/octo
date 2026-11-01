@@ -124,6 +124,10 @@ pub struct LibraryActionOutcome {
 
     /// For a replacement that went in: where the original waits in quarantine.
     pub quarantine_path: Option<String>,
+
+    /// For a request Mornye's check keeps: the pause, so a caller waits for that pause's own end
+    /// or its checks passing.
+    pub mornye_wait: Option<Box<octo_core::spotiflac::check::CheckPause>>,
 }
 
 impl LibraryActionOutcome {
@@ -772,11 +776,14 @@ impl LibraryActionExecutor {
                     None => None,
                 };
                 return Ok(match out {
-                    Some(SourcesOut::MornyeCheck(pause)) => LibraryActionOutcome::coded(
-                        LibraryActionState::Failed,
-                        mornye_wait_text(&pause),
-                        Some(LibraryActionCodes::MORNYE_CHECK),
-                    ),
+                    Some(SourcesOut::MornyeCheck(pause)) => LibraryActionOutcome {
+                        mornye_wait: Some(Box::new(pause.clone())),
+                        ..LibraryActionOutcome::coded(
+                            LibraryActionState::Failed,
+                            mornye_wait_text(&pause),
+                            Some(LibraryActionCodes::MORNYE_CHECK),
+                        )
+                    },
                     _ => LibraryActionOutcome::coded(
                         LibraryActionState::Failed,
                         OFFLINE_TEXT,
@@ -1621,11 +1628,14 @@ impl LibraryActionExecutor {
                     && let Some(wait) = wait
                 {
                     return Replaced {
-                        outcome: LibraryActionOutcome::coded(
-                            LibraryActionState::Failed,
-                            mornye_wait_text(&wait.pause),
-                            Some(LibraryActionCodes::MORNYE_KEPT),
-                        ),
+                        outcome: LibraryActionOutcome {
+                            mornye_wait: Some(Box::new(wait.pause.clone())),
+                            ..LibraryActionOutcome::coded(
+                                LibraryActionState::Failed,
+                                mornye_wait_text(&wait.pause),
+                                Some(LibraryActionCodes::MORNYE_KEPT),
+                            )
+                        },
                         quarantine_path: None,
                         new_path: None,
                         arrived: None,
@@ -1923,10 +1933,10 @@ impl LibraryActionExecutor {
         }
     }
 
-    /// Whether Mornye's check keeps it from every extension a song could use now.
-    pub async fn mornye_kept(&self) -> bool {
+    /// Whether the Mornye checks a wait named (`labels`) pass now.
+    pub async fn mornye_passed(&self, labels: &[String]) -> bool {
         match &self.sources {
-            Some(sources) => sources.mornye_kept().await,
+            Some(sources) => sources.mornye_passed(labels).await,
             None => false,
         }
     }

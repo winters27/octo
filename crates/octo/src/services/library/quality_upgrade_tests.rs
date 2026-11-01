@@ -359,6 +359,58 @@ async fn a_song_mornyes_check_kept_is_not_put_off_for_four_weeks() {
 }
 
 #[tokio::test]
+async fn a_kept_song_is_passed_over_so_the_next_run_tries_the_next_song() {
+    let store = Arc::new(QualityUpgradeStore::new());
+    let (w, _) = worker(7, true, Some(store.clone()));
+    let now = Arc::new(Mutex::new(chrono::Utc::now()));
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (clock_now, seen) = (now.clone(), asked.clone());
+    let until = chrono::Utc::now() + chrono::TimeDelta::days(30);
+    w.configure(|s| {
+        s.clock = Clock::new(move || *clock_now.lock());
+        s.list_songs = Arc::new(|| async { (vec![row("a", "A/a.mp3"), row("b", "B/b.mp3")], true) }.boxed());
+        s.apply = Arc::new(move |request| {
+            seen.lock().push(request.navidrome_id.clone());
+            let kept = request.navidrome_id == "a";
+            async move {
+                Ok(if kept {
+                    LibraryActionOutcome {
+                        code: Some(LibraryActionCodes::MORNYE_KEPT.to_string()),
+                        mornye_wait: Some(Box::new(octo_core::spotiflac::check::CheckPause {
+                            until_utc: until,
+                            labels: vec!["Example".into()],
+                        })),
+                        ..LibraryActionOutcome::new(
+                            LibraryActionState::Failed,
+                            Some("Waiting for Mornye's check.".into()),
+                        )
+                    }
+                } else {
+                    LibraryActionOutcome::new(LibraryActionState::Failed, Some("nothing better".into()))
+                })
+            }
+            .boxed()
+        });
+    });
+
+    assert_eq!(w.tick().await, Tick::Offline);
+    *now.lock() += chrono::TimeDelta::days(2);
+    assert_eq!(w.tick().await, Tick::Ran);
+
+    assert_eq!(
+        *asked.lock(),
+        vec!["a".to_string(), "b".to_string()],
+        "the kept song does not block the run"
+    );
+    assert!(
+        store
+            .snapshot()
+            .mornye_holds
+            .contains_key(&QualityUpgradeWorker::key_of(&row("a", "A/a.mp3")))
+    );
+}
+
+#[tokio::test]
 async fn when_navidrome_cannot_list_the_library_the_weeks_run_is_not_spent() {
     let store = Arc::new(QualityUpgradeStore::new());
     let (w, calls) = worker(7, true, Some(store.clone()));

@@ -143,6 +143,8 @@ struct State {
     running: HashMap<String, (Job, CancellationToken)>,
     /// Songs not tried again until then: they failed, or turned out to be the listener's already.
     resting: HashMap<String, DateTime<Utc>>,
+    /// The Mornye checks a resting song waits on, when its check kept it.
+    resting_for_mornye: HashMap<String, Vec<String>>,
     errors: VecDeque<String>,
     last_played: Option<DateTime<Utc>>,
     last_sweep: Option<DateTime<Utc>>,
@@ -509,13 +511,20 @@ impl PrefetchService {
     async fn wanted(&self, provider: &str, external_id: &str) -> bool {
         let key = format!("{provider}:{external_id}");
         let now = self.now();
+        let checks = self.state.lock().resting_for_mornye.get(&key).cloned();
+        // A song Mornye's check kept rests until that pause ends, or until its checks pass.
+        let passed = match (checks, self.parts.spotiflac.as_ref()) {
+            (Some(labels), Some(client)) => client.checks_pass(&labels).await,
+            _ => false,
+        };
         {
             let mut state = self.state.lock();
             if let Some(until) = state.resting.get(&key) {
-                if *until > now {
+                if *until > now && !passed {
                     return false;
                 }
                 state.resting.remove(&key);
+                state.resting_for_mornye.remove(&key);
             }
         }
         if self.parts.store.is_ready(provider, external_id)
@@ -855,9 +864,19 @@ impl PrefetchService {
                     None if unreachable(&e) || self.soulseek_down().await => RETRY_UNREACHABLE_AFTER,
                     None => RETRY_AFTER,
                 };
+                let checks = mornye_waited(&e).map(|wait| wait.pause.labels.clone());
                 let named = self.view(job);
                 let mut state = self.state.lock();
-                state.resting.insert(key, now + rest);
+                state.resting.insert(key.clone(), now + rest);
+                // A Pass of those checks ends the rest before its time.
+                match checks {
+                    Some(labels) if !labels.is_empty() => {
+                        state.resting_for_mornye.insert(key, labels);
+                    }
+                    _ => {
+                        state.resting_for_mornye.remove(&key);
+                    }
+                }
                 let line = match (named.artist, named.title) {
                     (Some(artist), Some(title)) => format!("{artist} - {title}: {words}"),
                     _ => words,
