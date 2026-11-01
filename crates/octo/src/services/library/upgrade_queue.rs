@@ -775,7 +775,9 @@ impl UpgradeWorker {
 
         let state = Self::state_for(&outcome);
         let result = (state == UpgradeStates::UPGRADED).then(|| self.report(&outcome, job));
+        let mornye_check = outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_CHECK);
         let detail = match state {
+            UpgradeStates::WAITING if mornye_check => outcome.detail.clone(),
             UpgradeStates::WAITING => Some("Waiting for Soulseek".to_string()),
             UpgradeStates::UPGRADED if result.as_ref().is_some_and(|r| r.after.is_some()) => {
                 let result = result.as_ref().expect("checked above");
@@ -814,6 +816,7 @@ impl UpgradeWorker {
                     "The copy you picked did not go in; your copy was kept"
                 }
                 UpgradeStates::NOT_FOUND => "No lossless copy found; your copy is unchanged",
+                UpgradeStates::WAITING if mornye_check => "Waiting for Mornye's check",
                 UpgradeStates::WAITING => "Waiting for Soulseek",
                 UpgradeStates::REHEARSED => "Only rehearsed; nothing changed",
                 _ => "Your copy is unchanged",
@@ -952,7 +955,9 @@ impl UpgradeWorker {
         match (outcome.state, outcome.code.as_deref()) {
             (LibraryActionState::Applied, _) => UpgradeStates::UPGRADED,
             (LibraryActionState::Rehearsed, _) => UpgradeStates::REHEARSED,
-            (_, Some(LibraryActionCodes::SOULSEEK_OFFLINE)) => UpgradeStates::WAITING,
+            (_, Some(LibraryActionCodes::SOULSEEK_OFFLINE | LibraryActionCodes::MORNYE_CHECK)) => {
+                UpgradeStates::WAITING
+            }
             (_, Some(LibraryActionCodes::NO_REPLACEMENT)) => UpgradeStates::NOT_FOUND,
             (LibraryActionState::Skipped, _) => UpgradeStates::SKIPPED,
             _ => UpgradeStates::FAILED,

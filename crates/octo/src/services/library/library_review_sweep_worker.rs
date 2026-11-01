@@ -1593,9 +1593,14 @@ impl LibraryReviewSweepWorker {
                 );
                 Replacing::Done
             }
-            Ok(outcome) if outcome.code.as_deref() == Some(LibraryActionCodes::SOULSEEK_OFFLINE) => {
+            Ok(outcome)
+                if matches!(
+                    outcome.code.as_deref(),
+                    Some(LibraryActionCodes::SOULSEEK_OFFLINE | LibraryActionCodes::MORNYE_CHECK)
+                ) =>
+            {
                 info!(
-                    "Library review sweep: '{} - {}' waits, because Soulseek is out and the replacement may come from nowhere else",
+                    "Library review sweep: '{} - {}' waits, because Soulseek or Mornye's check is out and the replacement may come from nowhere else",
                     song.artist, song.title
                 );
                 Replacing::Waits

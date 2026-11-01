@@ -190,3 +190,148 @@ async fn the_worker_runs_up_to_the_width_and_the_rest_wait() {
 async fn at_width_one_the_worker_is_strictly_one_at_a_time() {
     run(1, 3).await;
 }
+
+/// Downloads that fail: song "kept" because Mornye's check is paused, any other plainly.
+struct FailingDownloads;
+
+#[async_trait]
+impl IDownloadService for FailingDownloads {
+    async fn download_song(&self, _: &str, _: &str, _: &CancellationToken) -> anyhow::Result<String> {
+        anyhow::bail!("not set up")
+    }
+
+    async fn download_and_stream(
+        &self,
+        _: &str,
+        _: &str,
+        _: &CancellationToken,
+    ) -> anyhow::Result<AudioStream> {
+        anyhow::bail!("not set up")
+    }
+
+    fn download_remaining_album_tracks_in_background(&self, _: &str, _: &str, _: &str) {}
+
+    async fn execute_acquisition(
+        &self,
+        _: &str,
+        external_id: &str,
+        _: bool,
+        _: bool,
+        _: Option<DownloadSource>,
+        _: &CancellationToken,
+        _: Option<Vec<String>>,
+        _: bool,
+        _: Option<Arc<ReplacementHandoff>>,
+    ) -> anyhow::Result<String> {
+        if external_id == "kept" {
+            let pause = octo_core::spotiflac::check::CheckPause {
+                until_utc: chrono::Utc::now(),
+                labels: vec!["Example".into()],
+            };
+            return Err(
+                crate::services::spotiflac::MornyeWaiting::new(pause, false, chrono::Utc::now()).into_error(),
+            );
+        }
+        anyhow::bail!("No Soulseek FLAC found")
+    }
+
+    async fn download_album_with_source(
+        &self,
+        _: &str,
+        _: &str,
+        _: DownloadSource,
+        _: bool,
+        _: &CancellationToken,
+        _: Option<Vec<String>>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn get_download_status(&self, _: &str) -> Option<DownloadInfo> {
+        None
+    }
+
+    async fn get_local_path_if_exists(&self, _: &str, _: &str) -> Option<String> {
+        None
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+
+    async fn get_direct_stream(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: &CancellationToken,
+    ) -> anyhow::Result<Option<DirectStreamInfo>> {
+        Ok(None)
+    }
+}
+
+/// Every push sent, by its kind.
+#[derive(Default)]
+struct SentPushes(parking_lot::Mutex<Vec<NotificationEventType>>);
+
+#[async_trait]
+impl crate::services::notifications::INotificationSink for SentPushes {
+    fn name(&self) -> &str {
+        "recorded"
+    }
+
+    fn is_configured(&self) -> bool {
+        true
+    }
+
+    async fn send(&self, message: &octo_core::notifications::NotificationMessage) -> anyhow::Result<()> {
+        self.0.lock().push(message.r#type);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_star_mornyes_check_kept_sends_no_failure_push_of_its_own() {
+    let queue = Arc::new(TrackAcquisitionQueue::new());
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+        notifications: octo_core::settings::NotificationSettings {
+            notify_download_failed: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let sent = Arc::new(SentPushes::default());
+    let worker = Arc::new(AcquisitionWorker::new(
+        Arc::clone(&queue),
+        Arc::new(FailingDownloads) as Arc<dyn IDownloadService>,
+        Arc::new(ExternalIdRegistry::in_memory()),
+        Arc::new(NotificationService::new(
+            vec![Arc::clone(&sent) as Arc<dyn crate::services::notifications::INotificationSink>],
+            settings,
+            None,
+        )),
+        None,
+    ));
+    let stopping = CancellationToken::new();
+    let running = tokio::spawn(worker.run(stopping.clone()));
+    for id in ["kept", "missing"] {
+        let done = queue.enqueue("soulseek", id, true, false, true, None, true, None, false, None);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), done.wait())
+            .await
+            .expect("the request finishes");
+        assert!(outcome.is_err());
+    }
+    until({
+        let sent = Arc::clone(&sent);
+        move || !sent.0.lock().is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // One push, the plain failure's: the check has its own push, once per stretch.
+    assert_eq!(*sent.0.lock(), vec![NotificationEventType::DownloadFailed]);
+    stopping.cancel();
+    running
+        .await
+        .expect("the worker ran")
+        .expect("the worker stopped cleanly");
+}

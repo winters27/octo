@@ -37,7 +37,7 @@ use super::replacement_handoff::{
     BeforeReveal, OnRevealed, ReplacementHandoff, ReplacementRejectedException,
 };
 use super::upgrade_queue::{KEPT_BUSY, KeptFor, KeptRechecks, OriginalSound};
-use super::upgrade_sources::UpgradeSources;
+use super::upgrade_sources::{SourcesOut, UpgradeSources};
 use super::{NavidromeSongPathResolver, ResolvedSongFile};
 use crate::services::common::download_picks::AnywaySong;
 use crate::services::common::{SoundDeny, StarOnArrival, TrackAcquisitionQueue};
@@ -166,6 +166,19 @@ impl LibraryActionCodes {
 
     /// The search found no copy good enough to replace the song with.
     pub const NO_REPLACEMENT: &'static str = "noReplacement";
+
+    /// Mornye's check keeps it from every extension (and slskd cannot be used either), so the
+    /// request waits like an outage.
+    pub const MORNYE_CHECK: &'static str = "mornyeCheck";
+}
+
+/// The words of a request waiting for Mornye's check.
+fn mornye_wait_text(pause: &octo_core::spotiflac::check::CheckPause) -> String {
+    format!(
+        "Waiting for Mornye's check, which it could not pass for {}; it allows its next try at {}.",
+        octo_core::spotiflac::check::names_list(&pause.labels),
+        octo_core::spotiflac::check::until_words(pause.until_utc, Utc::now())
+    )
 }
 
 /// Navidrome shows this id at this file. Tests set it; otherwise the resolver.
@@ -745,11 +758,22 @@ impl LibraryActionExecutor {
             let sources = self.sources_for(request.action, request.only_source).await;
             let replacing = request.action != LibraryAction::BetterQuality;
             if sources.is_empty() && (replacing || self.waiting_for_soulseek().await) {
-                return Ok(LibraryActionOutcome::coded(
-                    LibraryActionState::Failed,
-                    OFFLINE_TEXT,
-                    Some(LibraryActionCodes::SOULSEEK_OFFLINE),
-                ));
+                let out = match &self.sources {
+                    Some(sources) => sources.waiting_for().await,
+                    None => None,
+                };
+                return Ok(match out {
+                    Some(SourcesOut::MornyeCheck(pause)) => LibraryActionOutcome::coded(
+                        LibraryActionState::Failed,
+                        mornye_wait_text(&pause),
+                        Some(LibraryActionCodes::MORNYE_CHECK),
+                    ),
+                    _ => LibraryActionOutcome::coded(
+                        LibraryActionState::Failed,
+                        OFFLINE_TEXT,
+                        Some(LibraryActionCodes::SOULSEEK_OFFLINE),
+                    ),
+                });
             }
             if sources.is_empty() {
                 return Ok(LibraryActionOutcome::said(
@@ -1563,6 +1587,22 @@ impl LibraryActionExecutor {
                         quarantine_path: quarantined,
                         new_path: Some(revealed),
                         arrived: handoff.as_ref().and_then(|h| h.arrived()),
+                    };
+                }
+                // Mornye's check kept the copy from Mornye: the request waits for it, like an
+                // outage, instead of reading as "no copy found".
+                if quarantine_path().is_none()
+                    && let Some(wait) = crate::services::spotiflac::mornye_waited(&e)
+                {
+                    return Replaced {
+                        outcome: LibraryActionOutcome::coded(
+                            LibraryActionState::Failed,
+                            mornye_wait_text(&wait.pause),
+                            Some(LibraryActionCodes::MORNYE_CHECK),
+                        ),
+                        quarantine_path: None,
+                        new_path: None,
+                        arrived: None,
                     };
                 }
                 // A search that found nothing usable reports not found, passed through the queue

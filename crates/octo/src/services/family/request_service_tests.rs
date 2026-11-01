@@ -92,6 +92,8 @@ struct Fetcher {
     pool: Arc<FamilyPool>,
     in_flight: Mutex<HashSet<String>>,
     no_flac: Mutex<bool>,
+    /// Every download fails because Mornye's check is paused.
+    mornye_waits: Mutex<bool>,
     asked: Mutex<Vec<(String, String, RequestQuality)>>,
     upgrades: Mutex<Vec<(String, String)>>,
     imports: Mutex<Vec<(String, String)>>,
@@ -107,6 +109,7 @@ impl Fetcher {
             pool,
             in_flight: Mutex::new(HashSet::new()),
             no_flac: Mutex::new(false),
+            mornye_waits: Mutex::new(false),
             asked: Mutex::new(Vec::new()),
             upgrades: Mutex::new(Vec::new()),
             imports: Mutex::new(Vec::new()),
@@ -141,6 +144,15 @@ impl RequestFetcher for Fetcher {
         }
         if quality == RequestQuality::Flac && *self.no_flac.lock() {
             return Fetched::Failed("No Soulseek FLAC found".into());
+        }
+        if *self.mornye_waits.lock() {
+            let pause = octo_core::spotiflac::check::CheckPause {
+                until_utc: chrono::Utc::now() + chrono::Duration::minutes(15),
+                labels: vec!["Example".into()],
+            };
+            let error =
+                crate::services::spotiflac::MornyeWaiting::new(pause, false, chrono::Utc::now()).into_error();
+            return fetched_failure(&error);
         }
         let extension = if quality == RequestQuality::Mp3 {
             "mp3"
@@ -827,6 +839,40 @@ async fn a_song_shared_where_the_member_cannot_look_is_not_theirs_already() {
         .await
         .expect("made");
     assert_eq!(alexs.outcome, Some(RequestOutcome::AlreadyShared));
+}
+
+#[tokio::test]
+async fn a_flac_request_mornyes_check_kept_says_so_instead_of_no_real_flac() {
+    let world = World::new(None);
+    let navidrome = navidrome_knowing(&world, &[]).await;
+    world.point_at(&navidrome.uri());
+    let setup = setup(world);
+    *setup.fetcher.mornye_waits.lock() = true;
+    let made = setup
+        .service
+        .create("alex", "ext-test-song-6", RequestQuality::Flac, None)
+        .await
+        .expect("made");
+    assert!(eventually(|| state_of(&setup, &made.id) == RequestState::Failed).await);
+    assert_eq!(
+        setup.service.get(&made.id).expect("kept").failure.as_deref(),
+        Some("Mornye could not pass its check for Example, so Octo did not ask it for this song.")
+    );
+}
+
+#[test]
+fn a_failed_download_reads_as_mornyes_check_only_when_it_was() {
+    let pause = octo_core::spotiflac::check::CheckPause {
+        until_utc: chrono::Utc::now(),
+        labels: vec!["Example".into()],
+    };
+    let wait = crate::services::spotiflac::MornyeWaiting::new(pause, true, chrono::Utc::now());
+    let shown = wait.shown.clone();
+    assert!(matches!(fetched_failure(&wait.into_error()), Fetched::MornyeCheck(words) if words == shown));
+    assert!(matches!(
+        fetched_failure(&anyhow::anyhow!("No Soulseek FLAC found")),
+        Fetched::Failed(words) if words == "No Soulseek FLAC found"
+    ));
 }
 
 #[tokio::test]

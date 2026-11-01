@@ -895,10 +895,13 @@ async fn serve_acquired(
                 // lossless, so lossy bytes would be the same contract violation in reverse.
                 warn!("Lossless acquisition failed for {id}: {message}");
             }
+            // Other Subsonic apps show this to whoever played: the first sentence, no server paths.
+            let said = octo_core::common::acquisition_tracker::user_safe(Some(&message))
+                .unwrap_or_else(|| "no source had it".to_string());
             return Ok((
                 state
                     .subsonic_response_builder
-                    .create_error(format, 70, &format!("Could not fetch a lossless copy: {message}"))
+                    .create_error(format, 70, &format!("Could not fetch a lossless copy: {said}"))
                     .into_response(),
                 None,
             ));

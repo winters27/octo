@@ -2976,13 +2976,20 @@ impl DownloadBackend for SoulseekDownloadService {
                     {
                         warn!("Lossless download failed ({e}); falling back to YouTube MP3");
                         if !download.suppress_notify {
+                            let why = match crate::services::spotiflac::mornye_waited(&e) {
+                                Some(wait) if self.slskd.is_on() => format!(
+                                    "Soulseek had no FLAC and Mornye could not pass its check for {}",
+                                    octo_core::spotiflac::check::names_list(&wait.pause.labels)
+                                ),
+                                _ => e.to_string(),
+                            };
                             base.notifications().notify(NotificationEvent {
                                 artist: snapshot.artist.clone(),
                                 title: snapshot.title.clone(),
                                 album: snapshot.album.clone(),
                                 source: Some("YouTube".into()),
                                 format: Some("MP3".into()),
-                                detail: Some(e.to_string()),
+                                detail: Some(why),
                                 ..NotificationEvent::new(NotificationEventType::LosslessFallback)
                             });
                         }

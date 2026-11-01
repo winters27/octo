@@ -15,7 +15,12 @@ use octo_core::spotiflac::{
 };
 
 use super::*;
-use crate::services::spotiflac::{Connection, SPOTIFLAC_FOLDER, SpotiflacClient, make_shared_folder};
+use crate::services::spotiflac::{
+    CheckSong, Connection, MornyeWaiting, SPOTIFLAC_FOLDER, SpotiflacClient, make_shared_folder,
+    mornye_waited,
+};
+use octo_core::spotiflac::ExtensionsAnswer;
+use octo_core::spotiflac::check::{FailureFacts, failure_words, named_provider};
 
 /// The source's name, as the downloads log and the fetched-songs list show it. Rows written before 2026.10.25 keep "SpotiFLAC".
 pub const SPOTIFLAC_SOURCE: &str = "Mornye";
@@ -64,8 +69,18 @@ impl SoulseekDownloadService {
                         "Mornye brought no copy; asking Soulseek",
                         user_safe(Some(&e.to_string())).as_deref(),
                     );
-                    self.download_via_soulseek(base, routing, download, profile, ct)
+                    let waited = mornye_waited(&e).cloned();
+                    match self
+                        .download_via_soulseek(base, routing, download, profile, ct)
                         .await
+                    {
+                        // Soulseek had none either: the song is still one Mornye's check keeps.
+                        Err(other) if !ct.is_cancelled() => match waited {
+                            Some(wait) => Err(wait.over(other)),
+                            None => Err(other),
+                        },
+                        result => result,
+                    }
                 }
                 other => other,
             };
@@ -180,8 +195,32 @@ impl SoulseekDownloadService {
             "Found it through Mornye",
             Some(&why),
         );
+        let check_song = CheckSong {
+            link: link.clone(),
+            artist: artist.clone(),
+            title: title.clone(),
+            utc: Utc::now(),
+        };
 
+        // Mornye's check keeps every extension the song could use: Octo does not ask, and keeps
+        // the song for "Pass Mornye's check". Once before waiting for a turn, and again with the
+        // turn, since a song ahead may have just run into the check.
+        if let Some(wait) = self
+            .mornye_gate(base, client, &settings, &track_key, &check_song)
+            .await
+        {
+            return Err(wait);
+        }
         let _slot = or_canceled(ct, async { Ok(client.slot().await) }).await?;
+        if let Some(wait) = self
+            .mornye_gate(base, client, &settings, &track_key, &check_song)
+            .await
+        {
+            return Err(wait);
+        }
+        let before = bounded_extensions(client, &connection).await;
+        client.count_job();
+        let at_start = client.activity();
         let job_dir = combine(&combine(&download_path, SPOTIFLAC_FOLDER), &new_guid());
         make_shared_folder(&job_dir)?;
         let their_dir = path_for_spotiflac(&job_dir, &download_path, settings.effective_folder().as_deref());
@@ -203,7 +242,7 @@ impl SoulseekDownloadService {
             &track_key,
             acquisition_event_kinds::TRY,
             "Asked Mornye to save it",
-            Some(&format!("Into {their_dir}, as {}", settings.effective_quality())),
+            Some(&format!("As {}", settings.effective_quality())),
         );
         let job = match client.queue(&connection, &link, &settings, &their_dir).await {
             Ok(job) => job,
@@ -221,35 +260,77 @@ impl SoulseekDownloadService {
             .wait_for_spotiflac(client, &connection, &job, &job_dir, client.song_timeout(), ct)
             .await;
         let path = match waited {
-            Ok(path) => path,
+            Ok((path, through)) => {
+                client.check.store.brought(through.as_deref(), &link);
+                path
+            }
             Err(e) => {
-                if job.is_pollable() && !matches!(e, Waited::Failed(_)) {
+                if job.is_pollable() && !matches!(e, Waited::Failed { .. }) {
                     client.cancel(&connection, &job.id).await;
                 }
                 let _ = std::fs::remove_dir_all(&job_dir);
-                let words = match e {
+                let (words, shown) = match e {
                     Waited::Canceled => return Err(OperationCanceled.into()),
-                    Waited::TimedOut(timeout) => format!(
-                        "Mornye took longer than {} seconds for '{artist} - {title}', so Octo stopped waiting",
-                        timeout.as_secs()
-                    ),
-                    Waited::Failed(reason) => {
-                        format!("Mornye could not download '{artist} - {title}': {reason}")
+                    Waited::TimedOut(timeout) => {
+                        let words = format!(
+                            "Mornye took longer than {} seconds for '{artist} - {title}', so Octo stopped waiting",
+                            timeout.as_secs()
+                        );
+                        (words.clone(), words)
                     }
-                    Waited::NoFile => format!(
-                        "Mornye said it saved '{artist} - {title}', but nothing arrived in {job_dir}. \
-                         Mornye must save into the same folder Octo reads; see the Music folder setting on the Mornye page"
-                    ),
-                    Waited::Unreachable(reason) => format!("Mornye stopped answering: {reason}"),
+                    Waited::Failed { reason, provider } => {
+                        let explained = self
+                            .explain_failure(
+                                client,
+                                &connection,
+                                &reason,
+                                provider.as_deref(),
+                                &before,
+                                at_start,
+                                &their_dir,
+                            )
+                            .await;
+                        match explained {
+                            Explained::Waiting(wait) => {
+                                warn!(
+                                    "Mornye's job for '{artist} - {title}' ran into its check: {}",
+                                    wait.shown
+                                );
+                                base.log_step(
+                                    &track_key,
+                                    acquisition_event_kinds::NOTE,
+                                    &wait.shown,
+                                    Some(&wait.detail),
+                                );
+                                client.check.store.remember(check_song);
+                                return Err(wait.into_error());
+                            }
+                            Explained::Words(words) => (
+                                format!("Mornye could not download '{artist} - {title}': {}", words.shown),
+                                words.shown,
+                            ),
+                        }
+                    }
+                    Waited::NoFile => {
+                        let words = format!(
+                            "Mornye said it saved '{artist} - {title}', but nothing arrived in {job_dir}. \
+                             Mornye must save into the same folder Octo reads; see the Music folder setting on the Mornye page"
+                        );
+                        (words.clone(), words)
+                    }
+                    Waited::Unreachable(reason) => {
+                        let words = format!("Mornye stopped answering: {reason}");
+                        (words.clone(), words)
+                    }
                 };
                 warn!("{words}");
                 base.log_step(
                     &track_key,
                     acquisition_event_kinds::NOTE,
                     "Mornye brought no file",
-                    user_safe(Some(&words)).as_deref(),
+                    user_safe(Some(&shown)).as_deref(),
                 );
-                return Err(file_not_found(words));
+                return Err(file_not_found(shown));
             }
         };
         let (quality, _) = AudioSummary::describe(Some(&path));
@@ -271,9 +352,9 @@ impl SoulseekDownloadService {
         }
     }
 
-    /// Waits for the job to end and finds its file in the job folder. A job Mornye cannot be
-    /// asked about again is watched by its folder: a song file whose size held still for one
-    /// look is the song.
+    /// Waits for the job to end and finds its file in the job folder, with the extension it came
+    /// through when Mornye says. A job Mornye cannot be asked about again is watched by its
+    /// folder: a song file whose size held still for one look is the song.
     async fn wait_for_spotiflac(
         &self,
         client: &SpotiflacClient,
@@ -282,7 +363,7 @@ impl SoulseekDownloadService {
         job_dir: &str,
         timeout: Duration,
         ct: &CancellationToken,
-    ) -> Result<String, Waited> {
+    ) -> Result<(String, Option<String>), Waited> {
         let deadline = Instant::now() + timeout;
         let mut pollable = job.is_pollable();
         let mut failures = 0;
@@ -300,15 +381,24 @@ impl SoulseekDownloadService {
                         failures = 0;
                         match now.state() {
                             JobState::Done => {
-                                return self.landed_file(job_dir, ct).await.ok_or(Waited::NoFile);
+                                let through = now.provider().map(str::to_string);
+                                return self
+                                    .landed_file(job_dir, ct)
+                                    .await
+                                    .map(|path| (path, through))
+                                    .ok_or(Waited::NoFile);
                             }
                             JobState::Failed => {
-                                return Err(Waited::Failed(
-                                    now.failure().unwrap_or_else(|| "it gave no reason".to_string()),
-                                ));
+                                return Err(Waited::Failed {
+                                    reason: now.failure().unwrap_or_default(),
+                                    provider: now.provider().map(str::to_string),
+                                });
                             }
                             JobState::Cancelled => {
-                                return Err(Waited::Failed("the job was cancelled in Mornye".to_string()));
+                                return Err(Waited::Failed {
+                                    reason: "the job was cancelled in Mornye".to_string(),
+                                    provider: None,
+                                });
                             }
                             JobState::Working => {}
                         }
@@ -326,7 +416,7 @@ impl SoulseekDownloadService {
             } else {
                 let now = audio_in(job_dir);
                 if now.is_some() && now == last_seen {
-                    return now.map(|(path, _)| path).ok_or(Waited::NoFile);
+                    return now.map(|(path, _)| (path, None)).ok_or(Waited::NoFile);
                 }
                 last_seen = now;
             }
@@ -522,9 +612,121 @@ fn goes_on(error: &anyhow::Error) -> bool {
 enum Waited {
     Canceled,
     TimedOut(Duration),
-    Failed(String),
+    /// Mornye's reason, and the extension the job failed in when it says.
+    Failed {
+        reason: String,
+        provider: Option<String>,
+    },
     NoFile,
     Unreachable(String),
+}
+
+/// Why a Mornye job failed: its check, or words for anything else.
+enum Explained {
+    Waiting(MornyeWaiting),
+    Words(octo_core::spotiflac::check::FailureWords),
+}
+
+/// Mornye's extensions and their health, or None when Mornye did not answer in time.
+async fn bounded_extensions(client: &SpotiflacClient, connection: &Connection) -> Option<ExtensionsAnswer> {
+    let bound = client.check.times.call_bound;
+    match tokio::time::timeout(bound, client.extensions(connection)).await {
+        Ok(Ok(answer)) => Some(answer),
+        _ => None,
+    }
+}
+
+/// Whether extension `name`'s last error is this job's own: its row moved by exactly one failure
+/// and at least one try between the two reads.
+fn moved_by_one_failure(
+    before: Option<&ExtensionsAnswer>,
+    after: Option<&ExtensionsAnswer>,
+    name: &str,
+) -> bool {
+    let (Some(before), Some(after)) = (before.and_then(|b| b.row(name)), after.and_then(|a| a.row(name)))
+    else {
+        return false;
+    };
+    after.failures == before.failures + 1 && after.attempts > before.attempts
+}
+
+impl SoulseekDownloadService {
+    /// The gate: when Mornye's check keeps every extension the song could use, the wait, logged,
+    /// with the song kept for "Pass Mornye's check". None when Mornye may be asked.
+    async fn mornye_gate(
+        &self,
+        base: &BaseDownloadService,
+        client: &SpotiflacClient,
+        settings: &SpotiflacSettings,
+        track_key: &str,
+        song: &CheckSong,
+    ) -> Option<anyhow::Error> {
+        let view = client.check_view(None).await?;
+        let now = Utc::now();
+        let pause = view.pause(&settings.effective_services(), now)?;
+        let wait = MornyeWaiting::new(pause, false, now);
+        info!(
+            "Not asking Mornye for '{} - {}': {}",
+            song.artist, song.title, wait.shown
+        );
+        base.log_step(
+            track_key,
+            acquisition_event_kinds::NOTE,
+            &wait.shown,
+            Some(&wait.detail),
+        );
+        client.check.store.remember(song.clone());
+        Some(wait.into_error())
+    }
+
+    /// Why a Mornye job failed, read after the failure was seen: a wait when Mornye's check
+    /// keeps its extension (or every extension, or Mornye's own words say it is paused), else
+    /// words from the extension's health.
+    #[allow(clippy::too_many_arguments)]
+    async fn explain_failure(
+        &self,
+        client: &SpotiflacClient,
+        connection: &Connection,
+        reason: &str,
+        provider: Option<&str>,
+        before: &Option<ExtensionsAnswer>,
+        at_start: (usize, u64),
+        their_dir: &str,
+    ) -> Explained {
+        let seen = Instant::now();
+        let provider = provider.and_then(named_provider);
+        let view = client.check_view(Some(seen)).await;
+        let now = Utc::now();
+        if let Some(view) = &view {
+            let pause = provider
+                .and_then(|name| view.pause_of(name, now))
+                .or_else(|| view.pause(&client.settings().effective_services(), now));
+            if let Some(pause) = pause {
+                return Explained::Waiting(MornyeWaiting::new(pause, true, now));
+            }
+        }
+        if let Some(until) = octo_core::spotiflac::check::next_try_from_words(reason, now) {
+            let pause = octo_core::spotiflac::check::CheckPause {
+                until_utc: until,
+                labels: provider.map(|name| vec![name.to_string()]).unwrap_or_default(),
+            };
+            return Explained::Waiting(MornyeWaiting::new(pause, true, now));
+        }
+        let after = bounded_extensions(client, connection).await;
+        let health = provider.and_then(|name| after.as_ref().and_then(|answer| answer.row(name)));
+        // Octo asked Mornye for this song alone, from the health read before it to the one after.
+        let own_job = at_start.0 == 1
+            && client.activity() == at_start
+            && provider.is_some_and(|name| moved_by_one_failure(before.as_ref(), after.as_ref(), name));
+        Explained::Words(failure_words(&FailureFacts {
+            reason,
+            provider,
+            health,
+            own_job,
+            their_dir,
+            utilities_missing: view.as_ref().is_some_and(|view| view.utilities_missing),
+        }))
+    }
 }
 
 /// The song file in a job folder, with its size, or None while there is none.
@@ -548,7 +750,12 @@ pub(super) fn sweep_spotiflac_folders(download_path: &str) {
         }
         for entry in std::fs::read_dir(&jobs)? {
             let dir = entry?.path();
-            if !dir.is_dir() {
+            // Mornye's own downloads may share this folder: only Octo's job and check folders go.
+            let named_by_octo = dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(octo_folder_name);
+            if !dir.is_dir() || !named_by_octo {
                 continue;
             }
             let empty = audio_in(&dir.to_string_lossy()).is_none();
@@ -568,6 +775,12 @@ pub(super) fn sweep_spotiflac_folders(download_path: &str) {
     if let Err(e) = sweep() {
         debug!("Could not sweep {jobs}: {e}");
     }
+}
+
+/// A folder name Octo gives: a job id (32 hex characters), or a folder check's `octo-check-<id>`.
+pub(crate) fn octo_folder_name(name: &str) -> bool {
+    let id = name.strip_prefix("octo-check-").unwrap_or(name);
+    id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]

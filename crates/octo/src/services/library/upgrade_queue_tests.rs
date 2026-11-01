@@ -231,6 +231,26 @@ async fn during_an_outage_a_job_waits_then_runs_once_soulseek_is_back() {
     assert_eq!(tries.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn a_job_waiting_for_mornyes_check_says_so() {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a"]), "alice", "app");
+    let words = "Waiting for Mornye's check, which it could not pass for Example; it allows its next try at 14:05 UTC.";
+    let apply: Apply = Arc::new(move |_| {
+        let answer = LibraryActionOutcome {
+            code: Some(LibraryActionCodes::MORNYE_CHECK.to_string()),
+            ..outcome(LibraryActionState::Failed, words)
+        };
+        async move { answer }.boxed()
+    });
+    let worker = worker(&queue, 1, apply, None);
+    worker.tick(&CancellationToken::new()).await;
+    worker.drain().await;
+    let job = queue.snapshot().remove(0);
+    assert_eq!(job.state, UpgradeStates::WAITING);
+    assert_eq!(job.detail.as_deref(), Some(words));
+}
+
 #[test]
 fn outcomes_map_on_the_code_not_the_words() {
     let cases = [
@@ -239,6 +259,11 @@ fn outcomes_map_on_the_code_not_the_words() {
         (
             LibraryActionState::Failed,
             Some(LibraryActionCodes::SOULSEEK_OFFLINE),
+            UpgradeStates::WAITING,
+        ),
+        (
+            LibraryActionState::Failed,
+            Some(LibraryActionCodes::MORNYE_CHECK),
             UpgradeStates::WAITING,
         ),
         (

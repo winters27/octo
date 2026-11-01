@@ -34,6 +34,7 @@ use crate::services::library::GeneratedPlaylistService;
 use crate::services::local::ILocalLibraryService;
 use crate::services::soulseek::soulseek_link::SoulseekLinkState;
 use crate::services::soulseek::{ExternalIdRegistry, ISoulseekLink, RadioQueueStore};
+use crate::services::spotiflac::{SpotiflacClient, mornye_waited};
 
 /// A saved play queue older than this no longer says what plays next.
 const SAVED_QUEUE_FOR: Duration = Duration::hours(6);
@@ -76,6 +77,9 @@ pub struct PrefetchParts {
     pub names: Option<Arc<ExternalIdRegistry>>,
     /// Whether Soulseek is connected: nothing is fetched while it is not, unless SpotiFLAC is on.
     pub soulseek: Option<Arc<dyn ISoulseekLink>>,
+    /// Mornye, whose check can keep it from every extension: nothing is fetched then either,
+    /// while Soulseek cannot be used.
+    pub spotiflac: Option<Arc<SpotiflacClient>>,
     pub clock: Clock,
 }
 
@@ -611,7 +615,26 @@ impl PrefetchService {
         if self.soulseek_down().await {
             return Some("Waiting for Soulseek to connect".to_string());
         }
+        if self.mornye_kept().await {
+            return Some("Waiting for Mornye's check".to_string());
+        }
         None
+    }
+
+    /// Mornye is the lossless source left (Soulseek off, unreachable or logged out) and its
+    /// check keeps it from every extension a song could use.
+    async fn mornye_kept(&self) -> bool {
+        let Some(client) = self.parts.spotiflac.as_ref().filter(|client| client.is_on()) else {
+            return false;
+        };
+        if !self.soulseek_unusable().await {
+            return false;
+        }
+        let Some(view) = client.check_view(None).await else {
+            return false;
+        };
+        view.pause(&client.settings().effective_services(), chrono::Utc::now())
+            .is_some()
     }
 
     /// Nobody played anything lately, and nothing new starts then (PauseWhenStopped).
@@ -630,6 +653,11 @@ impl PrefetchService {
         if self.parts.settings.current().spotiflac.is_on() {
             return false;
         }
+        self.soulseek_unusable().await
+    }
+
+    /// Soulseek cannot be used: it is off, slskd cannot be reached, or slskd is not logged in.
+    async fn soulseek_unusable(&self) -> bool {
         let Some(link) = &self.parts.soulseek else {
             return false;
         };
@@ -812,8 +840,9 @@ impl PrefetchService {
             Err(e) => {
                 let words = format!("{e:#}");
                 info!("Could not download {key} ahead: {words}");
-                // A source that could not be reached says nothing about the song.
-                let unreachable = unreachable(&e) || self.soulseek_down().await;
+                // A source that could not be reached, or Mornye's check, says nothing about the song.
+                let unreachable =
+                    unreachable(&e) || mornye_waited(&e).is_some() || self.soulseek_down().await;
                 let named = self.view(job);
                 let mut state = self.state.lock();
                 let rest = if unreachable {

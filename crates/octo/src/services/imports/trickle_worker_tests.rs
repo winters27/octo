@@ -19,6 +19,7 @@ struct Rig {
     finished: Arc<Mutex<Vec<TrickleJob>>>,
     busy: Arc<AtomicBool>,
     soulseek_out: Arc<AtomicBool>,
+    mornye_out: Arc<AtomicBool>,
     held: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -62,6 +63,7 @@ fn rig_with(owned: Owned, outcome: Outcome) -> Rig {
     let started: Arc<Mutex<Vec<String>>> = Arc::default();
     let busy = Arc::new(AtomicBool::new(false));
     let out = Arc::new(AtomicBool::new(false));
+    let mornye_out = Arc::new(AtomicBool::new(false));
     let held: Arc<Mutex<HashSet<String>>> = Arc::default();
     let seams = TrickleSeams {
         owned: Arc::new(move |job| {
@@ -90,6 +92,13 @@ fn rig_with(owned: Owned, outcome: Outcome) -> Rig {
         },
         soulseek_out: {
             let out = out.clone();
+            Arc::new(move || {
+                let value = out.load(Ordering::SeqCst);
+                Box::pin(async move { value })
+            })
+        },
+        mornye_out: {
+            let out = mornye_out.clone();
             Arc::new(move || {
                 let value = out.load(Ordering::SeqCst);
                 Box::pin(async move { value })
@@ -124,6 +133,7 @@ fn rig_with(owned: Owned, outcome: Outcome) -> Rig {
         finished,
         busy,
         soulseek_out: out,
+        mornye_out,
         held,
     }
 }
@@ -281,6 +291,93 @@ async fn it_waits_while_peoples_own_downloads_run_and_while_soulseek_is_out() {
 
     rig.soulseek_out.store(false, Ordering::SeqCst);
     assert!(rig.tick().await);
+}
+
+#[tokio::test]
+async fn it_waits_while_mornyes_check_keeps_the_only_source() {
+    let rig = rig();
+    rig.mornye_out.store(true, Ordering::SeqCst);
+    rig.add(&["a"]);
+    assert!(!rig.tick().await);
+    assert_eq!(
+        rig.worker.status_for("alice").state,
+        trickle_states::WAITING_FOR_MORNYE_CHECK
+    );
+    assert_eq!(
+        trickle_states::label(trickle_states::WAITING_FOR_MORNYE_CHECK, false),
+        "Waiting for Mornye's check"
+    );
+    rig.mornye_out.store(false, Ordering::SeqCst);
+    assert!(rig.tick().await);
+}
+
+/// A Mornye whose one gateway session is in `state`.
+async fn mornye(state: &str) -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let server = wiremock::MockServer::builder().start().await;
+    let paused_s = if state == "active" { 0.0 } else { 900.0 };
+    Mock::given(method("POST"))
+        .and(path("/api/get_signed_sessions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": {"sessions": [
+                {"key": "gateway-v2-abc-6836abb49bb0e8c9", "kind": "gateway", "label": "Example",
+                 "extensions": ["example-ext"], "state": state, "auth_paused_s": paused_s}
+            ]}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/get_download_services"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": {"services": [
+                {"id": "ext:example-ext", "label": "Example", "extensions": ["example-ext"]}
+            ]}})),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn mornye_keeps_the_step_only_when_it_is_the_source_left_and_its_check_is_paused() {
+    use crate::services::common::test_fakes::{OffLink, OfflineLink};
+    let paused = mornye("unverified").await;
+    let clear = mornye("active").await;
+    let store = |url: &str, lidarr_after: bool| {
+        let mut all = AppSettings::default();
+        all.spotiflac.enabled = true;
+        all.spotiflac.url = url.into();
+        if lidarr_after {
+            all.subsonic.heart_download_sources = vec![
+                octo_core::settings::HeartDownloadStep {
+                    source: HeartDownloadSource::Soulseek,
+                    song_enabled: Some(true),
+                    ..Default::default()
+                },
+                octo_core::settings::HeartDownloadStep {
+                    source: HeartDownloadSource::Lidarr,
+                    song_enabled: Some(true),
+                    ..Default::default()
+                },
+            ];
+        }
+        Arc::new(SettingsStore::for_tests(all))
+    };
+    let keeps = |settings: Arc<SettingsStore>, link: Arc<dyn ISoulseekLink>| async move {
+        let client = SpotiflacClient::new(Arc::clone(&settings));
+        mornye_keeps_the_step(&settings, link.as_ref(), Some(&client)).await
+    };
+    assert!(keeps(store(&paused.uri(), false), Arc::new(OffLink)).await);
+    assert!(keeps(store(&paused.uri(), false), Arc::new(OfflineLink)).await);
+    assert!(
+        !keeps(store(&clear.uri(), false), Arc::new(OffLink)).await,
+        "the check passes"
+    );
+    assert!(
+        !keeps(store(&paused.uri(), true), Arc::new(OffLink)).await,
+        "Lidarr comes after"
+    );
 }
 
 #[tokio::test]
