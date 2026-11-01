@@ -510,9 +510,9 @@ fn a_finished_run_moves_the_holds_it_shares_a_check_with_and_leaves_the_rest() {
             .and_then(|job| job.mornye_hold.as_ref())
             .map(|hold| hold.until_utc)
     };
+    assert!(jobs.iter().all(|job| !job.mornye_scout), "a's try is known");
     assert_eq!(hold("b"), Some(later), "b shares check A");
     assert_eq!(hold("c"), Some(early), "c waits on another check");
-    assert!(jobs.iter().all(|job| !job.mornye_scout), "a's try is known");
 }
 
 #[test]
