@@ -316,6 +316,16 @@
             <div class="status-card-body">Checking…</div>
             <div class="status-card-foot">slskd, downloads on heart</div>
           </article>
+          <article class="status-card" data-svc="mornye">
+            <div class="status-card-head">
+              <span class="status-card-mark"><svg class="icon" aria-hidden="true"><use href="#i-plugs-connected"/></svg></span>
+              <span class="status-card-title">Mornye (SpotiFLAC)</span>
+              <span class="status-dot pending"></span>
+            </div>
+            <div class="status-card-body">Checking…</div>
+            <button type="button" class="link-button status-card-action" data-status-action="spotiflac" hidden>Pass Mornye's check</button>
+            <div class="status-card-foot">Optional, songs Soulseek does not have</div>
+          </article>
           <article class="status-card" data-svc="lidarr">
             <div class="status-card-head">
               <span class="status-card-mark"><svg class="icon brand" aria-hidden="true"><use href="#b-lidarr"/></svg></span>
@@ -1240,6 +1250,14 @@
                 <div class="set-info-d">Every heart source failed, so nothing was saved. The only place a failed heart is reported.</div>
               </div>
               <label class="switch"><input type="checkbox" id="f-notify-failed" name="Notifications.NotifyDownloadFailed" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Mornye could not pass its check</div>
+                <div class="set-info-d">Mornye's check paused its downloads. One message each time a pause begins.</div>
+                <div class="set-info-more">It links to the Mornye page, where you can pass the check, when Octo's outside address is saved on Status. On by default.</div>
+              </div>
+              <label class="switch"><input type="checkbox" id="f-notify-mornye-check" name="Notifications.NotifyMornyeCheck" checked /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
             <div class="set-row">
               <div class="set-info">
@@ -3020,14 +3038,60 @@
 
         <div class="set-section">
           <div class="set-head">
+            <h3 class="set-title">Mornye now</h3>
+            <p class="set-desc">What Mornye answers right now, and whether its check lets songs through.</p>
+          </div>
+          <div class="set-card mornye-card" id="mornye-card">
+            <div class="set-row stack mornye-now">
+              <div class="mornye-head">
+                <span class="status-dot pending" id="mornye-dot" aria-hidden="true"></span>
+                <p class="mornye-title" id="mornye-title" role="status" aria-live="polite">Asking Mornye…</p>
+                <button type="button" class="btn btn-ghost btn-icon" id="mornye-refresh" aria-label="Ask Mornye again" title="Ask again"><svg class="icon" aria-hidden="true"><use href="#i-arrows-clockwise"/></svg></button>
+              </div>
+              <ul class="test-checks mornye-findings" id="mornye-findings" hidden></ul>
+              <div class="mornye-actions" id="mornye-actions" hidden>
+                <button type="button" class="btn btn-primary" id="mornye-pass-open" hidden>Pass Mornye's check</button>
+                <a class="btn btn-ghost" id="mornye-open" target="_blank" rel="noopener noreferrer" title="Mornye's own page, in a new tab" hidden><svg class="icon" aria-hidden="true"><use href="#i-arrow-square-out"/></svg><span>Open Mornye</span></a>
+              </div>
+            </div>
+            <div class="set-row stack pass-panel" id="mornye-pass" hidden>
+              <div class="pass-head">
+                <h4 class="pass-title" id="mornye-pass-title" tabindex="-1">Pass Mornye's check</h4>
+                <button type="button" class="btn btn-ghost btn-sm" id="mornye-pass-close">Close</button>
+              </div>
+              <p class="pass-line" id="mornye-pass-line" role="status" aria-live="polite"></p>
+              <ul class="test-checks" id="mornye-pass-notes" hidden></ul>
+              <div class="pass-live" id="mornye-pass-live" hidden>
+                <div class="pass-zoom" id="mornye-pass-zoom" role="group" aria-labelledby="mornye-pass-zoom-label">
+                  <span class="pass-zoom-label" id="mornye-pass-zoom-label">Zoom</span>
+                  <button type="button" data-zoom="1" aria-pressed="true"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span>1×</span></button>
+                  <button type="button" data-zoom="2" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span>2×</span></button>
+                  <button type="button" data-zoom="3" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span>3×</span></button>
+                  <button type="button" data-zoom="4" aria-pressed="false"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg><span>4×</span></button>
+                </div>
+                <div class="pass-box" id="mornye-pass-box" data-zoom="1">
+                  <img id="mornye-pass-frame" alt="Mornye's check, live" draggable="false" hidden />
+                  <span class="pass-wait" id="mornye-pass-wait">Waiting for Mornye's browser…</span>
+                </div>
+              </div>
+              <p class="pass-note" id="mornye-pass-note" role="alert" hidden></p>
+              <div class="pass-actions" id="mornye-pass-actions" hidden>
+                <button type="button" class="btn" id="mornye-pass-retry"><span>Try again</span></button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="set-section">
+          <div class="set-head">
             <h3 class="set-title">What you bring</h3>
             <p class="set-desc">Set these up in Mornye first, then test the connection below.</p>
           </div>
           <div class="set-card">
             <ol class="bring-list">
-              <li><span class="bring-t">Mornye with its web page on</span><span class="bring-d">Started with <code>mornye --web --host 0.0.0.0</code>, or the optional <code>spotiflac</code> service in Octo's <code>docker-compose.yml</code>, which builds and runs Mornye. An older SpotiFLAC works too.</span></li>
+              <li><span class="bring-t">Mornye with its web page on</span><span class="bring-d">Started with <code>mornye --web --host 0.0.0.0</code>, or the optional <code>spotiflac</code> service in Octo's <code>docker-compose.yml</code>, which runs Mornye 1.0.5 from its published image. An older SpotiFLAC works too.</span></li>
               <li><span class="bring-t">Your extension registry and an extension</span><span class="bring-d">Mornye has none of its own. Give it the registry you choose in <code>SPOTIFLAC_REGISTRIES</code>. Mornye installs every extension it lists by itself, when it starts and again every hour.</span></li>
-              <li><span class="bring-t">A web token</span><span class="bring-d">Set <code>SPOTIFLAC_WEB_TOKEN</code> (Mornye's own name: <code>MORNYE_WEB_TOKEN</code>) and type the same token here, so nobody else can use it.</span></li>
+              <li><span class="bring-t">A web token</span><span class="bring-d">Set <code>SPOTIFLAC_WEB_TOKEN</code> (Mornye's own name: <code>MORNYE_WEB_TOKEN</code>) and type the same token here, so nobody else can use it. With Octo's <code>spotiflac</code> service, it also lets you pass Mornye's check from this page.</span></li>
               <li><span class="bring-t">Octo's music folder, shared</span><span class="bring-d">Mornye saves into a hidden folder inside Octo's music folder, so it needs that folder mounted. If its path differs in Mornye, set it under More settings.</span></li>
             </ol>
           </div>
