@@ -291,6 +291,10 @@ impl IDownloadService for Pipeline {
         None
     }
 
+    fn held_root(&self) -> Option<PathBuf> {
+        Some(self.root.join(".octo-incoming/held"))
+    }
+
     async fn place_held(&self, held: &HeldPlacement) -> Option<String> {
         if let Some(dir) = Path::new(&held.target).parent() {
             std::fs::create_dir_all(dir).ok()?;

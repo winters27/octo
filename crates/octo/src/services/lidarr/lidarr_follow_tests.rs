@@ -977,8 +977,10 @@ async fn stop_waiting_for_lidarr_ends_the_follow_and_places_the_kept_copy() {
 
 /// Two hearts on one follow: alice's kept Teardrop waits, and bob waits on Octo's download of
 /// Angel. Alice stops waiting, so her copy is placed while the follow stays open for bob, and a
-/// rescan links it into the artist. It is Octo's own copy, never a file of the user's: the follow
+/// rescan links it into the album. It is Octo's own copy, never a file of the user's: the follow
 /// does not step aside, the artist still has no music of the user's, and bob's Angel still lands.
+/// Lidarr's import of Angel replaces every file the album had, alice's copy among them: Octo puts
+/// it back from the link it kept, and tells nobody a file of theirs was replaced.
 #[tokio::test]
 async fn a_rescan_linking_a_copy_octo_placed_never_makes_the_follow_step_aside() {
     let f = Fixture::new().await;
@@ -1034,7 +1036,21 @@ async fn a_rescan_linking_a_copy_octo_placed_never_makes_the_follow_step_aside()
 
     until(|| f.taken() == ["Angel"]).await;
     over(&f).await;
-    assert!(Path::new(&held.target).is_file(), "alice's copy stays as it was");
+    assert!(
+        Path::new(&held.target).is_file(),
+        "alice's copy is back where it was placed"
+    );
+    assert!(
+        !notes(&f, &teardrop_key(&f))
+            .iter()
+            .any(|(text, _)| text == REPLACED_YOURS),
+        "nobody is told a file of theirs was replaced"
+    );
+    let links = f.root.path().join(".octo-incoming/held/lidarr-placed");
+    assert!(
+        !std::fs::read_dir(&links).is_ok_and(|mut entries| entries.next().is_some()),
+        "the link goes once the follow is over"
+    );
 }
 
 /// Octo's download was its client's only item and is gone from the client: Lidarr gives no proof

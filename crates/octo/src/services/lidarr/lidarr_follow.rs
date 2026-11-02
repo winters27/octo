@@ -21,8 +21,9 @@
 //!   else cannot be proven gone: it stays watched, and the dashboard's Lidarr card lists its
 //!   follow with the admin's "Put Lidarr back", which counts it gone and ends the follow.
 //! - **Octo's own copies.** A copy Octo placed while a follow on its artist stays open (a kept
-//!   copy whose person stopped waiting) is Octo's, never the user's: a rescan linking it never
-//!   makes Octo step aside.
+//!   copy whose person stopped waiting) is Octo's, never the user's, while that follow is listed:
+//!   a rescan linking it never makes Octo step aside. A link of it waits in the hold path, and
+//!   when Octo's own import replaces it, it is put back from that link.
 //! - **Octo's turn.** While a download of Octo's is finished and waits for its import, the
 //!   commands are read at a sub-second pace; a rescan that covers the artist, or a manual import
 //!   or scan that is not Octo's, makes Octo remove its items before its import could replace
@@ -72,6 +73,9 @@ const FAILED_STATES: [&str; 4] = [
 ];
 /// The states whose removal also blocklists the release.
 const BLOCKLISTED: [&str; 2] = ["downloadFailed", "downloadFailedPending"];
+/// The folder in the hold path where the links of the copies Octo placed during an open follow
+/// wait.
+const PLACED_LINKS: &str = "lidarr-placed";
 
 /// One read of Lidarr, in the order that settles a file with no row: the artist's track files,
 /// then the commands, then the queue, then the history.
@@ -343,7 +347,7 @@ impl Inner {
         }
         self.judge_files(job, &mut entry, run, &reading, settings, &mut end)
             .await?;
-        self.tell_replaced(&mut entry, &reading).await;
+        self.tell_replaced(&mut entry, &reading, settings).await;
         self.account(&mut entry, run, &reading, &mut end).await?;
         let all_accounted = entry.watched().next().is_none() && entry.pending_items.is_empty();
         if end.is_none() && entry.following() && !windows.research_running {
@@ -988,8 +992,10 @@ impl Inner {
     }
 
     /// Tells, on the downloads entry, of each file of the user's that Lidarr deleted as an upgrade
-    /// while importing Octo's download: a file at a path no import of Octo's had filled before.
-    async fn tell_replaced(&self, entry: &mut PendingAlbum, reading: &Reading) {
+    /// while importing Octo's download: a file at a path no import of Octo's had filled before. A
+    /// copy Octo placed during the follow is put back instead (its link was kept), and nothing is
+    /// told.
+    async fn tell_replaced(&self, entry: &mut PendingAlbum, reading: &Reading, settings: &LidarrSettings) {
         let Some(since) = entry.searched_at else {
             return;
         };
@@ -1036,6 +1042,9 @@ impl Inner {
         for row in replaced {
             entry.replaced_told.push(row.id);
             let path = row.source_title.clone();
+            if self.restore_placed(&path, settings) {
+                continue;
+            }
             warn!("{REPLACED_YOURS}: {path}");
             let detail = match &bin {
                 Some(bin) => format!("{path}. Lidarr moved it to its recycle bin, {bin}"),
@@ -1339,8 +1348,12 @@ impl Inner {
                     held.song
                 );
                 // A follow still open on its artist (others wait on it) may see a rescan link it:
-                // while that follow is listed, it is Octo's own copy there, never the user's.
-                self.pending.placed_copy(&path, &held.follows);
+                // while that follow is listed, it is Octo's own copy there, never the user's, and
+                // a link of it waits in the hold path in case Octo's own import replaces it.
+                if self.pending.any_following(&held.follows) {
+                    let backup = self.keep_link(&path);
+                    self.pending.placed_copy(&path, &held.follows, backup);
+                }
             }
             None => {
                 warn!(
@@ -1363,6 +1376,61 @@ impl Inner {
             let last = (why == FollowEnd::ProvenElsewhere).then_some(PROVEN_ELSEWHERE);
             tracker.end_aside(provider, id, last);
         }
+    }
+
+    /// A link of the copy placed at `path`, in the hold path's `lidarr-placed` folder (a copy when
+    /// the two lie on different disks); None when neither can be made or no hold path is known.
+    fn keep_link(&self, path: &str) -> Option<String> {
+        let folder = self.downloads.as_ref()?.held_root()?.join(PLACED_LINKS);
+        std::fs::create_dir_all(&folder).ok()?;
+        let extension = Path::new(path)
+            .extension()
+            .map(|extension| format!(".{}", extension.to_string_lossy()))
+            .unwrap_or_default();
+        let link = folder.join(format!("{}{extension}", uuid::Uuid::new_v4().simple()));
+        let made = std::fs::hard_link(path, &link).is_ok() || std::fs::copy(path, &link).is_ok();
+        if !made {
+            warn!("Could not keep a link of the copy Octo placed at {path}");
+            return None;
+        }
+        Some(link.to_string_lossy().into_owned())
+    }
+
+    /// The copy Octo placed during this follow that Lidarr deleted as an upgrade at `lidarr_path`
+    /// (Octo's own import replaced it) comes back from the link Octo kept: where it was, or beside
+    /// the file Lidarr imported there. True when it is back.
+    fn restore_placed(&self, lidarr_path: &str, settings: &LidarrSettings) -> bool {
+        let octo_root = self.music.octo_root();
+        let Ok(local) =
+            translate_imported_path(lidarr_path, settings.root_folder_path.as_deref(), &octo_root)
+        else {
+            return false;
+        };
+        let Some(backup) = self
+            .pending
+            .backup_of(&local)
+            .filter(|backup| Path::new(backup).is_file())
+        else {
+            return false;
+        };
+        let target = if Path::new(&local).exists() {
+            octo_core::common::PathHelper::resolve_unique_path(&local)
+        } else {
+            local.clone()
+        };
+        if let Some(folder) = Path::new(&target).parent() {
+            let _ = std::fs::create_dir_all(folder);
+        }
+        let back = std::fs::hard_link(&backup, &target).is_ok() || std::fs::copy(&backup, &target).is_ok();
+        if !back {
+            warn!("Lidarr's import replaced the copy Octo placed at {local}, and Octo could not put it back");
+            return false;
+        }
+        if target != local {
+            self.pending.placed_copy_moved(&local, &target);
+        }
+        info!("Lidarr's import replaced the copy Octo placed at {local}; it is back at {target}");
+        true
     }
 
     /// The follow is over: the pipeline's work waited for, the album's hold folder settled for the

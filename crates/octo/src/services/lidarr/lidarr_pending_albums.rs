@@ -792,8 +792,9 @@ struct PendingFile {
 }
 
 /// A copy Octo placed while follows on its artist were still open (a kept copy whose person
-/// stopped waiting): Octo's own, never the user's music, while one of those follows is listed.
-/// Once they are all over it is a file of the library like any other.
+/// stopped waiting): Octo's own, never the user's music, while one of those follows is listed,
+/// with a link of it kept in the hold path, so an import of Octo's that replaces it can give it
+/// back. Once its follows are all over it is a file of the library like any other.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 struct PlacedCopy {
@@ -801,6 +802,9 @@ struct PlacedCopy {
     path: String,
     /// The follows, by foreign album id, it was placed during.
     follows: Vec<String>,
+    /// The link (or copy) of it Octo keeps in the hold path while it counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<String>,
 }
 
 #[derive(Default)]
@@ -814,16 +818,32 @@ struct Listed {
 }
 
 impl Listed {
-    /// Lets go of the placed copies none of whose follows is listed any more, or whose file is
-    /// gone from where Octo placed it.
+    /// Lets go of the placed copies none of whose follows is listed any more, and of the links
+    /// kept of them.
     fn tidy_placed(&mut self) {
         let albums = &self.albums;
         self.placed.retain(|copy| {
-            copy.follows
+            let counts = copy
+                .follows
                 .iter()
-                .any(|follow| albums.contains_key(&key(follow)))
-                && std::path::Path::new(&copy.path).is_file()
+                .any(|follow| albums.contains_key(&key(follow)));
+            if !counts && let Some(backup) = &copy.backup {
+                let _ = std::fs::remove_file(backup);
+            }
+            counts
         });
+    }
+
+    /// The placed copy at `path` that still counts as Octo's own.
+    fn placed_at(&self, path: &str) -> Option<&PlacedCopy> {
+        let full = get_full_path(path);
+        self.placed.iter().find(|copy| {
+            get_full_path(&copy.path) == full
+                && copy
+                    .follows
+                    .iter()
+                    .any(|follow| self.albums.contains_key(&key(follow)))
+        })
     }
 }
 
@@ -1393,10 +1413,22 @@ impl LidarrPendingAlbums {
 
     // ---- Copies Octo placed ----------------------------------------------------------------------
 
-    /// A held file was placed at `path` while `follows` waited for it: when one of them is still
-    /// open, it is Octo's own copy there (never the user's music) for as long as one of the follows
-    /// it was placed during is listed and a file lies at that path.
-    pub fn placed_copy(&self, path: &str, follows: &[String]) {
+    /// Whether one of `follows` is open.
+    pub fn any_following(&self, follows: &[String]) -> bool {
+        let listed = self.listed.lock();
+        follows.iter().any(|follow| {
+            listed
+                .albums
+                .get(&key(follow))
+                .is_some_and(PendingAlbum::following)
+        })
+    }
+
+    /// A held file was placed at `path` while `follows` waited for it, with `backup` the link of
+    /// it kept in the hold path: when one of them is still open, it is Octo's own copy there
+    /// (never the user's music) for as long as one of the follows it was placed during is listed.
+    /// Otherwise it is a file of the library like any other, and the link goes.
+    pub fn placed_copy(&self, path: &str, follows: &[String], backup: Option<String>) {
         let mut listed = self.listed.lock();
         let open: Vec<String> = follows
             .iter()
@@ -1410,11 +1442,22 @@ impl LidarrPendingAlbums {
             .collect();
         listed.tidy_placed();
         let full = get_full_path(path);
-        listed.placed.retain(|known| get_full_path(&known.path) != full);
-        if !open.is_empty() {
+        listed.placed.retain(|known| {
+            let same = get_full_path(&known.path) == full;
+            if same && let Some(old) = &known.backup {
+                let _ = std::fs::remove_file(old);
+            }
+            !same
+        });
+        if open.is_empty() {
+            if let Some(backup) = &backup {
+                let _ = std::fs::remove_file(backup);
+            }
+        } else {
             listed.placed.push(PlacedCopy {
                 path: path.to_string(),
                 follows: open,
+                backup,
             });
         }
         self.save(&listed);
@@ -1424,15 +1467,35 @@ impl LidarrPendingAlbums {
     /// follow still listed: never the user's music, for a follow's step aside or for an artist
     /// that already has music.
     pub fn is_octos_copy(&self, path: &str) -> bool {
-        let full = get_full_path(path);
-        let listed = self.listed.lock();
-        listed.placed.iter().any(|copy| {
-            get_full_path(&copy.path) == full
-                && copy
-                    .follows
-                    .iter()
-                    .any(|follow| listed.albums.contains_key(&key(follow)))
-        })
+        self.listed.lock().placed_at(path).is_some()
+    }
+
+    /// The link Octo keeps of the copy it placed at `path`, while that copy counts as its own.
+    pub fn backup_of(&self, path: &str) -> Option<String> {
+        self.listed
+            .lock()
+            .placed_at(path)
+            .and_then(|copy| copy.backup.clone())
+    }
+
+    /// The copy Octo placed at `from` is at `to` now.
+    pub fn placed_copy_moved(&self, from: &str, to: &str) {
+        let mut listed = self.listed.lock();
+        let full = get_full_path(from);
+        let moved = match listed
+            .placed
+            .iter_mut()
+            .find(|copy| get_full_path(&copy.path) == full)
+        {
+            Some(copy) => {
+                copy.path = to.to_string();
+                true
+            }
+            None => false,
+        };
+        if moved {
+            self.save(&listed);
+        }
     }
 
     /// Whether any copy Octo placed still counts as its own.
@@ -2016,9 +2079,9 @@ mod tests {
     }
 
     /// A copy Octo placed while a follow on its artist was open is Octo's own while that follow is
-    /// listed and a file lies where it was placed, a restart included; a copy placed once its
-    /// follows were over, one whose file is gone, and one whose follow Octo forgot are files of the
-    /// library like any other.
+    /// listed, a restart included, with the link kept of it; a copy placed once its follows were
+    /// over, and one whose follow Octo forgot, are files of the library like any other, their
+    /// links gone and the files themselves left as they are.
     #[test]
     fn a_placed_copy_is_octos_while_the_follow_it_was_placed_during_is_listed() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -2029,29 +2092,48 @@ mod tests {
             std::fs::write(&file, b"kept").expect("written");
             file.to_string_lossy().into_owned()
         };
-        let (teardrop, angel, roads) = (file("03 - Teardrop.m4a"), file("01 - Angel.m4a"), file("Roads.m4a"));
+        let (teardrop, angel, roads) = (
+            file("03 - Teardrop.m4a"),
+            file("01 - Angel.m4a"),
+            file("Roads.m4a"),
+        );
         let pending = LidarrPendingAlbums::new(Some(path.clone()));
         pending.remember(PendingAlbum {
             search_command: 3,
             ..album("rg-1", Utc::now())
         });
+        let link = |name: &str| {
+            let link = dir.path().join(name);
+            std::fs::write(&link, b"kept").expect("written");
+            link.to_string_lossy().into_owned()
+        };
+        let (teardrop_link, roads_link) = (link("teardrop-link.m4a"), link("roads-link.m4a"));
         assert!(!pending.has_octos_copies());
-        pending.placed_copy(&teardrop, &["rg-1".into()]);
-        pending.placed_copy(&angel, &["rg-1".into()]);
-        pending.placed_copy(&roads, &[]);
+        pending.placed_copy(&teardrop, &["rg-1".into()], Some(teardrop_link.clone()));
+        pending.placed_copy(&angel, &["rg-1".into()], None);
+        pending.placed_copy(&roads, &[], Some(roads_link.clone()));
         assert!(pending.has_octos_copies());
         assert!(pending.is_octos_copy(&teardrop));
-        assert!(!pending.is_octos_copy(&roads), "placed once no follow waited for it");
+        assert_eq!(pending.backup_of(&teardrop), Some(teardrop_link.clone()));
+        assert!(
+            !pending.is_octos_copy(&roads),
+            "placed once no follow waited for it"
+        );
+        assert!(
+            !std::path::Path::new(&roads_link).exists(),
+            "so no link of it is kept"
+        );
         assert!(!pending.is_octos_copy(&dir.path().join("x.flac").to_string_lossy()));
 
-        std::fs::remove_file(&angel).expect("removed");
         let reloaded = LidarrPendingAlbums::new(Some(path));
-        assert!(reloaded.is_octos_copy(&teardrop));
-        assert!(!reloaded.is_octos_copy(&angel), "its file is gone");
+        assert!(reloaded.is_octos_copy(&teardrop), "a restart keeps it");
+        assert!(reloaded.is_octos_copy(&angel));
 
         reloaded.forget("rg-1");
         assert!(!reloaded.is_octos_copy(&teardrop), "its follow is over");
         assert!(!reloaded.has_octos_copies());
+        assert!(!std::path::Path::new(&teardrop_link).exists(), "its link goes");
+        assert!(std::path::Path::new(&teardrop).is_file(), "the copy itself stays");
     }
 
     /// A follow Octo cannot settle is listed until the admin puts Lidarr back: that counts its
