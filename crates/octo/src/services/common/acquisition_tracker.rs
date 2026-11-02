@@ -79,6 +79,8 @@ pub mod acquisition_kinds {
     pub const UPGRADE: &str = "upgrade";
     /// The one copy someone picked from Find songs.
     pub const PICK: &str = "pick";
+    /// A hearted album's own row, whatever its state: no one song, so nothing to find songs for.
+    pub const ALBUM: &str = "album";
 }
 
 pub use octo_core::models::download::acquisition_event::acquisition_event_kinds;
@@ -517,6 +519,38 @@ impl AcquisitionTracker {
         note: &str,
         keep_anyway: bool,
     ) {
+        self.hold_row_of(provider, external_id, owners, note, keep_anyway, None);
+    }
+
+    /// [`Self::hold_row`] for a hearted album's own row, which says it is an album's
+    /// ([`acquisition_kinds::ALBUM`]) from then on, in every state it reaches.
+    pub fn hold_album_row(
+        &self,
+        provider: &str,
+        album_id: &str,
+        owners: &[String],
+        note: &str,
+        keep_anyway: bool,
+    ) {
+        self.hold_row_of(
+            provider,
+            album_id,
+            owners,
+            note,
+            keep_anyway,
+            Some(acquisition_kinds::ALBUM),
+        );
+    }
+
+    fn hold_row_of(
+        &self,
+        provider: &str,
+        external_id: &str,
+        owners: &[String],
+        note: &str,
+        keep_anyway: bool,
+        kind: Option<&str>,
+    ) {
         if blank(provider) || blank(external_id) {
             return;
         }
@@ -527,6 +561,9 @@ impl AcquisitionTracker {
             .get(&key_of(provider, external_id))
             .is_none_or(Entry::finished);
         let entry = open(&mut state, provider, external_id, true, now);
+        if let Some(kind) = kind {
+            entry.kind = kind.to_string();
+        }
         union_owners(&mut entry.owners, owners);
         entry.state = AcquisitionState::Searching;
         entry.progress = None;

@@ -1466,7 +1466,7 @@ impl HeartAcquisitionCoordinator {
         });
         if let Some(tracker) = self.tracker() {
             let owners: Vec<String> = kept.holders.iter().map(|holder| holder.user.clone()).collect();
-            tracker.hold_row(provider, album_external_id, &owners, line, false);
+            tracker.hold_album_row(provider, album_external_id, &owners, line, false);
         }
         info!("Holding album {}: {line}", kept.key());
         if waiting_for == WaitingFor::MusicBrainz
@@ -1537,7 +1537,7 @@ impl HeartAcquisitionCoordinator {
             }
         }
         let keep_anyway = held.iter().any(HeldAcquisition::keeps_anyway);
-        tracker.hold_row(
+        tracker.hold_album_row(
             provider,
             album_external_id,
             &owners,
@@ -2463,7 +2463,7 @@ impl HeartAcquisitionCoordinator {
                 .line
                 .clone()
                 .unwrap_or_else(|| waiting_line(waiting).to_string());
-            tracker.hold_row(&record.provider, &record.external_id, &owners, &line, false);
+            tracker.hold_album_row(&record.provider, &record.external_id, &owners, &line, false);
             return;
         }
         let routing = self

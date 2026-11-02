@@ -1,8 +1,8 @@
 //! Keep anyway over the Subsonic API (octoAcquisitions 4): getAcquisitions and getAcquisition carry
 //! `keepAnyway` only for a caller waiting in a hold that offers it, and no more once they asked,
-//! and an album row its `heldTracks`; keepAcquisitionAnyway saves the keep before it answers a
-//! plain ok, refuses anyone not waiting in the row's holds with 50, asks the admin to name the
-//! person with 10, and answers 70 once nothing waits.
+//! and an album row its `heldTracks` and, in every state, `kind: "album"`; keepAcquisitionAnyway
+//! saves the keep before it answers a plain ok, refuses anyone not waiting in the row's holds with
+//! 50, asks the admin to name the person with 10, and answers 70 once nothing waits.
 
 use std::path::PathBuf;
 
@@ -238,6 +238,47 @@ async fn the_rows_carry_keep_anyway_only_for_a_holder_and_held_tracks_only_on_an
     let rows = t.rows("alice").await;
     assert!(rows["soulseek:help"].get("keepAnyway").is_none(), "asked already");
     assert_eq!(rows["soulseek:help-album"]["keepAnyway"], true);
+}
+
+/// A hearted album's row says it is an album's (`kind: "album"`) on getAcquisitions and
+/// getAcquisition while its tracks are held and still once they landed and the row is done; a
+/// song's row and a held track's own row never do.
+#[tokio::test]
+async fn an_album_row_says_it_is_an_albums_while_held_and_once_landed() {
+    let t = KeepApp::new().await;
+    t.hold_song();
+    let night = t.hold_track("night");
+
+    let rows = t.rows("alice").await;
+    assert_eq!(rows["soulseek:help-album"]["kind"], "album");
+    assert_eq!(rows["soulseek:help"]["kind"], "download", "a song row");
+    assert_eq!(
+        rows["soulseek:night"]["kind"], "download",
+        "a held track's own row"
+    );
+
+    // The held track landed: nothing of the album waits, and its row is done.
+    t.state.soulseek_holds.release(&night.key());
+    t.state
+        .heart_acquisition_coordinator
+        .album_row("soulseek", "help-album");
+    let rows = t.rows("alice").await;
+    assert_eq!(rows["soulseek:help-album"]["state"], "done");
+    assert_eq!(rows["soulseek:help-album"]["kind"], "album");
+    assert!(rows["soulseek:help-album"].get("heldTracks").is_none());
+    assert_ne!(rows["soulseek:help"]["kind"], "album");
+
+    let detail = get(
+        &t.app,
+        &format!(
+            "/rest/getAcquisition.view?{}&key=soulseek:help-album",
+            auth("alice", "good", "octo-android")
+        ),
+    )
+    .await
+    .envelope();
+    assert_eq!(detail["acquisition"]["state"], "done");
+    assert_eq!(detail["acquisition"]["kind"], "album");
 }
 
 /// keepAcquisitionAnyway: a missing key is error 10; someone waiting in none of the row's holds
