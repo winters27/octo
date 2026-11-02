@@ -3846,12 +3846,6 @@ async fn song_hold_joined_by_an_album_heart(
 async fn a_merged_hold_every_gate_refuses_ends_the_album_heart_and_runs_the_song_heart_again() {
     let gates = Arc::new(RouteGates::default());
     let (rig, _album_gates, _dir, key) = song_hold_joined_by_an_album_heart(gates.clone()).await;
-    let merged = rig.holds.get(&key).expect("one hold");
-    assert_eq!(
-        merged.origin,
-        Some(AcquisitionOrigin::AlbumHeart),
-        "the album's held track"
-    );
     let (landed, stop) = land_everything(&rig.queue);
 
     rig.coordinator.recheck_held(&key).await;
@@ -3906,23 +3900,46 @@ fn users_of(record: &HeldAcquisition) -> Vec<String> {
     users(record)
 }
 
-/// A held album track the album is un-hearted from goes on as the song's own hold of a heart, and
-/// its next run runs the song's person's chain as a heart's.
+/// A song's hold an album heart turns into the album's held track runs as an album heart's.
+#[tokio::test]
+async fn a_song_hold_an_album_heart_joins_runs_as_an_album_hearts() {
+    let gates = Arc::new(RouteGates::default());
+    let (rig, _album_gates, _dir, key) = song_hold_joined_by_an_album_heart(gates).await;
+    let merged = rig.holds.get(&key).expect("one hold");
+    assert!(merged.album_track.is_some());
+    assert_eq!(merged.origin, Some(AcquisitionOrigin::AlbumHeart));
+}
+
+/// A hearted album's held track that a song heart joined, and that the album is then un-hearted
+/// from, goes on as the song's own hold of a heart, and its next run runs the song's person's
+/// chain as a heart's.
 #[tokio::test]
 async fn an_album_track_left_to_its_song_heart_runs_as_a_hearts_hold() {
-    let gates = Arc::new(RouteGates::default());
-    let (rig, _album_gates, _dir, key) = song_hold_joined_by_an_album_heart(gates.clone()).await;
+    use crate::services::common::soulseek_hold_store::HoldRoute;
+
+    let holds = memory_holds();
+    let mut record = held(
+        "help",
+        AcquisitionOrigin::AlbumHeart,
+        WaitingFor::NotYetProven,
+        &["brandon", "anna"],
+    );
+    record.album_track = Some(crate::services::common::soulseek_hold_store::HeldAlbumTrack {
+        album_key: "soulseek:album-1".into(),
+        song_ids: vec!["help".into()],
+        ..Default::default()
+    });
+    record.holders[0].routes = vec![HoldRoute::Song];
+    let key = holds.hold(record).key();
+    let (rig, _album_gates) = album_rig(Arc::new(RouteGates::default()), holds);
     assert_eq!(
-        rig.coordinator.leave_album_holds("soulseek", "album-1", "anna"),
+        rig.coordinator
+            .leave_album_holds("soulseek", "album-1", "anna"),
         1
     );
     let song = rig.holds.get(&key).expect("brandon's song heart keeps it");
     assert!(song.album_track.is_none());
     assert_eq!(song.origin, Some(AcquisitionOrigin::Heart));
-    // Its file is gone by the next run: brandon's chain fetches anew.
-    for file in &song.held_files {
-        let _ = std::fs::remove_file(file);
-    }
     let (landed, stop) = land_everything(&rig.queue);
     rig.coordinator.recheck_held(&key).await;
     until(|| !landed.lock().is_empty()).await;
