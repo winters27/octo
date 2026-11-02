@@ -234,17 +234,13 @@ impl Drop for EndsTheRun {
             );
             return;
         };
-        // Holds no job of its own, so dropping it ends the run. A job whose cancel goes unanswered,
-        // or never goes, stays kept for the next look at Mornye to cancel.
+        // Holds no job of its own, so dropping it ends the run. A job that is not over yet, or
+        // whose end never gets asked, stays kept for the cleanup worker.
         let ends = EndsTheRun::new(&self.run, &self.client);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let bound = ends.client.check.times.call_bound;
-                    let over = tokio::time::timeout(bound, ends.client.cancel(&ends.run.connection, &job.id))
-                        .await
-                        .unwrap_or(false);
-                    if over {
+                    if ends.client.end_job(&ends.run.connection, &job.id).await {
                         ends.client.check.store.forget_pass_job(&job);
                     }
                     drop(ends);
@@ -256,12 +252,54 @@ impl Drop for EndsTheRun {
 }
 
 impl SpotiflacClient {
-    /// Cancels the song jobs Pass runs left at Mornye when Octo stopped following them (a
-    /// restart, or a cancel Mornye did not take), and removes their folders; the live run's own
-    /// job is left to it. Each cancel takes no longer than one read of Mornye's check may. A job
-    /// whose cancel does not reach Mornye stays kept for a later read; one kept for a Mornye now
-    /// at another address cannot be asked, so it is let go.
-    pub(super) async fn cancel_left_pass_jobs(&self) {
+    /// Ends job `id` at Mornye if it still runs, in no longer than one read of Mornye's check
+    /// may take. Answers whether it is over: Mornye took the cancel, or reports the job done,
+    /// failed, cancelled or unknown. A job still working, or a Mornye that did not answer, is not
+    /// over.
+    pub(super) async fn end_job(&self, connection: &Connection, id: &str) -> bool {
+        let ask = async {
+            if self.cancel(connection, id).await {
+                return true;
+            }
+            match self.job(connection, id).await {
+                Ok(None) => true,
+                Ok(Some(job)) => job.state() != JobState::Working,
+                Err(_) => false,
+            }
+        };
+        tokio::time::timeout(self.check.times.call_bound, ask)
+            .await
+            .unwrap_or(false)
+    }
+
+    /// The cleanup worker: each time a read of Mornye's check reaches Mornye while song jobs are
+    /// kept, it ends the ones stopped Pass runs left there. Off every reader's way, one sweep at
+    /// a time. Ends when Octo stops.
+    pub async fn clean_left_pass_jobs(
+        self: Arc<Self>,
+        stopping: tokio_util::sync::CancellationToken,
+    ) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                _ = stopping.cancelled() => return Ok(()),
+                _ = self.assist.left_jobs.notified() => {}
+            }
+            self.end_left_pass_jobs().await;
+        }
+    }
+
+    /// Wakes the cleanup worker when song jobs are kept; called after a read that reached Mornye.
+    pub(super) fn left_pass_jobs_may_end(&self) {
+        if self.check.store.keeps_pass_jobs() {
+            self.assist.left_jobs.notify_one();
+        }
+    }
+
+    /// Ends the song jobs Pass runs left at Mornye when Octo stopped following them (a restart,
+    /// or an end Mornye did not confirm), and removes their folders; the live run's own job is
+    /// left to it. A job not over yet stays kept for a later sweep; one kept for a Mornye now at
+    /// another address cannot be asked, so it is let go.
+    pub(super) async fn end_left_pass_jobs(&self) {
         let kept = self.check.store.pass_jobs();
         if kept.is_empty() {
             return;
@@ -278,18 +316,12 @@ impl SpotiflacClient {
             if live.as_ref().is_some_and(|job| job.as_ref() == Some(&left)) {
                 continue;
             }
-            if connection.url == left.url {
-                let bound = self.check.times.call_bound;
-                let over = tokio::time::timeout(bound, self.cancel(&connection, &left.id))
-                    .await
-                    .unwrap_or(false);
-                if !over {
-                    continue;
-                }
+            if connection.url == left.url && !self.end_job(&connection, &left.id).await {
+                continue;
             }
             remove_check_folder(&left.dir);
             self.check.store.forget_pass_job(&left);
-            info!("Pass Mornye's check: cancelled a song job a stopped run left at Mornye");
+            info!("Pass Mornye's check: ended a song job a stopped run left at Mornye");
         }
     }
 }
@@ -318,6 +350,8 @@ pub struct Assist {
     tried: Mutex<BTreeSet<String>>,
     /// One start at a time: a second start waits, then answers the run the first one made.
     starting: tokio::sync::Mutex<()>,
+    /// Wakes the worker that ends song jobs stopped runs left at Mornye.
+    left_jobs: tokio::sync::Notify,
     /// Tests stop the follower partway, right after Mornye took the song.
     #[cfg(test)]
     stop_after_queue: AtomicBool,
@@ -608,7 +642,7 @@ impl SpotiflacClient {
         }
         let outcome = self.watch_pass(&run, &job).await;
         if let Some(kept) = &ends.job
-            && self.cancel(&run.connection, &job.id).await
+            && self.end_job(&run.connection, &job.id).await
         {
             self.check.store.forget_pass_job(kept);
         }

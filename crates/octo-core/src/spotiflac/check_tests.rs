@@ -324,6 +324,20 @@ fn the_gate_says_who_and_when() {
     );
 }
 
+#[test]
+fn the_gate_names_the_checks_a_wait_shares_when_it_watches_none() {
+    let pause = CheckPause {
+        until_utc: at(14, 4, 30),
+        labels: Vec::new(),
+        holding: vec!["gateway-v2-abc".into()],
+    };
+    let (shown, _) = gate_words(&pause, at(12, 0, 0));
+    assert_eq!(
+        shown,
+        "Mornye could not pass its check for gateway-v2-abc, so Octo did not ask it for this song."
+    );
+}
+
 fn paused_row(
     key: &str,
     label: &str,

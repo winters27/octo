@@ -174,9 +174,9 @@ pub struct CheckFile {
     #[serde(flatten)]
     pub episodes: Episodes,
     pub check_songs: Vec<CheckSong>,
-    /// The song jobs Pass runs asked Mornye for, until a cancel of each has reached Mornye. A run
-    /// Octo stopped following (a restart) leaves its job here, and a later read that reaches
-    /// Mornye cancels it.
+    /// The song jobs Pass runs asked Mornye for, until each is known to be over. A run Octo
+    /// stopped following (a restart) leaves its job here, and the cleanup worker ends it once a
+    /// read reaches Mornye.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pass_jobs: Vec<PassJob>,
 }
@@ -306,12 +306,17 @@ impl MornyeCheckStore {
         self.state.lock().episodes.since(labels)
     }
 
-    /// The song jobs Pass runs asked Mornye for that no cancel has reached yet.
+    /// The song jobs Pass runs asked Mornye for that are not known to be over yet.
     pub fn pass_jobs(&self) -> Vec<PassJob> {
         self.state.lock().pass_jobs.clone()
     }
 
-    /// Keeps the song job a Pass run just asked Mornye for, beside any still waiting for a cancel.
+    /// Whether any song job a Pass run asked Mornye for is kept.
+    pub fn keeps_pass_jobs(&self) -> bool {
+        !self.state.lock().pass_jobs.is_empty()
+    }
+
+    /// Keeps the song job a Pass run just asked Mornye for, beside any not known to be over yet.
     pub fn keep_pass_job(&self, job: PassJob) {
         self.update(|state| {
             if state.pass_jobs.contains(&job) {
@@ -322,7 +327,7 @@ impl MornyeCheckStore {
         })
     }
 
-    /// Forgets `job` once a cancel of it has reached Mornye.
+    /// Forgets `job` once it is known to be over.
     pub fn forget_pass_job(&self, job: &PassJob) {
         self.update(|state| {
             let before = state.pass_jobs.len();

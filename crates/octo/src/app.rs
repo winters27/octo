@@ -1398,6 +1398,10 @@ impl Acquisition {
         workers.register("CacheCleanupService", move |stopping| {
             cleanup.clone().run(stopping)
         });
+        let spotiflac = self.spotiflac.clone();
+        workers.register("MornyeLeftPassJobs", move |stopping| {
+            spotiflac.clone().clean_left_pass_jobs(stopping)
+        });
     }
 }
 

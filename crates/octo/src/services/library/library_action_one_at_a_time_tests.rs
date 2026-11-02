@@ -611,11 +611,13 @@ async fn better_quality_asks_lidarr_when_soulseek_finds_nothing() {
     assert!(!Path::new(&f.original).exists());
 }
 
+/// A wait read from Mornye's words beside a working read: it watches no check, and shares
+/// Example's.
 fn kept_by_mornye() -> anyhow::Error {
     let pause = octo_core::spotiflac::check::CheckPause {
         until_utc: chrono::Utc::now() + chrono::Duration::minutes(15),
-        labels: vec!["Example".into()],
-        holding: Vec::new(),
+        labels: Vec::new(),
+        holding: vec!["Example".into()],
     };
     crate::services::spotiflac::MornyeWaiting::new(pause, false, chrono::Utc::now()).into_error()
 }

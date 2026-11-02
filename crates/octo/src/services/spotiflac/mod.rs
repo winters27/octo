@@ -224,11 +224,10 @@ impl SpotiflacClient {
                 push_words(labels, until, meanwhile, &public_url, now)
             });
         }
-        // A read that reached Mornye then cancels the song jobs stopped Pass runs left there,
-        // after the read's turn is over so other readers do not wait on it.
-        drop(_turn);
+        // A read that reached Mornye wakes the worker that ends song jobs stopped Pass runs left
+        // there; no reader waits on it.
         if view.reached {
-            self.cancel_left_pass_jobs().await;
+            self.left_pass_jobs_may_end();
         }
         Some(view)
     }
@@ -474,11 +473,9 @@ impl SpotiflacClient {
         .await
     }
 
-    /// `POST /api/v1/downloads/{id}/cancel`. A failure is only logged: the job folder is
-    /// removed either way.
-    /// Asks Mornye to cancel job `id`. Answers whether the job is over at Mornye: cancelled, or
-    /// one Mornye does not know (404, 410). A refusal (401, 403), a busy or failing Mornye (5xx)
-    /// or no answer leaves it running, to be asked again.
+    /// `POST /api/v1/downloads/{id}/cancel`. Answers whether Mornye took the cancel; any other
+    /// answer (a job it no longer runs, a refusal, a Mornye without the call, or none) is for the
+    /// caller to look into.
     pub async fn cancel(&self, connection: &Connection, id: &str) -> bool {
         let request = self.request(
             connection,
@@ -488,13 +485,10 @@ impl SpotiflacClient {
         match reach(connection, request).await {
             Ok(response) => {
                 let status = response.status();
-                let over = status.is_success()
-                    || status == reqwest::StatusCode::NOT_FOUND
-                    || status == reqwest::StatusCode::GONE;
-                if !over {
+                if !status.is_success() {
                     tracing::debug!("Mornye did not cancel job {id}: it answered {status}");
                 }
-                over
+                status.is_success()
             }
             Err(e) => {
                 tracing::debug!("Mornye did not cancel job {id}: {e}");

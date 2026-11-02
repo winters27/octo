@@ -1253,6 +1253,36 @@ async fn the_mp3_fallback_says_soulseek_brought_none_and_mornyes_check_kept_it()
 }
 
 #[tokio::test]
+async fn the_mp3_fallback_names_the_check_of_a_wait_read_from_mornyes_words() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.soulseek_on = true;
+    // The read shows the gateway working; only Mornye's words say its check is paused.
+    setup.fake.sessions = vec![gateway("active")];
+    setup.fake.services = Some(example_service());
+    setup.fake.file = None;
+    setup.fake.status = "failed";
+    setup.fake.error =
+        Some("RuntimeError: verification paused after a failed attempt \u{2014} next try in 4 min");
+    setup.fake.provider = Some("ext:example-ext");
+    let fetch = setup.build(events).await;
+
+    let _ = fetch.acquire_from(DownloadSource::SoulseekThenYouTube).await;
+
+    let bodies = {
+        let _ = fetch.sent().await;
+        fetch.sent.1.lock().clone()
+    };
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body
+                .contains("Soulseek brought no FLAC and Mornye could not pass its check for Example")),
+        "{bodies:?}"
+    );
+}
+
+#[tokio::test]
 async fn mornye_1_1_without_its_utilities_says_so_when_its_search_fails() {
     let events: Events = Arc::default();
     let mut setup = Setup::new(&events);
