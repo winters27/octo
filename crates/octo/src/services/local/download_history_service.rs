@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use chrono::{DateTime, TimeDelta, Utc};
+use octo_core::common::SongIdentity;
 use octo_core::models::download::acquisition_event::acquisition_event_kinds;
 use octo_core::models::download::{AcquisitionEvent, DownloadHistoryEntry};
 use parking_lot::Mutex;
@@ -217,10 +218,12 @@ impl DownloadHistoryService {
     }
 
     /// The entries whose artist, title, album or file path hold every word of `text`, ignoring
-    /// case, newest first, at most `limit`. Searches every kept entry, not only the newest
-    /// that the Fetched songs list shows. Blank text finds nothing.
+    /// case, accents and full-width forms ([`SongIdentity::plain`]), newest first, at most
+    /// `limit`. Searches every kept entry, not only the newest that the Fetched songs list
+    /// shows. Blank text finds nothing.
     pub fn search(&self, text: &str, limit: usize) -> Vec<DownloadHistoryEntry> {
-        let words: Vec<String> = text.split_whitespace().map(str::to_lowercase).collect();
+        let plain = SongIdentity::plain(text);
+        let words: Vec<&str> = plain.split_whitespace().collect();
         if words.is_empty() {
             return Vec::new();
         }
@@ -229,10 +232,10 @@ impl DownloadHistoryService {
         list.iter()
             .filter(|entry| {
                 let album = entry.album.as_deref().unwrap_or_default();
-                let said = [entry.artist.as_str(), &entry.title, album, &entry.path]
-                    .join("\n")
-                    .to_lowercase();
-                words.iter().all(|word| said.contains(word.as_str()))
+                let said = SongIdentity::plain(
+                    &[entry.artist.as_str(), &entry.title, album, &entry.path].join("\n"),
+                );
+                words.iter().all(|word| said.contains(word))
             })
             .take(limit)
             .cloned()
@@ -375,6 +378,27 @@ mod tests {
         );
         assert!(service.search("   ", 50).is_empty());
         assert_eq!(service.search("later", 7).len(), 7, "the limit holds");
+    }
+
+    #[test]
+    fn a_search_ignores_accents_and_full_width_forms_and_reads_any_script() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let service = DownloadHistoryService::new(dir.path().join("downloads-history.json"));
+        service.record(DownloadHistoryEntry {
+            artist: "Beyoncé".into(),
+            ..entry("Halo")
+        });
+        service.record(DownloadHistoryEntry {
+            artist: "周杰倫".into(),
+            ..entry("晴天")
+        });
+
+        assert_eq!(service.search("beyonce", 50).len(), 1, "the accent is not needed");
+        assert_eq!(service.search("BEYONCÉ halo", 50).len(), 1);
+        assert_eq!(service.search("ＨＡＬＯ", 50).len(), 1, "full-width letters");
+        let found = service.search("晴天 周杰倫", 50);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "晴天");
     }
 
     // ---- The saved log --------------------------------------------------------------------
