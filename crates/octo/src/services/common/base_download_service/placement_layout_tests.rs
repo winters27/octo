@@ -2428,7 +2428,7 @@ struct FolderMaker {
 }
 
 impl FolderMaker {
-    fn new(folder: &Path, files: &[(&'static str, u32)]) -> Arc<dyn ILoudnessMeter> {
+    fn shared(folder: &Path, files: &[(&'static str, u32)]) -> Arc<dyn ILoudnessMeter> {
         Arc::new(FolderMaker {
             folder: folder.to_path_buf(),
             files: files.to_vec(),
@@ -2484,7 +2484,7 @@ async fn dreams_beside(
         None,
         Some(catalog(vec![("1", dreams)])),
         DownloadServices {
-            loudness_meter: Some(FolderMaker::new(&dir.path().join(folder), files)),
+            loudness_meter: Some(FolderMaker::shared(&dir.path().join(folder), files)),
             ..Default::default()
         },
     );
@@ -2647,7 +2647,10 @@ async fn album_facts_are_pinned_from_the_folder_settle_chose() {
         None,
         Some(catalog(vec![("1", dreams)])),
         DownloadServices {
-            loudness_meter: Some(FolderMaker::new(&folder, &[("01 - Second Hand News.mp3", 1977)])),
+            loudness_meter: Some(FolderMaker::shared(
+                &folder,
+                &[("01 - Second Hand News.mp3", 1977)],
+            )),
             ..Default::default()
         },
     );

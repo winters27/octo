@@ -1474,7 +1474,7 @@ async fn a_pool_move_whose_source_cannot_go_fails_and_leaves_one_copy() {
     assert!(moved.is_err(), "the move fails");
     assert_eq!(
         files_named_like(dir.path(), "01 Song.mp3"),
-        [from.clone()],
+        std::slice::from_ref(&from),
         "exactly one copy, where the song was"
     );
     assert_eq!(std::fs::read(&from).ok().map(|bytes| bytes.len()), Some(10));
@@ -1515,7 +1515,10 @@ async fn a_pool_move_it_cannot_take_back_is_finished_by_recovery() {
         ],
         "the copy's folder is flushed before its source goes"
     );
-    assert_eq!(files_named_like(dir.path(), "01 Song.mp3"), [to.clone()]);
+    assert_eq!(
+        files_named_like(dir.path(), "01 Song.mp3"),
+        std::slice::from_ref(&to)
+    );
     assert_eq!(std::fs::read(&to).ok().map(|bytes| bytes.len()), Some(10));
     assert!(holds_no_record(&records));
 }
@@ -1582,7 +1585,7 @@ async fn a_take_back_whose_folder_cannot_be_flushed_keeps_its_record() {
     assert!(kept, "its record stays while the take-back may not last");
     assert_eq!(
         files_named_like(dir.path(), "01 Song.mp3"),
-        [from.clone()],
+        std::slice::from_ref(&from),
         "exactly the source"
     );
     assert!(holds_no_record(&records));
@@ -1609,7 +1612,10 @@ async fn a_members_copy_move_whose_source_cannot_go_is_done() {
 
     assert!(moved.is_ok(), "{moved:?}");
     assert!(waits, "its source waits for the next recovery");
-    assert_eq!(files_named_like(dir.path(), "01 Song.mp3"), [to.clone()]);
+    assert_eq!(
+        files_named_like(dir.path(), "01 Song.mp3"),
+        std::slice::from_ref(&to)
+    );
     assert!(holds_no_record(&staging.join("replacing")));
 }
 
@@ -1634,7 +1640,7 @@ async fn a_members_copy_move_stopped_after_its_rename_keeps_its_new_place() {
 
     assert_eq!(
         files_named_like(dir.path(), "01 Song.mp3"),
-        [to.clone()],
+        std::slice::from_ref(&to),
         "the copy keeps its new place"
     );
     assert!(holds_no_record(&staging.join("replacing")));
@@ -1662,7 +1668,7 @@ async fn a_pool_move_whose_record_cannot_say_moved_fails_and_is_taken_back() {
     assert!(moved.is_err(), "the move fails");
     assert_eq!(
         files_named_like(dir.path(), "01 Song.mp3"),
-        [from.clone()],
+        std::slice::from_ref(&from),
         "exactly the source"
     );
     assert!(holds_no_record(&staging.join("replacing")));
