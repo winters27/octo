@@ -154,6 +154,14 @@ pub struct PendingAlbum {
     /// A song of Octo's import landed: the follow's end gives back only the release choice and
     /// what Octo's add created, tried again until it is done.
     pub landed: bool,
+    /// Octo's downloads that Lidarr's queue, read after a refresh, no longer lists while their
+    /// client lists nothing else: Lidarr gives no proof they are gone, so the follow cannot settle
+    /// them and keeps reading. Read again at every read of the follow.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unseen: Vec<String>,
+    /// The admin put Lidarr back for those downloads: their absence counts as settled.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unseen_let_go: bool,
 }
 
 /// Lidarr's record of a file Octo moved out, kept for later when Lidarr would not delete it yet.
@@ -241,6 +249,8 @@ impl Default for PendingAlbum {
             lidarr_url: None,
             imported_releases: Vec::new(),
             landed: false,
+            unseen: Vec::new(),
+            unseen_let_go: false,
         }
     }
 }
@@ -492,6 +502,8 @@ impl PendingAlbum {
         union(&mut self.album_hearts, other.album_hearts);
         union(&mut self.filed, other.filed);
         self.replacement |= other.replacement;
+        union(&mut self.unseen, other.unseen);
+        self.unseen_let_go |= other.unseen_let_go;
     }
 }
 
@@ -684,6 +696,21 @@ pub enum FollowEnd {
     Stopped,
     /// Everyone who asked took their heart back.
     Unhearted,
+    /// The admin put Lidarr back for a download of Octo's that Lidarr no longer lists and Octo
+    /// cannot prove gone.
+    PutBack,
+}
+
+/// The Lidarr card's line for a follow Octo cannot settle, beside the admin's "Put Lidarr back".
+pub const CANNOT_SEE: &str = "Octo is still following a Lidarr download it cannot see";
+
+/// A follow Octo cannot settle, as the Lidarr card lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsettledFollow {
+    /// The album's foreign id, which "Put Lidarr back" names.
+    pub follow: String,
+    pub artist: String,
+    pub album: String,
 }
 
 /// A file Octo would have placed under one of Lidarr's root folders for a followed artist,
@@ -760,6 +787,20 @@ struct PendingFile {
     held: Vec<HeldPlacement>,
     #[serde(deserialize_with = "finished_from_file")]
     finished_grabs: Vec<FinishedGrab>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    placed: Vec<PlacedCopy>,
+}
+
+/// A copy Octo placed while follows on its artist were still open (a kept copy whose person
+/// stopped waiting): Octo's own, never the user's music, while one of those follows is listed.
+/// Once they are all over it is a file of the library like any other.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct PlacedCopy {
+    /// Where it was placed, on Octo's side.
+    path: String,
+    /// The follows, by foreign album id, it was placed during.
+    follows: Vec<String>,
 }
 
 #[derive(Default)]
@@ -768,6 +809,22 @@ struct Listed {
     held: Vec<HeldPlacement>,
     /// The downloads of entries Octo forgot, newest last.
     finished_grabs: Vec<FinishedGrab>,
+    /// The copies Octo placed while follows on their artist were open, while one is listed.
+    placed: Vec<PlacedCopy>,
+}
+
+impl Listed {
+    /// Lets go of the placed copies none of whose follows is listed any more, or whose file is
+    /// gone from where Octo placed it.
+    fn tidy_placed(&mut self) {
+        let albums = &self.albums;
+        self.placed.retain(|copy| {
+            copy.follows
+                .iter()
+                .any(|follow| albums.contains_key(&key(follow)))
+                && std::path::Path::new(&copy.path).is_file()
+        });
+    }
 }
 
 /// The newest saved text of the list and the number of the last one written, so saves written off
@@ -812,6 +869,8 @@ impl LidarrPendingAlbums {
                         }
                         listed.held = file.held;
                         listed.finished_grabs = file.finished_grabs;
+                        listed.placed = file.placed;
+                        listed.tidy_placed();
                     }
                     Err(e) => warn!(
                         "Could not read {}: {e}; starting with no pending Lidarr albums",
@@ -939,6 +998,8 @@ impl LidarrPendingAlbums {
             }
             let over = listed.finished_grabs.len().saturating_sub(FINISHED_KEPT);
             listed.finished_grabs.drain(..over);
+            // A copy placed during this follow alone is now a file of the library like any other.
+            listed.tidy_placed();
             self.save(&listed);
         }
     }
@@ -1129,6 +1190,44 @@ impl LidarrPendingAlbums {
             .collect()
     }
 
+    /// The follows Octo cannot settle (see [`PendingAlbum::unseen`]) that the admin has not put
+    /// back yet.
+    pub fn unsettled(&self) -> Vec<UnsettledFollow> {
+        self.listed
+            .lock()
+            .albums
+            .values()
+            .filter(|album| !album.unseen.is_empty() && !album.unseen_let_go)
+            .map(|album| UnsettledFollow {
+                follow: album.foreign_album_id.clone(),
+                artist: album.artist.clone(),
+                album: album.title.clone(),
+            })
+            .collect()
+    }
+
+    /// The admin's "Put Lidarr back" on a follow Octo cannot settle: the downloads it cannot see
+    /// count as gone from now on, and a follow still open ends ([`FollowEnd::PutBack`]), so its
+    /// running follow puts the pick back. False when the follow is not one Octo cannot settle.
+    pub fn let_go_unseen(&self, foreign_album_id: &str) -> bool {
+        {
+            let mut listed = self.listed.lock();
+            let Some(album) = listed.albums.get_mut(&key(foreign_album_id)) else {
+                return false;
+            };
+            if album.unseen.is_empty() || album.unseen_let_go {
+                return false;
+            }
+            album.unseen_let_go = true;
+            if album.following() {
+                album.ended = Some(FollowEnd::PutBack);
+            }
+            self.save(&listed);
+        }
+        self.wake(foreign_album_id);
+        true
+    }
+
     // ---- Files held while a follow is open -----------------------------------------------------
 
     /// The open follows a file Octo would place at `target` waits for: those on an artist named in
@@ -1292,6 +1391,60 @@ impl LidarrPendingAlbums {
         self.save(&listed);
     }
 
+    // ---- Copies Octo placed ----------------------------------------------------------------------
+
+    /// A held file was placed at `path` while `follows` waited for it: when one of them is still
+    /// open, it is Octo's own copy there (never the user's music) for as long as one of the follows
+    /// it was placed during is listed and a file lies at that path.
+    pub fn placed_copy(&self, path: &str, follows: &[String]) {
+        let mut listed = self.listed.lock();
+        let open: Vec<String> = follows
+            .iter()
+            .filter(|follow| {
+                listed
+                    .albums
+                    .get(&key(follow))
+                    .is_some_and(PendingAlbum::following)
+            })
+            .cloned()
+            .collect();
+        listed.tidy_placed();
+        let full = get_full_path(path);
+        listed.placed.retain(|known| get_full_path(&known.path) != full);
+        if !open.is_empty() {
+            listed.placed.push(PlacedCopy {
+                path: path.to_string(),
+                follows: open,
+            });
+        }
+        self.save(&listed);
+    }
+
+    /// Whether the file at `path` (a full path on Octo's side) is a copy Octo placed during a
+    /// follow still listed: never the user's music, for a follow's step aside or for an artist
+    /// that already has music.
+    pub fn is_octos_copy(&self, path: &str) -> bool {
+        let full = get_full_path(path);
+        let listed = self.listed.lock();
+        listed.placed.iter().any(|copy| {
+            get_full_path(&copy.path) == full
+                && copy
+                    .follows
+                    .iter()
+                    .any(|follow| listed.albums.contains_key(&key(follow)))
+        })
+    }
+
+    /// Whether any copy Octo placed still counts as its own.
+    pub fn has_octos_copies(&self) -> bool {
+        let listed = self.listed.lock();
+        listed.placed.iter().any(|copy| {
+            copy.follows
+                .iter()
+                .any(|follow| listed.albums.contains_key(&key(follow)))
+        })
+    }
+
     /// Saves the list as it stands. Inside a runtime the file is written on a blocking thread,
     /// never on the async thread that changed the list; saves land in the order they were made,
     /// and only the newest of several waiting is written.
@@ -1303,6 +1456,7 @@ impl LidarrPendingAlbums {
             albums: listed.albums.values().cloned().collect(),
             held: listed.held.clone(),
             finished_grabs: listed.finished_grabs.clone(),
+            placed: listed.placed.clone(),
         };
         let text = match serde_json::to_string_pretty(&file) {
             Ok(text) => text,
@@ -1859,5 +2013,74 @@ mod tests {
         std::fs::write(&path, "{ not json").expect("written");
 
         assert!(LidarrPendingAlbums::new(Some(path)).get("anything").is_none());
+    }
+
+    /// A copy Octo placed while a follow on its artist was open is Octo's own while that follow is
+    /// listed and a file lies where it was placed, a restart included; a copy placed once its
+    /// follows were over, one whose file is gone, and one whose follow Octo forgot are files of the
+    /// library like any other.
+    #[test]
+    fn a_placed_copy_is_octos_while_the_follow_it_was_placed_during_is_listed() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("lidarr-pending.json");
+        let file = |name: &str| {
+            let file = dir.path().join("Massive Attack/Mezzanine").join(name);
+            std::fs::create_dir_all(file.parent().expect("a folder")).expect("made");
+            std::fs::write(&file, b"kept").expect("written");
+            file.to_string_lossy().into_owned()
+        };
+        let (teardrop, angel, roads) = (file("03 - Teardrop.m4a"), file("01 - Angel.m4a"), file("Roads.m4a"));
+        let pending = LidarrPendingAlbums::new(Some(path.clone()));
+        pending.remember(PendingAlbum {
+            search_command: 3,
+            ..album("rg-1", Utc::now())
+        });
+        assert!(!pending.has_octos_copies());
+        pending.placed_copy(&teardrop, &["rg-1".into()]);
+        pending.placed_copy(&angel, &["rg-1".into()]);
+        pending.placed_copy(&roads, &[]);
+        assert!(pending.has_octos_copies());
+        assert!(pending.is_octos_copy(&teardrop));
+        assert!(!pending.is_octos_copy(&roads), "placed once no follow waited for it");
+        assert!(!pending.is_octos_copy(&dir.path().join("x.flac").to_string_lossy()));
+
+        std::fs::remove_file(&angel).expect("removed");
+        let reloaded = LidarrPendingAlbums::new(Some(path));
+        assert!(reloaded.is_octos_copy(&teardrop));
+        assert!(!reloaded.is_octos_copy(&angel), "its file is gone");
+
+        reloaded.forget("rg-1");
+        assert!(!reloaded.is_octos_copy(&teardrop), "its follow is over");
+        assert!(!reloaded.has_octos_copies());
+    }
+
+    /// A follow Octo cannot settle is listed until the admin puts Lidarr back: that counts its
+    /// unseen downloads gone and ends a follow still open; a follow with nothing unseen is not
+    /// put back.
+    #[test]
+    fn put_back_lets_go_of_a_follows_unseen_downloads_once() {
+        let pending = LidarrPendingAlbums::new(None);
+        pending.remember(PendingAlbum {
+            search_command: 3,
+            ..album("rg-1", Utc::now())
+        });
+        assert!(pending.unsettled().is_empty());
+        assert!(!pending.let_go_unseen("rg-1"), "nothing unseen");
+
+        pending.update("rg-1", |entry| entry.unseen = vec!["dl-1".into()]);
+        assert_eq!(
+            pending
+                .unsettled()
+                .iter()
+                .map(|follow| follow.follow.as_str())
+                .collect::<Vec<_>>(),
+            ["rg-1"]
+        );
+        assert!(pending.let_go_unseen("RG-1"));
+        let entry = pending.get("rg-1").expect("listed");
+        assert!(entry.unseen_let_go);
+        assert_eq!(entry.ended, Some(FollowEnd::PutBack));
+        assert!(pending.unsettled().is_empty());
+        assert!(!pending.let_go_unseen("rg-1"), "once");
     }
 }

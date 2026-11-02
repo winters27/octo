@@ -23,9 +23,9 @@ pub use lidarr_heart_acquisition_service::{
 };
 pub use lidarr_import_handoff::{LidarrImport, LidarrImportHandoff};
 pub use lidarr_pending_albums::{
-    FinishedGrab, FollowEnd, FollowedGrab, FollowedItem, HELD_FOR_LIDARR, HeldPlacement, HeldTrack,
-    LidarrPendingAlbums, MovedRecord, PROVEN_ELSEWHERE, PendingAdd, PendingAlbum, REPLACED_YOURS,
-    STOP_WAITING, SongGate, StopWaiting,
+    CANNOT_SEE, FinishedGrab, FollowEnd, FollowedGrab, FollowedItem, HELD_FOR_LIDARR, HeldPlacement,
+    HeldTrack, LidarrPendingAlbums, MovedRecord, PROVEN_ELSEWHERE, PendingAdd, PendingAlbum, REPLACED_YOURS,
+    STOP_WAITING, SongGate, StopWaiting, UnsettledFollow,
 };
 pub use lidarr_pick::{ALREADY_LOOKING, ArtistMusic, LidarrArtistMusic};
 pub use lidarr_track_fetcher::{

@@ -505,6 +505,7 @@ async function refreshStatus() {
 
     setStatusCard('octo', data.octo);
     Object.entries(data.services || {}).forEach(([k, v]) => setStatusCard(k, v));
+    renderLidarrFollows(data.services?.lidarr?.follows);
     renderDownloadChecks(data.downloads);
     renderAcoustIdKeyHelp(data.acoustIdBuiltInKey);
 
@@ -625,6 +626,55 @@ ready.then(refreshStatus);
 // No point probing every service while nobody is looking; catch up when the tab returns.
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 30_000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshStatus(); });
+
+// Lidarr's card: each follow Octo cannot settle (a download of Octo's left Lidarr's queue while its
+// client lists nothing else, so nothing proves it gone) has its line and the admin's Put Lidarr
+// back, which counts that download gone, ends the follow and puts back what Octo changed in
+// Lidarr. Drawn again only when the list changed, so words shown under a button stay.
+function renderLidarrFollows(follows) {
+  const holder = document.getElementById('lidarr-follows');
+  if (!holder) return;
+  const shown = Array.isArray(follows) ? follows.filter(follow => follow?.follow && follow.text) : [];
+  const markup = shown.map(follow => {
+    const album = [follow.artist, follow.album].filter(Boolean).join(' - ');
+    return `<div class="status-card-follow" data-follow="${escapeHtml(follow.follow)}">
+      <div class="status-card-follow-text">${icon('i-warning-circle')}<span>${escapeHtml(follow.text)}${album ? `: ${escapeHtml(album)}` : ''}</span></div>
+      <button type="button" class="btn btn-ghost btn-sm" data-put-back="${escapeHtml(follow.follow)}">Put Lidarr back</button>
+      <span class="status-card-follow-status" role="status"></span>
+    </div>`;
+  }).join('');
+  if (holder.dataset.rendered !== markup) {
+    holder.innerHTML = markup;
+    holder.dataset.rendered = markup;
+  }
+  holder.hidden = shown.length === 0;
+}
+
+// Put Lidarr back for one follow, as a Navidrome admin's own sign-in (asked for when missing),
+// then the status read again: a follow put back leaves the card. A refusal says why under the
+// button, which can be pressed again.
+async function putLidarrBack(button) {
+  const follow = button.dataset.putBack;
+  if (!follow || button.disabled) return;
+  const status = button.parentElement?.querySelector('.status-card-follow-status') || button;
+  button.disabled = true;
+  status.textContent = '';
+  status.classList?.remove('is-error');
+  try {
+    const response = await parityFetch('/api/admin/lidarr/put-back', parityJson({ follow }), status);
+    if (!response.ok) throw new Error(await parityError(response));
+  } catch (error) {
+    status.textContent = error.message;
+    status.classList?.add('is-error');
+    button.disabled = false;
+    return;
+  }
+  await refreshStatus();
+}
+document.getElementById('lidarr-follows')?.addEventListener('click', event => {
+  const button = event.target.closest?.('[data-put-back]');
+  if (button) putLidarrBack(button);
+});
 
 // ────────────────────────────────────────────────────────────────
 // Settings: load -> populate forms -> save on submit
@@ -4985,14 +5035,17 @@ async function dlogLoad(cacheKey, key, at, holder) {
   });
 }
 
-// In progress: Log and Find songs under each card, a held one's Keep anyway and Stop waiting for
-// Lidarr, and the log across the panel when open.
+// In progress: Log and Find songs under each card (an album's row is no one song, so it has no
+// Find songs), a held one's Keep anyway and Stop waiting for Lidarr, and the log across the panel
+// when open.
 function acqActions(a) {
   if (!a.key) return '';
   const open = dlogIsOpen(a.key);
+  const album = a.kind === 'album' || a.heldTracks != null;
+  const find = album ? '' : `
+    <button type="button" class="btn btn-ghost btn-sm" data-find-id="${escapeHtml(a.key)}" data-find-title="${escapeHtml(a.title || '')}" data-find-artist="${escapeHtml(a.artist || '')}" data-focus-id="find:${escapeHtml(a.key)}">${icon('i-magnifying-glass')}<span>Find songs</span></button>`;
   return `<div class="acq-actions">
-    <button type="button" class="btn btn-ghost btn-sm" data-dlog-toggle="${escapeHtml(a.key)}" aria-expanded="${open}" data-focus-id="log:${escapeHtml(a.key)}">${icon(open ? 'i-caret-down' : 'i-caret-right')}<span>Log${a.logLines ? ` (${a.logLines})` : ''}</span></button>
-    <button type="button" class="btn btn-ghost btn-sm" data-find-id="${escapeHtml(a.key)}" data-find-title="${escapeHtml(a.title || '')}" data-find-artist="${escapeHtml(a.artist || '')}" data-focus-id="find:${escapeHtml(a.key)}">${icon('i-magnifying-glass')}<span>Find songs</span></button>
+    <button type="button" class="btn btn-ghost btn-sm" data-dlog-toggle="${escapeHtml(a.key)}" aria-expanded="${open}" data-focus-id="log:${escapeHtml(a.key)}">${icon(open ? 'i-caret-down' : 'i-caret-right')}<span>Log${a.logLines ? ` (${a.logLines})` : ''}</span></button>${find}
     ${acqHeldMenus(a)}
   </div>`;
 }

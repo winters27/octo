@@ -1114,6 +1114,22 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .status-card.off .status-card-body { color: var(--text-muted); }
 .status-card-foot { font-size: var(--t-label); color: var(--text-muted); margin-top: auto; }
 .status-grid { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+/* Lidarr follows Octo cannot settle: a warning line each, with the admin's Put Lidarr back under it. */
+.status-card-follows { display: flex; flex-direction: column; gap: var(--s-l); }
+.status-card-follow { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s-s); }
+.status-card-follow-text {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-s);
+  font-size: var(--t-meta);
+  line-height: 1.5;
+  color: var(--warn);
+  word-break: break-word;
+}
+.status-card-follow-text .icon { width: 16px; height: 16px; flex: 0 0 auto; margin-top: 2px; }
+.status-card-follow-status { font-size: var(--t-label); color: var(--text-muted); }
+.status-card-follow-status.is-error { color: #ff9a8f; }
+.status-card-follow-status:empty { display: none; }
 
 .status-dot {
   width: 8px; height: 8px;

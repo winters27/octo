@@ -17,7 +17,12 @@
 //!   download-level row, Octo removes it, Octo's own manual import of it ends (with Lidarr's
 //!   imports off), or its absence is settled: missing from a queue read after a refresh that
 //!   started since Lidarr's own start, with another item of its client listed, so a client that
-//!   failed one refresh is never read as done.
+//!   failed one refresh is never read as done. A download missing while its client lists nothing
+//!   else cannot be proven gone: it stays watched, and the dashboard's Lidarr card lists its
+//!   follow with the admin's "Put Lidarr back", which counts it gone and ends the follow.
+//! - **Octo's own copies.** A copy Octo placed while a follow on its artist stays open (a kept
+//!   copy whose person stopped waiting) is Octo's, never the user's: a rescan linking it never
+//!   makes Octo step aside.
 //! - **Octo's turn.** While a download of Octo's is finished and waits for its import, the
 //!   commands are read at a sub-second pace; a rescan that covers the artist, or a manual import
 //!   or scan that is not Octo's, makes Octo remove its items before its import could replace
@@ -25,8 +30,8 @@
 //! - **The end.** The follow ends on Lidarr's own states (a failed, blocked or ignored download,
 //!   one that left without an import), on the work of people and other sources (a proven file
 //!   of another source for the artist, a kept copy with a download that makes no progress, the
-//!   person's "Stop waiting for Lidarr", every heart taken back), or when every download is
-//!   accounted for. Octo then removes its items, places the files it held back, and once the
+//!   person's "Stop waiting for Lidarr", every heart taken back, the admin's "Put Lidarr back"),
+//!   or when every download is accounted for. Octo then removes its items, places the files it held back, and once the
 //!   watch list is empty and no search of the album is queued or running puts the pick back,
 //!   unless the song landed.
 
@@ -356,8 +361,8 @@ impl Inner {
         };
         if let Some(why) = entry.ended {
             self.remove_items(&run.key, &entry, &reading).await;
-            if why == FollowEnd::Unhearted {
-                self.unhearted_absent(&run.key, &reading);
+            if why == FollowEnd::Unhearted || entry.unseen_let_go {
+                self.absent_let_go(&run.key, &reading);
             }
             if !entry.released {
                 // What the hold folder is judging settles first: a kept copy that a proven import
@@ -813,6 +818,15 @@ impl Inner {
                 .iter()
                 .any(|file| rows.get(&file.id).copied().is_some_and(octos));
         let following = entry.following();
+        let octo_root = self.music.octo_root();
+        // A copy Octo placed itself (a kept copy whose person stopped waiting while others still
+        // wait on the follow) that a rescan linked is neither the user's nor this follow's import.
+        let octos_copy = |file: &LidarrTrackFile| {
+            file.path.as_deref().is_some_and(|path| {
+                translate_imported_path(path, settings.root_folder_path.as_deref(), &octo_root)
+                    .is_ok_and(|local| self.pending.is_octos_copy(&local))
+            })
+        };
         let mut mine: Vec<&LidarrTrackFile> = Vec::new();
         let mut users: Vec<i32> = Vec::new();
         for file in &reading.files {
@@ -825,6 +839,7 @@ impl Inner {
             }
             match rows.get(&file.id).copied() {
                 Some(row) if octos(row) => mine.push(file),
+                _ if octos_copy(file) => {}
                 Some(row)
                     if row.download_client().is_some()
                         && row
@@ -854,7 +869,6 @@ impl Inner {
             entry.users_files.extend(users);
         }
 
-        let octo_root = self.music.octo_root();
         let gated = job.gated();
         let by_sound = !gated && job.files_by_sound() && self.gates.is_some();
         let replacement_only = job.replacement_only();
@@ -1069,6 +1083,7 @@ impl Inner {
             .collect();
         let imports_on = entry.completed_download_handling.unwrap_or(true);
         let mut failed = false;
+        let mut unseen = Vec::new();
         for index in 0..entry.grabs.len() {
             let grab = entry.grabs[index].clone();
             if grab.accounted {
@@ -1101,11 +1116,17 @@ impl Inner {
             let Some(refreshed_at) = refreshed else {
                 continue;
             };
-            let absent = !listed.contains(&dotnet::ordinal_ignore_case_key(&grab.download_id))
-                && grab
-                    .client
-                    .as_deref()
-                    .is_some_and(|client| clients.contains(&dotnet::ordinal_ignore_case_key(client)));
+            let missing = !listed.contains(&dotnet::ordinal_ignore_case_key(&grab.download_id));
+            let client_answered = grab
+                .client
+                .as_deref()
+                .is_some_and(|client| clients.contains(&dotnet::ordinal_ignore_case_key(client)));
+            // Missing from a refresh that began after its grab, its client listing nothing else:
+            // Lidarr gives no proof it is gone, so it stays watched, and the Lidarr card says so.
+            if missing && !client_answered && grab.grabbed_at.is_none_or(|grabbed| refreshed_at > grabbed) {
+                unseen.push(grab.download_id.clone());
+            }
+            let absent = missing && client_answered;
             if !absent {
                 continue;
             }
@@ -1147,6 +1168,7 @@ impl Inner {
                 }
             });
         }
+        entry.unseen = unseen;
         if failed && following {
             end.get_or_insert(FollowEnd::Failed);
         }
@@ -1198,6 +1220,7 @@ impl Inner {
             current.replaced_told = entry.replaced_told;
             current.tracks_taken = entry.tracks_taken;
             current.first_poll = entry.first_poll;
+            current.unseen = entry.unseen;
             current.completed_download_handling = entry.completed_download_handling;
             current.roots = entry.roots;
             if current.search_command <= 0 {
@@ -1258,11 +1281,12 @@ impl Inner {
         }
     }
 
-    /// Nobody's heart is on the follow any more: a download of Octo's missing from a queue read
-    /// made after a refresh since Lidarr's start is accounted for even when its client lists
-    /// nothing else (nobody waits on proof of it), and a release Lidarr no longer holds back is
-    /// let go. One still listed stays watched, and its removal is asked again at every read.
-    fn unhearted_absent(&self, key: &str, reading: &Reading) {
+    /// Nobody waits on proof of the follow's downloads any more (every heart on it was taken back,
+    /// or the admin put Lidarr back for downloads Octo cannot see): a download of Octo's missing
+    /// from a queue read made after a refresh since Lidarr's start is accounted for even when its
+    /// client lists nothing else, and a release Lidarr no longer holds back is let go. One still
+    /// listed stays watched, and its removal is asked again at every read.
+    fn absent_let_go(&self, key: &str, reading: &Reading) {
         let listed: HashSet<String> = reading
             .queue
             .iter()
@@ -1309,10 +1333,15 @@ impl Inner {
             None => None,
         };
         match placed {
-            Some(path) => info!(
-                "Placed {} now that Octo no longer waits for Lidarr: {path}",
-                held.song
-            ),
+            Some(path) => {
+                info!(
+                    "Placed {} now that Octo no longer waits for Lidarr: {path}",
+                    held.song
+                );
+                // A follow still open on its artist (others wait on it) may see a rescan link it:
+                // while that follow is listed, it is Octo's own copy there, never the user's.
+                self.pending.placed_copy(&path, &held.follows);
+            }
             None => {
                 warn!(
                     "Could not place {} from {}; it plays from there and is placed again later",

@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use super::lidarr_pending_albums::{FollowEnd, HELD_FOR_LIDARR, SongGate, StopWaiting};
+use super::lidarr_pending_albums::{FollowEnd, HELD_FOR_LIDARR, SongGate, StopWaiting, UnsettledFollow};
 use super::lidarr_pick::{
     ALREADY_LOOKING, LidarrArtistMusic, delete_moved_record, put_back_unsearched,
     put_back_unsearched_after_restart, users_queue_item, wait_for_rescans,
@@ -156,6 +156,20 @@ pub trait ILidarrHeartAcquisitionService: Send + Sync {
     /// waits for an open follow was kept for, in the order they were listed.
     fn stop_waiters(&self, _provider: &str, _external_id: &str) -> Vec<String> {
         Vec::new()
+    }
+
+    /// The follows Octo cannot settle: a download of Octo's left Lidarr's queue while its client
+    /// lists nothing else, so Octo cannot prove it gone, and the follow keeps reading Lidarr.
+    fn unsettled_follows(&self) -> Vec<UnsettledFollow> {
+        Vec::new()
+    }
+
+    /// The admin's "Put Lidarr back" on a follow Octo cannot settle (`follow`, the album's foreign
+    /// id): the downloads it cannot see count as gone, the follow ends, and its pick is put back
+    /// as any pick that ends without a gated import is. False when the follow is not one Octo
+    /// cannot settle.
+    fn put_lidarr_back(&self, _follow: &str) -> bool {
+        false
     }
 }
 
@@ -912,7 +926,11 @@ impl LidarrHeartAcquisitionService {
         let catalog = extras
             .catalog
             .unwrap_or_else(|| deezer.clone() as Arc<dyn CatalogQuestions>);
-        let music = LidarrArtistMusic::new(client.clone(), settings.clone(), nav_identity);
+        let pending = extras
+            .pending
+            .unwrap_or_else(|| Arc::new(LidarrPendingAlbums::new(None)));
+        let music = LidarrArtistMusic::new(client.clone(), settings.clone(), nav_identity)
+            .with_octos_copies(pending.clone());
         let inner = Arc::new(Inner {
             client,
             metadata,
@@ -933,9 +951,7 @@ impl LidarrHeartAcquisitionService {
             journal: extras.journal,
             ownership: extras.ownership,
             upgrades: extras.upgrades,
-            pending: extras
-                .pending
-                .unwrap_or_else(|| Arc::new(LidarrPendingAlbums::new(None))),
+            pending,
             rounds: extras.rounds,
             album_gates: extras.album_gates,
             gates: extras.gates,
@@ -1127,6 +1143,19 @@ impl ILidarrHeartAcquisitionService for LidarrHeartAcquisitionService {
             }
         }
         waiters
+    }
+
+    fn unsettled_follows(&self) -> Vec<UnsettledFollow> {
+        self.inner.pending.unsettled()
+    }
+
+    fn put_lidarr_back(&self, follow: &str) -> bool {
+        if !self.inner.pending.let_go_unseen(follow) {
+            return false;
+        }
+        info!("The admin put Lidarr back for {follow}: the downloads Octo cannot see count as gone");
+        self.inner.ensure_following(follow);
+        true
     }
 
     async fn try_acquire_album(

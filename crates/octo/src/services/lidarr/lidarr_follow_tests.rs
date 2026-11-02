@@ -975,6 +975,115 @@ async fn stop_waiting_for_lidarr_ends_the_follow_and_places_the_kept_copy() {
     over(&f).await;
 }
 
+/// Two hearts on one follow: alice's kept Teardrop waits, and bob waits on Octo's download of
+/// Angel. Alice stops waiting, so her copy is placed while the follow stays open for bob, and a
+/// rescan links it into the artist. It is Octo's own copy, never a file of the user's: the follow
+/// does not step aside, the artist still has no music of the user's, and bob's Angel still lands.
+#[tokio::test]
+async fn a_rescan_linking_a_copy_octo_placed_never_makes_the_follow_step_aside() {
+    let f = Fixture::new().await;
+    f.lidarr.plan_grab(7, Grab::of("dl-1", &[(1, "Angel", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!f.heart_teardrop(&service).await);
+    followed(&f, "dl-1").await;
+    let angel = format!("soulseek:{}", f.id("Angel"));
+    f.pending.update(ALBUM_ID, |entry| {
+        entry.songs.push(angel.clone());
+        entry.holders.push("bob".into());
+    });
+    let held = hold_kept_copy(&f);
+    let (provider, id) = teardrop(&f);
+
+    assert_eq!(
+        service.stop_waiting_for_lidarr(&provider, &id, "alice").await,
+        StopWaiting::Stopped
+    );
+    until(|| f.placed.lock().len() == 1).await;
+    assert!(Path::new(&held.target).is_file());
+    assert!(entry(&f).following(), "bob still waits on the follow");
+
+    f.lidarr.queue_command(
+        "RescanFolders",
+        serde_json::json!({ "folders": ["/data/music/Massive Attack"], "artistIds": [5] }),
+        "manual",
+    );
+    let linked = f.client().artist_track_files(5).await.expect("Lidarr answers");
+    assert!(
+        linked.iter().any(|file| file
+            .path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("03 - Teardrop.m4a"))),
+        "the rescan linked alice's copy: {linked:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let watching = entry(&f);
+    assert!(watching.following(), "Octo's own copy never makes it step aside");
+    assert!(watching.users_files.is_empty());
+    let music = service
+        .artist_music()
+        .read(ARTIST_ID)
+        .await
+        .expect("Lidarr answers");
+    assert!(
+        !music.has_music,
+        "a copy Octo placed is not the user's music for the artist"
+    );
+
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
+
+    until(|| f.taken() == ["Angel"]).await;
+    over(&f).await;
+    assert!(Path::new(&held.target).is_file(), "alice's copy stays as it was");
+}
+
+/// Octo's download was its client's only item and is gone from the client: Lidarr gives no proof
+/// it is gone, so the follow keeps reading, nothing is put back or deleted, and the Lidarr card
+/// lists it as a follow Octo cannot settle. The admin's "Put Lidarr back" counts the download
+/// gone: the follow ends and the pick is put back.
+#[tokio::test]
+async fn a_download_octo_cannot_see_is_put_back_only_by_the_admin() {
+    let f = Fixture::new().await;
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!f.heart_teardrop(&service).await);
+    followed(&f, "dl-1").await;
+    assert!(service.unsettled_follows().is_empty(), "its client lists it");
+    assert!(
+        !service.put_lidarr_back(ALBUM_ID),
+        "nothing to put back while Octo sees it"
+    );
+
+    f.lidarr.remove_in_client("dl-1");
+    f.lidarr.refresh();
+    until(|| !service.unsettled_follows().is_empty()).await;
+    let listed = service.unsettled_follows();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].follow, ALBUM_ID);
+    assert_eq!(listed[0].artist, "Massive Attack");
+    assert_eq!(listed[0].album, "Mezzanine");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let watching = entry(&f);
+    assert!(watching.following(), "the follow keeps reading");
+    assert_eq!(watching.watched().count(), 1);
+    assert!(!album_deleted(&f), "nothing is put back without the admin");
+    assert!(
+        f.lidarr.deleted().is_empty(),
+        "nothing is deleted without the admin"
+    );
+
+    assert!(service.put_lidarr_back(ALBUM_ID));
+    assert!(
+        service.unsettled_follows().is_empty(),
+        "the card lists it no more"
+    );
+
+    over(&f).await;
+    assert!(album_deleted(&f), "the album Octo's add created is put back");
+    assert!(!service.put_lidarr_back(ALBUM_ID), "nothing is left to put back");
+}
+
 /// A restart forgets every downloads row, but a copy held for an open follow still waits: its row
 /// comes back saying so, for the people it was kept for, and offers them Stop waiting.
 #[tokio::test]

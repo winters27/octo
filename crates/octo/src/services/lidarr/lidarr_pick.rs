@@ -44,13 +44,16 @@ pub struct ArtistMusic {
     pub has_music: bool,
 }
 
-/// Reads whether an artist already has music in the user's Lidarr.
+/// Reads whether an artist already has music in the user's Lidarr. The copies Octo placed for a
+/// followed artist are Octo's own, never the user's music.
 #[derive(Clone)]
 pub struct LidarrArtistMusic {
     client: Arc<LidarrClient>,
     /// The Lidarr settings and `Library:DownloadPath`, read at use.
     settings: Arc<SettingsStore>,
     nav_identity: NavidromeIdentityService,
+    /// Where the copies Octo placed are listed.
+    octos: Option<Arc<LidarrPendingAlbums>>,
 }
 
 impl LidarrArtistMusic {
@@ -63,7 +66,24 @@ impl LidarrArtistMusic {
             client,
             settings,
             nav_identity,
+            octos: None,
         }
+    }
+
+    /// The same reader, leaving out the copies Octo placed that `pending` lists.
+    pub fn with_octos_copies(mut self, pending: Arc<LidarrPendingAlbums>) -> Self {
+        self.octos = Some(pending);
+        self
+    }
+
+    /// Whether the file at `lidarr_path` is a copy Octo placed.
+    fn is_octos_copy(&self, lidarr_path: Option<&str>) -> bool {
+        let Some(octos) = &self.octos else {
+            return false;
+        };
+        lidarr_path
+            .and_then(|path| self.local(path))
+            .is_some_and(|local| octos.is_octos_copy(&local.to_string_lossy()))
     }
 
     /// Octo's music root: where Lidarr's root folder lies on Octo's side.
@@ -113,14 +133,20 @@ impl LidarrArtistMusic {
         Ok(ArtistMusic { artist, has_music })
     }
 
-    /// Whether Lidarr's database holds a track file of the artist. The artist's statistic is
-    /// only a quick first read: above 0 it proves files, at 0 the track file list has the last
-    /// word.
+    /// Whether Lidarr's database holds a track file of the artist that is not a copy Octo placed.
+    /// The artist's statistic is only a quick first read: above 0 it proves files while Octo has
+    /// placed none, else the track file list has the last word.
     pub async fn has_files(&self, artist: &LidarrArtist) -> Result<bool, LidarrError> {
-        if artist.track_file_count.unwrap_or(0) > 0 {
+        let placed_any = self.octos.as_ref().is_some_and(|octos| octos.has_octos_copies());
+        if !placed_any && artist.track_file_count.unwrap_or(0) > 0 {
             return Ok(true);
         }
-        Ok(!self.client.artist_track_files(artist.id).await?.is_empty())
+        Ok(self
+            .client
+            .artist_track_files(artist.id)
+            .await?
+            .iter()
+            .any(|file| !self.is_octos_copy(file.path.as_deref())))
     }
 
     async fn folder_holds_audio(&self, lidarr_path: Option<&str>) -> bool {
@@ -130,20 +156,33 @@ impl LidarrArtistMusic {
         else {
             return false;
         };
-        tokio::task::spawn_blocking(move || holds_audio(&local))
-            .await
-            .unwrap_or(false)
+        let octos = self.octos.clone();
+        tokio::task::spawn_blocking(move || {
+            holds_audio_but(&local, &|file: &Path| {
+                octos
+                    .as_ref()
+                    .is_some_and(|octos| octos.is_octos_copy(&file.to_string_lossy()))
+            })
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 
-/// Whether an audio file lies anywhere under a folder. Dot folders are skipped, as Lidarr's
-/// scans skip them, so nothing there can be linked. A folder reached twice (a link back up the
-/// tree) is read once.
+/// Whether any audio file lies anywhere under a folder.
+#[cfg(test)]
 fn holds_audio(folder: &Path) -> bool {
-    holds_audio_once(folder, &mut HashSet::new())
+    holds_audio_but(folder, &|_| false)
 }
 
-fn holds_audio_once(folder: &Path, seen: &mut HashSet<PathBuf>) -> bool {
+/// Whether an audio file that `skipped` does not name (the copies Octo placed) lies anywhere under
+/// a folder. Dot folders are skipped, as Lidarr's scans skip them, so nothing there can be linked.
+/// A folder reached twice (a link back up the tree) is read once.
+fn holds_audio_but(folder: &Path, skipped: &dyn Fn(&Path) -> bool) -> bool {
+    holds_audio_once(folder, skipped, &mut HashSet::new())
+}
+
+fn holds_audio_once(folder: &Path, skipped: &dyn Fn(&Path) -> bool, seen: &mut HashSet<PathBuf>) -> bool {
     let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
     if !seen.insert(real) {
         return false;
@@ -154,14 +193,16 @@ fn holds_audio_once(folder: &Path, seen: &mut HashSet<PathBuf>) -> bool {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if !entry.file_name().to_string_lossy().starts_with('.') && holds_audio_once(&path, seen) {
+            if !entry.file_name().to_string_lossy().starts_with('.') && holds_audio_once(&path, skipped, seen)
+            {
                 return true;
             }
         } else if path.extension().is_some_and(|extension| {
             AUDIO_EXTENSIONS
                 .iter()
                 .any(|audio| extension.eq_ignore_ascii_case(audio))
-        }) {
+        }) && !skipped(&path)
+        {
             return true;
         }
     }

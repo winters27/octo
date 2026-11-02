@@ -17,6 +17,7 @@ use octo_core::settings::{AppSettings, SoulseekSettings, SubsonicSettings};
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 
+use super::downloads::NOTHING_TO_PUT_BACK;
 use super::test_app::{Reply, app, send};
 use crate::app::{AppState, TestServices};
 use crate::controllers::subsonic::downloads::{
@@ -26,15 +27,18 @@ use crate::http::pipeline::App;
 use crate::services::common::album_gates::tracks_wait_line;
 use crate::services::common::soulseek_hold_store::HeldAlbumTrack;
 use crate::services::common::{HeldAcquisition, HeldKind, Holder};
-use crate::services::lidarr::{ILidarrHeartAcquisitionService, StopWaiting};
+use crate::services::lidarr::{CANNOT_SEE, ILidarrHeartAcquisitionService, StopWaiting, UnsettledFollow};
 use crate::services::test_support::refused_address;
 
-/// Lidarr's hearts as far as Stop waiting goes: alice's and carol's kept copies of Teardrop wait
-/// for a follow until someone stops it.
+/// Lidarr's hearts as far as Stop waiting and Put Lidarr back go: alice's and carol's kept copies
+/// of Teardrop wait for a follow until someone stops it, and the follows Octo cannot settle wait
+/// for the admin to put Lidarr back.
 #[derive(Default)]
 struct Waits {
     waiting: Mutex<Vec<String>>,
     stopped: Mutex<Vec<(String, String)>>,
+    unsettled: Mutex<Vec<UnsettledFollow>>,
+    put_back: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -87,6 +91,21 @@ impl ILidarrHeartAcquisitionService for Waits {
             Vec::new()
         }
     }
+
+    fn unsettled_follows(&self) -> Vec<UnsettledFollow> {
+        self.unsettled.lock().clone()
+    }
+
+    fn put_lidarr_back(&self, follow: &str) -> bool {
+        let mut unsettled = self.unsettled.lock();
+        let before = unsettled.len();
+        unsettled.retain(|known| known.follow != follow);
+        if unsettled.len() == before {
+            return false;
+        }
+        self.put_back.lock().push(follow.to_string());
+        true
+    }
 }
 
 struct Dashboard {
@@ -100,7 +119,7 @@ impl Dashboard {
     fn new() -> Dashboard {
         let files = tempfile::tempdir().expect("a temp dir");
         let closed = format!("http://{}", refused_address());
-        let settings = AppSettings {
+        let mut settings = AppSettings {
             subsonic: SubsonicSettings {
                 url: Some(closed.clone()),
                 auto_detect_download_path: false,
@@ -113,6 +132,8 @@ impl Dashboard {
             },
             ..Default::default()
         };
+        // The status page's probes refuse at once.
+        settings.radio_sources.sonic_url = closed.clone();
         let mut state = AppState::for_tests_with(
             settings,
             TestServices {
@@ -490,4 +511,68 @@ async fn the_dashboard_stops_waiting_for_lidarr_for_the_person_it_names() {
     );
     let again = stop(json!({ "key": "soulseek:teardrop", "user": "carol" })).await;
     assert_eq!(again.status, StatusCode::CONFLICT, "nothing waits for anyone now");
+}
+
+/// A follow Octo cannot settle is on Lidarr's card for the admin (never in the signed-out status),
+/// with its line and the album "Put Lidarr back" names. Putting it back needs a Navidrome admin's
+/// own sign-in and the follow named; a follow Octo can settle by itself is a conflict and nothing
+/// changes; the one listed is put back, and the card lists it no more.
+#[tokio::test]
+async fn lidarrs_card_lists_a_follow_octo_cannot_settle_and_the_admin_puts_lidarr_back() {
+    let dash = Dashboard::new();
+    *dash.waits.unsettled.lock() = vec![UnsettledFollow {
+        follow: "rg-mezzanine".into(),
+        artist: "Massive Attack".into(),
+        album: "Mezzanine".into(),
+    }];
+
+    let status = dash.get("admin", "/api/admin/status").await.json();
+    assert_eq!(
+        status["services"]["lidarr"]["follows"],
+        json!([{
+            "follow": "rg-mezzanine",
+            "artist": "Massive Attack",
+            "album": "Mezzanine",
+            "text": CANNOT_SEE,
+        }])
+    );
+    let signed_out = send(&dash.app, Method::GET, "/api/admin/status", &[], None)
+        .await
+        .json();
+    assert!(
+        signed_out["services"]["lidarr"].get("follows").is_none(),
+        "{signed_out}"
+    );
+
+    let path = "/api/admin/lidarr/put-back";
+    let follow = json!({ "follow": "rg-mezzanine" });
+    for who in [None, Some("recovery")] {
+        assert_eq!(
+            dash.post(who, path, &follow).await.status,
+            StatusCode::UNAUTHORIZED,
+            "as {who:?}"
+        );
+    }
+    let unnamed = dash.post(Some("admin"), path, &json!({})).await;
+    assert_eq!(unnamed.status, StatusCode::BAD_REQUEST);
+    let settled = dash
+        .post(Some("admin"), path, &json!({ "follow": "rg-protection" }))
+        .await;
+    assert_eq!(settled.status, StatusCode::CONFLICT);
+    assert_eq!(settled.json()["error"], NOTHING_TO_PUT_BACK);
+    assert!(dash.waits.put_back.lock().is_empty(), "nothing is put back");
+
+    let done = dash
+        .post(Some("admin"), path, &json!({ "follow": " rg-mezzanine " }))
+        .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text());
+    assert_eq!(done.json(), json!({ "status": "ok" }));
+    assert_eq!(*dash.waits.put_back.lock(), ["rg-mezzanine"]);
+    let status = dash.get("admin", "/api/admin/status").await.json();
+    assert!(
+        status["services"]["lidarr"].get("follows").is_none(),
+        "the card lists it no more"
+    );
+    let again = dash.post(Some("admin"), path, &follow).await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
 }

@@ -31,7 +31,7 @@ use crate::services::admin::directory_browser::is_writable;
 use crate::services::common::acquisition_tracker::key_of;
 use crate::services::common::heart_acquisition_coordinator::waiting_line;
 use crate::services::http_client_factory::{connect_failure_message, timeout_message};
-use crate::services::lidarr::NO_INDEXER_SEARCHES;
+use crate::services::lidarr::{CANNOT_SEE, NO_INDEXER_SEARCHES};
 use crate::services::soulseek::soulseek_link::ISoulseekLink;
 use crate::services::subsonic::subsonic_response_builder::acquisition_json;
 use crate::services::you_tube::you_tube_resolver::FRESH_HEADER;
@@ -182,7 +182,9 @@ pub async fn acquisitions(State(state): State<AppState>) -> Response {
 
 /// Health of one backing service. `configured` is false for an optional service nobody set
 /// up, which the dashboard shows as off rather than as a failure. `indexers` (sent only when
-/// set) says Lidarr answers and its warning is about its indexers, not its setup.
+/// set) says Lidarr answers and its warning is about its indexers, not its setup. `follows` (sent
+/// only when there are any) lists the Lidarr follows Octo cannot settle, each with its line and
+/// the album "Put Lidarr back" names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ServiceProbe {
     ok: bool,
@@ -191,6 +193,8 @@ struct ServiceProbe {
     configured: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     indexers: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    follows: Vec<serde_json::Value>,
 }
 
 impl ServiceProbe {
@@ -201,6 +205,7 @@ impl ServiceProbe {
             warning: false,
             configured: true,
             indexers: false,
+            follows: Vec::new(),
         }
     }
 
@@ -273,7 +278,27 @@ async fn probe_slskd(state: &AppState) -> ServiceProbe {
     ServiceProbe::new(up, detail).warning(warning)
 }
 
+/// Lidarr's card: how Lidarr answers, and the follows Octo cannot settle, whatever Lidarr answers
+/// now (a follow outlives a Lidarr cleared from the settings).
 async fn probe_lidarr(state: &AppState) -> ServiceProbe {
+    let mut probe = probe_lidarr_service(state).await;
+    probe.follows = state
+        .lidarr_hearts
+        .unsettled_follows()
+        .into_iter()
+        .map(|follow| {
+            json!({
+                "follow": follow.follow,
+                "artist": follow.artist,
+                "album": follow.album,
+                "text": CANNOT_SEE,
+            })
+        })
+        .collect();
+    probe
+}
+
+async fn probe_lidarr_service(state: &AppState) -> ServiceProbe {
     let settings = state.settings.current();
     let lidarr = &settings.lidarr;
     let lidarr_enabled = settings

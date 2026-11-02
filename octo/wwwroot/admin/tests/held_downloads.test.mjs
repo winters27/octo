@@ -21,6 +21,7 @@ function slice(from, to) {
 
 const checksBlock = slice('function renderDownloadChecks(lines)', "document.getElementById('status-refresh')");
 const menusBlock = slice('const ACQ_MENUS = {', '// Fetched songs: the log folds under the row');
+const actionsBlock = slice('function acqActions(a) {', 'function acqLog(a) {');
 const keyHelpBlock = slice('const ACOUSTID_KEY_HELP = {', '// The downloads card: what');
 const importKeyBlock = slice('function renderImportKeyLine(key, t)', 'function renderTrickle()');
 
@@ -284,6 +285,20 @@ test('Stop waiting for Lidarr picks from whose kept copy waits, and stops for th
     method: 'POST',
     body: { key: 'soulseek:teardrop', token: 'token-a' },
   });
+});
+
+test('an album row offers no Find songs in any state; a song row does', () => {
+  const context = { escapeHtml, icon: name => `<svg data-icon="${name}"></svg>`, dlogIsOpen: () => false, acqHeldMenus: () => '' };
+  vm.createContext(context);
+  vm.runInContext(actionsBlock, context);
+  const song = context.acqActions({ key: 'soulseek:help', kind: 'download', state: 'done', title: 'Help!' });
+  assert.ok(song.includes('data-find-id="soulseek:help"'));
+  assert.ok(song.includes('data-dlog-toggle="soulseek:help"'));
+  const landed = context.acqActions({ key: 'soulseek:help-album', kind: 'album', state: 'done' });
+  assert.ok(!landed.includes('data-find-id'), 'a landed album row is still no one song');
+  assert.ok(landed.includes('data-dlog-toggle="soulseek:help-album"'), 'its log stays');
+  const older = context.acqActions({ key: 'soulseek:help-album', kind: 'download', heldTracks: 2 });
+  assert.ok(!older.includes('data-find-id'), 'an older server marks an album row by its held tracks');
 });
 
 test('a menu with nobody left says nothing waits', async () => {

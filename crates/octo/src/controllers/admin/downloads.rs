@@ -1,7 +1,8 @@
 //! The download log and Find songs routes: the dashboard's side of what the Octo apps already
 //! do, for admins whose listeners use other Subsonic apps. A download's full log on Fetched
-//! songs, Find songs (a search run again by hand, every copy listed, one picked), and a held
-//! download's Keep anyway and Stop waiting for Lidarr for one of the people it was held for.
+//! songs, Find songs (a search run again by hand, every copy listed, one picked), a held
+//! download's Keep anyway and Stop waiting for Lidarr for one of the people it was held for, and
+//! Put Lidarr back on a Lidarr follow Octo cannot settle.
 //! Recently removed and Put back (`trash`, `trash/restore`) are the library edits' (see `trash`).
 //!
 //! Everything here names peers, files or people, or changes the library, so every call needs a
@@ -52,6 +53,7 @@ pub fn routes() -> RouteSet {
         .route("/api/admin/acquisitions/holders", get(held_for))
         .route("/api/admin/acquisitions/keep", post(keep_anyway))
         .route("/api/admin/acquisitions/stop-waiting", post(stop_waiting))
+        .route("/api/admin/lidarr/put-back", post(put_lidarr_back))
         .route("/api/admin/find", post(start_find))
         .route("/api/admin/find/outside", get(outside_songs))
         .route("/api/admin/find/cover", get(find_cover))
@@ -306,6 +308,52 @@ pub async fn stop_waiting(State(state): State<AppState>, request: Request) -> Re
         }
         StopWaiting::NothingWaits => error(StatusCode::CONFLICT, NOTHING_WAITS_FOR_LIDARR),
     }
+}
+
+// ---- Put Lidarr back ----------------------------------------------------------------------
+
+/// `PutBackRequest(string? Follow)`: the album (its foreign id) of a follow the Lidarr card lists
+/// as one Octo cannot settle.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PutBackRequest {
+    follow: Option<String>,
+}
+
+impl FromBody for PutBackRequest {
+    const SHAPE: &'static Shape = text_record!(
+        "Octo.Controllers.AdminDownloadsController+PutBackRequest",
+        "follow"
+    );
+}
+
+/// What "Put Lidarr back" answers for a follow Octo can settle by itself, or one already over.
+pub const NOTHING_TO_PUT_BACK: &str = "Octo can see this download again, or its follow is over";
+
+/// "Put Lidarr back" on a follow the Lidarr card lists as one Octo cannot settle: the downloads
+/// Octo cannot see count as gone, the follow ends, and its pick is put back, held copies placed. A
+/// conflict when the follow is not one Octo cannot settle; nothing changes then.
+pub async fn put_lidarr_back(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, body) = split(request).await;
+    let request: Option<PutBackRequest> = match bind_optional_body(&parts.headers, &body) {
+        Ok(request) => request,
+        Err(answer) => return answer,
+    };
+    let Some(admin) = admin(&state, &parts.headers) else {
+        return sign_in();
+    };
+    let Some(follow) = request
+        .and_then(|request| request.follow)
+        .filter(|follow| !is_blank(follow))
+    else {
+        return error(StatusCode::BAD_REQUEST, "Which follow? The album is missing.");
+    };
+    let follow = follow.trim();
+    if !state.lidarr_hearts.put_lidarr_back(follow) {
+        return error(StatusCode::CONFLICT, NOTHING_TO_PUT_BACK);
+    }
+    info!("{admin} put Lidarr back for {follow} from the dashboard");
+    ok(&json!({ "status": "ok" }))
 }
 
 // ---- Find songs ---------------------------------------------------------------------------
