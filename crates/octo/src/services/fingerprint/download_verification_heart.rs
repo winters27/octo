@@ -6,15 +6,16 @@ use std::collections::HashSet;
 use chrono::Utc;
 use octo_core::fingerprint::acoust_id_client::{AcoustIdAnswer, AcoustIdOutcome};
 use octo_core::fingerprint::heart_gate::{
-    AcquisitionOrigin, AlbumContext, ClipReading, FileFacts, FileLabels, HeardAnswerReading, HeardMaster,
-    HeardReading, HeardRecord, HeardRecording, Judgement, MusicBrainzFact, Need, StandIn, TagClaim, became,
-    heard_codes, is_heard_audio, read_heard_answer, read_stand_in,
+    AcquisitionOrigin, AlbumContext, ClipReading, FileFacts, FileLabels, FileNames, HeardAnswerReading,
+    HeardMaster, HeardReading, HeardRecord, HeardRecording, Judgement, MusicBrainzFact, Need, StandIn,
+    TagClaim, became, heard_codes, is_heard_audio, read_heard_answer, read_stand_in,
 };
 use octo_core::fingerprint::heart_release::{GroupFacts, HeardIdentity, HeartSong, listened_release};
 use octo_core::fingerprint::verification::{
     Reading, RecordingProof, WeighedRecording, length_fits, read_answer,
 };
 use octo_core::fingerprint::{InconclusiveReason, VerificationResult, VerificationVerdict};
+use octo_core::models::domain::explicit_status;
 use octo_core::soulseek::SoulseekRouting;
 use octo_media::audio::FingerprintOutcome;
 use octo_media::tags::tag_writer_extras;
@@ -686,16 +687,21 @@ impl DownloadVerificationService {
             lookup,
         } = sound.clone();
 
-        let labels = match &candidate.labels {
+        let (labels, names) = match &candidate.labels {
             LabelSource::TheFile => labels_of(&file),
             LabelSource::Delivered(delivered) => labels_of(&delivered.to_string_lossy()),
-            LabelSource::None => FileLabels::default(),
+            LabelSource::None => (FileLabels::default(), FileNames::default()),
         };
         let reading = match &outcome {
             AcoustIdOutcome::Answered(answer) => Some(read_answer(answer, &r, self.min_score())),
             _ => None,
         };
         let mut facts = FileFacts::new(outcome, labels);
+        facts.seconds = file_ms.map(|ms| ms as f64 / 1000.0);
+        facts.names = FileNames {
+            file: path.file_stem().map(|stem| stem.to_string_lossy().into_owned()),
+            ..names
+        };
         if let (Some(parts), Some(raw)) = (&parts, &raw) {
             facts.heard_distance = reference_print(parts, gate, settings.effective_fingerprint_seconds())
                 .await
@@ -939,13 +945,20 @@ async fn heard_master(
     }
 }
 
-/// A file's own ISRC tags and `MUSICBRAINZ_TRACKID`, as read from it.
-fn labels_of(path: &str) -> FileLabels {
+/// A file's own ISRC tags and `MUSICBRAINZ_TRACKID`, as read from it, and the title and album its
+/// tags give.
+fn labels_of(path: &str) -> (FileLabels, FileNames) {
     let facts = tag_writer_extras::read_facts(path, true);
-    FileLabels {
+    let labels = FileLabels {
         isrcs: facts.isrcs,
         recording_id: facts.recording_id.filter(|id| !id.trim().is_empty()),
-    }
+    };
+    let names = FileNames {
+        title: facts.title,
+        album: facts.album,
+        file: None,
+    };
+    (labels, names)
 }
 
 fn hold(gate: HeartGate, waiting_for: WaitingFor, line: &str, question: Option<String>) -> GateBuild {
@@ -966,6 +979,7 @@ fn named_r(song: &HeartSong) -> HeardRecording {
             .collect(),
         title: song.title.clone(),
         artist: song.artist.clone(),
+        explicit: song.explicit,
         ..Default::default()
     }
 }
@@ -1036,11 +1050,17 @@ fn overlap(song: &HeartSong, rs: &[HeardRecording]) -> HeardRecording {
             artist_ids.push(id.clone());
         }
     }
+    // Any candidate marked explicit or the clean edit may be the one heard.
+    let marked = rs.iter().find_map(|r| {
+        r.explicit
+            .filter(|explicit| *explicit != explicit_status::NOT_EXPLICIT)
+    });
     HeardRecording {
         ids: shared(&first.ids, |r| &r.ids),
         duplicates: shared(&first.duplicates, |r| &r.duplicates),
         isrcs,
         artist_ids,
+        explicit: marked.or(song.explicit),
         ..named_r(song)
     }
 }

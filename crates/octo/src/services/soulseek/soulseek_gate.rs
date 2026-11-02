@@ -80,6 +80,10 @@ fn verdict_words(verdict: &GateVerdict) -> (&'static str, &'static str) {
             octo_core::fingerprint::heart_gate::Acceptance::HeardMaster => {
                 ("The master you heard", "It matches what played, window by window")
             }
+            octo_core::fingerprint::heart_gate::Acceptance::SameTake => (
+                "The same take you heard",
+                "It sounds like what played and runs as long, and names no other version",
+            ),
         },
         GateVerdict::Refuse(refusal) => (
             "Not the version you heard; thrown away",

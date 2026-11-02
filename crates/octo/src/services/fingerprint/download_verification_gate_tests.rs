@@ -16,7 +16,7 @@ use wiremock::{Mock, ResponseTemplate};
 use super::*;
 use crate::services::common::{HeldAcquisition, HeldKind, acquisition_key};
 use crate::services::fingerprint::heart_test_support::{
-    GateRig, GateSetup, gate_fixture, gate_rig, print_items, sound_bytes, sound_flac,
+    GateRig, GateSetup, flac_header, gate_fixture, gate_rig, print_items, sound_bytes, sound_flac,
 };
 use crate::services::prefetch::heard_samples::HeardPrints;
 use crate::services::prefetch::heard_samples::tests::items_of;
@@ -517,6 +517,62 @@ async fn a_file_fpcalc_could_not_print_is_judged_without_acoust_id() {
         check.verdict
     );
     assert!(rig.answers.asked().is_empty(), "nothing was sent to AcoustID");
+}
+
+/// Octo's own file check reads a file's length and its names for the same take: another master
+/// of the take heard, which AcoustID cannot tell from the other mix, is kept as the same take
+/// when it is as long as the song; named live, or 30 s off the song's length, the heard copy is
+/// kept instead.
+#[tokio::test]
+async fn another_master_as_long_as_the_song_is_kept_as_the_same_take() {
+    let rig = gate_rig(GateSetup::default()).await;
+    rig.shim_streams(VIDEO, sound_bytes("-", "help-2009-master", "-"))
+        .await;
+    rig.answers.answer(
+        "clustered",
+        &answer(&[
+            (HELP_2009, "Help!", "The Beatles", 139, 700, HELP_CODE),
+            (HELP_2015, "Help!", "The Beatles", 139, 300, "GBUM71505900"),
+        ]),
+    );
+    let lasting = |seconds: i32| HeartGate {
+        heard_seconds: Some(seconds),
+        ..help_heard(&rig)
+    };
+    let keep = GateVerdict::Undecided(octo_core::fingerprint::heart_gate::Undecided::KeepHeardCopy);
+    // Audio after the header, so the file's container gives its 200 s.
+    let lasting_file = |name: &str| {
+        let path = rig.dir.path().join(format!("{name}.flac"));
+        let mut bytes = flac_header(200);
+        bytes.extend_from_slice(&sound_bytes("help-2009", "another-master", "clustered"));
+        bytes.extend(std::iter::repeat_n(0u8, 256 * 1024));
+        std::fs::write(&path, bytes).expect("the file is written");
+        path
+    };
+
+    let other = lasting_file("Help!");
+    let check = rig
+        .service
+        .verify_for_heart(&other, &candidate("help"), &lasting(200))
+        .await;
+    assert_eq!(
+        check.verdict,
+        GateVerdict::Accept {
+            by: Acceptance::SameTake,
+            tags: TagClaim::AsHeard,
+        }
+    );
+    let check = rig
+        .service
+        .verify_for_heart(&other, &candidate("help"), &lasting(170))
+        .await;
+    assert_eq!(check.verdict, keep);
+    let live = lasting_file("Help! (Live)");
+    let check = rig
+        .service
+        .verify_for_heart(&live, &candidate("help"), &lasting(200))
+        .await;
+    assert_eq!(check.verdict, keep);
 }
 
 /// With AcoustID busy for the file itself, a file that is the very master that played (A2) lands

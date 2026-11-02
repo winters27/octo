@@ -1278,3 +1278,406 @@ fn an_owned_copy_of_another_mix_never_counts() {
         as_heard(Acceptance::HeardAudio)
     );
 }
+
+// ---- The same take ----------------------------------------------------------------------------
+
+/// A file as long as the song in the gate (139 s).
+const SONG_SECONDS: f64 = 139.4;
+
+/// Another master of the take a 2009 heart heard: AcoustID clusters the mixes, its print 0.15
+/// from the heard print, the song's length, and names that add no version.
+fn another_master() -> FileFacts {
+    FileFacts {
+        heard_distance: Some(0.15),
+        seconds: Some(SONG_SECONDS),
+        names: FileNames {
+            title: Some("Help! (Remastered 2015)".into()),
+            album: Some("1 (Remastered)".into()),
+            file: Some("07 - The Beatles - Help!".into()),
+        },
+        ..facts(answered(clustered()))
+    }
+}
+
+fn same_take() -> GateVerdict {
+    as_heard(Acceptance::SameTake)
+}
+
+fn named(title: &str, album: &str) -> FileFacts {
+    FileFacts {
+        names: FileNames {
+            title: Some(title.into()),
+            album: Some(album.into()),
+            file: None,
+        },
+        ..another_master()
+    }
+}
+
+/// AcoustID cannot tell the masters apart and the file is not the master heard: another master of
+/// the heard take, as long as the song, with no version named and a song not marked explicit, is
+/// the same take, and only once the heard master was asked.
+#[test]
+fn another_master_of_the_heard_take_is_the_same_take() {
+    let (verdict, asked) = settle(&r_stays(), another_master(), Some(HeardMaster::Differs));
+    assert_eq!(verdict, same_take());
+    assert_eq!(asked, [Need::HeardMaster]);
+    // Tagged as the heard master is: the heard answer's clear recording, else as heard.
+    let tagged = HeartGate {
+        r: Some(HeardRecording {
+            tag_isrcs: vec![ISRC_2009.into()],
+            ..help_r()
+        }),
+        ..gate(HeardReading::RStays {
+            tag: Some(HELP_2009.into()),
+        })
+    };
+    assert_eq!(
+        verdict_of(&tagged, another_master(), Some(HeardMaster::Differs)),
+        GateVerdict::Accept {
+            by: Acceptance::SameTake,
+            tags: TagClaim::Recording {
+                id: HELP_2009.into(),
+                isrcs: vec![ISRC_2009.into()],
+            },
+        }
+    );
+    // Nothing proving which recording played, and a song marked neither explicit nor clean.
+    assert_eq!(
+        verdict_of(
+            &gate(HeardReading::OnlyHeardOrMaster),
+            another_master(),
+            Some(HeardMaster::Differs)
+        ),
+        same_take()
+    );
+    let neither = HeartGate {
+        r: Some(HeardRecording {
+            explicit: Some(explicit_status::NOT_EXPLICIT),
+            ..help_r()
+        }),
+        ..r_stays()
+    };
+    assert_eq!(
+        verdict_of(&neither, another_master(), Some(HeardMaster::Differs)),
+        same_take()
+    );
+    // A heard title that names a version lets a file name it too.
+    let live = HeartGate {
+        r: Some(HeardRecording {
+            title: "Help! (Live)".into(),
+            ..help_r()
+        }),
+        ..r_stays()
+    };
+    assert_eq!(
+        verdict_of(
+            &live,
+            named("Help! (Live at the Hollywood Bowl)", "Live at the Hollywood Bowl"),
+            Some(HeardMaster::Differs)
+        ),
+        same_take()
+    );
+}
+
+/// A file AcoustID reads as another recording of the heart's song, or whose own label names one,
+/// at 0.15 from the heard print, is the same take; no entry and an unlinked fingerprint too.
+#[test]
+fn another_recording_of_the_same_song_is_the_same_take() {
+    let gate = r_stays();
+    let another = FileFacts {
+        answer: answered(vec![help(HELP_2015, &[ISRC_2015], 500)]),
+        ..another_master()
+    };
+    let (verdict, asked) = settle(&gate, another, None);
+    assert_eq!(verdict, same_take());
+    assert_eq!(asked, [Need::CurrentRecording(HELP_2015.into())]);
+    let labeled = FileFacts {
+        labels: FileLabels {
+            isrcs: vec![ISRC_2015.into()],
+            recording_id: None,
+        },
+        ..another_master()
+    };
+    assert_eq!(
+        verdict_of(&gate, labeled, Some(HeardMaster::Differs)),
+        same_take()
+    );
+    let empty = FileFacts {
+        answer: AcoustIdOutcome::Answered(AcoustIdAnswer::default()),
+        ..another_master()
+    };
+    assert_eq!(verdict_of(&gate, empty, Some(HeardMaster::Differs)), same_take());
+}
+
+/// Over the match line a re-recording (0.27) and a live take (0.41) are refused as before; between
+/// it and the same-take line the heard copy is kept.
+#[test]
+fn a_rerecording_or_a_live_take_is_not_the_same_take() {
+    let gate = r_stays();
+    assert_eq!(
+        verdict_of(&gate, another_master(), Some(HeardMaster::Differs)),
+        same_take()
+    );
+    let at = |distance: f64| FileFacts {
+        heard_distance: Some(distance),
+        ..another_master()
+    };
+    for distance in [0.27, 0.41] {
+        assert_eq!(
+            verdict_of(&gate, at(distance), Some(HeardMaster::Differs)),
+            GateVerdict::Refuse(Refusal::DiffersFromHeard),
+            "{distance}"
+        );
+    }
+    assert_eq!(
+        verdict_of(&gate, at(SAME_TAKE_AT_MOST), Some(HeardMaster::Differs)),
+        same_take()
+    );
+    assert_eq!(verdict_of(&gate, at(0.23), Some(HeardMaster::Differs)), KEEP);
+    let no_distance = FileFacts {
+        heard_distance: None,
+        ..another_master()
+    };
+    assert_eq!(verdict_of(&gate, no_distance, Some(HeardMaster::Differs)), KEEP);
+}
+
+/// A file 30 s off the song's length is an edit, and a length either side does not know proves
+/// nothing: the heard copy is kept.
+#[test]
+fn an_edit_is_not_the_same_take() {
+    let gate = r_stays();
+    assert_eq!(
+        verdict_of(&gate, another_master(), Some(HeardMaster::Differs)),
+        same_take()
+    );
+    let long = |seconds: Option<f64>| FileFacts {
+        seconds,
+        ..another_master()
+    };
+    assert_eq!(
+        verdict_of(&gate, long(Some(SONG_SECONDS + 30.0)), Some(HeardMaster::Differs)),
+        KEEP
+    );
+    assert_eq!(
+        verdict_of(&gate, long(Some(SONG_SECONDS - 30.0)), Some(HeardMaster::Differs)),
+        KEEP
+    );
+    assert_eq!(
+        verdict_of(&gate, long(Some(142.5)), Some(HeardMaster::Differs)),
+        KEEP
+    );
+    assert_eq!(
+        verdict_of(&gate, long(Some(141.9)), Some(HeardMaster::Differs)),
+        same_take()
+    );
+    assert_eq!(verdict_of(&gate, long(None), Some(HeardMaster::Differs)), KEEP);
+    let unknown_song = HeartGate {
+        heard_seconds: None,
+        ..r_stays()
+    };
+    assert_eq!(
+        verdict_of(&unknown_song, another_master(), Some(HeardMaster::Differs)),
+        KEEP
+    );
+}
+
+/// A song marked explicit, or the clean edit, keeps the exact rule: the two sound alike. A file
+/// whose own names say explicit is not the same take of a song not marked so either.
+#[test]
+fn an_explicit_song_keeps_the_exact_rule() {
+    let marked = |explicit: i32| HeartGate {
+        r: Some(HeardRecording {
+            explicit: Some(explicit),
+            ..help_r()
+        }),
+        ..r_stays()
+    };
+    assert_eq!(
+        verdict_of(&r_stays(), another_master(), Some(HeardMaster::Differs)),
+        same_take()
+    );
+    for explicit in [explicit_status::EXPLICIT, explicit_status::CLEAN] {
+        assert_eq!(
+            verdict_of(&marked(explicit), another_master(), Some(HeardMaster::Differs)),
+            KEEP,
+            "{explicit}"
+        );
+    }
+    assert_eq!(
+        verdict_of(
+            &r_stays(),
+            named("Help! (Explicit)", "Help!"),
+            Some(HeardMaster::Differs)
+        ),
+        KEEP
+    );
+}
+
+/// A file whose title, album or file name names a version the heard title does not is not the
+/// same take; a remaster, mono or stereo word names none.
+#[test]
+fn a_file_naming_another_version_is_not_the_same_take() {
+    let gate = r_stays();
+    for (title, album) in [
+        ("Help! (Live)", "Help!"),
+        ("Help! (Instrumental)", "Help!"),
+        ("Help! - Acoustic Version", "Help!"),
+        ("Help! (Demo)", "Help!"),
+        ("Help! (Karaoke Version)", "Help!"),
+        ("Help! (Sped Up)", "Help!"),
+        ("Help! (Radio Edit)", "Help!"),
+        ("Help! (Extended)", "Help!"),
+        ("Help! (Remix)", "Help!"),
+        ("Help!", "Live at the BBC"),
+    ] {
+        assert_eq!(
+            verdict_of(&gate, named(title, album), Some(HeardMaster::Differs)),
+            KEEP,
+            "{title} on {album}"
+        );
+    }
+    let file_named = FileFacts {
+        names: FileNames {
+            title: None,
+            album: None,
+            file: Some("07 - The Beatles - Help! (Live)".into()),
+        },
+        ..another_master()
+    };
+    assert_eq!(verdict_of(&gate, file_named, Some(HeardMaster::Differs)), KEEP);
+    for (title, album) in [
+        ("Help! - Remastered 2009", "Help! (Remastered)"),
+        ("Help! (Mono)", "Help! (Mono)"),
+        ("Help! (2015 Stereo Mix)", "1"),
+    ] {
+        assert_eq!(
+            verdict_of(&gate, named(title, album), Some(HeardMaster::Differs)),
+            same_take(),
+            "{title} on {album}"
+        );
+    }
+}
+
+/// A label naming another song refuses as before, and so does a reading that does: the same take
+/// never keeps another song.
+#[test]
+fn another_song_is_never_the_same_take() {
+    let gate = r_stays();
+    assert_eq!(
+        verdict_of(&gate, another_master(), Some(HeardMaster::Differs)),
+        same_take()
+    );
+    let mut recordings = clustered();
+    recordings.push(wonderwall(5));
+    let labeled = FileFacts {
+        labels: FileLabels {
+            isrcs: vec![WONDERWALL_ISRC.into()],
+            recording_id: None,
+        },
+        ..FileFacts {
+            answer: answered(recordings),
+            ..another_master()
+        }
+    };
+    let (verdict, asked) = settle(&gate, labeled, None);
+    assert_eq!(verdict, GateVerdict::Refuse(Refusal::Label));
+    assert!(asked.is_empty());
+    let read_as_another_song = FileFacts {
+        answer: answered(vec![wonderwall(900), help(HELP_2009, &[ISRC_2009], 5)]),
+        ..another_master()
+    };
+    assert_eq!(
+        verdict_of(&gate, read_as_another_song, None),
+        GateVerdict::Refuse(Refusal::AnotherRecording)
+    );
+}
+
+/// A0, A2 and A1-clear accept as before, ahead of the same take; with AcoustID off a never-played
+/// heart and a heard one are judged as before; and with no copy that passes the heard copy is
+/// kept.
+#[test]
+fn the_exact_acceptances_and_acoustid_off_are_unchanged() {
+    let heard = r_stays();
+    let identical = FileFacts {
+        identical: true,
+        ..another_master()
+    };
+    assert_eq!(
+        verdict_of(&heard, identical, None),
+        as_heard(Acceptance::HeardAudio)
+    );
+    assert_eq!(
+        verdict_of(&heard, another_master(), Some(HeardMaster::Same)),
+        as_heard(Acceptance::HeardMaster)
+    );
+    let clear_file = FileFacts {
+        answer: answered(clear()),
+        ..another_master()
+    };
+    assert_eq!(
+        verdict_of(&heard, clear_file, Some(HeardMaster::Differs)),
+        GateVerdict::Accept {
+            by: Acceptance::Sound,
+            tags: TagClaim::Recording {
+                id: HELP_2009.into(),
+                isrcs: vec![ISRC_2009.into()],
+            },
+        }
+    );
+    let off = || FileFacts {
+        answer: AcoustIdOutcome::Off,
+        ..another_master()
+    };
+    let (verdict, asked) = settle(&never_played(), off(), None);
+    assert_eq!(verdict, NOT_YET);
+    assert!(asked.is_empty());
+    let stood_in = HeartGate {
+        stand_in: Some(StandIn {
+            video_id: "pinned".into(),
+            sample_id: None,
+            is_reference: true,
+        }),
+        ..never_played()
+    };
+    assert_eq!(verdict_of(&stood_in, off(), None), NOT_YET);
+    assert_eq!(verdict_of(&never_played(), another_master(), None), NOT_YET);
+    assert_eq!(verdict_of(&heard, off(), Some(HeardMaster::Differs)), KEEP);
+    assert_eq!(
+        verdict_of(
+            &gate(HeardReading::Clip(ClipReading::ThisSong)),
+            off(),
+            Some(HeardMaster::Differs)
+        ),
+        KEEP
+    );
+    let busy = FileFacts {
+        answer: AcoustIdOutcome::Busy,
+        ..another_master()
+    };
+    assert_eq!(
+        verdict_of(&heard, busy, Some(HeardMaster::Differs)),
+        GateVerdict::Hold(WaitingFor::AcoustId)
+    );
+    let unreadable = FileFacts {
+        answer: AcoustIdOutcome::Unreadable { code: Some(3) },
+        ..another_master()
+    };
+    assert_eq!(
+        verdict_of(&heard, unreadable, Some(HeardMaster::Differs)),
+        GateVerdict::Refuse(Refusal::Unreadable)
+    );
+}
+
+/// R carries the song's explicit mark, and keeps it when it becomes the recording that played.
+#[test]
+fn r_keeps_the_songs_explicit_mark_when_it_becomes_what_played() {
+    let catalog = HeardRecording {
+        explicit: Some(explicit_status::EXPLICIT),
+        ..help_r()
+    };
+    let answer = answer(clustered());
+    let dominant = weighed(&answer, HELP_2009);
+    let (r, _) = became(&answer, &dominant, &[], &catalog, MATCH_SCORE);
+    assert_eq!(r.explicit, Some(explicit_status::EXPLICIT));
+}

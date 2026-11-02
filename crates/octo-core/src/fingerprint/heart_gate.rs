@@ -3,9 +3,12 @@
 //! acquisition waits for, the readings the gate takes (the heard sample's AcoustID answer, the
 //! catalog's clip, the heard master) and its verdict on one downloaded file.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::common::{SongIdentity, SongMatchOptions, SongTitle};
 use crate::fingerprint::acoust_id_client::{AcoustIdAnswer, AcoustIdOutcome, AnswerRecording};
 use crate::fingerprint::clip_check;
 use crate::fingerprint::heart_release::MOST_HEARD_RECORDINGS;
@@ -13,10 +16,23 @@ use crate::fingerprint::verification::{
     AnswerReading, MIN_SHARE, MIN_SOURCES_TO_CONFIRM, Reading, SongName, WeighedRecording,
     believed_other_song, is_same_song, length_fits, one_recording, r_song, read_answer, same_song,
 };
+use crate::models::domain::explicit_status;
 
 /// The client an album context opened through Navidrome's own API is filed under: that API sends
 /// no client name.
 pub const NATIVE_CLIENT: &str = "navidrome-native";
+
+/// At or under this share of differing bits from the heard print, a file can be the take that
+/// played. Measured: the same recording 0.052 to 0.185, another mix or master of it 0.096 to
+/// 0.200, a re-recording 0.272 and up, a live take 0.40 and up, another song 0.425 and up.
+pub const SAME_TAKE_AT_MOST: f64 = 0.22;
+/// A same-take file's length may be this many seconds from the song's, or
+/// [`SAME_TAKE_LENGTH_SHARE`] of the song's length when that is more.
+pub const SAME_TAKE_LENGTH_SECONDS: f64 = 3.0;
+pub const SAME_TAKE_LENGTH_SHARE: f64 = 0.02;
+/// Version words that say nothing of another performance: another mix of the take that played,
+/// and a bare "version".
+const SAME_TAKE_NEUTRAL: [&str; 2] = ["mix", "version"];
 
 /// Why an acquisition runs, which decides how its downloaded file is judged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -242,6 +258,11 @@ pub struct HeardRecording {
     /// answer carries ([`heard_codes`]). None claims no ISRC.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tag_isrcs: Vec<String>,
+    /// The song's words as the catalog marks them where the person listened from: explicit (1),
+    /// the clean edit (3) or neither (0), as `explicit_status::from_catalog` reads them. None when
+    /// the catalog does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit: Option<i32>,
 }
 
 impl HeardRecording {
@@ -367,6 +388,10 @@ pub enum Acceptance {
     Sound,
     /// The master that played, window by window, both ways.
     HeardMaster,
+    /// The take that played, perhaps in another master or mix of it: its print within
+    /// [`SAME_TAKE_AT_MOST`] of the heard print, as long as the song, and nothing about it naming
+    /// another song or another version.
+    SameTake,
 }
 
 /// Which recording-level tags (MusicBrainz recording id, ISRC) an accepted file may carry.
@@ -429,6 +454,16 @@ pub struct FileLabels {
     pub recording_id: Option<String>,
 }
 
+/// A file's own names, which can only refuse it as the same take: its title and album as its
+/// labels give them, and its file name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileNames {
+    pub title: Option<String>,
+    pub album: Option<String>,
+    /// The file's name without its extension.
+    pub file: Option<String>,
+}
+
 /// What MusicBrainz said about one question the gate needed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MusicBrainzFact<T> {
@@ -456,6 +491,9 @@ pub struct FileFacts {
     pub current_recordings: Vec<(String, MusicBrainzFact<String>)>,
     /// The recordings MusicBrainz lists for each asked code.
     pub isrc_recordings: Vec<(String, MusicBrainzFact<Vec<AnswerRecording>>)>,
+    /// The file's length in seconds, when its container gives one.
+    pub seconds: Option<f64>,
+    pub names: FileNames,
 }
 
 impl FileFacts {
@@ -469,6 +507,8 @@ impl FileFacts {
             heard_master: None,
             current_recordings: Vec::new(),
             isrc_recordings: Vec::new(),
+            seconds: None,
+            names: FileNames::default(),
         }
     }
 }
@@ -632,6 +672,7 @@ pub fn became(
         artist_ids,
         from_unclear: false,
         tag_isrcs: Vec::new(),
+        explicit: catalog.explicit,
     };
     let again = read_answer(answer, &r, min_score);
     let tag = (again.reading == Reading::Clear && dominant.weight >= i64::from(MIN_SOURCES_TO_CONFIRM))
@@ -811,13 +852,15 @@ impl HeartGate {
     ///    not clear), ambiguous leaves it undecided, another recording, no entry and an unlinked
     ///    fingerprint refuse it. A busy lookup holds; a file AcoustID cannot read is refused; with
     ///    AcoustID off the file is undecided.
+    /// 8. The same take: a file steps 5 to 7 would keep the heard copy for, or refuse as another
+    ///    recording of R's song, no entry or an unlinked fingerprint, is accepted when it is the
+    ///    take that played ([`HeartGate::same_take`]).
     ///
     /// Before the file's reading names another recording, a dominant recording of R's song
     /// outside R is asked of MusicBrainz, since AcoustID never follows MusicBrainz's merges.
     /// Undecided keeps the heard copy when something was heard, else holds "not yet proven".
     pub fn judge(&self, facts: &FileFacts, min_score: f64) -> Judgement {
         let catalog = self.r.clone().unwrap_or_default();
-        let heard = self.heard_usable();
         if self.proof_two_applies()
             && facts
                 .heard_distance
@@ -836,7 +879,7 @@ impl HeartGate {
             }
             _ => {}
         }
-        if heard && facts.identical {
+        if self.heard_usable() && facts.identical {
             return accept(Acceptance::HeardAudio, self.heard_tag(&catalog));
         }
 
@@ -848,16 +891,32 @@ impl HeartGate {
             _ => (None, catalog),
         };
         let findings = label_findings(reading.as_ref(), facts, &r);
+        let exact = self.exact_verdict(facts, reading.as_ref(), &r, &findings);
+        if same_take_may_replace(&exact) && self.same_take(facts, reading.as_ref(), &r, &findings) {
+            return accept(Acceptance::SameTake, self.heard_tag(&r));
+        }
+        exact
+    }
 
-        let master_may_accept = heard && reading.as_ref().is_none_or(|f| f.reading != Reading::Another);
+    /// Steps 4 to 7 of [`HeartGate::judge`], once the file's reading and its labels' findings are
+    /// known.
+    fn exact_verdict(
+        &self,
+        facts: &FileFacts,
+        reading: Option<&AnswerReading>,
+        r: &HeardRecording,
+        findings: &[LabelCheck],
+    ) -> Judgement {
+        let heard = self.heard_usable();
+        let master_may_accept = heard && reading.is_none_or(|f| f.reading != Reading::Another);
         let names_other_song = findings.contains(&LabelCheck::NamesAnother { other_song: true });
         if master_may_accept && !names_other_song {
-            if let Some(waiting) = unsettled(&findings) {
+            if let Some(waiting) = unsettled(findings) {
                 return waiting;
             }
             match facts.heard_master {
                 None => return Judgement::Needs(Need::HeardMaster),
-                Some(HeardMaster::Same) => return accept(Acceptance::HeardMaster, self.heard_tag(&r)),
+                Some(HeardMaster::Same) => return accept(Acceptance::HeardMaster, self.heard_tag(r)),
                 Some(HeardMaster::Busy) => return hold(WaitingFor::Shim),
                 Some(HeardMaster::Differs | HeardMaster::Undecided | HeardMaster::HeardGone) => {}
             }
@@ -869,7 +928,7 @@ impl HeartGate {
         {
             return refuse(Refusal::Label);
         }
-        if let Some(waiting) = unsettled(&findings) {
+        if let Some(waiting) = unsettled(findings) {
             return waiting;
         }
         let undecided = Judgement::Verdict(GateVerdict::Undecided(if heard {
@@ -906,6 +965,59 @@ impl HeartGate {
         }
     }
 
+    /// Whether a file is the take that played, all of these holding:
+    ///
+    /// - something was heard and the file's distance from it can refuse it (proof 2), and the
+    ///   file's distance is at most [`SAME_TAKE_AT_MOST`];
+    /// - AcoustID read the file: with AcoustID off, busy or unable to read it, nothing changes;
+    /// - the file's length is within the larger of [`SAME_TAKE_LENGTH_SECONDS`] and
+    ///   [`SAME_TAKE_LENGTH_SHARE`] of the song's ([`HeartGate::heard_seconds`]);
+    /// - the song is not marked explicit or the clean edit: the two sound alike, so either keeps
+    ///   the exact rule;
+    /// - no label and no reading of the file names another song;
+    /// - the file's own names add no version the heard title does not carry
+    ///   ([`names_another_version`]).
+    fn same_take(
+        &self,
+        facts: &FileFacts,
+        reading: Option<&AnswerReading>,
+        r: &HeardRecording,
+        findings: &[LabelCheck],
+    ) -> bool {
+        let Some(reading) = reading else {
+            return false;
+        };
+        self.heard_usable()
+            && self.proof_two_applies()
+            && facts
+                .heard_distance
+                .is_some_and(|distance| distance <= SAME_TAKE_AT_MOST)
+            && self.same_length(facts.seconds)
+            && !matches!(
+                r.explicit,
+                Some(explicit_status::EXPLICIT | explicit_status::CLEAN)
+            )
+            && !findings.contains(&LabelCheck::NamesAnother { other_song: true })
+            && reading
+                .dominant()
+                .is_none_or(|dominant| same_song(reading, r, dominant))
+            && !names_another_version(&facts.names, r)
+    }
+
+    /// Whether a file of `seconds` is as long as the song: within the larger of
+    /// [`SAME_TAKE_LENGTH_SECONDS`] and [`SAME_TAKE_LENGTH_SHARE`] of its length. Never when
+    /// either length is unknown.
+    fn same_length(&self, seconds: Option<f64>) -> bool {
+        let (Some(file), Some(song)) = (
+            seconds.filter(|seconds| *seconds > 0.0),
+            self.heard_seconds.filter(|seconds| *seconds > 0),
+        ) else {
+            return false;
+        };
+        let song = f64::from(song);
+        (file - song).abs() <= (SAME_TAKE_LENGTH_SHARE * song).max(SAME_TAKE_LENGTH_SECONDS)
+    }
+
     /// Something was heard that may be the song: not a heart never played, and not a stream that
     /// stood in with another song.
     fn heard_usable(&self) -> bool {
@@ -940,6 +1052,58 @@ impl HeartGate {
             _ => TagClaim::AsHeard,
         }
     }
+}
+
+/// Whether the exact rule's verdict is one a same-take file is accepted in place of: the heard
+/// copy kept, or a refusal for another recording (by AcoustID or a label), no entry or an
+/// unlinked fingerprint. Another song is left to [`HeartGate::same_take`], which refuses it.
+fn same_take_may_replace(judgement: &Judgement) -> bool {
+    matches!(
+        judgement,
+        Judgement::Verdict(
+            GateVerdict::Undecided(Undecided::KeepHeardCopy)
+                | GateVerdict::Refuse(
+                    Refusal::Label | Refusal::AnotherRecording | Refusal::NoEntry | Refusal::Unknown
+                )
+        )
+    )
+}
+
+/// Whether a file's own names add a version the heard title (R's) does not carry: live,
+/// acoustic, demo, instrumental, karaoke, cover, sped up, slowed, nightcore, remix, edit,
+/// extended, or any other marker [`SongIdentity`] reads as a different recording, and the
+/// explicit word. Only another mix of the take and a bare "version" say nothing. The title and
+/// the file name are read as titles; the album is read whole, since a release's name says what
+/// kind it is anywhere in it ("Live at the BBC").
+fn names_another_version(names: &FileNames, r: &HeardRecording) -> bool {
+    let options = SongMatchOptions {
+        also_neutral: SAME_TAKE_NEUTRAL.iter().map(|word| word.to_string()).collect(),
+        ..Default::default()
+    };
+    let versions = |title: &SongTitle| -> BTreeSet<String> {
+        let mut versions = SongIdentity::distinct_versions(title, Some(&options));
+        if title
+            .versions
+            .iter()
+            .any(|version| version == explicit_status::EXPLICIT_WORD)
+        {
+            versions.insert(explicit_status::EXPLICIT_WORD.to_string());
+        }
+        versions
+    };
+    let artist = Some(r.artist.as_str()).filter(|artist| !artist.trim().is_empty());
+    let heard = versions(&SongIdentity::parse_title(&r.title, artist));
+    let mut read: Vec<SongTitle> = [&names.title, &names.file]
+        .into_iter()
+        .flatten()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| SongIdentity::parse_title(name, artist))
+        .collect();
+    if let Some(album) = names.album.as_deref().filter(|album| !album.trim().is_empty()) {
+        read.push(SongIdentity::parse_title(&format!("({album})"), None));
+    }
+    read.iter()
+        .any(|title| versions(title).iter().any(|version| !heard.contains(version)))
 }
 
 /// The file's own reading against R. When it names another recording because a recording of R's

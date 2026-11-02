@@ -97,6 +97,10 @@ fn words(verdict: &GateVerdict) -> String {
             by: Acceptance::Sound,
             ..
         } => "accept: sound alone".into(),
+        GateVerdict::Accept {
+            by: Acceptance::SameTake,
+            ..
+        } => "accept: the same take".into(),
         GateVerdict::Refuse(Refusal::DiffersFromHeard) => "refuse: proof 2".into(),
         GateVerdict::Refuse(Refusal::Label) => "refuse: a label names another recording".into(),
         GateVerdict::Refuse(Refusal::AnotherRecording) => "refuse: AcoustID names another recording".into(),
