@@ -82,6 +82,12 @@ struct Pipeline {
     asked: Arc<Mutex<Vec<Asked>>>,
     placed: Arc<Mutex<Vec<HeldPlacement>>>,
     dropped: Arc<Mutex<Vec<(HeldPlacement, Vec<String>)>>>,
+    /// The next drop of a kept copy fails (its record could not be written), when set.
+    drops_failing: Arc<Mutex<Option<()>>>,
+    /// Titles whose file a hearted song's gates take half a second to judge.
+    slow: Arc<Mutex<HashSet<String>>>,
+    /// Held while placing a held file must wait.
+    place_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Pipeline {
@@ -214,6 +220,10 @@ impl IDownloadService for Pipeline {
         });
         // The file judged is the one offered: a take of the song is refused by its own name.
         let named = |set: &HashSet<String>| set.iter().any(|title| file.ends_with(&format!(" - {title}")));
+        let slow = !place.gates.is_empty() && named(&self.slow.lock());
+        if slow {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
         if !place.gates.is_empty() {
             if named(&self.refused_for_hearts.lock()) {
                 for gate in &place.gates {
@@ -238,6 +248,7 @@ impl IDownloadService for Pipeline {
                     waiting_for: octo_core::fingerprint::heart_gate::WaitingFor::AcoustId,
                     line: "Waiting for AcoustID".into(),
                     files: vec![held.to_string_lossy().into_owned()],
+                    lidarr: Vec::new(),
                     users: place.gates.iter().map(|gate| gate.user.clone()).collect(),
                 }
                 .into());
@@ -263,6 +274,9 @@ impl IDownloadService for Pipeline {
     }
 
     async fn drop_held(&self, held: &HeldPlacement, users: &[String]) -> bool {
+        if self.drops_failing.lock().take().is_some() {
+            return false;
+        }
         let _ = std::fs::remove_file(&held.held_path);
         self.dropped.lock().push((held.clone(), users.to_vec()));
         true
@@ -284,13 +298,32 @@ impl IDownloadService for Pipeline {
         None
     }
 
-    async fn place_held(&self, held: &HeldPlacement) -> Option<String> {
-        if let Some(dir) = Path::new(&held.target).parent() {
-            std::fs::create_dir_all(dir).ok()?;
+    fn held_root(&self) -> Option<PathBuf> {
+        Some(self.root.join(".octo-incoming/held"))
+    }
+
+    /// As the shared library places a held file: a kept copy whose song's Lidarr file passed the
+    /// gate of someone it was kept for gives way to that file instead.
+    async fn place_held(&self, held: &HeldPlacement) -> crate::services::i_download_service::HeldEnd {
+        use crate::services::i_download_service::HeldEnd;
+        let _wait = self.place_gate.lock().await;
+        if held.kept && !held.proven_for.is_empty() {
+            return if self.drop_held(held, &held.proven_for).await {
+                HeldEnd::GaveWay
+            } else {
+                HeldEnd::Later
+            };
         }
-        std::fs::rename(&held.held_path, &held.target).ok()?;
+        if let Some(dir) = Path::new(&held.target).parent()
+            && std::fs::create_dir_all(dir).is_err()
+        {
+            return HeldEnd::Later;
+        }
+        if std::fs::rename(&held.held_path, &held.target).is_err() {
+            return HeldEnd::Later;
+        }
         self.placed.lock().push(held.clone());
-        Some(held.target.clone())
+        HeldEnd::Placed(held.target.clone())
     }
 
     async fn get_local_path_if_exists(&self, _: &str, _: &str) -> Option<String> {
@@ -339,6 +372,14 @@ struct Fixture {
     placed: Arc<Mutex<Vec<HeldPlacement>>>,
     /// The kept copies the pipeline dropped for a proven one, and for whom.
     dropped: Arc<Mutex<Vec<(HeldPlacement, Vec<String>)>>>,
+    /// The next drop of a kept copy fails, when set.
+    drops_failing: Arc<Mutex<Option<()>>>,
+    /// Titles whose file the pipeline takes half a second to judge.
+    slow: Arc<Mutex<HashSet<String>>>,
+    /// Held while placing a held file must wait.
+    place_gate: Arc<tokio::sync::Mutex<()>>,
+    /// The settings of the service built last.
+    settings: Mutex<Option<Arc<SettingsStore>>>,
 }
 
 /// How a test's service is built beyond the defaults.
@@ -408,7 +449,16 @@ impl Fixture {
             tracker: Arc::new(AcquisitionTracker::new(None, Clock::system())),
             placed: Arc::default(),
             dropped: Arc::default(),
+            drops_failing: Arc::default(),
+            slow: Arc::default(),
+            place_gate: Arc::default(),
+            settings: Mutex::new(None),
         }
+    }
+
+    /// The settings of the service built last, which a test may change while it runs.
+    fn settings(&self) -> Arc<SettingsStore> {
+        self.settings.lock().clone().expect("a service was built")
     }
 
     /// Lidarr's next search of Mezzanine grabs one download of these tracks, finished at once and
@@ -463,6 +513,7 @@ impl Fixture {
             .octo_root
             .unwrap_or_else(|| self.root.path().to_path_buf());
         settings.set_raw("Library:DownloadPath", Some(&octo_root.to_string_lossy()));
+        *self.settings.lock() = Some(settings.clone());
         let identity = NavidromeIdentityService::new(settings.clone(), reqwest::Client::new());
 
         let metadata = self.metadata.clone();
@@ -530,6 +581,9 @@ impl Fixture {
             asked: self.asked.clone(),
             placed: self.placed.clone(),
             dropped: self.dropped.clone(),
+            drops_failing: self.drops_failing.clone(),
+            slow: self.slow.clone(),
+            place_gate: self.place_gate.clone(),
         });
         let client = Arc::new(LidarrClient::new(settings.clone()));
         client.set_metadata_poll(Duration::from_millis(20));
@@ -611,10 +665,13 @@ impl Fixture {
     }
 
     /// Every request that could change Lidarr, as `METHOD path?query`.
+    /// Every request that changed Lidarr, in order. A health check, which Octo has Lidarr queue
+    /// for the time Lidarr stamps on it, changes nothing.
     fn changes(&self) -> Vec<String> {
         self.lidarr
             .changes()
             .iter()
+            .filter(|r| r.body.as_ref().is_none_or(|body| body["name"] != "CheckHealth"))
             .map(|r| format!("{} {}", r.method, r.path))
             .collect()
     }

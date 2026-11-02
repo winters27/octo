@@ -38,7 +38,13 @@ pub struct AcquisitionWorker {
     /// The family pool: a finished download is linked for every member who asked, however
     /// late they joined. Without it, or with Family off, nothing changes.
     family: Option<Arc<dyn FamilyPlacement>>,
+
+    /// Frees the heard-copy places the rounds of a finished download hold, by its key.
+    end_rounds: Option<EndRounds>,
 }
+
+/// Frees the heard-copy places the open rounds of an acquisition hold, by the acquisition's key.
+pub type EndRounds = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl AcquisitionWorker {
     pub fn new(
@@ -55,12 +61,20 @@ impl AcquisitionWorker {
             notifications,
             concurrency,
             family: None,
+            end_rounds: None,
         }
     }
 
     /// The same worker, settling members' downloads in the family pool.
     pub fn with_family(mut self, family: Arc<dyn FamilyPlacement>) -> Self {
         self.family = Some(family);
+        self
+    }
+
+    /// The same worker, freeing each finished download's heard-copy places with `end_rounds`:
+    /// a chain waiting in the queue for its next step never keeps one.
+    pub fn with_end_rounds(mut self, end_rounds: EndRounds) -> Self {
+        self.end_rounds = Some(end_rounds);
         self
     }
 
@@ -136,6 +150,9 @@ impl AcquisitionWorker {
             .await
         }
         .unwrap_or_else(|_| Err(anyhow::anyhow!("the acquisition panicked")));
+        if let Some(end_rounds) = &self.end_rounds {
+            end_rounds(&request.key());
+        }
 
         // Hearts and plays that joined with a gate of their own count the file only when that
         // gate passed it.
@@ -163,6 +180,10 @@ impl AcquisitionWorker {
 
         match attempt {
             Ok(path) => {
+                // Released first, as a failure is: a joiner whose own gate never judged the file
+                // runs its own step at once, and must never join this finished request again. The
+                // next request of the song waiting behind this one judges this file first.
+                self.queue.release_landed(&request, Some(&path));
                 request.completion.try_set_result(path.clone());
                 info!(
                     "Acquisition finished for {}:{} -> {path}",

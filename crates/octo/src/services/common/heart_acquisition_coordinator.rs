@@ -1,6 +1,6 @@
 //! The heart acquisition coordinator: which source a heart or a play is handed to.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -22,10 +22,10 @@ use super::acquisition_tracker::key_of;
 use super::album_gates::{
     AlbumGate, AlbumGateHold, AlbumGateTrack, AlbumGates, TrackFiling, tracks_wait_line,
 };
-use super::soulseek_hold_store::{HeldAlbumTrack, Holder};
+use super::soulseek_hold_store::{HeldAlbumTrack, HeldLidarrFile, Holder};
 use super::{
-    AcquisitionHeld, AcquisitionState, AcquisitionTarget, AcquisitionTracker, HeldAcquisition, HeldKind,
-    SoulseekHoldStore, StarOnArrival,
+    AcquisitionHeld, AcquisitionState, AcquisitionTarget, AcquisitionTracker, HeldAcquisition, HeldFiles,
+    HeldKind, SoulseekHoldStore, StarOnArrival,
 };
 use crate::services::family::{FamilyPool, LibraryScope, LibraryWriteGate, WriteDecision};
 use crate::services::fingerprint::MusicBrainzClient;
@@ -57,6 +57,18 @@ pub enum GateStart {
         line: String,
         question: Option<String>,
     },
+    /// The heart ends before any source runs, with the line the downloads row shows: nothing
+    /// could ever prove a copy for it.
+    End { gate: HeartGate, line: String },
+}
+
+/// Why no gate of a chain is ready to run its sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateStop {
+    /// Every holder holds; the first wait.
+    Held(WaitingFor),
+    /// Every holder's heart ended, with this line.
+    Ended(String),
 }
 
 /// Builds each heart's, play's or import's gate before its sources run, one per person who
@@ -76,11 +88,28 @@ pub trait HeartGates: Send + Sync {
     /// hold waits for is asked again until it answers.
     fn on_filed(&self, _record: &HeldAcquisition, _user: &str) {}
 
+    /// The hold `key` runs again once `waiting_for` answers for `user` (who heard `heard`;
+    /// `question` the MusicBrainz question that did not answer), whatever the hold itself waits
+    /// for: a held album track whose check of a new play met a busy answer keeps that play.
+    fn wake_for(
+        &self,
+        _key: &str,
+        _waiting_for: WaitingFor,
+        _user: &str,
+        _heard: Option<&HeardRecord>,
+        _question: Option<String>,
+    ) {
+    }
+
     /// Opens one heard-master round per gate for one pass of the chain over the acquisition
     /// `acquisition_key`; the rounds end when what this returns is dropped.
     fn open_rounds(&self, _acquisition_key: &str, _gates: &[HeartGate]) -> Box<dyn Send> {
         Box::new(())
     }
+
+    /// The open rounds of `acquisition_key` give their heard-copy places back before the chain
+    /// waits in the queue; the next check makes each copy again.
+    fn pause_rounds(&self, _acquisition_key: &str) {}
 
     /// Whether `gate` proves the person's library copy at `path` is the version they heard: its
     /// own clear reading against R, or the very master that played. Without a way to judge it,
@@ -104,12 +133,29 @@ pub trait HeartGates: Send + Sync {
         self.build(provider, external_id, holder, origin).await
     }
 
-    /// Judges one held file of a hearted album's track with these gates by the album's rule,
-    /// fetching nothing else: one verdict per gate. `acquisition_key` finds each person's open
-    /// heard-master round. Without a way to judge it, no gate judges it and it stays held.
+    /// Judges one held file of a hearted album's track with these gates by the album's rule, its
+    /// labels read from `labels`, fetching nothing else: one verdict per gate. `acquisition_key`
+    /// finds each person's open heard-master round. Without a way to judge it, no gate judges it
+    /// and it stays held.
     async fn judge_held(
         &self,
         _path: &str,
+        _labels: LabelSource,
+        _acquisition_key: &str,
+        _gates: &[HeartGate],
+    ) -> Vec<GateVerdict> {
+        Vec::new()
+    }
+
+    /// Judges a file with each gate as a fresh download's file is judged, its labels read from
+    /// `labels`: a file another acquisition landed, which these gates' chain joined and nobody
+    /// judged for them, or a held album track's file for those in it by their heart of the song.
+    /// One verdict per gate. `acquisition_key` finds each person's open heard-master round.
+    /// Without a way to judge it, no gate judges it.
+    async fn judge_landed(
+        &self,
+        _path: &str,
+        _labels: LabelSource,
         _acquisition_key: &str,
         _gates: &[HeartGate],
     ) -> Vec<GateVerdict> {
@@ -133,11 +179,6 @@ pub trait HeartGates: Send + Sync {
             None,
         )
     }
-
-    /// Notes files Lidarr brought that now wait in the one hold path, with where their labels
-    /// were read from, so a later judgment of them reads the same labels. Nothing without a way
-    /// to judge them.
-    fn held_from_lidarr(&self, _files: &[String], _labels: &LabelSource) {}
 }
 
 /// The coordinator's optional collaborators, each `None` by default.
@@ -174,6 +215,13 @@ pub struct HeartCoordinatorExtras {
     pub album_gates: Option<Arc<AlbumGates>>,
     /// The catalog a hearted album's tracks are listed from; without it, Family's.
     pub metadata: Option<Arc<dyn IMusicMetadataService>>,
+    /// The library's own record of each file it placed, which says whose keep a kept file is.
+    /// Without it, no keep counts as landed before a restart.
+    pub library: Option<Arc<dyn crate::services::local::ILocalLibraryService>>,
+    /// Whether Deezer's last call answered: the count of times it answered again after a call it
+    /// did not answer, or None while its last call went unanswered. Without it, a hold for Deezer
+    /// waits for the next such answer.
+    pub deezer_answering: Option<Arc<dyn Fn() -> Option<u64> + Send + Sync>>,
 }
 
 /// How one song's heart chain ended.
@@ -195,14 +243,23 @@ pub enum TrackOutcome {
 
 /// Whether a gate or a download holding for `waiting_for` files a hold record for `origin`.
 /// Plays never hold, and neither does a family request, whose own state answers the member; an
-/// import waiting for MusicBrainz is put back on the trickle instead, its wait being the import
-/// matcher's own.
+/// import waiting for MusicBrainz or Deezer is put back on the trickle instead, to be asked again
+/// on its next turn.
 fn files_hold(origin: AcquisitionOrigin, waiting_for: WaitingFor) -> bool {
     match origin {
         AcquisitionOrigin::Play | AcquisitionOrigin::Request => false,
-        AcquisitionOrigin::Import => waiting_for != WaitingFor::MusicBrainz,
+        AcquisitionOrigin::Import => !trickle_waits(waiting_for),
         _ => true,
     }
+}
+
+/// Whether an import waiting for this goes back on the trickle: an answer from MusicBrainz or
+/// Deezer, or a sound `fpcalc` could not read, which the trickle's next turn tries again.
+fn trickle_waits(waiting_for: WaitingFor) -> bool {
+    matches!(
+        waiting_for,
+        WaitingFor::MusicBrainz | WaitingFor::Deezer | WaitingFor::SoundUnread
+    )
 }
 
 /// What a chain notes in `filed` for a holder whose gate did not pass the file that landed: they
@@ -226,6 +283,9 @@ pub const KEPT_BESIDE_OWNED: &str = "You already had a copy; Octo kept the versi
 /// The downloads line of a play over a library copy: nothing is downloaded.
 pub const PLAY_OVER_OWNED: &str =
     "You already have this song; Octo could not check it is the version you heard";
+/// The downloads line of a heart that waited for MusicBrainz, which gave up on its question, and
+/// ended with nothing.
+pub const MUSIC_BRAINZ_GAVE_UP: &str = "MusicBrainz could not answer for this song";
 
 /// How a heart's chain ended when no source brought a file its gates passed.
 struct ChainEnd<'a> {
@@ -254,6 +314,11 @@ fn keep_gates(gates: &[HeartGate]) -> Vec<HeartGate> {
         .collect()
 }
 
+/// What a running heart chain or play holds of what its people heard, for as long as it runs: each
+/// heard copy under an id of the run's own (a hold keeps the same copy under the person's id, which
+/// no run's end frees) and each heard sample, so no sweep, cap or re-pin takes them meanwhile.
+type HeldWhileRunning = crate::services::prefetch::heard_samples::RunHold;
+
 /// The line a held row shows when its hold kept none of its own.
 pub(crate) fn waiting_line(waiting_for: WaitingFor) -> &'static str {
     match waiting_for {
@@ -264,6 +329,9 @@ pub(crate) fn waiting_line(waiting_for: WaitingFor) -> &'static str {
         WaitingFor::Deezer => "Waiting for Deezer",
         WaitingFor::Shim => "Waiting for YouTube",
         WaitingFor::NotYetProven => "Play it once so Octo can keep the version you hear",
+        WaitingFor::SoundUnread => {
+            crate::services::fingerprint::download_verification_service::SOUND_NOT_READ
+        }
     }
 }
 
@@ -317,6 +385,35 @@ pub struct HeartAcquisitionCoordinator {
 
     // The holds whose acquisition is running again now, by key: a second resume waits for it.
     resuming: Mutex<HashSet<String>>,
+
+    // The holds woken again while they ran (a joiner, a new heard source, an answer): each runs
+    // once more when its run ends, so no wake is lost.
+    again: Mutex<HashSet<String>>,
+    // The holds whose MusicBrainz question was given up on, each with its song's provider and id:
+    // the run that serves that wake says so on the song's row, by what its last pass came to.
+    gave_up: Mutex<std::collections::HashMap<String, (String, String)>>,
+
+    // Told each time a hold's run lets go of it, so a recheck that found one going waits for it.
+    run_ended: tokio::sync::Notify,
+
+    // Held album tracks whose recheck waits for Deezer's next answer.
+    deezer_waits: Mutex<HashSet<String>>,
+
+    // The hold whose turn it is to run once Deezer answers again: holds waiting for Deezer run one
+    // at a time, the one served longest ago first, the next once this one gets past Deezer or
+    // Deezer answers another call while this one still fails.
+    deezer_turn: Mutex<Option<String>>,
+
+    // For each hold waiting for Deezer, Deezer's answer count when its last turn began: a hold has
+    // one turn per count, so one that keeps failing for its own reason never starves the rest.
+    deezer_turns: Mutex<HashMap<String, u64>>,
+
+    // How many times Deezer was said to answer again, the count read without a way to ask Deezer.
+    deezer_events: std::sync::atomic::AtomicU64,
+
+    // For each hold filed while Deezer was answering, how many times Deezer had answered again
+    // then: one that answered since runs it once more, and no more until it answers again.
+    deezer_seen: Mutex<HashMap<String, u64>>,
 }
 
 /// How long the album walk that follows a song heart waits for the hearted song to show in the
@@ -359,6 +456,14 @@ impl HeartAcquisitionCoordinator {
             landed_wait: Mutex::new(LandedSongWait::default()),
             me: me.clone(),
             resuming: Mutex::new(HashSet::new()),
+            again: Mutex::new(HashSet::new()),
+            run_ended: tokio::sync::Notify::new(),
+            gave_up: Mutex::new(std::collections::HashMap::new()),
+            deezer_waits: Mutex::new(HashSet::new()),
+            deezer_turn: Mutex::new(None),
+            deezer_turns: Mutex::new(HashMap::new()),
+            deezer_events: std::sync::atomic::AtomicU64::new(0),
+            deezer_seen: Mutex::new(HashMap::new()),
         })
     }
 
@@ -527,6 +632,7 @@ impl HeartAcquisitionCoordinator {
                     owner,
                     &target,
                     Vec::new(),
+                    None,
                 );
             }
             if lidarr {
@@ -554,6 +660,18 @@ impl HeartAcquisitionCoordinator {
         let (provider, external_id, requested_by) = owned3(provider, external_id, requested_by);
         let (client_id, owner) = (client_id.map(str::to_string), owner.map(str::to_string));
         tokio::spawn(async move {
+            // What the play heard is kept from before its gate is built until its download, and
+            // any keep of what it played, ends.
+            let player = Holder {
+                user: requested_by
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .to_string(),
+                heard: heard.clone(),
+                ..Default::default()
+            };
+            let held = coordinator.hold_while_running(&provider, &external_id, &[player], true);
             // A play never downloads over a copy already in the library: its row says so.
             if coordinator
                 .play_over_owned(
@@ -620,6 +738,7 @@ impl HeartAcquisitionCoordinator {
                             owner.as_deref(),
                             &target,
                             gates,
+                            held,
                         )
                         .await
                 } else {
@@ -632,6 +751,7 @@ impl HeartAcquisitionCoordinator {
                         owner.as_deref(),
                         &target,
                         gates,
+                        held,
                     );
                 }
             }
@@ -641,6 +761,25 @@ impl HeartAcquisitionCoordinator {
     /// Whether AcoustID is on; without a way to ask, it counts as on.
     fn acoust_id_is_on(&self) -> bool {
         self.extras.acoust_id_on.as_ref().is_none_or(|on| on())
+    }
+
+    /// The gate of `user`'s family request for a song fetched at one quality, built as every
+    /// request's is: R from the catalog, so the reading's refusals apply to its file. A request
+    /// never holds: what its gate would wait for, it goes on without. Empty when no gates are
+    /// built.
+    pub async fn request_gates(&self, provider: &str, external_id: &str, user: &str) -> Vec<HeartGate> {
+        let Some(builder) = self.extras.gates.clone() else {
+            return Vec::new();
+        };
+        let holder = self.holder_for(external_id, Some(user));
+        match builder
+            .build(provider, external_id, &holder, AcquisitionOrigin::Request)
+            .await
+        {
+            GateStart::Ready(gate) | GateStart::Hold { gate, .. } | GateStart::End { gate, .. } => {
+                vec![gate]
+            }
+        }
     }
 
     /// A play's gate, built from what this play itself played (never another play's), when
@@ -669,6 +808,8 @@ impl HeartAcquisitionCoordinator {
             GateStart::Hold {
                 gate, waiting_for, ..
             } => Err(Box::new((gate, waiting_for))),
+            // A play is never ended this way; with nothing to prove, it fetches nothing.
+            GateStart::End { gate, .. } => Err(Box::new((gate, WaitingFor::NotYetProven))),
         }
     }
 
@@ -694,7 +835,11 @@ impl HeartAcquisitionCoordinator {
             "The play of {provider}:{external_id} downloads nothing: the library has {}",
             copy.absolute_path
         );
-        if let Some(tracker) = self.tracker() {
+        // A held song's row keeps the line it waits with: the play leaves it alone.
+        if let Some(tracker) = self
+            .tracker()
+            .filter(|tracker| !tracker.is_held(provider, external_id))
+        {
             tracker.begin(
                 provider,
                 external_id,
@@ -705,8 +850,8 @@ impl HeartAcquisitionCoordinator {
                 Some(&song.album),
             );
             tracker.done_line(provider, external_id, PLAY_OVER_OWNED);
+            self.settle(provider, external_id, &copy);
         }
-        self.settle(provider, external_id, &copy);
         true
     }
 
@@ -744,6 +889,8 @@ impl HeartAcquisitionCoordinator {
         }
     }
 
+    /// Queues a play's download, judged by its gates. `held` is what the play heard, kept since
+    /// before its gate was built; without it, what its gates heard is kept from here.
     #[allow(clippy::too_many_arguments)] // the play's facts, whose library it is for and its gate
     fn queue_play_download(
         &self,
@@ -755,8 +902,16 @@ impl HeartAcquisitionCoordinator {
         owner: Option<&str>,
         target: &AcquisitionTarget,
         gates: Vec<HeartGate>,
+        held: Option<HeldWhileRunning>,
     ) {
         let on_queued = || {
+            // A held song's row keeps the line it waits with: a play never takes it over.
+            if self
+                .tracker()
+                .is_some_and(|tracker| tracker.is_held(provider, external_id))
+            {
+                return;
+            }
             // Same row a heart gets, opened before the worker can report its first stage.
             let routing = self
                 .extras
@@ -799,11 +954,24 @@ impl HeartAcquisitionCoordinator {
         ) else {
             return;
         };
+        // What the play heard is kept until its download, and any keep of what it played, ends.
+        let held = held.or_else(|| {
+            let heard_holders: Vec<Holder> = own_gates
+                .iter()
+                .map(|gate| Holder {
+                    user: gate.user.clone(),
+                    heard: gate.heard.clone(),
+                    ..Default::default()
+                })
+                .collect();
+            self.hold_while_running(provider, external_id, &heard_holders, true)
+        });
         let tracker = self.tracker().cloned();
         let coordinator = self.me.clone();
         let (provider, external_id) = (provider.to_string(), external_id.to_string());
         let (requested_by, target) = (requested_by.map(str::to_string), target.clone());
         tokio::spawn(async move {
+            let _held = held;
             let Err(reason) = request.completion.wait().await else {
                 return;
             };
@@ -820,10 +988,12 @@ impl HeartAcquisitionCoordinator {
                     .keep_play_heard(&provider, &external_id, requested_by.as_deref(), &target, gate)
                     .await;
             }
-            // A heart that joined owns the row, and may still be trying its next source.
+            // A heart that joined owns the row, and may still be trying its next source; a held
+            // song's row keeps the line it waits with.
             if !request.is_star
                 && !request.heart_joined()
                 && let Some(tracker) = tracker
+                && !tracker.is_held(&provider, &external_id)
             {
                 tracker.fail(&provider, &external_id, Some(&reason.to_string()));
             }
@@ -843,6 +1013,7 @@ impl HeartAcquisitionCoordinator {
         owner: Option<&str>,
         target: &AcquisitionTarget,
         gates: Vec<HeartGate>,
+        held: Option<HeldWhileRunning>,
     ) {
         let key = format!("{provider}:{external_id}");
         let Some(link) = self.extras.soulseek.clone() else {
@@ -864,6 +1035,7 @@ impl HeartAcquisitionCoordinator {
             owner,
             target,
             gates,
+            held,
         );
     }
 
@@ -1206,7 +1378,8 @@ impl HeartAcquisitionCoordinator {
                 ..Default::default()
             };
             let r = match builder.build(track_provider, &track_id, &holder, origin).await {
-                GateStart::Ready(gate) => gate.r.unwrap_or_else(named),
+                // An album track's gate never ends: it goes on with what is known of it.
+                GateStart::Ready(gate) | GateStart::End { gate, .. } => gate.r.unwrap_or_else(named),
                 // A family request never holds: the track goes on with what is known of it.
                 GateStart::Hold { gate, .. } if origin == AcquisitionOrigin::Request => {
                     gate.r.unwrap_or_else(named)
@@ -1242,9 +1415,26 @@ impl HeartAcquisitionCoordinator {
             origin,
             tracks,
         };
-        // Tracks already held for this album wait where they are: no walk fetches them again.
+        // Tracks already held for this album wait where they are: no walk fetches them again, and
+        // this person joins each of them by their album heart, so its proof or a keep lands it for
+        // them too. A song's own hold of one of its tracks that holds files is one of them: it
+        // becomes this album's held track. One holding no file is left to the walk, whose hold of
+        // the track joins it.
         let album_key = key_of(provider, album_external_id);
-        let settled: Vec<String> = self
+        let track_of = |record: &HeldAcquisition| {
+            gate.tracks
+                .iter()
+                .find(|track| track.catalog_track_id == record.external_id)
+                .map(|track| HeldAlbumTrack {
+                    album_key: album_key.clone(),
+                    song_ids: vec![track.catalog_track_id.clone()],
+                    artist: track.artist.clone(),
+                    title: track.title.clone(),
+                    duration_seconds: track.duration_seconds,
+                    r: track.r.clone(),
+                })
+        };
+        let held: Vec<(HeldAcquisition, Option<HeldAlbumTrack>)> = self
             .extras
             .holds
             .as_ref()
@@ -1252,16 +1442,71 @@ impl HeartAcquisitionCoordinator {
                 holds
                     .snapshot()
                     .into_iter()
-                    .filter(|record| {
-                        record
-                            .album_track
-                            .as_ref()
-                            .is_some_and(|track| track.album_key == album_key)
+                    .filter_map(|record| {
+                        let track = match &record.album_track {
+                            Some(track) if track.album_key == album_key => None,
+                            Some(_) => return None,
+                            None => {
+                                // A heart's own hold of the song only: an import's is judged as
+                                // one, never as an album's track.
+                                let song_hold = record.kind == HeldKind::Track
+                                    && record.waiting_for.is_some()
+                                    && record.origin() == AcquisitionOrigin::Heart
+                                    && eq_ignore_case(&record.provider, provider)
+                                    && record
+                                        .held_files
+                                        .iter()
+                                        .any(|file| std::path::Path::new(file).is_file());
+                                match track_of(&record) {
+                                    Some(track) if song_hold => Some(track),
+                                    _ => return None,
+                                }
+                            }
+                        };
+                        Some((record, track))
                     })
-                    .map(|record| record.external_id)
                     .collect()
             })
             .unwrap_or_default();
+        if let Some(holds) = self.extras.holds.as_ref() {
+            let joining: Vec<&(HeldAcquisition, Option<HeldAlbumTrack>)> = held
+                .iter()
+                .filter(|(record, _)| {
+                    !record.holders.iter().any(|holder| {
+                        eq_ignore_case(holder.user.trim(), user.trim())
+                            && holder
+                                .routes_in(record)
+                                .contains(&super::soulseek_hold_store::HoldRoute::Album)
+                    })
+                })
+                .collect();
+            for (record, track) in &joining {
+                holds.hold(HeldAcquisition {
+                    kind: record.kind,
+                    provider: record.provider.clone(),
+                    external_id: record.external_id.clone(),
+                    requested_by: record.requested_by.clone(),
+                    held_since_utc: record.held_since_utc,
+                    origin: record.origin,
+                    waiting_for: record.waiting_for,
+                    holders: vec![Holder {
+                        user: user.trim().to_string(),
+                        routes: vec![super::soulseek_hold_store::HoldRoute::Album],
+                        ..Default::default()
+                    }],
+                    album_track: track.clone(),
+                    ..Default::default()
+                });
+                info!(
+                    "{user} joins held {}, a track of their hearted album",
+                    record.key()
+                );
+            }
+            if !joining.is_empty() {
+                self.album_row(provider, album_external_id);
+            }
+        }
+        let settled: Vec<String> = held.into_iter().map(|(record, _)| record.external_id).collect();
         Ok(Some(store.register(provider, album_external_id, gate, settled)))
     }
 
@@ -1302,13 +1547,16 @@ impl HeartAcquisitionCoordinator {
         });
         if let Some(tracker) = self.tracker() {
             let owners: Vec<String> = kept.holders.iter().map(|holder| holder.user.clone()).collect();
-            tracker.hold_row(provider, album_external_id, &owners, line, false);
+            tracker.hold_album_row(provider, album_external_id, &owners, line, false);
         }
         info!("Holding album {}: {line}", kept.key());
         if waiting_for == WaitingFor::MusicBrainz
             && let Some(question) = question
         {
             self.re_ask_for(&kept.key(), &question);
+        }
+        if waiting_for == WaitingFor::Deezer {
+            self.deezer_filed(&kept.key());
         }
     }
 
@@ -1373,7 +1621,7 @@ impl HeartAcquisitionCoordinator {
             }
         }
         let keep_anyway = held.iter().any(HeldAcquisition::keeps_anyway);
-        tracker.hold_row(
+        tracker.hold_album_row(
             provider,
             album_external_id,
             &owners,
@@ -1414,7 +1662,7 @@ impl HeartAcquisitionCoordinator {
                 held.waiting_for,
                 vec![holder],
                 &held.line,
-                held.files.clone(),
+                Some(&held),
                 None,
                 &mut Vec::new(),
             );
@@ -1422,9 +1670,13 @@ impl HeartAcquisitionCoordinator {
         self.album_row(provider, album_external_id);
     }
 
-    /// `user` took their heart of an album back: they leave every held track of it, and a held
-    /// track nobody is left in ends, its files deleted. How many holds they left.
+    /// `user` took their heart of an album back: they leave every held track of it their album
+    /// heart keeps them in (one their heart of the song also keeps them in stays theirs), and every
+    /// song's own hold that heart joined, and a hold nobody is left in ends, its files deleted. A
+    /// held track that only song hearts keep now is the song's own hold again, off the album's
+    /// row. How many holds they left.
     pub fn leave_album_holds(&self, provider: &str, album_external_id: &str, user: &str) -> usize {
+        use super::soulseek_hold_store::HoldRoute;
         let Some(holds) = self.extras.holds.as_ref() else {
             return 0;
         };
@@ -1435,23 +1687,37 @@ impl HeartAcquisitionCoordinator {
                 .album_track
                 .as_ref()
                 .is_some_and(|track| track.album_key == album_key)
-                && record
+        }) {
+            if !self.leave_by_route(&record, user, HoldRoute::Album) {
+                continue;
+            }
+            left += 1;
+            if let Some(still) = holds.get(&record.key())
+                && !still
                     .holders
                     .iter()
-                    .any(|holder| eq_ignore_case(holder.user.trim(), user.trim()))
-        }) {
-            left += 1;
-            if holds.release_holder(&record.key(), user).is_none() {
-                info!(
-                    "{user} took back the album heart of held {}; it ends",
-                    record.key()
-                );
-                for file in &record.held_files {
-                    let _ = std::fs::remove_file(file);
-                }
+                    .any(|holder| holder.routes_in(&still).contains(&HoldRoute::Album))
+            {
+                holds.update(&record.key(), as_song_hold);
             }
-            if let Some(tracker) = self.tracker() {
-                tracker.release_row(&record.provider, &record.external_id, holds);
+            self.let_row_go(&record.provider, &record.external_id, user);
+        }
+        // A song's own hold they joined by this album heart while it held no file: the album it
+        // names is this one.
+        for record in holds.snapshot().into_iter().filter(|record| {
+            record.album_track.is_none()
+                && record.holders.iter().any(|holder| {
+                    eq_ignore_case(holder.user.trim(), user.trim())
+                        && by_album(holder, record)
+                        && holder
+                            .context
+                            .as_ref()
+                            .is_some_and(|context| key_of(provider, &context.catalog_album_id) == album_key)
+                })
+        }) {
+            if self.leave_by_route(&record, user, HoldRoute::Album) {
+                left += 1;
+                self.let_row_go(&record.provider, &record.external_id, user);
             }
         }
         // The album heart itself, held for an answer before any track was fetched.
@@ -1479,87 +1745,203 @@ impl HeartAcquisitionCoordinator {
         left
     }
 
-    /// A heart that was waiting for Soulseek when Octo restarted. Its saved start time
-    /// keeps the original deadline; the entry goes once the chain has finished either way.
+    /// A heart that was waiting for Soulseek when Octo restarted. Its saved start time keeps the
+    /// original deadline. Every person waiting in it runs their own chain again, and each leaves
+    /// the hold once their chain has finished either way.
     pub(crate) fn resume_track(self: &Arc<Self>, held: HeldAcquisition) {
-        let coordinator = Arc::clone(self);
-        tokio::spawn(async move {
-            let chain = coordinator
-                .acquire_track_for(
-                    &held.provider,
-                    &held.external_id,
-                    held.requested_by.as_deref(),
-                    Some(held.held_since_utc),
-                    &AcquisitionTarget::Shared,
-                    held.origin(),
-                )
-                .await;
-            coordinator.resumed(&held, chain);
-        });
+        for user in Self::outage_people(&held) {
+            let coordinator = Arc::clone(self);
+            let held = held.clone();
+            tokio::spawn(async move {
+                let chain = coordinator
+                    .acquire_track_for(
+                        &held.provider,
+                        &held.external_id,
+                        user.as_deref(),
+                        Some(held.held_since_utc),
+                        &AcquisitionTarget::Shared,
+                        held.origin(),
+                    )
+                    .await;
+                coordinator.resumed(&held, user.as_deref(), chain);
+            });
+        }
     }
 
     pub(crate) fn resume_album(self: &Arc<Self>, held: HeldAcquisition) {
-        let coordinator = Arc::clone(self);
-        tokio::spawn(async move {
-            let chain = coordinator
-                .acquire_album_as(
-                    &held.provider,
-                    &held.external_id,
-                    held.requested_by.as_deref(),
-                    Some(held.held_since_utc),
-                    held.origin(),
-                )
-                .await;
-            coordinator.resumed(&held, chain);
-        });
+        for user in Self::outage_people(&held) {
+            let coordinator = Arc::clone(self);
+            let held = held.clone();
+            tokio::spawn(async move {
+                let chain = coordinator
+                    .acquire_album_as(
+                        &held.provider,
+                        &held.external_id,
+                        user.as_deref(),
+                        Some(held.held_since_utc),
+                        held.origin(),
+                    )
+                    .await;
+                coordinator.resumed(&held, user.as_deref(), chain);
+            });
+        }
     }
 
-    /// The end of a resumed chain: a chain that failed is logged, and the entry goes either way.
-    fn resumed(&self, held: &HeldAcquisition, chain: anyhow::Result<()>) {
+    /// Whose chains a Soulseek outage's hold runs again: each person in it, or its one requester
+    /// when it lists nobody.
+    fn outage_people(held: &HeldAcquisition) -> Vec<Option<String>> {
+        if held.holders.is_empty() {
+            return vec![held.requested_by.clone()];
+        }
+        held.holders
+            .iter()
+            .map(|holder| Some(holder.user.clone()))
+            .collect()
+    }
+
+    /// The end of one person's resumed chain: a chain that failed is logged, and they leave the
+    /// hold either way; it ends once nobody is left.
+    fn resumed(&self, held: &HeldAcquisition, user: Option<&str>, chain: anyhow::Result<()>) {
         if let Err(e) = chain {
             warn!("Resumed {} failed: {e}", held.key());
         }
         if let Some(holds) = &self.extras.holds {
-            holds.release(&held.key());
+            self.leave_outage_hold(holds, &held.key(), user);
         }
     }
 
-    /// Runs the held acquisition `key` again now, once: as one acquisition, its first holder
-    /// starting it and every other holder joining with their own gate. A holder whose gate holds
-    /// again stays in a hold of that wait; everyone else leaves the record with the chain's end,
-    /// and the record ends when nobody is left. Nothing for a hold that waits out a Soulseek
-    /// outage (its own chain is waiting), for one already running again, or for no such hold.
+    /// Runs the held acquisition `key` again now: each holder's own chain, with their own gate, into
+    /// their own library, every one of them judging the files the hold kept. A holder whose gate
+    /// holds again stays in a hold of that wait; everyone else leaves the record with their chain's
+    /// end, and the record ends when nobody is left. A wake that comes while it runs (a joiner, a new
+    /// heard source, an answer) runs it once more when the run ends. Nothing for a hold that waits
+    /// out a Soulseek outage (its own chain is waiting), or for no such hold.
     pub(crate) fn resume_held(self: &Arc<Self>, key: &str) {
-        let Some(record) = self.extras.holds.as_ref().and_then(|holds| holds.get(key)) else {
-            return;
-        };
-        if record.waiting_for.is_none() || !self.resuming.lock().insert(key.to_string()) {
+        if !self.claim_run(key) {
             return;
         }
         info!("Resuming held {key}");
-        self.checked_again(&record);
         let coordinator = Arc::clone(self);
         let key = key.to_string();
-        tokio::spawn(async move {
-            coordinator.run_held(&record).await;
-            coordinator.resuming.lock().remove(&key);
-            coordinator.keeps_after(&key, &record.keep_requested).await;
-        });
+        tokio::spawn(async move { coordinator.run_claimed(&key).await });
     }
 
-    /// [`Self::resume_held`] run to its end here; nothing when it already runs.
+    /// [`Self::resume_held`] run to its end here; when it already runs, that run runs once more
+    /// and this waits until it has.
     pub(crate) async fn recheck_held(&self, key: &str) {
-        let Some(record) = self.extras.holds.as_ref().and_then(|holds| holds.get(key)) else {
-            return;
-        };
-        if record.waiting_for.is_none() || !self.resuming.lock().insert(key.to_string()) {
+        if !self.claim_run(key) {
+            self.run_over(key).await;
             return;
         }
         info!("Checking held {key} again");
-        self.checked_again(&record);
-        self.run_held(&record).await;
+        self.run_claimed(key).await;
+    }
+
+    /// Waits until the held acquisition `key` neither runs nor has a run owed to it.
+    async fn run_over(&self, key: &str) {
+        loop {
+            let mut ended = std::pin::pin!(self.run_ended.notified());
+            ended.as_mut().enable();
+            let going = {
+                let again = self.again.lock();
+                again.contains(key) || self.resuming.lock().contains(key)
+            };
+            if !going {
+                return;
+            }
+            ended.await;
+        }
+    }
+
+    /// Claims the held acquisition `key` for a run: false for no such hold waiting for anything,
+    /// and false when it runs already, which then runs once more when it ends.
+    fn claim_run(&self, key: &str) -> bool {
+        let waits = self
+            .extras
+            .holds
+            .as_ref()
+            .and_then(|holds| holds.get(key))
+            .is_some_and(|record| record.waiting_for.is_some());
+        if !waits {
+            // Nothing waits under the key: no wake of it is left to answer, no turn at Deezer is
+            // left to it, and no give-up line is owed to it.
+            if self.again.lock().remove(key) {
+                self.run_ended.notify_waiters();
+            }
+            self.deezer_turn_ended(key);
+            self.gave_up.lock().remove(key);
+            return false;
+        }
+        let mut again = self.again.lock();
+        if self.resuming.lock().insert(key.to_string()) {
+            return true;
+        }
+        again.insert(key.to_string());
+        false
+    }
+
+    /// The run of the held acquisition `key` lets go of it.
+    fn release_run(&self, key: &str) {
         self.resuming.lock().remove(key);
-        self.keeps_after(key, &record.keep_requested).await;
+        self.run_ended.notify_waiters();
+    }
+
+    /// Runs the claimed hold `key`, its saved keeps after each run, and again while wakes came
+    /// during a run; the claim ends with the last run.
+    async fn run_claimed(&self, key: &str) {
+        loop {
+            let record = self
+                .extras
+                .holds
+                .as_ref()
+                .and_then(|holds| holds.get(key))
+                .filter(|record| record.waiting_for.is_some());
+            let Some(record) = record else {
+                self.again.lock().remove(key);
+                self.release_run(key);
+                self.deezer_turn_ended(key);
+                self.tell_gave_up(key);
+                return;
+            };
+            // This run serves every wake that came before it.
+            self.again.lock().remove(key);
+            self.checked_again(&record);
+            self.run_held(&record).await;
+            self.release_run(key);
+            self.keeps_after(key, &record.keep_requested).await;
+            if !self.run_again(key) {
+                return;
+            }
+            debug!("Held {key} was woken while it ran; it runs again");
+        }
+    }
+
+    /// Whether the claimed run of the hold `key` that just ended runs once more: a wake came during
+    /// it, and the run takes the hold again. With no wake, its last pass is over: the turn at Deezer
+    /// and the give-up line are settled now. When another run took the hold meanwhile, the wake is
+    /// left for that run, and so are the turn and the line: that run's last pass settles them.
+    fn run_again(&self, key: &str) -> bool {
+        let next = {
+            let mut again = self.again.lock();
+            if !again.remove(key) {
+                Some(false)
+            } else if self.resuming.lock().insert(key.to_string()) {
+                Some(true)
+            } else {
+                again.insert(key.to_string());
+                None
+            }
+        };
+        match next {
+            Some(again) => {
+                if !again {
+                    self.deezer_turn_ended(key);
+                    self.tell_gave_up(key);
+                }
+                again
+            }
+            None => false,
+        }
     }
 
     /// Octo's start: each hold a person waits on ("not yet proven" hearts and held album tracks)
@@ -1600,8 +1982,16 @@ impl HeartAcquisitionCoordinator {
 
     /// Runs again now every held acquisition that waits for `waiting_for`: AcoustID turning off
     /// sends every hold waiting for it to the catalog's clip, and a key working again sends every
-    /// hold the clip check left back to the heard answer.
+    /// hold the clip check left back to the heard answer. Deezer answering again runs the holds
+    /// waiting for it one at a time, the one served longest ago first, each once the one before
+    /// got past Deezer.
     pub fn resume_waiting(self: &Arc<Self>, waiting_for: WaitingFor) {
+        if waiting_for == WaitingFor::Deezer {
+            self.deezer_events
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.wake_next_deezer();
+            return;
+        }
         let Some(holds) = self.extras.holds.as_ref() else {
             return;
         };
@@ -1614,9 +2004,130 @@ impl HeartAcquisitionCoordinator {
         }
     }
 
+    /// Deezer's answer count now: how many times it answered again after a call it did not answer,
+    /// or, without a way to ask, how many times it was said to. None while its last call went
+    /// unanswered.
+    fn deezer_count(&self) -> Option<u64> {
+        match &self.extras.deezer_answering {
+            Some(answering) => answering(),
+            None => Some(self.deezer_events.load(std::sync::atomic::Ordering::SeqCst)),
+        }
+    }
+
+    /// Runs the next hold that waits for Deezer (one filed under that wait, or a held album track
+    /// whose check met a busy Deezer), when none has the turn: of those that have not had a turn at
+    /// Deezer's answer count now, the one served longest ago (one never served first), oldest first
+    /// among equals. It is that hold's turn until its run ends. Nothing while Deezer's last call
+    /// went unanswered.
+    fn wake_next_deezer(&self) {
+        let Some(holds) = self.extras.holds.as_ref() else {
+            return;
+        };
+        let next = {
+            let mut turn = self.deezer_turn.lock();
+            if turn.is_some() {
+                return;
+            }
+            let Some(count) = self.deezer_count() else {
+                return;
+            };
+            let waits = self.deezer_waits.lock().clone();
+            let waiting: Vec<String> = holds
+                .snapshot()
+                .into_iter()
+                .filter(|record| {
+                    record.waiting_for == Some(WaitingFor::Deezer) || waits.contains(&record.key())
+                })
+                .map(|record| record.key())
+                .collect();
+            let mut turns = self.deezer_turns.lock();
+            turns.retain(|key, _| waiting.contains(key));
+            let next = waiting
+                .into_iter()
+                .filter(|key| turns.get(key) != Some(&count))
+                .min_by_key(|key| turns.get(key).map_or(0, |served| served + 1));
+            if let Some(key) = &next {
+                turns.insert(key.clone(), count);
+                *turn = Some(key.clone());
+            }
+            next
+        };
+        let Some(key) = next else {
+            return;
+        };
+        self.deezer_waits.lock().remove(&key);
+        info!("Deezer answers; {key}, the hold waiting for it served longest ago, runs");
+        if let Some(me) = self.me.upgrade() {
+            me.resume_held(&key);
+        }
+    }
+
+    /// The run of the hold `key` ended. When it was the hold whose turn it was and it got past
+    /// Deezer, the next hold waiting for Deezer runs. When it still waits for Deezer: if Deezer
+    /// answered since its turn began, its failure is its own, and the next hold runs; else Deezer
+    /// did not answer it, and every hold waits for Deezer's next answer.
+    fn deezer_turn_ended(&self, key: &str) {
+        {
+            let mut turn = self.deezer_turn.lock();
+            if turn.as_deref() != Some(key) {
+                return;
+            }
+            *turn = None;
+        }
+        let still = self.deezer_waits.lock().contains(key)
+            || self
+                .extras
+                .holds
+                .as_ref()
+                .and_then(|holds| holds.get(key))
+                .is_some_and(|record| record.waiting_for == Some(WaitingFor::Deezer));
+        if still {
+            let began = self.deezer_turns.lock().get(key).copied();
+            if self.deezer_count().is_none_or(|now| Some(now) == began) {
+                debug!("Held {key} still waits for Deezer; every hold waits for its next answer");
+                return;
+            }
+            debug!(
+                "Held {key} still waits for Deezer, which answered since its turn began; the next hold runs"
+            );
+        } else {
+            self.deezer_turns.lock().remove(key);
+            self.deezer_seen.lock().remove(key);
+        }
+        self.wake_next_deezer();
+    }
+
+    /// The hold `key` was filed waiting for Deezer. When Deezer's last call answered, the answer
+    /// that wakes it may have come before it was filed: it runs once more now, and not again until
+    /// Deezer answers again after a call it did not answer.
+    fn deezer_filed(&self, key: &str) {
+        let Some(answered) = self
+            .extras
+            .deezer_answering
+            .as_ref()
+            .and_then(|answering| answering())
+        else {
+            return;
+        };
+        {
+            let mut seen = self.deezer_seen.lock();
+            if let Some(holds) = self.extras.holds.as_ref() {
+                seen.retain(|known, _| holds.get(known).is_some());
+            }
+            if seen.insert(key.to_string(), answered) == Some(answered) {
+                return;
+            }
+        }
+        info!("Deezer answered since {key} met it busy; it runs once more");
+        if let Some(me) = self.me.upgrade() {
+            me.resume_held(key);
+        }
+    }
+
     /// Someone streamed a song a hold waits on. When `user` holds it, every hold of it that waits
-    /// on what they heard (a proof, the heard lookup, the catalog's clip or the shim) takes this
-    /// newer heard source and runs again with it. Anyone else's play only checks again, once, a
+    /// on what they heard (a proof, the heard lookup, the catalog's clip, the sound `fpcalc` could
+    /// not read, the shim, and with AcoustID on a clip check that could not tell) takes this newer
+    /// heard source and runs again with it. Anyone else's play only checks again, once, a
     /// hold a person waits on ("not yet proven"), taking nothing it heard: each person's hold
     /// keeps their own heard source. A hearted album's held track is found by the played song's
     /// id among its track's ids, else (a play reached from search or radio) by its artist, core
@@ -1692,10 +2203,20 @@ impl HeartAcquisitionCoordinator {
                 }
                 continue;
             }
-            if !matches!(
-                held.waiting_for,
-                Some(WaitingFor::NotYetProven | WaitingFor::AcoustId | WaitingFor::Deezer | WaitingFor::Shim)
-            ) {
+            // A hold the clip check left unsure while AcoustID is on is read again from a new play
+            // too: a working AcoustID reads the new heard audio.
+            let waits_on_heard = match held.waiting_for {
+                Some(
+                    WaitingFor::NotYetProven
+                    | WaitingFor::AcoustId
+                    | WaitingFor::Deezer
+                    | WaitingFor::Shim
+                    | WaitingFor::SoundUnread,
+                ) => true,
+                Some(WaitingFor::AcoustIdOff) => self.acoust_id_is_on(),
+                _ => false,
+            };
+            if !waits_on_heard {
                 continue;
             }
             let newer = held
@@ -1733,6 +2254,11 @@ impl HeartAcquisitionCoordinator {
         let Some(record) = self.keeps_first(record).await else {
             return;
         };
+        // A held album track with no file left that a song heart holds goes on as the song's hold.
+        let record = match self.spent_track_as_song_hold(&record) {
+            Some(song) => song,
+            None => record,
+        };
         let record = &record;
         let Some(holds) = self.extras.holds.clone() else {
             return;
@@ -1748,9 +2274,10 @@ impl HeartAcquisitionCoordinator {
             .as_deref()
             .and_then(|user| self.import_target(user).ok())
             .unwrap_or(AcquisitionTarget::Shared);
-        // A hearted album's held track is checked again by its own held files, nothing fetched.
-        if record.album_track.is_some() && record.kind == HeldKind::Track {
-            self.recheck_album_track(record, &target).await;
+        // A hearted album's held track is checked again by its own held files, nothing fetched. One
+        // held before any file was fetched runs its chain, each holder by the heart that keeps them.
+        if record.album_track.is_some() && record.kind == HeldKind::Track && !record.held_files.is_empty() {
+            self.recheck_album_track(record).await;
             return;
         }
         // The row leaves the line it waited with now: the whole chain runs again.
@@ -1794,38 +2321,93 @@ impl HeartAcquisitionCoordinator {
             return;
         }
         let mut filed: Vec<(String, String)> = Vec::new();
-        let ended = match record.kind {
-            HeldKind::Track => {
-                self.track_chain(
-                    &record.provider,
-                    &record.external_id,
-                    requested_by.as_deref(),
-                    None,
-                    &target,
-                    origin,
-                    record.holders.clone(),
-                    record.held_files.clone(),
-                    &mut filed,
-                )
-                .await
+        // Whose chain ended held, "" for a hold that lists nobody.
+        let mut held_again: Vec<String> = Vec::new();
+        match record.kind {
+            HeldKind::Track if record.holders.len() > 1 => {
+                // A download that carries a sound check belongs to one person: each holder runs
+                // their own chain, with their own gate, into their own library, every one of them
+                // judging the files the hold kept, which stay held for the others until it ends.
+                let held = HeldFiles {
+                    files: record.held_files.clone(),
+                    lidarr: record.lidarr_files.clone(),
+                    shared: true,
+                };
+                let chains = record.holders.iter().map(|holder| {
+                    let held = held.clone();
+                    async move {
+                        let user = holder.user.trim().to_string();
+                        let target = self.import_target(&user).unwrap_or(AcquisitionTarget::Shared);
+                        let mut filed = Vec::new();
+                        let ended = self
+                            .track_chain(
+                                &record.provider,
+                                &record.external_id,
+                                Some(&user),
+                                None,
+                                &target,
+                                route_origin(holder, record),
+                                vec![holder.clone()],
+                                held,
+                                &mut filed,
+                            )
+                            .await;
+                        (user, ended, filed)
+                    }
+                });
+                for (user, ended, mut theirs) in futures::future::join_all(chains).await {
+                    match ended {
+                        Ok(TrackOutcome::Held(_)) => held_again.push(user),
+                        Err(e) => warn!("Resumed {key} failed for {user}: {e}"),
+                        Ok(_) => {}
+                    }
+                    filed.append(&mut theirs);
+                }
             }
-            HeldKind::Album => self
-                .acquire_album_as(
-                    &record.provider,
-                    &record.external_id,
-                    requested_by.as_deref(),
-                    None,
-                    origin,
-                )
-                .await
-                .map(|()| TrackOutcome::AlreadyThere),
-        };
-        let held_again = matches!(ended, Ok(TrackOutcome::Held(_)));
-        if let Err(e) = &ended {
-            warn!("Resumed {key} failed: {e}");
+            HeldKind::Track => {
+                let origin = record
+                    .holders
+                    .first()
+                    .map_or(origin, |holder| route_origin(holder, record));
+                let ended = self
+                    .track_chain(
+                        &record.provider,
+                        &record.external_id,
+                        requested_by.as_deref(),
+                        None,
+                        &target,
+                        origin,
+                        record.holders.clone(),
+                        HeldFiles::of(record.held_files.clone(), record.lidarr_files.clone()),
+                        &mut filed,
+                    )
+                    .await;
+                match ended {
+                    Ok(TrackOutcome::Held(_)) => {
+                        held_again.extend(record.holders.iter().map(|holder| holder.user.trim().to_string()));
+                        held_again.push(String::new());
+                    }
+                    Err(e) => warn!("Resumed {key} failed: {e}"),
+                    Ok(_) => {}
+                }
+            }
+            HeldKind::Album => {
+                let ended = self
+                    .acquire_album_as(
+                        &record.provider,
+                        &record.external_id,
+                        requested_by.as_deref(),
+                        None,
+                        origin,
+                    )
+                    .await;
+                if let Err(e) = ended {
+                    warn!("Resumed {key} failed: {e}");
+                }
+            }
         }
         // A holder filed again under this very hold stays; one filed under another wait has moved
-        // there; one the chain held without filing anywhere (an origin that never files that
+        // there; one their chain held without filing anywhere (an origin that never files that
         // wait) stays where it was. Everyone else's acquisition ended, and they leave it.
         let filed_under = |user: &str| {
             filed
@@ -1836,6 +2418,7 @@ impl HeartAcquisitionCoordinator {
         };
         let stays = |user: &str| {
             let keys = filed_under(user);
+            let held_again = held_again.iter().any(|who| eq_ignore_case(who, user.trim()));
             keys.contains(&key.as_str()) || keys.contains(&STAYS) || (held_again && keys.is_empty())
         };
         if record.holders.is_empty() {
@@ -1854,30 +2437,79 @@ impl HeartAcquisitionCoordinator {
                     tracker.release_row(&record.provider, &record.external_id, &holds);
                 }
             }
-            // Someone still waits here (a file landed only for the others): the row says so.
-            Some(still) => {
-                if self
-                    .tracker()
-                    .is_some_and(|tracker| !tracker.is_held(&record.provider, &record.external_id))
-                {
-                    self.hold_row_for(&still);
-                }
-            }
+            // Someone still waits here (a file landed only for the others): the row says so, held
+            // again with this hold's line, even when the landing closed it as done.
+            Some(still) => self.hold_row_for(&still),
+        }
+        // A hearted album's track that ran its chain: the album's row counts what still waits.
+        if let Some((provider, album_id)) = record
+            .album_track
+            .as_ref()
+            .and_then(|track| track.album_key.split_once(':'))
+        {
+            self.album_row(provider, album_id);
         }
     }
 
+    /// A hearted album's held track whose held files are all gone, that someone is in by their
+    /// heart of the song: the album's hearts leave it (a held track with no file ends for them),
+    /// and it goes on as the song's own hold for the rest, its album row counted again. None when
+    /// it is no album track, held no file, holds one still, or nobody is in it by the song.
+    fn spent_track_as_song_hold(&self, record: &HeldAcquisition) -> Option<HeldAcquisition> {
+        use super::soulseek_hold_store::HoldRoute;
+        let holds = self.extras.holds.as_ref()?;
+        let track = record.album_track.clone()?;
+        let by_song = |holder: &Holder| by_song(holder, record);
+        if record.kind != HeldKind::Track
+            || record.held_files.is_empty()
+            || record
+                .held_files
+                .iter()
+                .any(|file| std::path::Path::new(file).is_file())
+            || !record.holders.iter().any(by_song)
+        {
+            return None;
+        }
+        let leaving: Vec<Holder> = record
+            .holders
+            .iter()
+            .filter(|holder| !by_song(holder))
+            .cloned()
+            .collect();
+        let song = holds.update(&record.key(), |kept| {
+            let own = HoldRoute::of(kept);
+            kept.holders.retain(|holder| {
+                holder.routes.contains(&HoldRoute::Song)
+                    || (holder.routes.is_empty() && own == HoldRoute::Song)
+            });
+            as_song_hold(kept);
+        })?;
+        for holder in &leaving {
+            self.let_go_of_copies(&record.provider, &record.external_id, holder);
+        }
+        info!(
+            "Held {} has no file left for its album; it goes on as the song's own hold",
+            record.key()
+        );
+        if let Some((provider, album_id)) = track.album_key.split_once(':') {
+            self.album_row(provider, album_id);
+        }
+        Some(song)
+    }
+
     /// Checks a hearted album's held track again by its own held files alone, fetching nothing:
-    /// each holder's gate, built from what they heard of it (never from the held file itself),
-    /// judges each file by the album's rule. A file a gate accepts lands through the queue, as a
-    /// resumed hold's file does, and the held track ends; a file every gate refuses (another
-    /// recording, or not what a person played) is deleted; anything else stays held as it is. A
-    /// held track with no file left ends.
-    async fn recheck_album_track(&self, record: &HeldAcquisition, target: &AcquisitionTarget) {
+    /// each holder's gate, built from what they heard of it (never from the held file itself) as
+    /// the heart that keeps them in it is: an album heart's judges each file by the album's rule, a
+    /// song heart's by the song's own. A file a gate accepts lands, through the queue, for those
+    /// whose gate accepts it; a file every gate refuses (another recording, or not what a person
+    /// played) is deleted; anything else stays held as it is. Once a file an album heart accepts
+    /// lands, or no file is left, the album's hearts are done with the track, and anyone still in
+    /// it by their heart of the song goes on with the song's own hold.
+    async fn recheck_album_track(&self, record: &HeldAcquisition) {
         let (Some(holds), Some(track)) = (self.extras.holds.clone(), record.album_track.clone()) else {
             return;
         };
         let key = record.key();
-        let origin = record.origin();
         let mut files: Vec<String> = record
             .held_files
             .iter()
@@ -1887,8 +2519,10 @@ impl HeartAcquisitionCoordinator {
         if !files.is_empty()
             && let Some(builder) = self.extras.gates.clone()
         {
-            let mut gates = Vec::new();
+            // Each ready gate, and whether it judges by the album's rule.
+            let mut gates: Vec<(HeartGate, bool)> = Vec::new();
             for holder in &record.holders {
+                let album = by_album(holder, record);
                 let mut holder = holder.clone();
                 let heard_held = holder.heard.as_ref().is_some_and(|heard| match &heard.source {
                     HeardSource::Library { path } | HeardSource::Acquired { path } => {
@@ -1899,41 +2533,107 @@ impl HeartAcquisitionCoordinator {
                 if heard_held {
                     holder.heard = None;
                 }
-                match builder
-                    .build_for_track(&record.provider, &record.external_id, &holder, origin, &track.r)
-                    .await
-                {
-                    GateStart::Ready(gate) => gates.push(gate),
-                    // What they heard cannot be read yet: their held track waits as it is.
-                    GateStart::Hold { waiting_for, .. } => {
+                let start = if album {
+                    builder
+                        .build_for_track(
+                            &record.provider,
+                            &record.external_id,
+                            &holder,
+                            AcquisitionOrigin::AlbumHeart,
+                            &track.r,
+                        )
+                        .await
+                } else {
+                    builder
+                        .build(
+                            &record.provider,
+                            &record.external_id,
+                            &holder,
+                            AcquisitionOrigin::Heart,
+                        )
+                        .await
+                };
+                match start {
+                    GateStart::Ready(gate) => gates.push((gate, album)),
+                    // What they heard cannot be read yet: their held track waits as it is, and is
+                    // checked again with what they heard once that answers.
+                    GateStart::Hold {
+                        waiting_for,
+                        question,
+                        ..
+                    } => {
                         debug!(
                             "{} of held {key} waits for {} before it is checked again",
                             holder.user,
                             waiting_for.name()
                         );
+                        if waiting_for == WaitingFor::Deezer {
+                            self.deezer_waits.lock().insert(key.clone());
+                            self.deezer_filed(&key);
+                        } else {
+                            builder.wake_for(
+                                &key,
+                                waiting_for,
+                                &holder.user,
+                                holder.heard.as_ref(),
+                                question,
+                            );
+                        }
                     }
+                    GateStart::End { .. } => {}
                 }
             }
             if gates.is_empty() {
                 return;
             }
+            let album_gates: Vec<HeartGate> = gates
+                .iter()
+                .filter(|(_, album)| *album)
+                .map(|(gate, _)| gate.clone())
+                .collect();
+            let song_gates: Vec<HeartGate> = gates
+                .iter()
+                .filter(|(_, album)| !*album)
+                .map(|(gate, _)| gate.clone())
+                .collect();
+            let every: Vec<HeartGate> = gates.into_iter().map(|(gate, _)| gate).collect();
             // One heard-master round per person for this check: the copy of what they heard that
             // judges the held file here also serves its landing.
             let acquisition = super::acquisition_key(&record.provider, &record.external_id, false);
-            let _rounds = builder.open_rounds(&acquisition, &gates);
+            let _rounds = builder.open_rounds(&acquisition, &every);
             for file in files.clone() {
-                let verdicts = builder.judge_held(&file, &acquisition, &gates).await;
+                // A file Lidarr brought is judged by the labels of its download.
+                let labels = record
+                    .lidarr_files
+                    .iter()
+                    .find(|brought| brought.path == file)
+                    .map_or(LabelSource::TheFile, HeldLidarrFile::labels);
+                let mut verdicts: Vec<(HeartGate, GateVerdict)> = Vec::new();
+                if !album_gates.is_empty() {
+                    let judged = builder
+                        .judge_held(&file, labels.clone(), &acquisition, &album_gates)
+                        .await;
+                    verdicts.extend(album_gates.iter().cloned().zip(judged));
+                }
+                if !song_gates.is_empty() {
+                    let judged = builder
+                        .judge_landed(&file, labels, &acquisition, &song_gates)
+                        .await;
+                    verdicts.extend(song_gates.iter().cloned().zip(judged));
+                }
                 if verdicts
                     .iter()
-                    .any(|verdict| matches!(verdict, GateVerdict::Accept { .. }))
+                    .any(|(_, verdict)| matches!(verdict, GateVerdict::Accept { .. }))
                 {
-                    self.land_album_track(record, target, &gates, &file).await;
+                    // The landing waits in the queue, which never keeps a heard-copy place.
+                    builder.pause_rounds(&acquisition);
+                    self.land_album_track(record, &verdicts, &file).await;
                     return;
                 }
                 if !verdicts.is_empty()
                     && verdicts
                         .iter()
-                        .all(|verdict| matches!(verdict, GateVerdict::Refuse(_)))
+                        .all(|(_, verdict)| matches!(verdict, GateVerdict::Refuse(_)))
                 {
                     info!("The held file {file} of {key} is not its track's recording; deleted");
                     let _ = std::fs::remove_file(&file);
@@ -1943,30 +2643,46 @@ impl HeartAcquisitionCoordinator {
             }
         }
         if files.is_empty() {
-            info!("Held {key} has no file left; it ends");
-            self.end_album_track(record);
+            info!("Held {key} has no file left; the album's hearts are done with it");
+            self.album_track_over(record, &[], true);
         }
     }
 
-    /// A held album track's file one of its gates accepts lands through the queue (its download
-    /// checks the held file first and fetches nothing else); the held track then ends.
+    /// A held album track's file that the gates of `verdicts` accept lands for the people whose
+    /// gate accepts it: through the queue for the first of them, by their own gate (its download
+    /// checks the held file first and fetches nothing else), into their own library, and the
+    /// others' libraries then take the same file. The album's hearts are done with the track once a
+    /// file one of them accepts lands; a song heart that accepted it has it; everyone else in it
+    /// waits on as before.
     async fn land_album_track(
         &self,
         record: &HeldAcquisition,
-        target: &AcquisitionTarget,
-        gates: &[HeartGate],
+        verdicts: &[(HeartGate, GateVerdict)],
         file: &str,
     ) {
-        let origin = record.origin();
-        let requested_by = record
-            .requested_by
-            .clone()
-            .or_else(|| record.holders.first().map(|holder| holder.user.clone()));
+        let accepting: Vec<&HeartGate> = verdicts
+            .iter()
+            .filter(|(_, verdict)| matches!(verdict, GateVerdict::Accept { .. }))
+            .map(|(gate, _)| gate)
+            .collect();
+        let Some(first) = accepting.first() else {
+            return;
+        };
+        let target_of = |user: &str| self.import_target(user).unwrap_or(AcquisitionTarget::Shared);
         let completion = self.direct_queue.enqueue_holding(
-            Some(origin),
-            gates.to_vec(),
-            vec![file.to_string()],
-            target,
+            // A held album track's landing: nothing but the held file is fetched for it.
+            Some(AcquisitionOrigin::AlbumHeart),
+            vec![(*first).clone()],
+            HeldFiles::of(
+                vec![file.to_string()],
+                record
+                    .lidarr_files
+                    .iter()
+                    .filter(|brought| brought.path == file)
+                    .cloned()
+                    .collect(),
+            ),
+            &target_of(&first.user),
             false,
             &record.provider,
             &record.external_id,
@@ -1975,15 +2691,38 @@ impl HeartAcquisitionCoordinator {
             true,
             Some(DownloadSource::Soulseek),
             true,
-            requested_by.as_deref(),
+            Some(first.user.trim()),
             false,
             None,
         );
         match completion.wait().await {
             Ok(path) => {
                 info!("Held {} is proven; it lands at {path}", record.key());
-                self.after_proofs(origin, &record.holders, completion.ledger());
-                self.end_album_track(record);
+                for gate in accepting.iter().skip(1) {
+                    self.credit_landed(
+                        &record.provider,
+                        &record.external_id,
+                        &path,
+                        &target_of(&gate.user),
+                    )
+                    .await;
+                }
+                let proofs = super::GateLedger::default();
+                for (gate, verdict) in verdicts {
+                    crate::services::soulseek::soulseek_download_service::record_joiner(
+                        &proofs, gate, verdict,
+                    );
+                }
+                self.after_proofs(AcquisitionOrigin::AlbumHeart, &record.holders, &proofs);
+                self.after_proofs(AcquisitionOrigin::Heart, &record.holders, &proofs);
+                let landed_for: Vec<String> = accepting
+                    .iter()
+                    .map(|gate| gate.user.trim().to_string())
+                    .collect();
+                let album_done = accepting
+                    .iter()
+                    .any(|gate| gate.origin == AcquisitionOrigin::AlbumHeart);
+                self.album_track_over(record, &landed_for, album_done);
             }
             Err(failure) if failure.downcast_ref::<AcquisitionHeld>().is_some() => {
                 debug!("Held {} waits again: {failure}", record.key());
@@ -1998,11 +2737,102 @@ impl HeartAcquisitionCoordinator {
                         .cloned()
                         .collect();
                     if left.is_empty() {
-                        self.end_album_track(record);
+                        self.album_track_over(record, &[], true);
                     }
                 }
             }
         }
+    }
+
+    /// A held album track's hold ends for the people of `landed_for`, whose file landed, and, when
+    /// the album is done with the track (`album_done`: a file one of its hearts accepted landed, or
+    /// no file is left), for everyone in it by their heart of the album alone. Anyone left in it by
+    /// their heart of the song alone goes on with the song's own hold, run again; while an album
+    /// heart is still in it, it stays the album's held track, without the files that are gone, and
+    /// is checked again. The rows say so.
+    pub(crate) fn album_track_over(&self, record: &HeldAcquisition, landed_for: &[String], album_done: bool) {
+        let Some(holds) = self.extras.holds.clone() else {
+            return;
+        };
+        let key = record.key();
+        let current = holds.get(&key).unwrap_or_else(|| record.clone());
+        let leaves = |holder: &Holder| {
+            landed_for
+                .iter()
+                .any(|user| eq_ignore_case(user.trim(), holder.user.trim()))
+                || (album_done && !by_song(holder, &current))
+        };
+        let leaving: Vec<Holder> = current
+            .holders
+            .iter()
+            .filter(|holder| leaves(holder))
+            .cloned()
+            .collect();
+        let staying: Vec<Holder> = current
+            .holders
+            .iter()
+            .filter(|holder| !leaves(holder))
+            .cloned()
+            .collect();
+        let album_left = staying.iter().any(|holder| by_album(holder, &current)) && !album_done;
+        if staying.is_empty() {
+            self.end_album_track(record);
+        } else {
+            let song_only = !album_left;
+            holds.update(&key, |kept| {
+                kept.holders.retain(|holder| !leaves(holder));
+                kept.held_files
+                    .retain(|file| std::path::Path::new(file).is_file());
+                if song_only {
+                    as_song_hold(kept);
+                }
+            });
+            if song_only {
+                info!("Held {key} is done for its album; it goes on as the song's own hold");
+            }
+            if let Some((provider, album_id)) = record
+                .album_track
+                .as_ref()
+                .and_then(|track| track.album_key.split_once(':'))
+            {
+                self.album_row(provider, album_id);
+            }
+            if let Some(still) = holds.get(&key) {
+                self.hold_row_for(&still);
+            }
+            if let Some(me) = self.me.upgrade() {
+                me.resume_held(&key);
+            }
+        }
+        for holder in &leaving {
+            self.let_go_of_copies(&record.provider, &record.external_id, holder);
+        }
+    }
+
+    /// A file that landed on another request of the song counts as `target`'s too: it is linked
+    /// into their library as the worker links a member who asked (a member's own library, or the
+    /// shared library, which takes the file in when it wants it). Answers where the file is now.
+    async fn credit_landed(
+        &self,
+        provider: &str,
+        external_id: &str,
+        path: &str,
+        target: &AcquisitionTarget,
+    ) -> String {
+        use crate::services::family::FamilyPlacement;
+        let Some(family) = self.family.get() else {
+            return path.to_string();
+        };
+        let members: Vec<String> = target.member().map(str::to_string).into_iter().collect();
+        family
+            .pool
+            .settle(
+                path,
+                &members,
+                *target == AcquisitionTarget::Shared,
+                Some(&key_of(provider, external_id)),
+            )
+            .await
     }
 
     /// A held album track ends: its record goes, its row and its album's row with it.
@@ -2023,8 +2853,10 @@ impl HeartAcquisitionCoordinator {
         }
     }
 
-    /// `user` took their heart back: they leave every hold of the song, whatever it waits for, and
-    /// each hold nobody is left in ends, its row with the last. How many holds they left.
+    /// `user` took their heart of the song back: they leave every hold of the song it keeps them
+    /// in, whatever it waits for (a hearted album's held track keeps them while their heart of the
+    /// album does), and each hold nobody is left in ends, its files with it. Once nothing of the
+    /// song is held or fetched, their row lets them go. How many holds they left.
     pub fn leave_holds(&self, provider: &str, external_id: &str, user: &str) -> usize {
         self.lidarr.unhearted(provider, external_id, user);
         let Some(holds) = self.extras.holds.as_ref() else {
@@ -2032,29 +2864,110 @@ impl HeartAcquisitionCoordinator {
         };
         let mut left = 0;
         for record in holds.records_for(&track_base_key(provider, external_id)) {
-            let Some(holder) = record
-                .holders
-                .iter()
-                .find(|holder| eq_ignore_case(holder.user.trim(), user.trim()))
-                .cloned()
-            else {
-                continue;
-            };
-            left += 1;
-            if holds.release_holder(&record.key(), user).is_none() {
-                info!(
-                    "{user} took back the last heart on held {}; it ends",
-                    record.key()
-                );
+            if self.leave_by_route(&record, user, super::soulseek_hold_store::HoldRoute::Song) {
+                left += 1;
             }
-            self.let_go_of_copies(provider, external_id, &holder);
         }
-        if left > 0
-            && let Some(tracker) = self.tracker()
-        {
-            tracker.release_row(provider, external_id, holds);
+        if left > 0 {
+            self.let_row_go(provider, external_id, user);
         }
         left
+    }
+
+    /// `user` leaves `record` by the heart of `route` they took back: off it when no other heart of
+    /// theirs keeps them in it, else only that route goes. False when it does not hold them by it.
+    fn leave_by_route(
+        &self,
+        record: &HeldAcquisition,
+        user: &str,
+        route: super::soulseek_hold_store::HoldRoute,
+    ) -> bool {
+        let Some(holds) = self.extras.holds.as_ref() else {
+            return false;
+        };
+        let Some(holder) = record
+            .holders
+            .iter()
+            .find(|holder| eq_ignore_case(holder.user.trim(), user.trim()))
+            .cloned()
+        else {
+            return false;
+        };
+        let routes = holder.routes_in(record);
+        if !routes.contains(&route) {
+            return false;
+        }
+        if routes.iter().any(|other| *other != route) {
+            info!(
+                "{user} took back one heart on held {}; another of theirs keeps them in it",
+                record.key()
+            );
+            holds.update(&record.key(), |kept| {
+                if let Some(entry) = kept
+                    .holders
+                    .iter_mut()
+                    .find(|entry| eq_ignore_case(entry.user.trim(), user.trim()))
+                {
+                    entry.routes = routes.iter().copied().filter(|other| *other != route).collect();
+                }
+            });
+            return true;
+        }
+        if holds.release_holder(&record.key(), user).is_none() {
+            info!(
+                "{user} took back the last heart on held {}; it ends",
+                record.key()
+            );
+        }
+        self.let_go_of_copies(&record.provider, &record.external_id, &holder);
+        true
+    }
+
+    /// `user` took a heart back: once no hold of the song is left and nothing fetches it, its row
+    /// stops showing a search and lets them go, and goes once nobody is left on it.
+    fn let_row_go(&self, provider: &str, external_id: &str, user: &str) {
+        let (Some(tracker), Some(holds)) = (self.tracker(), self.extras.holds.as_ref()) else {
+            return;
+        };
+        tracker.release_row(provider, external_id, holds);
+        if holds
+            .records_for(&track_base_key(provider, external_id))
+            .is_empty()
+            && !self.direct_queue.is_in_flight(provider, external_id)
+        {
+            tracker.leave_row(provider, external_id, user);
+        }
+    }
+
+    /// Octo's start: every file in a hold's folder of the one hold path that no hold names goes, a
+    /// hold that ended before its files did, or a crash between.
+    pub(crate) fn sweep_held_files(&self) {
+        let (Some(holds), Some(root)) = (self.extras.holds.as_ref(), self.direct_downloads.held_root())
+        else {
+            return;
+        };
+        let swept = holds.sweep_unnamed(&root);
+        if swept > 0 {
+            info!("Removed {swept} held files no hold names");
+        }
+    }
+
+    /// Holds what `holders` heard of the song while a heart chain (`play` false) or a play runs,
+    /// each copy under an id of this run's own: two chains of one person and song each hold theirs.
+    /// None without heard samples, or when nobody heard anything.
+    fn hold_while_running(
+        &self,
+        provider: &str,
+        external_id: &str,
+        holders: &[Holder],
+        play: bool,
+    ) -> Option<HeldWhileRunning> {
+        let heard = self.extras.heard.clone()?;
+        let heard_by: Vec<(&str, &HeardRecord)> = holders
+            .iter()
+            .filter_map(|holder| holder.heard.as_ref().map(|record| (holder.user.as_str(), record)))
+            .collect();
+        heard.hold_for_run(&track_base_key(provider, external_id), &heard_by, play)
     }
 
     /// A holder of a held song keeps the copy of what they heard under their own holder id, so
@@ -2110,7 +3023,7 @@ impl HeartAcquisitionCoordinator {
                 .line
                 .clone()
                 .unwrap_or_else(|| waiting_line(waiting).to_string());
-            tracker.hold_row(&record.provider, &record.external_id, &owners, &line, false);
+            tracker.hold_album_row(&record.provider, &record.external_id, &owners, &line, false);
             return;
         }
         let routing = self
@@ -2191,9 +3104,15 @@ impl HeartAcquisitionCoordinator {
                 origin,
             )
             .await?;
-        if origin == AcquisitionOrigin::Import && outcome == TrackOutcome::Held(WaitingFor::MusicBrainz) {
+        if origin == AcquisitionOrigin::Import
+            && let TrackOutcome::Held(waiting) = outcome
+            && trickle_waits(waiting)
+        {
             return Err(TrickleCheckLater {
-                detail: WAITING_FOR_ANSWER.to_string(),
+                detail: match waiting {
+                    WaitingFor::MusicBrainz => WAITING_FOR_ANSWER.to_string(),
+                    other => waiting_line(other).to_string(),
+                },
                 turn_back: true,
             }
             .into());
@@ -2236,7 +3155,7 @@ impl HeartAcquisitionCoordinator {
             target,
             origin,
             holders,
-            Vec::new(),
+            HeldFiles::default(),
             &mut Vec::new(),
         )
         .await
@@ -2306,7 +3225,7 @@ impl HeartAcquisitionCoordinator {
             WaitingFor::NotYetProven,
             holders,
             line,
-            Vec::new(),
+            None,
             None,
             &mut Vec::new(),
         );
@@ -2354,12 +3273,55 @@ impl HeartAcquisitionCoordinator {
                     )
             })?;
         let waiting = record.waiting_for?;
-        let holder = self.holder_for(external_id, requested_by);
+        let mut holder = self.holder_for(external_id, requested_by);
         let key = record.key();
         if !holder.user.is_empty() {
+            // Only the person joins, by the heart they joined with: the hold as it is now keeps
+            // everything else it has. An album heart joining the song's own hold that holds a file
+            // brings the album's track, so taking either heart back leaves the other; one holding
+            // no file stays the song's hold, the person in it by their album heart with the album
+            // named, so its walk's track is fetched for them when it runs.
+            let album_heart = origin == AcquisitionOrigin::AlbumHeart;
+            holder.routes = vec![if album_heart {
+                super::soulseek_hold_store::HoldRoute::Album
+            } else {
+                super::soulseek_hold_store::HoldRoute::Song
+            }];
+            let holds_a_file = record
+                .held_files
+                .iter()
+                .any(|file| std::path::Path::new(file).is_file());
+            let theirs = album_heart
+                .then(|| self.album_track_of(provider, external_id, &holder.user))
+                .flatten();
+            let album_track = match &record.album_track {
+                Some(track) if album_heart => Some(track.clone()),
+                Some(_) => None,
+                None if holds_a_file => theirs.clone(),
+                None => None,
+            };
+            if record.album_track.is_none()
+                && album_track.is_none()
+                && let Some((_, album_id)) = theirs.as_ref().and_then(|track| track.album_key.split_once(':'))
+            {
+                holder.context = Some(octo_core::fingerprint::heart_gate::AlbumContext {
+                    user: holder.user.clone(),
+                    catalog_album_id: album_id.to_string(),
+                    listed_at: Utc::now(),
+                    ..Default::default()
+                });
+            }
             let joined = holds.hold(HeldAcquisition {
+                kind: record.kind,
+                provider: record.provider.clone(),
+                external_id: record.external_id.clone(),
+                requested_by: record.requested_by.clone(),
+                held_since_utc: record.held_since_utc,
+                origin: record.origin,
+                waiting_for: record.waiting_for,
                 holders: vec![holder],
-                ..record
+                album_track,
+                ..Default::default()
             });
             self.hold_copies(&joined);
         }
@@ -2381,7 +3343,8 @@ impl HeartAcquisitionCoordinator {
     }
 
     /// Each holder's gate, built before any source runs. A holder whose gate holds is filed under
-    /// that wait (`filed` says where); Err with the wait when nobody's gate is ready.
+    /// that wait (`filed` says where); one whose heart ends leaves. Err when nobody's gate is
+    /// ready: the first wait, else the line the hearts ended with.
     async fn gate_up(
         &self,
         provider: &str,
@@ -2390,12 +3353,13 @@ impl HeartAcquisitionCoordinator {
         origin: AcquisitionOrigin,
         holders: &[Holder],
         filed: &mut Vec<(String, String)>,
-    ) -> Result<Vec<HeartGate>, WaitingFor> {
+    ) -> Result<Vec<HeartGate>, GateStop> {
         let Some(builder) = self.extras.gates.clone() else {
             return Ok(Vec::new());
         };
         let mut gates = Vec::new();
         let mut held = None;
+        let mut ended = None;
         for holder in holders {
             // A hearted album's or a family album request's track carries the album's gate: its
             // track's own recording, what the holder heard of it read against that.
@@ -2433,23 +3397,35 @@ impl HeartAcquisitionCoordinator {
                         waiting_for,
                         vec![holder.clone()],
                         &line,
-                        Vec::new(),
+                        None,
                         question,
                         filed,
                     );
                 }
+                GateStart::End { line, .. } => {
+                    info!(
+                        "{provider}:{external_id} can never be proven for {}: {line}",
+                        holder.user
+                    );
+                    ended.get_or_insert(line);
+                }
             }
         }
-        match held {
-            Some(waiting) if gates.is_empty() => Err(waiting),
-            _ => Ok(gates),
+        if !gates.is_empty() {
+            return Ok(gates);
+        }
+        match (held, ended) {
+            (Some(waiting), _) => Err(GateStop::Held(waiting)),
+            (None, Some(line)) => Err(GateStop::Ended(line)),
+            (None, None) => Ok(gates),
         }
     }
 
     /// Files `holders` in a hold of this song waiting for `waiting_for`, joining one already
-    /// there, with the files it keeps; holds its downloads row with `line`; and, for a
-    /// MusicBrainz question, asks it again until it answers, which resumes the hold. Nothing for
-    /// an origin that never holds so.
+    /// there, with the files a download held (`held`), the labels of those Lidarr brought saved
+    /// beside them in the same write; holds its downloads row with `line`; and, for a MusicBrainz
+    /// question, asks it again until it answers, which resumes the hold. Nothing for an origin
+    /// that never holds so.
     #[allow(clippy::too_many_arguments)] // the song, who holds, what for, and where it went
     fn file_hold(
         &self,
@@ -2460,7 +3436,7 @@ impl HeartAcquisitionCoordinator {
         waiting_for: WaitingFor,
         holders: Vec<Holder>,
         line: &str,
-        files: Vec<String>,
+        held: Option<&AcquisitionHeld>,
         question: Option<String>,
         filed: &mut Vec<(String, String)>,
     ) {
@@ -2495,7 +3471,7 @@ impl HeartAcquisitionCoordinator {
             _ => line,
         };
         let album_key = album_track.as_ref().map(|track| track.album_key.clone());
-        let kept = holds.hold(HeldAcquisition {
+        let mut record = HeldAcquisition {
             kind: HeldKind::Track,
             provider: provider.to_string(),
             external_id: external_id.to_string(),
@@ -2505,22 +3481,25 @@ impl HeartAcquisitionCoordinator {
             waiting_for: Some(waiting_for),
             holders,
             album_track,
+            // The files, their labels and the line are written with the hold, in one write.
+            held_files: held.map(|held| held.files.clone()).unwrap_or_default(),
+            lidarr_files: held.map(|held| held.lidarr.clone()).unwrap_or_default(),
             line: Some(line.to_string()).filter(|line| !line.trim().is_empty()),
             ..Default::default()
-        });
+        };
+        // A song heart filed in a hearted album's held track keeps its person there by the song,
+        // beside any album heart of theirs.
+        if record.album_track.is_none()
+            && holds
+                .get(&record.key())
+                .is_some_and(|existing| existing.album_track.is_some())
+        {
+            for holder in &mut record.holders {
+                holder.routes = vec![super::soulseek_hold_store::HoldRoute::Song];
+            }
+        }
+        let kept = holds.hold(record);
         let key = kept.key();
-        let kept = holds
-            .update(&key, |record| {
-                for file in files {
-                    if !record.held_files.contains(&file) {
-                        record.held_files.push(file);
-                    }
-                }
-                if !line.trim().is_empty() {
-                    record.line = Some(line.to_string());
-                }
-            })
-            .unwrap_or(kept);
         self.hold_copies(&kept);
         if let Some(gates) = &self.extras.gates {
             for user in &users {
@@ -2541,6 +3520,9 @@ impl HeartAcquisitionCoordinator {
         {
             self.re_ask_for(&key, &question);
         }
+        if waiting_for == WaitingFor::Deezer {
+            self.deezer_filed(&key);
+        }
     }
 
     /// Asks the MusicBrainz question a hold waits on again until it answers (or MusicBrainz
@@ -2556,10 +3538,48 @@ impl HeartAcquisitionCoordinator {
             Box::new(move |ended| {
                 debug!("MusicBrainz {ended:?} the question {key} waited on");
                 if let Some(coordinator) = coordinator.upgrade() {
-                    coordinator.resume_held(&key);
+                    if ended == crate::services::fingerprint::music_brainz_client::ReAsked::GaveUp {
+                        coordinator.resume_after_gave_up(&key);
+                    } else {
+                        coordinator.resume_held(&key);
+                    }
                 }
             }),
         );
+    }
+
+    /// MusicBrainz gave up on the question a hold waited on: the hold runs again (or once more,
+    /// when it runs now), and the last pass of that run says on the song's row that MusicBrainz
+    /// could not answer for it when the heart ended with nothing.
+    fn resume_after_gave_up(self: &Arc<Self>, key: &str) {
+        let Some(record) = self.extras.holds.as_ref().and_then(|holds| holds.get(key)) else {
+            return;
+        };
+        self.gave_up
+            .lock()
+            .insert(key.to_string(), (record.provider, record.external_id));
+        self.resume_held(key);
+    }
+
+    /// The claimed run of the hold `key` ended its last pass: when MusicBrainz gave up on the
+    /// question it waited on, its song's row says so if the heart ended with nothing (the hold is
+    /// over and nothing of the song is held any more; a row whose file landed keeps its line).
+    fn tell_gave_up(&self, key: &str) {
+        let Some((provider, external_id)) = self.gave_up.lock().remove(key) else {
+            return;
+        };
+        let holds = self.extras.holds.as_ref();
+        let waits = holds
+            .and_then(|holds| holds.get(key))
+            .is_some_and(|record| record.waiting_for.is_some());
+        let song = track_base_key(&provider, &external_id);
+        let held = holds.is_some_and(|holds| !holds.records_for(&song).is_empty());
+        if !waits
+            && !held
+            && let Some(tracker) = self.tracker()
+        {
+            tracker.ended_with_nothing(&provider, &external_id, MUSIC_BRAINZ_GAVE_UP);
+        }
     }
 
     /// The download held instead of landing: the holders it holds for are filed under its wait
@@ -2593,7 +3613,7 @@ impl HeartAcquisitionCoordinator {
             held.waiting_for,
             holding,
             &held.line,
-            held.files.clone(),
+            Some(held),
             None,
             filed,
         );
@@ -2602,8 +3622,9 @@ impl HeartAcquisitionCoordinator {
 
     /// A file landed: what it is for each holder, by their own gate's verdict. A holder whose gate
     /// passed it has it; one whose gate holds is filed under that wait; one whose gate did not pass
-    /// it never counts it as theirs, and stays where they were when this runs a hold again. With
-    /// no gate's verdict on the file (the shipped checks ran) it is everyone's, as before.
+    /// it, or never judged it (a download already running that they joined), never counts it as
+    /// theirs, and stays where they were when this runs a hold again. Holders with no gate at all
+    /// (`gated` false: the shipped checks ran for them) have it, as before.
     #[allow(clippy::too_many_arguments)] // the song, who held it, the verdicts and where they went
     fn landed_for(
         &self,
@@ -2611,12 +3632,12 @@ impl HeartAcquisitionCoordinator {
         external_id: &str,
         requested_by: Option<&str>,
         origin: AcquisitionOrigin,
-        holders: &[Holder],
+        (holders, gated): (&[Holder], bool),
         ledger: &super::GateLedger,
         path: String,
         filed: &mut Vec<(String, String)>,
     ) -> TrackOutcome {
-        if ledger.is_empty() || holders.is_empty() {
+        if holders.is_empty() || (!gated && ledger.is_empty()) {
             return TrackOutcome::Landed(path);
         }
         self.after_proofs(origin, holders, ledger);
@@ -2636,7 +3657,7 @@ impl HeartAcquisitionCoordinator {
                         waiting,
                         vec![holder.clone()],
                         waiting_line(waiting),
-                        Vec::new(),
+                        None,
                         None,
                         filed,
                     );
@@ -2662,10 +3683,78 @@ impl HeartAcquisitionCoordinator {
         }
     }
 
+    /// A file another acquisition landed, which these holders joined and their own gates never
+    /// judged: each such holder's gate judges it now, as a joiner's gate judges a landed file, and
+    /// what they say is the chain's outcome when someone here has it or holds for it. A file one of
+    /// them passes is linked into their library (`target`), as the worker links a joiner whose gate
+    /// passed it. None when nobody was left unjudged, nothing could judge it, or it is nobody's
+    /// here.
+    #[allow(clippy::too_many_arguments)] // landed_for's facts and the gates that judge the file
+    async fn judged_as_joiners(
+        &self,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        (origin, target): (AcquisitionOrigin, &AcquisitionTarget),
+        (holders, gates): (&[Holder], &[HeartGate]),
+        ledger: &super::GateLedger,
+        path: &str,
+        filed: &mut Vec<(String, String)>,
+    ) -> Option<TrackOutcome> {
+        let builder = self.extras.gates.clone()?;
+        let unjudged: Vec<HeartGate> = gates
+            .iter()
+            .filter(|gate| {
+                holders
+                    .iter()
+                    .any(|holder| eq_ignore_case(holder.user.trim(), gate.user.trim()))
+                    && ledger.outcome_for(&gate.user, origin).is_none()
+            })
+            .cloned()
+            .collect();
+        if unjudged.is_empty() {
+            return None;
+        }
+        let acquisition = super::acquisition_key(provider, external_id, false);
+        let verdicts = builder
+            .judge_landed(path, LabelSource::TheFile, &acquisition, &unjudged)
+            .await;
+        if verdicts.len() != unjudged.len() {
+            return None;
+        }
+        for (gate, verdict) in unjudged.iter().zip(&verdicts) {
+            info!(
+                "{provider}:{external_id} landed for someone else; {}'s own gate says {verdict:?}",
+                gate.user
+            );
+            crate::services::soulseek::soulseek_download_service::record_joiner(ledger, gate, verdict);
+        }
+        let mut path = path.to_string();
+        if verdicts
+            .iter()
+            .any(|verdict| matches!(verdict, GateVerdict::Accept { .. }))
+        {
+            path = self.credit_landed(provider, external_id, &path, target).await;
+        }
+        match self.landed_for(
+            provider,
+            external_id,
+            requested_by,
+            origin,
+            (holders, true),
+            ledger,
+            path,
+            filed,
+        ) {
+            TrackOutcome::Failed(_) => None,
+            outcome => Some(outcome),
+        }
+    }
+
     /// The song chain for these holders: their gates first, then the sources in order, every
-    /// file judged with every ready gate. `held_files` are what a resumed hold held: the first
-    /// direct source checks them before it fetches anything. `filed` says which holders were
-    /// filed under which hold.
+    /// file judged with every ready gate. `held` is what a resumed hold held, with the labels of
+    /// the files Lidarr brought: the first direct source checks them before it fetches anything.
+    /// `filed` says which holders were filed under which hold.
     #[allow(clippy::too_many_arguments)] // the chain's facts, who holds it and where they went
     async fn track_chain(
         &self,
@@ -2676,10 +3765,12 @@ impl HeartAcquisitionCoordinator {
         target: &AcquisitionTarget,
         origin: AcquisitionOrigin,
         holders: Vec<Holder>,
-        held_files: Vec<String>,
+        mut held: HeldFiles,
         filed: &mut Vec<(String, String)>,
     ) -> anyhow::Result<TrackOutcome> {
-        let mut held_files = held_files;
+        // What each person heard is kept for as long as the chain runs, from before their gate is
+        // built: no sweep takes the copy or the sample its checks compare with.
+        let _heard = self.hold_while_running(provider, external_id, &holders, false);
         let scope = match target {
             AcquisitionTarget::Shared => LibraryScope::Shared,
             AcquisitionTarget::Member(user) => LibraryScope::Viewer(user.clone()),
@@ -2700,8 +3791,21 @@ impl HeartAcquisitionCoordinator {
             .await
         {
             Ok(gates) => gates,
-            Err(waiting) => return Ok(TrackOutcome::Held(waiting)),
+            Err(GateStop::Held(waiting)) => return Ok(TrackOutcome::Held(waiting)),
+            Err(GateStop::Ended(line)) => {
+                if let Some(tracker) = self.tracker() {
+                    tracker.fail(provider, external_id, Some(&line));
+                }
+                return Ok(TrackOutcome::Failed(line));
+            }
         };
+        // A heart's or a play's holders count a file only by their own gate's verdict; every other
+        // origin's file, kept by the shipped checks, is everyone's who asked.
+        let gated = !gates.is_empty()
+            && matches!(
+                origin,
+                AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart | AcquisitionOrigin::Play
+            );
         let mut beside_owned = false;
         if judged && let Some((song, copy)) = self.owned_copy(provider, external_id, &scope).await {
             let mut proven = false;
@@ -2764,7 +3868,7 @@ impl HeartAcquisitionCoordinator {
             let completion = self.direct_queue.enqueue_holding(
                 Some(origin),
                 gates.clone(),
-                std::mem::take(&mut held_files),
+                std::mem::take(&mut held),
                 target,
                 false,
                 provider,
@@ -2784,7 +3888,7 @@ impl HeartAcquisitionCoordinator {
                     external_id,
                     requested_by,
                     origin,
-                    &holders,
+                    (&holders, gated),
                     completion.ledger(),
                     path,
                     filed,
@@ -2880,13 +3984,13 @@ impl HeartAcquisitionCoordinator {
                             waiting_for,
                             holders.clone(),
                             waiting_line(waiting_for),
-                            Vec::new(),
+                            None,
                             question,
                             filed,
                         );
                         return Ok(TrackOutcome::Held(waiting_for));
                     }
-                    if origin == AcquisitionOrigin::Import && waiting_for == WaitingFor::MusicBrainz {
+                    if origin == AcquisitionOrigin::Import && trickle_waits(waiting_for) {
                         return Ok(TrackOutcome::Held(waiting_for));
                     }
                 }
@@ -2913,7 +4017,7 @@ impl HeartAcquisitionCoordinator {
                 let completion = self.direct_queue.enqueue_holding(
                     Some(origin),
                     gates.clone(),
-                    std::mem::take(&mut held_files),
+                    std::mem::take(&mut held),
                     target,
                     false,
                     provider,
@@ -2937,13 +4041,32 @@ impl HeartAcquisitionCoordinator {
                             external_id,
                             requested_by,
                             origin,
-                            &holders,
+                            (&holders, gated),
                             completion.ledger(),
-                            path,
+                            path.clone(),
                             filed,
                         ) {
                             // Nobody here has it: their own gates go on down their own chain.
                             TrackOutcome::Failed(why) => {
+                                filed.truncate(noted);
+                                // A file another acquisition landed that nobody here judged is
+                                // judged by their own gates first: one that passes it is theirs,
+                                // and nothing is fetched again.
+                                if let Some(outcome) = self
+                                    .judged_as_joiners(
+                                        provider,
+                                        external_id,
+                                        requested_by,
+                                        (origin, target),
+                                        (&holders, &gates),
+                                        completion.ledger(),
+                                        &path,
+                                        filed,
+                                    )
+                                    .await
+                                {
+                                    return Ok(outcome);
+                                }
                                 filed.truncate(noted);
                                 if !ran_as_joiner {
                                     ran_as_joiner = true;
@@ -3089,7 +4212,7 @@ impl HeartAcquisitionCoordinator {
                 WaitingFor::NotYetProven,
                 vec![holder_of(gate)],
                 line,
-                Vec::new(),
+                None,
                 None,
                 filed,
             );
@@ -3124,7 +4247,7 @@ impl HeartAcquisitionCoordinator {
                         external_id,
                         requested_by,
                         origin,
-                        &keepers,
+                        (&keepers, true),
                         &ledger,
                         path,
                         filed,
@@ -3174,7 +4297,7 @@ impl HeartAcquisitionCoordinator {
         let completion = self.direct_queue.enqueue_holding(
             Some(origin),
             keep_gates(gates),
-            Vec::new(),
+            HeldFiles::default(),
             target,
             false,
             provider,
@@ -3629,8 +4752,37 @@ impl HeartAcquisitionCoordinator {
                 }),
             );
         }
+        // Only this chain's own place in the wait ends: another person's heart waiting out the
+        // same outage stays in it.
         if let (Some(held), Some(holds)) = (held, &self.extras.holds) {
-            holds.release(&held.key());
+            self.leave_outage_hold(holds, &held.key(), requested_by);
+        }
+    }
+
+    /// One chain's place in a Soulseek outage's hold ends: its person leaves it, letting go of the
+    /// heard copy it kept for them once no hold of the song lists them, and the hold ends once
+    /// nobody is left (one with nobody listed ends with its chain).
+    fn leave_outage_hold(&self, holds: &SoulseekHoldStore, key: &str, user: Option<&str>) {
+        match user.map(str::trim).filter(|user| !user.is_empty()) {
+            Some(user) => {
+                let left = holds.get(key).and_then(|record| {
+                    record
+                        .holders
+                        .iter()
+                        .find(|holder| eq_ignore_case(holder.user.trim(), user))
+                        .cloned()
+                        .map(|holder| (record.provider.clone(), record.external_id.clone(), holder))
+                });
+                holds.release_holder(key, user);
+                if let Some((provider, external_id, holder)) = left {
+                    self.let_go_of_copies(&provider, &external_id, &holder);
+                }
+            }
+            None => {
+                if holds.get(key).is_some_and(|record| record.holders.is_empty()) {
+                    holds.release(key);
+                }
+            }
         }
     }
 
@@ -3642,6 +4794,51 @@ impl HeartAcquisitionCoordinator {
         };
         link.utc_now() < deadline
             && link.read(true).await.map(|r| r.link) == Some(SoulseekLinkState::NotLoggedIn)
+    }
+}
+
+/// What a person's chain in a hold runs for, by the heart that keeps them in it: the hold's own
+/// origin when they are in it by its own route, a song heart's when their heart of the song keeps
+/// them in another's hold, and an album heart's when only their heart of the album does.
+fn route_origin(holder: &Holder, record: &HeldAcquisition) -> AcquisitionOrigin {
+    use super::soulseek_hold_store::HoldRoute;
+    let routes = holder.routes_in(record);
+    if routes.contains(&HoldRoute::of(record)) {
+        record.origin()
+    } else if routes.contains(&HoldRoute::Song) {
+        AcquisitionOrigin::Heart
+    } else {
+        AcquisitionOrigin::AlbumHeart
+    }
+}
+
+/// Whether `holder` is in the held album track `record` by their heart of the album.
+fn by_album(holder: &Holder, record: &HeldAcquisition) -> bool {
+    holder
+        .routes_in(record)
+        .contains(&super::soulseek_hold_store::HoldRoute::Album)
+}
+
+/// Whether `holder` is in `record` by their heart of the song.
+fn by_song(holder: &Holder, record: &HeldAcquisition) -> bool {
+    holder
+        .routes_in(record)
+        .contains(&super::soulseek_hold_store::HoldRoute::Song)
+}
+
+/// A held album track becomes the song's own hold, for the people in it by their heart of the
+/// song: no album track, a song heart's, nobody listing a route of their own, and the album's
+/// line, when it shows one, the wait's own.
+fn as_song_hold(record: &mut HeldAcquisition) {
+    record.album_track = None;
+    record.origin = Some(AcquisitionOrigin::Heart);
+    for holder in &mut record.holders {
+        holder.routes.clear();
+    }
+    if record.line.as_deref() == Some(tracks_wait_line(1).as_str()) {
+        record.line = record
+            .waiting_for
+            .map(|waiting| waiting_line(waiting).to_string());
     }
 }
 

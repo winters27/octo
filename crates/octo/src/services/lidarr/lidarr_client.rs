@@ -242,6 +242,25 @@ impl LidarrClient {
     /// refused by its guid; the album's releases are then listed once more and the same
     /// release, by its indexer, title and size, is grabbed under its new guid.
     pub async fn grab_picked(&self, album_id: i32, pick: &LidarrReleasePick) -> Result<String, LidarrError> {
+        self.grab_picked_saving(album_id, pick, |_| async { Ok(()) })
+            .await
+    }
+
+    /// The same, telling `before` each guid right before the grab under it is sent, so the caller
+    /// can save it first: a grab is sent only once `before` answered Ok. A grab Lidarr may have
+    /// taken with no answer back (a timeout, a dropped connection) fails as it is; only one
+    /// Lidarr refused is looked for again.
+    pub async fn grab_picked_saving<F, Saved>(
+        &self,
+        album_id: i32,
+        pick: &LidarrReleasePick,
+        before: F,
+    ) -> Result<String, LidarrError>
+    where
+        F: Fn(String) -> Saved,
+        Saved: Future<Output = Result<(), LidarrError>>,
+    {
+        before(pick.guid.clone()).await?;
         match self.grab_release(pick).await {
             Ok(()) => return Ok(pick.guid.clone()),
             // Most likely forgotten; found again below, or refused in plain words.
@@ -260,6 +279,7 @@ impl LidarrClient {
             title: Some(again.title),
             size: again.size,
         };
+        before(fresh.guid.clone()).await?;
         match self.grab_release(&fresh).await {
             Ok(()) => Ok(fresh.guid),
             Err(LidarrError::Http(_)) => Err(LidarrError::InvalidOperation(PICK_REFUSED_TEXT.into())),
@@ -528,6 +548,15 @@ impl LidarrClient {
             .collect()
     }
 
+    /// One track file record by Lidarr's id, or None when Lidarr no longer has it.
+    pub async fn track_file(&self, track_file_id: i32) -> Result<Option<LidarrTrackFile>, LidarrError> {
+        self.get_object_or_none(&format!("/api/v1/trackfile/{track_file_id}"))
+            .await?
+            .as_ref()
+            .map(parse_track_file)
+            .transpose()
+    }
+
     /// Every track file of one album.
     pub async fn album_track_files(&self, album_id: i32) -> Result<Vec<LidarrTrackFile>, LidarrError> {
         self.get_array(&format!("/api/v1/trackfile?albumId={album_id}"))
@@ -573,6 +602,16 @@ impl LidarrClient {
     pub async fn start_time(&self) -> Result<Option<DateTime<Utc>>, LidarrError> {
         let status = self.get_object("/api/v1/system/status").await?;
         nullable_date(&status, "startTime")
+    }
+
+    /// The time on Lidarr's own clock now, to the millisecond: when Lidarr queued a health check
+    /// Octo posts for it. Octo compares Lidarr's dates only with times Lidarr stamped itself, never
+    /// with an answer's `Date` header, which a proxy in front of Lidarr may write by its own clock.
+    pub async fn now(&self) -> Result<DateTime<Utc>, LidarrError> {
+        let command = self.check_health().await?;
+        command.queued.or(command.started).ok_or_else(|| {
+            LidarrError::InvalidOperation("Lidarr's health check carries no time it was queued.".into())
+        })
     }
 
     /// Lidarr's health checks as they stand.
@@ -652,8 +691,25 @@ impl LidarrClient {
         album_id: i32,
         choice: &LidarrReleaseChoice,
     ) -> Result<LidarrAlbum, LidarrError> {
+        self.set_release_choice_if(album_id, |_| true, choice)
+            .await?
+            .ok_or_else(|| LidarrError::InvalidOperation("Lidarr's album changed meanwhile.".into()))
+    }
+
+    /// The same, only when the album as Lidarr sends it right before the change still passes
+    /// `still`: a change someone made in Lidarr since Octo last read the album is never written
+    /// over. None when it did not pass, and nothing was changed.
+    pub async fn set_release_choice_if(
+        &self,
+        album_id: i32,
+        still: impl Fn(&LidarrAlbum) -> bool,
+        choice: &LidarrReleaseChoice,
+    ) -> Result<Option<LidarrAlbum>, LidarrError> {
         let path = format!("/api/v1/album/{album_id}");
         let mut resource = self.get_object(&path).await?;
+        if !still(&parse_library_album(&resource)?) {
+            return Ok(None);
+        }
         resource.insert("anyReleaseOk".into(), Value::Bool(choice.any_release_ok));
         if let Some(Value::Array(releases)) = resource.get_mut("releases") {
             for release in releases.iter_mut().filter_map(Value::as_object_mut) {
@@ -664,7 +720,7 @@ impl LidarrClient {
             }
         }
         let updated = self.send_json(Method::PUT, &path, &resource).await?;
-        parse_library_album(&updated)
+        parse_library_album(&updated).map(Some)
     }
 
     /// Deletes an album from Lidarr, never its files, and keeps it off no import list.
@@ -973,11 +1029,19 @@ impl LidarrClient {
         Ok(response)
     }
 
-    /// What an error status is told as: the status and the start of the body.
+    /// What an error status is told as: the status and the start of the body. A 502, 503 or 504
+    /// is a proxy's in front of Lidarr, which may have passed the request on.
     async fn status_error(response: reqwest::Response, timeout: Duration) -> LidarrError {
         let status = response.status().as_u16();
         match response.text().await {
-            Ok(body) => LidarrError::Http(format!("Lidarr returned HTTP {status}: {}", truncate(&body, 300))),
+            Ok(body) => {
+                let message = format!("Lidarr returned HTTP {status}: {}", truncate(&body, 300));
+                if matches!(status, 502..=504) {
+                    LidarrError::MaybeSent(message)
+                } else {
+                    LidarrError::Http(message)
+                }
+            }
             Err(error) => transport_error(error, timeout),
         }
     }
@@ -1137,12 +1201,16 @@ fn artist_id_of(album: &JsonObject) -> Result<i32, LidarrError> {
     }
 }
 
-/// What a request that got no answer fails with: its timeout, or the connection.
+/// What a request that got no answer fails with: its timeout; a connection never made (nothing
+/// was sent); or a connection that dropped once the request was on its way, which Lidarr may have
+/// taken.
 fn transport_error(error: reqwest::Error, timeout: Duration) -> LidarrError {
     if error.is_timeout() {
         LidarrError::Canceled(http_client_factory::timeout_message(timeout))
-    } else {
+    } else if error.is_connect() {
         LidarrError::Http(http_client_factory::connect_failure_message(&error))
+    } else {
+        LidarrError::MaybeSent(http_client_factory::connect_failure_message(&error))
     }
 }
 

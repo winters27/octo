@@ -495,7 +495,8 @@ async fn a_refused_replacement_keeps_the_originals_mapping() {
 
 /// A replacement runs as a replacement: work nobody waits on, whose file's check takes the bulk
 /// turn. A file left waiting for that turn in the one hold path goes on with the same source once
-/// AcoustID's lane gives turns again, and the replacement lands from it.
+/// AcoustID's lane gives turns again, carrying the labels of a file Lidarr brought, and the
+/// replacement lands from it.
 #[tokio::test]
 async fn a_replacement_runs_as_one_and_its_file_waits_for_the_bulk_turn() {
     let f = Fixture::new().await;
@@ -509,18 +510,24 @@ async fn a_replacement_runs_as_one_and_its_file_waits_for_the_bulk_turn() {
         Some(octo_core::fingerprint::heart_gate::AcquisitionOrigin::Replacement)
     );
     let staged = f.staged(&flac(), ".flac");
+    let brought = crate::services::common::soulseek_hold_store::HeldLidarrFile {
+        path: staged.clone(),
+        delivered: Some("/downloads/complete/04 - Teardrop.flac".into()),
+    };
     f.fail(
         &download,
         anyhow::Error::new(crate::services::common::AcquisitionHeld {
             waiting_for: octo_core::fingerprint::heart_gate::WaitingFor::AcoustId,
             line: "Waiting for AcoustID".into(),
             files: vec![staged.clone()],
+            lidarr: vec![brought.clone()],
             users: Vec::new(),
         }),
     );
 
     let again = f.next_download().await;
     assert_eq!(again.place().held_files, std::slice::from_ref(&staged));
+    assert_eq!(again.place().held_lidarr, [brought]);
     assert!(again.replacement.is_some(), "still the same replacement");
     let landed = reveal(&again, &staged).await.expect("admitted");
     f.finish(&again, &landed);

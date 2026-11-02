@@ -251,6 +251,82 @@ async fn an_error_status_is_an_http_error_with_the_start_of_the_body() {
     assert!(!build(&server).is_reachable().await);
 }
 
+/// A client of the Lidarr at `base_url`.
+fn build_at(base_url: String) -> LidarrClient {
+    LidarrClient::new(Arc::new(SettingsStore::for_tests(AppSettings {
+        lidarr: LidarrSettings {
+            base_url: Some(base_url),
+            api_key: Some("secret".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    })))
+}
+
+/// A request that went out with no answer of Lidarr's back: a connection dropped once the request
+/// was read, or a proxy's 502, 503 or 504, may have been taken (Lidarr may have queued the
+/// search); a connection never made, and Lidarr's own refusal, were not.
+#[tokio::test]
+async fn a_request_lidarr_may_have_taken_is_told_apart_from_one_it_never_did() {
+    // Reads the whole request, then drops the connection without a word.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a port");
+    let dropping = format!("http://{}", listener.local_addr().expect("its address"));
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while let Ok(read) = socket.read(&mut buffer).await {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            drop(socket);
+        }
+    });
+    let dropped = build_at(dropping).album_search(7).await.expect_err("dropped");
+    assert!(matches!(dropped, LidarrError::MaybeSent(_)), "{dropped:?}");
+
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a port");
+    let nobody = format!("http://{}", closed.local_addr().expect("its address"));
+    drop(closed);
+    let refused = build_at(nobody).album_search(7).await.expect_err("refused");
+    assert!(matches!(refused, LidarrError::Http(_)), "{refused:?}");
+
+    for (status, maybe) in [(502, true), (503, true), (504, true), (400, false), (500, false)] {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(status).set_body_string("no"))
+            .mount(&server)
+            .await;
+        let error = build(&server).album_search(7).await.expect_err("failed");
+        assert_eq!(
+            matches!(error, LidarrError::MaybeSent(_)),
+            maybe,
+            "{status}: {error:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn nothing_is_asked_until_lidarr_is_set_up() {
     let client = LidarrClient::new(Arc::new(SettingsStore::for_tests(AppSettings::default())));

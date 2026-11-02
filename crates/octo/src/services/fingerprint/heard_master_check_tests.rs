@@ -201,6 +201,57 @@ async fn fifty_held_hearts_rounds_never_leave_more_than_two_heard_copies() {
     assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
 }
 
+/// Three people who heard one song are judged in one pass of its download, one after another, while
+/// another acquisition keeps a place: every check ends, the pass never holds more than one place,
+/// and at most two heard copies exist at once.
+#[tokio::test]
+async fn three_peoples_rounds_in_one_pass_take_turns_at_one_place() {
+    let server = shim(Duration::from_millis(5)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let rig = rig(dir.path(), &server.uri());
+    let check = check_on(&rig);
+    let file = dir.path().join("candidate.flac");
+    std::fs::write(&file, b"x").unwrap();
+    let elsewhere = check.open_round("Track:soulseek:other", "dora", heard_video());
+    elsewhere.round().check(&file).await;
+    assert_eq!(check.free_copy_places(), HEARD_COPIES_AT_ONCE - 1);
+
+    let key = "Track:soulseek:help";
+    let guards: Vec<RoundGuard> = ["anna", "ben", "cleo"]
+        .iter()
+        .map(|user| check.open_round(key, user, heard_video()))
+        .collect();
+    let pass = async {
+        let mut most = 0;
+        for _ in 0..2 {
+            for guard in &guards {
+                assert_eq!(guard.round().check(&file).await, HeardMaster::Differs);
+                let held = guards.iter().filter(|guard| guard.round().has_copy()).count();
+                most = most.max(held);
+                assert!(rig.samples.scratch_use().0 <= HEARD_COPIES_AT_ONCE);
+            }
+        }
+        most
+    };
+    let most = tokio::time::timeout(Duration::from_secs(10), pass)
+        .await
+        .expect("every check of the pass ends");
+    assert_eq!(most, 1, "the pass holds one place at a time");
+    // A check of one file with no open round of its own takes its turn too.
+    let once = check.check_once_in(Some(key), heard_video(), &file);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), once)
+            .await
+            .expect("it ends"),
+        HeardMaster::Differs
+    );
+    assert!(guards.iter().all(|guard| !guard.round().has_copy()));
+    check.pause_acquisition(key);
+    drop(guards);
+    drop(elsewhere);
+    assert_eq!(check.free_copy_places(), HEARD_COPIES_AT_ONCE);
+}
+
 #[tokio::test]
 async fn a_busy_shim_holds_and_a_heard_file_that_is_gone_says_so() {
     let server = MockServer::start().await;

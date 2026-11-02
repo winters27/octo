@@ -94,6 +94,13 @@ pub trait ILocalLibraryService: Send + Sync {
     /// song put back can have them again. `Err` when the mappings file could not be written.
     async fn forget_mapping(&self, local_path: &str) -> anyhow::Result<Vec<LocalSongMapping>>;
 
+    /// Drops the one mapping saved under `key` (a [`LocalSongMapping::key`]), leaving every other
+    /// mapping at its path alone. Whether there was one. (A no-op by default, for the test fakes;
+    /// the real service writes it.)
+    async fn forget_mapping_keyed(&self, _key: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     /// Puts back mappings a removal dropped, pointing at the song's path again. A song mapped
     /// anew since keeps its newer mapping. (A no-op by default, for the test fakes; the real
     /// service writes them.)

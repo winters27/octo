@@ -354,7 +354,7 @@ async fn upgrade_repoints_every_link() {
     );
 
     let flac = world.pool_file(&flac_rel, 30);
-    let first = world.pool.placed(&flac, &song(), "test", "1", &[]).await;
+    let first = world.pool.placed(&flac, &song(), "test", "1", &[], false).await;
     assert_eq!(first, None, "nobody new asked");
 
     assert!(is_link(&alex_new) && is_link(&sam_new));
@@ -440,7 +440,7 @@ async fn settle_links_members_and_moves_a_shared_ask() {
 async fn songs_are_found_by_outside_id_isrc_or_name() {
     let world = World::new(None);
     let pooled = world.pool_file(SONG, 10);
-    world.pool.placed(&pooled, &song(), "test", "1", &[]).await;
+    world.pool.placed(&pooled, &song(), "test", "1", &[], false).await;
     assert_eq!(
         world
             .pool
@@ -893,7 +893,7 @@ async fn a_download_that_lands_for_a_member_who_left_is_let_go_of() {
     assert_eq!(
         world
             .pool
-            .placed(&pooled, &song(), "test", "1", &["alex".to_string()])
+            .placed(&pooled, &song(), "test", "1", &["alex".to_string()], false)
             .await,
         None
     );

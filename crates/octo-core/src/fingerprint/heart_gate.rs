@@ -75,8 +75,8 @@ pub enum WaitingFor {
     LidarrIndexers,
     /// AcoustID has not answered for the heard sample or for a held file.
     AcoustId,
-    /// AcoustID is off and the catalog's clip could not settle what played; the person may keep
-    /// the heard audio anyway.
+    /// AcoustID is off (or could not settle what played) and the catalog's clip could not settle
+    /// it either; the person may keep the heard audio anyway.
     AcoustIdOff,
     /// Deezer has not answered for the catalog's clip.
     Deezer,
@@ -84,11 +84,14 @@ pub enum WaitingFor {
     Shim,
     /// Nothing could be proven yet; a play of the song, a proof or un-hearting ends it.
     NotYetProven,
+    /// `fpcalc` could not print the sound the catalog's clip check reads; Octo's next start or the
+    /// holder's next play of the song runs the check again.
+    SoundUnread,
 }
 
 impl WaitingFor {
     /// Every wait, in declaration order.
-    pub const ALL: [WaitingFor; 7] = [
+    pub const ALL: [WaitingFor; 8] = [
         Self::MusicBrainz,
         Self::LidarrIndexers,
         Self::AcoustId,
@@ -96,6 +99,7 @@ impl WaitingFor {
         Self::Deezer,
         Self::Shim,
         Self::NotYetProven,
+        Self::SoundUnread,
     ];
 
     /// The wait's name, as a hold's key and the hold file carry it.
@@ -108,6 +112,7 @@ impl WaitingFor {
             Self::Deezer => "Deezer",
             Self::Shim => "Shim",
             Self::NotYetProven => "NotYetProven",
+            Self::SoundUnread => "SoundUnread",
         }
     }
 }
@@ -232,6 +237,11 @@ pub struct HeardRecording {
     /// R was built from a dominant recording whose reading was not clear, so it may be another mix
     /// than the one heard, and a clear reading against it never accepts a file.
     pub from_unclear: bool,
+    /// The ISRCs a file kept as the very audio heard, or as its master, may carry with the heard
+    /// answer's recording tag: that recording's own codes that no other recording in the heard
+    /// answer carries ([`heard_codes`]). None claims no ISRC.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tag_isrcs: Vec<String>,
 }
 
 impl HeardRecording {
@@ -268,6 +278,17 @@ pub enum ClipReading {
     NoClip,
     /// Deezer or the shim did not answer; the heart holds for it.
     Busy(WaitingFor),
+    /// `fpcalc` could not print the clip or the heard audio, so nothing is known of what played:
+    /// the heart holds under [`ClipReading::UNPRINTED_WAITS_FOR`], whose wake-ups (Octo's next
+    /// start, the song's next play) run the check again.
+    Unprinted,
+}
+
+impl ClipReading {
+    /// What a heart holds under when `fpcalc` could not print for its clip check: a wait of its
+    /// own, whose holds run again at Octo's next start and at the holder's next play of the song,
+    /// never because Deezer answered.
+    pub const UNPRINTED_WAITS_FOR: WaitingFor = WaitingFor::SoundUnread;
 }
 
 /// The heard-master check's verdict on one file: whether it is the very master that played.
@@ -414,6 +435,9 @@ pub enum MusicBrainzFact<T> {
     Known(T),
     NotKnown,
     Busy,
+    /// MusicBrainz answered other questions but never this one, so nothing is learned from it: a
+    /// label it was asked for neither names another recording nor clears one.
+    GaveUp,
 }
 
 /// Everything known about one downloaded file when the gate judges it.
@@ -527,10 +551,14 @@ pub enum ImportJudgement {
 ///   the catalog's clip can then say what played;
 /// - the answer's dominant recording is a believed different song (another song at most of the
 ///   weight wins over R's sliver of it): [`HeardAnswerReading::AnotherSong`];
-/// - the reading is clear or ambiguous, or R's recordings hold at least [`MIN_SHARE`] of the
-///   weight: R stays, tagged with the dominant recording only when the reading is clear;
+/// - the reading is clear or ambiguous (with R's recording ids known), or R's recordings hold at
+///   least [`MIN_SHARE`] of the weight: R stays, tagged with the dominant recording only when the
+///   reading is clear;
 /// - R holds less and the dominant recording is R's song at half the weight or more: the stream
 ///   stood in with another version of the song, and R becomes it;
+/// - the dominant recording is another song, at any weight too slight to believe: only the
+///   catalog's clip can say whether another song played, so it decides
+///   ([`HeardAnswerReading::NeedsClip`]) before the heard audio or its master may be kept;
 /// - anything else, an empty or unknown answer included: nothing proves which recording played.
 pub fn read_heard_answer(
     outcome: &AcoustIdOutcome,
@@ -549,17 +577,21 @@ pub fn read_heard_answer(
     if believed_other_song(&reading, r, dominant) {
         return HeardAnswerReading::AnotherSong;
     }
+    // With no recording ids, R's song read alone is ambiguous: what stood in is read as the old
+    // "another" was, so R can still become the recording that played.
+    let ids_known = !r.ids.is_empty();
     match reading.reading {
         Reading::Clear => HeardAnswerReading::RStays {
             tag: Some(dominant.id.clone()),
         },
-        Reading::Ambiguous => HeardAnswerReading::RStays { tag: None },
+        Reading::Ambiguous if ids_known => HeardAnswerReading::RStays { tag: None },
         Reading::Another if reading.r_share >= MIN_SHARE => HeardAnswerReading::RStays { tag: None },
-        Reading::Another
+        Reading::Another | Reading::Ambiguous
             if same_song(&reading, r, dominant) && 2 * dominant.weight >= reading.total_weight() =>
         {
             HeardAnswerReading::Becomes(dominant.clone())
         }
+        _ if !same_song(&reading, r, dominant) => HeardAnswerReading::NeedsClip,
         _ => HeardAnswerReading::OnlyHeardOrMaster,
     }
 }
@@ -599,12 +631,44 @@ pub fn became(
         artist: catalog.artist.clone(),
         artist_ids,
         from_unclear: false,
+        tag_isrcs: Vec::new(),
     };
     let again = read_answer(answer, &r, min_score);
     let tag = (again.reading == Reading::Clear && dominant.weight >= i64::from(MIN_SOURCES_TO_CONFIRM))
         .then(|| dominant.id.clone());
     r.from_unclear = tag.is_none();
+    if let Some(id) = &tag {
+        r.tag_isrcs = heard_codes(answer, id);
+    }
     (r, tag)
+}
+
+/// The ISRCs a file kept as heard may carry beside the heard answer's recording `recording_id`:
+/// that recording's own codes in the answer that no other recording of the answer carries, since
+/// MusicBrainz files one code under more than one mix and the sound proves only the recording.
+pub fn heard_codes(answer: &AcoustIdAnswer, recording_id: &str) -> Vec<String> {
+    let recordings = || answer.results.iter().flat_map(|result| &result.recordings);
+    let carried_elsewhere = |code: &str| {
+        recordings().any(|other| {
+            !other.id.eq_ignore_ascii_case(recording_id)
+                && other
+                    .isrcs
+                    .iter()
+                    .any(|isrc| isrc.trim().eq_ignore_ascii_case(code))
+        })
+    };
+    let mut codes: Vec<String> = Vec::new();
+    for code in recordings()
+        .filter(|recording| recording.id.eq_ignore_ascii_case(recording_id))
+        .flat_map(|recording| &recording.isrcs)
+        .map(|code| code.trim())
+        .filter(|code| !code.is_empty())
+    {
+        if !carried_elsewhere(code) && !codes.iter().any(|known| known.eq_ignore_ascii_case(code)) {
+            codes.push(code.to_string());
+        }
+    }
+    codes
 }
 
 /// What a never-played heart's stand-in (the pinned video, fetched only to help find R) says.
@@ -705,8 +769,9 @@ pub fn is_heard_audio(heard: &HeardSource, candidate: &HeardSource) -> bool {
 ///   another recording when the recording it now is is neither; another song when the answer
 ///   shows that recording as another song.
 ///
-/// A label that names another song wins; then the first fact still to be asked
-/// ([`LabelCheck::Needs`]); then a MusicBrainz that did not answer ([`LabelCheck::Busy`]).
+/// A label whose question MusicBrainz gave up on says nothing either way. A label that names
+/// another song wins; then the first fact still to be asked ([`LabelCheck::Needs`]); then a
+/// MusicBrainz that did not answer ([`LabelCheck::Busy`]).
 pub fn check_labels(reading: Option<&AnswerReading>, facts: &FileFacts, r: &HeardRecording) -> LabelCheck {
     combine(&label_findings(reading, facts, r))
 }
@@ -763,6 +828,7 @@ impl HeartGate {
         match &self.reading {
             HeardReading::Busy => return hold(WaitingFor::AcoustId),
             HeardReading::Clip(ClipReading::Busy(wait)) => return hold(*wait),
+            HeardReading::Clip(ClipReading::Unprinted) => return hold(ClipReading::UNPRINTED_WAITS_FOR),
             HeardReading::Clip(
                 ClipReading::AnotherSongOrTake | ClipReading::Unclear | ClipReading::NoClip,
             ) => {
@@ -861,13 +927,14 @@ impl HeartGate {
     }
 
     /// The tags a file kept as the heard audio or the heard master may carry: the recording the
-    /// heard answer read clear, with R's ISRCs, else none ("as heard").
+    /// heard answer read clear, with only the codes its sound proved (R's `tag_isrcs`), else none
+    /// ("as heard").
     fn heard_tag(&self, r: &HeardRecording) -> TagClaim {
         match &self.reading {
             HeardReading::RStays { tag: Some(id) } | HeardReading::RBecame { tag: Some(id) } => {
                 TagClaim::Recording {
                     id: id.clone(),
-                    isrcs: r.isrcs.clone(),
+                    isrcs: r.tag_isrcs.clone(),
                 }
             }
             _ => TagClaim::AsHeard,
@@ -876,8 +943,9 @@ impl HeartGate {
 }
 
 /// The file's own reading against R. When it names another recording because a recording of R's
-/// song outside R dominates, MusicBrainz is asked what that recording is now, and a merged-away id
-/// of one of R's recordings counts as R's (the R returned holds it).
+/// song outside R dominates, MusicBrainz is asked what that recording is now: a merged-away id of
+/// one of R's recordings counts as R's (the R returned holds it), and a question MusicBrainz gave
+/// up on leaves the reading ambiguous, since that recording may still be R's.
 fn file_reading(
     answer: &AcoustIdAnswer,
     r: &HeardRecording,
@@ -900,6 +968,13 @@ fn file_reading(
             merged.ids.push(dominant.id.clone());
             Ok((read_answer(answer, &merged, min_score), merged))
         }
+        Some(MusicBrainzFact::GaveUp) => Ok((
+            AnswerReading {
+                reading: Reading::Ambiguous,
+                ..reading
+            },
+            r.clone(),
+        )),
         Some(_) => Ok((reading, r.clone())),
     }
 }
@@ -941,6 +1016,8 @@ fn recording_label(
     match current_recording(facts, id) {
         None => LabelCheck::Needs(Need::CurrentRecording(id.to_string())),
         Some(MusicBrainzFact::Busy) => LabelCheck::Busy,
+        // A question MusicBrainz could not answer says nothing of the label.
+        Some(MusicBrainzFact::GaveUp) => LabelCheck::Clean,
         Some(MusicBrainzFact::NotKnown) => LabelCheck::NamesAnother { other_song: false },
         Some(MusicBrainzFact::Known(current)) if r.holds(current) || is_duplicate(r, current) => {
             LabelCheck::Clean
@@ -987,6 +1064,7 @@ fn isrc_label(
     {
         None => LabelCheck::Needs(Need::IsrcRecordings(code.to_string())),
         Some(MusicBrainzFact::Busy) => LabelCheck::Busy,
+        Some(MusicBrainzFact::GaveUp) => LabelCheck::Clean,
         Some(MusicBrainzFact::NotKnown) => LabelCheck::NamesAnother { other_song: false },
         Some(MusicBrainzFact::Known(listed)) => {
             if listed

@@ -3,13 +3,15 @@
 //! edition's file included, and its acceptance recorded; a refused file goes back to its album's
 //! hold folder; its own labels are read only from the download as delivered or, with Lidarr
 //! writing no tags, from the file itself; a held file of Lidarr's is judged again by the same
-//! check and the labels of its download; a heart that joined an import of Lidarr's is judged by
-//! its own gate; and only a Better quality aims Lidarr at what the original is.
+//! check and the labels of its download, which its hold carries with it; a heart that joined an
+//! import of Lidarr's is judged by its own gate; and only a Better quality aims Lidarr at what the
+//! original is.
 
 use octo_core::fingerprint::heart_gate::Acceptance;
 
 use super::*;
 use crate::services::common::HeartGates;
+use crate::services::common::soulseek_hold_store::HeldLidarrFile;
 use crate::services::fingerprint::download_verification_service::LabelSource;
 
 /// A recording of "Started" MusicBrainz knows as a live take.
@@ -65,14 +67,30 @@ fn replacement() -> AcquisitionPlace {
     }
 }
 
-/// The files an acquisition left waiting in the one hold path.
-fn held_files_of(waited: &anyhow::Error) -> Vec<String> {
+/// What an acquisition left waiting in the one hold path: one file Lidarr brought, carrying the
+/// labels it was judged by (none: Lidarr wrote its tags).
+fn held_lidarr_file_of(waited: &anyhow::Error) -> AcquisitionHeld {
     let held = waited
         .downcast_ref::<AcquisitionHeld>()
-        .unwrap_or_else(|| panic!("held: {waited:?}"));
+        .unwrap_or_else(|| panic!("held: {waited:?}"))
+        .clone();
     assert_eq!(held.files.len(), 1, "{held:?}");
     assert!(std::path::Path::new(&held.files[0]).is_file(), "{held:?}");
-    held.files.clone()
+    assert_eq!(
+        held.lidarr,
+        [HeldLidarrFile::of(&held.files[0], &LabelSource::None)],
+        "{held:?}"
+    );
+    held
+}
+
+/// `place` resumed with what a hold held, as the chain and a replacement hand it back.
+fn resumed(held: &AcquisitionHeld, place: AcquisitionPlace) -> AcquisitionPlace {
+    AcquisitionPlace {
+        held_files: held.files.clone(),
+        held_lidarr: held.lidarr.clone(),
+        ..place
+    }
 }
 
 /// A replacement Lidarr brought a copy for, held for AcoustID's bulk turn, is judged again with
@@ -132,23 +150,16 @@ async fn a_lidarr_replacement_held_for_its_bulk_turn_is_judged_again_with_its_do
     let waited = acquire_as(&g, DownloadSource::Lidarr, replacement())
         .await
         .expect_err("the copy waits for its bulk turn");
-    let held = held_files_of(&waited);
+    let held = held_lidarr_file_of(&waited);
 
     tokio::time::sleep(limiter.gap(KeyLane::BuiltIn, LookupClass::Bulk)).await;
-    let landed = acquire_as(
-        &g,
-        DownloadSource::Lidarr,
-        AcquisitionPlace {
-            held_files: held.clone(),
-            ..replacement()
-        },
-    )
-    .await
-    .expect("the copy lands: Lidarr's own tag is no label");
+    let landed = acquire_as(&g, DownloadSource::Lidarr, resumed(&held, replacement()))
+        .await
+        .expect("the copy lands: Lidarr's own tag is no label");
 
     assert!(std::path::Path::new(&landed).is_file(), "{landed}");
     assert!(
-        !std::path::Path::new(&held[0]).exists(),
+        !std::path::Path::new(&held.files[0]).exists(),
         "taken from the hold path"
     );
     assert_eq!(fetches.requests.lock().len(), 1, "Lidarr is not asked again");
@@ -184,14 +195,13 @@ async fn a_held_lidarr_replacement_refused_when_judged_again_does_not_search_lid
     std::fs::create_dir_all(&folder).expect("made");
     let held = format!("{folder}/held-04 - Started.flac");
     std::fs::write(&held, named_flac("other", "other-master", "another", None)).expect("written");
-    g.verification
-        .hold_lidarr_files(std::slice::from_ref(&held), &LabelSource::None);
 
     let refused = acquire_as(
         &g,
         DownloadSource::Lidarr,
         AcquisitionPlace {
             held_files: vec![held.clone()],
+            held_lidarr: vec![HeldLidarrFile::of(&held, &LabelSource::None)],
             ..replacement()
         },
     )
@@ -206,12 +216,30 @@ async fn a_held_lidarr_replacement_refused_when_judged_again_does_not_search_lid
 /// A heart's Lidarr file that waits for AcoustID is judged again once AcoustID answers by the
 /// check every Lidarr file meets, with its download's labels: an ISRC Lidarr wrote from its own
 /// matching, naming another recording, does not refuse it, and it is kept by its sound for the
-/// person.
+/// person. Octo's own key's lane starts at test gaps, and the heart's pace the busy answer backed
+/// off is waited out before the file is judged again, so the second lookup is AcoustID's to
+/// answer however fast the test runs.
 #[tokio::test]
 async fn a_hearts_held_lidarr_file_is_judged_again_with_its_downloads_labels() {
+    use crate::services::fingerprint::acoust_id_rate_limiter::{KeyLane, LookupClass};
+
     let root = Root::new("octo-gate-lidarr-held-");
     let imports = Arc::new(LidarrImportHandoff::new());
-    let g = lidarr_gated(&root, &imports).await;
+    let limiter = Arc::new(
+        AcoustIdRateLimiter::with_gaps(Duration::from_millis(20), Duration::from_millis(10))
+            .with_jitter(|| 1.0),
+    );
+    let g = gated_with(
+        &root,
+        DownloadSource::Soulseek,
+        Vec::new(),
+        Options {
+            limiter: Some(limiter.clone()),
+            lidarr_imports: Some(imports.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
     let heard = g.heard_video(4_000_000, None, "started", "heard-master").await;
     let gate = gate_of("brandon", Some(heard), HeardReading::RStays { tag: None });
     g.answers.status("clear", 503);
@@ -228,24 +256,26 @@ async fn a_hearts_held_lidarr_file_is_judged_again_with_its_downloads_labels() {
     )
     .await
     .expect_err("it waits for AcoustID");
-    let waiting = held_files_of(&waited);
+    let waiting = held_lidarr_file_of(&waited);
+    assert!(
+        limiter.backing_off(KeyLane::BuiltIn, LookupClass::Heart),
+        "the busy answer backed the heart's pace off"
+    );
 
     g.answers.answer("clear", &started_clear());
+    tokio::time::sleep(limiter.gap(KeyLane::BuiltIn, LookupClass::Heart)).await;
     let ledger = GateLedger::default();
     let kept = acquire_as(
         &g,
         DownloadSource::Soulseek,
-        AcquisitionPlace {
-            held_files: waiting.clone(),
-            ..heart_place(vec![gate], &ledger)
-        },
+        resumed(&waiting, heart_place(vec![gate], &ledger)),
     )
     .await
     .expect("kept by its sound: Lidarr's own tag is no label");
 
     assert!(std::path::Path::new(&kept).is_file(), "{kept}");
     assert!(
-        !std::path::Path::new(&waiting[0]).exists(),
+        !std::path::Path::new(&waiting.files[0]).exists(),
         "taken from the hold path"
     );
     assert_eq!(
@@ -281,13 +311,14 @@ async fn a_held_album_track_lidarr_brought_is_checked_again_with_its_downloads_l
             &root,
             &named_flac("started", "pinned-master", "clear", Some("USXX19900001")),
         );
-        g.verification
-            .held_from_lidarr(std::slice::from_ref(&held), &labels);
+        // The labels the held track's hold carries for it.
+        let carried = HeldLidarrFile::of(&held, &labels).labels();
 
         let verdicts = g
             .verification
             .judge_held(
                 &held,
+                carried,
                 &acquisition_key("soulseek", &g.started(), false),
                 std::slice::from_ref(&gate),
             )
@@ -305,55 +336,51 @@ async fn a_held_album_track_lidarr_brought_is_checked_again_with_its_downloads_l
     }
 }
 
-/// A file Lidarr brought that waits in the one hold path keeps where its labels come from on the
-/// hold that keeps it, so after a restart it is judged again by the same labels.
+/// A held file of Lidarr's that waits again when judged again keeps its labels on the hold it
+/// leaves, and so does every held file that waits on with it.
 #[tokio::test]
-async fn a_held_lidarr_files_labels_are_saved_on_its_hold_and_read_after_a_restart() {
-    use crate::services::common::{HeldAcquisition, HeldKind, Holder};
-
-    let root = Root::new("octo-gate-lidarr-held-saved-");
+async fn held_lidarr_files_that_wait_again_keep_their_labels() {
+    let root = Root::new("octo-gate-lidarr-held-again-");
     let imports = Arc::new(LidarrImportHandoff::new());
     let g = lidarr_gated(&root, &imports).await;
-    let held = held_import(&root, &named_flac("started", "pinned-master", "clear", None));
-    let delivered = format!("{}/downloads/04 - Started.flac", root.path());
-    g.verification.hold_lidarr_files(
-        std::slice::from_ref(&held),
-        &LabelSource::Delivered(PathBuf::from(&delivered)),
-    );
-    let record = g.holds.hold(HeldAcquisition {
-        kind: HeldKind::Track,
-        provider: "soulseek".into(),
-        external_id: g.started(),
-        held_since_utc: Utc::now(),
-        origin: Some(AcquisitionOrigin::Heart),
-        waiting_for: Some(octo_core::fingerprint::heart_gate::WaitingFor::AcoustId),
-        holders: vec![Holder {
-            user: "brandon".into(),
-            ..Default::default()
-        }],
-        held_files: vec![held.clone()],
-        ..Default::default()
-    });
+    let heard = g.heard_video(4_000_000, None, "started", "heard-master").await;
+    let gate = gate_of("brandon", Some(heard), HeardReading::RStays { tag: None });
+    g.answers.status("clear", 503);
+    let folder = format!("{}/.octo-incoming/held/Track_soulseek_x", root.path());
+    std::fs::create_dir_all(&folder).expect("made");
+    let files: Vec<String> = ["a", "b"]
+        .iter()
+        .map(|name| {
+            let file = format!("{folder}/{name}-04 - Started.flac");
+            std::fs::write(&file, named_flac("started", "pinned-master", "clear", None)).expect("written");
+            file
+        })
+        .collect();
+    let lidarr = vec![
+        HeldLidarrFile::of(&files[0], &LabelSource::None),
+        HeldLidarrFile::of(
+            &files[1],
+            &LabelSource::Delivered(PathBuf::from("/downloads/complete/04 - Started.flac")),
+        ),
+    ];
 
-    g.verification.on_filed(&record, "brandon");
+    let waited = acquire_as(
+        &g,
+        DownloadSource::Soulseek,
+        AcquisitionPlace {
+            held_files: files.clone(),
+            held_lidarr: lidarr.clone(),
+            ..heart_place(vec![gate], &GateLedger::default())
+        },
+    )
+    .await
+    .expect_err("AcoustID does not answer: it waits again");
 
-    let saved = g.holds.get(&record.key()).expect("the hold");
-    assert_eq!(saved.lidarr_files.len(), 1, "{saved:?}");
-    assert_eq!(saved.lidarr_files[0].path, held);
-    assert_eq!(
-        saved.lidarr_files[0].delivered.as_deref(),
-        Some(delivered.as_str())
-    );
-    let written = serde_json::to_value(&saved).expect("written");
-    assert_eq!(written["LidarrFiles"][0]["Delivered"], delivered.as_str());
-
-    // After a restart only the hold remembers it.
-    g.verification.forget_held_lidarr_file(&held);
-    assert_eq!(
-        g.verification.held_lidarr_labels(&held),
-        Some(LabelSource::Delivered(PathBuf::from(&delivered)))
-    );
-    assert_eq!(g.verification.held_lidarr_labels(&format!("{held}.other")), None);
+    let held = waited
+        .downcast_ref::<AcquisitionHeld>()
+        .unwrap_or_else(|| panic!("held: {waited:?}"));
+    assert_eq!(held.files, files);
+    assert_eq!(held.lidarr, lidarr);
 }
 
 /// Only a Better quality aims Lidarr at what the original is (taken anyway too): a Wrong song or

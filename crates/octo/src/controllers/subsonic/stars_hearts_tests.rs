@@ -75,6 +75,11 @@ struct HeartApp {
 
 impl HeartApp {
     async fn new() -> HeartApp {
+        HeartApp::with(|_| {}).await
+    }
+
+    /// The same, with `change` made to the app's services.
+    async fn with(change: impl FnOnce(&mut crate::app::AppInner)) -> HeartApp {
         let navidrome = MockServer::builder().start().await;
         Mock::given(any())
             .respond_with(HeartNavidrome)
@@ -90,7 +95,7 @@ impl HeartApp {
         };
         // A waiting heart is listed only when it becomes a favorite on landing.
         settings.subsonic.star_downloads_for_requester = true;
-        let state = state_with(settings, |_| {});
+        let state = state_with(settings, change);
         state
             .settings
             .set_raw("Library:DownloadPath", Some(&directory.path().to_string_lossy()));
@@ -539,4 +544,111 @@ async fn a_star_navidrome_refuses_queues_nothing_from_outside() {
     assert!(t.state.track_acquisition_queue.is_idle());
     assert_eq!(t.state.star_on_arrival.held(), 0);
     assert_eq!(t.starred2_song_ids(&alice()).await, ["nd-7"]);
+}
+
+/// Lidarr as far as an un-heart goes: the songs and albums an open follow is on, and every
+/// un-heart it is told of.
+#[derive(Default)]
+struct FollowedLidarr {
+    on: parking_lot::Mutex<Vec<String>>,
+    unhearted: parking_lot::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::services::lidarr::ILidarrHeartAcquisitionService for FollowedLidarr {
+    async fn try_acquire_track(
+        &self,
+        _: &str,
+        _: &str,
+        _: bool,
+        _: Option<&str>,
+        _: octo_core::fingerprint::heart_gate::AcquisitionOrigin,
+        _: &[octo_core::fingerprint::heart_gate::HeartGate],
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn try_acquire_album(
+        &self,
+        _: &str,
+        _: &str,
+        _: bool,
+        _: Option<&str>,
+        _: octo_core::fingerprint::heart_gate::AcquisitionOrigin,
+        _: &[octo_core::fingerprint::heart_gate::HeartGate],
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn follows_heart(&self, provider: &str, external_id: &str) -> bool {
+        self.on.lock().contains(&format!("{provider}:{external_id}"))
+    }
+
+    fn unhearted(&self, provider: &str, external_id: &str, user: &str) {
+        self.unhearted
+            .lock()
+            .push((format!("{provider}:{external_id}"), user.to_string()));
+    }
+}
+
+/// Un-hearting reaches the Lidarr follow a heart is on whether or not anything of it is held: a
+/// song, an album sent as albumId, and an album sent as id each leave their follow for the person
+/// who signed in, and a wrong sign-in leaves nothing.
+#[tokio::test]
+async fn every_unstar_of_a_followed_song_or_album_reaches_its_lidarr_follow() {
+    use crate::services::common::StarOnArrival;
+
+    let lidarr = std::sync::Arc::new(FollowedLidarr::default());
+    let held = lidarr.clone();
+    let t = HeartApp::with(move |inner| inner.lidarr_hearts = held).await;
+    let teardrop = t.register(RoutingKind::Song, "Teardrop");
+    let mezzanine = t.register(RoutingKind::Album, "Mezzanine");
+    let key = |id: &str| {
+        let (_, provider, external_id) = t.state.local_library.parse_song_id(id);
+        format!(
+            "{}:{}",
+            provider.unwrap_or_else(|| "soulseek".into()),
+            external_id.unwrap_or_else(|| id.to_string())
+        )
+    };
+    let album_key = format!(
+        "{}:{mezzanine}",
+        t.state
+            .local_library
+            .parse_song_id(&mezzanine)
+            .1
+            .unwrap_or_else(|| "soulseek".into())
+    );
+    lidarr.on.lock().extend([key(&teardrop), album_key.clone()]);
+    let octo_app = StarOnArrival::OCTO_APP_CLIENT;
+    let unstar = |query: String, token: &'static str| {
+        let app = &t.app;
+        async move {
+            get(
+                app,
+                &format!(
+                    "/rest/unstar.view?{}&f=json&{query}",
+                    auth("alice", token, octo_app)
+                ),
+            )
+            .await
+        }
+    };
+
+    unstar(format!("id={teardrop}"), "bad").await;
+    assert!(lidarr.unhearted.lock().is_empty(), "a wrong sign-in");
+
+    let reply = unstar(format!("id={teardrop}"), "good").await;
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    unstar(format!("albumId={mezzanine}"), "good").await;
+    unstar(format!("id={mezzanine}"), "good").await;
+
+    assert_eq!(
+        *lidarr.unhearted.lock(),
+        [
+            (key(&teardrop), "alice".to_string()),
+            (album_key.clone(), "alice".to_string()),
+            (album_key, "alice".to_string()),
+        ]
+    );
 }

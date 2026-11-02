@@ -17,18 +17,26 @@
 //!   download-level row, Octo removes it, Octo's own manual import of it ends (with Lidarr's
 //!   imports off), or its absence is settled: missing from a queue read after a refresh that
 //!   started since Lidarr's own start, with another item of its client listed, so a client that
-//!   failed one refresh is never read as done.
+//!   failed one refresh is never read as done. A download missing while its client lists nothing
+//!   else cannot be proven gone: it stays watched, and the dashboard's Lidarr card lists its
+//!   follow with the admin's "Put Lidarr back", which counts it gone and ends the follow.
+//! - **Octo's own copies.** A file of Octo's that would land under one of Lidarr's root folders
+//!   for the artist waits in the hold path, and plays from there, until every follow on the artist
+//!   that may still import is over: no copy of Octo's is ever placed while an import of Octo's
+//!   could replace it. A late import meanwhile is judged as during the follow.
 //! - **Octo's turn.** While a download of Octo's is finished and waits for its import, the
 //!   commands are read at a sub-second pace; a rescan that covers the artist, or a manual import
 //!   or scan that is not Octo's, makes Octo remove its items before its import could replace
 //!   what that command links.
 //! - **The end.** The follow ends on Lidarr's own states (a failed, blocked or ignored download,
 //!   one that left without an import), on the work of people and other sources (a proven file
-//!   of another source for the artist, a kept copy with a download that makes no progress, the
-//!   person's "Stop waiting for Lidarr", every heart taken back), or when every download is
-//!   accounted for. Octo then removes its items, places the files it held back, and once the
-//!   watch list is empty and no search of the album is queued or running puts the pick back,
-//!   unless the song landed.
+//!   of another source for the artist, a kept copy with a download that makes no progress, every
+//!   heart taken back, the admin's "Put Lidarr back"), or when every download is accounted for.
+//!   Octo then removes its items at once. Once the watch list is empty and no search of the album
+//!   is queued or running, the follow is over: the files it held back are placed (or give way to
+//!   the song's proven Lidarr file), and the pick is put back unless the song landed. Only Octo
+//!   no longer having a Lidarr, or a new Lidarr address Octo cannot read, places the held files
+//!   at once.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -47,8 +55,10 @@ use tracing::{info, warn};
 
 use super::{AlbumJob, Inner, translate_imported_path};
 use crate::services::common::acquisition_tracker::acquisition_event_kinds;
+use crate::services::i_download_service::HeldEnd;
 use crate::services::lidarr::lidarr_pending_albums::{
-    FollowEnd, FollowedItem, HeldPlacement, PROVEN_ELSEWHERE, PendingAlbum, REPLACED_YOURS,
+    FollowEnd, FollowedGrab, FollowedItem, HELD_FOR_LIDARR, HeldPlacement, PROVEN_ELSEWHERE, PendingAlbum,
+    REPLACED_YOURS,
 };
 use crate::services::lidarr::lidarr_pick::{put_back_searched, restore_after_landing, retry_moved_records};
 
@@ -72,6 +82,9 @@ const BLOCKLISTED: [&str; 2] = ["downloadFailed", "downloadFailedPending"];
 /// then the commands, then the queue, then the history.
 struct Reading {
     start_time: Option<DateTime<Utc>>,
+    /// Lidarr's time at the read, on its own clock: the newest time Lidarr stamped on anything the
+    /// read lists, so every time a read compares with Lidarr's dates is Lidarr's own.
+    now: DateTime<Utc>,
     files: Vec<LidarrTrackFile>,
     commands: Vec<LidarrCommand>,
     /// Every queue item of every artist: another item of a download's client proves the client
@@ -95,28 +108,48 @@ impl Reading {
             .any(|command| command.is_active() && IMPORT_COMMANDS.contains(&command.name.as_str()))
     }
 
-    /// Whether the queue read follows a refresh of the downloads that ran since Lidarr started:
-    /// before it, the queue is empty whatever the clients hold.
-    fn queue_refreshed(&self) -> bool {
-        self.commands.iter().any(|command| {
-            command.name == "RefreshMonitoredDownloads"
-                && command.ended.is_some()
-                && match (command.started, self.start_time) {
-                    (Some(started), Some(start)) => started > start,
-                    (Some(_), None) => true,
-                    _ => false,
-                }
-        })
+    /// When the latest refresh of the downloads that ran since Lidarr started began, if one did:
+    /// the queue read follows it. Before any, the queue is empty whatever the clients hold.
+    fn queue_refreshed(&self) -> Option<DateTime<Utc>> {
+        self.commands
+            .iter()
+            .filter(|command| {
+                command.name == "RefreshMonitoredDownloads"
+                    && command.ended.is_some()
+                    && match (command.started, self.start_time) {
+                        (Some(started), Some(start)) => started > start,
+                        (Some(_), None) => true,
+                        _ => false,
+                    }
+            })
+            .filter_map(|command| command.started)
+            .max()
     }
 
-    /// The download-level row of a download: Lidarr writes it after every file's own row.
-    fn download_row(&self, download_id: &str) -> Option<&LidarrHistoryRecord> {
+    /// The date of the newest grab row of a download in the artist's history, on Lidarr's clock.
+    fn grabbed_at(&self, download_id: &str) -> Option<DateTime<Utc>> {
+        self.history
+            .iter()
+            .filter(|row| row.event == LidarrHistoryEvent::Grabbed)
+            .filter(|row| {
+                row.download_id
+                    .as_deref()
+                    .is_some_and(|id| dotnet::eq_ignore_case(id, download_id))
+            })
+            .map(|row| row.date)
+            .max()
+    }
+
+    /// The download-level row of Octo's grab of a download: Lidarr writes it after every file's
+    /// own row. A row older than the grab is of an earlier grab of the same id.
+    fn download_row(&self, grab: &FollowedGrab) -> Option<&LidarrHistoryRecord> {
         self.history.iter().find(|row| {
             row.event.ends_download()
+                && grab.grabbed_at.is_none_or(|grabbed| row.date >= grabbed)
                 && row
                     .download_id
                     .as_deref()
-                    .is_some_and(|id| dotnet::eq_ignore_case(id, download_id))
+                    .is_some_and(|id| dotnet::eq_ignore_case(id, &grab.download_id))
         })
     }
 }
@@ -126,6 +159,8 @@ struct Window {
     start: DateTime<Utc>,
     end: Option<DateTime<Utc>>,
     overlapped: bool,
+    /// One of Lidarr's own new searches after a failed grab of Octo's, not Octo's own search.
+    research: bool,
 }
 
 impl Window {
@@ -154,6 +189,8 @@ struct FollowRun {
     /// Every watched download was accounted for at the end of the last read, so this read began
     /// after the last accounting event and saw what came of it.
     quiet: bool,
+    /// Another Lidarr is set now: nothing is put back in it, since nothing of it is Octo's.
+    lidarr_gone: bool,
 }
 
 /// What a read decided.
@@ -178,25 +215,72 @@ impl Inner {
             artist_path: None,
             handed: Vec::new(),
             quiet: false,
+            lidarr_gone: false,
         };
         let finished = loop {
             if self.stopping.is_cancelled() {
                 break false;
             }
             let settings = self.settings.current().lidarr.clone();
-            retry_moved_records(&self.client, &self.pending, &key).await;
+            let moved = match self.pending.get(&key) {
+                Some(entry) => match self.lidarr_now(&entry, &settings).await {
+                    Ok(moved) => Some(moved),
+                    Err(e) => {
+                        // Whether it is the same Lidarr waits until it answers; nobody's copy
+                        // waits on a Lidarr Octo cannot read meanwhile.
+                        warn!("Could not read Octo's Lidarr at its new address for the follow of {key}: {e}");
+                        for held in self.pending.release(&key) {
+                            self.place_held(held, FollowEnd::Failed).await;
+                        }
+                        tokio::select! {
+                            () = tokio::time::sleep(self.poll(&settings)) => {}
+                            () = wake.notified() => {}
+                            () = self.stopping.cancelled() => break false,
+                        }
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            match moved {
+                Some(LidarrMoved::Cleared) => {
+                    // Octo no longer has a Lidarr: nobody's copy waits on it.
+                    for held in self.pending.release(&key) {
+                        self.place_held(held, FollowEnd::Failed).await;
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(self.poll(&settings)) => {}
+                        () = wake.notified() => {}
+                        () = self.stopping.cancelled() => break false,
+                    }
+                    continue;
+                }
+                Some(LidarrMoved::Swapped) => {
+                    info!(
+                        "Octo's Lidarr is another one now; the follow of {key} ends and nothing of the new one is touched"
+                    );
+                    self.pending.update(&key, |entry| {
+                        for grab in &mut entry.grabs {
+                            grab.accounted = true;
+                            grab.accounted_at = Some(DateTime::<Utc>::MIN_UTC);
+                        }
+                        entry.pending_items.clear();
+                        if entry.ended.is_none() {
+                            entry.ended = Some(FollowEnd::Failed);
+                        }
+                    });
+                    run.lidarr_gone = true;
+                    break true;
+                }
+                _ => {}
+            }
+            retry_moved_records(&self.client, &self.pending, &self.music, &key).await;
             let next = match self.follow_once(&job, &mut run, &settings).await {
                 Ok(next) => next,
                 Err(e) => {
+                    // The files it held stay held, playing from the hold path: a Lidarr Octo
+                    // cannot read may still import.
                     warn!("Could not read Lidarr for the follow of {key}: {e}");
-                    // A follow asked to end lets go of the files it held even when Lidarr cannot
-                    // be read: nobody's kept copy waits on Lidarr answering.
-                    if let Some(entry) = self.pending.get(&key)
-                        && let Some(why) = entry.ended
-                        && !entry.released
-                    {
-                        self.let_go(&key, why).await;
-                    }
                     Next::Wait { ready: false }
                 }
             };
@@ -243,9 +327,6 @@ impl Inner {
         let Some(mut entry) = self.pending.get(&run.key) else {
             return Ok(Next::Finish);
         };
-        if entry.first_poll.is_none() {
-            entry.first_poll = Some(Utc::now());
-        }
         if entry.completed_download_handling.is_none() {
             entry.completed_download_handling = Some(self.client.completed_download_handling().await?);
         }
@@ -260,6 +341,9 @@ impl Inner {
         }
         let reading = self.read_lidarr(run.artist_id).await?;
         let mut end: Option<FollowEnd> = None;
+        if entry.first_poll.is_none() {
+            entry.first_poll = Some(reading.now);
+        }
 
         let windows = self.windows(&mut entry, run, &reading).await?;
         self.record_grabs(&mut entry, run, &reading, &windows, &mut end);
@@ -290,19 +374,11 @@ impl Inner {
             return Ok(Next::Finish);
         };
         if let Some(why) = entry.ended {
+            // Octo's items go at once; the files it held stay held until the follow is over, so a
+            // late import meanwhile is judged as during the follow.
             self.remove_items(&run.key, &entry, &reading).await;
-            if why == FollowEnd::Unhearted {
-                // Nobody's heart is on it any more: what Octo could not remove is no longer
-                // watched for anyone.
-                self.pending.update(&run.key, |saved| {
-                    for grab in &mut saved.grabs {
-                        grab.accounted = true;
-                    }
-                    saved.pending_items.clear();
-                });
-            }
-            if !entry.released {
-                self.let_go(&run.key, why).await;
+            if why == FollowEnd::Unhearted || entry.unseen_let_go {
+                self.absent_let_go(&run.key, &reading, entry.unseen_let_go);
             }
             let Some(entry) = self.pending.get(&run.key) else {
                 return Ok(Next::Finish);
@@ -353,8 +429,15 @@ impl Inner {
         } else {
             Vec::new()
         };
+        let now = match reading_now(&commands, &queue, &history) {
+            Some(now) => now,
+            // Lidarr stamped nothing the read lists (it has just started): it stamps a health
+            // check now.
+            None => self.client.now().await?,
+        };
         Ok(Reading {
             start_time,
+            now,
             files,
             commands,
             queue,
@@ -375,7 +458,11 @@ impl Inner {
             .history
             .iter()
             .filter(|row| row.event == LidarrHistoryEvent::DownloadFailed)
-            .filter(|row| row.download_id.as_deref().is_some_and(|id| entry.owns_grab(id)))
+            .filter(|row| {
+                row.download_id
+                    .as_deref()
+                    .is_some_and(|id| entry.owns_grab_at(id, row.date))
+            })
             .map(|row| row.date)
             .min();
         if let Some(failed) = first_failure {
@@ -399,6 +486,36 @@ impl Inner {
                 }
             }
         }
+        // A restart came after Octo's search went out and before Lidarr's answer was saved: Octo's
+        // search is the first one of the album asked through Lidarr's API since Lidarr's time
+        // saved right before it went out, and no later than its request could still have reached
+        // Lidarr. One queued after that is someone else's.
+        if entry.search_command <= 0
+            && entry.picked_guid.is_none()
+            && let Some(pending_at) = entry.search_pending
+            && let Some(command) = reading
+                .commands
+                .iter()
+                .filter(|command| {
+                    command.name == "AlbumSearch"
+                        && command.album_ids().contains(&run.album_id)
+                        && command
+                            .trigger
+                            .as_deref()
+                            .is_some_and(|trigger| dotnet::eq_ignore_case(trigger, "manual"))
+                        && command.queued.is_some_and(|queued| {
+                            queued >= pending_at && queued <= pending_at + search_reach()
+                        })
+                })
+                .min_by_key(|command| command.queued)
+        {
+            info!(
+                "Octo's search of {} went out before a restart; Lidarr lists it as command {}",
+                run.key, command.id
+            );
+            entry.search_command = command.id;
+            entry.searched_at = command.queued;
+        }
         let octo_ids: Vec<i32> = std::iter::once(entry.search_command)
             .chain(entry.research_commands.iter().copied())
             .filter(|id| *id > 0)
@@ -408,6 +525,28 @@ impl Inner {
             search_ended: true,
             research_running: false,
         };
+        // Lidarr lists no search of Octo's: its window runs from Lidarr's time saved before it
+        // went out to the latest its request could have reached Lidarr (or the follow's first
+        // read, when that came sooner).
+        if entry.search_command <= 0
+            && entry.picked_guid.is_none()
+            && let Some(pending_at) = entry.search_pending
+        {
+            let reach = pending_at + search_reach();
+            let end = Some(entry.first_poll.map_or(reach, |first| first.min(reach)));
+            let overlapped = reading.commands.iter().any(|other| {
+                other.name == "AlbumSearch"
+                    && !octo_ids.contains(&other.id)
+                    && other.album_ids().contains(&run.album_id)
+                    && overlaps(other, pending_at, end)
+            });
+            windows.octo.push(Window {
+                start: pending_at,
+                end,
+                overlapped,
+                research: false,
+            });
+        }
         for id in &octo_ids {
             let command = match reading.command(*id) {
                 Some(command) => Some(command.clone()),
@@ -423,9 +562,11 @@ impl Inner {
             let (start, end) = match &command {
                 Some(command) => (
                     command.started.or(command.queued),
-                    command.ended.or_else(|| (!command.is_active()).then(Utc::now)),
+                    command
+                        .ended
+                        .or_else(|| (!command.is_active()).then_some(reading.now)),
                 ),
-                None if own_search => (entry.searched_at, entry.first_poll),
+                None if own_search => (entry.searched_at.or(entry.search_pending), entry.first_poll),
                 None => continue,
             };
             let Some(start) = start else {
@@ -447,6 +588,7 @@ impl Inner {
                 start,
                 end,
                 overlapped,
+                research: !own_search,
             });
         }
         Ok(windows)
@@ -462,9 +604,6 @@ impl Inner {
         windows: &Windows,
         end: &mut Option<FollowEnd>,
     ) {
-        let Some(since) = entry.searched_at else {
-            return;
-        };
         let following = entry.following();
         let listed: HashSet<i32> = reading
             .queue
@@ -478,34 +617,55 @@ impl Inner {
             .filter(|item| !listed.contains(&item.queue_id))
             .cloned()
             .collect();
+        let since = entry.searched_at.or(entry.search_pending);
         for row in reading.history.iter().rev() {
-            if row.event != LidarrHistoryEvent::Grabbed || row.date < since {
+            if row.event != LidarrHistoryEvent::Grabbed {
                 continue;
             }
             let Some(id) = row.download_id.as_deref() else {
                 continue;
             };
-            if entry.owns_grab(id) || self.pending.is_octos_grab(id) {
+            // A release picked in Find songs is Octo's by its guid alone (any guid a grab of it
+            // was sent under), the first time it is grabbed.
+            let picked = !entry.owns_grab(id) && row.guid().is_some_and(|guid| entry.picked(guid));
+            if !picked && since.is_none_or(|since| row.date < since) {
+                continue;
+            }
+            // A row of one of Octo's own grabs, inside that grab's span. A later grab of the same
+            // id (a torrent grabbed again) is a new grab, judged below.
+            if entry.owns_grab_at(id, row.date) || self.pending.is_octos_grab_at(id, row.date) {
                 continue;
             }
             let client = row.data("downloadClientName").or_else(|| row.download_client());
             if row.album_id == run.album_id {
                 let searched = matches!(row.release_source(), Some("Search" | "UserInvokedSearch"));
-                let picked = entry
-                    .picked_guid
-                    .as_deref()
-                    .is_some_and(|guid| row.guid().is_some_and(|own| dotnet::eq_ignore_case(own, guid)));
                 let in_window = windows
                     .octo
                     .iter()
                     .find(|window| window.holds(row.date))
                     .map(|window| !window.overlapped);
-                let from_held_back = gone
-                    .iter()
-                    .any(|item| item.last_seen.is_none_or(|seen| row.date >= seen));
+                // A release Lidarr held back from one of Octo's searches, taken in that search's
+                // window with no other search of the album beside it, becomes a grab with that
+                // search's own release source.
+                let from_held_back = gone.iter().any(|item| {
+                    item.added
+                        .and_then(|added| windows.octo.iter().find(|window| window.holds(added)))
+                        .is_some_and(|window| {
+                            let source = if window.research {
+                                "Search"
+                            } else {
+                                "UserInvokedSearch"
+                            };
+                            !window.overlapped && item.became(row, source)
+                        })
+                });
                 if picked || (searched && in_window == Some(true)) || from_held_back {
                     info!("Octo's grab {id} of {} is followed", run.key);
-                    entry.record_grab(id, client);
+                    if entry.owns_grab(id) {
+                        entry.watch_again(id, client, row.date);
+                    } else {
+                        entry.record_grab_at(id, client, Some(row.date));
+                    }
                     continue;
                 }
                 if following {
@@ -540,7 +700,7 @@ impl Inner {
     ) -> bool {
         let following = entry.following();
         let kept_waits = self.pending.kept_waits(&run.key);
-        let now = Utc::now();
+        let now = reading.now;
         let mut ready = false;
         for item in &reading.queue {
             let in_artist = item.artist_id == Some(run.artist_id) || item.album_id == Some(run.album_id);
@@ -582,7 +742,12 @@ impl Inner {
                     }
                 }
                 Some(_) if !in_artist => {}
-                Some(id) if self.pending.is_octos_grab(id) => {}
+                // Another follow's download, or one Octo was done with lately, still listed: Octo's
+                // while its newest grab row lies inside that grab's span.
+                Some(id)
+                    if self
+                        .pending
+                        .is_octos_grab_at(id, reading.grabbed_at(id).or(item.added).unwrap_or(now)) => {}
                 Some(_) => {
                     let others = item
                         .album_id
@@ -596,16 +761,19 @@ impl Inner {
                     }
                 }
                 None if item.album_id == Some(run.album_id) => {
+                    let seen = FollowedItem {
+                        queue_id: item.id,
+                        title: item.title.clone(),
+                        indexer: item.indexer.clone(),
+                        added: item.added,
+                    };
                     match entry
                         .pending_items
                         .iter_mut()
                         .find(|known| known.queue_id == item.id)
                     {
-                        Some(known) => known.last_seen = Some(now),
-                        None => entry.pending_items.push(FollowedItem {
-                            queue_id: item.id,
-                            last_seen: Some(now),
-                        }),
+                        Some(known) => *known = seen,
+                        None => entry.pending_items.push(seen),
                     }
                 }
                 None if in_artist => {
@@ -669,7 +837,10 @@ impl Inner {
         }
         let octos = |row: &LidarrHistoryRecord| {
             row.download_client().is_some()
-                && row.download_id.as_deref().is_some_and(|id| entry.owns_grab(id))
+                && row
+                    .download_id
+                    .as_deref()
+                    .is_some_and(|id| entry.owns_grab_at(id, row.date))
         };
         let own_row = !entry.octo_files.is_empty()
             || reading
@@ -677,6 +848,7 @@ impl Inner {
                 .iter()
                 .any(|file| rows.get(&file.id).copied().is_some_and(octos));
         let following = entry.following();
+        let octo_root = self.music.octo_root();
         let mut mine: Vec<&LidarrTrackFile> = Vec::new();
         let mut users: Vec<i32> = Vec::new();
         for file in &reading.files {
@@ -694,7 +866,7 @@ impl Inner {
                         && row
                             .download_id
                             .as_deref()
-                            .is_some_and(|id| self.pending.is_octos_grab(id)) => {}
+                            .is_some_and(|id| self.pending.is_octos_grab_at(id, row.date)) => {}
                 Some(_) => users.push(file.id),
                 None if idle => users.push(file.id),
                 None => {}
@@ -718,7 +890,6 @@ impl Inner {
             entry.users_files.extend(users);
         }
 
-        let octo_root = self.music.octo_root();
         let gated = job.gated();
         let by_sound = !gated && job.files_by_sound() && self.gates.is_some();
         let replacement_only = job.replacement_only();
@@ -730,6 +901,17 @@ impl Inner {
             }
             if let std::collections::hash_map::Entry::Vacant(slot) = tracks.entry(file.album_id) {
                 slot.insert(self.client.get_album_tracks(file.album_id).await?);
+                // Lidarr's import of Octo's own download may switch the album to the release it
+                // matched: that release is noted, so a put back still gives the saved choice back.
+                if file.album_id == run.album_id
+                    && let Some(album) = self.client.album(file.album_id).await?
+                {
+                    for release in album.releases.iter().filter(|release| release.monitored) {
+                        if !entry.imported_releases.contains(&release.id) {
+                            entry.imported_releases.push(release.id);
+                        }
+                    }
+                }
             }
             let Some(track) = tracks
                 .get(&file.album_id)
@@ -829,7 +1011,9 @@ impl Inner {
     /// Tells, on the downloads entry, of each file of the user's that Lidarr deleted as an upgrade
     /// while importing Octo's download: a file at a path no import of Octo's had filled before.
     async fn tell_replaced(&self, entry: &mut PendingAlbum, reading: &Reading) {
-        let Some(since) = entry.searched_at else {
+        // From Octo's search, or from Lidarr's time saved before it went out when a restart came
+        // before its answer was saved.
+        let Some(since) = entry.searched_at.or(entry.search_pending) else {
             return;
         };
         let octo_imports: Vec<(String, DateTime<Utc>, i32)> = reading
@@ -838,7 +1022,10 @@ impl Inner {
             .filter(|row| row.event == LidarrHistoryEvent::TrackFileImported)
             .filter(|row| {
                 row.download_client().is_some()
-                    && row.download_id.as_deref().is_some_and(|id| entry.owns_grab(id))
+                    && row
+                        .download_id
+                        .as_deref()
+                        .is_some_and(|id| entry.owns_grab_at(id, row.date))
             })
             .filter_map(|row| {
                 row.imported_path()
@@ -865,13 +1052,16 @@ impl Inner {
                 !octos_before && by_octo
             })
             .collect();
-        if replaced.is_empty() {
+        let mut told = Vec::new();
+        for row in replaced {
+            entry.replaced_told.push(row.id);
+            told.push(row.source_title.clone());
+        }
+        if told.is_empty() {
             return;
         }
         let bin = self.client.recycle_bin().await.ok().flatten();
-        for row in replaced {
-            entry.replaced_told.push(row.id);
-            let path = row.source_title.clone();
+        for path in told {
             warn!("{REPLACED_YOURS}: {path}");
             let detail = match &bin {
                 Some(bin) => format!("{path}. Lidarr moved it to its recycle bin, {bin}"),
@@ -919,13 +1109,14 @@ impl Inner {
             .collect();
         let imports_on = entry.completed_download_handling.unwrap_or(true);
         let mut failed = false;
+        let mut unseen = Vec::new();
         for index in 0..entry.grabs.len() {
             let grab = entry.grabs[index].clone();
             if grab.accounted {
                 continue;
             }
-            if let Some(row) = reading.download_row(&grab.download_id) {
-                entry.grabs[index].accounted = true;
+            if let Some(row) = reading.download_row(&grab) {
+                entry.grabs[index].account(row.date);
                 if row.event != LidarrHistoryEvent::DownloadImported {
                     info!(
                         "Lidarr wrote {} for Octo's download {} of {}; the pick ends",
@@ -942,17 +1133,26 @@ impl Inner {
                     Some(command) => Some(command.clone()),
                     None => self.client.command(grab.manual_import).await?,
                 };
-                if command.is_none_or(|command| !command.is_active()) {
-                    entry.grabs[index].accounted = true;
+                if command.as_ref().is_none_or(|command| !command.is_active()) {
+                    let ended = command.and_then(|command| command.ended).unwrap_or(reading.now);
+                    entry.grabs[index].account(ended);
                 }
                 continue;
             }
-            let absent = refreshed
-                && !listed.contains(&dotnet::ordinal_ignore_case_key(&grab.download_id))
-                && grab
-                    .client
-                    .as_deref()
-                    .is_some_and(|client| clients.contains(&dotnet::ordinal_ignore_case_key(client)));
+            let Some(refreshed_at) = refreshed else {
+                continue;
+            };
+            let missing = !listed.contains(&dotnet::ordinal_ignore_case_key(&grab.download_id));
+            let client_answered = grab
+                .client
+                .as_deref()
+                .is_some_and(|client| clients.contains(&dotnet::ordinal_ignore_case_key(client)));
+            // Missing from a refresh that began after its grab, its client listing nothing else:
+            // Lidarr gives no proof it is gone, so it stays watched, and the Lidarr card says so.
+            if missing && !client_answered && grab.grabbed_at.is_none_or(|grabbed| refreshed_at > grabbed) {
+                unseen.push(grab.download_id.clone());
+            }
+            let absent = missing && client_answered;
             if !absent {
                 continue;
             }
@@ -961,7 +1161,7 @@ impl Inner {
                     "Octo's download {} of {} left Lidarr's queue without an import",
                     grab.download_id, run.key
                 );
-                entry.grabs[index].accounted = true;
+                entry.grabs[index].account(refreshed_at);
                 failed = true;
                 continue;
             }
@@ -977,7 +1177,7 @@ impl Inner {
                 })
                 .collect();
             if items.is_empty() {
-                entry.grabs[index].accounted = true;
+                entry.grabs[index].account(refreshed_at);
                 continue;
             }
             info!(
@@ -994,6 +1194,7 @@ impl Inner {
                 }
             });
         }
+        entry.unseen = unseen;
         if failed && following {
             end.get_or_insert(FollowEnd::Failed);
         }
@@ -1009,7 +1210,13 @@ impl Inner {
                 if let Some(known) = current.grab_mut(&grab.download_id) {
                     // Only a play or a heart moves this mark; the read's copy may be older.
                     grab.size_left_at_event = known.size_left_at_event;
-                    grab.accounted |= known.accounted;
+                    // Accounted for meanwhile (Octo removed it): kept, unless this read saw the
+                    // id grabbed again after that.
+                    let regrabbed = grab.grabbed_at > known.grabbed_at && !grab.accounted;
+                    if known.accounted && !regrabbed {
+                        grab.accounted = true;
+                        grab.accounted_at = grab.accounted_at.or(known.accounted_at);
+                    }
                     if grab.manual_import <= 0 {
                         grab.manual_import = known.manual_import;
                     }
@@ -1039,8 +1246,18 @@ impl Inner {
             current.replaced_told = entry.replaced_told;
             current.tracks_taken = entry.tracks_taken;
             current.first_poll = entry.first_poll;
+            current.unseen = entry.unseen;
             current.completed_download_handling = entry.completed_download_handling;
             current.roots = entry.roots;
+            if current.search_command <= 0 {
+                current.search_command = entry.search_command;
+            }
+            current.searched_at = current.searched_at.or(entry.searched_at);
+            for release in entry.imported_releases {
+                if !current.imported_releases.contains(&release) {
+                    current.imported_releases.push(release);
+                }
+            }
             if current.ended.is_none() {
                 current.ended = end;
             }
@@ -1070,10 +1287,12 @@ impl Inner {
                 Ok(LidarrDeletion::Deleted) => {
                     info!("Removed Octo's item {} of {key} from Lidarr's queue", item.id);
                     let (download_id, queue_id) = (item.download_id.clone(), item.id);
+                    // The read listed it just before: no grab of the same id came in between.
+                    let at = reading.now;
                     self.pending.update(key, |saved| match &download_id {
                         Some(id) => {
                             if let Some(grab) = saved.grab_mut(id) {
-                                grab.accounted = true;
+                                grab.account(at);
                             }
                         }
                         None => saved.pending_items.retain(|pending| pending.queue_id != queue_id),
@@ -1088,48 +1307,135 @@ impl Inner {
         }
     }
 
-    /// The follow lets go of the files it held: each one no other open follow holds is placed now.
-    async fn let_go(&self, key: &str, why: FollowEnd) {
-        for held in self.pending.release(key) {
-            self.place_held(held, why).await;
-        }
-        self.pending.update(key, |entry| entry.released = true);
+    /// Nobody waits on proof of the follow's downloads any more (every heart on it was taken back,
+    /// or the admin put Lidarr back for downloads Octo cannot see): a download of Octo's missing
+    /// from a queue read made after a refresh since Lidarr's start, with another item of its
+    /// client listed, is accounted for, and a release Lidarr no longer holds back is let go. One
+    /// missing while its client lists nothing else is accounted for only on the admin's word
+    /// (`let_go_unseen`); until then it stays watched, and the Lidarr card lists its follow. One
+    /// still listed stays watched, and its removal is asked again at every read.
+    fn absent_let_go(&self, key: &str, reading: &Reading, let_go_unseen: bool) {
+        let listed: HashSet<String> = reading
+            .queue
+            .iter()
+            .filter_map(|item| item.download_id.as_deref())
+            .map(dotnet::ordinal_ignore_case_key)
+            .collect();
+        let clients: HashSet<String> = reading
+            .queue
+            .iter()
+            .filter_map(|item| item.download_client.as_deref())
+            .map(dotnet::ordinal_ignore_case_key)
+            .collect();
+        let held_back: HashSet<i32> = reading
+            .queue
+            .iter()
+            .filter(|item| item.download_id.is_none())
+            .map(|item| item.id)
+            .collect();
+        let refreshed = reading.queue_refreshed();
+        self.pending.update(key, |saved| {
+            if let Some(refreshed_at) = refreshed {
+                for grab in saved.grabs.iter_mut().filter(|grab| !grab.accounted) {
+                    let missing = !listed.contains(&dotnet::ordinal_ignore_case_key(&grab.download_id));
+                    let client_answered = grab
+                        .client
+                        .as_deref()
+                        .is_some_and(|client| clients.contains(&dotnet::ordinal_ignore_case_key(client)));
+                    if missing && (client_answered || let_go_unseen) {
+                        grab.account(refreshed_at);
+                    }
+                }
+            }
+            saved
+                .pending_items
+                .retain(|item| held_back.contains(&item.queue_id));
+        });
     }
 
-    async fn place_held(&self, held: HeldPlacement, why: FollowEnd) {
-        let placed = match &self.downloads {
-            Some(downloads) => downloads.place_held(&held).await,
-            None => None,
-        };
-        match placed {
-            Some(path) => info!(
-                "Placed {} now that Octo no longer waits for Lidarr: {path}",
-                held.song
-            ),
-            None => warn!(
-                "Could not place {} from {}; it stays where it plays from",
-                held.song, held.held_path
-            ),
+    /// The follow lets go of the files it held: it is over from this moment, so a file that lands
+    /// for its artist meanwhile never waits for it, and each one it held that no other follow that
+    /// may still import holds is placed now (or gives way to its song's proven Lidarr file). A
+    /// file an earlier end could not place, and one whose follows are gone or over, is tried again
+    /// with them.
+    async fn let_go(&self, key: &str, why: FollowEnd) {
+        let mut free = self.pending.let_go_of(key);
+        free.extend(self.pending.release_unfollowed());
+        for held in free {
+            self.place_held(held, why).await;
         }
-        // The row stops saying it waits for Lidarr; a proven copy that ended the wait is its last
-        // line.
+    }
+
+    /// Places a held file now, or has a kept copy whose song's Lidarr file passed the gate of
+    /// someone it was kept for give way to that file. One that can be neither now stays on the
+    /// list, waiting for no follow, plays from where it waits, and is tried again when the next
+    /// follow is over and at the next start.
+    pub(super) async fn place_held(&self, held: HeldPlacement, why: FollowEnd) {
+        let end = match &self.downloads {
+            Some(downloads) => downloads.place_held(&held).await,
+            None => HeldEnd::Later,
+        };
+        match end {
+            HeldEnd::Placed(path) => {
+                info!(
+                    "Placed {} now that Octo no longer waits for Lidarr: {path}",
+                    held.song
+                );
+            }
+            HeldEnd::GaveWay => {
+                info!(
+                    "The kept copy of {} gave way to its proven Lidarr file: {}",
+                    held.song, held.held_path
+                );
+            }
+            HeldEnd::Later => {
+                warn!(
+                    "Could not place {} from {}; it plays from there and is placed again later",
+                    held.song, held.held_path
+                );
+                if Path::new(&held.held_path).exists() {
+                    self.pending.hold_again(HeldPlacement {
+                        follows: Vec::new(),
+                        ..held.clone()
+                    });
+                }
+            }
+        }
+        // The row stops saying it waits for Lidarr once no copy of the song waits any more (a
+        // proven copy that ended the wait is its last line); while another copy of it still
+        // waits, it says so for the people that copy waits for.
         if let Some(tracker) = &self.tracker
             && let Some((provider, id)) = held.song.split_once(':')
         {
-            let last = (why == FollowEnd::ProvenElsewhere).then_some(PROVEN_ELSEWHERE);
-            tracker.end_aside(provider, id, last);
+            let waiting = self.pending.kept_copies_waiting(&held.song);
+            if waiting.is_empty() {
+                let last = (why == FollowEnd::ProvenElsewhere).then_some(PROVEN_ELSEWHERE);
+                tracker.end_aside(provider, id, last);
+            } else {
+                let users: Vec<String> = waiting
+                    .iter()
+                    .flat_map(|copy| copy.users.iter().cloned())
+                    .collect();
+                tracker.wait_aside(provider, id, &users, HELD_FOR_LIDARR);
+            }
         }
     }
 
     /// The follow is over: the pipeline's work waited for, the album's hold folder settled for the
-    /// last time (its tracks handed on when a hearted song passed, else deleted), the pick put back
-    /// unless its song landed (the pin restored either way), and the hearts still waiting told.
+    /// last time (its tracks handed on when a hearted song passed, else deleted), the files it held
+    /// let go (placed, or given way to their song's proven Lidarr file), even when its entry is
+    /// gone, the pick put back unless its song landed (the pin restored either way), and the
+    /// hearts still waiting told.
     async fn finish_follow(self: &Arc<Self>, job: &Arc<AlbumJob>, run: FollowRun) {
         for handoff in run.handed {
             let _ = handoff.await;
         }
+        let lidarr_gone = run.lidarr_gone;
         let key = run.key;
         self.clone().settle(job.clone(), key.clone(), true).await;
+        if self.pending.get(&key).is_none() {
+            self.let_go(&key, FollowEnd::Done).await;
+        }
         let landed_titles = job
             .landed
             .lock()
@@ -1140,16 +1446,26 @@ impl Inner {
             if !entry.released {
                 self.let_go(&key, entry.ended.unwrap_or(FollowEnd::Done)).await;
             }
+            if landed_titles > 0 {
+                self.pending.update(&key, |saved| saved.landed = true);
+            }
             let entry = self.pending.get(&key).unwrap_or(entry);
             *job.no_grab.lock() = entry.ended == Some(FollowEnd::NoGrab);
             let poll = self.poll(&self.settings.current().lidarr);
             // A hearted song passed before a restart counts as landed as much as one passed now.
-            if entry.ended == Some(FollowEnd::Done) && (landed_titles > 0 || !entry.passed.is_empty()) {
+            // A put back Lidarr fails is tried again when Lidarr next answers and at the poll pace.
+            if lidarr_gone {
+                info!("Octo let go of Lidarr's album {key}: the Lidarr it was asked of is no longer Octo's");
+                self.pending.forget(&key);
+            } else if entry.ended == Some(FollowEnd::Done) && (entry.landed || !entry.passed.is_empty()) {
                 match restore_after_landing(&self.client, &self.pending, &entry, poll).await {
                     Ok(()) => {
                         info!("Octo's import of Lidarr's album {key} landed; its release choice is as it was")
                     }
-                    Err(e) => warn!("Could not give Lidarr's album {key} its release choice back: {e}"),
+                    Err(e) => {
+                        warn!("Could not give Lidarr's album {key} its release choice back: {e}");
+                        self.owe_put_back(&key);
+                    }
                 }
             } else {
                 match put_back_searched(
@@ -1162,7 +1478,10 @@ impl Inner {
                 .await
                 {
                     Ok(()) => info!("Put back Lidarr's album {key} once Octo's downloads were accounted for"),
-                    Err(e) => warn!("Could not put back Lidarr's album {key}: {e}"),
+                    Err(e) => {
+                        warn!("Could not put back Lidarr's album {key}: {e}");
+                        self.owe_put_back(&key);
+                    }
                 }
             }
         }
@@ -1264,6 +1583,96 @@ impl Inner {
             self.ensure_following(key);
         }
     }
+}
+
+/// Whether the Lidarr Octo has now is the one a pick was made in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LidarrMoved {
+    Same,
+    /// No Lidarr is set.
+    Cleared,
+    /// Another Lidarr is set: the pick's ids name nothing of it.
+    Swapped,
+}
+
+/// Whether the Lidarr set now is the pick's by its address alone: the same address, none, or
+/// another address (which may be the same Lidarr reached another way).
+pub(super) fn lidarr_moved(entry: &PendingAlbum, settings: &LidarrSettings) -> LidarrMoved {
+    match (super::lidarr_identity(settings), &entry.lidarr_url) {
+        (None, _) => LidarrMoved::Cleared,
+        (Some(now), Some(saved)) if now != *saved => LidarrMoved::Swapped,
+        _ => LidarrMoved::Same,
+    }
+}
+
+impl Inner {
+    /// Whether the Lidarr set now is the one the pick was made in. Another address names the same
+    /// Lidarr when its album and artist under the pick's ids are the pick's (the same foreign ids):
+    /// the new address is saved and the pick goes on. Only a mismatch is another Lidarr. Err when
+    /// the Lidarr at the new address cannot be read.
+    pub(super) async fn lidarr_now(
+        &self,
+        entry: &PendingAlbum,
+        settings: &LidarrSettings,
+    ) -> Result<LidarrMoved, LidarrError> {
+        let moved = lidarr_moved(entry, settings);
+        if moved != LidarrMoved::Swapped {
+            return Ok(moved);
+        }
+        let album_same = entry.lidarr_album_id > 0
+            && self
+                .client
+                .album(entry.lidarr_album_id)
+                .await?
+                .is_some_and(|album| {
+                    dotnet::eq_ignore_case(album.foreign_album_id.trim(), entry.foreign_album_id.trim())
+                });
+        let artist_same = dotnet::is_blank(&entry.foreign_artist_id)
+            || entry.lidarr_artist_id <= 0
+            || self
+                .client
+                .artist(entry.lidarr_artist_id)
+                .await?
+                .is_some_and(|artist| {
+                    dotnet::eq_ignore_case(artist.foreign_artist_id.trim(), entry.foreign_artist_id.trim())
+                });
+        if !(album_same && artist_same) {
+            return Ok(LidarrMoved::Swapped);
+        }
+        let now = super::lidarr_identity(settings);
+        info!(
+            "Octo's Lidarr has a new address and holds the same album and artist; the pick of {} goes on there",
+            entry.foreign_album_id
+        );
+        self.pending
+            .update(&entry.foreign_album_id, |saved| saved.lidarr_url = now);
+        Ok(LidarrMoved::Same)
+    }
+}
+
+/// Lidarr's time at a read, on its own clock: the newest time Lidarr itself stamped on a command,
+/// a queue item or a history row the read lists. Never a `Date` header, which a proxy in front of
+/// Lidarr may write by its own clock. None when the read lists no stamp at all.
+pub(super) fn reading_now(
+    commands: &[LidarrCommand],
+    queue: &[LidarrQueueItem],
+    history: &[LidarrHistoryRecord],
+) -> Option<DateTime<Utc>> {
+    commands
+        .iter()
+        .flat_map(|command| [command.queued, command.started, command.ended])
+        .chain(queue.iter().map(|item| item.added))
+        .flatten()
+        .chain(history.iter().map(|row| row.date))
+        .max()
+}
+
+/// The latest after Lidarr's time saved before Octo's search went out that the search could still
+/// have reached Lidarr: the request's timeout, and two seconds more for the time Octo's own steps
+/// take between saving Lidarr's time and sending the search.
+fn search_reach() -> chrono::TimeDelta {
+    chrono::TimeDelta::from_std(super::LidarrClient::TIMEOUT).unwrap_or_default()
+        + chrono::TimeDelta::seconds(2)
 }
 
 /// Whether another command ran or waited during a window: from its queuing to its end.

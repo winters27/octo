@@ -101,13 +101,13 @@ fn waits(built: &GateBuild) -> Option<(WaitingFor, String)> {
         GateBuild::Hold {
             waiting_for, line, ..
         } => Some((*waiting_for, line.clone())),
-        GateBuild::Ready(_) => None,
+        GateBuild::Ready(_) | GateBuild::End { .. } => None,
     }
 }
 
 fn gate_of(built: GateBuild) -> HeartGate {
     match built {
-        GateBuild::Ready(gate) | GateBuild::Hold { gate, .. } => gate,
+        GateBuild::Ready(gate) | GateBuild::Hold { gate, .. } | GateBuild::End { gate, .. } => gate,
     }
 }
 
@@ -470,6 +470,55 @@ fn help_heard(rig: &GateRig) -> HeartGate {
     )
 }
 
+/// Prints nothing, as an fpcalc that is missing or runs out of time.
+struct NoPrints;
+
+#[async_trait::async_trait]
+impl crate::services::prefetch::heard_samples::Printer for NoPrints {
+    async fn raw(&self, _: &std::path::Path, _: i32, _: i32) -> Option<octo_media::audio::RawFingerprint> {
+        None
+    }
+
+    async fn compressed(&self, _: &std::path::Path, _: i32, _: i32) -> Option<(String, i32)> {
+        None
+    }
+}
+
+/// A file fpcalc could not print here is never refused for it: AcoustID was never asked, so the
+/// file is judged as with AcoustID off. Another master is not kept and is no refusal; the master
+/// that played is kept as heard.
+#[tokio::test]
+async fn a_file_fpcalc_could_not_print_is_judged_without_acoust_id() {
+    let rig = gate_rig(GateSetup::default()).await;
+    rig.shim_streams(VIDEO, sound_bytes("-", "help-2009-master", "-"))
+        .await;
+    let gate = help_heard(&rig);
+    rig.rig.samples.use_printer(Arc::new(NoPrints));
+    let other = file(&rig, "other", "help-2009", "another-master", "help", None);
+    let check = rig.service.verify_for_heart(&other, &candidate("x"), &gate).await;
+    assert_eq!(
+        check.verdict,
+        GateVerdict::Undecided(octo_core::fingerprint::heart_gate::Undecided::KeepHeardCopy)
+    );
+    let master = file(&rig, "master", "help-2009", "help-2009-master", "help", None);
+    let check = rig
+        .service
+        .verify_for_heart(&master, &candidate("x"), &gate)
+        .await;
+    assert!(
+        matches!(
+            check.verdict,
+            GateVerdict::Accept {
+                by: Acceptance::HeardMaster,
+                ..
+            }
+        ),
+        "{:?}",
+        check.verdict
+    );
+    assert!(rig.answers.asked().is_empty(), "nothing was sent to AcoustID");
+}
+
 /// With AcoustID busy for the file itself, a file that is the very master that played (A2) lands
 /// when its own ISRC is one MusicBrainz lists on another release of the same song, and is refused
 /// when its ISRC names another song.
@@ -741,6 +790,41 @@ async fn with_acoust_id_off_walrus_2023_on_another_channel_holds() {
         ))
     );
     assert_eq!(gate_of(built).reading, HeardReading::Clip(ClipReading::Unclear));
+}
+
+/// With AcoustID off, a catalog clip fpcalc cannot print says nothing of what played: the heart
+/// holds under the wait whose wake-ups run the check again (Octo's next start, the song's next
+/// play), saying Octo could not read the sound, never that it waits for a Deezer that answered.
+#[tokio::test]
+async fn with_acoust_id_off_a_clip_fpcalc_cannot_print_holds_saying_the_sound_was_not_read() {
+    let rig = gate_rig(GateSetup {
+        acoust_id_off: true,
+        music_brainz: false,
+        ..Default::default()
+    })
+    .await;
+    let id = rig.rig.registry.register(help(Some(139), Some(HELP_CODE)));
+    let preview = format!("{}/clip/unprintable.mp3?hdnea=exp=1~hmac=x", rig.shim.uri());
+    Mock::given(path(format!("/track/isrc:{HELP_CODE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!(
+                r#"{{"id":116,"title":"Help! (Remastered 2009)","duration":139,"isrc":"{HELP_CODE}","preview":"{preview}","artist":{{"id":1,"name":"The Beatles"}},"album":{{"id":9,"title":"x"}}}}"#
+            ),
+            "application/json",
+        ))
+        .mount(&rig.shim)
+        .await;
+    Mock::given(path("/clip/unprintable.mp3"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"ab".to_vec(), "audio/mpeg"))
+        .mount(&rig.shim)
+        .await;
+    let record = heard_with(&rig, VIDEO, frozen_print("help-2009-240"), true, "heard");
+    let built = build(&rig, &id, Some(record)).await;
+    assert_eq!(
+        waits(&built),
+        Some((ClipReading::UNPRINTED_WAITS_FOR, SOUND_NOT_READ.to_string()))
+    );
+    assert_eq!(gate_of(built).reading, HeardReading::Clip(ClipReading::Unprinted));
 }
 
 /// With AcoustID off, a Mrs. Robinson stream for a Help! row reads "another song or another take":

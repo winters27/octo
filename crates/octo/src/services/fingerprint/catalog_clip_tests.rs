@@ -433,3 +433,137 @@ async fn a_held_records_saved_prints_are_reused() {
         "nothing fetched twice"
     );
 }
+
+/// A shim that does not answer the channel question as asked (one older than Octo, which answers
+/// from its cache) holds for the shim and its round, never Keep anyway; only a video that is gone
+/// reads unclear.
+#[tokio::test]
+async fn an_old_shim_holds_for_the_shim_and_a_gone_video_reads_unclear() {
+    let s = setup().await;
+    help_on_deezer(&s.server, &fixture("clip/help-2009-clip.json")).await;
+    Mock::given(path("/facts"))
+        .and(query_param("id", HEARD))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"channel":"The Beatles - Topic"}"#, "application/json"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&s.server)
+        .await;
+    Mock::given(path("/facts"))
+        .and(query_param("id", HEARD))
+        .respond_with(ResponseTemplate::new(410).set_body_raw(
+            r#"{"error":"video_unavailable","fresh":true}"#,
+            "application/json",
+        ))
+        .mount(&s.server)
+        .await;
+    let heard = heard_video(&s.rig, &fixture("gate/prints/help-2009-240.json"));
+    let mut prints = ClipPrints::default();
+    assert_eq!(
+        s.clip.read(&help(), &heard, &mut prints).await,
+        ClipReading::Busy(WaitingFor::Shim)
+    );
+    assert_eq!(
+        s.clip.read(&help(), &heard, &mut prints).await,
+        ClipReading::Unclear
+    );
+}
+
+/// A clip fpcalc could not print says nothing of the song: it reads as unprinted, so the heart
+/// holds and runs the check again later, never reading "no clip" (which holds with Keep anyway for
+/// good) nor waiting for a Deezer that answered.
+#[tokio::test]
+async fn a_clip_fpcalc_could_not_print_holds_rather_than_reading_no_clip() {
+    let s = setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let unprintable = dir.path().join("clip.raw");
+    std::fs::write(&unprintable, b"ab").unwrap();
+    help_on_deezer(&s.server, &unprintable).await;
+    let heard = heard_video(&s.rig, &fixture("gate/prints/help-2009-240.json"));
+    let mut prints = ClipPrints::default();
+    assert_eq!(
+        s.clip.read(&help(), &heard, &mut prints).await,
+        ClipReading::Unprinted
+    );
+    assert_eq!(prints.clip, None, "nothing is kept of a clip never printed");
+}
+
+/// `brandon` heard the copy of Help! fetched ahead, made from `video` when it came from YouTube;
+/// its stored sample is the 2009 print.
+fn heard_copy(s: &Setup, video: Option<&str>) -> HeardRecord {
+    use crate::services::prefetch::{AheadSidecar, file_name, prepare_folder, write_sidecar};
+    let folder = s._dir.path().join("prefetch");
+    prepare_folder(&folder).unwrap();
+    let file = folder.join(file_name("soulseek", "help", "m4a"));
+    std::fs::write(&file, b"x").unwrap();
+    let ready_at = Utc::now();
+    write_sidecar(
+        &file,
+        &AheadSidecar {
+            provider: "soulseek".into(),
+            external_id: "help".into(),
+            ready_at: Some(ready_at),
+            video_id: video.map(str::to_string),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let source = HeardSource::Copy {
+        key: "soulseek:help".into(),
+        ready_at: Some(ready_at),
+        source_file: None,
+    };
+    let id = sample_id_of(&source);
+    s.rig.samples.store(
+        &id,
+        &HeardPrints {
+            raw: items_in(&fixture("gate/prints/help-2009-240.json")),
+            compressed: "AQAD".into(),
+            seconds: 240,
+            whole: true,
+            reaches_end: true,
+        },
+        None,
+    );
+    HeardRecord {
+        heard_at: Utc::now(),
+        source,
+        sample_id: Some(id),
+    }
+}
+
+/// A copy fetched ahead from a peer has no channel to vouch for it (a peer's upload can be a cover
+/// that sounds like the song): it reads unclear. One made from a YouTube video is read by that
+/// video's channel, as the video itself would be.
+#[tokio::test]
+async fn a_copy_fetched_ahead_passes_only_by_the_channel_of_its_own_video() {
+    let peer = setup().await;
+    help_on_deezer(&peer.server, &fixture("clip/help-2009-clip.json")).await;
+    channel(&peer.server, "The Beatles - Topic").await;
+    let from_a_peer = heard_copy(&peer, None);
+    assert_eq!(
+        peer.clip
+            .read(&help(), &from_a_peer, &mut ClipPrints::default())
+            .await,
+        ClipReading::Unclear
+    );
+
+    let youtube = setup().await;
+    help_on_deezer(&youtube.server, &fixture("clip/help-2009-clip.json")).await;
+    channel(&youtube.server, "The Beatles - Topic").await;
+    let from_youtube = heard_copy(&youtube, Some(HEARD));
+    assert_eq!(
+        youtube
+            .clip
+            .read(&help(), &from_youtube, &mut ClipPrints::default())
+            .await,
+        ClipReading::ThisSong
+    );
+    assert_eq!(
+        asked(&youtube.server, "/facts").await,
+        1,
+        "its video's channel was read"
+    );
+}

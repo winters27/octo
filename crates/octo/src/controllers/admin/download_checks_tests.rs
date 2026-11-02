@@ -347,3 +347,64 @@ async fn lidarrs_card_says_hearts_wait_for_its_indexers_and_when_none_can_search
     assert_eq!(none["warning"], true);
     assert_eq!(none["indexers"], true);
 }
+
+/// The status says whether this build carries Octo's own AcoustID key, so the key's setting says
+/// what a blank key means here. Once AcoustID refused that key (set aside until the settings
+/// change), the downloads card warns, asking for a key of the person's own.
+#[tokio::test]
+async fn a_refused_built_in_key_has_its_own_warning_asking_for_a_key_of_ones_own() {
+    use crate::services::fingerprint::acoust_id_rate_limiter::LookupClass;
+    use crate::services::fingerprint::{AcoustIdClient, AcoustIdRateLimitHandler, AcoustIdRateLimiter};
+
+    use super::system::BUILT_IN_KEY_REFUSED;
+
+    let closed = format!("http://{}", refused_address());
+    let acoust_id = MockServer::start().await;
+    Mock::given(path("/v2/lookup"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"status":"error","error":{"code":4,"message":"invalid API key"}}"#),
+        )
+        .mount(&acoust_id)
+        .await;
+    let mut settings = quiet(&closed);
+    settings.soulseek.acoust_id_api_key = String::new();
+    let mut state = AppState::for_tests_with(
+        settings.clone(),
+        TestServices {
+            raw_settings: raw(&closed, &closed),
+            ..Default::default()
+        },
+    );
+    let client = Arc::new(AcoustIdClient::with_built_in_key(
+        Arc::new(AcoustIdRateLimitHandler::with_base_url(
+            Arc::new(AcoustIdRateLimiter::new()),
+            url::Url::parse(&format!("{}/", acoust_id.uri())).expect("an address"),
+        )),
+        state.settings.clone(),
+        Some("octo-key"),
+    ));
+    Arc::get_mut(&mut state.inner)
+        .expect("nothing else holds a fresh test state")
+        .acoust_id = client.clone();
+    let app = app(state.clone());
+    assert_eq!(lines(&app).await, Vec::<(String, String)>::new());
+    assert_eq!(
+        get(&app, "/api/admin/status").await.json()["acoustIdBuiltInKey"],
+        true
+    );
+
+    client.lookup_answer(LookupClass::Heart, "AQAD", 200).await;
+
+    assert_eq!(
+        lines(&app).await,
+        [
+            line("builtInKeyRefused", BUILT_IN_KEY_REFUSED),
+            line("acoustIdOff", ACOUST_ID_OFF),
+        ]
+    );
+    let body = get(&app, "/api/admin/status").await.json();
+    assert_eq!(body["downloads"][0]["warning"], true);
+    state.settings.set(settings);
+    assert_eq!(lines(&app).await, Vec::<(String, String)>::new());
+}

@@ -505,7 +505,9 @@ async function refreshStatus() {
     const data = await r.json();
 
     statusCards(data).forEach(([k, v]) => setStatusCard(k, v));
+    renderLidarrFollows(data.services?.lidarr?.follows);
     renderDownloadChecks(data.downloads);
+    renderAcoustIdKeyHelp(data.acoustIdBuiltInKey);
 
     // Update sidebar badge with bad count, if any. An optional service nobody set up reports
     // ok, so it never counts here.
@@ -560,6 +562,19 @@ function setStatusCard(svc, probe) {
 document.querySelectorAll('[data-status-action]').forEach(button => {
   button.addEventListener('click', () => openTab(button.dataset.statusAction));
 });
+
+// What a blank AcoustID key means on this server: Octo's own key when this build carries one
+// (the published images do), else AcoustID off until a key is added. Unknown (an older server)
+// leaves the page's own words.
+const ACOUSTID_KEY_HELP = {
+  builtIn: 'Left blank, Octo uses its own key; your own key takes its place. Type off to turn AcoustID off; the length check and its memory of rejected files still work.',
+  none: 'This server has no key of Octo\'s own, so AcoustID is off until you add one: a free key of your own turns it on. Type off to keep it off; the length check and its memory of rejected files still work.',
+};
+function renderAcoustIdKeyHelp(builtIn) {
+  const help = document.getElementById('acoustid-key-help');
+  if (!help || typeof builtIn !== 'boolean') return;
+  help.textContent = builtIn ? ACOUSTID_KEY_HELP.builtIn : ACOUSTID_KEY_HELP.none;
+}
 
 // The downloads card: what Octo's checks of downloads by their sound cannot do right now, one
 // line each, from the status read. A line that names a setting (imported downloads going
@@ -619,6 +634,58 @@ ready.then(refreshStatus);
 // No point probing every service while nobody is looking; catch up when the tab returns.
 setInterval(() => { if (!document.hidden) refreshStatus(); }, 30_000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshStatus(); });
+
+// Lidarr's card: each follow Octo cannot settle (a download of Octo's left Lidarr's queue while its
+// client lists nothing else, so nothing proves it gone) has its line and the admin's Put Lidarr
+// back, which counts that download gone, ends the follow and puts back what Octo changed in
+// Lidarr. Drawn again only when the list changed, so words shown under a button stay.
+function renderLidarrFollows(follows) {
+  const holder = document.getElementById('lidarr-follows');
+  if (!holder) return;
+  const shown = Array.isArray(follows) ? follows.filter(follow => follow?.follow && follow.text) : [];
+  const markup = shown.map(follow => {
+    const album = [follow.artist, follow.album].filter(Boolean).join(' · ');
+    return `<div class="status-card-follow" data-follow="${escapeHtml(follow.follow)}">
+      <div class="status-card-follow-text">${icon('i-warning-circle')}<span>${escapeHtml(follow.text)}${album ? `: ${escapeHtml(album)}` : ''}</span></div>
+      <button type="button" class="btn btn-ghost btn-sm" data-put-back="${escapeHtml(follow.follow)}">Put Lidarr back</button>
+      <span class="status-card-follow-status" role="status"></span>
+    </div>`;
+  }).join('');
+  if (holder.dataset.rendered !== markup) {
+    holder.innerHTML = markup;
+    holder.dataset.rendered = markup;
+  }
+  holder.hidden = shown.length === 0;
+  // A follow that asks the admin to act is a warning on the card's dot, never "all fine".
+  const dot = holder.closest('.status-card')?.querySelector('.status-dot');
+  if (shown.length && dot?.classList.contains('ok')) dot.className = 'status-dot warn';
+}
+
+// Put Lidarr back for one follow, as a Navidrome admin's own sign-in (asked for when missing),
+// then the status read again: a follow put back leaves the card. A refusal says why under the
+// button, which can be pressed again.
+async function putLidarrBack(button) {
+  const follow = button.dataset.putBack;
+  if (!follow || button.disabled) return;
+  const status = button.parentElement?.querySelector('.status-card-follow-status') || button;
+  button.disabled = true;
+  status.textContent = '';
+  status.classList?.remove('is-error');
+  try {
+    const response = await parityFetch('/api/admin/lidarr/put-back', parityJson({ follow }), status);
+    if (!response.ok) throw new Error(await parityError(response));
+  } catch (error) {
+    status.textContent = error.message;
+    status.classList?.add('is-error');
+    button.disabled = false;
+    return;
+  }
+  await refreshStatus();
+}
+document.getElementById('lidarr-follows')?.addEventListener('click', event => {
+  const button = event.target.closest?.('[data-put-back]');
+  if (button) putLidarrBack(button);
+});
 
 // ────────────────────────────────────────────────────────────────
 // Settings: load -> populate forms -> save on submit
@@ -5167,7 +5234,8 @@ async function loadAcquisitions() {
   let rows = [];
   try {
     const r = await api('/api/admin/acquisitions', { cache: 'no-store' });
-    if (r.ok) rows = ((await r.json()).acquisitions || []).filter(a => a.state !== 'done');
+    // A done row whose kept copy still waits for Lidarr is still waiting, so it stays.
+    if (r.ok) rows = ((await r.json()).acquisitions || []).filter(a => a.state !== 'done' || a.waitsAside);
   } catch { /* the log below still loads */ }
 
   const moving = new Set(rows.filter(a => a.state !== 'failed').map(a => a.id));
@@ -5180,11 +5248,17 @@ async function loadAcquisitions() {
   list.innerHTML = rows.map(a => {
     const pct = typeof a.progress === 'number' ? Math.round(a.progress * 100) : null;
     const failed = a.state === 'failed';
-    const label = a.state === 'downloading' && pct !== null
-      ? `Downloading ${pct}%`
-      : a.state === 'queued' && a.ahead > 0
-        ? `Queued, ${a.ahead} ahead`
-        : (ACQ_LABELS[a.state] || a.state);
+    // A row that offers its holder menu has stopped and waits for a person, whatever its state.
+    const held = !failed && acqOffersKeep(a);
+    const label = held
+      ? 'Waiting'
+      : a.waitsAside
+        ? 'Kept'
+        : a.state === 'downloading' && pct !== null
+          ? `Downloading ${pct}%`
+          : a.state === 'queued' && a.ahead > 0
+            ? `Queued, ${a.ahead} ahead`
+            : (ACQ_LABELS[a.state] || a.state);
     const askers = Array.isArray(a.requestedBy) ? a.requestedBy.filter(Boolean) : [];
     const size = fmtSize(a.bytesTotal);
     const sub = [
@@ -5199,7 +5273,7 @@ async function loadAcquisitions() {
       : pct !== null && a.state === 'downloading'
         ? `<div class="acq-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><span style="width:${pct}%"></span></div>`
         : a.note
-          ? `<div class="dl-sub">${escapeHtml(a.note)}</div>`
+          ? `<div class="dl-sub acq-note">${escapeHtml(a.note)}</div>`
           : '';
     // No cover yet for a song still on its way: its state's glyph on a tile instead.
     const glyph = failed ? 'i-warning' : a.state === 'queued' ? 'i-clock' : 'i-tray-arrow-down';
@@ -5208,7 +5282,7 @@ async function loadAcquisitions() {
       <div class="dl-main">
         <div class="acq-head">
           <div class="dl-title">${escapeHtml(a.title || '?')}</div>
-          <span class="dl-badge ${failed ? 'failed' : 'state'}">${escapeHtml(label)}</span>
+          <span class="dl-badge ${failed ? 'failed' : held ? 'waiting' : 'state'}">${escapeHtml(label)}</span>
         </div>
         <div class="dl-sub">${sub}</div>
         ${detail}
@@ -5657,14 +5731,16 @@ async function dlogLoad(cacheKey, key, at, holder) {
   });
 }
 
-// In progress: Log and Find songs under each card, a held one's Keep anyway and Stop waiting for
-// Lidarr, and the log across the panel when open.
+// In progress: Log and Find songs under each card (an album's row is no one song, so it has no
+// Find songs), a held one's Keep anyway, and the log across the panel when open.
 function acqActions(a) {
   if (!a.key) return '';
   const open = dlogIsOpen(a.key);
+  const album = a.kind === 'album' || a.heldTracks != null;
+  const find = album ? '' : `
+    <button type="button" class="btn btn-ghost btn-sm" data-find-id="${escapeHtml(a.key)}" data-find-title="${escapeHtml(a.title || '')}" data-find-artist="${escapeHtml(a.artist || '')}" data-focus-id="find:${escapeHtml(a.key)}">${icon('i-magnifying-glass')}<span>Find songs</span></button>`;
   return `<div class="acq-actions">
-    <button type="button" class="btn btn-ghost btn-sm" data-dlog-toggle="${escapeHtml(a.key)}" aria-expanded="${open}" data-focus-id="log:${escapeHtml(a.key)}">${icon(open ? 'i-caret-down' : 'i-caret-right')}<span>Log${a.logLines ? ` (${a.logLines})` : ''}</span></button>
-    <button type="button" class="btn btn-ghost btn-sm" data-find-id="${escapeHtml(a.key)}" data-find-title="${escapeHtml(a.title || '')}" data-find-artist="${escapeHtml(a.artist || '')}" data-focus-id="find:${escapeHtml(a.key)}">${icon('i-magnifying-glass')}<span>Find songs</span></button>
+    <button type="button" class="btn btn-ghost btn-sm" data-dlog-toggle="${escapeHtml(a.key)}" aria-expanded="${open}" data-focus-id="log:${escapeHtml(a.key)}">${icon(open ? 'i-caret-down' : 'i-caret-right')}<span>Log${a.logLines ? ` (${a.logLines})` : ''}</span></button>${find}
     ${acqHeldMenus(a)}
   </div>`;
 }
@@ -5702,16 +5778,15 @@ document.getElementById('acq-list')?.addEventListener('click', event => {
   toggle.querySelector('use')?.setAttribute('href', `#${open ? 'i-caret-down' : 'i-caret-right'}`);
 });
 
-// ── A held download: Keep anyway and Stop waiting for Lidarr ────────────────
-// A held card offers Keep anyway (Keep these anyway on an album holding two or more tracks) and,
-// while a kept copy of its song waits for a Lidarr download, Stop waiting for Lidarr. Each acts
-// for one person: its menu lists who may, read when it opens (people are named only to a
-// Navidrome admin's own sign-in), and a name picked runs the action the apps' keepAcquisitionAnyway
-// and stopWaitingForLidarr run, with that person as user. What each menu shows is kept here, so
-// the list's redraw every few seconds leaves an open menu as it was.
+// ── A held download: Keep anyway ────────────────────────────────────────────
+// A held card offers Keep anyway (Keep these anyway on an album holding two or more tracks). It
+// acts for one person: its menu lists who may, read when it opens (only to a Navidrome admin's own
+// sign-in), each with the label the server gives (their name while Record who asked is on, else
+// "Listener 1" and so on) and an opaque token that names them back. A person picked runs the
+// action the apps' keepAcquisitionAnyway runs, for that token. What the menu shows is kept here,
+// so the list's redraw every few seconds leaves an open menu as it was.
 const ACQ_MENUS = {
   keep: { people: 'keepers', path: '/api/admin/acquisitions/keep', caption: 'Whose copy to keep', none: 'Nothing is waiting to be kept' },
-  stop: { people: 'stopWaiters', path: '/api/admin/acquisitions/stop-waiting', caption: 'Whose copy should stop waiting', none: 'Nothing is waiting for Lidarr' },
 };
 const acqMenu = { open: new Set(), people: new Map(), error: new Map(), busy: new Set() };
 const acqMenuId = (kind, key) => `${kind}|${key}`;
@@ -5720,9 +5795,13 @@ function acqKeepLabel(a) {
   return a.heldTracks >= 2 ? 'Keep these anyway' : 'Keep anyway';
 }
 
+// Whether a row draws its holder menu (Keep anyway): someone waiting in its holds may keep it. The
+// row's Waiting badge reads the same, so the two never disagree.
+function acqOffersKeep(a) {
+  return Boolean(a.key && a.keepAnyway);
+}
 function acqHeldMenus(a) {
-  return (a.keepAnyway ? acqMenuMarkup(a.key, 'keep', acqKeepLabel(a)) : '')
-    + (a.stopWaiting ? acqMenuMarkup(a.key, 'stop', 'Stop waiting for Lidarr') : '');
+  return acqOffersKeep(a) ? acqMenuMarkup(a.key, 'keep', acqKeepLabel(a)) : '';
 }
 
 function acqMenuMarkup(key, kind, label) {
@@ -5740,12 +5819,13 @@ function acqMenuBody(key, kind) {
   const people = acqMenu.people.get(key);
   if (!people) return stateBlock('loading', 'Reading who is waiting…');
   if (people.error) return stateBlock('error', people.error);
-  const names = Array.isArray(people[menu.people]) ? people[menu.people] : [];
+  const holders = (Array.isArray(people[menu.people]) ? people[menu.people] : [])
+    .filter(holder => holder && holder.token);
   const error = acqMenu.error.get(id);
   const busy = acqMenu.busy.has(id);
-  const list = names.length
+  const list = holders.length
     ? `<div class="acq-menu-caption">${escapeHtml(menu.caption)}</div>
-      <div class="acq-menu-people">${names.map(user => `<button type="button" class="btn btn-ghost btn-sm" data-acq-act="${kind}" data-acq-key="${escapeHtml(key)}" data-acq-user="${escapeHtml(user)}" data-focus-id="${escapeHtml(`${id}|${user}`)}"${busy ? ' disabled' : ''}>${escapeHtml(user)}</button>`).join('')}</div>`
+      <div class="acq-menu-people">${holders.map(holder => `<button type="button" class="btn btn-ghost btn-sm" data-acq-act="${kind}" data-acq-key="${escapeHtml(key)}" data-acq-token="${escapeHtml(holder.token)}" data-focus-id="${escapeHtml(`${id}|${holder.token}`)}"${busy ? ' disabled' : ''}>${escapeHtml(holder.label || '')}</button>`).join('')}</div>`
     : stateBlock('empty', menu.none);
   return `${list}${error ? `<div class="acq-error" role="alert">${escapeHtml(error)}</div>` : ''}`;
 }
@@ -5758,7 +5838,7 @@ function acqMenuFill(key) {
   });
 }
 
-// Who may keep the row, and whose kept copy of its song waits for Lidarr, read fresh.
+// Who may keep the row, read fresh.
 async function acqMenuLoad(key, holder) {
   acqMenu.people.delete(key);
   acqMenuFill(key);
@@ -5789,19 +5869,19 @@ function acqMenuToggled(details) {
   acqMenuLoad(key, details.querySelector('[data-acq-menu-body]') || details);
 }
 
-// A person picked: their copy is kept, or stops waiting. The card is drawn again either way: a
-// done row offers it no more, and a refusal shows its words in the menu.
+// A person picked: their copy is kept. The card is drawn again either way: a done row offers it
+// no more, and a refusal shows its words in the menu.
 async function acqMenuAct(button) {
   const kind = button.dataset.acqAct;
   const key = button.dataset.acqKey;
-  const user = button.dataset.acqUser;
+  const token = button.dataset.acqToken;
   const id = acqMenuId(kind, key);
   if (!ACQ_MENUS[kind] || acqMenu.busy.has(id)) return;
   acqMenu.busy.add(id);
   acqMenu.error.delete(id);
   acqMenuFill(key);
   try {
-    const response = await parityFetch(ACQ_MENUS[kind].path, parityJson({ key, user }), button.closest('[data-acq-menu-body]') || button);
+    const response = await parityFetch(ACQ_MENUS[kind].path, parityJson({ key, token }), button.closest('[data-acq-menu-body]') || button);
     if (!response.ok) throw new Error(await parityError(response));
     acqMenu.open.delete(id);
     acqMenu.people.delete(key);
@@ -9083,6 +9163,20 @@ function renderImportDetail() {
     </div>`;
 }
 
+// While songs wait or are fetched and the server checks them with Octo's own AcoustID key (at the
+// pace work nobody waits on goes), the card says a free key of the person's own checks them
+// faster, with where to get one. The words are the server's.
+function renderImportKeyLine(key, t) {
+  const line = impEl('imp-acoustid-key');
+  if (!line) return;
+  const moving = (t?.queued ?? 0) > 0 || (t?.downloading ?? 0) > 0;
+  const shown = Boolean(moving && key?.text);
+  line.hidden = !shown;
+  line.innerHTML = shown
+    ? `${escapeHtml(key.text)}.${key.link ? ` <a href="${escapeHtml(key.link)}" target="_blank" rel="noopener">Get a free key</a>` : ''}`
+    : '';
+}
+
 function renderTrickle() {
   const t = imp.view.trickle;
   const words = {
@@ -9110,6 +9204,7 @@ function renderTrickle() {
     .filter(([count]) => count > 0).map(([count, label]) => `${count}\u00a0${label}`);
   if (tally.length) parts.push(`${tally.join(', ')}.`);
   impEl('imp-trickle-line').textContent = parts.join(' ');
+  renderImportKeyLine(imp.view.acoustIdKey, t);
 
   const pause = impEl('imp-pause');
   pause.hidden = t.state === 'idle' && t.queued === 0;

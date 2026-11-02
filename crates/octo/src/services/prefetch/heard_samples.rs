@@ -119,6 +119,33 @@ pub fn covers_whole(items: usize, read_seconds: i32, reaches_end: bool, song_sec
     items > 0 && covered + WHOLE_SLACK_SECONDS >= f64::from(target)
 }
 
+/// What one run of a heart chain or a play holds of what its people heard, for as long as it lives:
+/// each heard copy under an id of the run's own, so a hold that keeps the same copy under the
+/// person's id, or another run, never frees it, and each heard sample. Let go when dropped.
+pub struct RunHold {
+    heard: Arc<HeardSamples>,
+    /// Each heard source and the id this run holds it under.
+    copies: Vec<(HeardSource, String)>,
+    /// The id the heard samples are held under.
+    samples: String,
+}
+
+impl RunHold {
+    /// The ids this run holds its heard copies under.
+    pub fn copy_ids(&self) -> Vec<String> {
+        self.copies.iter().map(|(_, id)| id.clone()).collect()
+    }
+}
+
+impl Drop for RunHold {
+    fn drop(&mut self) {
+        self.heard.release_samples(&self.samples);
+        for (source, id) in &self.copies {
+            self.heard.release_heard(source, id);
+        }
+    }
+}
+
 /// The id a heard source's prints are stored under: the same for the same source (the same video
 /// at the same size, type and format, the same copy, the same file), whoever heard it.
 pub fn sample_id_of(source: &HeardSource) -> String {
@@ -397,9 +424,13 @@ pub enum TopUp {
 /// What printing the heard audio over the whole song came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WholePrint {
-    Ready(Vec<u32>),
+    /// The raw items, and the song's length in whole seconds when the heard audio was there to
+    /// its end (a held file, or a fetch under its cap).
+    Ready(Vec<u32>, Option<i32>),
     Busy,
     Gone,
+    /// The heard audio is here, and `fpcalc` could not print it.
+    NotPrinted,
 }
 
 /// A local file of the heard audio: one already there (a copy, a library file), or one fetched
@@ -1072,18 +1103,41 @@ impl HeardSamples {
     }
 
     /// The heard audio's raw print over the whole song (`fpcalc -length 0`), from the held file,
-    /// else one fresh fetch.
+    /// else one fresh fetch, with the song's length when that file reaches the song's end.
     pub async fn whole_song_print(&self, heard: &HeardRecord) -> WholePrint {
         let file = match self.heard_file(heard, WHOLE_SONG_CAP_BYTES).await {
             HeardFetch::Ready(file) => file,
             HeardFetch::Busy => return WholePrint::Busy,
             HeardFetch::Gone => return WholePrint::Gone,
         };
+        let whole = match &file {
+            HeardFile::Held(_) => true,
+            HeardFile::Fetched(scratch) => {
+                std::fs::metadata(scratch.path()).is_ok_and(|meta| meta.len() < WHOLE_SONG_CAP_BYTES)
+            }
+        };
         let _slot = self.slot(FpcalcClass::Heart).await;
         match self.printer().raw(file.path(), 0, self.timeout_seconds()).await {
-            Some(raw) => WholePrint::Ready(raw.items),
-            None => WholePrint::Gone,
+            Some(raw) => {
+                let seconds = (raw.seconds.round() as i32).max(0);
+                WholePrint::Ready(raw.items, (whole && seconds > 0).then_some(seconds))
+            }
+            None => WholePrint::NotPrinted,
         }
+    }
+
+    /// The YouTube video a heard copy fetched ahead was made from, while it is still that copy;
+    /// None for any other source.
+    pub fn copy_video(&self, source: &HeardSource) -> Option<String> {
+        let HeardSource::Copy {
+            key,
+            ready_at,
+            source_file,
+        } = source
+        else {
+            return None;
+        };
+        self.prefetch.copy_video(key, *ready_at, source_file.as_deref())
     }
 
     // ---- Copies a hold keeps --------------------------------------------------------------
@@ -1105,6 +1159,40 @@ impl HeardSamples {
             HeardSource::Copy { key, .. } => self.prefetch.release(key, holder),
             HeardSource::Library { .. } | HeardSource::Acquired { .. } => {}
         }
+    }
+
+    /// Holds what `heard` names (each person, what they heard) of the acquisition `base_key` for one
+    /// run of a heart chain, or of a play (`play`), for as long as the returned hold lives: each
+    /// heard copy under an id of this run's own, never a hold's, and each heard sample. None when
+    /// nobody heard anything.
+    pub fn hold_for_run(
+        self: &Arc<Self>,
+        base_key: &str,
+        heard: &[(&str, &HeardRecord)],
+        play: bool,
+    ) -> Option<RunHold> {
+        if heard.is_empty() {
+            return None;
+        }
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let samples = format!("running:{base_key}:{run}");
+        let kind = if play { "play" } else { "run" };
+        let mut copies = Vec::new();
+        for (user, record) in heard {
+            let id = format!("{kind}:{base_key}:{}:{run}", user.trim());
+            self.hold_heard(&record.source, &id);
+            let sample = record
+                .sample_id
+                .clone()
+                .unwrap_or_else(|| sample_id_of(&record.source));
+            self.hold_sample(&sample, &samples);
+            copies.push((record.source.clone(), id));
+        }
+        Some(RunHold {
+            heard: Arc::clone(self),
+            copies,
+            samples,
+        })
     }
 
     /// At start: every saved copy holder id no live hold names goes, and every live hold's
@@ -1392,9 +1480,10 @@ impl HeardSamples {
             .keep_requested
             .iter()
             .any(|asker| asker.trim().eq_ignore_ascii_case(&user));
-        // The files of a hold nobody else waits in go with the last holder.
-        let ended = self.holds.release_holder(&wait.hold_key, &wait.user).is_none();
-        let held_files = if ended {
+        // The files of a hold nobody else waits in go with the last holder: they are filed under
+        // the new hold before the old one ends, so its end never takes them.
+        let last = record.holders.len() <= 1;
+        let held_files = if last {
             record.held_files.clone()
         } else {
             Vec::new()
@@ -1407,6 +1496,7 @@ impl HeardSamples {
             line: Some(STUCK_LINE.to_string()),
             ..record
         });
+        self.holds.release_holder(&wait.hold_key, &wait.user);
         let moved = self
             .holds
             .update(&moved.key(), |r| {

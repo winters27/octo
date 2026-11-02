@@ -321,6 +321,8 @@ struct Download {
     blocked: Option<String>,
     /// The files imported so far, by their path in the download.
     imported: BTreeSet<String>,
+    /// Its grab row's date, which the queue lists as `added`.
+    added: DateTime<Utc>,
 }
 
 struct PendingRelease {
@@ -329,6 +331,9 @@ struct PendingRelease {
     artist_id: i32,
     title: String,
     reason: String,
+    added: DateTime<Utc>,
+    /// The release source of the search that held it back, which its grab carries.
+    release_source: String,
 }
 
 #[derive(Clone)]
@@ -403,6 +408,11 @@ struct State {
     health: Value,
     start_time: DateTime<Utc>,
     clock: DateTime<Utc>,
+    /// How far Lidarr's clock is from Octo's.
+    skew: TimeDelta,
+    /// How far the `Date` header of every answer is from Lidarr's own clock: a proxy in front of
+    /// Lidarr writing its own.
+    date_skew: TimeDelta,
     on_search: Vec<(i32, String, String)>,
     searches: usize,
     deleted: Vec<i32>,
@@ -414,6 +424,15 @@ struct State {
     requests: Vec<Recorded>,
     /// Lidarr answers nothing but 503.
     down: bool,
+    /// Requests Lidarr fails with a 500, by method and path under `/api/v1/`, and how many more
+    /// times.
+    failing_requests: Vec<(String, String, u32)>,
+    /// The next request of a method and path under `/api/v1/` is answered this late.
+    slow_requests: Vec<(String, String, std::time::Duration)>,
+    /// The next request of a method and path under `/api/v1/` is done and its answer lost.
+    lost_answers: Vec<(String, String)>,
+    /// The next command of each name posted is run and its answer lost.
+    lost_commands: Vec<String>,
 }
 
 impl FakeLidarr {
@@ -471,6 +490,8 @@ impl FakeLidarr {
                 health: json!([]),
                 start_time: now - TimeDelta::hours(1),
                 clock: now,
+                skew: TimeDelta::zero(),
+                date_skew: TimeDelta::zero(),
                 on_search: Vec::new(),
                 searches: 0,
                 deleted: Vec::new(),
@@ -479,6 +500,10 @@ impl FakeLidarr {
                 grabs: Vec::new(),
                 requests: Vec::new(),
                 down: false,
+                failing_requests: Vec::new(),
+                slow_requests: Vec::new(),
+                lost_answers: Vec::new(),
+                lost_commands: Vec::new(),
             })),
         };
         let server = MockServer::builder().start().await;
@@ -575,6 +600,26 @@ impl FakeLidarr {
             let artist_id = state.ensure_artist(&artist, true, "all", LIDARR_ROOT, (1, 1), None);
             if let Some(album_id) = state.insert_album(foreign_album_id, artist_id, monitored) {
                 state.add_tracks(album_id);
+            }
+        });
+    }
+
+    /// The album's releases, each by id and whether it is monitored (a release the album lacks is
+    /// added), and whether any release is acceptable, as a change in Lidarr's own UI sets them.
+    pub fn set_releases(&self, album_id: i32, releases: &[(i32, bool)], any_release_ok: bool) {
+        self.with(|state| {
+            let album = state.albums.get_mut(&album_id).expect("an album Lidarr has");
+            album.any_release_ok = any_release_ok;
+            for (id, monitored) in releases {
+                match album.releases.iter_mut().find(|release| release.id == *id) {
+                    Some(release) => release.monitored = *monitored,
+                    None => album.releases.push(Release {
+                        id: *id,
+                        foreign_id: format!("release-{id}"),
+                        title: album.title.clone(),
+                        monitored: *monitored,
+                    }),
+                }
             }
         });
     }
@@ -676,6 +721,57 @@ impl FakeLidarr {
         });
     }
 
+    /// The next `times` requests of `method` whose path under `/api/v1/` starts with `prefix`
+    /// fail with a 500, the rest answer as usual.
+    pub fn fail_next(&self, method: &str, prefix: &str, times: u32) {
+        self.with(|state| {
+            state
+                .failing_requests
+                .push((method.to_string(), prefix.to_ascii_lowercase(), times));
+        });
+    }
+
+    /// The next request of `method` whose path under `/api/v1/` starts with `prefix` is done, and
+    /// its answer lost on the way back: a proxy in front of Lidarr answers 502 instead.
+    pub fn lose_next_answer(&self, method: &str, prefix: &str) {
+        self.with(|state| {
+            state
+                .lost_answers
+                .push((method.to_string(), prefix.to_ascii_lowercase()));
+        });
+    }
+
+    /// The next command named `name` posted is queued and run, and its answer lost on the way
+    /// back: a proxy in front of Lidarr answers 502 instead.
+    pub fn lose_next_command_answer(&self, name: &str) {
+        self.with(|state| state.lost_commands.push(name.to_string()));
+    }
+
+    /// The next request of `method` whose path under `/api/v1/` starts with `prefix` is answered
+    /// `delay` late.
+    pub fn slow_next(&self, method: &str, prefix: &str, delay: std::time::Duration) {
+        self.with(|state| {
+            state
+                .slow_requests
+                .push((method.to_string(), prefix.to_ascii_lowercase(), delay));
+        });
+    }
+
+    /// A proxy in front of Lidarr writes the `Date` header of every answer by its own clock, `skew`
+    /// away from Lidarr's, from now on.
+    pub fn set_date_header_skew(&self, skew: TimeDelta) {
+        self.with(|state| state.date_skew = skew);
+    }
+
+    /// Lidarr's clock runs `skew` away from Octo's from now on (its start time with it).
+    pub fn set_clock_skew(&self, skew: TimeDelta) {
+        self.with(|state| {
+            state.start_time = state.start_time + skew - state.skew;
+            state.clock = state.clock + skew - state.skew;
+            state.skew = skew;
+        });
+    }
+
     /// Lidarr restarts: a new start time, the command list empty (running commands orphaned),
     /// and the queue empty until the first refresh of the downloads. The clients keep their
     /// downloads.
@@ -715,12 +811,15 @@ impl FakeLidarr {
             let artist_id = state.albums.get(&album_id).map_or(0, |a| a.artist_id);
             let queue_id = 2_000_000_000 + state.next_queue;
             state.next_queue += 1;
+            let added = state.tick();
             state.pending.push(PendingRelease {
                 queue_id,
                 album_id,
                 artist_id,
                 title: format!("Pending release {queue_id}"),
                 reason: reason.to_string(),
+                added,
+                release_source: "Search".to_string(),
             });
             queue_id
         })
@@ -738,17 +837,35 @@ impl FakeLidarr {
     }
 
     /// A pending release is grabbed after all: it leaves the queue's pending list and becomes
-    /// this download, with its `grabbed` row naming the search it came from.
+    /// this download, with its `grabbed` row naming the search it came from (the release source of
+    /// the search that held it back).
     pub fn grab_pending(&self, queue_id: i32, grab: Grab) {
-        self.with(|state| {
-            let album_id = state
+        let source = self.with(|state| {
+            state
                 .pending
                 .iter()
                 .find(|p| p.queue_id == queue_id)
-                .map(|p| p.album_id)
+                .map(|p| p.release_source.clone())
+                .expect("a pending release")
+        });
+        self.take_pending(queue_id, grab, &source);
+    }
+
+    /// The pending release leaves the queue for a grab of the album made with `release_source`,
+    /// the grab carrying the same release title: Lidarr's own grab of what it held back
+    /// (`Search`), or any grab of the album by the user, which clears what Lidarr held back for
+    /// it.
+    pub fn take_pending(&self, queue_id: i32, mut grab: Grab, release_source: &str) {
+        self.with(|state| {
+            let (album_id, title) = state
+                .pending
+                .iter()
+                .find(|p| p.queue_id == queue_id)
+                .map(|p| (p.album_id, p.title.clone()))
                 .expect("a pending release");
             state.pending.retain(|p| p.queue_id != queue_id);
-            state.grab(album_id, grab, "Search");
+            grab.title = title;
+            state.grab(album_id, grab, release_source);
         });
     }
 
@@ -992,9 +1109,10 @@ fn missing(what: &str) -> ResponseTemplate {
 }
 
 impl State {
-    /// Lidarr's clock: now, and always later than the last time it gave.
+    /// Lidarr's clock: now (set apart from Octo's by the skew a test gives it), and always later
+    /// than the last time it gave.
     fn tick(&mut self) -> DateTime<Utc> {
-        let now = Utc::now().max(self.clock + TimeDelta::microseconds(1));
+        let now = (Utc::now() + self.skew).max(self.clock + TimeDelta::microseconds(1));
         self.clock = now;
         now
     }
@@ -1247,9 +1365,11 @@ impl State {
         self.history.push(row);
     }
 
+    /// The newest download of this id: a torrent grabbed again keeps its id.
     fn download(&mut self, download_id: &str) -> &mut Download {
         self.downloads
             .iter_mut()
+            .rev()
             .find(|d| d.grab.download_id == download_id)
             .expect("a download the fake grabbed")
     }
@@ -1271,6 +1391,7 @@ impl State {
             removed: false,
             blocked: None,
             imported: BTreeSet::new(),
+            added: self.clock,
             grab,
         };
         let protocol = if download.grab.protocol == "usenet" {
@@ -1291,6 +1412,8 @@ impl State {
         );
         let finished = download.grab.finished;
         let download_id = download.grab.download_id.clone();
+        let mut download = download;
+        download.added = self.history.last().map_or(download.added, |row| row.date);
         self.downloads.push(download);
         if finished {
             self.finish_download(&download_id);
@@ -1332,12 +1455,15 @@ impl State {
                 let artist_id = self.albums.get(album_id).map_or(0, |a| a.artist_id);
                 let queue_id = 2_000_000_000 + self.next_queue;
                 self.next_queue += 1;
+                let added = self.tick();
                 self.pending.push(PendingRelease {
                     queue_id,
                     album_id: *album_id,
                     artist_id,
                     title: format!("Pending release {queue_id}"),
                     reason,
+                    added,
+                    release_source: release_source.to_string(),
                 });
                 continue;
             }
@@ -1819,7 +1945,7 @@ impl State {
             "sizeleft": download.size_left as f64, "status": status, "trackedDownloadStatus": health,
             "trackedDownloadState": tracked, "statusMessages": [], "downloadId": download.grab.download_id,
             "protocol": download.grab.protocol, "downloadClient": download.grab.client_name,
-            "indexer": "Fake indexer", "outputPath": output_path,
+            "indexer": "Fake indexer", "outputPath": output_path, "added": at(download.added),
         })
     }
 
@@ -2168,7 +2294,12 @@ impl State {
         if self.mode == CommandMode::Instant && method != "GET" {
             self.drain();
         }
-        response
+        // Lidarr's own clock, to the second, as every answer of its web server carries it (or a
+        // proxy's in front of it).
+        let date = (Utc::now() + self.skew + self.date_skew)
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        response.insert_header("Date", date.as_str())
     }
 
     fn route(
@@ -2332,6 +2463,10 @@ impl State {
                     .collect();
                 answer(200, Value::Array(rows))
             }
+            ("GET", ["trackfile", id]) => match id.parse().ok().and_then(|id: i32| self.files.get(&id)) {
+                Some(file) => answer(200, self.file_json(file)),
+                None => missing("Track file"),
+            },
             ("DELETE", ["trackfile", id]) => match id.parse::<i32>() {
                 Ok(id) => self.delete_track_file(id),
                 Err(_) => missing("Track file"),
@@ -2402,6 +2537,7 @@ impl State {
                                 "id": p.queue_id, "artistId": p.artist_id, "albumId": p.album_id,
                                 "title": p.title, "status": p.reason, "trackedDownloadState": "downloading",
                                 "trackedDownloadStatus": "ok", "protocol": "torrent", "size": 1.0, "sizeleft": 1.0,
+                                "added": at(p.added), "indexer": "Fake indexer",
                             })
                         }),
                 );
@@ -2837,6 +2973,44 @@ impl Respond for FakeLidarr {
         if state.down {
             return answer(503, json!({ "message": "Lidarr is down" }));
         }
-        state.handle(request.method.as_str(), request.url.path(), &query, body.as_ref())
+        let path = request.url.path().to_ascii_lowercase();
+        let method = request.method.as_str().to_string();
+        let hit = |m: &str, prefix: &str| m == method && path.starts_with(&format!("/api/v1/{prefix}"));
+        if let Some(index) = state
+            .failing_requests
+            .iter()
+            .position(|(m, prefix, _)| hit(m, prefix))
+        {
+            state.failing_requests[index].2 -= 1;
+            if state.failing_requests[index].2 == 0 {
+                state.failing_requests.remove(index);
+            }
+            return answer(500, json!({ "message": "Lidarr failed this request" }));
+        }
+        let delay = state
+            .slow_requests
+            .iter()
+            .position(|(m, prefix, _)| hit(m, prefix))
+            .map(|index| state.slow_requests.remove(index).2);
+        let named = body
+            .as_ref()
+            .and_then(|body| body["name"].as_str())
+            .filter(|_| method == "POST" && path == "/api/v1/command")
+            .and_then(|name| state.lost_commands.iter().position(|lost| lost == name));
+        let lost = state
+            .lost_answers
+            .iter()
+            .position(|(m, prefix)| hit(m, prefix))
+            .map(|index| state.lost_answers.remove(index))
+            .is_some()
+            || named.map(|index| state.lost_commands.remove(index)).is_some();
+        let response = state.handle(request.method.as_str(), request.url.path(), &query, body.as_ref());
+        if lost {
+            return answer(502, json!({ "message": "Bad gateway" }));
+        }
+        match delay {
+            Some(delay) => response.set_delay(delay),
+            None => response,
+        }
     }
 }

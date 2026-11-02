@@ -6,7 +6,10 @@
 //! background lane into a scratch file. Every candidate of the round is compared with that one
 //! copy, so five peers make one fetch. A round takes one of two heard-copy places before it makes
 //! its copy, and gives it back (deleting a fetched copy) when it ends or waits on something
-//! outside, so at most two heard copies exist at once and a long wait never keeps one.
+//! outside, so at most two heard copies exist at once and a long wait never keeps one. The rounds
+//! of one acquisition (one per person who asked) take turns at one place: a round about to wait
+//! for a place first frees the place its siblings hold, so people judged in one pass never wait on
+//! each other's places.
 //!
 //! The comparison takes one `fpcalc` place (the queue every heart's sound work shares) once both
 //! files are local, and runs off the async threads: three passes over each file, each decoded by
@@ -270,12 +273,16 @@ pub fn run_check(decoder: &dyn Decoder, heard: &Path, file: &Path, timeout: Dura
     Some(reading.passed())
 }
 
+/// The open rounds, by acquisition and person.
+type Rounds = Mutex<HashMap<(String, String), HeardRound>>;
+
 /// What every round shares.
 struct Parts {
     samples: Arc<HeardSamples>,
     permits: Arc<Semaphore>,
     decoder: Mutex<Arc<dyn Decoder>>,
     timeout: Mutex<Option<Duration>>,
+    rounds: Rounds,
 }
 
 impl Parts {
@@ -295,6 +302,8 @@ struct RoundCopy {
 struct RoundInner {
     parts: Arc<Parts>,
     heard: HeardAudio,
+    /// The acquisition the round judges files of, whose rounds take turns at one place.
+    acquisition: Option<String>,
     copy: Mutex<Option<Arc<RoundCopy>>>,
     /// One copy is made at a time.
     making: tokio::sync::Mutex<()>,
@@ -305,13 +314,34 @@ struct RoundInner {
 pub struct HeardRound(Arc<RoundInner>);
 
 impl HeardRound {
-    fn new(parts: Arc<Parts>, heard: HeardAudio) -> Self {
+    fn new(parts: Arc<Parts>, heard: HeardAudio, acquisition: Option<String>) -> Self {
         HeardRound(Arc::new(RoundInner {
             parts,
             heard,
+            acquisition,
             copy: Mutex::new(None),
             making: tokio::sync::Mutex::new(()),
         }))
+    }
+
+    /// The other open rounds of this round's acquisition give their places back, so this one
+    /// never waits for a place while its own acquisition holds one.
+    fn pause_siblings(&self) {
+        let Some(acquisition) = &self.0.acquisition else {
+            return;
+        };
+        let siblings: Vec<HeardRound> = self
+            .0
+            .parts
+            .rounds
+            .lock()
+            .iter()
+            .filter(|((key, _), round)| key == acquisition && !Arc::ptr_eq(&round.0, &self.0))
+            .map(|(_, round)| round.clone())
+            .collect();
+        for round in siblings {
+            round.pause();
+        }
     }
 
     /// Whether `file` is the master the person heard. The round's heard copy is made at its first
@@ -343,6 +373,7 @@ impl HeardRound {
         if let Some(copy) = self.0.copy.lock().clone() {
             return Ok(copy);
         }
+        self.pause_siblings();
         let permit = Arc::clone(&self.0.parts.permits)
             .acquire_owned()
             .await
@@ -384,7 +415,6 @@ impl HeardRound {
 
 /// Ends its round when dropped: the round's copy goes and its place is freed.
 pub struct RoundGuard {
-    rounds: Arc<Mutex<HashMap<(String, String), HeardRound>>>,
     key: (String, String),
     round: HeardRound,
 }
@@ -398,7 +428,7 @@ impl RoundGuard {
 
 impl Drop for RoundGuard {
     fn drop(&mut self) {
-        let mut rounds = self.rounds.lock();
+        let mut rounds = self.round.0.parts.rounds.lock();
         if rounds
             .get(&self.key)
             .is_some_and(|open| Arc::ptr_eq(&open.0, &self.round.0))
@@ -414,7 +444,6 @@ impl Drop for RoundGuard {
 /// decoder.
 pub struct HeardMasterCheck {
     parts: Arc<Parts>,
-    rounds: Arc<Mutex<HashMap<(String, String), HeardRound>>>,
 }
 
 impl HeardMasterCheck {
@@ -425,8 +454,8 @@ impl HeardMasterCheck {
                 permits: Arc::new(Semaphore::new(HEARD_COPIES_AT_ONCE)),
                 decoder: Mutex::new(Arc::new(Ffmpeg)),
                 timeout: Mutex::new(None),
+                rounds: Mutex::new(HashMap::new()),
             }),
-            rounds: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -449,26 +478,54 @@ impl HeardMasterCheck {
     /// dropping the guard ends it.
     pub fn open_round(&self, acquisition_key: &str, user: &str, heard: HeardAudio) -> RoundGuard {
         let key = (acquisition_key.to_string(), user.trim().to_lowercase());
-        let round = HeardRound::new(Arc::clone(&self.parts), heard);
-        self.rounds.lock().insert(key.clone(), round.clone());
-        RoundGuard {
-            rounds: Arc::clone(&self.rounds),
-            key,
-            round,
-        }
+        let round = HeardRound::new(Arc::clone(&self.parts), heard, Some(acquisition_key.to_string()));
+        self.parts.rounds.lock().insert(key.clone(), round.clone());
+        RoundGuard { key, round }
     }
 
     /// The open round of `user` in `acquisition_key`.
     pub fn round(&self, acquisition_key: &str, user: &str) -> Option<HeardRound> {
-        self.rounds
+        self.parts
+            .rounds
             .lock()
             .get(&(acquisition_key.to_string(), user.trim().to_lowercase()))
             .cloned()
     }
 
+    /// Every open round of `acquisition_key` gives its place back: the acquisition waits on
+    /// something outside it, and the next check makes its copy again.
+    pub fn pause_acquisition(&self, acquisition_key: &str) {
+        let open: Vec<HeardRound> = self
+            .parts
+            .rounds
+            .lock()
+            .iter()
+            .filter(|((key, _), _)| key == acquisition_key)
+            .map(|(_, round)| round.clone())
+            .collect();
+        for round in open {
+            round.pause();
+        }
+    }
+
     /// A round of one candidate.
     pub async fn check_once(&self, heard: HeardAudio, file: &Path) -> HeardMaster {
-        let round = HeardRound::new(Arc::clone(&self.parts), heard);
+        self.check_once_in(None, heard, file).await
+    }
+
+    /// A round of one candidate of the acquisition `acquisition_key`, which takes its turn at the
+    /// acquisition's place as the acquisition's open rounds do.
+    pub async fn check_once_in(
+        &self,
+        acquisition_key: Option<&str>,
+        heard: HeardAudio,
+        file: &Path,
+    ) -> HeardMaster {
+        let round = HeardRound::new(
+            Arc::clone(&self.parts),
+            heard,
+            acquisition_key.map(str::to_string),
+        );
         let answer = round.check(file).await;
         round.pause();
         answer

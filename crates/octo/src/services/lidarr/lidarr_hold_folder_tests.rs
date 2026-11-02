@@ -10,6 +10,7 @@ use octo_core::lidarr::lidarr_client::LidarrReleaseChoice;
 use tokio::task::JoinHandle;
 
 use super::*;
+use crate::services::lidarr::FollowEnd;
 use crate::services::lidarr::fake_lidarr::GrabFile;
 use crate::services::lidarr::lidarr_pick::put_back_searched;
 
@@ -152,6 +153,7 @@ fn hold_kept_copy(f: &Fixture) -> HeldPlacement {
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
         users: vec!["alice".into()],
+        proven_for: Vec::new(),
     };
     f.pending.hold_placement(held.clone());
     held
@@ -464,12 +466,15 @@ async fn a_hearted_songs_file_that_waits_for_acoust_id_holds_the_heart_with_it()
 
 /// The heart kept the heard audio while Octo's download still moved (Lidarr last, its timeout
 /// passed), and the copy waits for the follow. The song's late import passes Alice's gate: the kept
-/// copy is dropped for it, never placed, and Alice ends with the proven file alone.
+/// copy is dropped for it, never placed, and Alice ends with the proven file alone. The judging
+/// takes longer than the follow takes to see every download accounted for, and the follow still
+/// lets go of nothing before it is done.
 #[tokio::test]
 async fn a_kept_copy_gives_way_to_the_songs_proven_lidarr_import() {
     let f = Fixture::new().await;
     f.lidarr
         .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    f.slow.lock().insert("Teardrop".into());
     let service = f.service(None, 1);
     assert!(!gated_heart(&f, &service, "alice", true).await.expect("the task"));
     watching(&f, "dl-1").await;
@@ -478,13 +483,147 @@ async fn a_kept_copy_gives_way_to_the_songs_proven_lidarr_import() {
     f.lidarr.complete("dl-1");
     f.lidarr.refresh();
 
-    until(|| f.taken.lock().len() == 1).await;
+    until(|| !f.dropped.lock().is_empty() || !f.placed.lock().is_empty()).await;
     over(&f).await;
     assert_eq!(f.taken(), ["Teardrop"]);
-    assert_eq!(*f.dropped.lock(), [(held.clone(), vec!["alice".to_string()])]);
+    assert_eq!(dropped(&f), [(held.held_path.clone(), vec!["alice".to_string()])]);
     assert!(f.placed.lock().is_empty(), "the kept copy is never placed");
     assert!(!Path::new(&held.held_path).exists());
     assert!(f.pending.held().is_empty());
+}
+
+/// The library's files of a song, by their path under the octo root.
+fn files_of(f: &Fixture, title: &str) -> Vec<String> {
+    audio_files(f)
+        .into_iter()
+        .filter(|path| path.contains(title))
+        .collect()
+}
+
+/// The kept copies the pipeline dropped, by where each was held, and for whom.
+fn dropped(f: &Fixture) -> Vec<(String, Vec<String>)> {
+    f.dropped
+        .lock()
+        .iter()
+        .map(|(copy, users)| (copy.held_path.clone(), users.clone()))
+        .collect()
+}
+
+/// Alice's follow ends (her download made no progress) while Octo's download cannot be removed
+/// from Lidarr's queue yet: Lidarr may still import it, so her kept copy stays held and is never
+/// placed. Lidarr does import it, and the late import is judged as during the follow: it passes
+/// her gate, her copy gives way to it, and the library ends with one Teardrop, Lidarr's proven one.
+#[tokio::test]
+async fn a_late_import_after_the_follow_ended_is_judged_before_the_kept_copy_is_placed() {
+    let f = Fixture::new().await;
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!gated_heart(&f, &service, "alice", false).await.expect("the task"));
+    watching(&f, "dl-1").await;
+    let held = hold_kept_copy(&f);
+    f.lidarr.fail_next("DELETE", "queue", 100_000);
+
+    assert!(f.pending.request_end(ALBUM_ID, FollowEnd::DeadDownload));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        f.placed.lock().is_empty(),
+        "never placed while Octo's download may still be imported"
+    );
+    assert!(
+        Path::new(&held.held_path).is_file(),
+        "it plays from the hold path"
+    );
+
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
+
+    until(|| !f.dropped.lock().is_empty()).await;
+    over(&f).await;
+    assert_eq!(f.taken(), ["Teardrop"]);
+    assert!(f.placed.lock().is_empty(), "the kept copy is never placed");
+    assert_eq!(dropped(&f), [(held.held_path.clone(), vec!["alice".to_string()])]);
+    assert_eq!(
+        files_of(&f, "Teardrop"),
+        ["Massive Attack - Teardrop.flac"],
+        "one Teardrop, Lidarr's proven one"
+    );
+}
+
+/// Alice and Bob each heart Teardrop with their own gate, on one follow of Octo's download of
+/// Mezzanine, their hearts holding with nothing landed yet.
+async fn alice_and_bob_wait_on_teardrop(f: &Fixture) -> LidarrHeartAcquisitionService {
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    let service = f.service(None, 1);
+    let alice = gated_heart(f, &service, "alice", false);
+    watching(f, "dl-1").await;
+    let bob = gated_heart(f, &service, "bob", false);
+    assert!(!alice.await.expect("the task"));
+    assert!(!bob.await.expect("the task"));
+    until(|| {
+        f.pending
+            .get(ALBUM_ID)
+            .is_some_and(|entry| entry.holders.len() == 2)
+    })
+    .await;
+    service
+}
+
+/// A kept copy of Teardrop for `users`, held for the follow of Mezzanine at `name`.
+fn hold_kept_copy_for(f: &Fixture, name: &str, users: &[&str]) -> HeldPlacement {
+    let folder = f.root.path().join(".octo-incoming/held/lidarr-follow-teardrop");
+    std::fs::create_dir_all(&folder).expect("made");
+    let held_path = folder.join(name);
+    std::fs::write(&held_path, format!("the version {} heard", users.join(" and "))).expect("written");
+    let held = HeldPlacement {
+        song: format!("soulseek:{}", f.id("Teardrop")),
+        held_path: held_path.to_string_lossy().into_owned(),
+        target: f
+            .root
+            .path()
+            .join(format!("Massive Attack/Mezzanine/{name}"))
+            .to_string_lossy()
+            .into_owned(),
+        kept: true,
+        follows: vec![ALBUM_ID.to_string()],
+        users: users.iter().map(|user| user.to_string()).collect(),
+        proven_for: Vec::new(),
+    };
+    f.pending.hold_placement(held.clone());
+    held
+}
+
+/// One kept copy of Teardrop for Alice and Bob, held for the follow in the shared library. Lidarr's
+/// Teardrop passes Bob's gate alone (Alice's refuses it): that proof is saved on the copy before
+/// anything is dropped, so when dropping it fails at once (its record could not be written), the
+/// follow's end drops it instead of placing it. The library ends with one Teardrop, Lidarr's
+/// proven one, never the kept copy beside it.
+#[tokio::test]
+async fn a_shared_copy_whose_drop_failed_gives_way_at_the_follows_end_never_placed() {
+    let f = Fixture::new().await;
+    alice_and_bob_wait_on_teardrop(&f).await;
+    let held = hold_kept_copy_for(&f, "03 - Teardrop.m4a", &["alice", "bob"]);
+    f.refused_users.lock().insert("alice".into());
+    *f.drops_failing.lock() = Some(());
+
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
+
+    until(|| !f.dropped.lock().is_empty() || !f.placed.lock().is_empty()).await;
+    over(&f).await;
+    assert_eq!(f.taken(), ["Teardrop"]);
+    assert!(f.placed.lock().is_empty(), "the kept copy is never placed");
+    assert_eq!(
+        dropped(&f),
+        [(held.held_path.clone(), vec!["bob".to_string()])],
+        "it gave way at the follow's end, for bob's proof"
+    );
+    assert_eq!(
+        files_of(&f, "Teardrop"),
+        ["Massive Attack - Teardrop.flac"],
+        "one Teardrop, Lidarr's proven one"
+    );
 }
 
 /// A folder import of the user's that Lidarr gave a guessed id of Octo's names no client: it is

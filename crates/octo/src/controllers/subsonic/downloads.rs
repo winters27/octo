@@ -1,8 +1,8 @@
 //! octoAcquisitions version 4, the apps' downloads drawer. One download's whole log, clearing
 //! finished ones, Find songs (a search run again by hand, every copy listed, one picked, and a
-//! library song replaced anyway once the person says so), keeping a held download anyway, and
-//! stopping a kept copy's wait for Lidarr. Always JSON, and every call is checked with a ping to
-//! Navidrome as getAcquisitions is. Each person sees and picks only their own.
+//! library song replaced anyway once the person says so), and keeping a held download anyway.
+//! Always JSON, and every call is checked with a ping to Navidrome as getAcquisitions is. Each
+//! person sees and picks only their own.
 
 use axum::extract::{Request, State};
 use axum::response::IntoResponse;
@@ -15,11 +15,9 @@ use super::caller_checks::{SubsonicCall, check_caller, signed_in_user};
 use crate::app::AppState;
 use crate::http::error::AppResult;
 use crate::http::routes::RouteSet;
-use crate::services::common::AcquisitionSnapshot;
 use crate::services::common::heart_acquisition_coordinator::KeepAnyway;
 use crate::services::common::song_finder::{PickOutcome, library_action_states};
 use crate::services::family::{WriteDecision, family_caller};
-use crate::services::lidarr::StopWaiting;
 use crate::services::subsonic::SubsonicResponseBuilderExt;
 use octo_core::family::abilities::RequestQuality;
 use octo_core::family::request::RequestKind;
@@ -32,10 +30,6 @@ pub fn routes() -> RouteSet {
         .subsonic(
             "keepAcquisitionAnyway",
             get(keep_acquisition_anyway).post(keep_acquisition_anyway),
-        )
-        .subsonic(
-            "stopWaitingForLidarr",
-            get(stop_waiting_for_lidarr).post(stop_waiting_for_lidarr),
         )
         .subsonic(
             "clearAcquisitions",
@@ -79,7 +73,6 @@ pub async fn get_acquisition(State(state): State<AppState>, req: Request) -> App
                     .heart_acquisition_coordinator
                     .keep_marks(&username)
                     .mark(&mut row);
-                mark_stop_waiting(&state, &username, &mut row);
                 row
             })
     };
@@ -143,7 +136,9 @@ pub async fn keep_acquisition_anyway(State(state): State<AppState>, req: Request
         });
     }
     let outcome = coordinator.keep_anyway(&key, &username);
-    if matches!(outcome, KeepAnyway::NotAHolder | KeepAnyway::NothingHeld)
+    // The admin is asked to name a person only for a row others hold; with nothing held, nothing
+    // waits to be kept.
+    if outcome == KeepAnyway::NotAHolder
         && named.is_empty()
         && super::extensions::is_caller_admin(&call, &username).await
     {
@@ -157,90 +152,6 @@ pub async fn keep_acquisition_anyway(State(state): State<AppState>, req: Request
         KeepAnyway::NotAHolder if listed_for_them() => refused(70, NOTHING_WAITING),
         KeepAnyway::NotAHolder => refused(50, KEEP_NOT_YOURS),
     })
-}
-
-/// What stopWaitingForLidarr answers someone whose heart kept no copy of the row's song.
-pub const STOP_NOT_YOURS: &str = "Only someone who hearted this can stop waiting for Lidarr";
-/// What it answers the admin who names nobody.
-pub const STOP_NAME_THE_PERSON: &str = "Name the person whose copy should stop waiting";
-/// What it answers when no copy of the row's song waits for Lidarr.
-pub const NOTHING_WAITS_FOR_LIDARR: &str = "Nothing is waiting for Lidarr";
-
-/// Sets the row's `stopWaiting` for `user`: their heart kept a copy of its song that waits for an
-/// open Lidarr follow.
-pub(super) fn mark_stop_waiting(state: &AppState, user: &str, row: &mut AcquisitionSnapshot) {
-    row.stop_waiting = !is_blank(user)
-        && state
-            .lidarr_hearts
-            .stop_waiters(&row.provider, &row.external_id)
-            .iter()
-            .any(|waiter| dotnet::eq_ignore_case(waiter, user.trim()));
-}
-
-/// octoAcquisitions version 4: "Stop waiting for Lidarr" on a downloads row, by the key
-/// getAcquisitions lists. It ends every Lidarr follow a kept copy of the row's song waits for, so
-/// that copy lands now. Only someone whose heart kept that copy may ask (error 50 for anyone else);
-/// the admin asks for a holder by naming them with `user` (error 10 without one). A plain ok once
-/// asked; error 70 when no copy of the song waits for Lidarr.
-pub async fn stop_waiting_for_lidarr(State(state): State<AppState>, req: Request) -> AppResult {
-    let call = match SubsonicCall::read(&state, req).await {
-        Ok(call) => call,
-        Err(response) => return Ok(response),
-    };
-    if let Some(refused) = check_caller(&state, &call).await {
-        return Ok(refused);
-    }
-    let builder = &state.subsonic_response_builder;
-    let key = trimmed(&call, "key");
-    if key.is_empty() {
-        return Ok(builder
-            .create_error(FORMAT, 10, "Required parameter is missing: key")
-            .into_response());
-    }
-    let refused = |code: i32, message: &str| builder.create_error(FORMAT, code, message).into_response();
-    let username = signed_in_user(&state, &call).await?;
-    if is_blank(&username) {
-        return Ok(refused(50, STOP_NOT_YOURS));
-    }
-    let Some((provider, external_id)) = key.split_once(':') else {
-        return Ok(refused(70, NOTHING_WAITS_FOR_LIDARR));
-    };
-    let hearts = &state.lidarr_hearts;
-    let waiters = hearts.stop_waiters(provider, external_id);
-    let waits_for = |user: &str| {
-        waiters
-            .iter()
-            .any(|waiter| dotnet::eq_ignore_case(waiter, user.trim()))
-    };
-    let stop = || async {
-        match hearts.stop_waiting_for_lidarr(provider, external_id).await {
-            StopWaiting::Stopped => builder
-                .create_response(FORMAT, "stopWaitingForLidarr")
-                .into_response(),
-            StopWaiting::NothingWaits => refused(70, NOTHING_WAITS_FOR_LIDARR),
-        }
-    };
-    // The admin stops a holder's wait by naming them; anyone else stops only their own.
-    let named = trimmed(&call, "user");
-    if !named.is_empty() && !dotnet::eq_ignore_case(&named, username.trim()) {
-        if !super::extensions::is_caller_admin(&call, &username).await {
-            return Ok(refused(50, STOP_NOT_YOURS));
-        }
-        if !waits_for(&named) {
-            return Ok(refused(70, NOTHING_WAITS_FOR_LIDARR));
-        }
-        return Ok(stop().await);
-    }
-    if waits_for(&username) {
-        return Ok(stop().await);
-    }
-    if named.is_empty() && super::extensions::is_caller_admin(&call, &username).await {
-        return Ok(refused(10, STOP_NAME_THE_PERSON));
-    }
-    if waiters.is_empty() {
-        return Ok(refused(70, NOTHING_WAITS_FOR_LIDARR));
-    }
-    Ok(refused(50, STOP_NOT_YOURS))
 }
 
 /// Takes the caller's finished downloads off their list, or the one named by key. A download

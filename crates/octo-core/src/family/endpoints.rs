@@ -148,7 +148,6 @@ pub const REST_ENDPOINTS: &[(&str, EndpointClass)] = &[
     ("keepAcquisitionAnyway", LibraryWrite),
     ("libraryAction", LibraryWrite),
     ("pickFoundSong", LibraryWrite),
-    ("stopWaitingForLidarr", LibraryWrite),
     // A listener's own chart countries.
     ("pinChartCountry", Read),
     ("setChartCountry", Read),
@@ -417,7 +416,6 @@ mod tests {
             "setLyricsChoice",
             "findSongs",
             "keepAcquisitionAnyway",
-            "stopWaitingForLidarr",
         ] {
             assert_eq!(rest_class(name), Some(LibraryWrite), "{name}");
         }

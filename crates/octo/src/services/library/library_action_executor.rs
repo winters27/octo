@@ -1474,8 +1474,10 @@ impl LibraryActionExecutor {
                 .record_requested_by
                 .then_some(request.username.as_str());
             let mut attempt = 0;
-            // The file a replacement's check left waiting for AcoustID's bulk turn.
+            // The file a replacement's check left waiting for AcoustID's bulk turn, with the labels
+            // of a file Lidarr brought.
             let mut waiting: Vec<String> = Vec::new();
+            let mut waiting_lidarr = Vec::new();
             loop {
                 let Some(&source) = sources.get(attempt) else {
                     return Err(Arc::new(anyhow::anyhow!(
@@ -1492,7 +1494,10 @@ impl LibraryActionExecutor {
                         None => octo_core::fingerprint::heart_gate::AcquisitionOrigin::Replacement,
                     }),
                     kept_gate.iter().cloned().collect(),
-                    std::mem::take(&mut waiting),
+                    crate::services::common::HeldFiles::of(
+                        std::mem::take(&mut waiting),
+                        std::mem::take(&mut waiting_lidarr),
+                    ),
                     &crate::services::common::AcquisitionTarget::Shared,
                     false,
                     SoulseekMetadataService::PROVIDER_NAME,
@@ -1531,6 +1536,7 @@ impl LibraryActionExecutor {
                         original.title
                     );
                     waiting = held.files.clone();
+                    waiting_lidarr = held.lidarr.clone();
                     continue;
                 }
                 match outcome {

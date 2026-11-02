@@ -747,6 +747,7 @@ async fn each_kind_of_answer_is_read_and_only_a_refused_question_is_warned() {
             Asked::NotKnown => "not known",
             Asked::Refused => "refused",
             Asked::Busy { .. } => "busy",
+            Asked::GaveUp => "gave up",
         };
         assert_eq!(kind, expected);
     }
@@ -1437,6 +1438,42 @@ async fn an_always_failing_page_and_code_lookup_on_an_idle_client_end_after_thre
     assert!(carriers.releases.is_empty());
     assert_eq!(questions.code_recordings(YESTERDAY_CODE).await, Ok(Vec::new()));
     assert_eq!(asked(&server).await.len(), sent.len());
+}
+
+/// A file's label question MusicBrainz gave up on answers its next ask as given up, never as an id
+/// or a code MusicBrainz knows nothing by, which would name another recording.
+#[tokio::test]
+async fn a_label_question_given_up_on_is_never_read_as_known_nothing_by() {
+    let probe = recorded_folder("c4-probe");
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/ws/2/artist/89ad4ac3-39f7-470e-963a-56509c546377"))
+        .respond_with(Recorded(Arc::clone(&probe)))
+        .mount(&server)
+        .await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let client = Arc::new(quick(&server, Duration::from_secs(5)));
+    let recording = recording_question(YESTERDAY_1987).expect("an id");
+
+    let (recording_woke, mut recording_ended) = mpsc::unbounded_channel();
+    let (code_woke, mut code_ended) = mpsc::unbounded_channel();
+    client.re_ask(&recording, wake_into(&recording_woke));
+    client.re_ask(YESTERDAY_CODE_LOOKUP, wake_into(&code_woke));
+    assert_eq!(ending(&mut recording_ended).await, ReAsked::GaveUp);
+    assert_eq!(ending(&mut code_ended).await, ReAsked::GaveUp);
+    let sent = asked(&server).await.len();
+
+    assert_eq!(
+        client.current_recording(YESTERDAY_1987).await,
+        MusicBrainzFact::GaveUp
+    );
+    assert_eq!(
+        client.isrc_songs_for_heart(YESTERDAY_CODE).await,
+        MusicBrainzFact::GaveUp
+    );
+    assert_eq!(asked(&server).await.len(), sent, "each answer is the re-asker's");
 }
 
 #[tokio::test]

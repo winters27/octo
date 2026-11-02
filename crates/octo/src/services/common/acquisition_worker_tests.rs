@@ -337,3 +337,43 @@ async fn a_star_mornyes_check_kept_sends_no_failure_push_of_its_own() {
         .expect("the worker ran")
         .expect("the worker stopped cleanly");
 }
+
+/// A finished download frees its heard-copy places before its waiters hear of it, so a chain that
+/// queues its next step never keeps one.
+#[tokio::test]
+async fn a_finished_download_ends_its_rounds_before_it_completes() {
+    let queue = Arc::new(TrackAcquisitionQueue::new());
+    let (release, released) = watch::channel(true);
+    let downloads = Arc::new(HeldDownloads {
+        inside: AtomicI32::new(0),
+        most: AtomicI32::new(0),
+        started: AtomicI32::new(0),
+        release: released,
+    });
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings::default()));
+    let ended: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+    let seen = Arc::clone(&ended);
+    let worker = Arc::new(
+        AcquisitionWorker::new(
+            Arc::clone(&queue),
+            downloads as Arc<dyn IDownloadService>,
+            Arc::new(ExternalIdRegistry::in_memory()),
+            Arc::new(NotificationService::new(Vec::new(), settings, None)),
+            None,
+        )
+        .with_end_rounds(Arc::new(move |key: &str| seen.lock().push(key.to_string()))),
+    );
+    let stopping = CancellationToken::new();
+    let running = tokio::spawn(worker.run(stopping.clone()));
+    let completion = queue.enqueue(
+        "soulseek", "song-1", true, false, true, None, true, None, false, None,
+    );
+    let outcome = tokio::time::timeout(Duration::from_secs(10), completion.wait())
+        .await
+        .expect("the request finishes");
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(*ended.lock(), ["soulseek:song-1"]);
+    drop(release);
+    stopping.cancel();
+    running.await.expect("the worker ran").expect("it stopped");
+}

@@ -3,9 +3,28 @@
 use serde::{Deserialize, Serialize};
 
 /// Octo's own AcoustID application key, which every install that sets no key of its own shares.
-/// Blank until the "Octo" application is registered with AcoustID: a blank built-in key counts as
-/// no key at all, so AcoustID is off for an install without one of its own.
-pub const OCTO_ACOUSTID_APPLICATION_KEY: &str = "";
+/// It is never written in the source: the release build is given it as the
+/// `OCTO_ACOUSTID_APPLICATION_KEY` variable, read here at compile time. A build given none has a
+/// blank built-in key, which counts as no key at all, so AcoustID is off there for an install
+/// without one of its own.
+pub const OCTO_ACOUSTID_APPLICATION_KEY: &str = match option_env!("OCTO_ACOUSTID_APPLICATION_KEY") {
+    Some(key) => key,
+    None => "",
+};
+
+/// Whether the build was asked to carry Octo's own key: `OCTO_REQUIRE_ACOUSTID_KEY` set to
+/// anything but blank (the release build sets it to 1).
+const KEY_REQUIRED: bool = key_required(option_env!("OCTO_REQUIRE_ACOUSTID_KEY"));
+
+const fn key_required(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.is_empty())
+}
+
+/// A build asked to carry Octo's own key (the release build) does not build without it.
+const _: () = assert!(
+    !KEY_REQUIRED || !OCTO_ACOUSTID_APPLICATION_KEY.trim_ascii().is_empty(),
+    "this build needs OCTO_ACOUSTID_APPLICATION_KEY, Octo's own AcoustID application key"
+);
 
 /// The `ACOUSTID_API_KEY` value that turns AcoustID off.
 pub const ACOUSTID_OFF: &str = "off";
@@ -102,8 +121,9 @@ pub struct SoulseekSettings {
     /// Fingerprint every finished download with Chromaprint and ask AcoustID what it actually
     /// is before accepting it. A Soulseek file identified as a different recording is discarded
     /// and the next peer tried; a YouTube file has no second candidate, so it is kept and, with
-    /// the Review playlist on, asked about. Needs the fpcalc binary. On by default: Octo brings
-    /// its own AcoustID key, so a default install checks what it downloads. Hearts and plays are
+    /// the Review playlist on, asked about. Needs the fpcalc binary. On by default: Octo's
+    /// published images carry Octo's own AcoustID key, so a default install from them checks what
+    /// it downloads (a build given no key needs a key of the user's own). Hearts and plays are
     /// checked by their sound whatever this says.
     ///
     /// This also switches on the rejected-peer memory. A file discarded for being the wrong
@@ -526,6 +546,100 @@ mod acoust_id_key_tests {
         assert!(example.lines().any(|line| line == "SLSKD_VERIFY_DOWNLOADS=true"));
         assert!(example.lines().any(|line| line == "ACOUSTID_API_KEY="));
         assert!(example.contains("ACOUSTID_API_KEY=off"));
+    }
+
+    /// The published server image is built with Octo's own AcoustID key from the repository's
+    /// secret, and its build refuses to go on when that key is blank: the workflow checks the
+    /// secret before building and hands the key to the server's build only as a build secret
+    /// (never a build argument, which an image's history and provenance keep), with the
+    /// requirement and the key's hash as build arguments and the provenance kept to its minimum;
+    /// the Dockerfile mounts the secret as a file into the server's build step alone (no `env=`,
+    /// which an older BuildKit cannot build), reads the key from that file only, never prints it
+    /// or its hash, checks it again, and the compile refuses a blank key.
+    #[test]
+    fn the_published_image_is_built_with_octos_own_acoustid_key() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read =
+            |name: &str| std::fs::read_to_string(repo.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let workflow = read(".github/workflows/docker.yml");
+        assert!(
+            workflow.contains("OCTO_ACOUSTID_APPLICATION_KEY: ${{ secrets.OCTO_ACOUSTID_APPLICATION_KEY }}")
+        );
+        assert!(workflow.contains("'OCTO_REQUIRE_ACOUSTID_KEY=1'"));
+        assert!(workflow.contains("arg=OCTO_ACOUSTID_KEY_SHA256="));
+        let check = workflow
+            .find("name: Octo's own AcoustID key is set")
+            .expect("the check of the secret");
+        let build = workflow
+            .find("name: Build and push by digest")
+            .expect("the image build");
+        assert!(check < build, "the secret is checked before the build");
+        let step = &workflow[build..];
+        let step = &step[..step.find("\n      - name:").unwrap_or(step.len())];
+        let args = &step[step.find("build-args:").expect("the build arguments")..];
+        let args = &args[..args.find("\n          secrets:").expect("the secrets after them")];
+        assert!(
+            !args.contains("secrets."),
+            "no secret is a build argument: {args}"
+        );
+        assert!(args.contains("${{ steps.acoustid.outputs.arg }}"));
+        assert!(
+            step.contains("format('acoustid_key={0}', secrets.OCTO_ACOUSTID_APPLICATION_KEY)"),
+            "the key is a build secret"
+        );
+        assert!(step.contains("provenance: mode=min"));
+
+        let dockerfile = read("Dockerfile");
+        assert!(dockerfile.starts_with("# syntax=docker/dockerfile:1\n"));
+        assert!(
+            !dockerfile.contains("ARG OCTO_ACOUSTID_APPLICATION_KEY"),
+            "the key is no build argument"
+        );
+        let from_the_secret =
+            "OCTO_ACOUSTID_APPLICATION_KEY=\"$(cat /run/secrets/acoustid_key 2>/dev/null || true)\"";
+        assert_eq!(
+            dockerfile.matches("OCTO_ACOUSTID_APPLICATION_KEY=").count(),
+            dockerfile.matches(from_the_secret).count(),
+            "the Dockerfile names no key: it reads it from the secret's file alone"
+        );
+        let required = dockerfile
+            .find("ARG OCTO_REQUIRE_ACOUSTID_KEY")
+            .expect("the requirement's build argument");
+        let hash = dockerfile
+            .find("ARG OCTO_ACOUSTID_KEY_SHA256")
+            .expect("the key's hash, which rebuilds the server when the key changes");
+        let mount = dockerfile
+            .find("RUN --mount=type=secret,id=acoustid_key \\\n")
+            .expect("the secret mounted as a file into the server's build step");
+        let server = dockerfile
+            .find("cargo build --release --locked --package octo --bin octo")
+            .expect("the server's build");
+        assert!(required < mount && hash < mount && mount < server);
+        assert!(
+            !dockerfile.contains(",env="),
+            "no secret mounted as an environment variable"
+        );
+        assert_eq!(
+            dockerfile.matches("--mount=type=secret").count(),
+            1,
+            "no other step sees the key"
+        );
+        let step = &dockerfile[mount..server];
+        assert!(step.contains(from_the_secret));
+        assert!(step.contains("exit 1"));
+        assert!(
+            !dockerfile.contains("${OCTO_ACOUSTID_KEY_SHA256"),
+            "the build log prints neither the key nor its hash"
+        );
+    }
+
+    /// Only a requirement given a value asks the build for Octo's own key: one set but blank does
+    /// not.
+    #[test]
+    fn a_blank_requirement_asks_for_no_key() {
+        assert!(!key_required(None));
+        assert!(!key_required(Some("")));
+        assert!(key_required(Some("1")));
     }
 }
 

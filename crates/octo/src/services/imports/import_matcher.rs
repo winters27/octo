@@ -974,7 +974,7 @@ pub fn isrc_recordings_from(
                 IsrcLookup::Found(doc) => Some(isrc_recordings_of(&doc)),
                 IsrcLookup::NotKnown => Some(Vec::new()),
                 IsrcLookup::Refused => Some(Vec::new()),
-                IsrcLookup::Unanswered => None,
+                IsrcLookup::Unanswered | IsrcLookup::GaveUp => None,
             }
         })
     })

@@ -126,6 +126,7 @@ fn held_tracks_are_taken_once_and_left_alone_by_later_walks() {
         waiting_for: WaitingFor::NotYetProven,
         line: tracks_wait_line(1),
         files: vec!["/held/help.flac".into()],
+        lidarr: Vec::new(),
         users: Vec::new(),
     };
     gates.held("soulseek", "help-album", &users, "help", held.clone());

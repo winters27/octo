@@ -8,7 +8,7 @@ use octo_core::fingerprint::acoust_id_client::{AcoustIdAnswer, AcoustIdOutcome};
 use octo_core::fingerprint::heart_gate::{
     AcquisitionOrigin, AlbumContext, ClipReading, FileFacts, FileLabels, HeardAnswerReading, HeardMaster,
     HeardReading, HeardRecord, HeardRecording, Judgement, MusicBrainzFact, Need, StandIn, TagClaim, became,
-    is_heard_audio, read_heard_answer, read_stand_in,
+    heard_codes, is_heard_audio, read_heard_answer, read_stand_in,
 };
 use octo_core::fingerprint::heart_release::{GroupFacts, HeardIdentity, HeartSong, listened_release};
 use octo_core::fingerprint::verification::{
@@ -22,13 +22,15 @@ use tracing::{debug, info};
 
 use super::*;
 use crate::services::common::album_gates::{self, AlbumGate, AlbumGateTrack, TrackCheck, TrackFiling};
-use crate::services::common::heart_acquisition_coordinator::{GateStart, HeartGates, waiting_line};
+use crate::services::common::heart_acquisition_coordinator::{
+    GateStart, HEARD_GONE, HeartGates, waiting_line,
+};
 use crate::services::common::{HeldAcquisition, Holder};
 use crate::services::fingerprint::heard_master_check::{HeardAudio, RoundGuard};
 use crate::services::fingerprint::music_brainz_client::{
     HeartBusy, HeartQuestions, Lane, code_question, heart_song, recording_question,
 };
-use crate::services::prefetch::heard_samples::{FpcalcClass, Printer, TopUp, sample_id_of};
+use crate::services::prefetch::heard_samples::{FpcalcClass, Printer, TopUp, WholePrint, sample_id_of};
 
 /// The downloads line of a heart whose heard lookup has not answered yet.
 pub const HEARD_LOOKUP_BUSY: &str = "Waiting for AcoustID to check what played";
@@ -39,6 +41,12 @@ pub const ANOTHER_SONG_PLAYED: &str =
 pub const ANOTHER_SONG_OR_TAKE: &str = "Octo played another song or another take for this one";
 /// The downloads line of a heart nobody played.
 pub const NEVER_PLAYED: &str = "Play it once so Octo can keep the version you hear";
+/// The downloads line of a heart whose clip check `fpcalc` could not print for: the check runs
+/// again at the song's next play (and Octo's next start).
+pub const SOUND_NOT_READ: &str = "Octo could not read the sound to check it; it tries again at the next play";
+/// The downloads line of a heart that AcoustID, switched on, could not settle, and the catalog's
+/// clip could not either: what played is not known, and the person may keep it anyway.
+pub const COULD_NOT_TELL: &str = "Octo could not tell what played from its sound";
 
 /// The most facts one file's judgement asks for before it settles: a bound, never reached by a
 /// gate that asks each fact once.
@@ -76,6 +84,12 @@ impl DownloadVerificationService {
         self.heart.get().is_some()
     }
 
+    /// What people heard, once the heart gate is built: a download holds a heard copy here while
+    /// its gate reads it.
+    pub fn heard_samples(&self) -> Option<std::sync::Arc<crate::services::prefetch::HeardSamples>> {
+        self.heart.get().map(|parts| parts.samples.clone())
+    }
+
     /// Resumes a hold by its key once what it waits for answers.
     pub fn on_resume(&self, resume: ResumeHold) {
         *self.resume.lock() = Some(resume);
@@ -105,6 +119,14 @@ impl DownloadVerificationService {
             if let Some(round) = parts.master.round(acquisition_key, &gate.user) {
                 round.pause();
             }
+        }
+    }
+
+    /// Pauses every open heard-master round of the acquisition: its download ended, and the
+    /// chain that asked may now wait in the queue, which must never keep a heard-copy place.
+    pub fn pause_acquisition(&self, acquisition_key: &str) {
+        if let Some(parts) = self.heart.get() {
+            parts.master.pause_acquisition(acquisition_key);
         }
     }
 
@@ -180,7 +202,7 @@ impl DownloadVerificationService {
         // disagree on the ISRC.
         let mut heard_answer = None;
         if let Some(record) = &heard {
-            match self.heard_lookup(&parts, record, &routing).await {
+            match self.heard_lookup(&parts, record, &routing, prints).await {
                 HeardLookup::Read(outcome, seconds) => {
                     gate.heard_seconds = gate.heard_seconds.or(seconds);
                     heard_answer = Some(outcome);
@@ -239,6 +261,18 @@ impl DownloadVerificationService {
             self.stand_in(&parts, external_id, &routing, &mut gate, &catalog, min)
                 .await;
             if gate.r.as_ref().is_none_or(|r| r.ids.is_empty()) {
+                // With no video to stand in and no recording named, nothing could ever prove a
+                // copy: the heart ends with the plain line rather than waiting.
+                let no_video = routing
+                    .you_tube_id
+                    .as_deref()
+                    .is_none_or(|video| video.trim().is_empty());
+                if no_video {
+                    return GateBuild::End {
+                        gate,
+                        line: HEARD_GONE.to_string(),
+                    };
+                }
                 return hold(gate, WaitingFor::NotYetProven, NEVER_PLAYED, None);
             }
             return GateBuild::Ready(gate);
@@ -267,13 +301,20 @@ impl DownloadVerificationService {
                         }
                         hold(gate, WaitingFor::AcoustIdOff, ANOTHER_SONG_OR_TAKE, None)
                     }
-                    ClipReading::Unclear | ClipReading::NoClip => hold(
-                        gate,
-                        WaitingFor::AcoustIdOff,
-                        waiting_line(WaitingFor::AcoustIdOff),
-                        None,
-                    ),
+                    // Keep anyway is offered either way; the line says AcoustID is off only when
+                    // it is.
+                    ClipReading::Unclear | ClipReading::NoClip => {
+                        let line = if matches!(outcome, AcoustIdOutcome::Off) {
+                            waiting_line(WaitingFor::AcoustIdOff)
+                        } else {
+                            COULD_NOT_TELL
+                        };
+                        hold(gate, WaitingFor::AcoustIdOff, line, None)
+                    }
                     ClipReading::Busy(waiting) => hold(gate, waiting, waiting_line(waiting), None),
+                    ClipReading::Unprinted => {
+                        hold(gate, ClipReading::UNPRINTED_WAITS_FOR, SOUND_NOT_READ, None)
+                    }
                 }
             }
             HeardAnswerReading::AnotherSong => {
@@ -291,6 +332,13 @@ impl DownloadVerificationService {
                 GateBuild::Ready(gate)
             }
             HeardAnswerReading::RStays { tag } => {
+                // A file kept as heard claims only the codes the heard answer proves are this
+                // recording's own.
+                if let (Some(id), AcoustIdOutcome::Answered(answer), Some(r)) =
+                    (&tag, &outcome, gate.r.as_mut())
+                {
+                    r.tag_isrcs = heard_codes(answer, id);
+                }
                 gate.reading = HeardReading::RStays { tag };
                 GateBuild::Ready(gate)
             }
@@ -341,13 +389,16 @@ impl DownloadVerificationService {
 
     /// The heard audio's own AcoustID answer, from its whole print (topped up from the heard audio
     /// when short or missing), sent with the song's played length: the routing's, else the
-    /// print's when it reached the song's end. Never sent with a guessed or zero length: with none
-    /// the sample reads as one AcoustID could not check, and the catalog's clip decides.
+    /// print's when it reached the song's end, else the length of the heard audio itself, read by
+    /// one whole-song print of it (kept in `prints` for the catalog's clip). Never sent with a
+    /// guessed or zero length: with none the sample reads as one AcoustID could not check, and the
+    /// catalog's clip decides.
     async fn heard_lookup(
         &self,
         parts: &HeartParts,
         record: &HeardRecord,
         routing: &SoulseekRouting,
+        prints_taken: &mut ClipPrints,
     ) -> HeardLookup {
         let song_seconds = routing.duration.filter(|seconds| *seconds > 0);
         let sample_id = record
@@ -365,8 +416,20 @@ impl DownloadVerificationService {
         let Some(prints) = prints else {
             return HeardLookup::Gone;
         };
-        let seconds =
+        let mut seconds =
             song_seconds.or_else(|| prints.reaches_end.then_some(prints.seconds).filter(|s| *s > 0));
+        if seconds.is_none() {
+            // The stored print stops short of a song of unknown length: the heard audio itself
+            // says how long it is.
+            match parts.samples.whole_song_print(record).await {
+                WholePrint::Ready(items, length) => {
+                    prints_taken.whole_heard.get_or_insert(items);
+                    seconds = length;
+                }
+                WholePrint::Busy => return HeardLookup::ShimBusy,
+                WholePrint::Gone | WholePrint::NotPrinted => {}
+            }
+        }
         let Some(seconds) = seconds else {
             debug!("The heard audio's length is not known; its sample is read by the catalog's clip");
             return HeardLookup::Read(AcoustIdOutcome::Unreadable { code: None }, None);
@@ -472,8 +535,9 @@ impl DownloadVerificationService {
             },
             sample_id: None,
         };
-        let HeardLookup::Read(AcoustIdOutcome::Answered(answer), _) =
-            self.heard_lookup(parts, &record, routing).await
+        let HeardLookup::Read(AcoustIdOutcome::Answered(answer), _) = self
+            .heard_lookup(parts, &record, routing, &mut ClipPrints::default())
+            .await
         else {
             return;
         };
@@ -579,8 +643,14 @@ impl DownloadVerificationService {
         let print = fingerprint.fingerprint.clone().filter(|print| !print.is_empty());
         let (outcome, lookup) = match (&print, seconds > 0) {
             (Some(print), true) => self.client.lookup_answer_read(class, print, seconds).await,
-            // A file nothing could fingerprint is one AcoustID cannot check.
-            _ => (AcoustIdOutcome::Unreadable { code: None }, None),
+            // fpcalc could not print the file here (missing, too slow, or no length to send): that
+            // says nothing of the file, and AcoustID was never asked, so it is judged as with
+            // AcoustID off, kept only as the very audio heard or its master and never refused for
+            // it. Only audio that cannot be decoded, and AcoustID's own codes, read unreadable.
+            _ => {
+                debug!("fpcalc could not print {file}; it is judged without AcoustID");
+                (AcoustIdOutcome::Off, None)
+            }
         };
         Ok(FileSound {
             raw,
@@ -860,9 +930,10 @@ async fn heard_master(
     match parts.master.round(&candidate.acquisition_key, &gate.user) {
         Some(round) => round.check(path).await,
         None => {
+            let acquisition = Some(candidate.acquisition_key.as_str()).filter(|key| !key.is_empty());
             parts
                 .master
-                .check_once(HeardAudio::Heard(heard.clone()), path)
+                .check_once_in(acquisition, HeardAudio::Heard(heard.clone()), path)
                 .await
         }
     }
@@ -1131,14 +1202,15 @@ impl HeartGates for DownloadVerificationService {
             .await
     }
 
-    fn held_from_lidarr(&self, files: &[String], labels: &LabelSource) {
-        self.hold_lidarr_files(files, labels);
-    }
-
-    async fn judge_held(&self, path: &str, acquisition_key: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
-        // A held file Lidarr brought keeps the labels of its download.
+    async fn judge_held(
+        &self,
+        path: &str,
+        labels: LabelSource,
+        acquisition_key: &str,
+        gates: &[HeartGate],
+    ) -> Vec<GateVerdict> {
         let candidate = HeartCandidate {
-            labels: self.held_lidarr_labels(path).unwrap_or(LabelSource::TheFile),
+            labels,
             identity: None,
             acquisition_key: acquisition_key.to_string(),
         };
@@ -1167,6 +1239,28 @@ impl HeartGates for DownloadVerificationService {
             .collect()
     }
 
+    async fn judge_landed(
+        &self,
+        path: &str,
+        labels: LabelSource,
+        acquisition_key: &str,
+        gates: &[HeartGate],
+    ) -> Vec<GateVerdict> {
+        let candidate = HeartCandidate {
+            labels,
+            identity: None,
+            acquisition_key: acquisition_key.to_string(),
+        };
+        let mut verdicts = Vec::with_capacity(gates.len());
+        for gate in gates {
+            let check = self
+                .verify_for_heart(std::path::Path::new(path), &candidate, gate)
+                .await;
+            verdicts.push(check.verdict);
+        }
+        verdicts
+    }
+
     fn on_filed(&self, record: &HeldAcquisition, user: &str) {
         let Some(parts) = self.heart.get() else {
             return;
@@ -1176,45 +1270,53 @@ impl HeartGates for DownloadVerificationService {
         if let Some(prints) = self.clip_prints.lock().remove(&song) {
             prints.save_to(&parts.holds, &key, user);
         }
-        // Each held file Lidarr brought is saved with where its labels come from, so a restart
-        // judges it again by the same labels.
-        let lidarr = self.lidarr_files_of(record);
-        if !lidarr.is_empty() {
-            parts.holds.update(&key, |kept| {
-                for file in lidarr {
-                    if !kept.lidarr_files.iter().any(|known| known.path == file.path) {
-                        kept.lidarr_files.push(file);
-                    }
-                }
-            });
-        }
-        match record.waiting_for {
-            Some(WaitingFor::Shim) => {
-                let video = record
-                    .holders
-                    .iter()
-                    .find(|holder| holder.user.trim().eq_ignore_ascii_case(user.trim()))
-                    .and_then(|holder| holder.heard.as_ref())
-                    .and_then(|heard| heard.source.video_id())
-                    .map(str::to_string);
-                if let Some(video) = video {
-                    parts.samples.wait_for_shim(&key, user, &video);
+        let Some(waiting) = record.waiting_for else {
+            return;
+        };
+        let heard = record
+            .holders
+            .iter()
+            .find(|holder| holder.user.trim().eq_ignore_ascii_case(user.trim()))
+            .and_then(|holder| holder.heard.clone());
+        // A hold a file's label check left: its question is asked again until it answers, as a
+        // gate's own question is.
+        let question = (waiting == WaitingFor::MusicBrainz)
+            .then(|| {
+                let song = (
+                    format!("{}:{}", record.provider, record.external_id),
+                    user.trim().to_lowercase(),
+                );
+                self.file_questions.lock().remove(&song)
+            })
+            .flatten();
+        self.wake_for(&key, waiting, user, heard.as_ref(), question);
+    }
+
+    fn wake_for(
+        &self,
+        key: &str,
+        waiting_for: WaitingFor,
+        user: &str,
+        heard: Option<&HeardRecord>,
+        question: Option<String>,
+    ) {
+        let Some(parts) = self.heart.get() else {
+            return;
+        };
+        let key = key.to_string();
+        match waiting_for {
+            WaitingFor::Shim => {
+                if let Some(video) = heard.and_then(|heard| heard.source.video_id()) {
+                    parts.samples.wait_for_shim(&key, user, video);
                 }
             }
-            Some(WaitingFor::AcoustId) => {
+            WaitingFor::AcoustId => {
                 let resume = self.resume.lock().clone();
                 if let Some(resume) = resume {
                     self.client.hold_lookup(Box::new(move || resume(&key)));
                 }
             }
-            Some(WaitingFor::MusicBrainz) => {
-                // A hold a file's label check left: its question is asked again until it
-                // answers, as a gate's own question is.
-                let song = (
-                    format!("{}:{}", record.provider, record.external_id),
-                    user.trim().to_lowercase(),
-                );
-                let question = self.file_questions.lock().remove(&song);
+            WaitingFor::MusicBrainz => {
                 let resume = self.resume.lock().clone();
                 if let (Some(question), Some(resume), Some(music_brainz)) =
                     (question, resume, self.music_brainz.as_ref())
@@ -1222,7 +1324,7 @@ impl HeartGates for DownloadVerificationService {
                     music_brainz.re_ask(
                         &question,
                         Box::new(move |ended| {
-                            debug!("MusicBrainz {ended:?} the label question {key} waited on");
+                            debug!("MusicBrainz {ended:?} the question {key} waited on");
                             resume(&key);
                         }),
                     );
@@ -1266,6 +1368,10 @@ impl HeartGates for DownloadVerificationService {
             })
             .collect();
         Box::new(rounds)
+    }
+
+    fn pause_rounds(&self, acquisition_key: &str) {
+        self.pause_acquisition(acquisition_key);
     }
 }
 
@@ -1339,6 +1445,7 @@ fn start_of(built: GateBuild) -> GateStart {
             line,
             question,
         },
+        GateBuild::End { gate, line } => GateStart::End { gate, line },
     }
 }
 

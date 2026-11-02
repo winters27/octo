@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::services::common::soulseek_hold_store::HeldLidarrFile;
 use crate::services::library::ReplacementHandoff;
 
 /// How an acquisition ended: the path of the file on disk and fully registered, or why not.
@@ -33,14 +34,16 @@ pub enum PlayOutcome {
 }
 
 /// A download that holds instead of landing: what it waits for, the line its row shows, the
-/// files it keeps in the one hold path, and whose gates hold (empty for everyone who asked). A
-/// verify step resolves the request's completion with it, and the heart chain files the hold.
+/// files it keeps in the one hold path, those of them Lidarr brought with where their labels are
+/// read from, and whose gates hold (empty for everyone who asked). A verify step resolves the
+/// request's completion with it, and the heart chain files the hold.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{line}")]
 pub struct AcquisitionHeld {
     pub waiting_for: WaitingFor,
     pub line: String,
     pub files: Vec<String>,
+    pub lidarr: Vec<HeldLidarrFile>,
     pub users: Vec<String>,
 }
 
@@ -156,6 +159,33 @@ impl std::fmt::Debug for GateLedger {
             .entries(self.verdicts.lock().iter())
             .entries(self.accepted_by.lock().iter())
             .finish()
+    }
+}
+
+/// The gates of a request as they stand now, shared with the download that runs it: a heart or a
+/// play that joins after the download started is judged by its own gate all the same. A handle is
+/// where gates are read from, never part of what a place asks for, so any two compare equal.
+#[derive(Clone, Default)]
+pub struct SharedGates(Option<Arc<Mutex<Vec<HeartGate>>>>);
+
+impl SharedGates {
+    /// Every gate of the request now, or None for a place built without a request.
+    pub fn current(&self) -> Option<Vec<HeartGate>> {
+        self.0.as_ref().map(|gates| gates.lock().clone())
+    }
+}
+
+impl PartialEq for SharedGates {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SharedGates {}
+
+impl std::fmt::Debug for SharedGates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SharedGates").field(&self.current()).finish()
     }
 }
 
@@ -299,8 +329,12 @@ pub struct AcquisitionPlace {
     pub origin: Option<AcquisitionOrigin>,
     /// One gate per heart or play that asked, each judged on its own.
     pub gates: Vec<HeartGate>,
+    /// The request's gates as they stand when a file is judged, joiners' included.
+    pub live_gates: SharedGates,
     /// The files a resumed hold held in the one hold path, which the download checks first.
     pub held_files: Vec<String>,
+    /// Those of `held_files` Lidarr brought, each with where its labels are read from.
+    pub held_lidarr: Vec<HeldLidarrFile>,
     /// Where each gate's verdict on the file is written, for everyone who waits on it.
     pub ledger: GateLedger,
     /// What a replacement refuses by its original's sound.
@@ -308,6 +342,35 @@ pub struct AcquisitionPlace {
     /// The person keeps it anyway: the download lands a file its hold kept, as it is, or the very
     /// audio they heard, marked "kept by you, version not proven", and searches for nothing.
     pub keep_anyway: bool,
+    /// Whose keep it is: a file a keep lands counts as kept only for them.
+    pub keep_for: Vec<String>,
+    /// Files of the song that other people's requests landed while this one waited behind them,
+    /// which its own gates judge before anything is fetched.
+    pub landed: Vec<String>,
+    /// Other people of the hold judge the same held files on requests of their own: a held file
+    /// this download's gates refuse stays for them.
+    pub held_for_others: bool,
+}
+
+/// What a resumed hold brings to its download: the files it held, which the download checks
+/// before any source, the labels of those Lidarr brought, and whether other people of the hold
+/// judge the same files on requests of their own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldFiles {
+    pub files: Vec<String>,
+    pub lidarr: Vec<HeldLidarrFile>,
+    pub shared: bool,
+}
+
+impl HeldFiles {
+    /// These held files, the labels of those Lidarr brought, judged by one person's request alone.
+    pub fn of(files: Vec<String>, lidarr: Vec<HeldLidarrFile>) -> Self {
+        HeldFiles {
+            files,
+            lidarr,
+            shared: false,
+        }
+    }
 }
 
 /// One queued request to fetch a permanent copy of a track.
@@ -350,18 +413,25 @@ pub struct AcquisitionRequest {
     /// the shipped checks.
     pub origin: Option<AcquisitionOrigin>,
     /// The gates of the hearts and plays that asked, one per person and origin, joiners'
-    /// included.
-    gates: Mutex<Vec<HeartGate>>,
+    /// included, shared with the download that runs the request.
+    gates: Arc<Mutex<Vec<HeartGate>>>,
     /// The files a resumed hold held, which the download checks before any source.
     held_files: Mutex<Vec<String>>,
+    /// Those of the held files Lidarr brought, with where their labels are read from.
+    held_lidarr: Mutex<Vec<HeldLidarrFile>>,
     /// Hearts and plays that joined with a gate of their own: their library, their name and their
     /// claim on the outcome are recorded only once their own gate passes the landed file.
     joiners: Mutex<Vec<GatedJoiner>>,
     /// What a replacement refuses by its original's sound.
     pub deny: Option<SoundDeny>,
-    /// A person's keep: settable until the worker reads the place, so a keep that joins a request
-    /// still waiting makes it one.
-    keep_anyway: AtomicBool,
+    /// A person's keep. Only another keep of the same person shares its download.
+    keep_anyway: bool,
+    /// Whose keep it is: the people of its gates, a file it lands counted as kept for them alone.
+    keep_for: Mutex<Vec<String>>,
+    /// Files of the song the requests it waited behind landed, which its own gates judge first.
+    landed: Mutex<Vec<String>>,
+    /// Other people of its hold judge the same held files on requests of their own.
+    held_for_others: AtomicBool,
 
     pub completion: Completion,
 }
@@ -373,8 +443,6 @@ struct GatedJoiner {
     users: Vec<String>,
     requested_by: Option<String>,
     target: AcquisitionTarget,
-    /// A heart joining a play: it owns the outcome once its gate passes.
-    heart: Option<bool>,
 }
 
 impl AcquisitionRequest {
@@ -406,17 +474,72 @@ impl AcquisitionRequest {
             pool_members: Mutex::new(Vec::new()),
             flac_only: false,
             origin: None,
-            gates: Mutex::new(Vec::new()),
+            gates: Arc::new(Mutex::new(Vec::new())),
             held_files: Mutex::new(Vec::new()),
+            held_lidarr: Mutex::new(Vec::new()),
             joiners: Mutex::new(Vec::new()),
             deny: None,
-            keep_anyway: AtomicBool::new(false),
+            keep_anyway: false,
+            keep_for: Mutex::new(Vec::new()),
+            landed: Mutex::new(Vec::new()),
+            held_for_others: AtomicBool::new(false),
             completion: Completion::default(),
         }
     }
 
-    /// A heart or play joining with its own gates: its library, its name and (for a heart joining
-    /// a play) its claim on the outcome wait for its own gate's verdict on the landed file.
+    /// The people this request's sound checks are for, in lower case: the person of each of its
+    /// gates; for a play with none, its asker, whose gate its download builds inside; nobody for
+    /// any other request that carries no gate (the shipped checks, which every asker shares).
+    fn checked_for(&self) -> Vec<String> {
+        let mut people: Vec<String> = self
+            .gates
+            .lock()
+            .iter()
+            .map(|gate| dotnet::to_lower_invariant(gate.user.trim()))
+            .collect();
+        if people.is_empty() && self.origin == Some(AcquisitionOrigin::Play) {
+            people.extend(
+                self.first_requester()
+                    .map(|user| dotnet::to_lower_invariant(user.trim())),
+            );
+        }
+        people.sort();
+        people.dedup();
+        people
+    }
+
+    /// Whether `other` may share this request's download: a download that carries a sound check
+    /// belongs to one person, so either neither carries one or both carry them for that same one
+    /// person; and a person's keep shares only with another keep.
+    fn shares_with(&self, other: &AcquisitionRequest) -> bool {
+        if self.keep_anyway != other.keep_anyway {
+            return false;
+        }
+        let mine = self.checked_for();
+        mine.len() <= 1 && mine == other.checked_for()
+    }
+
+    /// Adds the people of a keep's gates to whose keep it is.
+    fn add_keepers(&self, gates: &[HeartGate]) {
+        let mut keepers = self.keep_for.lock();
+        for gate in gates {
+            let user = gate.user.trim();
+            if !keepers.iter().any(|known| eq_ignore_case(known, user)) {
+                keepers.push(user.to_string());
+            }
+        }
+    }
+
+    /// Files of the song the requests this one waited behind landed: its own gates judge them
+    /// before anything is fetched.
+    pub fn landed(&self) -> Vec<String> {
+        self.landed.lock().clone()
+    }
+
+    /// A heart or play joining with its own gates: its library and its name wait for its own
+    /// gate's verdict on the landed file. A heart joining a play claims the outcome at once: from
+    /// now on the play leaves the row alone, whether the download lands or fails, and the heart's
+    /// own chain goes on from it.
     fn join_gated(
         &self,
         gates: &[HeartGate],
@@ -427,23 +550,24 @@ impl AcquisitionRequest {
         for gate in gates {
             self.add_gate(gate.clone());
         }
+        if let Some(notify) = heart {
+            self.join_heart(notify);
+        }
         self.joiners.lock().push(GatedJoiner {
             users: gates.iter().map(|gate| gate.user.trim().to_string()).collect(),
             requested_by: requested_by.map(str::to_string),
             target: target.clone(),
-            heart,
         });
     }
 
     /// The file landed: every gated joiner whose own gate passed it is recorded now, with its
-    /// library, its name and its claim; one its gate did not pass gets none of them. When no gate
-    /// judged the file at all (the shipped checks ran), every joiner is recorded as before.
+    /// library and its name; one with no such verdict (its gate did not pass the file, or never
+    /// judged it) gets neither. A joiner that brought no gate is recorded as before.
     pub(crate) fn settle_joiners(&self) {
         let joiners = std::mem::take(&mut *self.joiners.lock());
         let ledger = self.completion.ledger();
-        let judged = !ledger.is_empty();
         for joiner in joiners {
-            if judged && !joiner.users.iter().any(|user| ledger.accepted(user)) {
+            if !joiner.users.is_empty() && !joiner.users.iter().any(|user| ledger.accepted(user)) {
                 debug!(
                     "{} joined {} and its own gate did not pass the file; no link and no attribution",
                     joiner.users.join(", "),
@@ -453,18 +577,22 @@ impl AcquisitionRequest {
             }
             self.add_requester(joiner.requested_by.as_deref());
             self.add_target(&joiner.target);
-            if let Some(notify) = joiner.heart {
-                self.join_heart(notify);
-            }
         }
     }
 
-    /// Adds files a resumed hold held, which the download checks before any source.
-    pub fn add_held_files(&self, files: &[String]) {
+    /// Adds files a resumed hold held, which the download checks before any source, with the
+    /// labels of those Lidarr brought.
+    pub fn add_held_files(&self, files: &[String], lidarr: &[HeldLidarrFile]) {
         let mut held = self.held_files.lock();
         for file in files {
             if !held.contains(file) {
                 held.push(file.clone());
+            }
+        }
+        let mut labeled = self.held_lidarr.lock();
+        for file in lidarr {
+            if files.contains(&file.path) && !labeled.iter().any(|known| known.path == file.path) {
+                labeled.push(file.clone());
             }
         }
     }
@@ -542,10 +670,15 @@ impl AcquisitionRequest {
             flac_only: self.flac_only,
             origin: self.origin,
             gates: self.gates(),
+            live_gates: SharedGates(Some(Arc::clone(&self.gates))),
             held_files: self.held_files.lock().clone(),
+            held_lidarr: self.held_lidarr.lock().clone(),
             ledger: self.completion.ledger().clone(),
             deny: self.deny.clone(),
-            keep_anyway: self.keep_anyway.load(Ordering::SeqCst),
+            keep_anyway: self.keep_anyway,
+            keep_for: self.keep_for.lock().clone(),
+            landed: self.landed(),
+            held_for_others: self.held_for_others.load(Ordering::SeqCst),
         }
     }
 
@@ -575,10 +708,6 @@ impl AcquisitionRequest {
 
     pub(crate) fn ask_for_upgrade_search(&self) {
         self.upgrade_search.store(true, Ordering::SeqCst);
-    }
-
-    fn ask_to_keep(&self) {
-        self.keep_anyway.store(true, Ordering::SeqCst);
     }
 
     /// Every user who asked for this track, not only the one who asked first.
@@ -681,6 +810,43 @@ impl Receivers {
     }
 }
 
+/// The requests of one song now: the one queued or running, the requests that may not share its
+/// download waiting behind it, each its own, in the order they came, and the files the song's
+/// requests landed meanwhile.
+struct SongRequests {
+    running: Arc<AcquisitionRequest>,
+    behind: VecDeque<Arc<AcquisitionRequest>>,
+    landed: Vec<String>,
+}
+
+impl SongRequests {
+    fn new(running: Arc<AcquisitionRequest>) -> Self {
+        SongRequests {
+            running,
+            behind: VecDeque::new(),
+            landed: Vec::new(),
+        }
+    }
+
+    /// The request of the song `request` may share: the one running, else one waiting behind it.
+    fn sharing(&self, request: &AcquisitionRequest) -> Option<Arc<AcquisitionRequest>> {
+        std::iter::once(&self.running)
+            .chain(self.behind.iter())
+            .find(|known| known.shares_with(request))
+            .cloned()
+    }
+}
+
+/// Where a new request of a song went.
+enum Claimed {
+    /// Nothing of the song was queued: it is the song's request now.
+    New,
+    /// It shares this request of the song.
+    Joins(Arc<AcquisitionRequest>),
+    /// It waits behind the song's running request as its own.
+    Behind,
+}
+
 /// Serializes permanent-copy downloads onto a single background worker.
 ///
 /// The point is that a download must never be tied to the HTTP request that asked for it.
@@ -698,7 +864,7 @@ pub struct TrackAcquisitionQueue {
 
     // Producer-side, so a duplicate never consumes a queue slot at all. Consumer-side dedup
     // would be too late: Feishin re-requests /rest/stream on seek, so duplicates are routine.
-    in_flight: Mutex<HashMap<String, Arc<AcquisitionRequest>>>,
+    in_flight: Mutex<HashMap<String, SongRequests>>,
 
     // Requests in the plays channel that the worker has not taken yet.
     waiting_plays: AtomicI32,
@@ -797,6 +963,70 @@ impl TrackAcquisitionQueue {
         *self.on_skipped_play.lock() = Some(hook);
     }
 
+    /// The request queued or running under `key`.
+    #[cfg(test)]
+    pub(crate) fn running(&self, key: &str) -> Option<Arc<AcquisitionRequest>> {
+        self.in_flight.lock().get(key).map(|song| song.running.clone())
+    }
+
+    /// How many requests of the song wait behind its running one.
+    #[cfg(test)]
+    pub(crate) fn waiting_behind(&self, provider: &str, external_id: &str) -> usize {
+        self.in_flight
+            .lock()
+            .get(&acquisition_key(provider, external_id, false))
+            .map_or(0, |song| song.behind.len())
+    }
+
+    /// Claims the song for `request`, joins a request of it `request` may share, or puts it behind
+    /// the song's running request as its own.
+    fn claim(&self, request: &Arc<AcquisitionRequest>) -> Claimed {
+        let mut in_flight = self.in_flight.lock();
+        let Some(song) = in_flight.get_mut(&request.key()) else {
+            in_flight.insert(request.key(), SongRequests::new(request.clone()));
+            return Claimed::New;
+        };
+        match song.sharing(request) {
+            Some(known) => Claimed::Joins(known),
+            None => {
+                song.behind.push_back(request.clone());
+                Claimed::Behind
+            }
+        }
+    }
+
+    /// Hands a request that holds its song's claim to the worker's lane. False when the lane is
+    /// full: the request is dropped, saying so, its claim let go and its completion failed.
+    fn send(&self, request: &Arc<AcquisitionRequest>) -> bool {
+        let is_star = request.is_star;
+        if is_star {
+            self.waiting_stars.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.waiting_plays.fetch_add(1, Ordering::SeqCst);
+        }
+        let channel = if is_star { &self.stars } else { &self.plays };
+        let room = !is_star || self.waiting_stars.load(Ordering::SeqCst) <= Self::STAR_CAPACITY;
+        if room && channel.try_send(request.clone()).is_ok() {
+            return true;
+        }
+        if is_star {
+            self.waiting_stars.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            self.waiting_plays.fetch_sub(1, Ordering::SeqCst);
+        }
+        // Full. Say so out loud: silently shedding work is how "why didn't that download?" becomes
+        // unanswerable.
+        warn!(
+            "Acquisition queue full ({}); dropped {}:{}",
+            if is_star { "star" } else { "play" },
+            request.provider,
+            request.external_id
+        );
+        self.release(request);
+        request.completion.try_set_error(queue_full());
+        false
+    }
+
     /// Queue an acquisition, or join the one already running for this track. The returned
     /// completion settles when the file is on disk and fully registered; callers that do not
     /// care may drop it.
@@ -891,7 +1121,7 @@ impl TrackAcquisitionQueue {
         self.enqueue_holding(
             origin,
             gates,
-            Vec::new(),
+            HeldFiles::default(),
             target,
             flac_only,
             provider,
@@ -907,14 +1137,14 @@ impl TrackAcquisitionQueue {
         )
     }
 
-    /// [`Self::enqueue_as`] for a resumed hold: `held_files` are the files it held, which the
-    /// download checks before any source.
+    /// [`Self::enqueue_as`] for a resumed hold: `held` is what it held, which the download checks
+    /// before any source.
     #[allow(clippy::too_many_arguments)] // enqueue_as's arguments and the held files
     pub fn enqueue_holding(
         &self,
         origin: Option<AcquisitionOrigin>,
         gates: Vec<HeartGate>,
-        held_files: Vec<String>,
+        held: HeldFiles,
         target: &AcquisitionTarget,
         flac_only: bool,
         provider: &str,
@@ -932,7 +1162,7 @@ impl TrackAcquisitionQueue {
             None,
             origin,
             gates,
-            held_files,
+            held,
             target,
             flac_only,
             provider,
@@ -956,7 +1186,7 @@ impl TrackAcquisitionQueue {
         deny: Option<SoundDeny>,
         origin: Option<AcquisitionOrigin>,
         gates: Vec<HeartGate>,
-        held_files: Vec<String>,
+        held: HeldFiles,
         target: &AcquisitionTarget,
         flac_only: bool,
         provider: &str,
@@ -985,22 +1215,15 @@ impl TrackAcquisitionQueue {
             request = request.with_origin(origin);
         }
         request.deny = deny;
-        self.queue_request(
-            request,
-            gates,
-            held_files,
-            target,
-            requested_by,
-            upgrade_search,
-            false,
-        )
-        .0
+        self.queue_request(request, gates, held, target, requested_by, upgrade_search, false)
+            .0
     }
 
     /// A person's keep of what a hold kept for them: the download lands one of `held_files` as it
-    /// is, or else the very audio a gate's person heard, and searches for nothing. A request still
-    /// waiting for this song becomes a keep when this joins it. Answers the completion, and whether
-    /// it joined a request already in flight (one already running is not a keep).
+    /// is, or else the very audio a gate's person heard, and searches for nothing; it counts as
+    /// kept only for the people of `gates`. It shares a download only with another keep of the same
+    /// person: every other request of the song runs on its own, before or after it. Answers the
+    /// completion, and whether it joined such a keep in flight.
     #[allow(clippy::too_many_arguments)] // why it runs, whose it is, what it keeps and where from
     pub fn enqueue_keeping(
         &self,
@@ -1024,17 +1247,27 @@ impl TrackAcquisitionQueue {
             None,
         )
         .with_origin(origin);
-        self.queue_request(request, gates, held_files, target, requested_by, false, true)
+        // A keep lands a held file as it is: nothing reads its labels.
+        self.queue_request(
+            request,
+            gates,
+            HeldFiles::of(held_files, Vec::new()),
+            target,
+            requested_by,
+            false,
+            true,
+        )
     }
 
-    /// Queues `request` with its askers, or joins the one already in flight for its song. True
-    /// with the completion when it joined.
+    /// Queues `request` with its askers, joins a request of its song it may share, or waits behind
+    /// the song's running request as its own. `held`: what a hold held. True with the completion
+    /// when it joined.
     #[allow(clippy::too_many_arguments)] // the request and what each asker brings to it
     fn queue_request(
         &self,
-        request: AcquisitionRequest,
+        mut request: AcquisitionRequest,
         gates: Vec<HeartGate>,
-        held_files: Vec<String>,
+        held: HeldFiles,
         target: &AcquisitionTarget,
         requested_by: Option<&str>,
         upgrade_search: bool,
@@ -1042,87 +1275,73 @@ impl TrackAcquisitionQueue {
     ) -> (Completion, bool) {
         let (provider, external_id) = (request.provider.clone(), request.external_id.clone());
         let (is_star, notify_on_failure) = (request.is_star, request.notify_on_failure);
+        request.keep_anyway = keep;
         let request = Arc::new(request);
         request.add_requester(requested_by);
         request.add_target(target);
         for gate in &gates {
             request.add_gate(gate.clone());
         }
-        request.add_held_files(&held_files);
+        if keep {
+            request.add_keepers(&gates);
+        }
+        request.add_held_files(&held.files, &held.lidarr);
+        if held.shared {
+            request.held_for_others.store(true, Ordering::SeqCst);
+        }
         if upgrade_search {
             request.ask_for_upgrade_search();
         }
-        if keep {
-            request.ask_to_keep();
-        }
 
-        let existing = {
-            let mut in_flight = self.in_flight.lock();
-            match in_flight.get(&request.key()) {
-                Some(existing) => Some(existing.clone()),
-                None => {
-                    in_flight.insert(request.key(), request.clone());
-                    None
+        match self.claim(&request) {
+            Claimed::Joins(existing) => {
+                // Already queued or running for the same people. Join it rather than fetching the
+                // same file twice, and record this caller on the request that is actually going to
+                // run, so the file is attributed to everyone who asked and not just to whoever was
+                // first. A heart for a track a play already asked for. The source cannot change any
+                // more, but the failure is now someone's explicit ask, and the heart chain still
+                // owns its fallback.
+                let heart = (is_star && !existing.is_star).then_some(notify_on_failure);
+                if gates.is_empty() {
+                    existing.add_requester(requested_by);
+                    existing.add_target(target);
+                    if let Some(notify) = heart {
+                        existing.join_heart(notify);
+                    }
+                } else {
+                    // A heart or play with its own gate counts the file as its own only once that
+                    // gate passes it.
+                    existing.join_gated(&gates, requested_by, target, heart);
                 }
-            }
-        };
-        if let Some(existing) = existing {
-            // Already queued or running. Join it rather than fetching the same file twice,
-            // and record this caller on the request that is actually going to run, so the
-            // file is attributed to everyone who asked and not just to whoever was first.
-            // A heart for a track a play already asked for. The source cannot change any more, but
-            // the failure is now someone's explicit ask, and the heart chain still owns its fallback.
-            let heart = (is_star && !existing.is_star).then_some(notify_on_failure);
-            if gates.is_empty() {
-                existing.add_requester(requested_by);
-                existing.add_target(target);
-                if let Some(notify) = heart {
-                    existing.join_heart(notify);
+                if keep {
+                    existing.add_keepers(&gates);
                 }
-            } else {
-                // A heart or play with its own gate counts the file as its own only once that gate
-                // passes it.
-                existing.join_gated(&gates, requested_by, target, heart);
+                existing.add_held_files(&held.files, &held.lidarr);
+                if held.shared {
+                    existing.held_for_others.store(true, Ordering::SeqCst);
+                }
+                if upgrade_search {
+                    existing.ask_for_upgrade_search();
+                }
+                (existing.completion.clone(), true)
             }
-            existing.add_held_files(&held_files);
-            if upgrade_search {
-                existing.ask_for_upgrade_search();
+            Claimed::Behind => {
+                info!(
+                    "{provider}:{external_id} is being fetched for someone else; this {} waits behind it as its own",
+                    if is_star { "star" } else { "play" }
+                );
+                (request.completion.clone(), false)
             }
-            if keep {
-                existing.ask_to_keep();
+            Claimed::New => {
+                if self.send(&request) {
+                    info!(
+                        "Queued {} acquisition for {provider}:{external_id}",
+                        if is_star { "star" } else { "play" }
+                    );
+                }
+                (request.completion.clone(), false)
             }
-            return (existing.completion.clone(), true);
         }
-
-        if is_star {
-            self.waiting_stars.fetch_add(1, Ordering::SeqCst);
-        } else {
-            self.waiting_plays.fetch_add(1, Ordering::SeqCst);
-        }
-        let channel = if is_star { &self.stars } else { &self.plays };
-        let room = !is_star || self.waiting_stars.load(Ordering::SeqCst) <= Self::STAR_CAPACITY;
-        if !room || channel.try_send(request.clone()).is_err() {
-            if is_star {
-                self.waiting_stars.fetch_sub(1, Ordering::SeqCst);
-            } else {
-                self.waiting_plays.fetch_sub(1, Ordering::SeqCst);
-            }
-            // Full. Say so out loud: silently shedding work is how "why didn't that
-            // download?" becomes unanswerable.
-            warn!(
-                "Acquisition queue full ({}); dropped {provider}:{external_id}",
-                if is_star { "star" } else { "play" }
-            );
-            self.release(&request);
-            request.completion.try_set_error(queue_full());
-            return (request.completion.clone(), false);
-        }
-
-        info!(
-            "Queued {} acquisition for {provider}:{external_id}",
-            if is_star { "star" } else { "play" }
-        );
-        (request.completion.clone(), false)
     }
 
     /// Queue a copy of a played track unless another played track is still waiting. Radio
@@ -1182,11 +1401,35 @@ impl TrackAcquisitionQueue {
         for gate in &gates {
             request.add_gate(gate.clone());
         }
-        // Already wanted: ride along, whatever is waiting.
-        let known = self.in_flight.lock().get(&request.key()).cloned();
-        if let Some(known) = known {
-            join_play(&known, &gates, requested_by, target);
-            return Some(known);
+        // Already wanted: ride along, whatever is waiting, on a request this play may share; else
+        // wait behind the song's running request as its own.
+        let known = {
+            let mut in_flight = self.in_flight.lock();
+            in_flight
+                .get_mut(&request.key())
+                .map(|song| match song.sharing(&request) {
+                    Some(known) => Claimed::Joins(known),
+                    None => {
+                        song.behind.push_back(request.clone());
+                        Claimed::Behind
+                    }
+                })
+        };
+        match known {
+            Some(Claimed::Joins(known)) => {
+                join_play(&known, &gates, requested_by, target);
+                return Some(known);
+            }
+            Some(_) => {
+                if let Some(on_queued) = on_queued {
+                    on_queued();
+                }
+                info!(
+                    "{provider}:{external_id} is being fetched for someone else; this play waits behind it"
+                );
+                return Some(request);
+            }
+            None => {}
         }
         // The waiting slot is taken BEFORE the key is claimed. Claiming first and letting go on a
         // full slot would leave a heart that joined in between waiting on a request nobody runs:
@@ -1208,20 +1451,20 @@ impl TrackAcquisitionQueue {
             }
             return None;
         }
-        let existing = {
-            let mut in_flight = self.in_flight.lock();
-            match in_flight.get(&request.key()) {
-                Some(existing) => Some(existing.clone()),
-                None => {
-                    in_flight.insert(request.key(), request.clone());
-                    None
-                }
+        match self.claim(&request) {
+            Claimed::Joins(existing) => {
+                self.waiting_plays.fetch_sub(1, Ordering::SeqCst);
+                join_play(&existing, &gates, requested_by, target);
+                return Some(existing);
             }
-        };
-        if let Some(existing) = existing {
-            self.waiting_plays.fetch_sub(1, Ordering::SeqCst);
-            join_play(&existing, &gates, requested_by, target);
-            return Some(existing);
+            Claimed::Behind => {
+                self.waiting_plays.fetch_sub(1, Ordering::SeqCst);
+                if let Some(on_queued) = on_queued {
+                    on_queued();
+                }
+                return Some(request);
+            }
+            Claimed::New => {}
         }
         if let Some(on_queued) = on_queued {
             on_queued();
@@ -1282,12 +1525,47 @@ impl TrackAcquisitionQueue {
     /// failure, not just on success: a leaked claim makes every future request for that
     /// track join a job that will never run.
     pub(crate) fn release(&self, request: &Arc<AcquisitionRequest>) {
-        let mut in_flight = self.in_flight.lock();
-        if in_flight
-            .get(&request.key())
-            .is_some_and(|claimed| Arc::ptr_eq(claimed, request))
+        self.release_landed(request, None);
+    }
+
+    /// [`Self::release`] for a request whose file landed at `landed`: the next request waiting
+    /// behind it, someone else's, runs now and judges that file with its own gates first.
+    pub(crate) fn release_landed(&self, request: &Arc<AcquisitionRequest>, landed: Option<&str>) {
+        let next = {
+            let mut in_flight = self.in_flight.lock();
+            let key = request.key();
+            let Some(song) = in_flight.get_mut(&key) else {
+                return;
+            };
+            if !Arc::ptr_eq(&song.running, request) {
+                // One that never ran lets go of its place behind.
+                song.behind.retain(|waiting| !Arc::ptr_eq(waiting, request));
+                return;
+            }
+            if let Some(path) = landed.filter(|path| !path.trim().is_empty())
+                && !song.landed.iter().any(|known| known == path)
+            {
+                song.landed.push(path.to_string());
+            }
+            match song.behind.pop_front() {
+                Some(next) => {
+                    next.landed.lock().extend(song.landed.iter().cloned());
+                    song.running = next.clone();
+                    Some(next)
+                }
+                None => {
+                    in_flight.remove(&key);
+                    None
+                }
+            }
+        };
+        if let Some(next) = next
+            && self.send(&next)
         {
-            in_flight.remove(&request.key());
+            info!(
+                "{}:{} runs again for the next person who asked for it",
+                next.provider, next.external_id
+            );
         }
     }
 }

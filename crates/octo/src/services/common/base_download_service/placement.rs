@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 use super::{BaseDownloadService, FileNotFoundException, RequestedIdentity, file_exists, get_extension};
 use crate::services::common::acquisition_tracker::{acquisition_event_kinds, key_of};
 use crate::services::common::soulseek_hold_store::held_root;
+use crate::services::i_download_service::HeldEnd;
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::replacement_handoff::ArrivedTags;
 use crate::services::library::{ReplacementHandoff, ReplacementRejectedException};
@@ -236,7 +237,7 @@ impl BaseDownloadService {
         if file_exists(&held_path) {
             held_path = PathHelper::resolve_unique_path(&held_path);
         }
-        if let Err(e) = move_file(current_path, &held_path) {
+        if let Err(e) = move_off_thread(current_path, &held_path).await {
             warn!("Could not hold {current_path} back from the library: {e}");
             return None;
         }
@@ -248,6 +249,7 @@ impl BaseDownloadService {
             kept: matches!(proof, RecordingProof::AsHeard { .. } | RecordingProof::KeptByYou),
             follows: follows.clone(),
             users: users.to_vec(),
+            proven_for: Vec::new(),
         });
         if proven {
             info!("{held_path} is proven: Octo stops following Lidarr for its artist and places it");
@@ -263,18 +265,63 @@ impl BaseDownloadService {
         Some(Placement::new(held_path, false))
     }
 
-    /// Places a file a Lidarr follow held back, now that no follow holds it: moved where the
+    /// Places a file a Lidarr follow held back, now that no follow that may still import holds it
+    /// (see [`crate::services::i_download_service::IDownloadService::place_held`]): moved where the
     /// layout gave it (beside a different file already there, never over it), with whatever was
-    /// written beside it, the library's record moved along, and a scan asked for. Never while a
-    /// library job or a download is placing files. None when it could not be placed.
-    pub async fn place_held_file(&self, held: &HeldPlacement) -> Option<String> {
+    /// written beside it, the library's record moved along, and a scan asked for. A kept copy
+    /// whose song's Lidarr file passed the gate of someone it was kept for never lands beside that
+    /// file: in the shared library it gives way to it; in the family pool it lands, recorded and
+    /// linked, only in the libraries of the members it is still for, and gives way once there are
+    /// none. Never while a library job or a download is placing files.
+    pub async fn place_held_file(&self, held: &HeldPlacement) -> HeldEnd {
         let _share = match &self.services.write_gate {
             Some(gate) => Some(gate.write().await),
             None => None,
         };
-        let _permit = self.download_lock.acquire().await.ok()?;
+        let Ok(_permit) = self.download_lock.acquire().await else {
+            return HeldEnd::Later;
+        };
         if !file_exists(&held.held_path) {
-            return None;
+            return HeldEnd::Later;
+        }
+        let pool = self
+            .services
+            .family
+            .as_ref()
+            .filter(|family| family.is_pool_path(&held.target));
+        let record = self
+            .local_library
+            .get_mappings()
+            .await
+            .into_iter()
+            .find(|mapping| mapping.local_path == held.held_path);
+        let kept_for = kept_for(held, record.as_ref());
+        // Whom it was kept for that the song's proven file is for already: as the follow saved
+        // it, and as the library records it (a restart may have come before the follow saved it).
+        let mut proven_for: Vec<String> = Vec::new();
+        if held.kept {
+            let in_library = self.proven_in_library(held, &kept_for).await;
+            for user in held.proven_for.iter().chain(in_library.iter()) {
+                if one_of(&kept_for, user) && !one_of(&proven_for, user) {
+                    proven_for.push(user.clone());
+                }
+            }
+        }
+        let still_for: Vec<String> = kept_for
+            .iter()
+            .filter(|user| !one_of(&proven_for, user))
+            .cloned()
+            .collect();
+        if !proven_for.is_empty() && (pool.is_none() || still_for.is_empty()) {
+            return if self.drop_held_locked(held, &proven_for).await {
+                info!(
+                    "The kept {} gives way to the song's proven Lidarr file instead of being placed: {}",
+                    held.song, held.held_path
+                );
+                HeldEnd::GaveWay
+            } else {
+                HeldEnd::Later
+            };
         }
         let mut target = held.target.clone();
         if file_exists(&target) {
@@ -284,11 +331,11 @@ impl BaseDownloadService {
             && let Err(e) = std::fs::create_dir_all(&dir)
         {
             warn!("Could not make {dir} for a held file: {e}");
-            return None;
+            return HeldEnd::Later;
         }
-        if let Err(e) = move_file(&held.held_path, &target) {
+        if let Err(e) = move_off_thread(&held.held_path, &target).await {
             warn!("Could not place the held {}: {e}", held.held_path);
-            return None;
+            return HeldEnd::Later;
         }
         move_beside(&held.held_path, &target);
         // The hold folder goes with its last file.
@@ -305,19 +352,95 @@ impl BaseDownloadService {
                 held.held_path
             );
         }
+        if let Some(family) = pool {
+            self.place_for_members(family.as_ref(), held, &target, record, &still_for)
+                .await;
+        }
         self.local_library.trigger_library_scan(false).await;
         info!(
             "Placed the held {} where the layout files it: {target}",
             held.song
         );
-        Some(target)
+        HeldEnd::Placed(target)
     }
 
-    /// Drops a kept copy a Lidarr follow held back, once a proven copy of its song passed the gate
-    /// of every person the copy was kept for (`users`): its file, whatever was written beside it,
-    /// and the library's record of it go, so those people end with the proven copy alone. A copy
-    /// the library records for anyone else, or does not record at all, stays. Never while a
-    /// library job or a download is placing files.
+    /// Those of `people` the library records another, proven file of the held copy's song for:
+    /// that file passed their own gate.
+    async fn proven_in_library(&self, held: &HeldPlacement, people: &[String]) -> Vec<String> {
+        let Some((provider, external_id)) = held.song.split_once(':') else {
+            return Vec::new();
+        };
+        let held_path = get_full_path(&held.held_path);
+        let mappings = self.local_library.get_mappings().await;
+        people
+            .iter()
+            .filter(|user| {
+                mappings.iter().any(|mapping| {
+                    mapping.external_provider == provider
+                        && mapping.external_id == external_id
+                        && !mapping.kept_unproven()
+                        && !dotnet::eq_ignore_case(&get_full_path(&mapping.local_path), &held_path)
+                        && mapping.heart.as_ref().is_some_and(|heart| heart.is_for(user))
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// A held file placed in the family pool at `target`: recorded there and linked into the
+    /// libraries of `members` alone. A kept copy's record names only them, so a member whose gate
+    /// passed the song's Lidarr file is never counted as holding this copy too.
+    async fn place_for_members(
+        &self,
+        family: &dyn crate::services::family::FamilyPlacement,
+        held: &HeldPlacement,
+        target: &str,
+        record: Option<crate::services::local::LocalSongMapping>,
+        members: &[String],
+    ) {
+        let (provider, external_id) = held.song.split_once(':').unwrap_or(("", held.song.as_str()));
+        let song = Song {
+            title: record.as_ref().map(|r| r.title.clone()).unwrap_or_default(),
+            artist: record.as_ref().map(|r| r.artist.clone()).unwrap_or_default(),
+            album: record.as_ref().map(|r| r.album.clone()).unwrap_or_default(),
+            external_provider: Some(provider.to_string()),
+            external_id: Some(external_id.to_string()),
+            transcoded_from: record.as_ref().and_then(|r| r.transcoded_from.clone()),
+            ..Default::default()
+        };
+        family
+            .placed(target, &song, provider, external_id, members, true)
+            .await;
+        let Some(mut record) = record.filter(|record| {
+            record.heart.as_ref().is_some_and(|heart| {
+                heart.users.len() != members.len() || heart.users.iter().any(|user| !one_of(members, user))
+            })
+        }) else {
+            return;
+        };
+        if let Some(heart) = record.heart.as_mut() {
+            heart.users.retain(|user| one_of(members, user));
+        }
+        record.local_path = target.to_string();
+        let rewritten = match self.local_library.forget_mapping_keyed(&record.key()).await {
+            Ok(_) => {
+                self.local_library
+                    .restore_mappings(std::slice::from_ref(&record), target)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = rewritten {
+            warn!("Could not write the library's record of {target} for its members: {e}");
+        }
+    }
+
+    /// Drops a kept copy a Lidarr follow held back, once Lidarr's file for its song passed the gate
+    /// of `users` (see [`crate::services::i_download_service::IDownloadService::drop_held`]): its
+    /// file, whatever was written beside it, and the library's record of it go. In the shared
+    /// library that is when it was kept for any of them, the library holding one file of the song;
+    /// in the family pool, only when it was kept for none but them. Never while a library job or a
+    /// download is placing files.
     pub async fn drop_held_copy(&self, held: &HeldPlacement, users: &[String]) -> bool {
         let _share = match &self.services.write_gate {
             Some(gate) => Some(gate.write().await),
@@ -326,27 +449,35 @@ impl BaseDownloadService {
         let Ok(_permit) = self.download_lock.acquire().await else {
             return false;
         };
+        self.drop_held_locked(held, users).await
+    }
+
+    /// [`Self::drop_held_copy`], with the write gate and the download lock held by the caller.
+    async fn drop_held_locked(&self, held: &HeldPlacement, users: &[String]) -> bool {
         let mapping = self
             .local_library
             .get_mappings()
             .await
             .into_iter()
             .find(|mapping| mapping.local_path == held.held_path);
-        let only_theirs = mapping
+        let kept_for = kept_for(held, mapping.as_ref());
+        let in_pool = self
+            .services
+            .family
             .as_ref()
-            .and_then(|mapping| mapping.heart.as_ref())
-            .is_some_and(|heart| {
-                !heart.users.is_empty()
-                    && heart.users.iter().all(|kept_for| {
-                        users
-                            .iter()
-                            .any(|user| dotnet::eq_ignore_case(user.trim(), kept_for.trim()))
-                    })
-            });
-        if !only_theirs {
+            .is_some_and(|family| family.is_pool_path(&held.target));
+        let gives_way = !kept_for.is_empty()
+            && if in_pool {
+                kept_for.iter().all(|kept| one_of(users, kept))
+            } else {
+                kept_for.iter().any(|kept| one_of(users, kept))
+            };
+        if !gives_way {
             return false;
         }
-        if let Err(e) = self.local_library.forget_mapping(&held.held_path).await {
+        if mapping.is_some()
+            && let Err(e) = self.local_library.forget_mapping(&held.held_path).await
+        {
             warn!("Could not forget the library's record of {}: {e}", held.held_path);
             return false;
         }
@@ -811,37 +942,111 @@ impl BaseDownloadService {
     }
 }
 
-/// Moves a file: a rename, or a copy and a delete across file systems. Never over an existing
-/// file.
+/// Moves a file to a path nothing lies at, and never over a file that lands there meanwhile (an
+/// import of Lidarr's runs outside Octo's locks): linked into place and the old name removed, or,
+/// on another disk or a file system with no hard links, copied into place by [`copy_new`] and the
+/// old file removed. Whatever fails leaves the file where it was and nothing new at `to`.
 pub(super) fn move_file(from: &str, to: &str) -> std::io::Result<()> {
-    if Path::new(to).exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("The file '{to}' already exists."),
-        ));
-    }
-    match std::fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            std::fs::copy(from, to)?;
-            std::fs::remove_file(from)
+    match std::fs::hard_link(from, to) {
+        Ok(()) => std::fs::remove_file(from).inspect_err(|_| {
+            let _ = std::fs::remove_file(to);
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(already_there(to)),
+        Err(_) => {
+            copy_new(Path::new(from), Path::new(to))?;
+            std::fs::remove_file(from).inspect_err(|_| {
+                let _ = std::fs::remove_file(to);
+            })
         }
-        Err(e) => Err(e),
     }
 }
 
+/// [`move_file`] on a blocking thread: a move across disks copies the whole file.
+async fn move_off_thread(from: &str, to: &str) -> std::io::Result<()> {
+    let (from, to) = (from.to_string(), to.to_string());
+    tokio::task::spawn_blocking(move || move_file(&from, &to))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+}
+
+fn already_there(to: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("The file '{to}' already exists."),
+    )
+}
+
+/// Copies a file to a path nothing lies at, never over a file that lands there meanwhile: to a
+/// temporary name in the target's folder first, then linked into place, which fails when the path
+/// is taken; on a file system with no hard links, the path is claimed by creating it new before
+/// the copy is renamed onto it. A failed copy leaves no temporary file and nothing at `to`.
+pub(crate) fn copy_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    let folder = to.parent().unwrap_or_else(|| Path::new("."));
+    let name = to
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temporary = folder.join(format!(".{name}.{}.part", uuid::Uuid::new_v4().simple()));
+    if let Err(e) = std::fs::copy(from, &temporary) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(e);
+    }
+    let placed = match std::fs::hard_link(&temporary, to) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(to)
+            .and_then(|claimed| {
+                drop(claimed);
+                std::fs::rename(&temporary, to).inspect_err(|_| {
+                    let _ = std::fs::remove_file(to);
+                })
+            }),
+    };
+    let _ = std::fs::remove_file(&temporary);
+    placed
+}
+
+impl BaseDownloadService {
+    /// Moves a file to a path nothing lies at, never over a file that lands there meanwhile (see
+    /// [`move_file`]), for the services that hold files outside the library.
+    pub fn move_new(from: &Path, to: &Path) -> std::io::Result<()> {
+        move_file(&from.to_string_lossy(), &to.to_string_lossy())
+    }
+}
+
+/// Whom a held file was kept for: as the library records it, else as it was held.
+fn kept_for(held: &HeldPlacement, record: Option<&crate::services::local::LocalSongMapping>) -> Vec<String> {
+    record
+        .and_then(|record| record.heart.as_ref())
+        .map(|heart| heart.users.clone())
+        .filter(|kept_for| !kept_for.is_empty())
+        .unwrap_or_else(|| held.users.clone())
+}
+
+/// Whether `user` is one of `people`, ignoring case and spaces around.
+fn one_of(people: &[String], user: &str) -> bool {
+    people
+        .iter()
+        .any(|known| dotnet::eq_ignore_case(known.trim(), user.trim()))
+}
+
 /// Moves the files written beside `from` (its name with another extension, such as its lyrics)
-/// to beside `to`, named after it. Best effort; one already there stays.
-fn move_beside(from: &str, to: &str) {
+/// to beside `to`, named after it. Best effort; one already there stays. The files it moved, by
+/// their new paths.
+fn move_beside(from: &str, to: &str) -> Vec<String> {
+    let mut moved = Vec::new();
     let (from, to) = (Path::new(from), Path::new(to));
     let (Some(from_dir), Some(to_dir)) = (from.parent(), to.parent()) else {
-        return;
+        return moved;
     };
     let (Some(from_stem), Some(to_stem)) = (from.file_stem(), to.file_stem()) else {
-        return;
+        return moved;
     };
     let Ok(entries) = std::fs::read_dir(from_dir) else {
-        return;
+        return moved;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -856,10 +1061,11 @@ fn move_beside(from: &str, to: &str) {
             to_stem.to_string_lossy(),
             extension.to_string_lossy()
         ));
-        if !beside.exists() {
-            let _ = std::fs::rename(&path, &beside);
+        if move_file(&path.to_string_lossy(), &beside.to_string_lossy()).is_ok() {
+            moved.push(beside.to_string_lossy().into_owned());
         }
     }
+    moved
 }
 
 /// The folder of a path: everything before the last separator, `"/"` for a file in the root,

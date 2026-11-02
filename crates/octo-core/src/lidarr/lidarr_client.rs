@@ -23,6 +23,11 @@ pub enum LidarrError {
     /// Lidarr answered with an error status, or could not be reached.
     #[error("{0}")]
     Http(String),
+    /// The request went out and no answer of Lidarr's says what came of it: the connection
+    /// dropped after it was sent, or a proxy in front of Lidarr answered 502, 503 or 504. Lidarr
+    /// may have done it, as after a timeout.
+    #[error("{0}")]
+    MaybeSent(String),
     /// The client's timeout, or the caller's cancellation.
     #[error("{0}")]
     Canceled(String),
@@ -325,6 +330,11 @@ pub struct LidarrQueueItem {
     /// Where the client puts the download, in Lidarr's paths.
     pub output_path: Option<String>,
     pub protocol: Option<String>,
+    /// When Lidarr took the item, on Lidarr's clock: a download's newest grab row, a held-back
+    /// release's own time.
+    pub added: Option<DateTime<Utc>>,
+    /// The indexer the release came from.
+    pub indexer: Option<String>,
 }
 
 /// What a history row records, as Lidarr numbers and names it.
@@ -957,6 +967,8 @@ pub fn parse_queue_item(row: &Map<String, Value>) -> Result<LidarrQueueItem, Lid
         size_left_bytes: nullable_bytes(row, "sizeleft")?,
         output_path: nullable_str(row, "outputPath")?,
         protocol: nullable_str(row, "protocol")?,
+        added: nullable_date(row, "added")?,
+        indexer: present(nullable_str(row, "indexer")?),
     })
 }
 

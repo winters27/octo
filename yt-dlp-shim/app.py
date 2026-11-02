@@ -1579,8 +1579,14 @@ def stream():
         url = _resolve_url(video_id, bg)
         upstream = _open_upstream(url, upstream_headers, video_id) if url else None
         # A freshly resolved URL that is refused again is not an expiry; the
-        # most common remaining cause is a stale cached player.
-        if upstream is not None and upstream.status_code in (403, 410):
+        # most common remaining cause is a stale cached player. A fresh request
+        # is Octo proving one video in the background: its refusal is that
+        # video's answer, never a reason to purge the plays' cache or update.
+        if (
+            upstream is not None
+            and upstream.status_code in (403, 410)
+            and not _in_fresh_request()
+        ):
             _purge_ytdlp_cache(video_id)
             # Last rung: a refusal that outlives a fresh URL and a purged cache
             # points at the binary, not at this play. Only retry when the update

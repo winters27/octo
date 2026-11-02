@@ -66,6 +66,9 @@ enum Asked {
     /// A 429, a 5xx, a body that could not be read, or no answer at all: worth asking again, after
     /// `retry_after` when MusicBrainz said how long to wait.
     Busy { retry_after: Option<Duration> },
+    /// A held question that kept failing while MusicBrainz answered others: nothing is learned
+    /// from it, which is not the same as MusicBrainz knowing nothing by it.
+    GaveUp,
 }
 
 impl Asked {
@@ -73,7 +76,7 @@ impl Asked {
     fn found(self) -> Option<Value> {
         match self {
             Asked::Answer(doc) => Some(doc),
-            Asked::NotKnown | Asked::Refused | Asked::Busy { .. } => None,
+            Asked::NotKnown | Asked::Refused | Asked::Busy { .. } | Asked::GaveUp => None,
         }
     }
 
@@ -94,6 +97,9 @@ pub enum IsrcLookup {
     /// MusicBrainz refused the question as Octo asked it: a definite answer, never worth
     /// asking again the same way.
     Refused,
+    /// A held question about the code kept failing while MusicBrainz answered others: nothing is
+    /// learned of the code, which is not the same as MusicBrainz knowing no recording with it.
+    GaveUp,
 }
 
 /// The releases kept per recording of a code: the candidate reader takes no more.
@@ -424,6 +430,7 @@ impl MusicBrainzClient {
             Asked::NotKnown => Vec::new(),
             Asked::Refused => return Ok(IsrcLookup::Refused),
             Asked::Busy { .. } => return Ok(IsrcLookup::Unanswered),
+            Asked::GaveUp => return Ok(IsrcLookup::GaveUp),
         };
         if recordings.is_empty() {
             return Ok(IsrcLookup::NotKnown);
@@ -467,6 +474,7 @@ impl MusicBrainzClient {
                 }
             }
             Ok(Asked::NotKnown | Asked::Refused) => MusicBrainzFact::NotKnown,
+            Ok(Asked::GaveUp) => MusicBrainzFact::GaveUp,
             Ok(Asked::Busy { .. }) | Err(_) => MusicBrainzFact::Busy,
         }
     }
@@ -487,6 +495,7 @@ impl MusicBrainzClient {
                     .collect(),
             ),
             Ok(IsrcLookup::NotKnown | IsrcLookup::Refused) => MusicBrainzFact::NotKnown,
+            Ok(IsrcLookup::GaveUp) => MusicBrainzFact::GaveUp,
             Ok(IsrcLookup::Unanswered) | Err(_) => MusicBrainzFact::Busy,
         }
     }
@@ -502,7 +511,7 @@ impl MusicBrainzClient {
         let search = format!("recording?query=isrc:{code}&limit=100&fmt=json");
         let recordings = match self.ask(&search, "code search").await? {
             Asked::Answer(doc) => recordings_of(&doc, |recording| carries(recording, &code)),
-            Asked::NotKnown => Vec::new(),
+            Asked::NotKnown | Asked::GaveUp => Vec::new(),
             Asked::Refused => return Ok(IsrcLookup::Refused),
             Asked::Busy { .. } => return Ok(IsrcLookup::Unanswered),
         };
@@ -994,7 +1003,7 @@ impl MusicBrainzClient {
             let now_seen = *answers.borrow_and_update();
             if musicbrainz_answers {
                 if self.count_failure(&question, now_seen) {
-                    self.settle(&question, Asked::NotKnown);
+                    self.settle(&question, Asked::GaveUp);
                     self.end_held(&question, ReAsked::GaveUp);
                 }
             } else {
@@ -1389,7 +1398,9 @@ impl ReleaseLookup for MusicBrainzClient {
         match MusicBrainzClient::lookup_isrc(self, isrc).await? {
             IsrcLookup::Found(doc) => Ok(Some(doc)),
             IsrcLookup::NotKnown => Ok(None),
-            IsrcLookup::Unanswered => anyhow::bail!("MusicBrainz could not be asked about the code"),
+            IsrcLookup::Unanswered | IsrcLookup::GaveUp => {
+                anyhow::bail!("MusicBrainz could not be asked about the code")
+            }
             IsrcLookup::Refused => anyhow::bail!("MusicBrainz refused the question about the code"),
         }
     }
@@ -1543,7 +1554,8 @@ impl HeartQuestions {
         };
         match self.music_brainz.code_recordings_on(isrc, self.lane).await {
             Ok(IsrcLookup::Found(doc)) => Ok(release::read_code_recordings(&doc)),
-            Ok(IsrcLookup::NotKnown | IsrcLookup::Refused) => Ok(Vec::new()),
+            // A code MusicBrainz could not answer for leaves the identity with what it has.
+            Ok(IsrcLookup::NotKnown | IsrcLookup::Refused | IsrcLookup::GaveUp) => Ok(Vec::new()),
             Ok(IsrcLookup::Unanswered) | Err(_) => Err(HeartBusy::MusicBrainz(question)),
         }
     }
@@ -1708,7 +1720,7 @@ impl HeartQuestions {
                     }
                 }
                 Asked::Busy { .. } => return Err(HeartBusy::MusicBrainz(page(limit))),
-                Asked::NotKnown | Asked::Refused => {
+                Asked::NotKnown | Asked::Refused | Asked::GaveUp => {
                     whole = false;
                     match release_count {
                         Some(count) if offset + limit < count => offset += limit,

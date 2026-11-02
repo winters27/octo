@@ -18,6 +18,8 @@ pub(crate) struct FakeLocalLibrary {
     pub scans: AtomicUsize,
     /// Every move of the records at one path to another, in order.
     pub moved: Mutex<Vec<(String, String)>>,
+    /// The library file of an outside song, by its id.
+    pub files: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeLocalLibrary {
@@ -36,8 +38,12 @@ impl FakeLocalLibrary {
 
 #[async_trait]
 impl ILocalLibraryService for FakeLocalLibrary {
-    async fn get_local_path_for_external_song(&self, _: &str, _: &str) -> Option<String> {
-        None
+    async fn get_local_path_for_external_song(&self, _: &str, external_id: &str) -> Option<String> {
+        self.files
+            .lock()
+            .iter()
+            .find(|(id, _)| id == external_id)
+            .map(|(_, path)| path.clone())
     }
 
     async fn register_downloaded_song(&self, _: &Song, _: &str) -> anyhow::Result<()> {
@@ -87,6 +93,13 @@ impl ILocalLibraryService for FakeLocalLibrary {
             .collect();
         by_tags.retain(|(.., mapping)| mapping.local_path != local_path);
         Ok(forgotten)
+    }
+
+    async fn forget_mapping_keyed(&self, key: &str) -> anyhow::Result<bool> {
+        let mut by_tags = self.by_tags.lock();
+        let before = by_tags.len();
+        by_tags.retain(|(.., mapping)| mapping.key() != key);
+        Ok(by_tags.len() != before)
     }
 
     async fn trigger_library_scan(&self, _force: bool) -> bool {

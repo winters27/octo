@@ -16,9 +16,12 @@
 //!   another artist leads they are deleted instead. When the follow ends and no hearted song
 //!   passed, every held track is deleted. Octo deletes held files itself, and the hold folder goes
 //!   with its pending entry.
-//! - **One file.** A copy kept as heard (or kept by the person) that waited for the follow is
-//!   dropped once the song's own Lidarr file passes the gates of everyone it was kept for: they
-//!   end with the proven file alone.
+//! - **One file.** A copy kept as heard (or kept by the person) waits for the follow until it is
+//!   over, playing from the hold path. Once the song's own Lidarr file passes the gate of anyone
+//!   it was kept for, that proof is saved first; in the shared library the copy then gives way
+//!   (the library holds one file of the song), and in the family pool it lands later only in the
+//!   libraries of the members whose gate did not pass that file. A file refused for them is never
+//!   kept as one of the album's other tracks.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,11 +38,11 @@ use octo_core::soulseek::{RoutingKind, SoulseekRouting};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::{AlbumJob, Inner, key_of, translate_imported_path};
+use super::{AlbumJob, Inner, key_of, match_song, song_entry_key, translate_imported_path};
 use crate::services::common::{AcquisitionHeld, AcquisitionPlace, BaseDownloadService, GateLedger};
 use crate::services::fingerprint::download_verification_service::LabelSource;
 use crate::services::lidarr::LidarrImport;
-use crate::services::lidarr::lidarr_pending_albums::{HeldTrack, SongGate};
+use crate::services::lidarr::lidarr_pending_albums::{HELD_FOR_LIDARR, HeldTrack, SongGate};
 use crate::services::lidarr::lidarr_pick::delete_moved_record;
 use crate::services::soulseek::SoulseekMetadataService;
 use crate::services::soulseek::soulseek_download_service::INCOMING_FOLDER_NAME;
@@ -72,13 +75,13 @@ fn folder_name(foreign_album_id: &str) -> String {
         .collect()
 }
 
-/// Moves a file, copying it when it lies on another volume.
-fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    if std::fs::rename(from, to).is_ok() {
-        return Ok(());
-    }
-    std::fs::copy(from, to)?;
-    std::fs::remove_file(from)
+/// Moves a file to a path nothing lies at, never over a file that lands there meanwhile, on a
+/// blocking thread: a move across disks copies the whole file.
+async fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (from, to) = (from.to_path_buf(), to.to_path_buf());
+    tokio::task::spawn_blocking(move || BaseDownloadService::move_new(&from, &to))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
 impl Inner {
@@ -160,7 +163,7 @@ impl Inner {
         if held_path.exists() {
             held_path = folder.join(format!("{}-{name}", track.track_file_id));
         }
-        if let Err(e) = move_file(Path::new(imported_path), &held_path) {
+        if let Err(e) = move_file(Path::new(imported_path), &held_path).await {
             warn!("Could not hold {imported_path} back for its album: {e}");
             return false;
         }
@@ -300,7 +303,7 @@ impl Inner {
                     entry.held_tracks.retain(|held| held.track_file_id != file_id);
                 });
                 job.add_landed(Some(&song), Some(&track.imported()), &job.view());
-                self.drop_kept_copies(song_key, &users).await;
+                self.drop_kept_copies(foreign_album_id, song_key, &users).await;
             }
             Candidate::Refused { back } => {
                 let key = song_key.to_string();
@@ -471,6 +474,19 @@ impl Inner {
             self.pending.update(foreign_album_id, |entry| {
                 entry.held_tracks.retain(|held| held.track_file_id != file_id);
             });
+            // A song whose file is a person's kept copy takes Lidarr's file only by that person's
+            // gate, never as one of the album's other tracks: the library holds one file of it.
+            let kept_song = match_song(&job.view(), &track.imported(), job.match_by_number())
+                .and_then(song_entry_key)
+                .is_some_and(|song| self.pending.kept_copy_for(&song));
+            if kept_song {
+                let _ = std::fs::remove_file(&track.path);
+                info!(
+                    "'{}' of {foreign_album_id} is not kept: a kept copy is that song's file",
+                    track.title
+                );
+                continue;
+            }
             if led_by_another {
                 let _ = std::fs::remove_file(&track.path);
                 info!(
@@ -547,25 +563,37 @@ impl Inner {
         let _ = std::fs::remove_dir(&root);
     }
 
-    /// A copy of the song kept as heard, or kept by its person, waits for the follow: once the
-    /// song's Lidarr file passed the gates of everyone that copy was kept for, it is dropped, so
-    /// they end with the proven file alone.
-    async fn drop_kept_copies(&self, song_key: &str, users: &[String]) {
+    /// The song's Lidarr file, imported for the follow `foreign_album_id`, passed the gates of
+    /// `users`. That proof is saved on the follow and on each kept copy of the song (kept as heard,
+    /// or kept by its person) held for one of them, before anything is dropped, so a copy that
+    /// cannot give way now never lands beside that file once the follow is over. In the shared
+    /// library each such copy then gives way at once (the library holds one file of the song); in
+    /// the family pool only one kept for none but them does, and the rest land later in the
+    /// libraries of the members still waiting on them.
+    async fn drop_kept_copies(&self, foreign_album_id: &str, song_key: &str, users: &[String]) {
+        let copies = self.pending.proven(foreign_album_id, song_key, users).await;
         let Some(downloads) = &self.downloads else {
             return;
         };
-        for held in self
-            .pending
-            .held()
-            .into_iter()
-            .filter(|held| held.kept && held.song == song_key)
-        {
-            if downloads.drop_held(&held, users).await {
+        for held in copies {
+            if held.proven_for.is_empty() {
+                continue;
+            }
+            if downloads.drop_held(&held, &held.proven_for).await {
                 self.pending.unhold(&held.held_path);
                 if let Some(tracker) = &self.tracker
                     && let Some((provider, id)) = song_key.split_once(':')
                 {
-                    tracker.end_aside(provider, id, None);
+                    let waiting = self.pending.kept_copies_waiting(song_key);
+                    if waiting.is_empty() {
+                        tracker.end_aside(provider, id, None);
+                    } else {
+                        let still: Vec<String> = waiting
+                            .iter()
+                            .flat_map(|copy| copy.users.iter().cloned())
+                            .collect();
+                        tracker.wait_aside(provider, id, &still, HELD_FOR_LIDARR);
+                    }
                 }
                 info!(
                     "The kept copy of {song_key} gives way to its proven Lidarr file: {}",

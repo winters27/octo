@@ -5,8 +5,8 @@
 //! whose lookup would have to wait for its bulk turn moves its file to the one hold path instead.
 
 use octo_core::fingerprint::heart_gate::{
-    AcquisitionOrigin, FileFacts, GateVerdict, HeardReading, HeardSource, HeartGate, ImportJudgement,
-    Refusal, TagClaim, Undecided, WaitingFor, import_judgement,
+    AcquisitionOrigin, FileFacts, GateVerdict, HeardReading, HeardRecording, HeardSource, HeartGate,
+    ImportJudgement, Refusal, TagClaim, Undecided, WaitingFor, import_judgement,
 };
 use octo_core::fingerprint::verification::{RecordingProof, read_answer};
 
@@ -24,12 +24,15 @@ pub(crate) enum FileJudged {
     /// Keep it, tagged by this verdict.
     Keep(VerificationResult),
     /// It is not kept. `shared` when the file is not the song at all, so the peer's file is
-    /// remembered for every download; otherwise only the gates that refused it remember it.
-    /// `verdict` is the shipped reading of its sound, for the words and the YouTube loop.
+    /// remembered for every download; otherwise only the R of each gate that refused it
+    /// (`refused`) remembers it, and none when no gate refused it (a file no gate could decide is
+    /// thrown away and remembered by nobody). `verdict` is the shipped reading of its sound, for
+    /// the words and the YouTube loop.
     Refuse {
         reason: String,
         shared: bool,
         verdict: VerificationResult,
+        refused: Vec<HeardRecording>,
     },
     /// It waits in the one hold path, where it was moved, and the acquisition holds.
     Hold(AcquisitionHeld),
@@ -98,6 +101,24 @@ fn verdict_words(verdict: &GateVerdict) -> (&'static str, &'static str) {
             "Nothing was heard yet to prove it by",
         ),
         GateVerdict::Hold(_) => ("Waiting before it is kept", "Moved aside until it can be checked"),
+    }
+}
+
+/// Records in `ledger` what the gate of someone who joined another acquisition said of its file:
+/// the outcome for their person, and which acceptance passed it when one did.
+pub(crate) fn record_joiner(
+    ledger: &crate::services::common::GateLedger,
+    gate: &HeartGate,
+    verdict: &GateVerdict,
+) {
+    let outcome = match verdict {
+        GateVerdict::Accept { .. } => GateOutcome::Accepted,
+        GateVerdict::Hold(waiting) => GateOutcome::Held(*waiting),
+        other => GateOutcome::NotAccepted(not_kept(verdict_words(other).1)),
+    };
+    ledger.record(&gate.user, gate.origin, outcome);
+    if let GateVerdict::Accept { by, .. } = verdict {
+        ledger.record_accepted(&gate.user, gate.origin, *by);
     }
 }
 
@@ -188,6 +209,8 @@ impl SoulseekDownloadService {
         length_known: bool,
         labels: LabelSource,
     ) -> FileJudged {
+        // Everyone who joined the request since the download started is judged too.
+        download.refresh_gates();
         if gated(download) {
             return self.judge_by_gates(base, download, path, identity, labels).await;
         }
@@ -213,14 +236,15 @@ impl SoulseekDownloadService {
         identity: Option<HeardSource>,
         labels: LabelSource,
     ) {
-        let joiners: Vec<&HeartGate> = download.gates.iter().filter(|gate| personal(gate)).collect();
+        // The request's gates now: a heart that joined after the download started is a joiner too.
+        let gates = download.current_gates();
+        let joiners: Vec<&HeartGate> = gates.iter().filter(|gate| personal(gate)).collect();
         if gated(download) || joiners.is_empty() {
             return;
         }
         let ledger = &download.ledger;
         if let Some(origin) = download.origin {
-            let own = download
-                .gates
+            let own = gates
                 .iter()
                 .filter(|gate| gate.origin == origin)
                 .map(|gate| gate.user.clone())
@@ -248,16 +272,72 @@ impl SoulseekDownloadService {
                 download.acquisition_key,
                 check.verdict
             );
-            let outcome = match &check.verdict {
-                GateVerdict::Accept { .. } => GateOutcome::Accepted,
-                GateVerdict::Hold(waiting) => GateOutcome::Held(*waiting),
-                other => GateOutcome::NotAccepted(not_kept(verdict_words(other).1)),
-            };
-            ledger.record(&gate.user, gate.origin, outcome);
-            if let GateVerdict::Accept { by, .. } = check.verdict {
-                ledger.record_accepted(&gate.user, gate.origin, by);
-            }
+            record_joiner(ledger, gate, &check.verdict);
         }
+    }
+
+    /// A file of the song another person's request landed while this download waited behind it,
+    /// judged by this download's own gates as a fresh file is (a hearted album's track by the
+    /// album's rule, a Wait for lossless play by its own gate, built now), and never moved or
+    /// deleted: whether one passes it, each gate's verdict written in the ledger. None when no gate
+    /// of this download judges by sound.
+    pub(crate) async fn judge_landed_file(
+        &self,
+        base: &BaseDownloadService,
+        download: &mut TrackDownload,
+        path: &str,
+    ) -> Option<bool> {
+        download.refresh_gates();
+        let (proven_somehow, _heard) = self.own_play_gate(download).await;
+        if !proven_somehow {
+            return Some(false);
+        }
+        if !gated(download) {
+            return None;
+        }
+        let track_key = download.song.external_id.clone().unwrap_or_default();
+        let candidate = HeartCandidate {
+            labels: LabelSource::TheFile,
+            identity: None,
+            acquisition_key: download.acquisition_key.clone(),
+        };
+        let album_file = download
+            .gates
+            .iter()
+            .any(|gate| gate.origin == AcquisitionOrigin::AlbumHeart)
+            .then(|| album_gates::title_and_length(path));
+        let mut passed = false;
+        for gate in &download.gates {
+            let mut check = self
+                .verification
+                .verify_for_heart(Path::new(path), &candidate, gate)
+                .await;
+            if let (AcquisitionOrigin::AlbumHeart, Some((title, seconds))) = (gate.origin, &album_file) {
+                check.verdict = album_track_verdict(gate, &check, &download.song, title.as_deref(), *seconds);
+            }
+            let accepted = matches!(check.verdict, GateVerdict::Accept { .. });
+            let text = if accepted {
+                "The copy that landed for someone else is the version you heard"
+            } else {
+                "The copy that landed for someone else is not provably the version you heard"
+            };
+            base.log_step_heard(
+                &track_key,
+                acquisition_event_kinds::CHECK,
+                text,
+                Some(verdict_words(&check.verdict).1),
+                check.verification.heard(),
+            );
+            info!(
+                "The gate of {} ({}) for {track_key}, on the copy that landed for someone else at {path}: {:?}",
+                gate.user,
+                gate.origin.name(),
+                check.verdict
+            );
+            record_joiner(&download.ledger, gate, &check.verdict);
+            passed |= accepted;
+        }
+        Some(passed)
     }
 
     /// A heart's or a play's file, judged by each asker's own gate. Kept when one gate accepts it
@@ -327,11 +407,12 @@ impl SoulseekDownloadService {
                 }
             }
             let kept = DownloadVerificationService::kept_verification(check, gate);
+            // The file carries only a code the sound proved: the song's own when it is one of
+            // them, else the first of them, and none when none was proven.
             if let GateVerdict::Accept {
                 tags: TagClaim::Recording { isrcs, .. },
                 ..
             } = &check.verdict
-                && !isrcs.is_empty()
                 && !download
                     .song
                     .isrc
@@ -375,6 +456,7 @@ impl SoulseekDownloadService {
                     reason: "the file could not be moved aside to wait".to_string(),
                     shared: false,
                     verdict: first.verification.clone(),
+                    refused: Vec::new(),
                 };
             };
             for (gate, check) in &checks {
@@ -384,6 +466,7 @@ impl SoulseekDownloadService {
                 waiting_for,
                 line,
                 files: vec![moved],
+                lidarr: Vec::new(),
                 users: holding.iter().map(|(gate, _)| gate.user.clone()).collect(),
             });
         }
@@ -411,15 +494,22 @@ impl SoulseekDownloadService {
             }
         }
         // Not the song at all only when its audio cannot even be decoded; every other refusal is
-        // one person's version, remembered for them alone.
+        // one person's version, remembered for them alone. A gate that could not decide refuses
+        // nothing: the file is thrown away, and a later play may still prove it.
         let shared = checks.iter().all(|(_, check)| {
             check.verdict == GateVerdict::Refuse(Refusal::Unreadable)
                 && check.verification.verdict == VerificationVerdict::Mismatch
         });
+        let refused = checks
+            .iter()
+            .filter(|(_, check)| matches!(check.verdict, GateVerdict::Refuse(_)))
+            .map(|(gate, _)| gate.r.clone().unwrap_or_default())
+            .collect();
         FileJudged::Refuse {
             reason,
             shared,
             verdict: first.verification.clone(),
+            refused,
         }
     }
 
@@ -476,6 +566,7 @@ impl SoulseekDownloadService {
                         waiting_for: WaitingFor::AcoustId,
                         line: file_line(WaitingFor::AcoustId).to_string(),
                         files: vec![moved],
+                        lidarr: Vec::new(),
                         users: Vec::new(),
                     })
                 }
@@ -494,6 +585,7 @@ impl SoulseekDownloadService {
                 waiting_for: WaitingFor::AcoustId,
                 line: ACOUST_ID_BUSY.to_string(),
                 files: Vec::new(),
+                lidarr: Vec::new(),
                 users: Vec::new(),
             });
         }
@@ -509,14 +601,23 @@ impl SoulseekDownloadService {
                 reason: verdict.deny_reason.clone(),
                 shared: true,
                 verdict,
+                refused: Vec::new(),
             };
         }
 
+        let gates_r = || {
+            download
+                .gates
+                .iter()
+                .map(|gate| gate.r.clone().unwrap_or_default())
+                .collect()
+        };
         if self.import_refuses(base, download, path, &mut verdict, labels) {
             return FileJudged::Refuse {
                 reason: "is another recording by AcoustID's reading".to_string(),
                 shared: false,
                 verdict,
+                refused: gates_r(),
             };
         }
         if let Some(why) = self.denied_by_sound(base, download, &verdict) {
@@ -524,6 +625,7 @@ impl SoulseekDownloadService {
                 reason: why.to_string(),
                 shared: false,
                 verdict,
+                refused: gates_r(),
             };
         }
 
@@ -539,6 +641,7 @@ impl SoulseekDownloadService {
                 },
                 reason,
                 shared: true,
+                refused: Vec::new(),
             },
         }
     }
@@ -663,23 +766,20 @@ impl SoulseekDownloadService {
             })
     }
 
-    /// Remembers a peer's file one heart's or play's gate refused, for that gate's song and R only.
+    /// Remembers a peer's file the gates of `refused` (their R) refused, for the song and each of
+    /// those R only. None remembers a file no gate refused.
     pub(crate) fn deny_for_gates(
         &self,
         download: &TrackDownload,
+        refused: &[HeardRecording],
         username: &str,
         filename: &str,
         reason: &str,
     ) {
         let song = download.song.external_id.clone().unwrap_or_default();
-        for gate in &download.gates {
-            self.rejected_peers.deny_for_heart(
-                &song,
-                &gate.r.clone().unwrap_or_default(),
-                Some(username),
-                Some(filename),
-                reason,
-            );
+        for r in refused {
+            self.rejected_peers
+                .deny_for_heart(&song, r, Some(username), Some(filename), reason);
         }
     }
 }
@@ -750,6 +850,7 @@ impl SoulseekDownloadService {
                 FileJudged::Keep(verdict) => {
                     info!("Kept the stream of video {id} that played, as it is: {remuxed}");
                     download.fetched_from = Some("YouTube".to_string());
+                    download.fetched_video = Some(id.clone());
                     verdict.apply_tags_to(&mut download.song);
                     download.song.verification = Some(Box::new(verdict));
                     return Some(Ok(remuxed));
@@ -775,6 +876,7 @@ impl SoulseekDownloadService {
                 waiting_for: WaitingFor::Shim,
                 line: KEEP_WAITS_FOR_YOUTUBE.to_string(),
                 files: Vec::new(),
+                lidarr: Vec::new(),
                 users: download.gates.iter().map(|gate| gate.user.clone()).collect(),
             }
             .into()));
@@ -784,20 +886,21 @@ impl SoulseekDownloadService {
 
     /// A person's keep of what their hold kept: the first held file still there lands as it is,
     /// nothing judged, marked "kept by you, version not proven", and printed once so a later check
-    /// can read its sound; every other held file goes. Each gate's person counts it as theirs, by
-    /// no proof. None when no held file is left.
+    /// can read its sound; every other held file goes. Only the people whose keep it is count it as
+    /// theirs, by no proof: any other gate on the download records nothing, so its own chain runs
+    /// its own step. None when no held file is left.
     pub(crate) async fn keep_held_file(
         &self,
         base: &BaseDownloadService,
         download: &mut TrackDownload,
     ) -> Option<String> {
+        download.refresh_gates();
         let held = std::mem::take(&mut download.held_files);
         let mut left = held.into_iter().filter(|file| file_exists(file));
         let file = left.next()?;
         for other in left {
             let _ = std::fs::remove_file(&other);
         }
-        self.verification.forget_held_lidarr_file(&file);
         let settings = base.current_soulseek_settings();
         let printed = self
             .verification
@@ -821,7 +924,12 @@ impl SoulseekDownloadService {
         }));
         download.song.isrc = None;
         download.song.music_brainz_recording_id = None;
-        for gate in &download.gates {
+        for gate in download.gates.iter().filter(|gate| {
+            download
+                .keep_for
+                .iter()
+                .any(|keeper| octo_core::common::dotnet::eq_ignore_case(keeper.trim(), gate.user.trim()))
+        }) {
             download
                 .ledger
                 .record(&gate.user, gate.origin, GateOutcome::Accepted);
@@ -848,6 +956,7 @@ impl SoulseekDownloadService {
         path: &str,
         identity: HeardSource,
     ) -> bool {
+        download.refresh_gates();
         let candidate = HeartCandidate {
             labels: LabelSource::TheFile,
             identity: Some(identity),

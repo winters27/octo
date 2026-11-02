@@ -1,8 +1,8 @@
 //! A held download on the dashboard: the In progress rows say when someone may keep one anyway
-//! (with an album's count of held tracks, for "Keep these anyway") or stop its wait for Lidarr,
-//! from the holds, never the row's own flag; the holder menus read who; and the admin keeps or
-//! stops for the person they pick, the same action as the apps' keepAcquisitionAnyway and
-//! stopWaitingForLidarr with `user`. Every one of these needs a Navidrome admin's own sign-in.
+//! (with an album's count of held tracks, for "Keep these anyway"), from the holds, never the
+//! row's own flag; the holder menu reads who; and the admin keeps for the person they pick, the
+//! same action as the apps' keepAcquisitionAnyway with `user`. Every one of these needs a
+//! Navidrome admin's own sign-in.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,24 +17,23 @@ use octo_core::settings::{AppSettings, SoulseekSettings, SubsonicSettings};
 use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
 
+use super::downloads::NOTHING_TO_PUT_BACK;
 use super::test_app::{Reply, app, send};
 use crate::app::{AppState, TestServices};
-use crate::controllers::subsonic::downloads::{
-    NAME_THE_PERSON, NOTHING_WAITING, NOTHING_WAITS_FOR_LIDARR, STOP_NAME_THE_PERSON,
-};
+use crate::controllers::subsonic::downloads::{NAME_THE_PERSON, NOTHING_WAITING};
 use crate::http::pipeline::App;
 use crate::services::common::album_gates::tracks_wait_line;
 use crate::services::common::soulseek_hold_store::HeldAlbumTrack;
 use crate::services::common::{HeldAcquisition, HeldKind, Holder};
-use crate::services::lidarr::{ILidarrHeartAcquisitionService, StopWaiting};
+use crate::services::lidarr::{CANNOT_SEE, ILidarrHeartAcquisitionService, UnsettledFollow};
 use crate::services::test_support::refused_address;
 
-/// Lidarr's hearts as far as Stop waiting goes: alice's and carol's kept copies of Teardrop wait
-/// for a follow until someone stops it.
+/// Lidarr's hearts as far as Put Lidarr back goes: the follows Octo cannot settle wait for the
+/// admin to put Lidarr back.
 #[derive(Default)]
 struct Waits {
-    waiting: Mutex<Vec<String>>,
-    stopped: Mutex<Vec<(String, String)>>,
+    unsettled: Mutex<Vec<UnsettledFollow>>,
+    put_back: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -63,28 +62,19 @@ impl ILidarrHeartAcquisitionService for Waits {
         Ok(false)
     }
 
-    async fn stop_waiting_for_lidarr(&self, provider: &str, external_id: &str) -> StopWaiting {
-        self.stopped
-            .lock()
-            .push((provider.to_string(), external_id.to_string()));
-        let mut waiting = self.waiting.lock();
-        if waiting.is_empty() {
-            return StopWaiting::NothingWaits;
-        }
-        waiting.clear();
-        StopWaiting::Stopped
+    fn unsettled_follows(&self) -> Vec<UnsettledFollow> {
+        self.unsettled.lock().clone()
     }
 
-    fn waits_for_lidarr(&self, provider: &str, external_id: &str) -> bool {
-        !self.stop_waiters(provider, external_id).is_empty()
-    }
-
-    fn stop_waiters(&self, provider: &str, external_id: &str) -> Vec<String> {
-        if (provider, external_id) == ("soulseek", "teardrop") {
-            self.waiting.lock().clone()
-        } else {
-            Vec::new()
+    fn put_lidarr_back(&self, follow: &str) -> bool {
+        let mut unsettled = self.unsettled.lock();
+        let before = unsettled.len();
+        unsettled.retain(|known| known.follow != follow);
+        if unsettled.len() == before {
+            return false;
         }
+        self.put_back.lock().push(follow.to_string());
+        true
     }
 }
 
@@ -99,7 +89,7 @@ impl Dashboard {
     fn new() -> Dashboard {
         let files = tempfile::tempdir().expect("a temp dir");
         let closed = format!("http://{}", refused_address());
-        let settings = AppSettings {
+        let mut settings = AppSettings {
             subsonic: SubsonicSettings {
                 url: Some(closed.clone()),
                 auto_detect_download_path: false,
@@ -112,6 +102,8 @@ impl Dashboard {
             },
             ..Default::default()
         };
+        // The status page's probes refuse at once.
+        settings.radio_sources.sonic_url = closed.clone();
         let mut state = AppState::for_tests_with(
             settings,
             TestServices {
@@ -180,6 +172,29 @@ impl Dashboard {
             .json()
     }
 
+    /// Record who asked, switched as the settings page saves it.
+    fn record_who_asked(&self, on: bool) {
+        let mut settings = (*self.state.settings.current()).clone();
+        settings.subsonic.record_requested_by = on;
+        self.state.settings.set(settings);
+    }
+}
+
+/// The labels a holder menu shows, in order.
+fn labels(menu: &Value) -> Vec<String> {
+    menu.as_array()
+        .expect("a menu")
+        .iter()
+        .map(|person| person["label"].as_str().expect("a label").to_string())
+        .collect()
+}
+
+/// The token of the `index`th person of a holder menu.
+fn token_of(menu: &Value, index: usize) -> String {
+    menu[index]["token"].as_str().expect("a token").to_string()
+}
+
+impl Dashboard {
     /// The song "help" held while AcoustID is off for alice and bob, who each heard a video of it.
     fn hold_song(&self) -> HeldAcquisition {
         let heard = |video: &str| HeardRecord {
@@ -248,10 +263,10 @@ impl Dashboard {
     }
 }
 
-/// The holder menus and both actions refuse no sign-in and the recovery code: they name people
-/// and land files in the library.
+/// The holder menu and Keep anyway refuse no sign-in and the recovery code: they name people and
+/// land files in the library.
 #[tokio::test]
-async fn the_holder_menus_and_their_actions_need_a_navidrome_admins_own_sign_in() {
+async fn the_holder_menu_and_keep_anyway_need_a_navidrome_admins_own_sign_in() {
     let dash = Dashboard::new();
     let holders = "/api/admin/acquisitions/holders?key=soulseek:help";
     assert_eq!(
@@ -263,18 +278,21 @@ async fn the_holder_menus_and_their_actions_need_a_navidrome_admins_own_sign_in(
         StatusCode::UNAUTHORIZED
     );
     for who in [None, Some("recovery")] {
-        for path in [
-            "/api/admin/acquisitions/keep",
-            "/api/admin/acquisitions/stop-waiting",
-        ] {
-            let body = json!({ "key": "soulseek:help", "user": "alice" });
-            assert_eq!(
-                dash.post(who, path, &body).await.status,
-                StatusCode::UNAUTHORIZED,
-                "{path} as {who:?}"
-            );
-        }
+        let body = json!({ "key": "soulseek:help", "user": "alice" });
+        assert_eq!(
+            dash.post(who, "/api/admin/acquisitions/keep", &body).await.status,
+            StatusCode::UNAUTHORIZED,
+            "as {who:?}"
+        );
     }
+    // Nothing on the dashboard stops a wait for Lidarr: that call is gone.
+    let body = json!({ "key": "soulseek:help", "user": "alice" });
+    assert_eq!(
+        dash.post(Some("admin"), "/api/admin/acquisitions/stop-waiting", &body)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
 }
 
 /// The rows say Keep anyway from the holds: a song held while AcoustID is off, and a hearted
@@ -311,14 +329,22 @@ async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_nam
             .all(|row| row.get("keepers").is_none() && row.get("requestedBy").is_none()),
         "the list names nobody while Record who asked is off"
     );
-
-    assert_eq!(
-        dash.holders("soulseek:help").await,
-        json!({ "key": "soulseek:help", "keepers": ["alice", "bob"], "stopWaiters": [] })
+    assert!(
+        rows.values().all(|row| row.get("stopWaiting").is_none()),
+        "no row offers to stop waiting for Lidarr"
     );
+
+    // Record who asked is off: the menu names nobody, each person a numbered listener with a token.
+    let menu = dash.holders("soulseek:help").await;
+    assert_eq!(menu["key"], "soulseek:help");
+    assert_eq!(labels(&menu["keepers"]), ["Listener 1", "Listener 2"]);
+    assert!(menu.get("stopWaiters").is_none(), "keepers is the one menu");
+    let text = menu.to_string();
+    assert!(!text.contains("alice") && !text.contains("bob"), "{text}");
+    assert_ne!(token_of(&menu["keepers"], 0), token_of(&menu["keepers"], 1));
     assert_eq!(
-        dash.holders("soulseek:help-album").await["keepers"],
-        json!(["alice"])
+        labels(&dash.holders("soulseek:help-album").await["keepers"]),
+        ["Listener 1"]
     );
 
     let board = &dash;
@@ -333,8 +359,13 @@ async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_nam
     let stranger = keep(json!({ "key": "soulseek:help", "user": "carol" })).await;
     assert_eq!(stranger.status, StatusCode::CONFLICT);
     assert_eq!(stranger.json()["error"], NOTHING_WAITING);
+    // A token is good for its own row only.
+    let elsewhere =
+        keep(json!({ "key": "soulseek:help-album", "token": token_of(&menu["keepers"], 1) })).await;
+    assert_eq!(elsewhere.status, StatusCode::CONFLICT);
+    assert_eq!(elsewhere.json()["error"], NOTHING_WAITING);
 
-    let kept = keep(json!({ "key": "soulseek:help", "user": " bob " })).await;
+    let kept = keep(json!({ "key": "soulseek:help", "token": token_of(&menu["keepers"], 1) })).await;
     assert_eq!(kept.status, StatusCode::OK, "{}", kept.text());
     assert_eq!(kept.json(), json!({ "status": "ok" }));
     let saved = dash
@@ -343,12 +374,32 @@ async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_nam
         .get(&song.key())
         .expect("held while it is carried out");
     assert_eq!(saved.keep_requested, ["bob"], "saved before the answer");
-    assert_eq!(dash.holders("soulseek:help").await["keepers"], json!(["alice"]));
-    let again = keep(json!({ "key": "soulseek:help", "user": "bob" })).await;
+    assert_eq!(
+        labels(&dash.holders("soulseek:help").await["keepers"]),
+        ["Listener 1"]
+    );
+    let again = keep(json!({ "key": "soulseek:help", "user": " bob " })).await;
     assert_eq!(again.status, StatusCode::CONFLICT, "bob asked already");
+
+    // With Record who asked on, the menu names each person.
+    dash.record_who_asked(true);
+    assert_eq!(labels(&dash.holders("soulseek:help").await["keepers"]), ["alice"]);
+
+    // A held track's download log offers what its holds offer now.
+    let log_row = || async {
+        dash.get("admin", "/api/admin/downloads/log?key=soulseek:night")
+            .await
+            .json()["row"]
+            .clone()
+    };
+    assert_eq!(log_row().await["keepAnyway"], true);
 
     let album = keep(json!({ "key": "soulseek:help-album", "user": "alice" })).await;
     assert_eq!(album.status, StatusCode::OK, "{}", album.text());
+    assert!(
+        log_row().await.get("keepAnyway").is_none(),
+        "the keep is asked, so the log's row offers it no more"
+    );
     assert_eq!(
         dash.state
             .soulseek_holds
@@ -365,68 +416,110 @@ async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_nam
     );
 }
 
-/// A row whose song's kept copies wait for Lidarr says so, and its menu lists whose; stopping for
-/// someone who kept nothing, or for nobody, stops nothing; stopping for alice ends the wait
-/// through the same call the apps use, and the row offers it no more.
+/// A song whose kept copy plays from where it waits for Lidarr's download of its artist is done as
+/// far as its own download goes, yet still waits: its row says `waitsAside` in the list and in its
+/// log, so In progress keeps showing its line; once the copy no longer waits, the row says it no
+/// more, and a row that never waited aside never says it.
 #[tokio::test]
-async fn the_dashboard_stops_waiting_for_lidarr_for_the_person_it_names() {
+async fn a_row_whose_copy_waits_for_lidarr_says_it_waits_aside() {
+    use crate::services::lidarr::HELD_FOR_LIDARR;
+
     let dash = Dashboard::new();
-    *dash.waits.waiting.lock() = vec!["alice".into(), "carol".into()];
-    for user in ["alice", "bob"] {
-        dash.state.acquisition_tracker.begin(
-            "soulseek",
-            "teardrop",
-            None,
-            Some(user),
-            Some("Massive Attack"),
-            Some("Teardrop"),
-            Some("Mezzanine"),
-        );
-    }
-    dash.state.acquisition_tracker.begin(
+    let tracker = &dash.state.acquisition_tracker;
+    tracker.begin(
         "soulseek",
         "angel",
         None,
         Some("alice"),
         Some("Massive Attack"),
         Some("Angel"),
-        None,
+        Some("Mezzanine"),
     );
+    // Teardrop's own download is over; its kept copy waits for Lidarr.
+    tracker.wait_aside("soulseek", "teardrop", &["alice".to_string()], HELD_FOR_LIDARR);
 
     let rows = dash.rows().await;
-    assert_eq!(rows["soulseek:teardrop"]["stopWaiting"], true);
-    assert!(rows["soulseek:angel"].get("stopWaiting").is_none());
-    assert_eq!(
-        dash.holders("soulseek:teardrop").await,
-        json!({ "key": "soulseek:teardrop", "keepers": [], "stopWaiters": ["alice", "carol"] })
-    );
-
-    let board = &dash;
-    let stop = |body: Value| async move {
-        board
-            .post(Some("admin"), "/api/admin/acquisitions/stop-waiting", &body)
-            .await
-    };
-    let unnamed = stop(json!({ "key": "soulseek:teardrop" })).await;
-    assert_eq!(unnamed.status, StatusCode::BAD_REQUEST);
-    assert_eq!(unnamed.json()["error"], STOP_NAME_THE_PERSON);
-    let bob = stop(json!({ "key": "soulseek:teardrop", "user": "bob" })).await;
-    assert_eq!(bob.status, StatusCode::CONFLICT);
-    assert_eq!(bob.json()["error"], NOTHING_WAITS_FOR_LIDARR);
-    assert!(dash.waits.stopped.lock().is_empty(), "nothing stopped for bob");
-
-    let stopped = stop(json!({ "key": "soulseek:teardrop", "user": "Alice" })).await;
-    assert_eq!(stopped.status, StatusCode::OK, "{}", stopped.text());
-    assert_eq!(stopped.json(), json!({ "status": "ok" }));
-    assert_eq!(
-        *dash.waits.stopped.lock(),
-        [("soulseek".to_string(), "teardrop".to_string())]
-    );
+    assert_eq!(rows["soulseek:teardrop"]["state"], "done");
+    assert_eq!(rows["soulseek:teardrop"]["waitsAside"], true);
+    assert_eq!(rows["soulseek:teardrop"]["note"], HELD_FOR_LIDARR);
     assert!(
-        dash.rows().await["soulseek:teardrop"]
-            .get("stopWaiting")
-            .is_none()
+        rows["soulseek:angel"].get("waitsAside").is_none(),
+        "written only when it waits"
     );
-    let again = stop(json!({ "key": "soulseek:teardrop", "user": "carol" })).await;
-    assert_eq!(again.status, StatusCode::CONFLICT, "nothing waits for anyone now");
+    let log_row = dash
+        .get("admin", "/api/admin/downloads/log?key=soulseek:teardrop")
+        .await
+        .json()["row"]
+        .clone();
+    assert_eq!(log_row["waitsAside"], true);
+
+    tracker.end_aside("soulseek", "teardrop", None);
+    assert!(
+        dash.rows().await["soulseek:teardrop"].get("waitsAside").is_none(),
+        "the copy no longer waits"
+    );
+}
+
+/// A follow Octo cannot settle is on Lidarr's card for the admin (never in the signed-out status),
+/// with its line and the album "Put Lidarr back" names. Putting it back needs a Navidrome admin's
+/// own sign-in and the follow named; a follow Octo can settle by itself is a conflict and nothing
+/// changes; the one listed is put back, and the card lists it no more.
+#[tokio::test]
+async fn lidarrs_card_lists_a_follow_octo_cannot_settle_and_the_admin_puts_lidarr_back() {
+    let dash = Dashboard::new();
+    *dash.waits.unsettled.lock() = vec![UnsettledFollow {
+        follow: "rg-mezzanine".into(),
+        artist: "Massive Attack".into(),
+        album: "Mezzanine".into(),
+    }];
+
+    let status = dash.get("admin", "/api/admin/status").await.json();
+    assert_eq!(
+        status["services"]["lidarr"]["follows"],
+        json!([{
+            "follow": "rg-mezzanine",
+            "artist": "Massive Attack",
+            "album": "Mezzanine",
+            "text": CANNOT_SEE,
+        }])
+    );
+    let signed_out = send(&dash.app, Method::GET, "/api/admin/status", &[], None)
+        .await
+        .json();
+    assert!(
+        signed_out["services"]["lidarr"].get("follows").is_none(),
+        "{signed_out}"
+    );
+
+    let path = "/api/admin/lidarr/put-back";
+    let follow = json!({ "follow": "rg-mezzanine" });
+    for who in [None, Some("recovery")] {
+        assert_eq!(
+            dash.post(who, path, &follow).await.status,
+            StatusCode::UNAUTHORIZED,
+            "as {who:?}"
+        );
+    }
+    let unnamed = dash.post(Some("admin"), path, &json!({})).await;
+    assert_eq!(unnamed.status, StatusCode::BAD_REQUEST);
+    let settled = dash
+        .post(Some("admin"), path, &json!({ "follow": "rg-protection" }))
+        .await;
+    assert_eq!(settled.status, StatusCode::CONFLICT);
+    assert_eq!(settled.json()["error"], NOTHING_TO_PUT_BACK);
+    assert!(dash.waits.put_back.lock().is_empty(), "nothing is put back");
+
+    let done = dash
+        .post(Some("admin"), path, &json!({ "follow": " rg-mezzanine " }))
+        .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.text());
+    assert_eq!(done.json(), json!({ "status": "ok" }));
+    assert_eq!(*dash.waits.put_back.lock(), ["rg-mezzanine"]);
+    let status = dash.get("admin", "/api/admin/status").await.json();
+    assert!(
+        status["services"]["lidarr"].get("follows").is_none(),
+        "the card lists it no more"
+    );
+    let again = dash.post(Some("admin"), path, &follow).await;
+    assert_eq!(again.status, StatusCode::CONFLICT);
 }

@@ -166,8 +166,10 @@ impl CatalogClip {
                 .await;
             // The clip's audio goes as soon as it is printed.
             drop(file);
+            // fpcalc failing here says nothing of the clip: the heart holds, and the check runs
+            // again on Octo's next start or the next play or heart of the song.
             let Some(items) = printed else {
-                return ClipReading::NoClip;
+                return ClipReading::Unprinted;
             };
             prints.clip = Some(items);
         }
@@ -322,11 +324,13 @@ impl CatalogClip {
             }
         }
         match self.samples.whole_song_print(heard).await {
-            WholePrint::Ready(items) => {
+            WholePrint::Ready(items, _) => {
                 prints.whole_heard = Some(items.clone());
                 Ok((items, true))
             }
             WholePrint::Busy => Err(ClipReading::Busy(WaitingFor::Shim)),
+            // fpcalc could not print the heard audio: the check runs again later, as for a clip.
+            WholePrint::NotPrinted => Err(ClipReading::Unprinted),
             // The heard audio is gone: what is stored is all there is, and it cannot say
             // another song.
             WholePrint::Gone => match stored {
@@ -337,14 +341,22 @@ impl CatalogClip {
     }
 
     /// "This song" holds only when the heard video's channel, without " - Topic", names the
-    /// song's artist: a cover or karaoke upload can sound like the song. Audio that is no video's
-    /// (a copy, a library file) has no channel to read.
+    /// song's artist: a cover or karaoke upload can sound like the song. A library or acquired
+    /// file has no channel to read and needs none. A copy fetched ahead is read by the channel of
+    /// the YouTube video it was made from; one from any other source (a peer's upload can be a
+    /// cover too) is unclear. A shim that does not answer, or one too old to answer fresh, holds
+    /// for the shim; a video gone or refused is unclear.
     async fn channel_guard(&self, routing: &SoulseekRouting, heard: &HeardRecord) -> ClipReading {
-        let HeardSource::Video { id, .. } = &heard.source else {
-            return ClipReading::ThisSong;
+        let id = match &heard.source {
+            HeardSource::Video { id, .. } => id.clone(),
+            HeardSource::Library { .. } | HeardSource::Acquired { .. } => return ClipReading::ThisSong,
+            copy @ HeardSource::Copy { .. } => match self.samples.copy_video(copy) {
+                Some(id) => id,
+                None => return ClipReading::Unclear,
+            },
         };
         let artist = routing.artist.clone().unwrap_or_default();
-        match self.youtube.facts_fresh(id).await {
+        match self.youtube.facts_fresh(&id).await {
             Lookup::Found(facts) => match facts.channel {
                 Some(channel) if clip_check::channel_names_artist(&channel, &artist) => ClipReading::ThisSong,
                 Some(channel) => {
@@ -353,8 +365,10 @@ impl CatalogClip {
                 }
                 None => ClipReading::Unclear,
             },
-            Lookup::Failed(Failure::Busy | Failure::Unreachable) => ClipReading::Busy(WaitingFor::Shim),
-            Lookup::Failed(_) | Lookup::None => ClipReading::Unclear,
+            Lookup::Failed(Failure::Busy | Failure::Unreachable | Failure::Other) => {
+                ClipReading::Busy(WaitingFor::Shim)
+            }
+            Lookup::Failed(Failure::Gone | Failure::Refused) | Lookup::None => ClipReading::Unclear,
         }
     }
 }

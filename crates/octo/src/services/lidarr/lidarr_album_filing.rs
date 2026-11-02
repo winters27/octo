@@ -26,6 +26,7 @@ use tracing::{info, warn};
 use super::{AlbumJob, Inner, lane_for, song_entry_key};
 use crate::services::common::album_gates::{AlbumGate, AlbumGateTrack, TrackFiling, tracks_wait_line};
 use crate::services::common::heart_acquisition_coordinator::waiting_line;
+use crate::services::common::soulseek_hold_store::HeldLidarrFile;
 use crate::services::common::{AcquisitionHeld, HeldAcquisition, HeldKind};
 use crate::services::fingerprint::download_verification_service::LabelSource;
 use crate::services::fingerprint::music_brainz_client::{HeartBusy, HeartQuestions};
@@ -368,9 +369,9 @@ impl Inner {
     }
 
     /// A file of an album heart's import that waits for proof of the track it was filed as: moved
-    /// into the one hold path (its Lidarr record deleted), noted with where its labels were read
-    /// from, and handed to each person whose heart gate lists the track, as that heart's held
-    /// album track.
+    /// into the one hold path (its Lidarr record deleted), and handed with where its labels were
+    /// read from to each person whose heart gate lists the track, as that heart's held album
+    /// track.
     #[allow(clippy::too_many_arguments)] // the file, the album's hearts and gates, and the track
     async fn hold_album_track(
         &self,
@@ -416,14 +417,12 @@ impl Inner {
         )
         .await;
         let held_path = held_path.to_string_lossy().into_owned();
-        if let Some(gates) = &self.gates {
-            gates.held_from_lidarr(std::slice::from_ref(&held_path), labels);
-        }
         let users: Vec<String> = albums.iter().map(|album| album.gate.user.clone()).collect();
         let held = AcquisitionHeld {
             waiting_for,
             line: held_line(waiting_for),
             files: vec![held_path.clone()],
+            lidarr: vec![HeldLidarrFile::of(&held_path, labels)],
             users: users.clone(),
         };
         let hook = self.album_holds.lock().clone();

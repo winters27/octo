@@ -314,6 +314,7 @@ fn every_change_to_the_pool_is_a_future_that_may_move_between_threads() {
         "test",
         "1",
         &[],
+        false,
     ));
     movable(FamilyPlacement::settle(pool.as_ref(), path, &[], false, None));
 }

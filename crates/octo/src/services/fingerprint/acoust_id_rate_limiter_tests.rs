@@ -408,11 +408,14 @@ fn waker(woken: &Arc<Mutex<Vec<(u32, Instant)>>>, n: u32) -> Box<dyn FnOnce() + 
 }
 
 /// A held lookup is woken after an answered call on its lane, the oldest first, one per answer;
-/// a busy answer wakes none.
+/// a busy answer wakes none. The wake comes once the person gap has passed since the lane's last
+/// person call, so the woken lookup's turn is free at once and it never goes back behind the
+/// others.
 #[tokio::test(start_paused = true)]
 async fn an_answered_call_wakes_the_oldest_held_lookup() {
     let limiter = steady();
     let woken = Arc::new(Mutex::new(Vec::new()));
+    let start = Instant::now();
     let busy_turn = limiter
         .permit(KeyLane::BuiltIn, LookupClass::Heart, true)
         .await
@@ -424,16 +427,30 @@ async fn an_answered_call_wakes_the_oldest_held_lookup() {
     busy_turn.end(CallEnd::Busy(BusyKind::Outage));
     assert!(woken.lock().is_empty(), "a busy answer wakes nothing at once");
 
-    // The person pace is backed off now, so the next answered call here is bulk work's, whose own
-    // pace is free.
-    let start = Instant::now();
+    // The person pace is backed off to 4 s now, so the next answered call here is bulk work's,
+    // whose own pace is free.
     let turn = limiter
         .permit(KeyLane::BuiltIn, LookupClass::Bulk, true)
         .await
         .expect("a turn");
     assert_eq!(Instant::now(), start);
     turn.end(CallEnd::Answered);
-    assert_eq!(woken.lock().iter().map(|(n, _)| *n).collect::<Vec<_>>(), [1]);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        woken.lock().is_empty(),
+        "a heart's turn is not free before the person gap: the wake waits for it"
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let woken_now = woken.lock().clone();
+    assert_eq!(woken_now, [(1, start + Duration::from_secs(4))]);
+    // The woken lookup's turn is free at once, though its pace is still backed off.
+    let at = Instant::now();
+    let again = limiter
+        .permit(KeyLane::BuiltIn, LookupClass::Heart, true)
+        .now_or_never()
+        .flatten();
+    assert!(again.is_some(), "the woken lookup is sent at once");
+    assert_eq!(Instant::now(), at);
 }
 
 /// With held lookups and nothing else sent, the lane wakes the oldest at its person gap since its

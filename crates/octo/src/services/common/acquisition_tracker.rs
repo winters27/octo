@@ -79,6 +79,8 @@ pub mod acquisition_kinds {
     pub const UPGRADE: &str = "upgrade";
     /// The one copy someone picked from Find songs.
     pub const PICK: &str = "pick";
+    /// A hearted album's own row, whatever its state: no one song, so nothing to find songs for.
+    pub const ALBUM: &str = "album";
 }
 
 pub use octo_core::models::download::acquisition_event::acquisition_event_kinds;
@@ -121,9 +123,9 @@ pub struct AcquisitionSnapshot {
     /// How many held tracks a hearted album's row holds, filled in from the holds when a person's
     /// list is read; None on every other row.
     pub held_tracks: Option<i32>,
-    /// The row's copy waits for an open Lidarr follow and the person may stop waiting for it. A
-    /// person's list sets it for them alone, when their heart kept that copy.
-    pub stop_waiting: bool,
+    /// The row's copy plays from where it waits aside for Lidarr's download of its artist: it is
+    /// still waiting, whatever its state says.
+    pub waits_aside: bool,
 }
 
 /// How a row ended. `library_id` is set only for a song Navidrome showed; `album_keys` are
@@ -517,6 +519,38 @@ impl AcquisitionTracker {
         note: &str,
         keep_anyway: bool,
     ) {
+        self.hold_row_of(provider, external_id, owners, note, keep_anyway, None);
+    }
+
+    /// [`Self::hold_row`] for a hearted album's own row, which says it is an album's
+    /// ([`acquisition_kinds::ALBUM`]) from then on, in every state it reaches.
+    pub fn hold_album_row(
+        &self,
+        provider: &str,
+        album_id: &str,
+        owners: &[String],
+        note: &str,
+        keep_anyway: bool,
+    ) {
+        self.hold_row_of(
+            provider,
+            album_id,
+            owners,
+            note,
+            keep_anyway,
+            Some(acquisition_kinds::ALBUM),
+        );
+    }
+
+    fn hold_row_of(
+        &self,
+        provider: &str,
+        external_id: &str,
+        owners: &[String],
+        note: &str,
+        keep_anyway: bool,
+        kind: Option<&str>,
+    ) {
         if blank(provider) || blank(external_id) {
             return;
         }
@@ -527,6 +561,9 @@ impl AcquisitionTracker {
             .get(&key_of(provider, external_id))
             .is_none_or(Entry::finished);
         let entry = open(&mut state, provider, external_id, true, now);
+        if let Some(kind) = kind {
+            entry.kind = kind.to_string();
+        }
         union_owners(&mut entry.owners, owners);
         entry.state = AcquisitionState::Searching;
         entry.progress = None;
@@ -571,6 +608,27 @@ impl AcquisitionTracker {
         if let Some(entry) = state.entries.get_mut(&key_of(provider, external_id)) {
             entry.held = false;
             entry.keep_anyway = false;
+        }
+    }
+
+    /// `user` took back their heart of an acquisition nothing holds or fetches any more: they
+    /// leave its row, which goes once nobody is left on it. A row still held for someone, or one
+    /// that finished, stays as it is.
+    pub fn leave_row(&self, provider: &str, external_id: &str, user: &str) {
+        if blank(provider) || blank(external_id) || blank(user) {
+            return;
+        }
+        let key = key_of(provider, external_id);
+        let mut state = self.state.lock();
+        let Some(entry) = state.entries.get_mut(&key) else {
+            return;
+        };
+        if entry.held || entry.finished() {
+            return;
+        }
+        entry.owners.retain(|owner| !eq_ignore_case(owner, user.trim()));
+        if entry.owners.is_empty() {
+            state.entries.remove(&key);
         }
     }
 
@@ -1033,6 +1091,36 @@ impl AcquisitionTracker {
             end_of(&state, &key)
         };
         self.raise(ended);
+    }
+
+    /// A heart that ended with nothing says `why` on its row: a row left looking for a source
+    /// fails with it, and a row that already failed says `why` instead of what it failed with. A
+    /// row with a file on its way, or one that landed, keeps its line.
+    pub fn ended_with_nothing(&self, provider: &str, external_id: &str, why: &str) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let key = key_of(provider, external_id);
+        let looking = {
+            let now = self.now();
+            let mut state = self.state.lock();
+            let Some(entry) = state.entries.get_mut(&key) else {
+                return;
+            };
+            match entry.state {
+                AcquisitionState::Failed => {
+                    entry.error = Some(why.to_string());
+                    entry.updated_at = now;
+                    add(entry, now, acquisition_event_kinds::NOTE, why, None, None);
+                    false
+                }
+                AcquisitionState::Queued | AcquisitionState::Searching => !entry.finished(),
+                _ => false,
+            }
+        };
+        if looking {
+            self.fail(provider, external_id, Some(why));
+        }
     }
 
     /// Fail every track of a hearted album that is still running.
@@ -1685,7 +1773,7 @@ fn snapshot(entry: &Entry, ahead: Option<i32>, with_events: bool) -> Acquisition
         events: with_events.then(|| entry.events.clone()),
         keep_anyway: entry.held && entry.keep_anyway,
         held_tracks: None,
-        stop_waiting: false,
+        waits_aside: entry.aside,
     }
 }
 

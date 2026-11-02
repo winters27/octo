@@ -512,6 +512,7 @@ async fn a_busy_shim_holds_the_keep_with_its_line_until_its_round_keeps_it() {
                 waiting_for: WaitingFor::Shim,
                 line: KEEP_WAITS_FOR_YOUTUBE.into(),
                 files: Vec::new(),
+                lidarr: Vec::new(),
                 users: vec!["brandon".into()],
             }
             .into());
@@ -691,5 +692,139 @@ async fn a_keep_that_cannot_land_leaves_the_track_held_and_offers_the_keep_again
         KeepAnyway::Keeping,
         "asked again, it tries again"
     );
+    stop.cancel();
+}
+
+/// A keep's copies go in a folder named by a hash of the person, ignoring case: two people whose
+/// names differ only by a character a folder name cannot hold never share one, and no name shows.
+#[test]
+fn a_keeps_copies_go_in_a_folder_named_by_a_hash_of_the_person() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let held = held_file(&dir, "night");
+    let folder_of = |user: &str| {
+        let copies = copies_for(std::slice::from_ref(&held), user).expect("copied");
+        Path::new(&copies[0])
+            .parent()
+            .and_then(Path::file_name)
+            .expect("a folder")
+            .to_string_lossy()
+            .into_owned()
+    };
+    let (dotted, underscored) = (folder_of("a.b"), folder_of("a_b"));
+    assert_ne!(dotted, underscored);
+    assert!(dotted.starts_with(KEPT_FOR_PREFIX), "{dotted}");
+    assert!(!dotted.contains("a.b") && !underscored.contains("a_b"));
+    assert_eq!(folder_of(" A.B "), dotted, "the same person, whatever the case");
+}
+
+/// MusicBrainz gave up on the question a held heart waited on: the heart runs again, and once it
+/// ends with nothing (nothing landed, nothing of the song held), its row says MusicBrainz could not
+/// answer for this song.
+#[tokio::test]
+async fn a_heart_whose_question_musicbrainz_gave_up_on_ends_with_that_line() {
+    use super::super::MUSIC_BRAINZ_GAVE_UP;
+
+    let rig = memory_rig();
+    let held = rig
+        .holds
+        .hold(song_hold("yesterday", WaitingFor::MusicBrainz, &["brandon"]));
+    rig.coordinator.hold_row_for(&held);
+    let (_taken, stop) = work(&rig, |_| Err(anyhow::anyhow!("no source has it")));
+
+    rig.coordinator.resume_after_gave_up(&held.key());
+
+    until(|| {
+        rig.tracker
+            .detail("soulseek:yesterday", None)
+            .and_then(|row| row.error)
+            .as_deref()
+            == Some(MUSIC_BRAINZ_GAVE_UP)
+    })
+    .await;
+    assert!(rig.holds.records_for("Track:soulseek:yesterday").is_empty());
+    stop.cancel();
+}
+
+/// MusicBrainz gives up while a run of the held heart goes on already: the line is decided by the
+/// last pass of that run (which runs once more for the wake), never before it ends.
+#[tokio::test]
+async fn a_give_up_during_a_run_says_its_line_when_that_run_ends_with_nothing() {
+    use super::super::MUSIC_BRAINZ_GAVE_UP;
+
+    let rig = memory_rig();
+    let held = rig
+        .holds
+        .hold(song_hold("yesterday", WaitingFor::MusicBrainz, &["brandon"]));
+    rig.coordinator.hold_row_for(&held);
+    let (_taken, stop) = work(&rig, |_| Err(anyhow::anyhow!("no source has it")));
+    // A run of it goes on.
+    rig.coordinator.resuming.lock().insert(held.key());
+
+    rig.coordinator.resume_after_gave_up(&held.key());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        rig.tracker
+            .detail("soulseek:yesterday", None)
+            .and_then(|row| row.error)
+            .is_none(),
+        "nothing is said while the run goes on"
+    );
+    // The run going on ends; the wake runs it once more.
+    rig.coordinator.run_claimed(&held.key()).await;
+
+    until(|| {
+        rig.tracker
+            .detail("soulseek:yesterday", None)
+            .and_then(|row| row.error)
+            .as_deref()
+            == Some(MUSIC_BRAINZ_GAVE_UP)
+    })
+    .await;
+    stop.cancel();
+}
+
+/// "Keep these anyway" on a held track two people hold keeps it for the one who asked, alone:
+/// their own gate and their own request, from a copy of the held file, and only they leave the
+/// hold. The other still waits in it with the held file; when they keep it too, the held file
+/// itself lands for them and the hold ends.
+#[tokio::test]
+async fn keep_these_anyway_keeps_a_shared_held_track_for_the_caller_alone() {
+    let rig = memory_rig();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let file = held_file(&dir, "night");
+    let night = rig.holds.hold(album_track("night", &file, &["brandon", "anna"]));
+    rig.coordinator.hold_row_for(&night);
+    let (taken, stop) = work(&rig, lands);
+
+    assert_eq!(
+        rig.coordinator.keep_anyway("soulseek:help-album", "anna"),
+        KeepAnyway::Keeping
+    );
+    until(|| {
+        rig.holds
+            .get(&night.key())
+            .is_some_and(|record| users(&record) == ["brandon"])
+    })
+    .await;
+
+    let first = taken.lock()[0].clone();
+    assert_eq!(first.requested_by(), ["anna"]);
+    let gates = first.gates();
+    assert_eq!(gates.len(), 1);
+    assert_eq!(gates[0].user, "anna");
+    let handed = first.place().held_files;
+    assert_eq!(handed.len(), 1);
+    assert_ne!(handed[0], file, "a copy of the held file");
+    assert!(Path::new(&file).is_file(), "brandon's held file stays");
+
+    assert_eq!(
+        rig.coordinator.keep_anyway("soulseek:help-album", "brandon"),
+        KeepAnyway::Keeping
+    );
+    until(|| rig.holds.get(&night.key()).is_none()).await;
+    let second = taken.lock()[1].clone();
+    assert_eq!(second.requested_by(), ["brandon"]);
+    assert_eq!(second.gates()[0].user, "brandon");
+    assert_eq!(second.place().held_files, [file]);
     stop.cancel();
 }

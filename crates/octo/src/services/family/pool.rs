@@ -346,8 +346,10 @@ pub trait FamilyPlacement: Send + Sync {
     /// owner's copy is fetched as usual: the pool is never the owner's copy.
     async fn for_owner(&self, path: &str) -> Option<String>;
     /// Records a file just placed in the pool and links it for `members`. A copy of the same
-    /// song already in the pool that this one betters is replaced for everyone. Answers the
-    /// first member's link.
+    /// song already in the pool that this one betters is replaced for everyone, unless the file
+    /// is `personal` (judged by its own people's checks): then it replaces that copy only for
+    /// those of `members` who have it, and everyone else keeps theirs. Answers the first
+    /// member's link.
     async fn placed(
         &self,
         path: &str,
@@ -355,6 +357,7 @@ pub trait FamilyPlacement: Send + Sync {
         provider: &str,
         external_id: &str,
         members: &[String],
+        personal: bool,
     ) -> Option<String>;
     /// Links a finished download for every member who asked, and moves it into the shared
     /// library when someone wants it there. A download that is in a shared library already
@@ -1400,22 +1403,30 @@ impl FamilyPool {
         let (old_path, new_path) = (old_path.to_string(), new_path.to_string());
         self.whole(Vec::new(), move |pool| async move {
             let _claim = pool.claims.claim(&[&old_path, &new_path]).await;
-            pool.repoint_claimed(&old_path, &new_path).await
+            pool.repoint_claimed(&old_path, &new_path, None).await
         })
         .await
     }
 
-    /// [`Self::repoint`] for a change that holds both files' claims already.
-    async fn repoint_claimed(&self, old_path: &str, new_path: &str) -> Vec<String> {
+    /// [`Self::repoint`] for a change that holds both files' claims already. With `only`, just
+    /// those of them who have the old copy move, and the old copy stays as it is while anyone
+    /// else still has it.
+    async fn repoint_claimed(&self, old_path: &str, new_path: &str, only: Option<&[String]>) -> Vec<String> {
         if old_path == new_path {
             return Vec::new();
         }
         let Some(old) = self.store.get(old_path) else {
             return Vec::new();
         };
+        let moving: Vec<String> = old
+            .refs
+            .iter()
+            .filter(|user| only.is_none_or(|only| only.iter().any(|member| eq_ignore_case(member, user))))
+            .cloned()
+            .collect();
         let mut remaps = Vec::new();
         let mut moved = Vec::new();
-        for before in self.stars_before(old_path, &old.refs).await {
+        for before in self.stars_before(old_path, &moving).await {
             let Some(new_link) = self.link_path(new_path, &before.user) else {
                 continue;
             };
@@ -1441,6 +1452,14 @@ impl FamilyPool {
                     before.user
                 ),
             }
+        }
+        if only.is_some() && self.store.get(old_path).is_some_and(|file| !file.refs.is_empty()) {
+            info!(
+                "FAMILY {} moved from {old_path} to the better copy {new_path}; everyone else keeps {old_path}",
+                moved.join(", ")
+            );
+            self.carry_over(remaps);
+            return moved;
         }
         // Whoever bettered the copy is recorded too, so the store follows the outside ids.
         {
@@ -2081,6 +2100,7 @@ impl FamilyPlacement for FamilyPool {
         provider: &str,
         external_id: &str,
         members: &[String],
+        personal: bool,
     ) -> Option<String> {
         let (path, song, provider, external_id, members) = (
             path.to_string(),
@@ -2090,7 +2110,7 @@ impl FamilyPlacement for FamilyPool {
             members.to_vec(),
         );
         self.whole(None, move |pool| async move {
-            pool.placed_now(&path, &song, &provider, &external_id, &members)
+            pool.placed_now(&path, &song, &provider, &external_id, &members, personal)
                 .await
         })
         .await
@@ -2129,6 +2149,7 @@ impl FamilyPool {
         provider: &str,
         external_id: &str,
         members: &[String],
+        personal: bool,
     ) -> Option<String> {
         // Each new pool file is a moment to let go of any that went missing by hand.
         self.sweep_dangling_now().await;
@@ -2175,7 +2196,9 @@ impl FamilyPool {
             }
         }
         if let Some(older) = bettered {
-            self.repoint_claimed(&older.path, path).await;
+            // A personal file is proven only for its own people: anyone else keeps their copy.
+            let only = personal.then_some(members);
+            self.repoint_claimed(&older.path, path, only).await;
         }
         first
     }

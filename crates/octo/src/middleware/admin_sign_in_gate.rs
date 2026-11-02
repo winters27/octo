@@ -99,12 +99,13 @@ pub const LIBRARY_FILE_ROUTES: &[(&str, bool, &str)] = &[
         true,
         "Sign in with your Navidrome account first.",
     ),
-    // Downloads: a song's log, a held download's people, Keep anyway and Stop waiting for Lidarr
-    // (which land files), Find songs and its picks, the trash and Put back.
+    // Downloads: a song's log, a held download's people, Keep anyway (which lands files), Find
+    // songs and its picks, the trash and Put back.
     ("/api/admin/downloads/log", false, SIGN_IN_FIRST),
     ("/api/admin/acquisitions/holders", false, SIGN_IN_FIRST),
     ("/api/admin/acquisitions/keep", false, SIGN_IN_FIRST),
-    ("/api/admin/acquisitions/stop-waiting", false, SIGN_IN_FIRST),
+    // Put Lidarr back (places held copies, deletes Octo's own files and adds from Lidarr).
+    ("/api/admin/lidarr/put-back", false, SIGN_IN_FIRST),
     ("/api/admin/find", true, SIGN_IN_FIRST),
     ("/api/admin/trash", true, SIGN_IN_FIRST),
     // Library health and its fixes (tags written in place, songs removed).
@@ -392,7 +393,7 @@ mod tests {
 
     #[test]
     fn library_file_routes_match_exactly_or_below_a_prefix() {
-        let cases: [(&str, Option<&str>); 15] = [
+        let cases: [(&str, Option<&str>); 16] = [
             ("/api/admin/browse", Some("Browse session required.")),
             ("/api/admin/browse/session", None),
             ("/api/admin/browse/signout", None),
@@ -406,7 +407,8 @@ mod tests {
             ("/api/admin/downloads/log", Some(SIGN_IN_FIRST)),
             ("/api/admin/acquisitions", None),
             ("/api/admin/acquisitions/keep", Some(SIGN_IN_FIRST)),
-            ("/api/admin/acquisitions/stop-waiting", Some(SIGN_IN_FIRST)),
+            ("/api/admin/lidarr/put-back", Some(SIGN_IN_FIRST)),
+            ("/api/admin/lidarr/test", None),
             ("/api/admin/genre/presets", None),
             ("/api/admin/genre/backfill/undo", Some(SIGN_IN_FIRST)),
             ("/api/admin/lyricsx", None),

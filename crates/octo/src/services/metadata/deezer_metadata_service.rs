@@ -190,6 +190,13 @@ struct Inner {
     in_flight_calls: InFlight<DeezerResponse>,
     /// The chart and artist top lists on their way (`deezer_charts.rs`).
     in_flight_charts: InFlight<Option<Arc<Vec<octo_core::charts::top_songs::CatalogTrack>>>>,
+
+    /// A call did not answer since the last one that did.
+    unanswered: std::sync::atomic::AtomicBool,
+    /// How many times a call answered after one that did not.
+    answered_again: std::sync::atomic::AtomicU64,
+    /// Runs on the first answered call after one that did not: what waits for Deezer asks again.
+    on_answered: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Flow out of a block that can return early.
@@ -223,7 +230,42 @@ impl DeezerMetadataService {
                 in_flight_albums: InFlight::new(),
                 in_flight_calls: InFlight::new(),
                 in_flight_charts: InFlight::new(),
+                unanswered: std::sync::atomic::AtomicBool::new(false),
+                answered_again: std::sync::atomic::AtomicU64::new(0),
+                on_answered: parking_lot::Mutex::new(None),
             }),
+        }
+    }
+
+    /// Runs `answered` on the first call Deezer answers after one it did not (a `transient`
+    /// answer, a 429, a 5xx, a network error): the held hearts that wait for Deezer ask again then.
+    pub fn on_answered_again(&self, answered: Arc<dyn Fn() + Send + Sync>) {
+        *self.inner.on_answered.lock() = Some(answered);
+    }
+
+    /// Whether Deezer's last call answered: how many times a call answered after one that did not,
+    /// or None while the last call went unanswered. A hold filed for Deezer reads it to know
+    /// whether the answer that wakes it already came.
+    pub fn answering(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        (!self.inner.unanswered.load(Ordering::SeqCst))
+            .then(|| self.inner.answered_again.load(Ordering::SeqCst))
+    }
+
+    /// Notes how one call went: a call that did not answer is remembered, and the first answer
+    /// after one runs the hook.
+    fn note_answer(&self, transient: bool) {
+        use std::sync::atomic::Ordering;
+        if transient {
+            self.inner.unanswered.store(true, Ordering::SeqCst);
+            return;
+        }
+        if self.inner.unanswered.swap(false, Ordering::SeqCst) {
+            self.inner.answered_again.fetch_add(1, Ordering::SeqCst);
+            let answered = self.inner.on_answered.lock().clone();
+            if let Some(answered) = answered {
+                answered();
+            }
         }
     }
 
@@ -1636,6 +1678,12 @@ impl DeezerMetadataService {
     }
 
     async fn fetch_json(&self, url: &str, background: bool, after_permit: bool) -> DeezerResponse {
+        let response = self.fetch_json_once(url, background, after_permit).await;
+        self.note_answer(response.transient);
+        response
+    }
+
+    async fn fetch_json_once(&self, url: &str, background: bool, after_permit: bool) -> DeezerResponse {
         // Genre names in album payloads localize to the caller's IP country
         // unless this header pins them. Read per request, so a settings
         // change reaches the next lookup without a restart.

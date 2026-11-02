@@ -150,6 +150,10 @@ struct Pacing {
     last_woken: Option<Instant>,
     /// A task is waking held lookups while the lane is idle.
     waking: bool,
+    /// Held lookups answered calls have earned a wake for, each woken once its call can go.
+    owed: usize,
+    /// A task is waking the held lookups answered calls earned.
+    paying: bool,
 }
 
 /// One lane: its pacing, and for the user's lane the 3-a-second budget it keeps.
@@ -265,28 +269,76 @@ impl Lanes {
     fn end(self: &Arc<Self>, kind: KeyLane, class: LookupClass, end: Option<CallEnd>) {
         let lane = self.lane(kind);
         let jitter = (self.jitter)();
-        let woken = {
+        let earned = {
             let mut pacing = lane.pacing.lock();
             pacing.in_flight = pacing.in_flight.saturating_sub(1);
             if let Some(end) = end {
                 let pace = lane.pace(class);
                 pacing.gaps[pace].end(end, jitter);
             }
-            if end == Some(CallEnd::Answered) {
-                let woken = pacing.held.pop_front();
-                if woken.is_some() {
-                    pacing.last_woken = Some(Instant::now());
-                }
-                woken
-            } else {
-                None
+            // An answer earns the oldest held lookup a wake, paid once its call can go at once:
+            // woken before the person gap has passed, its call would be turned away and it would
+            // be held again behind the others.
+            let earned = end == Some(CallEnd::Answered) && pacing.owed < pacing.held.len();
+            if earned {
+                pacing.owed += 1;
             }
+            earned
         };
         lane.changed.notify_waiters();
-        if let Some(wake) = woken {
-            wake();
+        if earned {
+            self.pay_wakes(kind);
         }
         self.wake_when_idle(kind);
+    }
+
+    /// Wakes the held lookups answers earned, oldest first, each once the lane's person gap has
+    /// passed since its last call and its last wake.
+    fn pay_wakes(self: &Arc<Self>, kind: KeyLane) {
+        {
+            let mut pacing = self.lane(kind).pacing.lock();
+            if pacing.paying || pacing.owed == 0 {
+                return;
+            }
+            pacing.paying = true;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.lane(kind).pacing.lock().paying = false;
+            return;
+        };
+        let lanes = Arc::clone(self);
+        runtime.spawn(async move {
+            loop {
+                let woken = {
+                    let mut pacing = lanes.lane(kind).pacing.lock();
+                    if pacing.held.is_empty() {
+                        pacing.owed = 0;
+                    }
+                    if pacing.owed == 0 {
+                        pacing.paying = false;
+                        return;
+                    }
+                    let gap = pacing.gaps[0].current;
+                    let since = pacing.last_sent[0].max(pacing.last_woken);
+                    match since.map(|at| at + gap) {
+                        Some(due) if Instant::now() < due => Err(due),
+                        _ => {
+                            pacing.owed -= 1;
+                            pacing.last_woken = Some(Instant::now());
+                            Ok(pacing.held.pop_front())
+                        }
+                    }
+                };
+                match woken {
+                    Err(due) => tokio::time::sleep_until(due).await,
+                    Ok(wake) => {
+                        if let Some(wake) = wake {
+                            wake();
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Holds a lookup until the lane answers a call, or, while nothing else is sent, until the
@@ -398,6 +450,8 @@ impl AcoustIdRateLimiter {
                 held: VecDeque::new(),
                 last_woken: None,
                 waking: false,
+                owed: 0,
+                paying: false,
             })
         };
         // A test's shorter floors keep the outage caps in the same proportion.

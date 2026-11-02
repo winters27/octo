@@ -1114,3 +1114,55 @@ async fn the_page_lists_who_it_can_import_for() {
     .await;
     assert_eq!(signed_out.status, StatusCode::UNAUTHORIZED);
 }
+
+/// While an import's songs are checked with Octo's own AcoustID key (the person has no key of
+/// their own), the overview carries the import card's line: a free key of their own checks them
+/// faster, and where to get one. With a key of their own it carries none.
+#[tokio::test]
+async fn the_import_card_says_a_key_of_ones_own_checks_faster_while_octos_own_checks_the_songs() {
+    use std::sync::Arc;
+
+    use crate::services::fingerprint::{AcoustIdClient, AcoustIdRateLimitHandler, AcoustIdRateLimiter};
+
+    let server = navidrome().await;
+    let mut state = AppState::for_tests_with(
+        AppSettings {
+            subsonic: SubsonicSettings {
+                url: Some(server.uri()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        TestServices::default(),
+    );
+    let settings = state.settings.clone();
+    Arc::get_mut(&mut state.inner)
+        .expect("nothing else holds a fresh test state")
+        .acoust_id = Arc::new(AcoustIdClient::with_built_in_key(
+        Arc::new(AcoustIdRateLimitHandler::new(
+            Arc::new(AcoustIdRateLimiter::new()),
+        )),
+        settings,
+        Some("octo-key"),
+    ));
+    let app = app(state.clone());
+    let token = state.browse_sessions.create("alice");
+    let auth = [("X-Octo-Browse-Token", token.as_str()), ("X-Octo-Admin", "1")];
+
+    let page = send(&app, Method::GET, "/api/admin/imports", &auth, None)
+        .await
+        .json();
+    assert_eq!(
+        page["overview"]["acoustIdKey"],
+        serde_json::json!({ "text": built_in_key_pace(), "link": ACOUST_ID_NEW_KEY })
+    );
+    assert!(built_in_key_pace().contains("one every 20 seconds"));
+
+    let mut own = (*state.settings.current()).clone();
+    own.soulseek.acoust_id_api_key = "user-key".into();
+    state.settings.set(own);
+    let page = send(&app, Method::GET, "/api/admin/imports", &auth, None)
+        .await
+        .json();
+    assert!(page["overview"].get("acoustIdKey").is_none(), "{page}");
+}

@@ -775,7 +775,8 @@ pub fn believed_other_song(
 /// into one of R's is not followed here; the caller asks for it. The reading is then:
 ///
 /// - [`Reading::Another`]: R has no song name, the dominant recording is not R's song, or R holds
-///   under [`MIN_SHARE`] while the dominant recording is not R's;
+///   under [`MIN_SHARE`] while the dominant recording is not R's (never when R names no recording:
+///   a dominant recording of R's song then reads [`Reading::Ambiguous`]);
 /// - [`Reading::Clear`]: the dominant recording is R's, no recording of R's song outside R carries
 ///   an ISRC of its own, those of R's song outside R without one hold under [`MIN_SHARE`] together,
 ///   and R's recordings carry at least [`MIN_SOURCES_TO_CONFIRM`] submissions together (a lone
@@ -845,7 +846,14 @@ fn weigh(reading: &AnswerReading, r: &HeardRecording, r_weight: i64, total: i64)
     };
     let is_song = |recording: &WeighedRecording| is_same_song(&recording.song(), &song);
     let dominant_in_r = r.holds(&dominant.id);
-    if !is_song(dominant) || (!dominant_in_r && reading.r_share < MIN_SHARE) {
+    if !is_song(dominant) {
+        return Reading::Another;
+    }
+    // An R that names no recording cannot tell one recording of its song from another.
+    if r.ids.is_empty() {
+        return Reading::Ambiguous;
+    }
+    if !dominant_in_r && reading.r_share < MIN_SHARE {
         return Reading::Another;
     }
     let outside: Vec<&WeighedRecording> = reading

@@ -46,7 +46,7 @@ use octo_core::fingerprint::acoust_id_client::AcoustIdOutcome;
 use octo_core::fingerprint::compressed_print;
 use octo_core::fingerprint::heart_gate::{
     AcquisitionOrigin, HeardAnswerReading, HeardReading, HeardRecord, HeardRecording, HeardSource, HeartGate,
-    read_heard_answer,
+    heard_codes, read_heard_answer,
 };
 use octo_core::fingerprint::verification::{Reading, SongName, read_answer};
 
@@ -1388,8 +1388,8 @@ pub enum Reread {
     /// AcoustID did not answer: nothing changes until the next event.
     Busy,
     /// R stays as the heart had it: a copy is accepted by its own clear reading against R, or as
-    /// the very master the kept file is.
-    Stays { tag: Option<String> },
+    /// the very master the kept file is, then tagged `tag` with only the `codes` its sound proved.
+    Stays { tag: Option<String>, codes: Vec<String> },
     /// What played was this recording: R becomes it.
     Became { r: HeardRecording, tag: Option<String> },
     /// Nothing proves which recording the kept file is: only the very master it is can replace it.
@@ -1684,7 +1684,13 @@ impl KeptRechecks {
             HeardAnswerReading::Busy => Reread::Busy,
             HeardAnswerReading::NeedsClip => Reread::Unread,
             HeardAnswerReading::AnotherSong => Reread::AnotherSong,
-            HeardAnswerReading::RStays { tag } => Reread::Stays { tag },
+            HeardAnswerReading::RStays { tag } => {
+                let codes = match (&tag, &outcome) {
+                    (Some(id), AcoustIdOutcome::Answered(answer)) => heard_codes(answer, id),
+                    _ => Vec::new(),
+                };
+                Reread::Stays { tag, codes }
+            }
             HeardAnswerReading::Becomes(dominant) => match &outcome {
                 AcoustIdOutcome::Answered(answer) => {
                     let questions = self.questions();
@@ -1761,7 +1767,12 @@ impl KeptRechecks {
                 None => self.reread(&heart).await,
             };
             gate.reading = match read {
-                Reread::Stays { tag } => HeardReading::RStays { tag },
+                Reread::Stays { tag, codes } => {
+                    if let Some(r) = gate.r.as_mut() {
+                        r.tag_isrcs = codes;
+                    }
+                    HeardReading::RStays { tag }
+                }
                 Reread::Became { r, tag } => {
                     gate.r = Some(r);
                     HeardReading::RBecame { tag }

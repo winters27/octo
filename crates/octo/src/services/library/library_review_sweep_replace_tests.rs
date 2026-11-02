@@ -848,6 +848,7 @@ async fn an_upgrade_of_a_kept_file_that_meets_a_busy_lookup_stops_quietly_and_ho
                 waiting_for,
                 line: "Waiting for AcoustID".into(),
                 files: vec![slash_root(&held)],
+                lidarr: Vec::new(),
                 users: Vec::new(),
             }));
         let outcome = tokio::time::timeout(Duration::from_secs(10), applied)

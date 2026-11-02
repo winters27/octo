@@ -56,15 +56,68 @@ fn album_track_gate() -> HeartGate {
     }
 }
 
-/// A keep of "Started" run for `origin`, for these gates, with these held files.
+/// A keep of "Started" run for `origin`, for these gates, with these held files, kept for the people
+/// of its gates as the queue keeps it.
 fn keeping(gates: Vec<HeartGate>, held_files: Vec<String>, origin: AcquisitionOrigin) -> AcquisitionPlace {
     AcquisitionPlace {
         origin: Some(origin),
+        keep_for: gates.iter().map(|gate| gate.user.clone()).collect(),
         gates,
         held_files,
         keep_anyway: true,
         ..Default::default()
     }
+}
+
+/// A keep's file counts as kept only for the people whose keep it is: a gate of anyone else on the
+/// download records nothing, so it is never credited with a file nothing proved for it, and the
+/// library keeps it for the keeper alone.
+#[tokio::test]
+async fn a_keep_counts_as_kept_only_for_its_keeper() {
+    let root = Root::new("octo-keep-only-");
+    let library = library_in(&root);
+    let g = gated_into(&root, DownloadSource::Soulseek, "key", &library).await;
+    let held = tempfile::tempdir().expect("the hold folder");
+    let file = held.path().join("held.flac");
+    sound_flac(
+        &file,
+        180,
+        &sound_bytes("started-held", "held-master", "started-held"),
+        None,
+    );
+    let keeper = album_track_gate();
+    let other = HeartGate {
+        user: "anna".into(),
+        ..album_track_gate()
+    };
+    let ledger = GateLedger::default();
+    let place = AcquisitionPlace {
+        ledger: ledger.clone(),
+        keep_for: vec![keeper.user.clone()],
+        ..keeping(
+            vec![keeper.clone(), other.clone()],
+            vec![file.to_string_lossy().to_string()],
+            AcquisitionOrigin::AlbumHeart,
+        )
+    };
+
+    acquire_as(&g, DownloadSource::Soulseek, place)
+        .await
+        .expect("kept");
+
+    assert!(ledger.accepted(&keeper.user), "kept for its keeper");
+    assert_eq!(
+        ledger.outcome_for("anna", AcquisitionOrigin::AlbumHeart),
+        None,
+        "anna's gate records nothing: her own chain runs its own step"
+    );
+    let mapping = library
+        .get_mappings()
+        .await
+        .into_iter()
+        .find(|mapping| mapping.external_id == g.started())
+        .expect("registered");
+    assert_eq!(mapping.heart.expect("kept").users, [keeper.user]);
 }
 
 /// "Keep these anyway" lands a held track's file as it is: nothing looked up, nothing searched,

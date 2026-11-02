@@ -8,7 +8,6 @@
 //! a restart run a held heart again on their own.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use octo_core::lidarr::lidarr_heart_acquisition_service::{IndexerHealth, indexer_health};
 use parking_lot::Mutex;
@@ -23,22 +22,62 @@ pub type IndexersAwaited = Arc<dyn Fn() -> bool + Send + Sync>;
 /// Lidarr's indexers, while a heart waits for them.
 #[derive(Default)]
 pub(super) struct IndexerWatch {
-    /// A heart waits for the indexers.
-    failing: AtomicBool,
-    /// A watch reads Lidarr's health now.
-    watching: AtomicBool,
+    /// Whether a heart waits and whether a watch runs, changed together: a watch never stops
+    /// while a hold that came meanwhile has none.
+    state: Mutex<WatchState>,
     /// Something happened that may mean the indexers search again.
     nudged: Notify,
     /// Who runs the waiting hearts again, and who says whether any still waits.
     pub(super) back: Mutex<Option<(IndexersBack, Option<IndexersAwaited>)>>,
 }
 
+#[derive(Default)]
+struct WatchState {
+    /// A heart waits for the indexers.
+    failing: bool,
+    /// A watch reads Lidarr's health now.
+    watching: bool,
+    /// How many times a heart was told to wait: a watch that decided to stop goes on when this
+    /// moved since it looked.
+    told: u64,
+}
+
 impl IndexerWatch {
     /// Something happened that may mean the indexers search again: a waiting watch reads now.
     pub(super) fn nudge(&self) {
-        if self.failing.load(Ordering::SeqCst) {
+        if self.state.lock().failing {
             self.nudged.notify_one();
         }
+    }
+
+    /// A heart waits for the indexers: true when a watch must be started for it.
+    pub(super) fn hold(&self) -> bool {
+        let mut state = self.state.lock();
+        state.failing = true;
+        state.told += 1;
+        !std::mem::replace(&mut state.watching, true)
+    }
+
+    /// How many holds there were so far, for a watch about to decide.
+    pub(super) fn told(&self) -> u64 {
+        self.state.lock().told
+    }
+
+    /// The watch stops, unless a heart was told to wait since it looked (`seen`): true when it
+    /// stopped. Both are decided under one lock, so no hold is ever left without a watch.
+    pub(super) fn stop(&self, seen: u64) -> bool {
+        let mut state = self.state.lock();
+        if state.told != seen {
+            return false;
+        }
+        state.failing = false;
+        state.watching = false;
+        true
+    }
+
+    /// A watch that could not start.
+    pub(super) fn not_watching(&self) {
+        self.state.lock().watching = false;
     }
 }
 
@@ -81,25 +120,28 @@ impl Inner {
     /// A heart now waits for Lidarr's indexers: one watch reads their health until they search
     /// again, or nobody waits for them any more.
     pub(super) fn indexers_failing(self: &Arc<Self>) {
-        self.indexers.failing.store(true, Ordering::SeqCst);
-        if self.indexers.watching.swap(true, Ordering::SeqCst) {
+        if !self.indexers.hold() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            self.indexers.watching.store(false, Ordering::SeqCst);
+            self.indexers.not_watching();
             return;
         };
         runtime.spawn(self.clone().watch_indexers());
     }
 
+    /// Reads the indexers' health until nobody waits for them or they search again; then the
+    /// waiting hearts run again. A heart told to wait while the watch decided to stop keeps it
+    /// going.
     async fn watch_indexers(self: Arc<Self>) {
         loop {
+            let seen = self.indexers.told();
             let poll = self.poll(&self.settings.current().lidarr);
             let ticked = tokio::select! {
                 () = tokio::time::sleep(poll) => true,
                 () = self.indexers.nudged.notified() => false,
                 () = self.stopping.cancelled() => {
-                    self.indexers.watching.store(false, Ordering::SeqCst);
+                    self.indexers.not_watching();
                     return;
                 }
             };
@@ -117,23 +159,28 @@ impl Inner {
                 .as_ref()
                 .and_then(|(_, awaited)| awaited.clone());
             if ticked && !told && awaited.is_some_and(|awaited| !awaited()) {
-                info!("Nobody waits for Lidarr's indexers any more; Octo stops reading their health");
-                self.indexers.failing.store(false, Ordering::SeqCst);
-                self.indexers.watching.store(false, Ordering::SeqCst);
-                return;
+                if self.indexers.stop(seen) {
+                    info!("Nobody waits for Lidarr's indexers any more; Octo stops reading their health");
+                    return;
+                }
+                continue;
             }
             match self.client.health().await {
-                Ok(checks) if indexer_health(&checks) != IndexerHealth::Failing => break,
-                Ok(_) => {}
-                Err(e) => warn!("Could not read Lidarr's health: {e}"),
+                Ok(checks) if indexer_health(&checks) != IndexerHealth::Failing => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    warn!("Could not read Lidarr's health: {e}");
+                    continue;
+                }
             }
-        }
-        info!("Lidarr's indexers search again; every heart waiting for them runs again");
-        self.indexers.failing.store(false, Ordering::SeqCst);
-        self.indexers.watching.store(false, Ordering::SeqCst);
-        let back = self.indexers.back.lock().as_ref().map(|(back, _)| back.clone());
-        if let Some(back) = back {
-            back();
+            info!("Lidarr's indexers search again; every heart waiting for them runs again");
+            let back = self.indexers.back.lock().as_ref().map(|(back, _)| back.clone());
+            if let Some(back) = back {
+                back();
+            }
+            if self.indexers.stop(seen) {
+                return;
+            }
         }
     }
 
@@ -142,6 +189,10 @@ impl Inner {
     pub(super) fn lidarr_answered(&self, path: &str) {
         if !path.trim_end_matches('/').ends_with("/api/v1/health") {
             self.indexers.nudge();
+        }
+        // Lidarr answers again: a put back it failed is tried now.
+        if !self.put_backs.owed.lock().is_empty() {
+            self.put_backs.answered.notify_one();
         }
     }
 }

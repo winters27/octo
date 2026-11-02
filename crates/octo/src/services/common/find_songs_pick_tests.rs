@@ -944,6 +944,7 @@ async fn a_pick_is_held_to_its_songs_recording_and_its_row_ends_with_the_checks_
             waiting_for: WaitingFor::AcoustId,
             line: ACOUST_ID_BUSY.into(),
             files: vec![held.to_string_lossy().into_owned()],
+            lidarr: Vec::new(),
             users: Vec::new(),
         }));
     for _ in 0..200 {

@@ -24,6 +24,18 @@ use crate::services::lidarr::HeldPlacement;
 /// from.
 pub type AudioStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
+/// What became of a file a Lidarr follow held, once nothing holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeldEnd {
+    /// Placed where the layout files it, at this path.
+    Placed(String),
+    /// Lidarr's file for its song passed the gate of someone it was kept for, and it gave way to
+    /// that file instead of landing beside it.
+    GaveWay,
+    /// Neither, for now: it stays where it plays from and is tried again later.
+    Later,
+}
+
 /// Interface for the music download service (Deezspot or other)
 #[async_trait]
 pub trait IDownloadService: Send + Sync {
@@ -157,16 +169,25 @@ pub trait IDownloadService: Send + Sync {
         false
     }
 
-    /// Places a file a Lidarr follow held back from the library, now that no follow holds it:
-    /// moved where the layout files it, with the library's record moved along. Where it landed,
-    /// or None when it could not be placed (it then stays where it plays from).
-    async fn place_held(&self, _held: &HeldPlacement) -> Option<String> {
+    /// The one hold path every held file waits in, when the download path is known.
+    fn held_root(&self) -> Option<std::path::PathBuf> {
         None
     }
 
+    /// Places a file a Lidarr follow held back from the library, now that no follow that may
+    /// still import holds it: moved where the layout files it, with what was written beside it and
+    /// the library's record moved along. A kept copy whose song's Lidarr file passed the gate of
+    /// someone it was kept for (`held.proven_for`) never lands beside that file: in the shared
+    /// library it gives way to it, and in the family pool it lands only in the libraries of the
+    /// members it is still for. The default leaves it where it plays from.
+    async fn place_held(&self, _held: &HeldPlacement) -> HeldEnd {
+        HeldEnd::Later
+    }
+
     /// Drops a kept copy a Lidarr follow held back, its file and the library's record of it, once
-    /// a proven copy of its song passed the gate of everyone it was kept for (`users`). False, and
-    /// nothing changes, when the copy is anyone else's too. The default keeps it.
+    /// Lidarr's file for its song passed the gate of `users`: in the shared library when it was
+    /// kept for any of them (the library holds one file of a song), in the family pool only when
+    /// it was kept for no one else. False, and nothing changes, otherwise. The default keeps it.
     async fn drop_held(&self, _held: &HeldPlacement, _users: &[String]) -> bool {
         false
     }

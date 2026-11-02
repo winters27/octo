@@ -56,6 +56,9 @@ pub struct AheadSidecar {
     pub verification: Option<VerificationMirror>,
     /// A heart kept a copy while the song was playing: this file stays only for that play.
     pub promoted: bool,
+    /// The YouTube video it was made from, when it came from YouTube.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_id: Option<String>,
 }
 
 impl AheadSidecar {
@@ -85,6 +88,7 @@ impl AheadSidecar {
             source_file: song.source_file.clone(),
             verification: song.verification.as_deref().map(VerificationMirror::of),
             promoted: false,
+            video_id: None,
         }
     }
 }
@@ -309,6 +313,8 @@ struct Entry {
     verification: Option<Box<VerificationResult>>,
     /// The file the source delivered, as its facts name it.
     source_file: Option<String>,
+    /// The YouTube video it was made from, when it came from YouTube.
+    video_id: Option<String>,
     /// Hearts and plays holding it as what they heard: no sweep removes it meanwhile. Kept in
     /// memory; a hold takes its copies again at start.
     holders: HashSet<String>,
@@ -544,6 +550,22 @@ impl PrefetchStore {
         entry.path.is_file().then(|| entry.path.clone())
     }
 
+    /// The YouTube video the copy under `key` was made from, while it is still the copy made
+    /// ready at `ready_at` from `source_file`; None for a copy from any other source.
+    pub fn copy_video(
+        &self,
+        key: &str,
+        ready_at: Option<DateTime<Utc>>,
+        source_file: Option<&str>,
+    ) -> Option<String> {
+        let state = self.current();
+        let entry = state.entries.get(key)?;
+        if Some(entry.ready_at) != ready_at || entry.source_file.as_deref() != source_file {
+            return None;
+        }
+        entry.video_id.clone()
+    }
+
     /// Holds the copy under `key` as what `holder` heard; false when there is none.
     pub fn hold(&self, key: &str, holder: &str) -> bool {
         let mut state = self.current();
@@ -744,6 +766,7 @@ fn read_entry(path: &Path) -> Option<(String, Entry)> {
             served: None,
             verification: None,
             source_file: sidecar.source_file,
+            video_id: sidecar.video_id,
             holders: HashSet::new(),
         },
     ))

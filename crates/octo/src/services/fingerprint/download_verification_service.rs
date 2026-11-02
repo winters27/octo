@@ -30,8 +30,7 @@ use super::catalog_clip::{CatalogClip, ClipPrints};
 use super::heard_master_check::HeardMasterCheck;
 use super::music_brainz_client::{CatalogQuestions, MusicBrainzClient, MusicBrainzError};
 use super::preview_check::{self, PreviewOutcome, PreviewRequest, PreviewSource};
-use crate::services::common::soulseek_hold_store::HeldLidarrFile;
-use crate::services::common::{HeldAcquisition, SoulseekHoldStore};
+use crate::services::common::SoulseekHoldStore;
 use crate::services::prefetch::HeardSamples;
 use crate::services::prefetch::heard_samples::ResumeHold;
 use crate::services::soulseek::ExternalIdRegistry;
@@ -90,6 +89,10 @@ pub enum GateBuild {
         line: String,
         question: Option<String>,
     },
+    /// The heart ends before any source runs, with its downloads line: it was never played, no
+    /// video can stand in for it, and the catalog names no recording, so nothing could ever prove
+    /// a copy.
+    End { gate: HeartGate, line: String },
 }
 
 /// What the heart gate reads besides AcoustID: the songs and what each person heard, the heard
@@ -129,10 +132,6 @@ pub struct DownloadVerificationService {
     /// The MusicBrainz question a file's label check met busy, by song and person, until the hold
     /// it left is filed and asks it again.
     file_questions: parking_lot::Mutex<HashMap<(String, String), String>>,
-    /// The files Lidarr brought that wait in the one hold path, by held path, each with the
-    /// download as delivered its labels are read from (none when there is no such copy). The hold
-    /// that keeps one saves it, so a restart judges it by the same labels.
-    held_lidarr: parking_lot::Mutex<HashMap<String, Option<String>>>,
 }
 
 impl DownloadVerificationService {
@@ -162,67 +161,7 @@ impl DownloadVerificationService {
             resume: parking_lot::Mutex::new(None),
             clip_prints: parking_lot::Mutex::new(HashMap::new()),
             file_questions: parking_lot::Mutex::new(HashMap::new()),
-            held_lidarr: parking_lot::Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Notes files Lidarr brought that now wait in the one hold path, with where their labels
-    /// were read from at delivery: a judgment of them later reads the download as delivered when
-    /// that is where they came from, and no labels otherwise, never the held file's own tags.
-    pub fn hold_lidarr_files(&self, files: &[String], labels: &LabelSource) {
-        let delivered = match labels {
-            LabelSource::Delivered(path) => Some(path.to_string_lossy().into_owned()),
-            LabelSource::TheFile | LabelSource::None => None,
-        };
-        let mut held = self.held_lidarr.lock();
-        for file in files {
-            held.insert(file.clone(), delivered.clone());
-        }
-    }
-
-    /// Where the labels of a held file Lidarr brought are read from when it is judged again: the
-    /// download as delivered, else none. None for a held file Lidarr did not bring.
-    pub fn held_lidarr_labels(&self, path: &str) -> Option<LabelSource> {
-        let noted = self.held_lidarr.lock().get(path).cloned();
-        let delivered = match noted {
-            Some(delivered) => delivered,
-            None => {
-                self.heart
-                    .get()?
-                    .holds
-                    .snapshot()
-                    .into_iter()
-                    .flat_map(|record| record.lidarr_files)
-                    .find(|file| file.path == path)?
-                    .delivered
-            }
-        };
-        Some(match delivered {
-            Some(delivered) => LabelSource::Delivered(PathBuf::from(delivered)),
-            None => LabelSource::None,
-        })
-    }
-
-    /// A held file Lidarr brought no longer waits: it was kept or thrown away.
-    pub fn forget_held_lidarr_file(&self, path: &str) {
-        self.held_lidarr.lock().remove(path);
-    }
-
-    /// The held files of a hold Lidarr brought that it does not list yet, with their labels'
-    /// source, for the hold to keep beside them.
-    pub(crate) fn lidarr_files_of(&self, record: &HeldAcquisition) -> Vec<HeldLidarrFile> {
-        let held = self.held_lidarr.lock();
-        record
-            .held_files
-            .iter()
-            .filter(|file| !record.lidarr_files.iter().any(|known| &known.path == *file))
-            .filter_map(|file| {
-                held.get(file).map(|delivered| HeldLidarrFile {
-                    path: file.clone(),
-                    delivered: delivered.clone(),
-                })
-            })
-            .collect()
     }
 
     /// Whether a file that claims to be lossless really is, by its spectrum. Unknown, and no
@@ -1699,7 +1638,7 @@ fn get_extension(path: &str) -> &str {
 mod heart;
 
 pub use heart::{
-    ANOTHER_SONG_OR_TAKE, ANOTHER_SONG_PLAYED, HEARD_LOOKUP_BUSY, NEVER_PLAYED, YOUTUBE_PEER,
+    ANOTHER_SONG_OR_TAKE, ANOTHER_SONG_PLAYED, HEARD_LOOKUP_BUSY, NEVER_PLAYED, SOUND_NOT_READ, YOUTUBE_PEER,
     became_with_duplicates,
 };
 pub(crate) use heart::{pick_contexts, song_in};

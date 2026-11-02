@@ -76,6 +76,10 @@ struct Options {
     lidarr_fetcher: Option<Arc<dyn ILidarrTrackFetcher>>,
     /// MusicBrainz, which the shipped checks ask what a file's own recording tag names.
     music_brainz: Option<Arc<crate::services::fingerprint::MusicBrainzClient>>,
+    /// The ISRC the routing of "Started" carries, which a gate's identity asks MusicBrainz about.
+    started_isrc: Option<&'static str>,
+    /// A video whose whole copy the walk's preview copies hold ready from the start.
+    heard_copy: Option<&'static str>,
 }
 
 /// A 180 s FLAC whose sound is named, with `isrc` as its own tag.
@@ -143,6 +147,10 @@ async fn gated_with(root: &Root, source: DownloadSource, peers: Vec<Peer>, optio
                 album: Some("Nothing Was the Same".into()),
                 duration: Some(*seconds),
                 track: Some(i as i32 + 1),
+                isrc: options
+                    .started_isrc
+                    .filter(|_| *title == "Started")
+                    .map(str::to_string),
                 ..Default::default()
             });
             Song {
@@ -305,6 +313,14 @@ async fn gated_with(root: &Root, source: DownloadSource, peers: Vec<Peer>, optio
         None,
     ));
     let dir = tempfile::tempdir().expect("the heard samples' folder");
+    if let Some(video) = options.heard_copy {
+        std::fs::create_dir_all(dir.path().join("copies")).expect("made");
+        std::fs::write(
+            dir.path().join("copies").join(format!("{video}.preview")),
+            vec![0u8; 10],
+        )
+        .expect("written");
+    }
     let holds = Arc::new(SoulseekHoldStore::new(None::<PathBuf>));
     let rig = rig_in(dir.path(), &server.uri(), holds.clone(), 16, 64 << 20);
     let printer = Arc::new(SoundPrinter::default());
@@ -490,9 +506,10 @@ fn started_clear() -> String {
 // ---- A2 at Soulseek ------------------------------------------------------------------------------
 
 /// With an empty heard answer only A0 or A2 can keep a file: the first peer's upload of the song,
-/// another master, is not kept and is refused for this heart only; the second peer's file, the very
-/// master that played, is kept as the heard master. Both are checked against one fetch of the heard
-/// video, the round this pass opened.
+/// another master, is not kept, and since nothing could decide which version it is it is
+/// remembered as refused by nobody (a later play may still prove it); the second peer's file, the
+/// very master that played, is kept as the heard master. Both are checked against one fetch of the
+/// heard video, the round this pass opened.
 #[tokio::test]
 async fn an_empty_heard_answer_keeps_the_soulseek_file_that_passes_a2_and_not_the_one_that_fails() {
     let root = Root::new("octo-gate-a2-");
@@ -546,14 +563,64 @@ async fn an_empty_heard_answer_keeps_the_soulseek_file_that_passes_a2_and_not_th
         "never for imports"
     );
     assert!(
-        g.walk
+        !g.walk
             .rejected
-            .is_denied_for_heart(&song, &r, Some("wrongpeer"), Some(FIRST))
+            .is_denied_for_heart(&song, &r, Some("wrongpeer"), Some(FIRST)),
+        "an undecided file is no refusal"
     );
     assert!(
         !g.walk
             .rejected
             .is_denied_for_heart(&song, &r, Some("rightpeer"), Some(SECOND))
+    );
+}
+
+/// Three people who heard one video hearted the song: one download judges its file with each
+/// person's gate in turn, each needing the heard master, and the file lands for all three. Their
+/// rounds take turns at one heard-copy place, so the download never waits on itself.
+#[tokio::test]
+async fn three_heard_gates_needing_the_heard_master_in_one_download_finish() {
+    let root = Root::new("octo-gate-three-");
+    let g = gated(
+        &root,
+        DownloadSource::Soulseek,
+        "key",
+        vec![peer(
+            "rightpeer",
+            FIRST,
+            named_flac("started", "heard-master", "nothing", None),
+            1_000_000,
+        )],
+    )
+    .await;
+    let heard = g.heard_video(4_000_000, None, "started", "heard-master").await;
+    let people = ["anna", "ben", "cleo"];
+    let gates: Vec<HeartGate> = people
+        .iter()
+        .map(|user| gate_of(user, Some(heard.clone()), HeardReading::OnlyHeardOrMaster))
+        .collect();
+    let key = acquisition_key("soulseek", &g.started(), false);
+    let builder: &dyn crate::services::common::heart_acquisition_coordinator::HeartGates =
+        g.verification.as_ref();
+    let rounds = builder.open_rounds(&key, &gates);
+    let ledger = GateLedger::default();
+
+    let path = acquire_as(&g, DownloadSource::Soulseek, heart_place(gates, &ledger))
+        .await
+        .expect("the heard master lands");
+    drop(rounds);
+    assert!(std::path::Path::new(&path).is_file(), "{path}");
+    for user in people {
+        assert_eq!(
+            ledger.outcome_for(user, AcquisitionOrigin::Heart),
+            Some(GateOutcome::Accepted),
+            "{user}"
+        );
+    }
+    assert_eq!(
+        g.rig.samples.scratch_use().0,
+        0,
+        "no heard copy outlives the pass"
     );
 }
 
@@ -1041,6 +1108,337 @@ async fn a_heart_joining_an_import_of_a_song_fetched_ahead_is_judged_by_its_own_
     );
     let heart = ledger.outcome_for("anna", AcquisitionOrigin::Heart);
     assert!(matches!(heart, Some(GateOutcome::NotAccepted(_))), "{heart:?}");
+}
+
+// ---- A Wait for lossless play ---------------------------------------------------------------------
+
+/// A Wait for lossless play is queued with no gate and builds its own inside its acquisition: the
+/// request's gates, none, never take its place, so the play's file is judged by it. The faster
+/// peer's file, another recording by its sound, is refused, and the next peer's, the song's own
+/// recording, lands as the play's.
+#[tokio::test]
+async fn a_wait_for_lossless_play_queued_with_no_gate_is_judged_by_the_gate_it_builds() {
+    use crate::services::common::{AcquisitionTarget, TrackAcquisitionQueue};
+    use crate::services::fingerprint::heart_test_support::MusicBrainzByQuestion;
+
+    const CODE: &str = "USCM51300001";
+    let music_brainz = MockServer::builder().start().await;
+    let questions = MusicBrainzByQuestion::default();
+    questions.code(
+        CODE,
+        &json!({"recordings": [{
+            "id": "rec-started", "title": "Started", "length": 180_000, "disambiguation": "",
+            "isrcs": [CODE], "artist-credit": [{"name": "Drake", "artist": {"id": "drake", "name": "Drake"}}],
+        }]})
+        .to_string(),
+    );
+    Mock::given(any())
+        .respond_with(questions)
+        .mount(&music_brainz)
+        .await;
+    let base = url::Url::parse(&format!("{}/ws/2/", music_brainz.uri())).expect("parses");
+    let quick = Duration::from_millis(5);
+    let client = Arc::new(
+        crate::services::fingerprint::MusicBrainzClient::with_base_url(base).with_pace(
+            quick,
+            Duration::from_millis(500),
+            quick,
+        ),
+    );
+    let root = Root::new("octo-gate-lossless-play-");
+    let g = gated_with(
+        &root,
+        DownloadSource::Soulseek,
+        vec![
+            peer(
+                "wrongpeer",
+                FIRST,
+                named_flac("other", "other-master", "another", None),
+                2_000_000,
+            ),
+            peer(
+                "rightpeer",
+                SECOND,
+                named_flac("started", "started-master", "started", None),
+                1_000_000,
+            ),
+        ],
+        Options {
+            key: "key",
+            music_brainz: Some(client),
+            started_isrc: Some(CODE),
+            ..Default::default()
+        },
+    )
+    .await;
+    g.answers.answer(
+        "another",
+        &json!({"status": "ok", "results": [{"id": "fp", "score": 0.97, "recordings": [{
+            "id": "rec-other", "title": "Another Song", "artists": [{"name": "Someone Else"}],
+            "duration": 180, "sources": 40,
+        }]}]})
+        .to_string(),
+    );
+    g.answers.answer("started", &started_clear());
+    // Queued as Wait for lossless queues it: a play, with no gate of its own yet.
+    let queue = TrackAcquisitionQueue::new();
+    let _play = queue.enqueue_as(
+        Some(AcquisitionOrigin::Play),
+        Vec::new(),
+        &AcquisitionTarget::Shared,
+        false,
+        "soulseek",
+        &g.started(),
+        false,
+        false,
+        true,
+        None,
+        true,
+        Some("brandon"),
+        false,
+        None,
+    );
+    let request = queue.dequeue(&CancellationToken::new()).await.expect("the play");
+    let place = request.place();
+    assert!(place.gates.is_empty());
+    let ledger = place.ledger.clone();
+
+    // Run as the acquisition worker runs it: for the play's own requester.
+    let landed = tokio::time::timeout(
+        Duration::from_secs(60),
+        g.walk.service.execute_acquisition_to(
+            "soulseek",
+            &g.started(),
+            false,
+            true,
+            Some(DownloadSource::Soulseek),
+            &CancellationToken::new(),
+            Some(request.requested_by()),
+            false,
+            None,
+            place,
+        ),
+    )
+    .await
+    .expect("within a minute")
+    .expect("the song's own recording lands");
+    assert!(std::path::Path::new(&landed).is_file(), "{landed}");
+    assert_eq!(g.batch_users(), names(&["wrongpeer", "rightpeer"]));
+    assert_eq!(
+        ledger.outcome_for("brandon", AcquisitionOrigin::Play),
+        Some(GateOutcome::Accepted)
+    );
+}
+
+/// MusicBrainz as `inner` answers it, with a sweep of the preview copies run as each question is
+/// asked, noting whether the heard copy was still there after.
+struct SweepingQuestions {
+    inner: crate::services::fingerprint::heart_test_support::MusicBrainzByQuestion,
+    copies: Arc<std::sync::OnceLock<Arc<crate::services::prefetch::PreviewCopies>>>,
+    kept: Arc<Mutex<Vec<bool>>>,
+}
+
+impl wiremock::Respond for SweepingQuestions {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        if let Some(copies) = self.copies.get() {
+            copies.drop_copy(HEARD);
+            self.kept.lock().push(copies.is_ready(HEARD));
+        }
+        self.inner.respond(request)
+    }
+}
+
+/// A Wait for lossless play's own gate is built from what its asker heard of the song, and the copy
+/// of it is held from before the gate is built until the download returns: a sweep while the gate
+/// is built leaves it, and it goes free once the download is over.
+#[tokio::test]
+async fn a_wait_for_lossless_plays_heard_copy_is_held_while_its_gate_is_built() {
+    use crate::services::common::{AcquisitionTarget, TrackAcquisitionQueue};
+    use crate::services::fingerprint::heart_test_support::MusicBrainzByQuestion;
+
+    const CODE: &str = "USCM51300001";
+    let music_brainz = MockServer::builder().start().await;
+    let questions = MusicBrainzByQuestion::default();
+    questions.code(
+        CODE,
+        &json!({"recordings": [{
+            "id": "rec-started", "title": "Started", "length": 180_000, "disambiguation": "",
+            "isrcs": [CODE], "artist-credit": [{"name": "Drake", "artist": {"id": "drake", "name": "Drake"}}],
+        }]})
+        .to_string(),
+    );
+    let copies = Arc::new(std::sync::OnceLock::new());
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(any())
+        .respond_with(SweepingQuestions {
+            inner: questions,
+            copies: copies.clone(),
+            kept: kept.clone(),
+        })
+        .mount(&music_brainz)
+        .await;
+    let base = url::Url::parse(&format!("{}/ws/2/", music_brainz.uri())).expect("parses");
+    let quick = Duration::from_millis(5);
+    let client = Arc::new(
+        crate::services::fingerprint::MusicBrainzClient::with_base_url(base).with_pace(
+            quick,
+            Duration::from_millis(500),
+            quick,
+        ),
+    );
+    let root = Root::new("octo-gate-lossless-heard-");
+    let g = gated_with(
+        &root,
+        DownloadSource::Soulseek,
+        vec![peer(
+            "rightpeer",
+            FIRST,
+            named_flac("started", "started-master", "started", None),
+            1_000_000,
+        )],
+        Options {
+            key: "key",
+            music_brainz: Some(client),
+            started_isrc: Some(CODE),
+            heard_copy: Some(HEARD),
+            ..Default::default()
+        },
+    )
+    .await;
+    g.answers.answer("started", &started_clear());
+    g.answers.answer("heard", &started_clear());
+    let heard = g.heard_video(10, None, "started", "started-master").await;
+    g.walk
+        .registry
+        .remember_heard(&g.started(), "brandon", heard, None);
+    assert!(g.rig.copies.is_ready(HEARD));
+    let _ = copies.set(g.rig.copies.clone());
+    let queue = TrackAcquisitionQueue::new();
+    let _play = queue.enqueue_as(
+        Some(AcquisitionOrigin::Play),
+        Vec::new(),
+        &AcquisitionTarget::Shared,
+        false,
+        "soulseek",
+        &g.started(),
+        false,
+        false,
+        true,
+        None,
+        true,
+        Some("brandon"),
+        false,
+        None,
+    );
+    let request = queue.dequeue(&CancellationToken::new()).await.expect("the play");
+
+    let landed = tokio::time::timeout(
+        Duration::from_secs(60),
+        g.walk.service.execute_acquisition_to(
+            "soulseek",
+            &g.started(),
+            false,
+            true,
+            Some(DownloadSource::Soulseek),
+            &CancellationToken::new(),
+            Some(request.requested_by()),
+            false,
+            None,
+            request.place(),
+        ),
+    )
+    .await
+    .expect("within a minute");
+
+    let kept = kept.lock().clone();
+    assert!(
+        !kept.is_empty(),
+        "MusicBrainz was asked while the gate was built: {landed:?}"
+    );
+    assert!(kept.iter().all(|kept| *kept), "the sweep left the heard copy");
+    assert!(!g.rig.copies.is_held(HEARD), "free once the download is over");
+}
+
+/// A Wait for lossless play's download that carries another gate of its person (their heart's) still
+/// builds the play's own gate: its file is judged by the play's own gate too.
+#[tokio::test]
+async fn a_wait_for_lossless_play_carrying_another_gate_still_builds_its_own() {
+    use crate::services::fingerprint::heart_test_support::MusicBrainzByQuestion;
+
+    const CODE: &str = "USCM51300001";
+    let music_brainz = MockServer::builder().start().await;
+    let questions = MusicBrainzByQuestion::default();
+    questions.code(
+        CODE,
+        &json!({"recordings": [{
+            "id": "rec-started", "title": "Started", "length": 180_000, "disambiguation": "",
+            "isrcs": [CODE], "artist-credit": [{"name": "Drake", "artist": {"id": "drake", "name": "Drake"}}],
+        }]})
+        .to_string(),
+    );
+    Mock::given(any())
+        .respond_with(questions)
+        .mount(&music_brainz)
+        .await;
+    let base = url::Url::parse(&format!("{}/ws/2/", music_brainz.uri())).expect("parses");
+    let quick = Duration::from_millis(5);
+    let client = Arc::new(
+        crate::services::fingerprint::MusicBrainzClient::with_base_url(base).with_pace(
+            quick,
+            Duration::from_millis(500),
+            quick,
+        ),
+    );
+    let root = Root::new("octo-gate-lossless-joined-");
+    let g = gated_with(
+        &root,
+        DownloadSource::Soulseek,
+        vec![peer(
+            "rightpeer",
+            FIRST,
+            named_flac("started", "started-master", "started", None),
+            1_000_000,
+        )],
+        Options {
+            key: "key",
+            music_brainz: Some(client),
+            started_isrc: Some(CODE),
+            ..Default::default()
+        },
+    )
+    .await;
+    g.answers.answer("started", &started_clear());
+    let ledger = GateLedger::default();
+    let place = AcquisitionPlace {
+        origin: Some(AcquisitionOrigin::Play),
+        gates: vec![gate_of("brandon", None, HeardReading::NotHeard)],
+        ledger: ledger.clone(),
+        ..Default::default()
+    };
+
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        g.walk.service.execute_acquisition_to(
+            "soulseek",
+            &g.started(),
+            false,
+            true,
+            Some(DownloadSource::Soulseek),
+            &CancellationToken::new(),
+            Some(vec!["brandon".to_string()]),
+            false,
+            None,
+            place,
+        ),
+    )
+    .await
+    .expect("within a minute")
+    .expect("the song's own recording lands");
+    assert_eq!(
+        ledger.outcome_for("brandon", AcquisitionOrigin::Play),
+        Some(GateOutcome::Accepted),
+        "the play's own gate judged it"
+    );
 }
 
 /// What the file's ISRC tag reads back as, so a tagged peer file is known to carry its label.
