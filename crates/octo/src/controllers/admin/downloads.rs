@@ -103,7 +103,16 @@ pub async fn download_log(State(state): State<AppState>, request: Request) -> Re
         Some(entry) => DownloadHistoryService::written_at(entry)
             .is_none_or(|written| row.started_at <= written + chrono::TimeDelta::seconds(1)),
     });
-    if let Some(row) = row.filter(|_| same_run) {
+    if let Some(mut row) = row.filter(|_| same_run) {
+        // The holds say what the row offers now, never the row's own flags, which stay set after
+        // a keep was asked or a wait was stopped.
+        row.keep_anyway = state.heart_acquisition_coordinator.keepable_rows().contains(
+            &crate::services::common::acquisition_tracker::key_of(&row.provider, &row.external_id),
+        );
+        row.stop_waiting = !state
+            .lidarr_hearts
+            .stop_waiters(&row.provider, &row.external_id)
+            .is_empty();
         let mut json = acquisition_json(&row);
         json.insert("provider".into(), json!(row.provider));
         json.insert("externalId".into(), json!(row.external_id));
@@ -120,37 +129,103 @@ pub async fn download_log(State(state): State<AppState>, request: Request) -> Re
 
 // ---- Keep anyway and Stop waiting for Lidarr ------------------------------------------------
 
-/// `HeldRequest(string? Key, string? User)`: a held download's row key and the person to act for.
+/// `HeldRequest(string? Key, string? User, string? Token)`: a held download's row key and the
+/// person to act for, by name or by the token the holder menu gave for them.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct HeldRequest {
     key: Option<String>,
     user: Option<String>,
+    token: Option<String>,
 }
 
 impl FromBody for HeldRequest {
     const SHAPE: &'static Shape = text_record!(
         "Octo.Controllers.AdminDownloadsController+HeldRequest",
         "key",
-        "user"
+        "user",
+        "token"
     );
 }
 
-/// The row key and the person a Keep anyway or Stop waiting names, trimmed, or the words that say
-/// which is missing (`unnamed` when it is the person).
-fn held_request(request: Option<HeldRequest>, unnamed: &str) -> Result<(String, String), &str> {
-    let (key, user) = request.map_or((None, None), |r| (r.key, r.user));
+/// The row key and the person a Keep anyway or Stop waiting names, trimmed: by name, or by a
+/// holder menu's token, matched among `people` (who may be acted for on the row now; a token
+/// naming nobody who still waits names nobody, and nothing waits for nobody). Or the words that
+/// say which is missing (`unnamed` when it is the person).
+fn held_request(
+    request: Option<HeldRequest>,
+    unnamed: &'static str,
+    people: impl FnOnce(&str) -> Vec<String>,
+) -> Result<(String, String), &'static str> {
+    let (key, user, token) = request.map_or((None, None, None), |r| (r.key, r.user, r.token));
     let Some(key) = key.filter(|key| !is_blank(key)) else {
         return Err("Which download? The key is missing.");
     };
-    let Some(user) = user.filter(|user| !is_blank(user)) else {
+    let key = key.trim().to_string();
+    if let Some(user) = user.filter(|user| !is_blank(user)) {
+        return Ok((key, user.trim().to_string()));
+    }
+    let Some(token) = token.filter(|token| !is_blank(token)) else {
         return Err(unnamed);
     };
-    Ok((key.trim().to_string(), user.trim().to_string()))
+    let user = people(&key)
+        .into_iter()
+        .find(|user| dotnet::eq_ignore_case(&holder_token(&key, user), token.trim()))
+        .unwrap_or_default();
+    Ok((key, user))
+}
+
+/// An opaque token for one person on one row: a keyed hash of the two under a secret this
+/// process made at its start, so a holder menu acts for a person without naming them, and a
+/// token is good for that row only.
+fn holder_token(key: &str, user: &str) -> String {
+    use sha2::{Digest, Sha256};
+    static SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let secret = SECRET.get_or_init(rand::random::<[u8; 32]>);
+    let mut block = [0u8; 64];
+    block[..32].copy_from_slice(secret);
+    let message = format!(
+        "{}\n{}",
+        dotnet::to_lower_invariant(key.trim()),
+        dotnet::to_lower_invariant(user.trim())
+    );
+    let mut inner = Sha256::new();
+    inner.update(block.map(|byte| byte ^ 0x36));
+    inner.update(message.as_bytes());
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(block.map(|byte| byte ^ 0x5c));
+    outer.update(inner);
+    hex::encode(outer.finalize())
+}
+
+/// One holder menu: each person with the token that names them back. Their name shows while
+/// Record who asked is on; with it off, nobody is named and each shows as "Listener 1", "Listener
+/// 2" and so on, in the order they joined.
+fn holder_menu(state: &AppState, key: &str, people: &[String]) -> Vec<Value> {
+    let named = state.settings.current().subsonic.record_requested_by;
+    people
+        .iter()
+        .enumerate()
+        .map(|(index, user)| {
+            json!({
+                "label": if named { user.clone() } else { format!("Listener {}", index + 1) },
+                "token": holder_token(key, user),
+            })
+        })
+        .collect()
+}
+
+/// Whose kept copy of the row's song waits for Lidarr.
+fn stop_waiters_of(state: &AppState, key: &str) -> Vec<String> {
+    key.split_once(':')
+        .map(|(provider, id)| state.lidarr_hearts.stop_waiters(provider, id))
+        .unwrap_or_default()
 }
 
 /// The holder menus of one held row: who may keep it anyway now (`keepers`) and whose kept copy
-/// of its song waits for Lidarr (`stopWaiters`), each in the order they joined.
+/// of its song waits for Lidarr (`stopWaiters`), each in the order they joined, each as a label
+/// and a token ([`holder_menu`]).
 pub async fn held_for(State(state): State<AppState>, request: Request) -> Response {
     let (parts, _) = split(request).await;
     if admin(&state, &parts.headers).is_none() {
@@ -161,11 +236,12 @@ pub async fn held_for(State(state): State<AppState>, request: Request) -> Respon
     };
     let key = key.trim().to_string();
     let keepers = state.heart_acquisition_coordinator.keepers(&key);
-    let stop_waiters = key
-        .split_once(':')
-        .map(|(provider, id)| state.lidarr_hearts.stop_waiters(provider, id))
-        .unwrap_or_default();
-    ok(&json!({ "key": key, "keepers": keepers, "stopWaiters": stop_waiters }))
+    let stop_waiters = stop_waiters_of(&state, &key);
+    ok(&json!({
+        "key": key,
+        "keepers": holder_menu(&state, &key, &keepers),
+        "stopWaiters": holder_menu(&state, &key, &stop_waiters),
+    }))
 }
 
 /// Keep anyway (Keep these anyway on a hearted album's row) for one person waiting in the row's
@@ -181,11 +257,12 @@ pub async fn keep_anyway(State(state): State<AppState>, request: Request) -> Res
     let Some(admin) = admin(&state, &parts.headers) else {
         return sign_in();
     };
-    let (key, user) = match held_request(request, NAME_THE_PERSON) {
+    let coordinator = &state.heart_acquisition_coordinator;
+    let (key, user) = match held_request(request, NAME_THE_PERSON, |key| coordinator.keepers(key)) {
         Ok(named) => named,
         Err(missing) => return error(StatusCode::BAD_REQUEST, missing),
     };
-    match state.heart_acquisition_coordinator.keep_anyway(&key, &user) {
+    match coordinator.keep_anyway(&key, &user) {
         KeepAnyway::Keeping => {
             info!("{admin} kept {key} anyway for {user} from the dashboard");
             ok(&json!({ "status": "ok" }))
@@ -196,8 +273,8 @@ pub async fn keep_anyway(State(state): State<AppState>, request: Request) -> Res
 
 /// Stop waiting for Lidarr for one person whose kept copy of the row's song waits for an open
 /// Lidarr follow, the admin's own way to what stopWaitingForLidarr does for the apps with `user`:
-/// every follow that copy waits for ends and it lands now. A conflict when no copy of that
-/// person's waits.
+/// that person's copy lands now and they leave the follow's waits, which go on for anyone else. A
+/// conflict when no copy of that person's waits.
 pub async fn stop_waiting(State(state): State<AppState>, request: Request) -> Response {
     let (parts, body) = split(request).await;
     let request: Option<HeldRequest> = match bind_optional_body(&parts.headers, &body) {
@@ -207,7 +284,7 @@ pub async fn stop_waiting(State(state): State<AppState>, request: Request) -> Re
     let Some(admin) = admin(&state, &parts.headers) else {
         return sign_in();
     };
-    let (key, user) = match held_request(request, STOP_NAME_THE_PERSON) {
+    let (key, user) = match held_request(request, STOP_NAME_THE_PERSON, |key| stop_waiters_of(&state, key)) {
         Ok(named) => named,
         Err(missing) => return error(StatusCode::BAD_REQUEST, missing),
     };
@@ -222,7 +299,7 @@ pub async fn stop_waiting(State(state): State<AppState>, request: Request) -> Re
     if !waits {
         return error(StatusCode::CONFLICT, NOTHING_WAITS_FOR_LIDARR);
     }
-    match hearts.stop_waiting_for_lidarr(provider, id).await {
+    match hearts.stop_waiting_for_lidarr(provider, id, &user).await {
         StopWaiting::Stopped => {
             info!("{admin} stopped waiting for Lidarr on {key} for {user} from the dashboard");
             ok(&json!({ "status": "ok" }))

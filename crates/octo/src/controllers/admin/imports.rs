@@ -242,12 +242,34 @@ async fn split(request: Request) -> (axum::http::request::Parts, axum::body::Byt
 
 // ---- The endpoints ----------------------------------------------------------------------------
 
+/// Where a free AcoustID application key is had.
+pub const ACOUST_ID_NEW_KEY: &str = "https://acoustid.org/new-application";
+
+/// The import card's line while an import's songs are checked with Octo's own AcoustID key, at the
+/// pace work nobody waits on goes, for want of a key of the user's own.
+pub fn built_in_key_pace() -> String {
+    format!(
+        "Octo checks these songs with its own AcoustID key, one every {} seconds. A free key of your own in Settings checks them faster",
+        crate::services::fingerprint::AcoustIdRateLimiter::BULK_GAP.as_secs()
+    )
+}
+
 async fn overview(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
     let (_, user) = match whose(&state, &headers, &uri).await {
         Ok(people) => people,
         Err(refused) => return refused,
     };
-    let overview = state.imports.overview(&user);
+    let mut overview = serde_json::to_value(state.imports.overview(&user)).unwrap_or_default();
+    // An import's songs wait their turn on Octo's own AcoustID key: the card says a key of the
+    // person's own checks them faster, and where to get one.
+    if state.acoust_id.bulk_on_built_in_key()
+        && let Some(fields) = overview.as_object_mut()
+    {
+        fields.insert(
+            "acoustIdKey".into(),
+            json!({ "text": built_in_key_pace(), "link": ACOUST_ID_NEW_KEY }),
+        );
+    }
     ok(&json!({ "user": user, "overview": overview }))
 }
 

@@ -325,6 +325,11 @@ pub struct LidarrQueueItem {
     /// Where the client puts the download, in Lidarr's paths.
     pub output_path: Option<String>,
     pub protocol: Option<String>,
+    /// When Lidarr took the item, on Lidarr's clock: a download's newest grab row, a held-back
+    /// release's own time.
+    pub added: Option<DateTime<Utc>>,
+    /// The indexer the release came from.
+    pub indexer: Option<String>,
 }
 
 /// What a history row records, as Lidarr numbers and names it.
@@ -957,6 +962,8 @@ pub fn parse_queue_item(row: &Map<String, Value>) -> Result<LidarrQueueItem, Lid
         size_left_bytes: nullable_bytes(row, "sizeleft")?,
         output_path: nullable_str(row, "outputPath")?,
         protocol: nullable_str(row, "protocol")?,
+        added: nullable_date(row, "added")?,
+        indexer: present(nullable_str(row, "indexer")?),
     })
 }
 

@@ -71,13 +71,16 @@ pub struct PendingAlbum {
     pub pin: Option<LidarrReleaseChoice>,
     /// The AlbumSearch Octo posted, saved the moment Lidarr answered; 0 before the search.
     pub search_command: i32,
-    /// When the search was posted.
+    /// When the search or the grab was posted, on Lidarr's clock.
     pub searched_at: Option<DateTime<Utc>>,
+    /// Lidarr's time right before Octo posted its search or its grab, saved before the request
+    /// went out: a restart before Lidarr's answer was saved still follows what it started.
+    pub search_pending: Option<DateTime<Utc>>,
     /// Every download id of Octo's own grabs for this album, accounted for or not.
     pub grab_ids: Vec<String>,
     /// Track file records of Octo's moved imports that Lidarr would not delete yet, asked again
     /// later.
-    pub records_to_delete: Vec<i32>,
+    pub records_to_delete: Vec<MovedRecord>,
     /// The tracks whose late imports Octo dealt with: their records may be gone since Octo moved
     /// the files, and they count as in.
     pub tracks_taken: Vec<i32>,
@@ -140,6 +143,50 @@ pub struct PendingAlbum {
     /// song a fetch waits for, and a file nobody waits for is held out of the library and
     /// deleted with the pick.
     pub replacement: bool,
+    /// The MusicBrainz artist id the album is under: Lidarr's artist is checked against it before
+    /// anything of it is changed.
+    pub foreign_artist_id: String,
+    /// The Lidarr the pick was made in, by its address: another Lidarr set since holds none of it.
+    pub lidarr_url: Option<String>,
+    /// The releases Lidarr monitored when it linked a file of Octo's import: the release its
+    /// import switched the album to, which a put back gives the saved choice back from.
+    pub imported_releases: Vec<i32>,
+    /// A song of Octo's import landed: the follow's end gives back only the release choice and
+    /// what Octo's add created, tried again until it is done.
+    pub landed: bool,
+}
+
+/// Lidarr's record of a file Octo moved out, kept for later when Lidarr would not delete it yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default, from = "SavedRecord")]
+pub struct MovedRecord {
+    /// Lidarr's track file id.
+    pub id: i32,
+    /// Where Octo found the file, on Octo's side: the record is deleted only while it still names
+    /// this path and nothing lies there.
+    pub path: Option<String>,
+}
+
+/// A moved record as a file saves it: an object, or the bare id of an older save.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedRecord {
+    Id(i32),
+    Record {
+        #[serde(rename = "Id", default)]
+        id: i32,
+        #[serde(rename = "Path", default)]
+        path: Option<String>,
+    },
+}
+
+impl From<SavedRecord> for MovedRecord {
+    fn from(saved: SavedRecord) -> Self {
+        match saved {
+            SavedRecord::Id(id) => MovedRecord { id, path: None },
+            SavedRecord::Record { id, path } => MovedRecord { id, path },
+        }
+    }
 }
 
 impl Default for PendingAlbum {
@@ -163,6 +210,7 @@ impl Default for PendingAlbum {
             pin: None,
             search_command: 0,
             searched_at: None,
+            search_pending: None,
             grab_ids: Vec::new(),
             records_to_delete: Vec::new(),
             tracks_taken: Vec::new(),
@@ -189,14 +237,18 @@ impl Default for PendingAlbum {
             album_hearts: Vec::new(),
             filed: Vec::new(),
             replacement: false,
+            foreign_artist_id: String::new(),
+            lidarr_url: None,
+            imported_releases: Vec::new(),
+            landed: false,
         }
     }
 }
 
 impl PendingAlbum {
-    /// Whether Octo posted the album's search.
+    /// Whether Octo posted the album's search or its grab, or was about to when it stopped.
     pub fn searched(&self) -> bool {
-        self.search_command > 0 || self.searched_at.is_some()
+        self.search_command > 0 || self.searched_at.is_some() || self.search_pending.is_some()
     }
 
     /// Whether the follow of the search is open: searched, and not ended.
@@ -204,11 +256,30 @@ impl PendingAlbum {
         self.searched() && self.ended.is_none()
     }
 
-    /// Whether a download id is one of this entry's own.
+    /// Whether a download id was ever one of this entry's own. A download id is not unique over
+    /// time (a torrent grabbed again keeps its hash), so whether a row or an item of it is Octo's
+    /// is [`PendingAlbum::owns_grab_at`].
     pub fn owns_grab(&self, download_id: &str) -> bool {
         self.grab_ids
             .iter()
             .any(|id| dotnet::eq_ignore_case(id, download_id))
+    }
+
+    /// Whether a row of a download dated `date` (Lidarr's clock) is of Octo's own grab: the id is
+    /// this entry's, and the date lies inside that grab's own span, from its grab row to the
+    /// moment it was accounted for. A later grab of the same id is a new grab.
+    pub fn owns_grab_at(&self, download_id: &str, date: DateTime<Utc>) -> bool {
+        if !self.owns_grab(download_id) {
+            return false;
+        }
+        match self
+            .grabs
+            .iter()
+            .find(|grab| dotnet::eq_ignore_case(&grab.download_id, download_id))
+        {
+            Some(grab) => grab.spans(date),
+            None => true,
+        }
     }
 
     /// The downloads still on the watch list.
@@ -218,6 +289,17 @@ impl PendingAlbum {
 
     /// Records a download of Octo's own on the watch list; false when it was there already.
     pub fn record_grab(&mut self, download_id: &str, client: Option<&str>) -> bool {
+        self.record_grab_at(download_id, client, None)
+    }
+
+    /// Records a download of Octo's own on the watch list from its grab row dated `grabbed_at`
+    /// (Lidarr's clock); false when it was there already.
+    pub fn record_grab_at(
+        &mut self,
+        download_id: &str,
+        client: Option<&str>,
+        grabbed_at: Option<DateTime<Utc>>,
+    ) -> bool {
         if self.owns_grab(download_id) {
             return false;
         }
@@ -225,9 +307,26 @@ impl PendingAlbum {
         self.grabs.push(FollowedGrab {
             download_id: download_id.to_string(),
             client: client.map(str::to_string),
+            grabbed_at,
             ..Default::default()
         });
         true
+    }
+
+    /// A download of Octo's that was accounted for is grabbed again inside a window of Octo's (its
+    /// row dated `grabbed_at`): it goes back on the watch list as the new grab.
+    pub fn watch_again(&mut self, download_id: &str, client: Option<&str>, grabbed_at: DateTime<Utc>) {
+        if let Some(grab) = self.grab_mut(download_id) {
+            grab.accounted = false;
+            grab.accounted_at = None;
+            grab.grabbed_at = Some(grabbed_at);
+            grab.queue_id = 0;
+            grab.manual_import = 0;
+            grab.size_left_at_event = None;
+            if client.is_some() {
+                grab.client = client.map(str::to_string);
+            }
+        }
     }
 
     /// One of Octo's downloads by its id.
@@ -307,10 +406,21 @@ impl PendingAlbum {
             self.search_command = other.search_command;
         }
         self.searched_at = self.searched_at.or(other.searched_at);
+        self.search_pending = self.search_pending.or(other.search_pending);
+        if dotnet::is_blank(&self.foreign_artist_id) {
+            self.foreign_artist_id = other.foreign_artist_id;
+        }
+        if self.lidarr_url.is_none() {
+            self.lidarr_url = other.lidarr_url;
+        }
+        union(&mut self.imported_releases, other.imported_releases);
+        self.landed |= other.landed;
         for grab in other.grabs {
             match self.grab_mut(&grab.download_id) {
                 Some(known) => {
                     known.accounted |= grab.accounted;
+                    known.accounted_at = known.accounted_at.or(grab.accounted_at);
+                    known.grabbed_at = known.grabbed_at.or(grab.grabbed_at);
                     known.client = known.client.take().or(grab.client);
                 }
                 None => {
@@ -498,15 +608,60 @@ pub struct FollowedGrab {
     pub size_left_at_event: Option<i64>,
     /// The ManualImport Octo posted for it while Lidarr's own imports are off; 0 for none.
     pub manual_import: i32,
+    /// The date of the grab row that made it Octo's, on Lidarr's clock.
+    pub grabbed_at: Option<DateTime<Utc>>,
+    /// When it was accounted for, on Lidarr's clock: a row of its id dated later is of a new grab.
+    pub accounted_at: Option<DateTime<Utc>>,
 }
 
-/// A release Lidarr holds back for the album, followed by its queue id.
+impl FollowedGrab {
+    /// Whether a row dated `date` falls inside this grab's own span.
+    pub fn spans(&self, date: DateTime<Utc>) -> bool {
+        self.grabbed_at.is_none_or(|grabbed| date >= grabbed)
+            && self.accounted_at.is_none_or(|accounted| date <= accounted)
+    }
+
+    /// Marks it accounted for at `at` (Lidarr's clock, never before its own grab row: Lidarr's
+    /// `Date` header counts whole seconds).
+    pub fn account(&mut self, at: DateTime<Utc>) {
+        if !self.accounted {
+            self.accounted = true;
+            self.accounted_at = Some(self.grabbed_at.map_or(at, |grabbed| at.max(grabbed)));
+        }
+    }
+}
+
+/// A release Lidarr holds back for the album, followed by its queue id. The grab it becomes is
+/// known by its own row: a search's grab of the same release title from the same indexer, dated
+/// after Lidarr took the release.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct FollowedItem {
     pub queue_id: i32,
-    /// The last read that listed it: a grab of the album after it is the release it became.
-    pub last_seen: Option<DateTime<Utc>>,
+    /// The release's title.
+    pub title: String,
+    /// The indexer the release came from.
+    pub indexer: Option<String>,
+    /// When Lidarr took the release, on Lidarr's clock.
+    pub added: Option<DateTime<Utc>>,
+}
+
+impl FollowedItem {
+    /// Whether a grab row is this held-back release becoming a download: a search's grab of the
+    /// same title from the same indexer, no earlier than Lidarr took the release. Any other grab
+    /// of the album (the user's, which clears what Lidarr held back) is not.
+    pub fn became(&self, row: &octo_core::lidarr::lidarr_client::LidarrHistoryRecord) -> bool {
+        let searched = row
+            .release_source()
+            .is_some_and(|source| dotnet::eq_ignore_case(source, "Search"));
+        let same_title = !dotnet::is_blank(&self.title)
+            && dotnet::eq_ignore_case(row.source_title.trim(), self.title.trim());
+        let same_indexer = match (&self.indexer, row.data("indexer")) {
+            (Some(own), Some(theirs)) => dotnet::eq_ignore_case(own.trim(), theirs.trim()),
+            _ => false,
+        };
+        searched && same_title && same_indexer && self.added.is_none_or(|added| row.date >= added)
+    }
 }
 
 /// Why a follow ended.
@@ -564,21 +719,64 @@ pub enum StopWaiting {
 /// How many download ids of forgotten entries are still known as Octo's.
 const FINISHED_KEPT: usize = 500;
 
+/// A download of an entry Octo forgot, with its own span on Lidarr's clock: Lidarr's queue lists
+/// a finished download until its next refresh, and rows of it inside that span are still Octo's,
+/// never a grab of the user's. A later grab of the same id is not.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct FinishedGrab {
+    pub download_id: String,
+    pub grabbed_at: Option<DateTime<Utc>>,
+    pub accounted_at: Option<DateTime<Utc>>,
+}
+
+/// A finished download as a file saves it: an object, or the bare id an older save kept, which
+/// says nothing of its span and so is let go.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedFinished {
+    Grab(FinishedGrab),
+    Other(serde::de::IgnoredAny),
+}
+
+fn finished_from_file<'de, D>(deserializer: D) -> Result<Vec<FinishedGrab>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let saved: Vec<SavedFinished> = Vec::deserialize(deserializer)?;
+    Ok(saved
+        .into_iter()
+        .filter_map(|saved| match saved {
+            SavedFinished::Grab(grab) => Some(grab),
+            SavedFinished::Other(_) => None,
+        })
+        .collect())
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 struct PendingFile {
     albums: Vec<PendingAlbum>,
     held: Vec<HeldPlacement>,
-    finished_grabs: Vec<String>,
+    #[serde(deserialize_with = "finished_from_file")]
+    finished_grabs: Vec<FinishedGrab>,
 }
 
 #[derive(Default)]
 struct Listed {
     albums: IndexMap<String, PendingAlbum>,
     held: Vec<HeldPlacement>,
-    /// The download ids of entries Octo forgot, newest last: Lidarr's queue lists a finished
-    /// download until its next refresh, and it is still Octo's own, never a grab of the user's.
-    finished_grabs: Vec<String>,
+    /// The downloads of entries Octo forgot, newest last.
+    finished_grabs: Vec<FinishedGrab>,
+}
+
+/// The newest saved text of the list and the number of the last one written, so saves written off
+/// the async threads land in order.
+#[derive(Default)]
+struct Saves {
+    newest: Mutex<Option<(u64, String)>>,
+    written: Mutex<u64>,
+    next: std::sync::atomic::AtomicU64,
 }
 
 /// The listed albums, by foreign album id ignoring case, saved on every change; the files held
@@ -587,6 +785,7 @@ pub struct LidarrPendingAlbums {
     path: Option<PathBuf>,
     listed: Mutex<Listed>,
     running: Mutex<HashMap<String, Arc<Notify>>>,
+    saves: Arc<Saves>,
 }
 
 fn key(foreign_album_id: &str) -> String {
@@ -630,6 +829,7 @@ impl LidarrPendingAlbums {
             path,
             listed: Mutex::new(listed),
             running: Mutex::new(HashMap::new()),
+            saves: Arc::default(),
         }
     }
 
@@ -651,14 +851,18 @@ impl LidarrPendingAlbums {
         self.listed.lock().albums.get(&key(foreign_album_id)).cloned()
     }
 
-    /// Changes the listed album in place and saves; false when it is not listed.
+    /// Changes the listed album in place and saves when anything changed; false when it is not
+    /// listed.
     pub fn update(&self, foreign_album_id: &str, change: impl FnOnce(&mut PendingAlbum)) -> bool {
         let mut listed = self.listed.lock();
         let Some(album) = listed.albums.get_mut(&key(foreign_album_id)) else {
             return false;
         };
+        let before = album.clone();
         change(album);
-        self.save(&listed);
+        if *album != before {
+            self.save(&listed);
+        }
         true
     }
 
@@ -667,15 +871,31 @@ impl LidarrPendingAlbums {
         self.listed.lock().albums.values().cloned().collect()
     }
 
-    /// Whether a download id is one of Octo's own grabs, on any listed album or of an entry Octo
-    /// forgot lately.
-    pub fn is_octos_grab(&self, download_id: &str) -> bool {
+    /// Whether a download id was ever one of Octo's own, on a listed album or of an entry Octo
+    /// forgot lately, whatever grab of it a row is about.
+    pub fn knows_grab(&self, download_id: &str) -> bool {
         let listed = self.listed.lock();
         listed.albums.values().any(|album| album.owns_grab(download_id))
             || listed
                 .finished_grabs
                 .iter()
-                .any(|id| dotnet::eq_ignore_case(id, download_id))
+                .any(|grab| dotnet::eq_ignore_case(&grab.download_id, download_id))
+    }
+
+    /// Whether a row of a download dated `date` (Lidarr's clock) is of one of Octo's own grabs,
+    /// on any listed album or of an entry Octo forgot lately: the date lies inside that grab's
+    /// own span. A later grab of the same id (a torrent grabbed again) is not Octo's by its id.
+    pub fn is_octos_grab_at(&self, download_id: &str, date: DateTime<Utc>) -> bool {
+        let listed = self.listed.lock();
+        listed
+            .albums
+            .values()
+            .any(|album| album.owns_grab_at(download_id, date))
+            || listed.finished_grabs.iter().any(|grab| {
+                dotnet::eq_ignore_case(&grab.download_id, download_id)
+                    && grab.grabbed_at.is_none_or(|grabbed| date >= grabbed)
+                    && grab.accounted_at.is_none_or(|accounted| date <= accounted)
+            })
     }
 
     /// Whether a grab row of `album_id` from a search at `date` falls to a follow of Octo's other
@@ -698,18 +918,24 @@ impl LidarrPendingAlbums {
             })
     }
 
-    /// Takes an album off the list. Its download ids stay known as Octo's.
+    /// Takes an album off the list. Its downloads stay known as Octo's, each inside its own span.
     pub fn forget(&self, foreign_album_id: &str) {
         let mut listed = self.listed.lock();
         if let Some(album) = listed.albums.shift_remove(&key(foreign_album_id)) {
-            for id in album.grab_ids {
-                if !listed
-                    .finished_grabs
+            for id in &album.grab_ids {
+                let grab = album
+                    .grabs
                     .iter()
-                    .any(|known| dotnet::eq_ignore_case(known, &id))
-                {
-                    listed.finished_grabs.push(id);
-                }
+                    .find(|grab| dotnet::eq_ignore_case(&grab.download_id, id));
+                let finished = FinishedGrab {
+                    download_id: id.clone(),
+                    grabbed_at: grab.and_then(|grab| grab.grabbed_at),
+                    accounted_at: grab.and_then(|grab| grab.accounted_at),
+                };
+                listed
+                    .finished_grabs
+                    .retain(|known| !dotnet::eq_ignore_case(&known.download_id, id));
+                listed.finished_grabs.push(finished);
             }
             let over = listed.finished_grabs.len().saturating_sub(FINISHED_KEPT);
             listed.finished_grabs.drain(..over);
@@ -766,26 +992,43 @@ impl LidarrPendingAlbums {
         ended
     }
 
-    /// `user` took their heart on `song` back: they leave every open follow of it (their gate for
-    /// that song goes, and they stop holding the album unless their gate for another of its songs
-    /// is still there), and a follow nobody's heart is on any more is asked to end. The follows
-    /// asked to end.
-    pub fn unhearted(&self, song: &str, user: &str) -> Vec<String> {
+    /// `user` took their heart back on `heart`, a song or a whole album (as `provider:id`): they
+    /// leave every open follow of it (a song's heart and play gates for that song go, an album
+    /// heart's gates on every song of the album go, and they stop holding the album unless a
+    /// heart of theirs, of a song or of the album, is still on it), and a follow nobody's heart is
+    /// on any more is asked to end. The follows asked to end.
+    pub fn unhearted(&self, heart: &str, user: &str) -> Vec<String> {
         let ending: Vec<String> = {
             let mut listed = self.listed.lock();
             let mut ending = Vec::new();
             for album in listed.albums.values_mut() {
-                if !album.following() || !album.songs.iter().any(|known| known == song) {
+                let song = album.songs.iter().any(|known| known == heart);
+                let whole = album.album_hearts.iter().any(|known| known == heart);
+                if !album.following() || !(song || whole) {
                     continue;
                 }
                 let before = album.holders.len();
                 let theirs = |gate: &SongGate| dotnet::eq_ignore_case(gate.gate.user.trim(), user.trim());
-                album.gates.retain(|gate| !(gate.song == song && theirs(gate)));
-                if !album
-                    .gates
-                    .iter()
-                    .any(|gate| theirs(gate) && gate.gate.origin == AcquisitionOrigin::Heart)
+                album.gates.retain(|gate| {
+                    let album_gate = gate.gate.origin == AcquisitionOrigin::AlbumHeart;
+                    let gone = (song && gate.song == heart && !album_gate) || (whole && album_gate);
+                    !(gone && theirs(gate))
+                });
+                if whole
+                    && !album
+                        .gates
+                        .iter()
+                        .any(|gate| gate.gate.origin == AcquisitionOrigin::AlbumHeart)
                 {
+                    album.album_hearts.retain(|known| known != heart);
+                }
+                if !album.gates.iter().any(|gate| {
+                    theirs(gate)
+                        && matches!(
+                            gate.gate.origin,
+                            AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart
+                        )
+                }) {
                     album
                         .holders
                         .retain(|holder| !dotnet::eq_ignore_case(holder.trim(), user.trim()));
@@ -802,6 +1045,76 @@ impl LidarrPendingAlbums {
             self.wake(follow);
         }
         ending
+    }
+
+    /// `user` stops waiting for Lidarr on `song`: every kept copy of the song kept for them that
+    /// waits for an open follow is taken off the list, to be placed now, and they leave those
+    /// follows' waits for the song (their gate for it goes, and they stop holding a follow unless a
+    /// heart of theirs is still on it). A follow nobody's heart is on any more is asked to end, as
+    /// un-hearting ends it; one others still wait on stays open. The copies, and the follows asked
+    /// to end.
+    pub fn stop_waiting(&self, song: &str, user: &str) -> (Vec<HeldPlacement>, Vec<String>) {
+        let theirs_name = |name: &str| dotnet::eq_ignore_case(name.trim(), user.trim());
+        let (copies, ending) = {
+            let mut listed = self.listed.lock();
+            let open: Vec<String> = listed
+                .albums
+                .values()
+                .filter(|album| album.following())
+                .map(|album| key(&album.foreign_album_id))
+                .collect();
+            let (copies, kept): (Vec<HeldPlacement>, Vec<HeldPlacement>) =
+                std::mem::take(&mut listed.held).into_iter().partition(|held| {
+                    held.kept
+                        && held.song == song
+                        && held.users.iter().any(|known| theirs_name(known))
+                        && held.follows.iter().any(|follow| open.contains(&key(follow)))
+                });
+            listed.held = kept;
+            let mut ending = Vec::new();
+            for follow in copies.iter().flat_map(|held| held.follows.iter()) {
+                let Some(album) = listed.albums.get_mut(&key(follow)) else {
+                    continue;
+                };
+                if !album.following() || ending.contains(&album.foreign_album_id) {
+                    continue;
+                }
+                let before = album.holders.len();
+                album
+                    .gates
+                    .retain(|gate| !(gate.song == song && theirs_name(&gate.gate.user) && gate.personal()));
+                if !album.gates.iter().any(|gate| {
+                    theirs_name(&gate.gate.user)
+                        && matches!(
+                            gate.gate.origin,
+                            AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart
+                        )
+                }) {
+                    album.holders.retain(|holder| !theirs_name(holder));
+                }
+                if before > 0 && album.holders.is_empty() {
+                    album.ended = Some(FollowEnd::Stopped);
+                    ending.push(album.foreign_album_id.clone());
+                }
+            }
+            if !copies.is_empty() {
+                self.save(&listed);
+            }
+            (copies, ending)
+        };
+        for follow in &ending {
+            self.wake(follow);
+        }
+        (copies, ending)
+    }
+
+    /// Whether an open follow is on a song or a hearted album (as `provider:id`).
+    pub fn follows_heart(&self, heart: &str) -> bool {
+        self.listed.lock().albums.values().any(|album| {
+            album.following()
+                && (album.songs.iter().any(|known| known == heart)
+                    || album.album_hearts.iter().any(|known| known == heart))
+        })
     }
 
     /// The open follows a song belongs to, by foreign album id.
@@ -923,6 +1236,14 @@ impl LidarrPendingAlbums {
         let mut free = Vec::new();
         let mut kept = Vec::new();
         for mut held in std::mem::take(&mut listed.held) {
+            if !held
+                .follows
+                .iter()
+                .any(|follow| dotnet::eq_ignore_case(follow, foreign_album_id))
+            {
+                kept.push(held);
+                continue;
+            }
             held.follows
                 .retain(|follow| !dotnet::eq_ignore_case(follow, foreign_album_id));
             held.follows.retain(|follow| open.contains(&key(follow)));
@@ -934,6 +1255,24 @@ impl LidarrPendingAlbums {
         }
         listed.held = kept;
         self.save(&listed);
+        free
+    }
+
+    /// Takes off the list every held file that waits for no listed follow (one whose placing failed
+    /// waits for none), to be placed now. A file a listed follow names is let go by that follow.
+    pub fn release_unfollowed(&self) -> Vec<HeldPlacement> {
+        let mut listed = self.listed.lock();
+        let held = std::mem::take(&mut listed.held);
+        let (free, kept): (Vec<HeldPlacement>, Vec<HeldPlacement>) = held.into_iter().partition(|held| {
+            !held
+                .follows
+                .iter()
+                .any(|follow| listed.albums.contains_key(&key(follow)))
+        });
+        listed.held = kept;
+        if !free.is_empty() {
+            self.save(&listed);
+        }
         free
     }
 
@@ -953,6 +1292,9 @@ impl LidarrPendingAlbums {
         self.save(&listed);
     }
 
+    /// Saves the list as it stands. Inside a runtime the file is written on a blocking thread,
+    /// never on the async thread that changed the list; saves land in the order they were made,
+    /// and only the newest of several waiting is written.
     fn save(&self, listed: &Listed) {
         let Some(path) = &self.path else {
             return;
@@ -962,12 +1304,46 @@ impl LidarrPendingAlbums {
             held: listed.held.clone(),
             finished_grabs: listed.finished_grabs.clone(),
         };
-        let written = serde_json::to_string_pretty(&file)
-            .map_err(std::io::Error::other)
-            .and_then(|text| state_file::save_atomic(path, &text));
-        if let Err(e) = written {
-            warn!("Could not save {}: {e}", path.display());
+        let text = match serde_json::to_string_pretty(&file) {
+            Ok(text) => text,
+            Err(e) => {
+                warn!("Could not save {}: {e}", path.display());
+                return;
+            }
+        };
+        let number = self.saves.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        *self.saves.newest.lock() = Some((number, text));
+        let (saves, path) = (self.saves.clone(), path.clone());
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || write_newest(&saves, &path));
+            }
+            Err(_) => write_newest(&saves, &path),
         }
+    }
+
+    /// Waits until every save made so far is on disk.
+    #[cfg(test)]
+    pub(crate) fn flush(&self) {
+        if let Some(path) = &self.path {
+            write_newest(&self.saves, path);
+        }
+    }
+}
+
+/// Writes the newest save not written yet, if any: one writer at a time, never an older text
+/// after a newer one.
+fn write_newest(saves: &Saves, path: &std::path::Path) {
+    let mut written = saves.written.lock();
+    let Some((number, text)) = saves.newest.lock().take() else {
+        return;
+    };
+    if number <= *written {
+        return;
+    }
+    match state_file::save_atomic(path, &text) {
+        Ok(()) => *written = number,
+        Err(e) => warn!("Could not save {}: {e}", path.display()),
     }
 }
 
@@ -1190,8 +1566,8 @@ mod tests {
         assert_eq!((found.artist_added, found.search_command), (5, 12));
         assert_eq!(found.release_choice, Some(choice(true)));
         assert_eq!(found.pin, Some(choice(false)));
-        assert!(reloaded.is_octos_grab("dl-1"));
-        assert!(!reloaded.is_octos_grab("DL-2"));
+        assert!(reloaded.knows_grab("dl-1"));
+        assert!(!reloaded.knows_grab("DL-2"));
         assert!(reloaded.uses_artist(5, "other"));
         assert!(!reloaded.uses_artist(5, "RG-ABC"));
         assert_eq!(reloaded.entries().len(), 1);
@@ -1347,23 +1723,133 @@ mod tests {
     }
 
     /// Lidarr's queue lists a finished download until its next refresh: once its entry is
-    /// forgotten, its id is still Octo's, across a restart, so the next pick never reads Octo's
-    /// own download as a grab of the user's.
+    /// forgotten, rows of its id inside its own span are still Octo's, across a restart, so the
+    /// next pick never reads Octo's own download as a grab of the user's. A grab of the same id
+    /// after it was accounted for (a torrent grabbed again by the user) is not Octo's.
     #[test]
-    fn a_forgotten_entrys_downloads_stay_octos() {
+    fn a_forgotten_entrys_downloads_stay_octos_only_inside_their_own_span() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let path = dir.path().join("lidarr-pending.json");
         let pending = LidarrPendingAlbums::new(Some(path.clone()));
+        let grabbed = Utc::now() - TimeDelta::hours(2);
+        let accounted = grabbed + TimeDelta::minutes(30);
         let mut entry = album("rg-abc", Utc::now());
-        entry.record_grab("DL-1", Some("qBittorrent"));
+        entry.record_grab_at("DL-1", Some("qBittorrent"), Some(grabbed));
+        entry.grab_mut("dl-1").expect("recorded").account(accounted);
         pending.remember(entry);
+        assert!(pending.is_octos_grab_at("dl-1", grabbed + TimeDelta::minutes(5)));
+        assert!(!pending.is_octos_grab_at("dl-1", accounted + TimeDelta::seconds(1)));
 
         pending.forget("rg-abc");
 
         let reloaded = LidarrPendingAlbums::new(Some(path));
         assert!(reloaded.get("rg-abc").is_none());
-        assert!(reloaded.is_octos_grab("dl-1"));
-        assert!(!reloaded.is_octos_grab("dl-2"));
+        assert!(reloaded.is_octos_grab_at("dl-1", grabbed));
+        assert!(reloaded.is_octos_grab_at("dl-1", accounted));
+        assert!(
+            !reloaded.is_octos_grab_at("dl-1", accounted + TimeDelta::minutes(10)),
+            "the same id grabbed again later is a new grab"
+        );
+        assert!(!reloaded.is_octos_grab_at("dl-1", grabbed - TimeDelta::minutes(1)));
+        assert!(!reloaded.is_octos_grab_at("dl-2", grabbed));
+        assert!(reloaded.knows_grab("DL-1"));
+    }
+
+    /// A file an older Octo wrote, with bare finished ids and bare record ids, still reads: the
+    /// bare finished ids say nothing of their span and are let go, the records keep their ids.
+    #[test]
+    fn an_older_save_of_finished_ids_and_records_still_reads() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("lidarr-pending.json");
+        std::fs::write(
+            &path,
+            r#"{"Albums":[{"ForeignAlbumId":"rg-old","RecordsToDelete":[12,{"Id":13,"Path":"/music/x.flac"}]}],"FinishedGrabs":["dl-old",{"DownloadId":"dl-new"}]}"#,
+        )
+        .expect("written");
+        let pending = LidarrPendingAlbums::new(Some(path));
+        let entry = pending.get("rg-old").expect("listed");
+        assert_eq!(
+            entry.records_to_delete,
+            [
+                MovedRecord { id: 12, path: None },
+                MovedRecord {
+                    id: 13,
+                    path: Some("/music/x.flac".into())
+                }
+            ]
+        );
+        assert!(!pending.knows_grab("dl-old"));
+        assert!(pending.knows_grab("dl-new"));
+    }
+
+    /// Un-hearting a whole album lets its person go from the follow its heart started, whose
+    /// songs are the album's own; with nobody's heart left on it the follow is asked to end.
+    #[test]
+    fn unhearting_an_album_lets_its_follow_go() {
+        let pending = LidarrPendingAlbums::new(None);
+        let mut album_gate = heart_gate("alice");
+        album_gate.origin = AcquisitionOrigin::AlbumHeart;
+        pending.remember(PendingAlbum {
+            search_command: 3,
+            songs: vec!["soulseek:teardrop".into(), "soulseek:angel".into()],
+            holders: vec!["alice".into()],
+            album_hearts: vec!["soulseek:mezzanine".into()],
+            gates: vec![
+                SongGate {
+                    gate: album_gate.clone(),
+                    ..song_gate("soulseek:teardrop", "alice")
+                },
+                SongGate {
+                    gate: album_gate,
+                    ..song_gate("soulseek:angel", "alice")
+                },
+            ],
+            ..album("rg-abc", Utc::now())
+        });
+
+        assert!(
+            pending.unhearted("soulseek:teardrop", "alice").is_empty(),
+            "a song's un-heart leaves the album heart's gates"
+        );
+        assert_eq!(pending.get("rg-abc").expect("listed").gates.len(), 2);
+
+        assert_eq!(pending.unhearted("soulseek:mezzanine", "alice"), ["rg-abc"]);
+        let entry = pending.get("rg-abc").expect("listed");
+        assert!(entry.gates.is_empty());
+        assert_eq!(entry.ended, Some(FollowEnd::Unhearted));
+    }
+
+    /// A save that changes nothing writes nothing: the follow reads Lidarr several times a second
+    /// while a download waits for its import.
+    #[test]
+    fn an_update_that_changes_nothing_writes_nothing() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("lidarr-pending.json");
+        let pending = LidarrPendingAlbums::new(Some(path.clone()));
+        pending.remember(album("rg-abc", Utc::now()));
+        std::fs::remove_file(&path).expect("removed");
+
+        assert!(pending.update("rg-abc", |entry| entry.lidarr_album_id = 7));
+        assert!(!path.exists(), "nothing changed, nothing written");
+
+        assert!(pending.update("rg-abc", |entry| entry.lidarr_album_id = 8));
+        assert!(path.exists());
+    }
+
+    /// Inside a runtime the list is written off the async thread, and in the order it changed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saves_inside_a_runtime_land_in_order() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("lidarr-pending.json");
+        let pending = LidarrPendingAlbums::new(Some(path.clone()));
+        pending.remember(album("rg-abc", Utc::now()));
+        for id in 1..=50 {
+            pending.update("rg-abc", |entry| entry.lidarr_album_id = id);
+        }
+        pending.flush();
+
+        let reloaded = LidarrPendingAlbums::new(Some(path));
+        assert_eq!(reloaded.get("rg-abc").expect("listed").lidarr_album_id, 50);
     }
 
     #[test]

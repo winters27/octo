@@ -310,3 +310,20 @@ async fn nobody_waiting_for_the_indexers_stops_the_reads() {
     assert_eq!(health_reads(&f), reads);
     assert_eq!(back.load(Ordering::SeqCst), 0);
 }
+
+/// A heart told to wait for the indexers while the watch decides to stop keeps the watch going:
+/// whether anyone waits and whether a watch runs change together, so no hold is ever left without
+/// a watch, and the next hold after a stop starts a new one.
+#[test]
+fn a_hold_that_comes_while_the_watch_decides_to_stop_keeps_it_going() {
+    let watch = super::super::health::IndexerWatch::default();
+    assert!(watch.hold(), "the first hold starts a watch");
+    let seen = watch.told();
+
+    assert!(!watch.hold(), "a watch runs already");
+    assert!(!watch.stop(seen), "a hold came while it looked");
+
+    let seen = watch.told();
+    assert!(watch.stop(seen));
+    assert!(watch.hold(), "the next hold starts a new watch");
+}

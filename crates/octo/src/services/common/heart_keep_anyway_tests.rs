@@ -694,3 +694,77 @@ async fn a_keep_that_cannot_land_leaves_the_track_held_and_offers_the_keep_again
     );
     stop.cancel();
 }
+
+/// MusicBrainz gave up on the question a held heart waited on: the heart runs again, and once it
+/// ends with nothing (nothing landed, nothing of the song held), its row says MusicBrainz could not
+/// answer for this song.
+#[tokio::test]
+async fn a_heart_whose_question_musicbrainz_gave_up_on_ends_with_that_line() {
+    use super::super::MUSIC_BRAINZ_GAVE_UP;
+
+    let rig = memory_rig();
+    let held = rig
+        .holds
+        .hold(song_hold("yesterday", WaitingFor::MusicBrainz, &["brandon"]));
+    rig.coordinator.hold_row_for(&held);
+    let (_taken, stop) = work(&rig, |_| Err(anyhow::anyhow!("no source has it")));
+
+    rig.coordinator.resume_after_gave_up(&held.key());
+
+    until(|| {
+        rig.tracker
+            .detail("soulseek:yesterday", None)
+            .and_then(|row| row.error)
+            .as_deref()
+            == Some(MUSIC_BRAINZ_GAVE_UP)
+    })
+    .await;
+    assert!(rig.holds.records_for("Track:soulseek:yesterday").is_empty());
+    stop.cancel();
+}
+
+/// "Keep these anyway" on a held track two people hold keeps it for the one who asked, alone:
+/// their own gate and their own request, from a copy of the held file, and only they leave the
+/// hold. The other still waits in it with the held file; when they keep it too, the held file
+/// itself lands for them and the hold ends.
+#[tokio::test]
+async fn keep_these_anyway_keeps_a_shared_held_track_for_the_caller_alone() {
+    let rig = memory_rig();
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let file = held_file(&dir, "night");
+    let night = rig.holds.hold(album_track("night", &file, &["brandon", "anna"]));
+    rig.coordinator.hold_row_for(&night);
+    let (taken, stop) = work(&rig, lands);
+
+    assert_eq!(
+        rig.coordinator.keep_anyway("soulseek:help-album", "anna"),
+        KeepAnyway::Keeping
+    );
+    until(|| {
+        rig.holds
+            .get(&night.key())
+            .is_some_and(|record| users(&record) == ["brandon"])
+    })
+    .await;
+
+    let first = taken.lock()[0].clone();
+    assert_eq!(first.requested_by(), ["anna"]);
+    let gates = first.gates();
+    assert_eq!(gates.len(), 1);
+    assert_eq!(gates[0].user, "anna");
+    let handed = first.place().held_files;
+    assert_eq!(handed.len(), 1);
+    assert_ne!(handed[0], file, "a copy of the held file");
+    assert!(Path::new(&file).is_file(), "brandon's held file stays");
+
+    assert_eq!(
+        rig.coordinator.keep_anyway("soulseek:help-album", "brandon"),
+        KeepAnyway::Keeping
+    );
+    until(|| rig.holds.get(&night.key()).is_none()).await;
+    let second = taken.lock()[1].clone();
+    assert_eq!(second.requested_by(), ["brandon"]);
+    assert_eq!(second.gates()[0].user, "brandon");
+    assert_eq!(second.place().held_files, [file]);
+    stop.cancel();
+}

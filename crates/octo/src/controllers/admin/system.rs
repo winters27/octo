@@ -45,6 +45,10 @@ pub const ACOUST_ID_OFF: &str = "AcoustID is off: Octo checks what played agains
 pub const ACOUST_ID_HOLDS: &str = "AcoustID is not answering; hearts wait for it";
 /// The downloads card's line once AcoustID refused the user's submission key.
 pub const SUBMISSION_KEY_REFUSED: &str = "AcoustID refused your submission key";
+/// The downloads card's line once AcoustID refused Octo's own key, set aside until the settings
+/// change.
+pub const BUILT_IN_KEY_REFUSED: &str =
+    "AcoustID refused Octo's own key. Add a free key of your own in Settings";
 /// The yt-dlp shim's line when it is too old to answer a fresh lookup.
 pub const OLD_SHIM: &str = "Update the yt-dlp shim so Octo can check YouTube";
 /// The setting the verification line's switch turns on.
@@ -145,27 +149,15 @@ pub async fn acquisitions(State(state): State<AppState>) -> Response {
     let show_askers = state.settings.current().subsonic.record_requested_by;
     let coordinator = &state.heart_acquisition_coordinator;
     let held = coordinator.keep_marks("");
-    // The rows any hold lists: a hold's own song's, and a held album track's album's.
-    let listed: HashSet<String> = state
-        .soulseek_holds
-        .snapshot()
-        .iter()
-        .flat_map(|record| {
-            let album = record
-                .album_track
-                .as_ref()
-                .and_then(|track| track.album_key.split_once(':'))
-                .map(|(provider, id)| key_of(provider, id));
-            std::iter::once(key_of(&record.provider, &record.external_id)).chain(album)
-        })
-        .collect();
+    // The rows someone may keep anyway now, read once for every row.
+    let keepable: HashSet<String> = coordinator.keepable_rows();
     let rows: Vec<serde_json::Value> = state
         .acquisition_tracker
         .all()
         .into_iter()
         .map(|mut row| {
             // The holds decide, never the row's own flag, which stays set after a keep is asked.
-            row.keep_anyway = listed.contains(&row.key) && !coordinator.keepers(&row.key).is_empty();
+            row.keep_anyway = keepable.contains(&key_of(&row.provider, &row.external_id));
             row.held_tracks = held
                 .held_tracks(&row.key)
                 .map(|count| i32::try_from(count).unwrap_or(i32::MAX));
@@ -456,9 +448,10 @@ fn round_trip_offset(now: chrono::DateTime<Utc>) -> String {
 
 /// `GET /api/admin/status`: a quick health snapshot of each backing service, so the dashboard
 /// shows at a glance whether Octo can reach Navidrome, slskd, Lidarr, the yt-dlp shim, octo-sonic
-/// and Last.fm, and the downloads card's lines (`downloads`, see [`download_lines`]). Open without
-/// a sign-in, but then it answers only `ok` and `configured` per service (see
-/// [`anonymous_status`]).
+/// and Last.fm, and the downloads card's lines (`downloads`, see [`download_lines`]), and whether
+/// this build carries Octo's own AcoustID key (`acoustIdBuiltInKey`, which the AcoustID key's
+/// setting says). Open without a sign-in, but then it answers only `ok` and `configured` per
+/// service (see [`anonymous_status`]).
 pub async fn get_status(State(state): State<AppState>, caller: Caller) -> Response {
     if !caller_of(&caller).is_some_and(AdminCaller::is_admin) {
         return json_ok(&anonymous_status(&state).await);
@@ -467,6 +460,7 @@ pub async fn get_status(State(state): State<AppState>, caller: Caller) -> Respon
         "octo": ServiceProbe::new(true, "Octo is responding"),
         "services": probe_all(&state).await,
         "downloads": download_lines(&state),
+        "acoustIdBuiltInKey": state.acoust_id.has_built_in_key(),
         "time": round_trip_offset(Utc::now()),
     }))
 }
@@ -486,6 +480,12 @@ fn download_lines(state: &AppState) -> Vec<serde_json::Value> {
             !state.settings.current().soulseek.verify_downloads,
             "verificationOff",
             VERIFICATION_OFF,
+            true,
+        ),
+        (
+            state.acoust_id.built_in_key_refused(),
+            "builtInKeyRefused",
+            BUILT_IN_KEY_REFUSED,
             true,
         ),
         (!state.acoust_id.is_on(), "acoustIdOff", ACOUST_ID_OFF, false),

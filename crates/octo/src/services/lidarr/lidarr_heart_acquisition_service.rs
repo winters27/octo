@@ -129,12 +129,20 @@ pub trait ILidarrHeartAcquisitionService: Send + Sync {
     /// any progress since the last one.
     fn song_event(&self, _provider: &str, _external_id: &str) {}
 
-    /// `user` took their heart on the song back: a follow nobody's heart is on any more ends.
+    /// `user` took their heart on the song or the hearted album back: a follow nobody's heart is
+    /// on any more ends.
     fn unhearted(&self, _provider: &str, _external_id: &str, _user: &str) {}
 
-    /// The person stopped waiting for Lidarr on a song whose kept copy waits for a follow: every
-    /// follow holding it ends, Octo's downloads there are removed, and the copy is placed now.
-    async fn stop_waiting_for_lidarr(&self, _provider: &str, _external_id: &str) -> StopWaiting {
+    /// Whether an open follow is on the song or the hearted album.
+    fn follows_heart(&self, _provider: &str, _external_id: &str) -> bool {
+        false
+    }
+
+    /// `user` stopped waiting for Lidarr on a song whose kept copy, kept for them, waits for a
+    /// follow: the copy is placed now and they leave the follow's waits for the song. A follow
+    /// nobody's heart waits on any more ends and Octo's downloads there are removed; one others
+    /// still wait on goes on.
+    async fn stop_waiting_for_lidarr(&self, _provider: &str, _external_id: &str, _user: &str) -> StopWaiting {
         StopWaiting::NothingWaits
     }
 
@@ -287,10 +295,27 @@ struct Inner {
     indexers: health::IndexerWatch,
     /// Stops every follow this service runs, for tests that start the service again.
     stopping: CancellationToken,
+    /// Put backs Lidarr failed, tried again when it next answers and at the poll pace.
+    put_backs: PutBacks,
+    /// Held while a restart puts back the picks it cut short before their search: a fresh pick
+    /// waits until that is done, so it never merges into an entry being put back.
+    restart: Arc<tokio::sync::RwLock<()>>,
+    /// The service itself, for work it starts on its own.
+    me: OnceLock<std::sync::Weak<Inner>>,
 
     /// By foreign album id, ignoring case.
     jobs: Mutex<HashMap<String, Arc<AlbumJob>>>,
     timing: Mutex<Timing>,
+}
+
+/// The put backs owed, by foreign album id, and what wakes the work that tries them again.
+#[derive(Default)]
+struct PutBacks {
+    owed: Mutex<HashSet<String>>,
+    /// Lidarr answered a call of Octo's while a put back is owed.
+    answered: tokio::sync::Notify,
+    /// The work that tries them again runs.
+    running: std::sync::atomic::AtomicBool,
 }
 
 /// What a pick's album needs for its pin: the release the person listened from when the album is
@@ -918,12 +943,16 @@ impl LidarrHeartAcquisitionService {
             fetches: Mutex::new(HashMap::new()),
             held_files: Mutex::new(HashMap::new()),
             indexers: health::IndexerWatch::default(),
+            put_backs: PutBacks::default(),
+            restart: Arc::new(tokio::sync::RwLock::new(())),
+            me: OnceLock::new(),
             jobs: Mutex::new(HashMap::new()),
             timing: Mutex::new(Timing {
                 poll_override: None,
                 turn_poll: Duration::from_millis(250),
             }),
         });
+        let _ = inner.me.set(Arc::downgrade(&inner));
         // A play of a song is one of the events a follow of it reads Lidarr's progress on.
         if let Some(ids) = &inner.ids {
             let weak = Arc::downgrade(&inner);
@@ -973,14 +1002,16 @@ impl LidarrHeartAcquisitionService {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        // Taken now, before any fresh pick can start, and let go once the put back is done.
+        let barrier = self.inner.restart.clone().try_write_owned().ok();
         let inner = self.inner.clone();
-        runtime.spawn(async move { inner.resume_all().await });
+        runtime.spawn(async move { inner.resume_all(barrier).await });
     }
 
     /// The same, waited for, for tests.
     #[cfg(test)]
     pub(crate) async fn put_back_after_restart(&self) {
-        self.inner.resume_all().await;
+        self.inner.resume_all(None).await;
     }
 
     /// Stops every follow this service runs, as a restart would, for tests.
@@ -1066,8 +1097,14 @@ impl ILidarrHeartAcquisitionService for LidarrHeartAcquisitionService {
         }
     }
 
-    async fn stop_waiting_for_lidarr(&self, provider: &str, external_id: &str) -> StopWaiting {
-        self.inner.stop_waiting(provider, external_id)
+    fn follows_heart(&self, provider: &str, external_id: &str) -> bool {
+        self.inner
+            .pending
+            .follows_heart(&format!("{provider}:{external_id}"))
+    }
+
+    async fn stop_waiting_for_lidarr(&self, provider: &str, external_id: &str, user: &str) -> StopWaiting {
+        self.inner.stop_waiting(provider, external_id, user).await
     }
 
     fn waits_for_lidarr(&self, provider: &str, external_id: &str) -> bool {
@@ -1846,13 +1883,106 @@ impl Inner {
         }
     }
 
-    /// After a restart: every pick cut short before its search is put back, a hold folder no
-    /// entry names goes, each copy held for an open follow has its row back, and every search is
-    /// followed on, the tracks its album holds settled again.
-    async fn resume_all(self: &Arc<Self>) {
+    /// A put back Lidarr failed: it is tried again when Lidarr next answers a call of Octo's, and
+    /// at the poll pace, until it is done.
+    fn owe_put_back(&self, foreign_album_id: &str) {
+        self.put_backs.owed.lock().insert(foreign_album_id.to_string());
+        if self
+            .put_backs
+            .running
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let me = self.me.get().and_then(std::sync::Weak::upgrade);
+        match (me, tokio::runtime::Handle::try_current()) {
+            (Some(me), Ok(runtime)) => {
+                runtime.spawn(me.put_backs_again());
+            }
+            _ => self
+                .put_backs
+                .running
+                .store(false, std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// Tries every owed put back again, on Lidarr's next answer or at the poll pace, until none
+    /// is owed. A pick that never searched is put back here; a searched one through its follow,
+    /// whose end puts it back.
+    async fn put_backs_again(self: Arc<Self>) {
+        loop {
+            let poll = self.poll(&self.settings.current().lidarr);
+            tokio::select! {
+                () = tokio::time::sleep(poll) => {}
+                () = self.put_backs.answered.notified() => {}
+                () = self.stopping.cancelled() => {
+                    self.put_backs.running.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+            let owed: Vec<String> = self.put_backs.owed.lock().drain().collect();
+            let settings = self.settings.current().lidarr.clone();
+            for key in owed {
+                let Some(entry) = self.pending.get(&key) else {
+                    continue;
+                };
+                if follow::lidarr_moved(&entry, &settings) == follow::LidarrMoved::Swapped {
+                    info!(
+                        "Octo let go of Lidarr's album {key}: the Lidarr it was asked of is no longer Octo's"
+                    );
+                    self.pending.forget(&key);
+                    continue;
+                }
+                if !entry.searched() {
+                    match put_back_unsearched(&self.client, Some(self.pending.as_ref()), &entry, poll).await {
+                        Ok(()) => info!("Put back Lidarr's album {key} on a later try"),
+                        Err(e) => {
+                            warn!("Could not put back Lidarr's album {key} yet: {e}");
+                            self.put_backs.owed.lock().insert(key);
+                        }
+                    }
+                } else if self.pending.is_running(&key) {
+                    // Its follow is still winding up; looked at again next time.
+                    self.put_backs.owed.lock().insert(key);
+                } else {
+                    self.ensure_following(&key);
+                }
+            }
+            // Lidarr answering the tries just made is no news.
+            let _ = self.put_backs.answered.notified().now_or_never();
+            if self.put_backs.owed.lock().is_empty() {
+                self.put_backs
+                    .running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                // One owed while this stopped starts it again.
+                if self.put_backs.owed.lock().is_empty()
+                    || self
+                        .put_backs
+                        .running
+                        .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// After a restart: every pick cut short before its search is put back (a fresh pick waits
+    /// for that behind `barrier`; one Lidarr fails is tried again later), a hold folder no entry
+    /// names goes, a held file that waits for no follow is placed, each copy held for an open
+    /// follow has its row back, and every search is followed on, the tracks its album holds
+    /// settled again.
+    async fn resume_all(self: &Arc<Self>, barrier: Option<tokio::sync::OwnedRwLockWriteGuard<()>>) {
         let poll = self.poll(&self.settings.current().lidarr);
-        put_back_unsearched_after_restart(&self.client, &self.pending, poll).await;
+        let failed = put_back_unsearched_after_restart(&self.client, &self.pending, poll).await;
+        drop(barrier);
+        for key in failed {
+            self.owe_put_back(&key);
+        }
         self.sweep_hold_folders();
+        for held in self.pending.release_unfollowed() {
+            self.place_held(held, FollowEnd::Done).await;
+        }
         if let Some(tracker) = &self.tracker {
             for held in self.pending.held() {
                 let open = held
@@ -1875,6 +2005,8 @@ impl Inner {
     }
 
     async fn submit(self: Arc<Self>, job: Arc<AlbumJob>) -> anyhow::Result<()> {
+        // A restart's put back of what it cut short ends first.
+        drop(self.restart.read().await);
         let snapshot = self.settings.current().lidarr.clone();
         let key = job.candidate.foreign_album_id.clone();
         // An upgrade borrowing this album takes the files its search brings in; the heart waits
@@ -2018,13 +2150,16 @@ impl Inner {
             year: job.album.year,
             asked_at: Utc::now(),
             various_artists: dotnet::eq_ignore_case(&foreign_artist_id, VARIOUS_ARTISTS),
+            foreign_artist_id: foreign_artist_id.clone(),
+            lidarr_url: lidarr_identity(settings),
             ..job.saved()
         };
         if existing.is_none() {
+            let artists_before = self.client.artists().await?.iter().map(|a| a.id).collect();
             entry.add = Some(PendingAdd {
                 foreign_artist_id: foreign_artist_id.clone(),
-                posted_at: Utc::now(),
-                artists_before: self.client.artists().await?.iter().map(|a| a.id).collect(),
+                posted_at: self.client.now().await?,
+                artists_before,
             });
         }
         self.save(&entry);
@@ -2037,14 +2172,27 @@ impl Inner {
             Ok(Prepared::Skipped(_)) => true,
             Err(_) => false,
         };
-        // Skipped, or Lidarr failed partway: put back what was sent. A put-back that fails is
-        // left to the next start.
-        let poll = self.poll(settings);
         let saved = self.pending.get(&key).unwrap_or(entry);
+        // The search or the grab may have reached Lidarr with no answer back in time: what it
+        // started is followed, never put back as unsearched under it. A refusal Lidarr answered
+        // started nothing.
+        let unanswered = matches!(prepared, Err(LidarrError::Canceled(_)));
+        if unanswered && saved.search_pending.is_some() && saved.lidarr_album_id > 0 {
+            warn!("Lidarr did not answer Octo's search of {key}; Octo follows whatever it started");
+            return Ok(Prepared::Searched {
+                album_id: saved.lidarr_album_id,
+            });
+        }
+        // Skipped, or Lidarr failed partway: put back what was sent. A put-back that fails is
+        // tried again when Lidarr next answers and at the poll pace.
+        let poll = self.poll(settings);
         match put_back_unsearched(&self.client, Some(self.pending.as_ref()), &saved, poll).await {
             Ok(()) if skipped => info!("Put back Lidarr's album {key}: nothing was searched"),
             Ok(()) => {}
-            Err(e) => warn!("Could not put back Lidarr's album {key}: {e}"),
+            Err(e) => {
+                warn!("Could not put back Lidarr's album {key}: {e}");
+                self.owe_put_back(&key);
+            }
         }
         prepared
     }
@@ -2097,32 +2245,65 @@ impl Inner {
         };
 
         if let Some(pin) = self.pin_for(job, &album).await {
-            entry.release_choice = Some(album.release_choice());
+            let before = album.release_choice();
+            entry.release_choice = Some(before.clone());
             entry.pin = Some(pin.clone());
             self.save(entry);
-            self.client.set_release_choice(album_id, &pin).await?;
+            // Pinned only while the choice is still the one just read: a change the user made
+            // meanwhile is never written over, and the pick steps out.
+            let pinned = self
+                .client
+                .set_release_choice_if(album_id, |now| now.release_choice() == before, &pin)
+                .await?;
+            if pinned.is_none() {
+                info!("Lidarr's album {album_id} changed while Octo pinned it; it is not searched");
+                self.pending
+                    .update(&entry.foreign_album_id, |saved| saved.pin = None);
+                return Ok(Prepared::Skipped(None));
+            }
             wait_for_rescans(&self.client, album_id, artist_id, artist_path.as_deref(), poll).await?;
             if let Err(line) = self.read_again(album_id, artist_id).await? {
                 return Ok(Prepared::Skipped(line));
             }
         }
 
-        // A release picked in Find songs is grabbed as it is: its grab is Octo's by its guid.
+        // Lidarr's time is saved before the search or the grab goes out, so a restart before its
+        // answer is saved still follows what it started. A release picked in Find songs is grabbed
+        // as it is: its grab is Octo's by its guid, saved before each grab is sent.
+        let pending_at = self.client.now().await?;
+        entry.search_pending = Some(pending_at);
+        let key = entry.foreign_album_id.clone();
         let release = job.songs.lock().release.clone();
         match release {
             Some(pick) => {
-                let posted = Utc::now();
-                let guid = self.client.grab_picked(album_id, &pick).await?;
-                entry.picked_guid = Some(guid);
-                entry.searched_at = Some(posted);
+                entry.picked_guid = Some(pick.guid.clone());
+                self.save(entry);
+                let guid = self
+                    .client
+                    .grab_picked_saving(album_id, &pick, |guid| {
+                        self.pending
+                            .update(&key, |saved| saved.picked_guid = Some(guid.to_string()));
+                    })
+                    .await?;
+                entry.picked_guid = Some(guid.clone());
+                entry.searched_at = Some(pending_at);
+                self.pending.update(&key, |saved| {
+                    saved.picked_guid = Some(guid);
+                    saved.searched_at = Some(pending_at);
+                });
             }
             None => {
+                self.save(entry);
                 let command = self.client.album_search(album_id).await?;
                 entry.search_command = command.id;
-                entry.searched_at = Some(command.queued.unwrap_or_else(Utc::now));
+                entry.searched_at = Some(command.queued.unwrap_or(pending_at));
+                let searched_at = entry.searched_at;
+                self.pending.update(&key, |saved| {
+                    saved.search_command = command.id;
+                    saved.searched_at = searched_at;
+                });
             }
         }
-        self.save(entry);
         Ok(Prepared::Searched { album_id })
     }
 
@@ -2650,30 +2831,25 @@ impl Inner {
         );
     }
 
-    /// The person stopped waiting for Lidarr: every open follow holding a kept copy of the song is
-    /// asked to end, and its follow, running or started again for it, places the copy.
-    fn stop_waiting(self: &Arc<Self>, provider: &str, external_id: &str) -> StopWaiting {
+    /// `user` stopped waiting for Lidarr on the song: their kept copy is placed now, and they leave
+    /// the waits of every follow it waited for. A follow anyone else's heart still waits on goes on;
+    /// one nobody's is on any more ends, its follow (running or started again for it) removing
+    /// Octo's downloads.
+    async fn stop_waiting(self: &Arc<Self>, provider: &str, external_id: &str, user: &str) -> StopWaiting {
         let song = format!("{provider}:{external_id}");
-        let follows: Vec<String> = self
-            .pending
-            .held()
-            .into_iter()
-            .filter(|held| held.kept && held.song == song)
-            .flat_map(|held| held.follows)
-            .collect();
-        let mut stopped = false;
-        for follow in follows {
-            if self.pending.request_end(&follow, FollowEnd::Stopped) {
-                info!("Stopped waiting for Lidarr on {follow}: the kept copy of {song} is placed");
-                self.ensure_following(&follow);
-                stopped = true;
-            }
+        let (copies, ending) = self.pending.stop_waiting(&song, user);
+        if copies.is_empty() {
+            return StopWaiting::NothingWaits;
         }
-        if stopped {
-            StopWaiting::Stopped
-        } else {
-            StopWaiting::NothingWaits
+        for held in copies {
+            info!("{user} stopped waiting for Lidarr: the kept copy of {song} is placed");
+            self.place_held(held, FollowEnd::Stopped).await;
         }
+        for follow in ending {
+            info!("Nobody waits for Lidarr on {follow} any more; Octo stops following it");
+            self.ensure_following(&follow);
+        }
+        StopWaiting::Stopped
     }
 
     async fn try_acquire(
@@ -2709,6 +2885,15 @@ impl Inner {
             }
         }
     }
+}
+
+/// The Lidarr Octo is set to use, by its address, or None when none is set.
+fn lidarr_identity(settings: &LidarrSettings) -> Option<String> {
+    let url = settings.base_url.as_deref().map(str::trim).unwrap_or_default();
+    if url.is_empty() || dotnet::is_null_or_white_space(settings.api_key.as_deref()) {
+        return None;
+    }
+    Some(dotnet::to_lower_invariant(url.trim_end_matches('/')))
 }
 
 /// `SamePath`: the two full paths are one (ordinal, as on Linux).

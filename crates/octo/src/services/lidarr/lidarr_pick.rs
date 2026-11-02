@@ -16,11 +16,14 @@ use std::time::Duration;
 
 use octo_core::common::dotnet;
 use octo_core::lidarr::LidarrError;
-use octo_core::lidarr::lidarr_client::{LidarrArtist, LidarrDeletion, LidarrHistoryEvent};
+use octo_core::lidarr::lidarr_client::{
+    LidarrAlbum, LidarrArtist, LidarrDeletion, LidarrHistoryEvent, LidarrQueueItem, LidarrReleaseChoice,
+};
 use octo_core::settings::SettingsStore;
 use tracing::{info, warn};
 
-use super::lidarr_heart_acquisition_service::translate_imported_path;
+use super::lidarr_heart_acquisition_service::{same_path, translate_imported_path};
+use super::lidarr_pending_albums::MovedRecord;
 use super::{LidarrClient, LidarrPendingAlbums, PendingAlbum};
 use crate::services::subsonic::NavidromeIdentityService;
 
@@ -134,15 +137,24 @@ impl LidarrArtistMusic {
 }
 
 /// Whether an audio file lies anywhere under a folder. Dot folders are skipped, as Lidarr's
-/// scans skip them, so nothing there can be linked.
+/// scans skip them, so nothing there can be linked. A folder reached twice (a link back up the
+/// tree) is read once.
 fn holds_audio(folder: &Path) -> bool {
+    holds_audio_once(folder, &mut HashSet::new())
+}
+
+fn holds_audio_once(folder: &Path, seen: &mut HashSet<PathBuf>) -> bool {
+    let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
+    if !seen.insert(real) {
+        return false;
+    }
     let Ok(entries) = std::fs::read_dir(folder) else {
         return false;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if !entry.file_name().to_string_lossy().starts_with('.') && holds_audio(&path) {
+            if !entry.file_name().to_string_lossy().starts_with('.') && holds_audio_once(&path, seen) {
                 return true;
             }
         } else if path.extension().is_some_and(|extension| {
@@ -204,18 +216,50 @@ pub async fn users_queue_item(
     if artist_id <= 0 {
         return Ok(false);
     }
-    Ok(client
-        .artist_queue(artist_id)
-        .await?
-        .iter()
-        .any(|item| !is_octos(pending, item.download_id.as_deref())))
+    for item in client.artist_queue(artist_id).await? {
+        if !octos_item(client, pending, &item).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
-fn is_octos(pending: Option<&LidarrPendingAlbums>, download_id: Option<&str>) -> bool {
+/// Whether a row of a download dated `date` (Lidarr's clock) is of one of Octo's own grabs.
+fn is_octos_at(
+    pending: Option<&LidarrPendingAlbums>,
+    download_id: Option<&str>,
+    date: chrono::DateTime<chrono::Utc>,
+) -> bool {
     match (pending, download_id) {
-        (Some(pending), Some(id)) => pending.is_octos_grab(id),
+        (Some(pending), Some(id)) => pending.is_octos_grab_at(id, date),
         _ => false,
     }
+}
+
+/// Whether a queue item is one of Octo's own grabs: its download's newest grab row (Lidarr's own
+/// date, from that download's history, else the item's own time) lies inside the span of a grab
+/// of Octo's with that id. A download id is not unique over time: a torrent the user grabs again
+/// after Octo was done with it keeps the id and is the user's.
+async fn octos_item(
+    client: &LidarrClient,
+    pending: Option<&LidarrPendingAlbums>,
+    item: &LidarrQueueItem,
+) -> Result<bool, LidarrError> {
+    let (Some(pending), Some(id)) = (pending, item.download_id.as_deref()) else {
+        return Ok(false);
+    };
+    if !pending.knows_grab(id) {
+        return Ok(false);
+    }
+    let grabbed = client
+        .download_history(id)
+        .await?
+        .iter()
+        .filter(|row| row.event == LidarrHistoryEvent::Grabbed)
+        .map(|row| row.date)
+        .max()
+        .or(item.added);
+    Ok(grabbed.is_some_and(|date| pending.is_octos_grab_at(id, date)))
 }
 
 /// What of an artist is the user's: the albums holding a file whose import row is not of one of
@@ -254,14 +298,15 @@ impl UsersOwn {
                 else {
                     continue;
                 };
-                let octos = row.download_client().is_some() && is_octos(pending, row.download_id.as_deref());
+                let octos = row.download_client().is_some()
+                    && is_octos_at(pending, row.download_id.as_deref(), row.date);
                 if !octos {
                     own.file_albums.insert(file.album_id);
                 }
             }
         }
         for item in client.artist_queue(artist_id).await? {
-            if !is_octos(pending, item.download_id.as_deref()) {
+            if !octos_item(client, pending, &item).await? {
                 own.queue_albums.insert(item.album_id.unwrap_or(0));
             }
         }
@@ -319,55 +364,138 @@ pub async fn put_back_searched(
     entry: &PendingAlbum,
     poll: Duration,
 ) -> Result<(), LidarrError> {
-    delete_octos_files(client, pending, music, entry).await?;
+    delete_octos_files(client, music, entry).await?;
     restore_pin(client, entry, poll).await?;
-    delete_octos_files(client, pending, music, entry).await?;
+    delete_octos_files(client, music, entry).await?;
     remove_what_octo_added(client, pending, entry).await
 }
 
 /// After a gated import landed, once Octo moved its files out: the album's release choice goes
-/// back as it was (the rescan it queues waited out), and the entry is forgotten. The album and
-/// the artist stay in Lidarr.
+/// back as it was (the rescan it queues waited out), then what Octo's add created goes as
+/// [`put_back_unsearched`] removes it (Octo's landed files were moved out and their records
+/// deleted, so nothing of them keeps it), and the entry is forgotten.
 pub async fn restore_after_landing(
     client: &LidarrClient,
     pending: &LidarrPendingAlbums,
     entry: &PendingAlbum,
     poll: Duration,
 ) -> Result<(), LidarrError> {
-    let restored = restore_pin(client, entry, poll).await;
-    pending.forget(&entry.foreign_album_id);
-    restored
+    restore_pin(client, entry, poll).await?;
+    remove_what_octo_added(client, Some(pending), entry).await
+}
+
+/// The album the entry names, as Lidarr has it now: None when Lidarr no longer has it, or when the
+/// album under that id is another (another Lidarr set since, or the album deleted and its id
+/// given again).
+pub async fn entrys_album(
+    client: &LidarrClient,
+    entry: &PendingAlbum,
+) -> Result<Option<LidarrAlbum>, LidarrError> {
+    if entry.lidarr_album_id <= 0 {
+        return Ok(None);
+    }
+    Ok(client
+        .album(entry.lidarr_album_id)
+        .await?
+        .filter(|album| dotnet::eq_ignore_case(&album.foreign_album_id, &entry.foreign_album_id)))
+}
+
+/// The MusicBrainz artist id the entry's album is under, as the pick saved it.
+fn entrys_foreign_artist(entry: &PendingAlbum) -> Option<&str> {
+    Some(entry.foreign_artist_id.as_str())
+        .filter(|id| !dotnet::is_blank(id))
+        .or_else(|| entry.add.as_ref().map(|add| add.foreign_artist_id.as_str()))
+        .filter(|id| !dotnet::is_blank(id))
+}
+
+/// The artist under Lidarr's `artist_id`, when it is still the entry's own artist by its
+/// MusicBrainz id: nothing of another artist is ever changed.
+async fn entrys_artist(
+    client: &LidarrClient,
+    entry: &PendingAlbum,
+    artist_id: i32,
+) -> Result<Option<LidarrArtist>, LidarrError> {
+    let Some(foreign) = entrys_foreign_artist(entry) else {
+        return Ok(None);
+    };
+    if artist_id <= 0 {
+        return Ok(None);
+    }
+    Ok(client
+        .artist(artist_id)
+        .await?
+        .filter(|artist| dotnet::eq_ignore_case(&artist.foreign_artist_id, foreign)))
+}
+
+/// Whether the album's release choice is still Octo's pin: exactly the pin, or the pin with only
+/// its monitored release moved to one Lidarr's import of Octo's own download switched the album
+/// to. A choice the user changed in any other way is the user's.
+pub fn still_octos_pin(current: &LidarrReleaseChoice, pin: &LidarrReleaseChoice, imported: &[i32]) -> bool {
+    if current == pin {
+        return true;
+    }
+    if current.any_release_ok != pin.any_release_ok {
+        return false;
+    }
+    let ids = |choice: &LidarrReleaseChoice| -> Vec<i32> {
+        let mut ids: Vec<i32> = choice.releases.iter().map(|release| release.id).collect();
+        ids.sort_unstable();
+        ids
+    };
+    if ids(current) != ids(pin) {
+        return false;
+    }
+    let monitored = |choice: &LidarrReleaseChoice| -> Vec<i32> {
+        choice
+            .releases
+            .iter()
+            .filter(|release| release.monitored)
+            .map(|release| release.id)
+            .collect()
+    };
+    let (now, pinned) = (monitored(current), monitored(pin));
+    now.len() == 1 && pinned.len() == 1 && imported.contains(&now[0])
 }
 
 /// Gives the album back exactly the release choice saved before Octo pinned it, when it is still
-/// exactly Octo's pin (a choice the user changed stays as the user set it), and waits out the
-/// rescan the change queues, so any file it links is seen by what comes after.
+/// Octo's pin ([`still_octos_pin`]; a choice the user changed stays as the user set it, checked
+/// again in the read right before the change), and waits out the rescan the change queues, so
+/// any file it links is seen by what comes after.
 async fn restore_pin(client: &LidarrClient, entry: &PendingAlbum, poll: Duration) -> Result<(), LidarrError> {
-    let album = match entry.lidarr_album_id {
-        id if id > 0 => client.album(id).await?,
-        _ => None,
+    let album = entrys_album(client, entry).await?;
+    let (Some(album), Some(saved), Some(pin)) = (&album, &entry.release_choice, &entry.pin) else {
+        return Ok(());
     };
-    if let (Some(album), Some(saved), Some(pin)) = (&album, &entry.release_choice, &entry.pin)
-        && album.release_choice() == *pin
+    let octos = |now: &LidarrAlbum| {
+        dotnet::eq_ignore_case(&now.foreign_album_id, &entry.foreign_album_id)
+            && still_octos_pin(&now.release_choice(), pin, &entry.imported_releases)
+    };
+    if !octos(album) {
+        return Ok(());
+    }
+    if client
+        .set_release_choice_if(album.id, octos, saved)
+        .await?
+        .is_some()
     {
-        client.set_release_choice(album.id, saved).await?;
         let path = client.artist(album.artist_id).await?.and_then(|a| a.path);
         wait_for_rescans(client, album.id, album.artist_id, path.as_deref(), poll).await?;
     }
     Ok(())
 }
 
-/// Deletes every track file of the entry's artist whose own import row is of one of Octo's
-/// downloads and names a download client: from disk by Octo first (when Octo can reach it), then
-/// its record, a record Lidarr no longer has counting as deleted.
+/// Deletes every track file of the entry's artist whose own import row is of one of this entry's
+/// own downloads, inside that download's own span, and names a download client: from disk by Octo
+/// first (when Octo can reach it), then its record, a record Lidarr no longer has counting as
+/// deleted. Another open entry's imports on the same artist, and a later grab of the same id, are
+/// never this entry's. Nothing is deleted under an artist that is no longer the entry's own.
 async fn delete_octos_files(
     client: &LidarrClient,
-    pending: Option<&LidarrPendingAlbums>,
     music: &LidarrArtistMusic,
     entry: &PendingAlbum,
 ) -> Result<(), LidarrError> {
     let artist_id = entry.lidarr_artist_id;
-    if artist_id <= 0 {
+    if entrys_artist(client, entry, artist_id).await?.is_none() {
         return Ok(());
     }
     let files = client.artist_track_files(artist_id).await?;
@@ -381,8 +509,10 @@ async fn delete_octos_files(
         let octos = rows.iter().any(|row| {
             row.file_id() == Some(file.id)
                 && row.download_client().is_some()
-                && (entry.owns_grab(row.download_id.as_deref().unwrap_or_default())
-                    || is_octos(pending, row.download_id.as_deref()))
+                && row
+                    .download_id
+                    .as_deref()
+                    .is_some_and(|id| entry.owns_grab_at(id, row.date))
         });
         if !octos {
             continue;
@@ -412,16 +542,15 @@ async fn delete_octos_files(
     Ok(())
 }
 
-/// Removes what Octo's add created, then forgets the entry.
+/// Removes what Octo's add created, then forgets the entry. The album and the artist are read
+/// first and must still be the entry's own by their MusicBrainz ids: an id Lidarr now gives
+/// something else (another Lidarr set since) is never deleted.
 async fn remove_what_octo_added(
     client: &LidarrClient,
     pending: Option<&LidarrPendingAlbums>,
     entry: &PendingAlbum,
 ) -> Result<(), LidarrError> {
-    let album = match entry.lidarr_album_id {
-        id if id > 0 => client.album(id).await?,
-        _ => None,
-    };
+    let album = entrys_album(client, entry).await?;
     let artist_id = album
         .as_ref()
         .map(|album| album.artist_id)
@@ -449,14 +578,14 @@ async fn remove_what_octo_added(
     Ok(())
 }
 
-/// Whether the artist Octo's add created is still only Octo's.
+/// Whether the artist Octo's add created is still only Octo's, and still the entry's own artist.
 async fn artist_is_octos(
     client: &LidarrClient,
     pending: Option<&LidarrPendingAlbums>,
     entry: &PendingAlbum,
     own: &UsersOwn,
 ) -> Result<bool, LidarrError> {
-    let Some(artist) = client.artist(entry.artist_added).await? else {
+    let Some(artist) = entrys_artist(client, entry, entry.artist_added).await? else {
         return Ok(false);
     };
     let untouched = !artist.monitored
@@ -487,7 +616,8 @@ pub async fn put_back_unsearched_after_restart(
     client: &LidarrClient,
     pending: &LidarrPendingAlbums,
     poll: Duration,
-) {
+) -> Vec<String> {
+    let mut failed = Vec::new();
     for mut entry in pending.entries().into_iter().filter(|entry| !entry.searched()) {
         if let Some(add) = entry.add.clone() {
             if !entry.album_added {
@@ -503,6 +633,7 @@ pub async fn put_back_unsearched_after_restart(
                             "Could not read Lidarr's album {} after a restart: {e}",
                             entry.foreign_album_id
                         );
+                        failed.push(entry.foreign_album_id.clone());
                         continue;
                     }
                 }
@@ -522,22 +653,42 @@ pub async fn put_back_unsearched_after_restart(
                             "Could not read Lidarr's artist {} after a restart: {e}",
                             add.foreign_artist_id
                         );
+                        failed.push(entry.foreign_album_id.clone());
                         continue;
                     }
                 }
             }
+            // What the restart learned of the add is saved, so a put back tried again later
+            // knows it too.
+            let found = entry.clone();
+            pending.update(&entry.foreign_album_id, |saved| {
+                saved.album_added |= found.album_added;
+                if saved.lidarr_album_id <= 0 {
+                    saved.lidarr_album_id = found.lidarr_album_id;
+                }
+                if saved.lidarr_artist_id <= 0 {
+                    saved.lidarr_artist_id = found.lidarr_artist_id;
+                }
+                if saved.artist_added <= 0 {
+                    saved.artist_added = found.artist_added;
+                }
+            });
         }
         match put_back_unsearched(client, Some(pending), &entry, poll).await {
             Ok(()) => info!(
                 "Put back Lidarr's album {} that a restart cut short before its search",
                 entry.foreign_album_id
             ),
-            Err(e) => warn!(
-                "Could not put back Lidarr's album {} after a restart: {e}",
-                entry.foreign_album_id
-            ),
+            Err(e) => {
+                warn!(
+                    "Could not put back Lidarr's album {} after a restart: {e}",
+                    entry.foreign_album_id
+                );
+                failed.push(entry.foreign_album_id.clone());
+            }
         }
     }
+    failed
 }
 
 /// Deletes the Lidarr record of a track file Octo moved into its own layout, so the artist reads
@@ -559,16 +710,26 @@ pub async fn delete_moved_record(
         Ok(LidarrDeletion::Deleted | LidarrDeletion::NotFound) => {
             if let Some(pending) = pending {
                 pending.update(foreign_album_id, |entry| {
-                    entry.records_to_delete.retain(|id| *id != track_file_id);
+                    entry
+                        .records_to_delete
+                        .retain(|record| record.id != track_file_id);
                 });
             }
         }
         Ok(LidarrDeletion::Conflict) => {
             info!("Lidarr keeps the record of track file {track_file_id} for now; asking again later");
             if let Some(pending) = pending {
+                let path = local_path.to_string();
                 pending.update(foreign_album_id, |entry| {
-                    if !entry.records_to_delete.contains(&track_file_id) {
-                        entry.records_to_delete.push(track_file_id);
+                    if !entry
+                        .records_to_delete
+                        .iter()
+                        .any(|record| record.id == track_file_id)
+                    {
+                        entry.records_to_delete.push(MovedRecord {
+                            id: track_file_id,
+                            path: Some(path),
+                        });
                     }
                 });
             }
@@ -577,24 +738,60 @@ pub async fn delete_moved_record(
     }
 }
 
-/// Asks Lidarr again to delete the records it kept, for the entry of this album.
+/// Asks Lidarr again to delete the records it kept, for the entry of this album. Each record is
+/// read first: one Lidarr no longer has is done; one that now names another file (another Lidarr,
+/// or the id given again) is left alone and let go; one whose file lies at its path again is left
+/// for now, since deleting it would delete that file.
 pub async fn retry_moved_records(
     client: &LidarrClient,
     pending: &LidarrPendingAlbums,
+    music: &LidarrArtistMusic,
     foreign_album_id: &str,
 ) {
     let Some(entry) = pending.get(foreign_album_id) else {
         return;
     };
-    for track_file_id in entry.records_to_delete {
-        match client.delete_track_file_record(track_file_id).await {
-            Ok(LidarrDeletion::Deleted | LidarrDeletion::NotFound) => {
-                pending.update(foreign_album_id, |entry| {
-                    entry.records_to_delete.retain(|id| *id != track_file_id);
-                });
+    let forget = |id: i32| {
+        pending.update(foreign_album_id, |entry| {
+            entry.records_to_delete.retain(|record| record.id != id);
+        });
+    };
+    for record in entry.records_to_delete {
+        let now = match client.track_file(record.id).await {
+            Ok(Some(now)) => now,
+            Ok(None) => {
+                forget(record.id);
+                continue;
             }
+            Err(e) => {
+                warn!("Could not read Lidarr's track file {}: {e}", record.id);
+                continue;
+            }
+        };
+        let local = now.path.as_deref().and_then(|path| music.local(path));
+        let names_it = match (&record.path, &local) {
+            (Some(saved), Some(local)) => same_path(saved, &local.to_string_lossy()),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if !names_it {
+            info!(
+                "Lidarr's track file {} now names another file; it is left alone",
+                record.id
+            );
+            forget(record.id);
+            continue;
+        }
+        if local.as_ref().is_some_and(|local| local.exists()) {
+            continue;
+        }
+        match client.delete_track_file_record(record.id).await {
+            Ok(LidarrDeletion::Deleted | LidarrDeletion::NotFound) => forget(record.id),
             Ok(LidarrDeletion::Conflict) => {}
-            Err(e) => warn!("Could not delete the record of Lidarr track file {track_file_id}: {e}"),
+            Err(e) => warn!(
+                "Could not delete the record of Lidarr track file {}: {e}",
+                record.id
+            ),
         }
     }
 }

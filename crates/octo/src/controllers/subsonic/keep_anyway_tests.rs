@@ -265,6 +265,11 @@ async fn keep_acquisition_anyway_saves_the_keep_before_ok_and_answers_10_50_and_
         error_of(&t.keep("admin", "key=soulseek:help").await),
         (10, NAME_THE_PERSON.to_string())
     );
+    assert_eq!(
+        error_of(&t.keep("admin", "key=soulseek:angel").await),
+        (70, NOTHING_WAITING.to_string()),
+        "nothing of it is held, so there is nobody to name"
+    );
 
     let ok = t.keep("alice", "key=soulseek:help").await;
     assert_eq!(ok["status"], "ok", "{ok}");

@@ -141,6 +141,24 @@ impl HeartAcquisitionCoordinator {
         keepers
     }
 
+    /// Every row (as `provider:id`, the provider in lower case) someone waiting in its holds may
+    /// keep anyway now, from one look at the holds: a list of rows asks once for all of them.
+    pub fn keepable_rows(&self) -> HashSet<String> {
+        let mut rows = HashSet::new();
+        let Some(holds) = &self.extras.holds else {
+            return rows;
+        };
+        for record in holds.snapshot() {
+            if record.holders.iter().any(|holder| {
+                let user = holder.user.trim();
+                !user.is_empty() && keepable_by(&record, user)
+            }) {
+                rows.extend(rows_of(&record));
+            }
+        }
+        rows
+    }
+
     /// Every hold the row `key` lists, oldest first.
     fn records_of_row(&self, key: &str) -> Vec<HeldAcquisition> {
         let key = row_key(key);
@@ -246,11 +264,21 @@ impl HeartAcquisitionCoordinator {
         (!rest.holders.is_empty()).then_some(rest)
     }
 
-    /// One hold's keeps: its held files when any is left (one set, for everyone who holds it),
+    /// One hold's keeps: its held files when any is left, landed for each asker on their own,
     /// else each asker's own heard audio.
     async fn carry_out(&self, record: &HeldAcquisition, users: &[String]) {
         if record.held_files.iter().any(|file| Path::new(file).is_file()) {
-            self.keep_held_files(record).await;
+            for user in users {
+                let current = self
+                    .extras
+                    .holds
+                    .as_ref()
+                    .and_then(|holds| holds.get(&record.key()));
+                match current {
+                    Some(current) => self.keep_held_files(&current, user).await,
+                    None => return,
+                }
+            }
             return;
         }
         // Its files are gone and the song is in the library: the keep landed before Octo stopped,
@@ -282,65 +310,86 @@ impl HeartAcquisitionCoordinator {
             .is_some()
     }
 
-    /// A hold's file lands as it is, for everyone who holds it, and the hold ends. A keep that
-    /// cannot land clears the request, so the row offers it again; a hold with no file left ends.
-    async fn keep_held_files(&self, record: &HeldAcquisition) {
+    /// A hold's file lands as it is for `user` alone: into their own library, counted as theirs by
+    /// no proof (nothing heard is read), and they leave the hold. Anyone else in the hold keeps
+    /// waiting with the held files, so while someone else is left `user` lands a copy of them; the
+    /// last one lands the files themselves. A keep that cannot land clears this person's request,
+    /// so their row offers it again; a hold with no file left ends.
+    async fn keep_held_files(&self, record: &HeldAcquisition, user: &str) {
         let Some(holds) = self.extras.holds.clone() else {
+            return;
+        };
+        let user = user.trim();
+        let Some(holder) = record
+            .holders
+            .iter()
+            .find(|holder| eq_ignore_case(holder.user.trim(), user))
+            .cloned()
+        else {
+            holds.update(&record.key(), |kept| {
+                kept.keep_requested
+                    .retain(|asker| !eq_ignore_case(asker.trim(), user))
+            });
             return;
         };
         let key = record.key();
         let origin = record.origin();
-        let requested_by = record
-            .requested_by
-            .clone()
-            .or_else(|| record.holders.first().map(|holder| holder.user.clone()))
-            .filter(|user| !user.trim().is_empty());
-        let target = requested_by
-            .as_deref()
-            .and_then(|user| self.import_target(user).ok())
-            .unwrap_or(AcquisitionTarget::Shared);
-        let r = record.album_track.as_ref().map(|track| track.r.clone());
-        // Everyone who holds it counts the file as theirs, by no proof: nothing heard is read.
-        let gates: Vec<HeartGate> = record
-            .holders
-            .iter()
-            .map(|holder| HeartGate {
-                user: holder.user.trim().to_string(),
-                origin,
-                r: r.clone(),
-                heard: None,
-                heard_seconds: None,
-                reading: HeardReading::NotHeard,
-                stand_in: None,
-            })
-            .collect();
+        let target = self.import_target(user).unwrap_or(AcquisitionTarget::Shared);
+        let gate = HeartGate {
+            user: user.to_string(),
+            origin,
+            r: record.album_track.as_ref().map(|track| track.r.clone()),
+            heard: None,
+            heard_seconds: None,
+            reading: HeardReading::NotHeard,
+            stand_in: None,
+        };
         for attempt in 0..2 {
-            let files: Vec<String> = holds
-                .get(&key)
-                .unwrap_or_else(|| record.clone())
+            let current = holds.get(&key).unwrap_or_else(|| record.clone());
+            let files: Vec<String> = current
                 .held_files
-                .into_iter()
+                .iter()
                 .filter(|file| Path::new(file).is_file())
+                .cloned()
                 .collect();
             if files.is_empty() {
                 info!("Held {key} has no file left to keep; it ends");
                 self.end_kept(record);
                 return;
             }
+            let others = current
+                .holders
+                .iter()
+                .any(|other| !eq_ignore_case(other.user.trim(), user));
+            let handed = if others {
+                match copies_for(&files, user) {
+                    Ok(copies) => copies,
+                    Err(e) => {
+                        warn!("The keep of {key} for {user} could not copy its files: {e}");
+                        break;
+                    }
+                }
+            } else {
+                files
+            };
             let (completion, joined) = self.direct_queue.enqueue_keeping(
                 origin,
-                gates.clone(),
-                files,
+                vec![gate.clone()],
+                handed.clone(),
                 &target,
                 &record.provider,
                 &record.external_id,
                 Some(DownloadSource::Soulseek),
-                requested_by.as_deref(),
+                Some(user),
             );
-            match completion.wait().await {
+            let landed = completion.wait().await;
+            if others && landed.is_err() {
+                remove_copies(&handed);
+            }
+            match landed {
                 Ok(path) => {
-                    info!("Held {key} is kept anyway: {path}");
-                    self.end_kept(record);
+                    info!("Held {key} is kept anyway for {user}: {path}");
+                    self.leave_after_keep(record, &holder, None);
                     return;
                 }
                 // It joined a download already running for the song, which is not a keep: the
@@ -354,8 +403,11 @@ impl HeartAcquisitionCoordinator {
                 }
             }
         }
-        // Not kept: the row goes back to the line it waits with, offering the keep again.
-        if let Some(still) = holds.update(&key, |kept| kept.keep_requested.clear()) {
+        // Not kept: this person's request is cleared, and the row offers the keep again.
+        if let Some(still) = holds.update(&key, |kept| {
+            kept.keep_requested
+                .retain(|asker| !eq_ignore_case(asker.trim(), user))
+        }) {
             self.hold_row_for(&still);
         }
     }
@@ -478,10 +530,22 @@ impl HeartAcquisitionCoordinator {
         let Some(holds) = self.extras.holds.clone() else {
             return;
         };
+        let files = holds
+            .get(&record.key())
+            .map_or_else(|| record.held_files.clone(), |current| current.held_files);
         let left = holds.release_holder(&record.key(), &holder.user);
         self.let_go_of_copies(&record.provider, &record.external_id, holder);
-        if left.is_none() && record.album_track.is_some() {
-            self.end_album_track(record);
+        if left.is_none() {
+            // Nobody waits in the hold any more: what it held goes with it.
+            for file in files.iter().filter(|file| Path::new(file).is_file()) {
+                match std::fs::remove_file(file) {
+                    Ok(()) => debug!("Deleted the held {file}: nobody waits for it"),
+                    Err(e) => warn!("Could not delete the held {file}: {e}"),
+                }
+            }
+            if record.album_track.is_some() {
+                self.end_album_track(record);
+            }
         }
         let song = track_base_key(&record.provider, &record.external_id);
         let waiting = left.or_else(|| holds.records_for(&song).into_iter().next());
@@ -568,6 +632,43 @@ impl HeartAcquisitionCoordinator {
             record.key()
         );
         self.leave_after_keep(record, holder, Some(HEARD_GONE));
+    }
+}
+
+/// Copies of a hold's files for one person's keep, beside them in a folder of that person's own,
+/// each under its own name: the pipeline lands the copies, and the files stay held for the others.
+fn copies_for(files: &[String], user: &str) -> std::io::Result<Vec<String>> {
+    let folder_name: String = user
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let mut copies = Vec::new();
+    for file in files {
+        let source = Path::new(file);
+        let (Some(parent), Some(name)) = (source.parent(), source.file_name()) else {
+            remove_copies(&copies);
+            return Err(std::io::Error::other(format!("{file} names no file")));
+        };
+        let folder = parent.join(format!("kept-for-{folder_name}"));
+        let copy = folder.join(name);
+        let made = std::fs::create_dir_all(&folder).and_then(|()| std::fs::copy(source, &copy));
+        if let Err(e) = made {
+            remove_copies(&copies);
+            return Err(e);
+        }
+        copies.push(copy.to_string_lossy().into_owned());
+    }
+    Ok(copies)
+}
+
+/// Deletes the copies a keep could not land, and their folder once it is empty.
+fn remove_copies(copies: &[String]) {
+    for copy in copies {
+        let path = Path::new(copy);
+        let _ = std::fs::remove_file(path);
+        if let Some(folder) = path.parent() {
+            let _ = std::fs::remove_dir(folder);
+        }
     }
 }
 

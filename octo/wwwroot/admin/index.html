@@ -1989,7 +1989,7 @@
               <div class="set-info">
                 <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-acoustid"/></svg>AcoustID API key</div>
                 <div class="set-info-d">Free from <a href="https://acoustid.org/new-application" target="_blank" rel="noopener">acoustid.org/new-application</a>.</div>
-                <div class="set-info-more">Left blank, Octo uses its own key; your own key takes its place. Type off to turn AcoustID off; the length check and its memory of rejected files still work.</div>
+                <div class="set-info-more" id="acoustid-key-help">Octo's published images bring Octo's own key, used while this is blank; your own key takes its place. Type off to turn AcoustID off; the length check and its memory of rejected files still work.</div>
               </div>
               <input class="set-input" type="password" name="Soulseek.AcoustIdApiKey" autocomplete="new-password" />
             </div>
@@ -2488,6 +2488,7 @@
               <div class="set-info">
                 <div class="set-info-t" id="imp-trickle-title">Nothing to fetch</div>
                 <div class="set-info-d" id="imp-trickle-line"></div>
+                <div class="set-info-d" id="imp-acoustid-key" hidden></div>
               </div>
               <div class="imp-actions">
                 <button class="btn" type="button" id="imp-retry" hidden>Try not found again</button>

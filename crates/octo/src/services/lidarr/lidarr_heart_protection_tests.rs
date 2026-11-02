@@ -82,6 +82,8 @@ struct Pipeline {
     asked: Arc<Mutex<Vec<Asked>>>,
     placed: Arc<Mutex<Vec<HeldPlacement>>>,
     dropped: Arc<Mutex<Vec<(HeldPlacement, Vec<String>)>>>,
+    /// Titles whose file a hearted song's gates take half a second to judge.
+    slow: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Pipeline {
@@ -214,6 +216,10 @@ impl IDownloadService for Pipeline {
         });
         // The file judged is the one offered: a take of the song is refused by its own name.
         let named = |set: &HashSet<String>| set.iter().any(|title| file.ends_with(&format!(" - {title}")));
+        let slow = !place.gates.is_empty() && named(&self.slow.lock());
+        if slow {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
         if !place.gates.is_empty() {
             if named(&self.refused_for_hearts.lock()) {
                 for gate in &place.gates {
@@ -340,6 +346,10 @@ struct Fixture {
     placed: Arc<Mutex<Vec<HeldPlacement>>>,
     /// The kept copies the pipeline dropped for a proven one, and for whom.
     dropped: Arc<Mutex<Vec<(HeldPlacement, Vec<String>)>>>,
+    /// Titles whose file the pipeline takes half a second to judge.
+    slow: Arc<Mutex<HashSet<String>>>,
+    /// The settings of the service built last.
+    settings: Mutex<Option<Arc<SettingsStore>>>,
 }
 
 /// How a test's service is built beyond the defaults.
@@ -409,7 +419,14 @@ impl Fixture {
             tracker: Arc::new(AcquisitionTracker::new(None, Clock::system())),
             placed: Arc::default(),
             dropped: Arc::default(),
+            slow: Arc::default(),
+            settings: Mutex::new(None),
         }
+    }
+
+    /// The settings of the service built last, which a test may change while it runs.
+    fn settings(&self) -> Arc<SettingsStore> {
+        self.settings.lock().clone().expect("a service was built")
     }
 
     /// Lidarr's next search of Mezzanine grabs one download of these tracks, finished at once and
@@ -464,6 +481,7 @@ impl Fixture {
             .octo_root
             .unwrap_or_else(|| self.root.path().to_path_buf());
         settings.set_raw("Library:DownloadPath", Some(&octo_root.to_string_lossy()));
+        *self.settings.lock() = Some(settings.clone());
         let identity = NavidromeIdentityService::new(settings.clone(), reqwest::Client::new());
 
         let metadata = self.metadata.clone();
@@ -531,6 +549,7 @@ impl Fixture {
             asked: self.asked.clone(),
             placed: self.placed.clone(),
             dropped: self.dropped.clone(),
+            slow: self.slow.clone(),
         });
         let client = Arc::new(LidarrClient::new(settings.clone()));
         client.set_metadata_poll(Duration::from_millis(20));

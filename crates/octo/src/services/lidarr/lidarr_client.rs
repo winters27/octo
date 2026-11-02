@@ -242,6 +242,18 @@ impl LidarrClient {
     /// refused by its guid; the album's releases are then listed once more and the same
     /// release, by its indexer, title and size, is grabbed under its new guid.
     pub async fn grab_picked(&self, album_id: i32, pick: &LidarrReleasePick) -> Result<String, LidarrError> {
+        self.grab_picked_saving(album_id, pick, |_| {}).await
+    }
+
+    /// The same, telling `before` each guid right before the grab under it is sent, so the caller
+    /// can save it first.
+    pub async fn grab_picked_saving(
+        &self,
+        album_id: i32,
+        pick: &LidarrReleasePick,
+        before: impl Fn(&str),
+    ) -> Result<String, LidarrError> {
+        before(&pick.guid);
         match self.grab_release(pick).await {
             Ok(()) => return Ok(pick.guid.clone()),
             // Most likely forgotten; found again below, or refused in plain words.
@@ -260,6 +272,7 @@ impl LidarrClient {
             title: Some(again.title),
             size: again.size,
         };
+        before(&fresh.guid);
         match self.grab_release(&fresh).await {
             Ok(()) => Ok(fresh.guid),
             Err(LidarrError::Http(_)) => Err(LidarrError::InvalidOperation(PICK_REFUSED_TEXT.into())),
@@ -528,6 +541,15 @@ impl LidarrClient {
             .collect()
     }
 
+    /// One track file record by Lidarr's id, or None when Lidarr no longer has it.
+    pub async fn track_file(&self, track_file_id: i32) -> Result<Option<LidarrTrackFile>, LidarrError> {
+        self.get_object_or_none(&format!("/api/v1/trackfile/{track_file_id}"))
+            .await?
+            .as_ref()
+            .map(parse_track_file)
+            .transpose()
+    }
+
     /// Every track file of one album.
     pub async fn album_track_files(&self, album_id: i32) -> Result<Vec<LidarrTrackFile>, LidarrError> {
         self.get_array(&format!("/api/v1/trackfile?albumId={album_id}"))
@@ -571,8 +593,34 @@ impl LidarrClient {
 
     /// When the running Lidarr started.
     pub async fn start_time(&self) -> Result<Option<DateTime<Utc>>, LidarrError> {
-        let status = self.get_object("/api/v1/system/status").await?;
-        nullable_date(&status, "startTime")
+        Ok(self.status_times().await?.0)
+    }
+
+    /// The time on Lidarr's own clock, to the second, from its answer's `Date` header: every time
+    /// Octo compares with Lidarr's dates comes from Lidarr.
+    pub async fn now(&self) -> Result<DateTime<Utc>, LidarrError> {
+        Ok(self.status_times().await?.1)
+    }
+
+    /// When the running Lidarr started, and the time on its clock now.
+    pub async fn status_times(&self) -> Result<(Option<DateTime<Utc>>, DateTime<Utc>), LidarrError> {
+        let request = self.request(Method::GET, "/api/v1/system/status", None)?;
+        let timeout = request.timeout.unwrap_or(Self::TIMEOUT);
+        let response = self.send(request).await?;
+        let now = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| DateTime::parse_from_rfc2822(value.trim()).ok())
+            .map(|date| date.with_timezone(&Utc))
+            .ok_or_else(|| LidarrError::InvalidOperation("Lidarr's answer carries no Date header.".into()))?;
+        let text = response
+            .text()
+            .await
+            .map_err(|error| transport_error(error, timeout))?;
+        let node = serde_json::from_str(&text).map_err(|e| LidarrError::Json(e.to_string()))?;
+        let status = Self::object_of(node)?;
+        Ok((nullable_date(&status, "startTime")?, now))
     }
 
     /// Lidarr's health checks as they stand.
@@ -652,8 +700,25 @@ impl LidarrClient {
         album_id: i32,
         choice: &LidarrReleaseChoice,
     ) -> Result<LidarrAlbum, LidarrError> {
+        self.set_release_choice_if(album_id, |_| true, choice)
+            .await?
+            .ok_or_else(|| LidarrError::InvalidOperation("Lidarr's album changed meanwhile.".into()))
+    }
+
+    /// The same, only when the album as Lidarr sends it right before the change still passes
+    /// `still`: a change someone made in Lidarr since Octo last read the album is never written
+    /// over. None when it did not pass, and nothing was changed.
+    pub async fn set_release_choice_if(
+        &self,
+        album_id: i32,
+        still: impl Fn(&LidarrAlbum) -> bool,
+        choice: &LidarrReleaseChoice,
+    ) -> Result<Option<LidarrAlbum>, LidarrError> {
         let path = format!("/api/v1/album/{album_id}");
         let mut resource = self.get_object(&path).await?;
+        if !still(&parse_library_album(&resource)?) {
+            return Ok(None);
+        }
         resource.insert("anyReleaseOk".into(), Value::Bool(choice.any_release_ok));
         if let Some(Value::Array(releases)) = resource.get_mut("releases") {
             for release in releases.iter_mut().filter_map(Value::as_object_mut) {
@@ -664,7 +729,7 @@ impl LidarrClient {
             }
         }
         let updated = self.send_json(Method::PUT, &path, &resource).await?;
-        parse_library_album(&updated)
+        parse_library_album(&updated).map(Some)
     }
 
     /// Deletes an album from Lidarr, never its files, and keeps it off no import list.

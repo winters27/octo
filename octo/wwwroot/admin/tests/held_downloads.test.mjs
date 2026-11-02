@@ -21,6 +21,8 @@ function slice(from, to) {
 
 const checksBlock = slice('function renderDownloadChecks(lines)', "document.getElementById('status-refresh')");
 const menusBlock = slice('const ACQ_MENUS = {', '// Fetched songs: the log folds under the row');
+const keyHelpBlock = slice('const ACOUSTID_KEY_HELP = {', '// The downloads card: what');
+const importKeyBlock = slice('function renderImportKeyLine(key, t)', 'function renderTrickle()');
 
 function element(extra = {}) {
   return {
@@ -71,6 +73,44 @@ const VERIFICATION_OFF = {
   warning: true,
   turnOn: 'Soulseek.VerifyDownloads',
 };
+
+// One block run against a page of these elements, by id.
+function blockPage(block, elements) {
+  const context = {
+    document: { getElementById: id => elements[id] ?? null },
+    impEl: id => elements[id] ?? null,
+    escapeHtml,
+  };
+  vm.createContext(context);
+  vm.runInContext(block, context);
+  return context;
+}
+
+test('the AcoustID key setting says what a blank key means on this server', () => {
+  const help = element({ textContent: 'the page\'s own words' });
+  const page = blockPage(keyHelpBlock, { 'acoustid-key-help': help });
+  page.renderAcoustIdKeyHelp(undefined);
+  assert.equal(help.textContent, 'the page\'s own words', 'an older server says nothing of it');
+  page.renderAcoustIdKeyHelp(true);
+  assert.ok(help.textContent.startsWith('Left blank, Octo uses its own key'));
+  page.renderAcoustIdKeyHelp(false);
+  assert.ok(help.textContent.includes('no key of Octo\'s own, so AcoustID is off until you add one'));
+  assert.ok(!help.textContent.includes('uses its own key'));
+});
+
+test('while songs wait on Octo\'s own AcoustID key the import card says a key of their own is faster, with the link', () => {
+  const line = element({ hidden: true });
+  const page = blockPage(importKeyBlock, { 'imp-acoustid-key': line });
+  const key = { text: 'Octo checks these songs with its own AcoustID key, one every 20 seconds. A free key of your own in Settings checks them faster', link: 'https://acoustid.org/new-application' };
+  page.renderImportKeyLine(key, { queued: 3, downloading: 0 });
+  assert.equal(line.hidden, false);
+  assert.ok(line.innerHTML.includes('one every 20 seconds'));
+  assert.ok(line.innerHTML.includes('href="https://acoustid.org/new-application"'));
+  page.renderImportKeyLine(key, { queued: 0, downloading: 0 });
+  assert.equal(line.hidden, true, 'nothing waits, nothing to say');
+  page.renderImportKeyLine(undefined, { queued: 3, downloading: 1 });
+  assert.equal(line.hidden, true, 'a key of their own, or AcoustID off');
+});
 
 test('the downloads card shows each line, and the verification line carries its switch', () => {
   const page = checksPage();
@@ -143,10 +183,14 @@ function menusPage(answers) {
     const details = element({ open: true, dataset: { acqMenu: kind, acqKey: key }, querySelector: () => body });
     return { details, body };
   };
-  const pick = (kind, key, user, body) =>
-    context.acqMenuAct(element({ dataset: { acqAct: kind, acqKey: key, acqUser: user }, closest: () => body }));
+  const pick = (kind, key, token, body) =>
+    context.acqMenuAct(element({ dataset: { acqAct: kind, acqKey: key, acqToken: token }, closest: () => body }));
   return { context, calls, open, pick };
 }
+
+// A holder menu's person as the server lists them: the label it shows and the token that names
+// them back.
+const holder = (label, token) => ({ label, token });
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
@@ -164,9 +208,12 @@ test('a held row offers Keep anyway, Keep these anyway for two or more held trac
   assert.equal(context.acqHeldMenus({ key: 'soulseek:angel' }), '', 'nothing held offers nothing');
 });
 
-test('the holder menu reads who may keep, and a name picked keeps for that person', async () => {
+test('the holder menu reads who may keep, and a person picked keeps for them by their token', async () => {
   const page = menusPage({
-    '/api/admin/acquisitions/holders': { status: 200, body: { key: 'soulseek:help', keepers: ['alice', 'bob'], stopWaiters: [] } },
+    '/api/admin/acquisitions/holders': {
+      status: 200,
+      body: { key: 'soulseek:help', keepers: [holder('alice', 'token-a'), holder('bob', 'token-b')], stopWaiters: [] },
+    },
     '/api/admin/acquisitions/keep': { status: 200, body: { status: 'ok' } },
   });
   const { details, body } = page.open('keep', 'soulseek:help');
@@ -176,32 +223,47 @@ test('the holder menu reads who may keep, and a name picked keeps for that perso
     { path: '/api/admin/acquisitions/holders?key=soulseek%3Ahelp', method: 'GET', body: null },
   ]);
   assert.ok(body.innerHTML.includes('Whose copy to keep'));
-  assert.ok(body.innerHTML.includes('data-acq-user="alice"') && body.innerHTML.includes('data-acq-user="bob"'));
+  assert.ok(body.innerHTML.includes('>alice<') && body.innerHTML.includes('>bob<'));
+  assert.ok(body.innerHTML.includes('data-acq-token="token-b"'));
 
   // A redraw of the open menu opens it again; nothing new is read.
   page.context.acqMenuToggled(details);
   await settle();
   assert.equal(page.calls.fetches.length, 1);
 
-  await page.pick('keep', 'soulseek:help', 'bob', body);
+  await page.pick('keep', 'soulseek:help', 'token-b', body);
   assert.deepEqual(page.calls.fetches[1], {
     path: '/api/admin/acquisitions/keep',
     method: 'POST',
-    body: { key: 'soulseek:help', user: 'bob' },
+    body: { key: 'soulseek:help', token: 'token-b' },
   });
   assert.equal(page.calls.reloads, 1, 'the list is drawn again');
   assert.equal(page.context.acqMenuMarkup('soulseek:help', 'keep', 'Keep anyway').includes(' open'), false, 'the menu closes once kept');
 });
 
+test('with Record who asked off the menu names nobody: it shows the labels the server gives', async () => {
+  const page = menusPage({
+    '/api/admin/acquisitions/holders': {
+      status: 200,
+      body: { keepers: [holder('Listener 1', 'token-a'), holder('Listener 2', 'token-b')], stopWaiters: [] },
+    },
+  });
+  const { details, body } = page.open('keep', 'soulseek:help');
+  page.context.acqMenuToggled(details);
+  await settle();
+  assert.ok(body.innerHTML.includes('>Listener 1<') && body.innerHTML.includes('>Listener 2<'));
+  assert.ok(!body.innerHTML.includes('alice') && !body.innerHTML.includes('bob'));
+});
+
 test('a refused keep shows its words in the menu, which stays open', async () => {
   const page = menusPage({
-    '/api/admin/acquisitions/holders': { status: 200, body: { keepers: ['alice'], stopWaiters: [] } },
+    '/api/admin/acquisitions/holders': { status: 200, body: { keepers: [holder('alice', 'token-a')], stopWaiters: [] } },
     '/api/admin/acquisitions/keep': { status: 409, body: { error: 'Nothing is waiting to be kept' } },
   });
   const { details, body } = page.open('keep', 'soulseek:help');
   page.context.acqMenuToggled(details);
   await settle();
-  await page.pick('keep', 'soulseek:help', 'alice', body);
+  await page.pick('keep', 'soulseek:help', 'token-a', body);
   const redrawn = page.context.acqMenuMarkup('soulseek:help', 'keep', 'Keep anyway');
   assert.ok(redrawn.includes(' open'));
   assert.ok(redrawn.includes('Nothing is waiting to be kept'));
@@ -209,18 +271,18 @@ test('a refused keep shows its words in the menu, which stays open', async () =>
 
 test('Stop waiting for Lidarr picks from whose kept copy waits, and stops for that person', async () => {
   const page = menusPage({
-    '/api/admin/acquisitions/holders': { status: 200, body: { keepers: [], stopWaiters: ['alice'] } },
+    '/api/admin/acquisitions/holders': { status: 200, body: { keepers: [], stopWaiters: [holder('alice', 'token-a')] } },
     '/api/admin/acquisitions/stop-waiting': { status: 200, body: { status: 'ok' } },
   });
   const { details, body } = page.open('stop', 'soulseek:teardrop');
   page.context.acqMenuToggled(details);
   await settle();
   assert.ok(body.innerHTML.includes('Whose copy should stop waiting'));
-  await page.pick('stop', 'soulseek:teardrop', 'alice', body);
+  await page.pick('stop', 'soulseek:teardrop', 'token-a', body);
   assert.deepEqual(page.calls.fetches[1], {
     path: '/api/admin/acquisitions/stop-waiting',
     method: 'POST',
-    body: { key: 'soulseek:teardrop', user: 'alice' },
+    body: { key: 'soulseek:teardrop', token: 'token-a' },
   });
 });
 

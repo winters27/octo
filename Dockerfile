@@ -64,7 +64,18 @@ ARG OCTO_VERSION
 # conversion below runs again only when the converter's bytes change.
 RUN CARGO_PROFILE_RELEASE_LTO=off cargo build --release --locked --package octo-core --bin octo-places \
     && install -D -m 0755 target/release/octo-places /out/places/octo-places
-RUN cargo build --release --locked --package octo --bin octo \
+# Octo's own AcoustID application key, compiled into the server (octo-core's soulseek settings
+# read it with option_env!), never written in the source. The published images are given it by
+# docker.yml from the repository's secret, with OCTO_REQUIRE_ACOUSTID_KEY=1, which fails the
+# build when the key is blank. A build from source given neither has no built-in key: AcoustID
+# then needs a key of the user's own. Declared only here, so nothing before this step (the
+# converter above included) holds the key, and the final image's history never names it.
+ARG OCTO_ACOUSTID_APPLICATION_KEY
+ARG OCTO_REQUIRE_ACOUSTID_KEY
+RUN if [ -n "$OCTO_REQUIRE_ACOUSTID_KEY" ] && [ -z "$(printf '%s' "$OCTO_ACOUSTID_APPLICATION_KEY" | tr -d '[:space:]')" ]; then \
+        echo "OCTO_ACOUSTID_APPLICATION_KEY is blank, and this build needs Octo's own AcoustID key." >&2; exit 1; \
+    fi \
+    && cargo build --release --locked --package octo --bin octo \
     && install -D -m 0755 target/release/octo /out/octo
 
 # ---- Place data: the download ----
