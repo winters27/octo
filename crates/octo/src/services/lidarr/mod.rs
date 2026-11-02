@@ -19,15 +19,13 @@ pub use lidarr_album_claims::LidarrAlbumClaims;
 pub use lidarr_client::LidarrClient;
 pub use lidarr_heart_acquisition_service::{
     ILidarrHeartAcquisitionService, IndexersAwaited, IndexersBack, LidarrHeartAcquisitionService,
-    LidarrHeartExtras, LidarrImportEvent, LidarrImportOutcome, LidarrWaits, NO_INDEXER_SEARCHES,
-    OwnLibraryKeeper, PauseRounds,
+    LidarrHeartExtras, LidarrImportEvent, LidarrImportOutcome, LidarrWaits, NO_INDEXER_SEARCHES, PauseRounds,
 };
 pub use lidarr_import_handoff::{LidarrImport, LidarrImportHandoff};
 pub use lidarr_pending_albums::{
-    CANNOT_SEE, FinishedGrab, FollowEnd, FollowedGrab, FollowedItem, GivingWay, HELD_FOR_LIDARR,
-    HeldPlacement, HeldTrack, LidarrPendingAlbums, MovedRecord, OwnCopy, PROVEN_ELSEWHERE, PendingAdd,
-    PendingAlbum, PlacedAs, REPLACED_YOURS, ReplacedCopy, STOP_WAITING, SongGate, StopWaiting, Stopped,
-    UnsettledFollow,
+    CANNOT_SEE, FinishedGrab, FollowEnd, FollowedGrab, FollowedItem, HELD_FOR_LIDARR, HeldPlacement,
+    HeldTrack, LidarrPendingAlbums, MovedRecord, PROVEN_ELSEWHERE, PendingAdd, PendingAlbum, ProvenSong,
+    REPLACED_YOURS, SongGate, UnsettledFollow,
 };
 pub use lidarr_pick::{ALREADY_LOOKING, ArtistMusic, LidarrArtistMusic};
 pub use lidarr_track_fetcher::{

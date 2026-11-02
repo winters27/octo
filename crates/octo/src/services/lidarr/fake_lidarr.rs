@@ -410,6 +410,9 @@ struct State {
     clock: DateTime<Utc>,
     /// How far Lidarr's clock is from Octo's.
     skew: TimeDelta,
+    /// How far the `Date` header of every answer is from Lidarr's own clock: a proxy in front of
+    /// Lidarr writing its own.
+    date_skew: TimeDelta,
     on_search: Vec<(i32, String, String)>,
     searches: usize,
     deleted: Vec<i32>,
@@ -488,6 +491,7 @@ impl FakeLidarr {
                 start_time: now - TimeDelta::hours(1),
                 clock: now,
                 skew: TimeDelta::zero(),
+                date_skew: TimeDelta::zero(),
                 on_search: Vec::new(),
                 searches: 0,
                 deleted: Vec::new(),
@@ -751,6 +755,12 @@ impl FakeLidarr {
                 .slow_requests
                 .push((method.to_string(), prefix.to_ascii_lowercase(), delay));
         });
+    }
+
+    /// A proxy in front of Lidarr writes the `Date` header of every answer by its own clock, `skew`
+    /// away from Lidarr's, from now on.
+    pub fn set_date_header_skew(&self, skew: TimeDelta) {
+        self.with(|state| state.date_skew = skew);
     }
 
     /// Lidarr's clock runs `skew` away from Octo's from now on (its start time with it).
@@ -2284,8 +2294,9 @@ impl State {
         if self.mode == CommandMode::Instant && method != "GET" {
             self.drain();
         }
-        // Lidarr's own clock, to the second, as every answer of its web server carries it.
-        let date = (Utc::now() + self.skew)
+        // Lidarr's own clock, to the second, as every answer of its web server carries it (or a
+        // proxy's in front of it).
+        let date = (Utc::now() + self.skew + self.date_skew)
             .format("%a, %d %b %Y %H:%M:%S GMT")
             .to_string();
         response.insert_header("Date", date.as_str())

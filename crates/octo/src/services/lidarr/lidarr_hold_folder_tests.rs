@@ -9,12 +9,10 @@ use octo_core::fingerprint::heart_gate::{HeardReading, HeardRecording};
 use octo_core::lidarr::lidarr_client::LidarrReleaseChoice;
 use tokio::task::JoinHandle;
 
-use octo_core::models::domain::Song;
-
 use super::*;
+use crate::services::lidarr::FollowEnd;
 use crate::services::lidarr::fake_lidarr::GrabFile;
 use crate::services::lidarr::lidarr_pick::put_back_searched;
-use crate::services::lidarr::{HELD_FOR_LIDARR, OwnLibraryKeeper, StopWaiting};
 
 /// `user`'s gate for Teardrop: what they heard is Lidarr's Teardrop recording, `rec-3`.
 fn teardrop_gate(user: &str) -> HeartGate {
@@ -155,7 +153,7 @@ fn hold_kept_copy(f: &Fixture) -> HeldPlacement {
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
         users: vec!["alice".into()],
-        own_copies: Vec::new(),
+        proven_for: Vec::new(),
     };
     f.pending.hold_placement(held.clone());
     held
@@ -488,88 +486,10 @@ async fn a_kept_copy_gives_way_to_the_songs_proven_lidarr_import() {
     until(|| !f.dropped.lock().is_empty() || !f.placed.lock().is_empty()).await;
     over(&f).await;
     assert_eq!(f.taken(), ["Teardrop"]);
-    assert_eq!(*f.dropped.lock(), [(held.clone(), vec!["alice".to_string()])]);
+    assert_eq!(dropped(&f), [(held.held_path.clone(), vec!["alice".to_string()])]);
     assert!(f.placed.lock().is_empty(), "the kept copy is never placed");
     assert!(!Path::new(&held.held_path).exists());
     assert!(f.pending.held().is_empty());
-}
-
-/// `user`'s gate for Angel.
-fn angel_gate(user: &str) -> HeartGate {
-    HeartGate {
-        r: Some(HeardRecording {
-            ids: vec!["rec-1".into()],
-            title: "Angel".into(),
-            artist: "Massive Attack".into(),
-            ..Default::default()
-        }),
-        ..teardrop_gate(user)
-    }
-}
-
-/// Alice hearts Teardrop and Bob hearts Angel of Mezzanine, each with their own gate, on one
-/// follow of Octo's download of both; Alice's kept copy of Teardrop waits for it, and she stops
-/// waiting: her copy is placed at once while Bob still waits on the follow. With `rescan`, a
-/// rescan then links her copy into the album, so Lidarr's import replaces it.
-async fn alice_stops_while_bob_waits(
-    f: &Fixture,
-    rescan: bool,
-) -> (LidarrHeartAcquisitionService, HeldPlacement) {
-    f.lidarr.plan_grab(
-        7,
-        Grab::of("dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]),
-    );
-    let service = f.service(None, 1);
-    f.metadata.songs.lock().insert(
-        ("soulseek".into(), "angel-heart".into()),
-        Song {
-            title: "Angel".into(),
-            artist: "Massive Attack".into(),
-            album: "Mezzanine".into(),
-            track: Some(1),
-            external_provider: Some("soulseek".into()),
-            external_id: Some(f.id("Angel")),
-            ..Default::default()
-        },
-    );
-    let alice = gated_heart(f, &service, "alice", false);
-    watching(f, "dl-1").await;
-    let bob = {
-        let service = service.clone();
-        tokio::spawn(async move {
-            within(service.try_acquire_track(
-                "soulseek",
-                "angel-heart",
-                false,
-                Some("bob"),
-                AcquisitionOrigin::Heart,
-                &[angel_gate("bob")],
-            ))
-            .await
-        })
-    };
-    assert!(!alice.await.expect("the task"));
-    assert!(!bob.await.expect("the task"));
-    let held = hold_kept_copy(f);
-    assert_eq!(
-        service
-            .stop_waiting_for_lidarr("soulseek", &f.id("Teardrop"), "alice")
-            .await,
-        StopWaiting::Stopped
-    );
-    until(|| f.placed.lock().len() == 1).await;
-    assert!(Path::new(&held.target).is_file(), "alice's copy is placed");
-    let entry = f.pending.get(ALBUM_ID).expect("listed");
-    assert!(entry.following(), "bob still waits on the follow");
-    assert_eq!(entry.holders, ["bob"]);
-    if rescan {
-        f.lidarr.queue_command(
-            "RescanFolders",
-            serde_json::json!({ "folders": ["/data/music/Massive Attack"], "artistIds": [5] }),
-            "manual",
-        );
-    }
-    (service, held)
 }
 
 /// The library's files of a song, by their path under the octo root.
@@ -580,94 +500,54 @@ fn files_of(f: &Fixture, title: &str) -> Vec<String> {
         .collect()
 }
 
-/// Alice stopped waiting, so her kept Teardrop was placed; Lidarr's Teardrop then passes her own
-/// gate, which still judges it: her copy gives way to it, its link goes, and it never comes back.
-/// The library ends with one Teardrop, Lidarr's proven one; Bob's Angel lands too.
+/// The kept copies the pipeline dropped, by where each was held, and for whom.
+fn dropped(f: &Fixture) -> Vec<(String, Vec<String>)> {
+    f.dropped
+        .lock()
+        .iter()
+        .map(|(copy, users)| (copy.held_path.clone(), users.clone()))
+        .collect()
+}
+
+/// Alice's follow ends (her download made no progress) while Octo's download cannot be removed
+/// from Lidarr's queue yet: Lidarr may still import it, so her kept copy stays held and is never
+/// placed. Lidarr does import it, and the late import is judged as during the follow: it passes
+/// her gate, her copy gives way to it, and the library ends with one Teardrop, Lidarr's proven one.
 #[tokio::test]
-async fn a_stoppers_placed_copy_gives_way_to_lidarrs_file_that_passes_their_gate() {
+async fn a_late_import_after_the_follow_ended_is_judged_before_the_kept_copy_is_placed() {
     let f = Fixture::new().await;
-    let (_service, held) = alice_stops_while_bob_waits(&f, false).await;
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!gated_heart(&f, &service, "alice", false).await.expect("the task"));
+    watching(&f, "dl-1").await;
+    let held = hold_kept_copy(&f);
+    f.lidarr.fail_next("DELETE", "queue", 100_000);
+
+    assert!(f.pending.request_end(ALBUM_ID, FollowEnd::DeadDownload));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        f.placed.lock().is_empty(),
+        "never placed while Octo's download may still be imported"
+    );
+    assert!(
+        Path::new(&held.held_path).is_file(),
+        "it plays from the hold path"
+    );
 
     f.lidarr.complete("dl-1");
     f.lidarr.refresh();
 
-    until(|| f.taken.lock().len() == 2).await;
+    until(|| !f.dropped.lock().is_empty()).await;
     over(&f).await;
-    assert_eq!(f.taken(), ["Angel", "Teardrop"]);
+    assert_eq!(f.taken(), ["Teardrop"]);
+    assert!(f.placed.lock().is_empty(), "the kept copy is never placed");
+    assert_eq!(dropped(&f), [(held.held_path.clone(), vec!["alice".to_string()])]);
     assert_eq!(
         files_of(&f, "Teardrop"),
         ["Massive Attack - Teardrop.flac"],
         "one Teardrop, Lidarr's proven one"
     );
-    assert!(!Path::new(&held.target).exists(), "alice's copy gave way");
-    assert_eq!(
-        f.dropped
-            .lock()
-            .iter()
-            .map(|(copy, users)| (copy.held_path.clone(), users.clone()))
-            .collect::<Vec<_>>(),
-        [(held.target.clone(), vec!["alice".to_string()])]
-    );
-    assert!(
-        !f.root
-            .path()
-            .join(".octo-incoming/held/lidarr-placed")
-            .read_dir()
-            .is_ok_and(|mut links| links.next().is_some()),
-        "its link went"
-    );
-}
-
-/// Alice stopped waiting, so her kept Teardrop was placed, and a rescan linked it, so Lidarr's
-/// import replaced it. Lidarr's Teardrop is refused by her gate: it is not kept as one of the
-/// album's tracks though Bob's Angel passed, and her copy comes back from its link. The library
-/// ends with one Teardrop, hers.
-#[tokio::test]
-async fn a_stoppers_replaced_copy_comes_back_when_lidarrs_file_is_refused() {
-    let f = Fixture::new().await;
-    f.refused_for_hearts.lock().insert("Teardrop".into());
-    let (_service, held) = alice_stops_while_bob_waits(&f, true).await;
-
-    f.lidarr.complete("dl-1");
-    f.lidarr.refresh();
-
-    until(|| !f.taken.lock().is_empty()).await;
-    over(&f).await;
-    assert_eq!(f.taken(), ["Angel"]);
-    assert_eq!(
-        files_of(&f, "Teardrop"),
-        ["Massive Attack/Mezzanine/03 - Teardrop.m4a"],
-        "one Teardrop, alice's copy, back where it was placed"
-    );
-    assert!(Path::new(&held.target).is_file());
-    assert!(f.dropped.lock().is_empty(), "nothing gave way");
-}
-
-/// A heart joining the follow after Alice stopped waiting saves the job into its entry again:
-/// Alice, whose only gate on it is stopped, never holds the follow again, and her gate stays to
-/// judge Lidarr's Teardrop for her copy.
-#[tokio::test]
-async fn a_heart_joining_after_a_stop_never_has_the_stopper_hold_the_follow_again() {
-    let f = Fixture::new().await;
-    let (service, _held) = alice_stops_while_bob_waits(&f, false).await;
-
-    let carol = gated_heart(&f, &service, "carol", false);
-    until(|| {
-        f.pending
-            .get(ALBUM_ID)
-            .is_some_and(|entry| entry.holders.iter().any(|holder| holder == "carol"))
-    })
-    .await;
-    let entry = f.pending.get(ALBUM_ID).expect("listed");
-    assert_eq!(entry.holders, ["bob", "carol"]);
-    assert!(
-        entry
-            .gates
-            .iter()
-            .filter(|gate| gate.gate.user == "alice")
-            .all(|gate| gate.stopped)
-    );
-    assert!(!carol.await.expect("the task"));
 }
 
 /// Alice and Bob each heart Teardrop with their own gate, on one follow of Octo's download of
@@ -708,235 +588,42 @@ fn hold_kept_copy_for(f: &Fixture, name: &str, users: &[&str]) -> HeldPlacement 
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
         users: users.iter().map(|user| user.to_string()).collect(),
-        own_copies: Vec::new(),
+        proven_for: Vec::new(),
     };
     f.pending.hold_placement(held.clone());
     held
 }
 
-/// One kept copy of Teardrop for Alice and Bob, in the shared library: Alice's stop places it for
-/// both (one library, one file), Bob's gate still judges Lidarr's file, and when that file passes
-/// Bob's gate alone (Alice's refuses it), the copy gives way all the same. The library ends with
-/// one Teardrop, Lidarr's proven one.
+/// One kept copy of Teardrop for Alice and Bob, held for the follow in the shared library. Lidarr's
+/// Teardrop passes Bob's gate alone (Alice's refuses it): that proof is saved on the copy before
+/// anything is dropped, so when dropping it fails at once (its record could not be written), the
+/// follow's end drops it instead of placing it. The library ends with one Teardrop, Lidarr's
+/// proven one, never the kept copy beside it.
 #[tokio::test]
-async fn a_shared_copy_gives_way_to_lidarrs_file_proven_for_anyone_it_was_kept_for() {
+async fn a_shared_copy_whose_drop_failed_gives_way_at_the_follows_end_never_placed() {
     let f = Fixture::new().await;
-    let service = alice_and_bob_wait_on_teardrop(&f).await;
+    alice_and_bob_wait_on_teardrop(&f).await;
     let held = hold_kept_copy_for(&f, "03 - Teardrop.m4a", &["alice", "bob"]);
     f.refused_users.lock().insert("alice".into());
-
-    assert_eq!(
-        service
-            .stop_waiting_for_lidarr("soulseek", &f.id("Teardrop"), "alice")
-            .await,
-        StopWaiting::Stopped
-    );
-    until(|| f.placed.lock().len() == 1).await;
-    assert!(Path::new(&held.target).is_file(), "placed for both");
-    let entry = f.pending.get(ALBUM_ID).expect("listed");
-    assert!(entry.following(), "bob still waits on the follow");
-    assert_eq!(entry.holders, ["bob"]);
+    *f.drops_failing.lock() = Some(());
 
     f.lidarr.complete("dl-1");
     f.lidarr.refresh();
 
-    until(|| !f.dropped.lock().is_empty()).await;
+    until(|| !f.dropped.lock().is_empty() || !f.placed.lock().is_empty()).await;
     over(&f).await;
     assert_eq!(f.taken(), ["Teardrop"]);
+    assert!(f.placed.lock().is_empty(), "the kept copy is never placed");
+    assert_eq!(
+        dropped(&f),
+        [(held.held_path.clone(), vec!["bob".to_string()])],
+        "it gave way at the follow's end, for bob's proof"
+    );
     assert_eq!(
         files_of(&f, "Teardrop"),
         ["Massive Attack - Teardrop.flac"],
         "one Teardrop, Lidarr's proven one"
     );
-    assert_eq!(
-        f.dropped
-            .lock()
-            .iter()
-            .map(|(copy, users)| (copy.held_path.clone(), users.clone()))
-            .collect::<Vec<_>>(),
-        [(held.target.clone(), vec!["alice".to_string(), "bob".to_string()])]
-    );
-}
-
-/// Alice's copy of Teardrop is placed when she stops waiting, while Carol's copy of another
-/// version still waits for the follow: the song's row keeps saying it waits, for Carol.
-#[tokio::test]
-async fn a_stop_leaves_the_row_waiting_while_another_copy_of_the_song_waits() {
-    let f = Fixture::new().await;
-    let service = alice_and_bob_wait_on_teardrop(&f).await;
-    let alices = hold_kept_copy_for(&f, "03 - Teardrop.m4a", &["alice"]);
-    hold_kept_copy_for(&f, "03 - Teardrop (Carol).m4a", &["carol"]);
-    let song = f.id("Teardrop");
-    f.tracker.wait_aside(
-        "soulseek",
-        &song,
-        &["alice".to_string(), "carol".to_string()],
-        HELD_FOR_LIDARR,
-    );
-
-    assert_eq!(
-        service.stop_waiting_for_lidarr("soulseek", &song, "alice").await,
-        StopWaiting::Stopped
-    );
-    until(|| f.placed.lock().len() == 1).await;
-    assert!(Path::new(&alices.target).is_file());
-    assert_eq!(
-        row_line(&f, &song).as_deref(),
-        Some(HELD_FOR_LIDARR),
-        "carol's copy still waits"
-    );
-    assert_eq!(f.pending.held().len(), 1);
-}
-
-/// The line the downloads row of the song shows now.
-fn row_line(f: &Fixture, song: &str) -> Option<String> {
-    f.tracker
-        .detail(&format!("soulseek:{song}"), None)
-        .and_then(|row| row.note)
-}
-
-/// What lands a kept copy in a member's own library, in the tests: Alice has one, and each copy
-/// it is handed is recorded and moved into her library folder.
-struct OwnLibraries {
-    root: PathBuf,
-    kept: Mutex<Vec<(String, String)>>,
-}
-
-#[async_trait]
-impl OwnLibraryKeeper for OwnLibraries {
-    fn own_library(&self, user: &str) -> bool {
-        user == "alice"
-    }
-
-    async fn keep_for(&self, _provider: &str, _external_id: &str, file: &str, user: &str) -> bool {
-        let folder = self.root.join(format!("members/{user}"));
-        std::fs::create_dir_all(&folder).expect("made");
-        let landed = folder.join(Path::new(file).file_name().expect("a name"));
-        std::fs::rename(file, &landed).expect("moved");
-        self.kept
-            .lock()
-            .push((landed.to_string_lossy().into_owned(), user.to_string()));
-        true
-    }
-}
-
-/// With Family on and a library of her own, Alice's stop lands a copy of the kept file in her
-/// library for her alone; the original stays held for Bob, nothing lands in the shared library,
-/// and the row still says it waits, for Bob.
-#[tokio::test]
-async fn a_members_stop_lands_a_copy_in_her_own_library_and_the_original_waits_for_the_rest() {
-    let f = Fixture::new().await;
-    let service = alice_and_bob_wait_on_teardrop(&f).await;
-    let keeper = Arc::new(OwnLibraries {
-        root: f.root.path().to_path_buf(),
-        kept: Mutex::new(Vec::new()),
-    });
-    service.use_keeper(keeper.clone());
-    let held = hold_kept_copy_for(&f, "03 - Teardrop.m4a", &["alice", "bob"]);
-    let song = f.id("Teardrop");
-
-    assert_eq!(
-        service.stop_waiting_for_lidarr("soulseek", &song, "alice").await,
-        StopWaiting::Stopped
-    );
-
-    let kept = keeper.kept.lock().clone();
-    assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].1, "alice");
-    assert_eq!(
-        std::fs::read(&kept[0].0).expect("her copy"),
-        b"the version alice and bob heard"
-    );
-    assert!(Path::new(&held.held_path).is_file(), "the original stays held");
-    let still = f.pending.held();
-    assert_eq!(still.len(), 1);
-    assert_eq!(still[0].users, ["bob"]);
-    assert!(f.placed.lock().is_empty(), "nothing in the shared library");
-    assert!(!f.pending.has_octos_copies());
-    let entry = f.pending.get(ALBUM_ID).expect("listed");
-    assert!(entry.following());
-    assert_eq!(entry.holders, ["bob"]);
-    assert_eq!(
-        row_line(&f, &song).as_deref(),
-        Some(HELD_FOR_LIDARR),
-        "bob's wait goes on"
-    );
-}
-
-/// Alice stops waiting while placing her copy must wait (the library is busy), and Lidarr's
-/// Teardrop is judged and passes her gate meanwhile: the copy, listed the moment she stopped,
-/// gives way the moment it is placed. The library ends with one Teardrop, Lidarr's proven one.
-#[tokio::test]
-async fn a_stop_while_lidarrs_file_is_judged_never_leaves_two_files() {
-    let f = Fixture::new().await;
-    f.lidarr.plan_grab(
-        7,
-        Grab::of("dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]),
-    );
-    let service = f.service(None, 1);
-    f.metadata.songs.lock().insert(
-        ("soulseek".into(), "angel-heart".into()),
-        Song {
-            title: "Angel".into(),
-            artist: "Massive Attack".into(),
-            album: "Mezzanine".into(),
-            track: Some(1),
-            external_provider: Some("soulseek".into()),
-            external_id: Some(f.id("Angel")),
-            ..Default::default()
-        },
-    );
-    let alice = gated_heart(&f, &service, "alice", false);
-    watching(&f, "dl-1").await;
-    let bob = {
-        let service = service.clone();
-        tokio::spawn(async move {
-            within(service.try_acquire_track(
-                "soulseek",
-                "angel-heart",
-                false,
-                Some("bob"),
-                AcquisitionOrigin::Heart,
-                &[angel_gate("bob")],
-            ))
-            .await
-        })
-    };
-    assert!(!alice.await.expect("the task"));
-    assert!(!bob.await.expect("the task"));
-    let held = hold_kept_copy(&f);
-    let busy = f.place_gate.clone().lock_owned().await;
-    let stop = {
-        let (service, song) = (service.clone(), f.id("Teardrop"));
-        tokio::spawn(async move { service.stop_waiting_for_lidarr("soulseek", &song, "alice").await })
-    };
-    until(|| f.pending.held().is_empty()).await;
-
-    f.lidarr.complete("dl-1");
-    f.lidarr.refresh();
-    // Lidarr's Teardrop passed Alice's gate (its giving way runs in the same step) while her copy
-    // still waits to be placed.
-    let teardrop = format!("soulseek:{}", f.id("Teardrop"));
-    until(|| {
-        f.pending
-            .get(ALBUM_ID)
-            .is_some_and(|entry| entry.passed.contains(&teardrop))
-    })
-    .await;
-    assert!(f.placed.lock().is_empty());
-    drop(busy);
-
-    assert_eq!(stop.await.expect("the task"), StopWaiting::Stopped);
-    until(|| !f.dropped.lock().is_empty()).await;
-    over(&f).await;
-    assert_eq!(f.placed.lock().len(), 1, "placed once the library was free");
-    assert_eq!(
-        files_of(&f, "Teardrop"),
-        ["Massive Attack - Teardrop.flac"],
-        "one Teardrop, Lidarr's proven one"
-    );
-    assert!(!Path::new(&held.target).exists(), "alice's copy gave way");
-    assert!(!f.pending.has_octos_copies());
 }
 
 /// A folder import of the user's that Lidarr gave a guessed id of Octo's names no client: it is

@@ -4576,9 +4576,6 @@ fn to_direct_source(source: HeartDownloadSource) -> DownloadSource {
 #[path = "heart_keep_anyway.rs"]
 pub mod keep_anyway;
 
-#[path = "heart_member_keep.rs"]
-mod member_keep;
-
 pub use keep_anyway::{KEEP_WAITS_FOR_YOUTUBE, KeepAnyway, KeepMarks};
 
 #[cfg(test)]

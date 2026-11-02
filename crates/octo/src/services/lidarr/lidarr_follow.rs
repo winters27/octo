@@ -20,23 +20,23 @@
 //!   failed one refresh is never read as done. A download missing while its client lists nothing
 //!   else cannot be proven gone: it stays watched, and the dashboard's Lidarr card lists its
 //!   follow with the admin's "Put Lidarr back", which counts it gone and ends the follow.
-//! - **Octo's own copies.** A copy Octo placed while a follow on its artist stays open (a kept
-//!   copy whose person stopped waiting) is Octo's, never the user's, while that follow is listed:
-//!   a rescan linking it never makes Octo step aside. A link of it waits in the hold path. When
-//!   Octo's own import replaces it, it gives way to the song's Lidarr file if that passes the
-//!   gates of everyone it was kept for; otherwise (refused, deleted, or put back) it comes back
-//!   from its link. The library never ends with both.
+//! - **Octo's own copies.** A file of Octo's that would land under one of Lidarr's root folders
+//!   for the artist waits in the hold path, and plays from there, until every follow on the artist
+//!   that may still import is over: no copy of Octo's is ever placed while an import of Octo's
+//!   could replace it. A late import meanwhile is judged as during the follow.
 //! - **Octo's turn.** While a download of Octo's is finished and waits for its import, the
 //!   commands are read at a sub-second pace; a rescan that covers the artist, or a manual import
 //!   or scan that is not Octo's, makes Octo remove its items before its import could replace
 //!   what that command links.
 //! - **The end.** The follow ends on Lidarr's own states (a failed, blocked or ignored download,
 //!   one that left without an import), on the work of people and other sources (a proven file
-//!   of another source for the artist, a kept copy with a download that makes no progress, the
-//!   person's "Stop waiting for Lidarr", every heart taken back, the admin's "Put Lidarr back"),
-//!   or when every download is accounted for. Octo then removes its items, places the files it held back, and once the
-//!   watch list is empty and no search of the album is queued or running puts the pick back,
-//!   unless the song landed.
+//!   of another source for the artist, a kept copy with a download that makes no progress, every
+//!   heart taken back, the admin's "Put Lidarr back"), or when every download is accounted for.
+//!   Octo then removes its items at once. Once the watch list is empty and no search of the album
+//!   is queued or running, the follow is over: the files it held back are placed (or give way to
+//!   the song's proven Lidarr file), and the pick is put back unless the song landed. Only Octo
+//!   no longer having a Lidarr, or a new Lidarr address Octo cannot read, places the held files
+//!   at once.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -55,11 +55,10 @@ use tracing::{info, warn};
 
 use super::{AlbumJob, Inner, translate_imported_path};
 use crate::services::common::acquisition_tracker::acquisition_event_kinds;
-use crate::services::i_download_service::Restored;
-use crate::services::library::navidrome_song_path_resolver::get_full_path;
+use crate::services::i_download_service::HeldEnd;
 use crate::services::lidarr::lidarr_pending_albums::{
-    FollowEnd, FollowedGrab, FollowedItem, GivingWay, HELD_FOR_LIDARR, HeldPlacement, PROVEN_ELSEWHERE,
-    PendingAlbum, PlacedAs, REPLACED_YOURS,
+    FollowEnd, FollowedGrab, FollowedItem, HELD_FOR_LIDARR, HeldPlacement, PROVEN_ELSEWHERE, PendingAlbum,
+    REPLACED_YOURS,
 };
 use crate::services::lidarr::lidarr_pick::{put_back_searched, restore_after_landing, retry_moved_records};
 
@@ -78,16 +77,13 @@ const FAILED_STATES: [&str; 4] = [
 ];
 /// The states whose removal also blocklists the release.
 const BLOCKLISTED: [&str; 2] = ["downloadFailed", "downloadFailedPending"];
-/// The folder in the hold path where the links of the copies Octo placed during an open follow
-/// wait.
-const PLACED_LINKS: &str = "lidarr-placed";
 
 /// One read of Lidarr, in the order that settles a file with no row: the artist's track files,
 /// then the commands, then the queue, then the history.
 struct Reading {
     start_time: Option<DateTime<Utc>>,
-    /// The latest the time on Lidarr's clock can have been when the read began: every time a read
-    /// compares with Lidarr's dates is Lidarr's own.
+    /// Lidarr's time at the read, on its own clock: the newest time Lidarr stamped on anything the
+    /// read lists, so every time a read compares with Lidarr's dates is Lidarr's own.
     now: DateTime<Utc>,
     files: Vec<LidarrTrackFile>,
     commands: Vec<LidarrCommand>,
@@ -282,18 +278,9 @@ impl Inner {
             let next = match self.follow_once(&job, &mut run, &settings).await {
                 Ok(next) => next,
                 Err(e) => {
+                    // The files it held stay held, playing from the hold path: a Lidarr Octo
+                    // cannot read may still import.
                     warn!("Could not read Lidarr for the follow of {key}: {e}");
-                    // A follow asked to end lets go of the files it held even when Lidarr cannot
-                    // be read: nobody's kept copy waits on Lidarr answering.
-                    if let Some(entry) = self.pending.get(&key)
-                        && let Some(why) = entry.ended
-                        && !entry.released
-                    {
-                        for handoff in run.handed.drain(..) {
-                            let _ = handoff.await;
-                        }
-                        self.let_go(&key, why).await;
-                    }
                     Next::Wait { ready: false }
                 }
             };
@@ -370,7 +357,7 @@ impl Inner {
         }
         self.judge_files(job, &mut entry, run, &reading, settings, &mut end)
             .await?;
-        self.tell_replaced(&mut entry, &reading, settings).await;
+        self.tell_replaced(&mut entry, &reading).await;
         self.account(&mut entry, run, &reading, &mut end).await?;
         let all_accounted = entry.watched().next().is_none() && entry.pending_items.is_empty();
         if end.is_none() && entry.following() && !windows.research_running {
@@ -387,17 +374,11 @@ impl Inner {
             return Ok(Next::Finish);
         };
         if let Some(why) = entry.ended {
+            // Octo's items go at once; the files it held stay held until the follow is over, so a
+            // late import meanwhile is judged as during the follow.
             self.remove_items(&run.key, &entry, &reading).await;
             if why == FollowEnd::Unhearted || entry.unseen_let_go {
                 self.absent_let_go(&run.key, &reading, entry.unseen_let_go);
-            }
-            if !entry.released {
-                // What the hold folder is judging settles first: a kept copy that a proven import
-                // of its song replaces is dropped, never placed.
-                for handoff in run.handed.drain(..) {
-                    let _ = handoff.await;
-                }
-                self.let_go(&run.key, why).await;
             }
             let Some(entry) = self.pending.get(&run.key) else {
                 return Ok(Next::Finish);
@@ -435,19 +416,24 @@ impl Inner {
     }
 
     async fn read_lidarr(&self, artist_id: i32) -> Result<Reading, LidarrError> {
-        let (start_time, second) = self.client.status_times().await?;
+        let start_time = self.client.start_time().await?;
         let files = if artist_id > 0 {
             self.client.artist_track_files(artist_id).await?
         } else {
             Vec::new()
         };
         let commands = self.client.commands().await?;
-        let now = reading_now(second, &commands);
         let queue = self.client.queue().await?;
         let history = if artist_id > 0 {
             self.client.artist_history(artist_id, None).await?
         } else {
             Vec::new()
+        };
+        let now = match reading_now(&commands, &queue, &history) {
+            Some(now) => now,
+            // Lidarr stamped nothing the read lists (it has just started): it stamps a health
+            // check now.
+            None => self.client.now().await?,
         };
         Ok(Reading {
             start_time,
@@ -863,14 +849,6 @@ impl Inner {
                 .any(|file| rows.get(&file.id).copied().is_some_and(octos));
         let following = entry.following();
         let octo_root = self.music.octo_root();
-        // A copy Octo placed itself (a kept copy whose person stopped waiting while others still
-        // wait on the follow) that a rescan linked is neither the user's nor this follow's import.
-        let octos_copy = |file: &LidarrTrackFile| {
-            file.path.as_deref().is_some_and(|path| {
-                translate_imported_path(path, settings.root_folder_path.as_deref(), &octo_root)
-                    .is_ok_and(|local| self.pending.is_octos_copy(&local))
-            })
-        };
         let mut mine: Vec<&LidarrTrackFile> = Vec::new();
         let mut users: Vec<i32> = Vec::new();
         for file in &reading.files {
@@ -883,7 +861,6 @@ impl Inner {
             }
             match rows.get(&file.id).copied() {
                 Some(row) if octos(row) => mine.push(file),
-                _ if octos_copy(file) => {}
                 Some(row)
                     if row.download_client().is_some()
                         && row
@@ -1032,10 +1009,8 @@ impl Inner {
     }
 
     /// Tells, on the downloads entry, of each file of the user's that Lidarr deleted as an upgrade
-    /// while importing Octo's download: a file at a path no import of Octo's had filled before. A
-    /// copy Octo placed during the follow is marked replaced instead, and nothing is told: it gives
-    /// way to the song's file if that passes its people's gates, else it comes back from its link.
-    async fn tell_replaced(&self, entry: &mut PendingAlbum, reading: &Reading, settings: &LidarrSettings) {
+    /// while importing Octo's download: a file at a path no import of Octo's had filled before.
+    async fn tell_replaced(&self, entry: &mut PendingAlbum, reading: &Reading) {
         // From Octo's search, or from Lidarr's time saved before it went out when a restart came
         // before its answer was saved.
         let Some(since) = entry.searched_at.or(entry.search_pending) else {
@@ -1077,14 +1052,10 @@ impl Inner {
                 !octos_before && by_octo
             })
             .collect();
-        // Octo's own placed copies are marked first, before anything is awaited, so the hold
-        // folder judging their songs meanwhile knows they were replaced.
         let mut told = Vec::new();
         for row in replaced {
             entry.replaced_told.push(row.id);
-            if !self.mark_replaced_copy(&row.source_title, settings) {
-                told.push(row.source_title.clone());
-            }
+            told.push(row.source_title.clone());
         }
         if told.is_empty() {
             return;
@@ -1382,8 +1353,9 @@ impl Inner {
         });
     }
 
-    /// The follow lets go of the files it held: each one no other open follow holds is placed now.
-    /// A file an earlier end could not place is tried again with them.
+    /// The follow lets go of the files it held: each one no other follow that may still import
+    /// holds is placed now (or gives way to its song's proven Lidarr file). A file an earlier end
+    /// could not place, and one whose follows are gone or over, is tried again with them.
     async fn let_go(&self, key: &str, why: FollowEnd) {
         let mut free = self.pending.release(key);
         free.extend(self.pending.release_unfollowed());
@@ -1393,60 +1365,38 @@ impl Inner {
         self.pending.update(key, |entry| entry.released = true);
     }
 
-    /// Places a held file now. One that cannot be placed stays on the list, waiting for no follow,
-    /// and is tried again when the next follow ends and at the next start; one whose song's
-    /// proven Lidarr file landed meanwhile is dropped instead.
+    /// Places a held file now, or has a kept copy whose song's Lidarr file passed the gate of
+    /// someone it was kept for give way to that file. One that can be neither now stays on the
+    /// list, waiting for no follow, plays from where it waits, and is tried again when the next
+    /// follow is over and at the next start.
     pub(super) async fn place_held(&self, held: HeldPlacement, why: FollowEnd) {
-        let placed = match &self.downloads {
+        let end = match &self.downloads {
             Some(downloads) => downloads.place_held(&held).await,
-            None => None,
+            None => HeldEnd::Later,
         };
-        match placed {
-            Some(placed) => {
+        match end {
+            HeldEnd::Placed(path) => {
                 info!(
-                    "Placed {} now that Octo no longer waits for Lidarr: {}",
-                    held.song, placed.path
+                    "Placed {} now that Octo no longer waits for Lidarr: {path}",
+                    held.song
                 );
-                // A follow still open on its artist (others wait on it) may see a rescan link it:
-                // while that follow is listed, it is Octo's own copy there, never the user's, and
-                // a link of it waits in the hold path in case Octo's own import replaces it. Its
-                // song's proven Lidarr file landing while it was placed makes it give way now.
-                if self.pending.counts_placed(&held) {
-                    let backup = self.keep_link(&placed.path);
-                    if let PlacedAs::GaveWay(copy) =
-                        self.pending
-                            .placed_copy(&held, &placed.path, backup, placed.beside)
-                    {
-                        info!(
-                            "Lidarr's proven file for {} landed while its kept copy was placed; the copy gives way",
-                            held.song
-                        );
-                        self.give_way(&copy).await;
-                    }
-                }
             }
-            None => {
-                if self.pending.placing_failed(&held.held_path) {
-                    info!(
-                        "Lidarr's proven file for {} landed while its kept copy waited to be placed; the copy gives way",
-                        held.song
-                    );
-                    if let Some(downloads) = &self.downloads
-                        && !downloads.drop_held(&held, &held.users).await
-                    {
-                        warn!("The kept copy {} could not give way", held.held_path);
-                    }
-                } else {
-                    warn!(
-                        "Could not place {} from {}; it plays from there and is placed again later",
-                        held.song, held.held_path
-                    );
-                    if Path::new(&held.held_path).exists() {
-                        self.pending.hold_again(HeldPlacement {
-                            follows: Vec::new(),
-                            ..held.clone()
-                        });
-                    }
+            HeldEnd::GaveWay => {
+                info!(
+                    "The kept copy of {} gave way to its proven Lidarr file: {}",
+                    held.song, held.held_path
+                );
+            }
+            HeldEnd::Later => {
+                warn!(
+                    "Could not place {} from {}; it plays from there and is placed again later",
+                    held.song, held.held_path
+                );
+                if Path::new(&held.held_path).exists() {
+                    self.pending.hold_again(HeldPlacement {
+                        follows: Vec::new(),
+                        ..held.clone()
+                    });
                 }
             }
         }
@@ -1470,115 +1420,11 @@ impl Inner {
         }
     }
 
-    /// A copy Octo placed during a follow gives way to its song's proven Lidarr file: the copy
-    /// (only while it is still the file Octo placed) and its kept record go, then its link.
-    pub(super) async fn give_way(&self, copy: &GivingWay) {
-        let dropped = match &self.downloads {
-            Some(downloads) => downloads.drop_placed(copy).await,
-            None => false,
-        };
-        if !dropped {
-            warn!(
-                "The copy Octo placed at {} could not give way to the proven Lidarr file of {}",
-                copy.path, copy.song
-            );
-        }
-        if let Some(link) = &copy.backup {
-            let _ = std::fs::remove_file(link);
-        }
-        info!(
-            "The copy Octo placed of {} gives way to its proven Lidarr file: {}",
-            copy.song, copy.path
-        );
-    }
-
-    /// A link of the copy placed at `path`, in the hold path's `lidarr-placed` folder, and whether
-    /// it is a hard link (else a copy, when the two lie on different disks); None when neither can
-    /// be made or no hold path is known.
-    fn keep_link(&self, path: &str) -> Option<(String, bool)> {
-        let folder = self.downloads.as_ref()?.held_root()?.join(PLACED_LINKS);
-        std::fs::create_dir_all(&folder).ok()?;
-        let extension = Path::new(path)
-            .extension()
-            .map(|extension| format!(".{}", extension.to_string_lossy()))
-            .unwrap_or_default();
-        let link = folder.join(format!("{}{extension}", uuid::Uuid::new_v4().simple()));
-        let linked = std::fs::hard_link(path, &link).is_ok();
-        if !linked && std::fs::copy(path, &link).is_err() {
-            warn!("Could not keep a link of the copy Octo placed at {path}");
-            return None;
-        }
-        Some((link.to_string_lossy().into_owned(), linked))
-    }
-
-    /// After a restart: every link in the hold path's `lidarr-placed` folder that no copy Octo
-    /// placed names any more is left from a copy that is over, so it goes.
-    pub(super) fn sweep_placed_links(&self) {
-        let Some(folder) = self
-            .downloads
-            .as_ref()
-            .and_then(|downloads| downloads.held_root())
-            .map(|root| root.join(PLACED_LINKS))
-        else {
-            return;
-        };
-        let Ok(entries) = std::fs::read_dir(&folder) else {
-            return;
-        };
-        let named: Vec<String> = self
-            .pending
-            .placed_links()
-            .iter()
-            .map(|link| get_full_path(link))
-            .collect();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && !named.contains(&get_full_path(&path.to_string_lossy())) {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => info!("Removed a link of a placed copy that is over: {}", path.display()),
-                    Err(e) => warn!("Could not remove {}: {e}", path.display()),
-                }
-            }
-        }
-        let _ = std::fs::remove_dir(&folder);
-    }
-
-    /// Lidarr deleted the file at `lidarr_path` as an upgrade while importing Octo's download:
-    /// when it is a copy Octo placed during the follow, it is marked replaced and true is answered.
-    /// It comes back only once Lidarr's file for its song is known not to land for its people.
-    fn mark_replaced_copy(&self, lidarr_path: &str, settings: &LidarrSettings) -> bool {
-        let octo_root = self.music.octo_root();
-        translate_imported_path(lidarr_path, settings.root_folder_path.as_deref(), &octo_root)
-            .is_ok_and(|local| self.pending.mark_replaced(&local))
-    }
-
-    /// The copies Octo placed (during the follow `key`, or any when None; of `song` only, when one
-    /// is named) that Lidarr replaced, and whose song's Lidarr file did not land for their people,
-    /// come back from the links Octo kept, where each was and never beside another file. One
-    /// whose place holds its song's own landed file for its people gives way to it; one whose
-    /// place holds anything else keeps its link and is tried again at the next start.
-    pub(super) async fn restore_replaced(&self, key: Option<&str>, song: Option<&str>) {
-        let Some(downloads) = self.downloads.clone() else {
-            return;
-        };
-        for copy in self.pending.replaced_copies(key, song) {
-            match downloads.restore_placed(&copy).await {
-                Restored::Back => self.pending.copy_restored(&copy.path),
-                Restored::GaveWay | Restored::Lost => {
-                    if let Some(giving) = self.pending.replaced_gives_way(&copy.path) {
-                        self.give_way(&giving).await;
-                    }
-                }
-                Restored::Later => {}
-            }
-        }
-    }
-
     /// The follow is over: the pipeline's work waited for, the album's hold folder settled for the
-    /// last time (its tracks handed on when a hearted song passed, else deleted), a copy Octo
-    /// placed during the follow that Lidarr replaced back from its link unless its song's Lidarr
-    /// file landed for its people, the pick put back unless its song landed (the pin restored
-    /// either way), and the hearts still waiting told.
+    /// last time (its tracks handed on when a hearted song passed, else deleted), the files it held
+    /// let go (placed, or given way to their song's proven Lidarr file), even when its entry is
+    /// gone, the pick put back unless its song landed (the pin restored either way), and the
+    /// hearts still waiting told.
     async fn finish_follow(self: &Arc<Self>, job: &Arc<AlbumJob>, run: FollowRun) {
         for handoff in run.handed {
             let _ = handoff.await;
@@ -1586,7 +1432,9 @@ impl Inner {
         let lidarr_gone = run.lidarr_gone;
         let key = run.key;
         self.clone().settle(job.clone(), key.clone(), true).await;
-        self.restore_replaced(Some(&key), None).await;
+        if self.pending.get(&key).is_none() {
+            self.let_go(&key, FollowEnd::Done).await;
+        }
         let landed_titles = job
             .landed
             .lock()
@@ -1801,24 +1649,29 @@ impl Inner {
     }
 }
 
-/// The latest the time on Lidarr's clock can have been when a read began, from the `Date` header
-/// of its first answer (`second`, whole seconds, so the end of that second): never before the
-/// newest time Lidarr itself stamped on a command it lists, since a proxy in front of Lidarr may
-/// put its own clock on the header.
-pub(super) fn reading_now(second: DateTime<Utc>, commands: &[LidarrCommand]) -> DateTime<Utc> {
-    let header = second + chrono::TimeDelta::milliseconds(999);
+/// Lidarr's time at a read, on its own clock: the newest time Lidarr itself stamped on a command,
+/// a queue item or a history row the read lists. Never a `Date` header, which a proxy in front of
+/// Lidarr may write by its own clock. None when the read lists no stamp at all.
+pub(super) fn reading_now(
+    commands: &[LidarrCommand],
+    queue: &[LidarrQueueItem],
+    history: &[LidarrHistoryRecord],
+) -> Option<DateTime<Utc>> {
     commands
         .iter()
         .flat_map(|command| [command.queued, command.started, command.ended])
+        .chain(queue.iter().map(|item| item.added))
         .flatten()
-        .fold(header, DateTime::max)
+        .chain(history.iter().map(|row| row.date))
+        .max()
 }
 
 /// The latest after Lidarr's time saved before Octo's search went out that the search could still
-/// have reached Lidarr: the request's timeout, and the second Lidarr's `Date` header leaves out.
+/// have reached Lidarr: the request's timeout, and two seconds more for the time Octo's own steps
+/// take between saving Lidarr's time and sending the search.
 fn search_reach() -> chrono::TimeDelta {
     chrono::TimeDelta::from_std(super::LidarrClient::TIMEOUT).unwrap_or_default()
-        + chrono::TimeDelta::seconds(1)
+        + chrono::TimeDelta::seconds(2)
 }
 
 /// Whether another command ran or waited during a window: from its queuing to its end.
