@@ -491,6 +491,16 @@ async fn a_moved_mornye_never_shows_the_row_of_the_one_before() {
     );
 }
 
+/// From now on `mornye` answers its info after a minute, so no probe of it finishes in a test.
+async fn answer_after_a_minute(mornye: &MockServer) {
+    mornye.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/info"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(mornye)
+        .await;
+}
+
 #[tokio::test]
 async fn a_mornye_switched_off_and_on_again_never_shows_a_row_from_before() {
     let (mornye, _) = mornye_and_helper("active", false).await;
@@ -502,7 +512,9 @@ async fn a_mornye_switched_off_and_on_again_never_shows_a_row_from_before() {
     change_mornye(&state, |mornye| mornye.enabled = false);
     assert_eq!(mornye_row_of(&app).await, Value::Null);
 
-    // On again at the same address; no wait, so only a kept row could answer.
+    // On again at the same address, which now answers after a minute: only a kept row could
+    // answer the next status.
+    answer_after_a_minute(&mornye).await;
     state.mornye_row.set_wait(std::time::Duration::ZERO);
     change_mornye(&state, |mornye| mornye.enabled = true);
 
@@ -520,6 +532,8 @@ async fn a_mornye_switched_off_and_on_again_with_no_status_between_never_shows_a
     let app = app(state.clone());
     assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
 
+    // Off and on again with no status between, at an address that now answers after a minute.
+    answer_after_a_minute(&mornye).await;
     change_mornye(&state, |mornye| mornye.enabled = false);
     change_mornye(&state, |mornye| mornye.enabled = true);
     state.mornye_row.set_wait(std::time::Duration::ZERO);
