@@ -198,6 +198,40 @@ async fn rejected_keys_are_set_aside_until_the_settings_change() {
     assert!(client.is_on());
 }
 
+/// What the dashboard reads of Octo's own key: whether this build carries one, whether an
+/// import's songs are checked with it (only while the user has no key of their own), and whether
+/// AcoustID refused it, which lasts until the settings change.
+#[tokio::test]
+async fn the_dashboard_reads_whether_octos_own_key_is_there_used_for_imports_or_refused() {
+    let server = answering(&error(4)).await;
+    let keyless = settings_with("");
+    let none = client_on(&server, &keyless, quick(), None);
+    assert!(!none.has_built_in_key());
+    assert!(!none.bulk_on_built_in_key());
+    assert!(!none.built_in_key_refused());
+
+    let client = client_on(&server, &keyless, quick(), Some(OCTO_KEY));
+    assert!(client.has_built_in_key());
+    assert!(client.bulk_on_built_in_key(), "no key of the user's own");
+    assert!(!client.built_in_key_refused());
+
+    client.lookup_answer(LookupClass::Heart, "AQAD", 200).await;
+    assert!(client.built_in_key_refused());
+    assert!(!client.bulk_on_built_in_key(), "a refused key checks nothing");
+    keyless.set((*keyless.current()).clone());
+    assert!(
+        !client.built_in_key_refused(),
+        "tried again after a settings change"
+    );
+
+    let own = settings_with("user-key");
+    let with_own = client_on(&server, &own, quick(), Some(OCTO_KEY));
+    assert!(
+        !with_own.bulk_on_built_in_key(),
+        "the user's own key checks imports"
+    );
+}
+
 /// The `off` setting saved is heard by every listener, with no call made.
 #[tokio::test]
 async fn turning_acoustid_off_is_heard_without_a_call() {

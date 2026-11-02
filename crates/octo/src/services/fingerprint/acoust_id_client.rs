@@ -304,6 +304,23 @@ impl AcoustIdClient {
         self.keys.current().1.2
     }
 
+    /// Whether this build carries Octo's own key.
+    pub fn has_built_in_key(&self) -> bool {
+        self.keys.built_in.is_some()
+    }
+
+    /// Whether AcoustID refused Octo's own key, set aside until the settings change: an install
+    /// without a key of its own then needs one.
+    pub fn built_in_key_refused(&self) -> bool {
+        self.keys.built_in.is_some() && self.keys.current().1.1
+    }
+
+    /// Whether work nobody waits on (an import's songs) is checked with Octo's own key now, at its
+    /// lane's lowest place and the bulk pace, for want of a key of the user's own.
+    pub fn bulk_on_built_in_key(&self) -> bool {
+        matches!(self.keys.key_for(LookupClass::Bulk), Some((_, KeyLane::BuiltIn)))
+    }
+
     fn timeout_seconds(&self) -> i32 {
         self.keys
             .settings

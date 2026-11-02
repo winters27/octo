@@ -506,6 +506,7 @@ async function refreshStatus() {
     setStatusCard('octo', data.octo);
     Object.entries(data.services || {}).forEach(([k, v]) => setStatusCard(k, v));
     renderDownloadChecks(data.downloads);
+    renderAcoustIdKeyHelp(data.acoustIdBuiltInKey);
 
     // Update sidebar badge with bad count, if any. An optional service nobody set up reports
     // ok, so it never counts here.
@@ -551,6 +552,19 @@ function setStatusCard(svc, probe) {
   const body = card.querySelector('.status-card-body');
   if (dot)  dot.className  = `status-dot ${state}`;
   if (body) body.textContent = probe.detail || (probe.ok ? 'online' : 'unreachable');
+}
+
+// What a blank AcoustID key means on this server: Octo's own key when this build carries one
+// (the published images do), else AcoustID off until a key is added. Unknown (an older server)
+// leaves the page's own words.
+const ACOUSTID_KEY_HELP = {
+  builtIn: 'Left blank, Octo uses its own key; your own key takes its place. Type off to turn AcoustID off; the length check and its memory of rejected files still work.',
+  none: 'This server has no key of Octo\'s own, so AcoustID is off until you add one: a free key of your own turns it on. Type off to keep it off; the length check and its memory of rejected files still work.',
+};
+function renderAcoustIdKeyHelp(builtIn) {
+  const help = document.getElementById('acoustid-key-help');
+  if (!help || typeof builtIn !== 'boolean') return;
+  help.textContent = builtIn ? ACOUSTID_KEY_HELP.builtIn : ACOUSTID_KEY_HELP.none;
 }
 
 // The downloads card: what Octo's checks of downloads by their sound cannot do right now, one
@@ -5019,10 +5033,11 @@ document.getElementById('acq-list')?.addEventListener('click', event => {
 // ── A held download: Keep anyway and Stop waiting for Lidarr ────────────────
 // A held card offers Keep anyway (Keep these anyway on an album holding two or more tracks) and,
 // while a kept copy of its song waits for a Lidarr download, Stop waiting for Lidarr. Each acts
-// for one person: its menu lists who may, read when it opens (people are named only to a
-// Navidrome admin's own sign-in), and a name picked runs the action the apps' keepAcquisitionAnyway
-// and stopWaitingForLidarr run, with that person as user. What each menu shows is kept here, so
-// the list's redraw every few seconds leaves an open menu as it was.
+// for one person: its menu lists who may, read when it opens (only to a Navidrome admin's own
+// sign-in), each with the label the server gives (their name while Record who asked is on, else
+// "Listener 1" and so on) and an opaque token that names them back. A person picked runs the
+// action the apps' keepAcquisitionAnyway and stopWaitingForLidarr run, for that token. What each
+// menu shows is kept here, so the list's redraw every few seconds leaves an open menu as it was.
 const ACQ_MENUS = {
   keep: { people: 'keepers', path: '/api/admin/acquisitions/keep', caption: 'Whose copy to keep', none: 'Nothing is waiting to be kept' },
   stop: { people: 'stopWaiters', path: '/api/admin/acquisitions/stop-waiting', caption: 'Whose copy should stop waiting', none: 'Nothing is waiting for Lidarr' },
@@ -5054,12 +5069,13 @@ function acqMenuBody(key, kind) {
   const people = acqMenu.people.get(key);
   if (!people) return stateBlock('loading', 'Reading who is waiting…');
   if (people.error) return stateBlock('error', people.error);
-  const names = Array.isArray(people[menu.people]) ? people[menu.people] : [];
+  const holders = (Array.isArray(people[menu.people]) ? people[menu.people] : [])
+    .filter(holder => holder && holder.token);
   const error = acqMenu.error.get(id);
   const busy = acqMenu.busy.has(id);
-  const list = names.length
+  const list = holders.length
     ? `<div class="acq-menu-caption">${escapeHtml(menu.caption)}</div>
-      <div class="acq-menu-people">${names.map(user => `<button type="button" class="btn btn-ghost btn-sm" data-acq-act="${kind}" data-acq-key="${escapeHtml(key)}" data-acq-user="${escapeHtml(user)}" data-focus-id="${escapeHtml(`${id}|${user}`)}"${busy ? ' disabled' : ''}>${escapeHtml(user)}</button>`).join('')}</div>`
+      <div class="acq-menu-people">${holders.map(holder => `<button type="button" class="btn btn-ghost btn-sm" data-acq-act="${kind}" data-acq-key="${escapeHtml(key)}" data-acq-token="${escapeHtml(holder.token)}" data-focus-id="${escapeHtml(`${id}|${holder.token}`)}"${busy ? ' disabled' : ''}>${escapeHtml(holder.label || '')}</button>`).join('')}</div>`
     : stateBlock('empty', menu.none);
   return `${list}${error ? `<div class="acq-error" role="alert">${escapeHtml(error)}</div>` : ''}`;
 }
@@ -5108,14 +5124,14 @@ function acqMenuToggled(details) {
 async function acqMenuAct(button) {
   const kind = button.dataset.acqAct;
   const key = button.dataset.acqKey;
-  const user = button.dataset.acqUser;
+  const token = button.dataset.acqToken;
   const id = acqMenuId(kind, key);
   if (!ACQ_MENUS[kind] || acqMenu.busy.has(id)) return;
   acqMenu.busy.add(id);
   acqMenu.error.delete(id);
   acqMenuFill(key);
   try {
-    const response = await parityFetch(ACQ_MENUS[kind].path, parityJson({ key, user }), button.closest('[data-acq-menu-body]') || button);
+    const response = await parityFetch(ACQ_MENUS[kind].path, parityJson({ key, token }), button.closest('[data-acq-menu-body]') || button);
     if (!response.ok) throw new Error(await parityError(response));
     acqMenu.open.delete(id);
     acqMenu.people.delete(key);
@@ -8388,6 +8404,20 @@ function renderImportDetail() {
     </div>`;
 }
 
+// While songs wait or are fetched and the server checks them with Octo's own AcoustID key (at the
+// pace work nobody waits on goes), the card says a free key of the person's own checks them
+// faster, with where to get one. The words are the server's.
+function renderImportKeyLine(key, t) {
+  const line = impEl('imp-acoustid-key');
+  if (!line) return;
+  const moving = (t?.queued ?? 0) > 0 || (t?.downloading ?? 0) > 0;
+  const shown = Boolean(moving && key?.text);
+  line.hidden = !shown;
+  line.innerHTML = shown
+    ? `${escapeHtml(key.text)}.${key.link ? ` <a href="${escapeHtml(key.link)}" target="_blank" rel="noopener">Get a free key</a>` : ''}`
+    : '';
+}
+
 function renderTrickle() {
   const t = imp.view.trickle;
   const words = {
@@ -8411,6 +8441,7 @@ function renderTrickle() {
     .filter(([count]) => count > 0).map(([count, label]) => `${count}\u00a0${label}`);
   if (tally.length) parts.push(`${tally.join(', ')}.`);
   impEl('imp-trickle-line').textContent = parts.join(' ');
+  renderImportKeyLine(imp.view.acoustIdKey, t);
 
   const pause = impEl('imp-pause');
   pause.hidden = t.state === 'idle' && t.queued === 0;
