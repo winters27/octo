@@ -13,6 +13,9 @@ use octo_core::settings::{AppSettings, LibraryAction, SettingsStore, SoulseekSet
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use wiremock::matchers::path;
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
 use super::*;
 use crate::services::soulseek::soulseek_link::OFFLINE_TEXT;
 
@@ -117,6 +120,16 @@ fn clear_forgets_only_finished_jobs() {
 type Apply = Arc<dyn Fn(LibraryActionRequest) -> BoxFuture<'static, LibraryActionOutcome> + Send + Sync>;
 
 fn seams(width: i32, apply: Apply, offline: Arc<AtomicBool>) -> UpgradeWorkerSeams {
+    seams_with_mornye(width, apply, offline, Arc::new(|_| async { false }.boxed()))
+}
+
+/// The same, with Mornye's check keeping it from every extension while `kept` is set.
+fn seams_with_mornye(
+    width: i32,
+    apply: Apply,
+    offline: Arc<AtomicBool>,
+    passed: HoldOverFn,
+) -> UpgradeWorkerSeams {
     UpgradeWorkerSeams {
         apply: Arc::new(move |request| {
             let apply = apply.clone();
@@ -128,8 +141,76 @@ fn seams(width: i32, apply: Apply, offline: Arc<AtomicBool>) -> UpgradeWorkerSea
             let offline = offline.load(Ordering::SeqCst);
             async move { offline }.boxed()
         }),
+        mornye_hold_over: passed,
         source_name: Arc::new(|| "Soulseek".to_string()),
     }
+}
+
+/// An outcome Mornye's check kept, on the pause of check `label` that ends at `until`.
+fn kept_on(label: &str, until: chrono::DateTime<chrono::Utc>) -> LibraryActionOutcome {
+    LibraryActionOutcome {
+        code: Some(LibraryActionCodes::MORNYE_KEPT.to_string()),
+        mornye_wait: Some(Box::new(octo_core::spotiflac::check::CheckPause {
+            until_utc: until,
+            labels: vec![label.to_string()],
+            holding: Vec::new(),
+            url: String::new(),
+        })),
+        ..outcome(LibraryActionState::Failed, "Waiting for Mornye's check.")
+    }
+}
+
+/// A Mornye with two gateways, `A` paused and `B` passing, and the real seam reading it.
+async fn mornye_with_a_paused_and_b_passing(paused_a: Arc<AtomicBool>) -> (MockServer, HoldOverFn) {
+    struct Sessions(Arc<AtomicBool>);
+    impl wiremock::Respond for Sessions {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let a = if self.0.load(Ordering::SeqCst) {
+                ("unverified", 900.0)
+            } else {
+                ("active", 0.0)
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": {"sessions": [
+                {"key": "gateway-a-1", "kind": "gateway", "label": "A", "extensions": ["a-ext"], "state": a.0, "auth_paused_s": a.1},
+                {"key": "gateway-b-1", "kind": "gateway", "label": "B", "extensions": ["b-ext"], "state": "active", "auth_paused_s": 0.0}
+            ]}}))
+        }
+    }
+    let server = MockServer::builder().start().await;
+    Mock::given(path("/api/get_signed_sessions"))
+        .respond_with(Sessions(paused_a))
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/get_download_services"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"result": {"services": [
+                {"id": "ext:a-ext", "label": "A", "extensions": ["a-ext"]},
+                {"id": "ext:b-ext", "label": "B", "extensions": ["b-ext"]}
+            ]}})),
+        )
+        .mount(&server)
+        .await;
+    let settings = Arc::new(SettingsStore::for_tests(octo_core::settings::AppSettings {
+        spotiflac: octo_core::settings::SpotiflacSettings {
+            enabled: true,
+            url: server.uri(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    // A read is fresh for no time here, so each look reads Mornye again.
+    let check = crate::services::spotiflac::MornyeCheck::new(
+        Arc::new(crate::services::spotiflac::MornyeCheckStore::new(None)),
+        crate::services::spotiflac::CheckTimes {
+            fresh_for: std::time::Duration::ZERO,
+            call_bound: std::time::Duration::from_secs(5),
+        },
+        None,
+    );
+    let client =
+        Arc::new(crate::services::spotiflac::SpotiflacClient::new(Arc::clone(&settings)).with_check(check));
+    let sources = Arc::new(UpgradeSources::new(settings, None).with_spotiflac(client));
+    (server, mornye_hold_over_with(Some(sources)))
 }
 
 fn worker(
@@ -231,6 +312,714 @@ async fn during_an_outage_a_job_waits_then_runs_once_soulseek_is_back() {
     assert_eq!(tries.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn a_job_waiting_for_mornyes_check_says_so() {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a"]), "alice", "app");
+    let words = "Waiting for Mornye's check, which it could not pass for Example; it allows its next try at 14:05 UTC.";
+    let apply: Apply = Arc::new(move |_| {
+        let answer = LibraryActionOutcome {
+            code: Some(LibraryActionCodes::MORNYE_CHECK.to_string()),
+            ..outcome(LibraryActionState::Failed, words)
+        };
+        async move { answer }.boxed()
+    });
+    let worker = worker(&queue, 1, apply, None);
+    worker.tick(&CancellationToken::new()).await;
+    worker.drain().await;
+    let job = queue.snapshot().remove(0);
+    assert_eq!(job.state, UpgradeStates::WAITING);
+    assert_eq!(job.detail.as_deref(), Some(words));
+}
+
+#[tokio::test]
+async fn a_job_one_gateways_pause_kept_waits_for_that_pause_not_for_every_extension() {
+    // slskd is up the whole time; gateway A's pause kept the song, gateway B passes but had none.
+    let paused_a = Arc::new(AtomicBool::new(true));
+    let (_mornye, passed) = mornye_with_a_paused_and_b_passing(paused_a.clone()).await;
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a"]), "alice", "app");
+    let tries = Arc::new(AtomicUsize::new(0));
+    let tried = tries.clone();
+    let until = chrono::Utc::now() + chrono::Duration::minutes(15);
+    let apply: Apply = Arc::new(move |_| {
+        tried.fetch_add(1, Ordering::SeqCst);
+        let answer = kept_on("A", until);
+        async move { answer }.boxed()
+    });
+    let worker = Arc::new(UpgradeWorker::with_seams(
+        queue.clone(),
+        seams_with_mornye(1, apply, Arc::default(), passed),
+        None,
+        None,
+        None,
+    ));
+    let ct = CancellationToken::new();
+    for _ in 0..3 {
+        worker.tick(&ct).await;
+        worker.drain().await;
+    }
+    assert_eq!(
+        tries.load(Ordering::SeqCst),
+        1,
+        "never again while A's pause holds"
+    );
+    let job = queue.snapshot().remove(0);
+    assert_eq!(
+        (job.state.as_str(), job.wait.as_deref()),
+        (UpgradeStates::WAITING, Some(LibraryActionCodes::MORNYE_KEPT))
+    );
+    assert_eq!(
+        job.mornye_hold.as_ref().map(|hold| hold.labels.clone()),
+        Some(vec!["A".to_string()])
+    );
+
+    // Someone passes A's check: the job goes back at once.
+    paused_a.store(false, Ordering::SeqCst);
+    worker.tick(&ct).await;
+    worker.drain().await;
+    assert_eq!(tries.load(Ordering::SeqCst), 2, "once A's check passes");
+}
+
+#[tokio::test]
+async fn once_a_pause_ends_one_kept_job_tries_and_the_others_follow_its_answer() {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a", "b", "c"]), "alice", "app");
+    let tries = Arc::new(AtomicUsize::new(0));
+    let tried = tries.clone();
+    let ended = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let next = chrono::Utc::now() + chrono::Duration::minutes(45);
+    // The first round is kept on a pause that already ended; every later try fails again.
+    let apply: Apply = Arc::new(move |_| {
+        let n = tried.fetch_add(1, Ordering::SeqCst);
+        let answer = kept_on("A", if n < 3 { ended } else { next });
+        async move { answer }.boxed()
+    });
+    let worker = Arc::new(UpgradeWorker::with_seams(
+        queue.clone(),
+        seams_with_mornye(3, apply, Arc::default(), Arc::new(|_| async { false }.boxed())),
+        None,
+        None,
+        None,
+    ));
+    let ct = CancellationToken::new();
+    worker.tick(&ct).await;
+    worker.drain().await;
+    assert_eq!(tries.load(Ordering::SeqCst), 3, "the first round of all three");
+
+    for _ in 0..3 {
+        worker.tick(&ct).await;
+        worker.drain().await;
+    }
+    assert_eq!(
+        tries.load(Ordering::SeqCst),
+        4,
+        "one scout, whose try failed again"
+    );
+    assert!(
+        queue.snapshot().iter().all(|job| job
+            .mornye_hold
+            .as_ref()
+            .is_some_and(|hold| hold.until_utc == next)),
+        "the others now wait for the scout's new pause"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_while_a_scout_is_on_its_way_sends_no_second_one() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("upgrades.json");
+    let ended = chrono::Utc::now() - chrono::Duration::seconds(1);
+    {
+        let before = UpgradeQueue::with_path(Some(path.clone()));
+        before.add(asks(&["a", "b"]), "alice", "app");
+        // a went back alone when its pause ended and was running at the restart; b still waits.
+        before.update("a", |job| {
+            job.state = UpgradeStates::WORKING.to_string();
+            job.mornye_scout = true;
+        });
+        before.update("b", |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(MornyeHold {
+                labels: vec!["A".to_string()],
+                ..MornyeHold::until(ended)
+            });
+        });
+    }
+    let queue = Arc::new(UpgradeQueue::with_path(Some(path)));
+    let tries = Arc::new(AtomicUsize::new(0));
+    let tried = tries.clone();
+    let apply: Apply = Arc::new(move |_| {
+        tried.fetch_add(1, Ordering::SeqCst);
+        async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed()
+    });
+    let worker = worker(&queue, 3, apply, None);
+    let ct = CancellationToken::new();
+
+    worker.tick(&ct).await;
+    worker.drain().await;
+    assert_eq!(
+        tries.load(Ordering::SeqCst),
+        1,
+        "only the scout from before the restart"
+    );
+    let b = queue
+        .snapshot()
+        .into_iter()
+        .find(|job| job.navidrome_id == "b")
+        .expect("b");
+    assert_eq!(b.state, UpgradeStates::WAITING);
+
+    // The scout's try is known, so b is the next one to go.
+    worker.tick(&ct).await;
+    worker.drain().await;
+    assert_eq!(tries.load(Ordering::SeqCst), 2);
+    assert!(queue.snapshot().iter().all(|job| !job.mornye_scout));
+}
+
+#[test]
+fn a_finished_run_moves_the_holds_it_shares_a_check_with_and_leaves_the_rest() {
+    let queue = UpgradeQueue::new();
+    queue.add(asks(&["a", "b", "c"]), "alice", "app");
+    let early = Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap();
+    let later = Utc.with_ymd_and_hms(2026, 11, 1, 13, 0, 0).unwrap();
+    for (id, label) in [("b", "A"), ("c", "B")] {
+        queue.update(id, |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(MornyeHold {
+                labels: vec![label.to_string()],
+                ..MornyeHold::until(early)
+            });
+        });
+    }
+    queue.update("a", |job| job.mornye_scout = true);
+
+    queue.finish_run("a", |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+        job.mornye_hold = Some(MornyeHold {
+            labels: vec!["A".to_string()],
+            ..MornyeHold::until(later)
+        });
+    });
+
+    let jobs = queue.snapshot();
+    let hold = |id: &str| {
+        jobs.iter()
+            .find(|job| job.navidrome_id == id)
+            .and_then(|job| job.mornye_hold.as_ref())
+            .map(|hold| hold.until_utc)
+    };
+    assert!(jobs.iter().all(|job| !job.mornye_scout), "a's try is known");
+    assert_eq!(hold("b"), Some(later), "b shares check A");
+    assert_eq!(hold("c"), Some(early), "c waits on another check");
+}
+
+/// Holds job `id` on Mornye's check `label` until `until`.
+fn hold_on(queue: &UpgradeQueue, id: &str, label: &str, until: chrono::DateTime<Utc>) {
+    queue.update(id, |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+        job.mornye_hold = Some(MornyeHold {
+            labels: vec![label.to_string()],
+            ..MornyeHold::until(until)
+        });
+    });
+}
+
+#[test]
+fn a_wait_read_from_mornyes_words_moves_the_holds_on_its_extensions_checks_only() {
+    let queue = UpgradeQueue::new();
+    queue.add(asks(&["a", "b", "c"]), "alice", "app");
+    let early = Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap();
+    let later = Utc.with_ymd_and_hms(2026, 11, 1, 13, 0, 0).unwrap();
+    hold_on(&queue, "b", "Qobuz", early);
+    hold_on(&queue, "c", "Tidal", early);
+
+    // Mornye's words kept a's song on the Qobuz extension while its gateway read as working:
+    // nothing to watch, but it shares Qobuz's check.
+    queue.finish_run("a", |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+        job.mornye_hold = Some(MornyeHold {
+            holding: vec!["Qobuz".to_string()],
+            ..MornyeHold::until(later)
+        });
+    });
+
+    let jobs = queue.snapshot();
+    let hold = |id: &str| {
+        jobs.iter()
+            .find(|job| job.navidrome_id == id)
+            .and_then(|job| job.mornye_hold.as_ref())
+            .map(|hold| hold.until_utc)
+    };
+    assert_eq!(hold("b"), Some(later), "b waits on the same check");
+    assert_eq!(hold("c"), Some(early), "Tidal's own pause is left alone");
+}
+
+#[test]
+fn one_ended_job_goes_back_as_the_scout_and_passing_ones_go_back_unmarked() {
+    let queue = UpgradeQueue::new();
+    queue.add(asks(&["a", "b", "c"]), "alice", "app");
+    let now = Utc::now();
+    hold_on(&queue, "a", "A", now - chrono::Duration::seconds(1));
+    hold_on(&queue, "b", "A", now - chrono::Duration::seconds(1));
+    hold_on(&queue, "c", "B", now + chrono::Duration::minutes(30));
+    let judged = queue
+        .snapshot()
+        .into_iter()
+        .find(|job| job.navidrome_id == "c")
+        .and_then(|job| job.mornye_hold)
+        .expect("c's hold");
+    let passing: HashMap<String, MornyeHold> = [("c".to_string(), judged)].into();
+
+    assert_eq!(queue.release_mornye(&passing, now), 2);
+    let jobs = queue.snapshot();
+    let job = |id: &str| {
+        jobs.iter()
+            .find(|job| job.navidrome_id == id)
+            .cloned()
+            .expect("a job")
+    };
+    assert_eq!(
+        (job("a").state.as_str(), job("a").mornye_scout),
+        (UpgradeStates::QUEUED, true)
+    );
+    assert_eq!(
+        (job("c").state.as_str(), job("c").mornye_scout),
+        (UpgradeStates::QUEUED, false)
+    );
+    assert_eq!(job("b").state, UpgradeStates::WAITING);
+
+    // While a is on its way, b's ended pause sends nothing more.
+    assert_eq!(queue.release_mornye(&HashMap::new(), now), 0);
+    assert!(queue.mornye_scout_on_its_way());
+}
+
+#[tokio::test]
+async fn a_pass_read_before_a_hold_moved_does_not_let_that_job_go() {
+    // b's pause ends before the scout's new one, so the scout's try moves its end.
+    a_pass_read_before_a_scouts_try_leaves_b_waiting(5).await;
+}
+
+#[tokio::test]
+async fn a_pass_read_before_a_scouts_try_on_the_same_check_does_not_let_a_later_ending_job_go() {
+    // b's pause ends after the scout's new one: its end stays, the scout's try still counts.
+    a_pass_read_before_a_scouts_try_leaves_b_waiting(60).await;
+}
+
+/// A read finds check A passing while scout a's try comes back held on A until 45 minutes from
+/// now; b, held on A until `b_ends_in` minutes from now, stays waiting.
+async fn a_pass_read_before_a_scouts_try_leaves_b_waiting(b_ends_in: i64) {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a", "b"]), "alice", "app");
+    let next = Utc::now() + chrono::Duration::minutes(45);
+    queue.update("a", |job| {
+        job.state = UpgradeStates::WORKING.to_string();
+        job.mornye_scout = true;
+    });
+    hold_on(
+        &queue,
+        "b",
+        "A",
+        Utc::now() + chrono::Duration::minutes(b_ends_in),
+    );
+    // The read says A passes, and while it is read a's try comes back held on A's new pause.
+    let finishing = queue.clone();
+    let passed: HoldOverFn = Arc::new(move |_| {
+        finishing.finish_run("a", |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(MornyeHold {
+                labels: vec!["A".to_string()],
+                ..MornyeHold::until(next)
+            });
+        });
+        async { true }.boxed()
+    });
+    let tries = Arc::new(AtomicUsize::new(0));
+    let tried = tries.clone();
+    let apply: Apply = Arc::new(move |_| {
+        tried.fetch_add(1, Ordering::SeqCst);
+        async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed()
+    });
+    let worker = Arc::new(UpgradeWorker::with_seams(
+        queue.clone(),
+        seams_with_mornye(2, apply, Arc::default(), passed),
+        None,
+        None,
+        None,
+    ));
+
+    worker.tick(&CancellationToken::new()).await;
+    worker.drain().await;
+
+    assert_eq!(tries.load(Ordering::SeqCst), 0, "b's hold changed after the read");
+    let b = queue
+        .snapshot()
+        .into_iter()
+        .find(|job| job.navidrome_id == "b")
+        .expect("b");
+    assert_eq!(b.state, UpgradeStates::WAITING);
+}
+
+#[tokio::test]
+async fn a_scout_that_finishes_while_the_checks_are_read_sends_no_second_one_on_the_old_end() {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a", "b"]), "alice", "app");
+    let ended = Utc::now() - chrono::Duration::seconds(1);
+    let next = Utc::now() + chrono::Duration::minutes(45);
+    // a is the scout, running; b waits on the same check's pause, which has ended.
+    queue.update("a", |job| {
+        job.state = UpgradeStates::WORKING.to_string();
+        job.mornye_scout = true;
+    });
+    hold_on(&queue, "b", "A", ended);
+    // While b's checks are read, a's try comes back held again on a later pause.
+    let finishing = queue.clone();
+    let passed: HoldOverFn = Arc::new(move |_| {
+        finishing.finish_run("a", |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(MornyeHold {
+                labels: vec!["A".to_string()],
+                ..MornyeHold::until(next)
+            });
+        });
+        async { false }.boxed()
+    });
+    let tries = Arc::new(AtomicUsize::new(0));
+    let tried = tries.clone();
+    let apply: Apply = Arc::new(move |_| {
+        tried.fetch_add(1, Ordering::SeqCst);
+        async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed()
+    });
+    let worker = Arc::new(UpgradeWorker::with_seams(
+        queue.clone(),
+        seams_with_mornye(2, apply, Arc::default(), passed),
+        None,
+        None,
+        None,
+    ));
+
+    worker.tick(&CancellationToken::new()).await;
+    worker.drain().await;
+
+    assert_eq!(tries.load(Ordering::SeqCst), 0, "b waits for a's new pause");
+    let b = queue
+        .snapshot()
+        .into_iter()
+        .find(|job| job.navidrome_id == "b")
+        .expect("b");
+    assert_eq!(b.state, UpgradeStates::WAITING);
+    assert_eq!(b.mornye_hold.map(|hold| hold.until_utc), Some(next));
+}
+
+#[test]
+fn soulseek_coming_back_leaves_the_jobs_mornyes_check_kept() {
+    let queue = UpgradeQueue::new();
+    queue.add(asks(&["a", "b"]), "alice", "app");
+    queue.update("a", |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::SOULSEEK_OFFLINE.to_string());
+    });
+    hold_on(&queue, "b", "A", Utc::now() - chrono::Duration::seconds(1));
+    assert_eq!(queue.requeue(), 1);
+    let b = queue
+        .snapshot()
+        .into_iter()
+        .find(|job| job.navidrome_id == "b")
+        .expect("b");
+    assert_eq!(b.state, UpgradeStates::WAITING);
+}
+
+#[test]
+fn a_hold_keeps_the_address_of_the_mornye_that_paused() {
+    let pause = octo_core::spotiflac::check::CheckPause {
+        until_utc: Utc::now(),
+        labels: vec!["A".to_string()],
+        holding: Vec::new(),
+        url: "http://spotiflac:8000".to_string(),
+    };
+    assert_eq!(MornyeHold::of(&pause).url, "http://spotiflac:8000");
+}
+
+/// A Mornye that must never be asked, with slskd set up and logged in, and the real seams over
+/// them: the settings to switch Mornye off or move it, and the worker (starting nothing).
+async fn untouched_mornye() -> (MockServer, Arc<SettingsStore>, UpgradeWorkerSeams) {
+    let server = MockServer::builder().start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+        soulseek: SoulseekSettings {
+            base_url: Some("http://slskd:5030".into()),
+            username: Some("u".into()),
+            password: Some("p".into()),
+            ..Default::default()
+        },
+        spotiflac: octo_core::settings::SpotiflacSettings {
+            enabled: true,
+            url: server.uri(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let client = Arc::new(crate::services::spotiflac::SpotiflacClient::new(Arc::clone(
+        &settings,
+    )));
+    let sources = Arc::new(UpgradeSources::new(Arc::clone(&settings), None).with_spotiflac(client));
+    let apply: Apply = Arc::new(|_| async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed());
+    let mut seams = seams_with_mornye(
+        0,
+        apply,
+        Arc::default(),
+        mornye_hold_over_with(Some(sources.clone())),
+    );
+    seams.soulseek_offline = soulseek_offline_with(Some(sources), None);
+    (server, settings, seams)
+}
+
+/// Three jobs Mornye's check at `url` kept for another hour (c on a pause that names no check, as
+/// one read from Mornye's words can), and one waiting for Soulseek.
+fn three_kept_and_one_waiting(queue: &UpgradeQueue, url: &str) {
+    queue.add(asks(&["a", "b", "c", "d"]), "alice", "app");
+    for id in ["a", "b", "c"] {
+        queue.update(id, |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(MornyeHold {
+                labels: if id == "c" {
+                    Vec::new()
+                } else {
+                    vec!["A".to_string()]
+                },
+                url: url.to_string(),
+                ..MornyeHold::until(Utc::now() + chrono::Duration::hours(1))
+            });
+        });
+    }
+    queue.update("d", |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::SOULSEEK_OFFLINE.to_string());
+    });
+}
+
+fn assert_all_back_unmarked(queue: &UpgradeQueue) {
+    for job in queue.snapshot() {
+        assert_eq!(job.state, UpgradeStates::QUEUED, "{}", job.navidrome_id);
+        assert!(
+            !job.mornye_scout,
+            "{} went back with the others",
+            job.navidrome_id
+        );
+        assert_eq!(job.mornye_hold, None, "{}", job.navidrome_id);
+    }
+}
+
+#[tokio::test]
+async fn switching_mornye_off_sends_every_job_its_check_kept_back_at_once_without_asking_it() {
+    let (mornye, settings, seams) = untouched_mornye().await;
+    let queue = Arc::new(UpgradeQueue::new());
+    three_kept_and_one_waiting(&queue, &mornye.uri());
+    let mut off = (*settings.current()).clone();
+    off.spotiflac.enabled = false;
+    settings.set(off);
+    let worker = Arc::new(UpgradeWorker::with_seams(queue.clone(), seams, None, None, None));
+
+    worker.tick(&CancellationToken::new()).await;
+
+    assert_all_back_unmarked(&queue);
+    mornye.verify().await;
+}
+
+#[tokio::test]
+async fn moving_mornye_to_another_address_sends_every_job_its_check_kept_back_at_once() {
+    let (mornye, settings, seams) = untouched_mornye().await;
+    let elsewhere = MockServer::builder().start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&elsewhere)
+        .await;
+    let queue = Arc::new(UpgradeQueue::new());
+    three_kept_and_one_waiting(&queue, &mornye.uri());
+    let mut moved = (*settings.current()).clone();
+    moved.spotiflac.url = elsewhere.uri();
+    settings.set(moved);
+    let worker = Arc::new(UpgradeWorker::with_seams(queue.clone(), seams, None, None, None));
+
+    worker.tick(&CancellationToken::new()).await;
+
+    assert_all_back_unmarked(&queue);
+    mornye.verify().await;
+    elsewhere.verify().await;
+}
+
+#[tokio::test]
+async fn while_mornye_stays_the_same_its_holds_are_kept() {
+    // The hold's checks are read from the same Mornye: it answers that A is still paused.
+    let paused_a = Arc::new(AtomicBool::new(true));
+    let (mornye, passed) = mornye_with_a_paused_and_b_passing(paused_a).await;
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a"]), "alice", "app");
+    queue.update("a", |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+        job.mornye_hold = Some(MornyeHold {
+            labels: vec!["A".to_string()],
+            url: mornye.uri(),
+            ..MornyeHold::until(Utc::now() + chrono::Duration::hours(1))
+        });
+    });
+    let apply: Apply = Arc::new(|_| async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed());
+    let worker = Arc::new(UpgradeWorker::with_seams(
+        queue.clone(),
+        seams_with_mornye(0, apply, Arc::default(), passed),
+        None,
+        None,
+        None,
+    ));
+
+    worker.tick(&CancellationToken::new()).await;
+
+    assert_eq!(queue.snapshot()[0].state, UpgradeStates::WAITING);
+}
+
+#[tokio::test]
+async fn a_slow_mornye_never_holds_up_a_song_that_is_ready_to_go() {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["held", "ready"]), "alice", "app");
+    hold_on(&queue, "held", "A", Utc::now() + chrono::Duration::hours(1));
+    // Mornye never answers whether the held song's checks pass.
+    let never: HoldOverFn = Arc::new(|_| futures::future::pending().boxed());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let tell = started.clone();
+    let apply: Apply = Arc::new(move |_| {
+        tell.notify_one();
+        async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed()
+    });
+    let worker = Arc::new(UpgradeWorker::with_seams(
+        queue.clone(),
+        seams_with_mornye(2, apply, Arc::default(), never),
+        None,
+        None,
+        None,
+    ));
+    let ct = CancellationToken::new();
+    let ticking = {
+        let (worker, ct) = (worker.clone(), ct.clone());
+        tokio::spawn(async move { worker.tick(&ct).await })
+    };
+
+    // The read never ends, so a tick that waits for it never starts the song.
+    let ran = tokio::time::timeout(Duration::from_secs(30), started.notified()).await;
+    ticking.abort();
+
+    assert!(ran.is_ok(), "the ready song waited for Mornye's answer");
+}
+
+#[tokio::test]
+async fn a_slow_read_of_whether_a_source_can_search_never_holds_up_a_song_that_is_ready_to_go() {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["waiting", "ready"]), "alice", "app");
+    queue.update("waiting", |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::SOULSEEK_OFFLINE.to_string());
+    });
+    let started = Arc::new(tokio::sync::Notify::new());
+    let tell = started.clone();
+    let apply: Apply = Arc::new(move |_| {
+        tell.notify_one();
+        async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed()
+    });
+    let mut seams = seams(2, apply, Arc::default());
+    // Whether slskd can be used goes through Mornye when slskd cannot; that read never ends here.
+    seams.soulseek_offline = Arc::new(|| futures::future::pending().boxed());
+    let worker = Arc::new(UpgradeWorker::with_seams(queue.clone(), seams, None, None, None));
+    let ct = CancellationToken::new();
+    let ticking = {
+        let (worker, ct) = (worker.clone(), ct.clone());
+        tokio::spawn(async move { worker.tick(&ct).await })
+    };
+
+    // The read never ends, so a tick that waits for it never starts the song.
+    let ran = tokio::time::timeout(Duration::from_secs(30), started.notified()).await;
+    ticking.abort();
+
+    assert!(ran.is_ok(), "the ready song waited for the read");
+}
+
+#[tokio::test]
+async fn a_job_waiting_for_a_mornye_that_does_not_answer_says_so_and_goes_back_once_it_can() {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["a"]), "alice", "app");
+    let offline = Arc::new(AtomicBool::new(true));
+    let first = Arc::new(AtomicBool::new(true));
+    let apply: Apply = Arc::new(move |_| {
+        let out = first.swap(false, Ordering::SeqCst);
+        async move {
+            if out {
+                LibraryActionOutcome {
+                    code: Some(LibraryActionCodes::MORNYE_OUT.to_string()),
+                    ..outcome(LibraryActionState::Failed, "Mornye is not answering.")
+                }
+            } else {
+                outcome(LibraryActionState::Applied, "Upgraded")
+            }
+        }
+        .boxed()
+    });
+    let worker = worker(&queue, 1, apply, Some(offline.clone()));
+    let ct = CancellationToken::new();
+
+    worker.tick(&ct).await;
+    worker.drain().await;
+    let job = queue.snapshot().remove(0);
+    assert_eq!(job.state, UpgradeStates::WAITING);
+    assert_eq!(
+        job.detail.as_deref(),
+        Some("Waiting for Mornye, which is not answering or cannot download now")
+    );
+
+    offline.store(false, Ordering::SeqCst);
+    worker.tick(&ct).await;
+    worker.drain().await;
+    assert_eq!(queue.snapshot().remove(0).state, UpgradeStates::UPGRADED);
+}
+
+#[test]
+fn a_kept_jobs_hold_and_scout_mark_survive_a_restart() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("upgrades.json");
+    let until = Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap();
+    let hold = MornyeHold {
+        labels: vec!["A".to_string()],
+        holding: vec!["A".to_string(), "A two".to_string()],
+        url: "http://spotiflac:8000".to_string(),
+        ..MornyeHold::until(until)
+    };
+    {
+        let before = UpgradeQueue::with_path(Some(path.clone()));
+        before.add(asks(&["a"]), "alice", "app");
+        before.update("a", |job| {
+            job.state = UpgradeStates::WAITING.to_string();
+            job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
+            job.mornye_hold = Some(hold.clone());
+            job.mornye_scout = true;
+        });
+    }
+    let job = UpgradeQueue::with_path(Some(path)).snapshot().remove(0);
+    assert_eq!(job.mornye_hold, Some(hold));
+    assert_eq!(job.wait.as_deref(), Some(LibraryActionCodes::MORNYE_KEPT));
+    assert!(job.mornye_scout);
+}
+
 #[test]
 fn outcomes_map_on_the_code_not_the_words() {
     let cases = [
@@ -239,6 +1028,16 @@ fn outcomes_map_on_the_code_not_the_words() {
         (
             LibraryActionState::Failed,
             Some(LibraryActionCodes::SOULSEEK_OFFLINE),
+            UpgradeStates::WAITING,
+        ),
+        (
+            LibraryActionState::Failed,
+            Some(LibraryActionCodes::MORNYE_CHECK),
+            UpgradeStates::WAITING,
+        ),
+        (
+            LibraryActionState::Failed,
+            Some(LibraryActionCodes::MORNYE_KEPT),
             UpgradeStates::WAITING,
         ),
         (

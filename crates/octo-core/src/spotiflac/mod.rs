@@ -9,6 +9,8 @@ use crate::common::version_gap::{Against, other_version};
 use crate::fingerprint::track_match_comparer::TrackMatchComparer;
 use crate::soulseek::soulseek_download_service::DURATION_TOLERANCE_SECONDS;
 
+pub mod check;
+
 /// `GET /api/v1/info`.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -76,6 +78,9 @@ pub struct JobItem {
     /// The file's path on SpotiFLAC's side, once the song is done.
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
+    /// The extension the song went through (Mornye; `none` when the job failed before any, and
+    /// null or missing before one is tried).
+    pub provider: Option<String>,
 }
 
 impl JobItem {
@@ -148,6 +153,14 @@ impl Job {
     pub fn file(&self) -> Option<&str> {
         self.payload.items_detail.iter().find_map(JobItem::file)
     }
+
+    /// The extension the job's song went through or failed in, when an item names one.
+    pub fn provider(&self) -> Option<&str> {
+        self.payload
+            .items_detail
+            .iter()
+            .find_map(|item| item.provider.as_deref().and_then(check::named_provider))
+    }
 }
 
 /// One row of `GET /api/v1/extensions`.
@@ -155,6 +168,27 @@ impl Job {
 #[serde(default)]
 pub struct ExtensionRow {
     pub installed: bool,
+    /// The extension's name (Mornye; an older SpotiFLAC leaves it out).
+    pub provider: String,
+    pub attempts: i64,
+    pub failures: i64,
+    /// `success` or `failure`, for its last try.
+    pub last_outcome: String,
+    /// What its last failed try said, cut to 300 characters by Mornye.
+    pub last_error: String,
+}
+
+impl ExtensionsAnswer {
+    /// The row that counts extension `name`'s tries. Mornye keeps them on a row of the bare
+    /// name beside the installed `ext:` row, so of the rows with the same id the one with the
+    /// most tries wins, the exact name breaking a tie.
+    pub fn row(&self, name: &str) -> Option<&ExtensionRow> {
+        let id = check::extension_id(name);
+        self.providers
+            .iter()
+            .filter(|row| check::extension_id(&row.provider) == id)
+            .max_by_key(|row| (row.attempts, row.provider == name))
+    }
 }
 
 /// `GET /api/v1/extensions`.

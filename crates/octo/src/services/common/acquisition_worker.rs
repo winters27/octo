@@ -229,6 +229,11 @@ impl AcquisitionWorker {
     /// (`notify` cannot fail). Metadata comes from the same routing pair the download path itself
     /// uses, so the names match what the user starred.
     fn notify_failed(&self, request: &AcquisitionRequest, error: &anyhow::Error) {
+        // Mornye's check kept the song: its one push per stretch of failing says so, not a push
+        // per song.
+        if crate::services::spotiflac::mornye_waited(error).is_some() {
+            return;
+        }
         // A heart's or a play's song is kept in the registry; any other id is read unsaved.
         let register = matches!(
             request.origin,

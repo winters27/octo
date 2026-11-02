@@ -485,13 +485,223 @@ pub async fn get_status(State(state): State<AppState>, caller: Caller) -> Respon
     if !caller_of(&caller).is_some_and(AdminCaller::is_admin) {
         return json_ok(&anonymous_status(&state).await);
     }
+    let (mut services, mornye) = tokio::join!(probe_all(&state), mornye_row(&state));
+    // Only for an admin, so a signed-out caller never learns that a Mornye exists, and only while
+    // Mornye is switched on: a server that never set it up lists no row for it.
+    if let Some(mornye) = mornye {
+        services.insert("mornye".to_string(), mornye);
+    }
     json_ok(&json!({
         "octo": ServiceProbe::new(true, "Octo is responding"),
-        "services": probe_all(&state).await,
+        "services": services,
         "downloads": download_lines(&state),
         "acoustIdBuiltInKey": state.acoust_id.has_built_in_key(),
         "time": round_trip_offset(Utc::now()),
     }))
+}
+
+/// Mornye's row of the admin status, kept between answers so a slow Mornye never holds the
+/// status up: one probe at a time, each keeping its row for Mornye's settings as they were when
+/// it was asked.
+pub struct MornyeRowKeeper {
+    kept: parking_lot::Mutex<Option<KeptRow>>,
+    asking: std::sync::atomic::AtomicBool,
+    answered: tokio::sync::Notify,
+    /// How long a status answer waits for a probe, in milliseconds.
+    wait_ms: std::sync::atomic::AtomicU64,
+}
+
+/// A row a probe kept: the address it asked, how many times Mornye's settings had changed when
+/// it was asked (`SettingsStore::spotiflac_changes`), and the row.
+struct KeptRow {
+    url: String,
+    changes: u64,
+    row: serde_json::Value,
+}
+
+impl Default for MornyeRowKeeper {
+    fn default() -> Self {
+        MornyeRowKeeper {
+            kept: parking_lot::Mutex::new(None),
+            asking: std::sync::atomic::AtomicBool::new(false),
+            answered: tokio::sync::Notify::new(),
+            wait_ms: std::sync::atomic::AtomicU64::new(Self::WAIT.as_millis() as u64),
+        }
+    }
+}
+
+impl MornyeRowKeeper {
+    /// How long a status answer waits for a probe of Mornye before it uses the kept row.
+    pub const WAIT: Duration = Duration::from_secs(1);
+
+    fn wait(&self) -> Duration {
+        Duration::from_millis(self.wait_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Waits `wait` for a probe instead (tests).
+    #[cfg(test)]
+    pub(super) fn set_wait(&self, wait: Duration) {
+        self.wait_ms
+            .store(wait.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The row the last probe of the Mornye at `url` kept, while Mornye's settings have not
+    /// changed since it was asked (`changes` is the count now): any change, a switch off and on
+    /// again included, wants a new probe. Other settings changing does not.
+    pub(super) fn kept_for(&self, url: &str, changes: u64) -> Option<serde_json::Value> {
+        self.kept
+            .lock()
+            .as_ref()
+            .filter(|kept| kept.url == url && kept.changes == changes)
+            .map(|kept| kept.row.clone())
+    }
+
+    /// Keeps `row`, from a probe of the Mornye at `asked` begun when Mornye's settings had
+    /// changed `changes` times. One that outlived a change is kept too, but [`Self::kept_for`]
+    /// never shows it. Each probe reads the count while it alone may probe, so a later probe
+    /// never keeps an older count.
+    pub(super) fn keep(&self, changes: u64, asked: String, row: serde_json::Value) {
+        *self.kept.lock() = Some(KeptRow {
+            url: asked,
+            changes,
+            row,
+        });
+    }
+}
+
+/// Ends a probe: lets the next one start and wakes the answers waiting for it, also when the
+/// probe stopped short.
+struct ProbeDone(AppState);
+
+impl Drop for ProbeDone {
+    fn drop(&mut self) {
+        let keeper = &self.0.mornye_row;
+        keeper.asking.store(false, std::sync::atomic::Ordering::Release);
+        keeper.answered.notify_waiters();
+    }
+}
+
+/// Mornye's row for an admin: None while Mornye is switched off. Switched on with no address, a
+/// warning that says so. Otherwise the row of a probe that answers within the keeper's wait
+/// ([`MornyeRowKeeper::WAIT`]), else the row the last probe kept while Mornye's settings stayed
+/// as they are, else a warning that Mornye has not answered yet; a probe still asking keeps its
+/// row for the next answer.
+async fn mornye_row(state: &AppState) -> Option<serde_json::Value> {
+    let snapshot = state.settings.current();
+    let settings = &snapshot.spotiflac;
+    if !settings.enabled {
+        return None;
+    }
+    if !settings.is_on() {
+        return Some(json!(
+            ServiceProbe::new(
+                true,
+                "Switched on, but it has no address. Set it on the Mornye page."
+            )
+            .warning(true)
+        ));
+    }
+    let url = settings.effective_url();
+    let keeper = &state.mornye_row;
+    let answered = keeper.answered.notified();
+    tokio::pin!(answered);
+    answered.as_mut().enable();
+    if !keeper.asking.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let state = state.clone();
+        // Read while this probe alone may probe: the count first, so a change after it makes the
+        // row one no status shows.
+        let changes = state.settings.spotiflac_changes();
+        let asked = state.settings.current().spotiflac.effective_url();
+        tokio::spawn(async move {
+            let done = ProbeDone(state.clone());
+            let row = probe_mornye(&state).await;
+            state.mornye_row.keep(changes, asked, row);
+            drop(done);
+        });
+    }
+    let _ = tokio::time::timeout(keeper.wait(), answered).await;
+    Some(
+        keeper
+            .kept_for(&url, state.settings.spotiflac_changes())
+            .unwrap_or_else(|| json!(ServiceProbe::new(true, "Mornye has not answered yet.").warning(true))),
+    )
+}
+
+/// Mornye's row: off (optional), unreachable, its check paused (with "pass" when the dashboard can
+/// pass it), its utilities extension missing, or its name and version.
+pub(super) async fn probe_mornye(state: &AppState) -> serde_json::Value {
+    if !state.spotiflac.settings().is_on() {
+        return json!(ServiceProbe::new(true, "Off. Optional.").unconfigured());
+    }
+    let status = match tokio::time::timeout(PROBE_TIMEOUT, super::spotiflac::mornye_status(state, "")).await {
+        Ok(status) => status,
+        Err(_) => {
+            return json!(ServiceProbe::new(
+                false,
+                "Mornye did not answer within 5 seconds."
+            ));
+        }
+    };
+    let text = |key: &str| {
+        status
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    if !status.get("reachable").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return json!(ServiceProbe::new(false, text("problem")));
+    }
+    if status
+        .get("utilitiesMissing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return json!(
+            ServiceProbe::new(
+                true,
+                "Mornye needs its utilities extension, which your registry does not list."
+            )
+            .warning(true)
+        );
+    }
+    let now = Utc::now();
+    let next_try = status
+        .get("checks")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|check| check.get("pausedUntilUtc").and_then(|v| v.as_str()))
+        .filter_map(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+        .map(|t| t.with_timezone(&Utc))
+        .min();
+    let flag = |key: &str| status.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+    if flag("paused") {
+        let detail = match next_try {
+            Some(until) => format!(
+                "Check paused; next try {}",
+                octo_core::spotiflac::check::until_words(until, now)
+            ),
+            None => "Check paused".to_string(),
+        };
+        let mut row = json!(ServiceProbe::new(true, detail).warning(true));
+        // The same rule as the dashboard's Pass button, decided once in the status.
+        if flag("passable")
+            && let Some(object) = row.as_object_mut()
+        {
+            object.insert("action".to_string(), json!("pass"));
+        }
+        return row;
+    }
+    let version = text("version");
+    json!(ServiceProbe::new(
+        true,
+        if version.is_empty() {
+            "Mornye".to_string()
+        } else {
+            format!("Mornye {version}")
+        }
+    ))
 }
 
 /// The downloads card's lines: what Octo's checks of downloads by their sound cannot do right

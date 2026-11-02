@@ -618,6 +618,115 @@ async fn better_quality_asks_lidarr_when_soulseek_finds_nothing() {
     assert!(!Path::new(&f.original).exists());
 }
 
+/// A wait read from Mornye's words beside a working read: it watches no check, and shares
+/// Example's.
+fn kept_by_mornye() -> anyhow::Error {
+    let pause = octo_core::spotiflac::check::CheckPause {
+        until_utc: chrono::Utc::now() + chrono::Duration::minutes(15),
+        labels: Vec::new(),
+        holding: vec!["Example".into()],
+        url: String::new(),
+    };
+    crate::services::spotiflac::MornyeWaiting::new(pause, false, chrono::Utc::now()).into_error()
+}
+
+#[tokio::test]
+async fn better_quality_whose_copy_mornyes_check_kept_waits_for_mornye() {
+    let f = Fixture::new().await;
+    let action = spawn_apply(&f.plain_executor(), better_quality());
+
+    let download = f.next_download().await;
+    f.fail(&download, kept_by_mornye());
+    let outcome = outcome_of(action).await;
+
+    assert_eq!(outcome.state, LibraryActionState::Failed);
+    assert_eq!(outcome.code.as_deref(), Some(LibraryActionCodes::MORNYE_KEPT));
+    assert!(
+        outcome.detail.as_deref().unwrap_or_default().starts_with(
+            "Waiting for Mornye's check, which it could not pass for Example; it allows its next try at "
+        ),
+        "{outcome:?}"
+    );
+    assert!(!outcome.consumed());
+    assert!(Path::new(&f.original).exists());
+}
+
+#[tokio::test]
+async fn a_mornye_wait_on_the_first_source_still_waits_when_lidarr_has_nothing_either() {
+    let f = Fixture::new().await;
+    let action = spawn_apply(&f.executor(false, None, both_sources(None)), better_quality());
+
+    let soulseek = f.next_download().await;
+    f.fail(&soulseek, kept_by_mornye());
+    let lidarr = f.next_download().await;
+    assert_eq!(lidarr.source_override, Some(DownloadSource::Lidarr));
+    f.fail(&lidarr, not_found("Lidarr found no release"));
+    let outcome = outcome_of(action).await;
+
+    assert_eq!(
+        outcome.code.as_deref(),
+        Some(LibraryActionCodes::MORNYE_KEPT),
+        "{outcome:?}"
+    );
+    assert!(!outcome.consumed());
+}
+
+#[tokio::test]
+async fn better_quality_waits_for_mornyes_check_when_every_source_is_out() {
+    // slskd is logged out and Mornye's check keeps it from every extension.
+    let mornye = MockServer::builder().start().await;
+    for (at, body) in [
+        (
+            "/api/get_signed_sessions",
+            serde_json::json!({"result": {"sessions": [
+            {"key": "gateway-v2-abc-6836abb49bb0e8c9", "kind": "gateway", "label": "Example",
+             "extensions": ["example-ext"], "state": "unverified", "auth_paused_s": 900.0}]}}),
+        ),
+        (
+            "/api/get_download_services",
+            serde_json::json!({"result": {"services": [
+            {"id": "ext:example-ext", "label": "Example", "extensions": ["example-ext"]}]}}),
+        ),
+    ] {
+        Mock::given(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&mornye)
+            .await;
+    }
+    let settings = store(AppSettings {
+        soulseek: slskd_set_up(),
+        spotiflac: octo_core::settings::SpotiflacSettings {
+            enabled: true,
+            url: mornye.uri(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let sources = UpgradeSources::new(Arc::clone(&settings), Some(Arc::new(OfflineLink))).with_spotiflac(
+        Arc::new(crate::services::spotiflac::SpotiflacClient::new(settings)),
+    );
+    let f = Fixture::new().await;
+    let executor = f.executor(false, Some(Arc::new(OfflineLink)), Some(Arc::new(sources)));
+
+    let outcome = executor.apply(better_quality()).await.expect("an outcome");
+
+    assert_eq!(
+        outcome.code.as_deref(),
+        Some(LibraryActionCodes::MORNYE_CHECK),
+        "{outcome:?}"
+    );
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("Waiting for Mornye's check"),
+        "{outcome:?}"
+    );
+    assert!(f.queue.is_idle(), "nothing was asked");
+    assert!(Path::new(&f.original).exists());
+}
+
 #[tokio::test]
 async fn better_quality_asks_lidarr_when_soulseeks_copy_fails_the_checks() {
     let f = Fixture::new().await;

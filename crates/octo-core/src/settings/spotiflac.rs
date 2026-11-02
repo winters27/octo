@@ -67,6 +67,17 @@ pub struct SpotiflacSettings {
 
     /// How many songs SpotiFLAC is asked for at once (1 to 4). SPOTIFLAC_AT_ONCE.
     pub at_once: i32,
+
+    /// Mornye's own page as a browser reaches it, when the address above is one only Octo's
+    /// container reaches. Blank: worked out from the address. SPOTIFLAC_WEB_URL.
+    pub web_url: String,
+
+    /// The port Mornye's page is published on, for working out that address. SPOTIFLAC_PORT.
+    pub web_port: i32,
+
+    /// Octo's assist helper beside Mornye, which "Pass Mornye's check" talks to. Blank: port
+    /// 8011 of Octo's own spotiflac service, when the address is that service. SPOTIFLAC_ASSIST_URL.
+    pub assist_url: String,
 }
 
 impl Default for SpotiflacSettings {
@@ -81,14 +92,63 @@ impl Default for SpotiflacSettings {
             placement: SpotiflacPlacement::AfterSoulseek,
             timeout_seconds: 600,
             at_once: 2,
+            web_url: String::new(),
+            web_port: 8010,
+            assist_url: String::new(),
         }
     }
 }
+
+/// The name of Octo's own Mornye service in its compose file.
+pub const SPOTIFLAC_SERVICE_HOST: &str = "spotiflac";
+
+/// The port of Octo's assist helper inside that service.
+pub const ASSIST_PORT: u16 = 8011;
 
 impl SpotiflacSettings {
     /// On, with an address to ask.
     pub fn is_on(&self) -> bool {
         self.enabled && !self.effective_url().is_empty()
+    }
+
+    /// Whether the address is Octo's own spotiflac service.
+    pub fn is_octo_service(&self) -> bool {
+        url::Url::parse(&self.effective_url())
+            .ok()
+            .and_then(|url| {
+                url.host_str()
+                    .map(|host| host.eq_ignore_ascii_case(SPOTIFLAC_SERVICE_HOST))
+            })
+            .unwrap_or(false)
+    }
+
+    /// The assist helper's address: the setting, or port 8011 of Octo's own service. None for a
+    /// Mornye Octo does not run, with no address set.
+    pub fn effective_assist_url(&self) -> Option<String> {
+        let set = super::normalize_server_url(&self.assist_url);
+        if !set.is_empty() {
+            return Some(set);
+        }
+        self.is_octo_service()
+            .then(|| format!("http://{SPOTIFLAC_SERVICE_HOST}:{ASSIST_PORT}"))
+    }
+
+    /// Mornye's page for a browser: the setting, else `http://<dashboard host>:<port>` for Octo's
+    /// own service (the caller gives the dashboard's host), else the address.
+    pub fn effective_web_url(&self, dashboard_host: &str) -> String {
+        let set = super::normalize_server_url(&self.web_url);
+        if !set.is_empty() {
+            return set;
+        }
+        if self.is_octo_service() && !dashboard_host.trim().is_empty() {
+            let port = if (1..=65535).contains(&self.web_port) {
+                self.web_port
+            } else {
+                8010
+            };
+            return format!("http://{}:{port}", dashboard_host.trim());
+        }
+        self.effective_url()
     }
 
     /// The address, trimmed, with no trailing slash.

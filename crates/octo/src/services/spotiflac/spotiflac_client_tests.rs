@@ -251,29 +251,115 @@ async fn a_mornye_answers_by_its_own_name() {
     );
 }
 
+/// A stand-in Mornye's library scan: `/downloads` on its side is `music` on Octo's, and it counts
+/// the song files it finds in the one folder asked about, as Mornye does.
+struct LooksInOctosFolder {
+    music: std::path::PathBuf,
+}
+
+impl wiremock::Respond for LooksInOctosFolder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let asked: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+        assert_eq!(asked["recursive"], json!(false), "one folder, not its subfolders");
+        let seen = asked["path"]
+            .as_str()
+            .and_then(|theirs| theirs.strip_prefix("/downloads/"))
+            .and_then(|rest| std::fs::read_dir(self.music.join(rest)).ok())
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "flac"))
+                    .count()
+            })
+            .unwrap_or(0);
+        ResponseTemplate::new(200).set_body_json(json!({
+            "target": "HI_RES_LOSSLESS", "scanned": seen, "unreadable": seen, "already_ok": 0, "upgradable": 0, "candidates": []
+        }))
+    }
+}
+
+fn mornye_info(name: &str, version: &str) -> serde_json::Value {
+    json!({"name": name, "version": version, "api_version": "v1", "multiuser": false, "authenticated": true})
+}
+
+fn mornye_extensions() -> serde_json::Value {
+    json!({"providers": [
+        {"provider": "ext:example-ext", "installed": true, "attempts": 0, "last_outcome": "", "last_error": ""},
+        {"provider": "ext:example-ext-two", "installed": true, "attempts": 0, "last_outcome": "", "last_error": ""}
+    ]})
+}
+
+fn one_service() -> serde_json::Value {
+    json!({"result": {"services": [{"id": "ext:example-ext", "label": "Example", "extensions": ["example-ext"]}]}})
+}
+
+fn no_sessions() -> serde_json::Value {
+    json!({"result": {"sessions": []}})
+}
+
+/// A Mornye with these answers; `scan` answers its library scan.
+async fn mornye(
+    info: serde_json::Value,
+    extensions: serde_json::Value,
+    services: serde_json::Value,
+    sessions: serde_json::Value,
+    scan: impl wiremock::Respond + 'static,
+) -> MockServer {
+    let server = spotiflac(info, extensions).await;
+    Mock::given(method("POST"))
+        .and(path("/api/get_download_services"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(services))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/get_signed_sessions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(sessions))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/library/scan"))
+        .respond_with(scan)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// The Test of a Mornye whose library scan is `scan`, everything else ready.
+async fn test_with_scan(scan: impl wiremock::Respond + 'static) -> (TestReport, tempfile::TempDir) {
+    let music = tempfile::tempdir().expect("a folder");
+    let server = mornye(
+        mornye_info("Mornye", "1.0.5"),
+        mornye_extensions(),
+        one_service(),
+        no_sessions(),
+        scan,
+    )
+    .await;
+    let report = client(SpotiflacSettings::default())
+        .test(
+            &connection(&server.uri(), "s3cret"),
+            true,
+            Some("/downloads"),
+            &music.path().to_string_lossy(),
+        )
+        .await;
+    (report, music)
+}
+
 #[tokio::test]
-async fn a_ready_spotiflac_passes_and_the_folder_is_made() {
-    let server = MockServer::builder().start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/info"))
-        .and(header(
-            "cookie",
-            "mornye_web_token=s3cret; spotiflac_web_token=s3cret",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(info(true, false)))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/extensions"))
-        .and(header(
-            "cookie",
-            "mornye_web_token=s3cret; spotiflac_web_token=s3cret",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(two_extensions()))
-        .mount(&server)
-        .await;
+async fn a_ready_mornye_passes_and_sees_octos_folder() {
     let music = tempfile::tempdir().expect("a folder");
     let root = music.path().to_string_lossy().into_owned();
+    let server = mornye(
+        mornye_info("Mornye", "1.0.5"),
+        mornye_extensions(),
+        one_service(),
+        no_sessions(),
+        LooksInOctosFolder {
+            music: music.path().to_path_buf(),
+        },
+    )
+    .await;
     let report = client(SpotiflacSettings::default())
         .test(
             &connection(&server.uri(), "s3cret"),
@@ -283,21 +369,103 @@ async fn a_ready_spotiflac_passes_and_the_folder_is_made() {
         )
         .await;
     assert!(report.ok, "{:?}", report.checks);
-    assert_eq!(report.message, "Mornye is ready.");
-    assert_eq!(report.version.as_deref(), Some("5.0.5"));
+    assert_eq!(report.message, "Mornye is ready.", "{:?}", report.checks);
+    assert_eq!(report.version.as_deref(), Some("1.0.5"));
     assert_eq!(report.extensions, Some(2));
-    assert!(music.path().join(SPOTIFLAC_FOLDER).is_dir());
     assert!(
-        texts(&report, "ok")
-            .iter()
-            .any(|text| text.contains("/downloads/.octo-incoming/spotiflac on Mornye's side")),
+        texts(&report, "ok").contains(&format!(
+            "Mornye sees Octo's folder: /downloads/.octo-incoming/spotiflac in Mornye is {root}/.octo-incoming/spotiflac in Octo."
+        )),
+        "{:?}",
+        report.checks
+    );
+    let left: Vec<_> = std::fs::read_dir(music.path().join(SPOTIFLAC_FOLDER))
+        .unwrap()
+        .collect();
+    assert!(left.is_empty(), "the Test's own folder is removed");
+}
+
+#[tokio::test]
+async fn a_mornye_that_sees_no_song_in_octos_folder_fails_and_says_where_to_mount() {
+    // A Mornye whose /downloads is another disk sees an empty folder.
+    let (report, _music) =
+        test_with_scan(ResponseTemplate::new(200).set_body_json(json!({"scanned": 0, "unreadable": 0})))
+            .await;
+    assert!(!report.ok);
+    assert!(
+        report
+            .message
+            .starts_with("Mornye does not see Octo's folder at /downloads/.octo-incoming/spotiflac."),
+        "{}",
+        report.message
+    );
+}
+
+#[tokio::test]
+async fn a_folder_outside_mornyes_download_folder_is_a_warning_naming_both_sides() {
+    let outside = json!({"error": "That path is outside this instance's download folder.", "detail": "Scans are confined to the folder this account downloads into."});
+    let (report, _music) = test_with_scan(ResponseTemplate::new(400).set_body_json(outside)).await;
+    assert!(report.ok, "{:?}", report.checks);
+    assert_eq!(report.message, "Mornye is ready, with a warning below.");
+    assert!(
+        texts(&report, "warn")[0].starts_with(
+            "Octo cannot check the folder from here, because it is outside Mornye's own download folder."
+        ),
         "{:?}",
         report.checks
     );
 }
 
 #[tokio::test]
-async fn a_ready_spotiflac_with_the_switch_off_says_so() {
+async fn a_scan_that_is_missing_or_broken_is_a_plain_warning() {
+    for answer in [ResponseTemplate::new(404), ResponseTemplate::new(500)] {
+        let (report, _music) = test_with_scan(answer).await;
+        assert!(report.ok, "{:?}", report.checks);
+        let warned = texts(&report, "warn");
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(
+            warned[0].starts_with("Octo cannot check the folder from here. Make sure"),
+            "{warned:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_ready_mornye_with_the_switch_off_says_so() {
+    let music = tempfile::tempdir().expect("a folder");
+    let server = mornye(
+        mornye_info("Mornye", "1.0.5"),
+        mornye_extensions(),
+        one_service(),
+        no_sessions(),
+        LooksInOctosFolder {
+            music: music.path().to_path_buf(),
+        },
+    )
+    .await;
+    let report = client(SpotiflacSettings::default())
+        .test(
+            &connection(&server.uri(), "t"),
+            false,
+            Some("/downloads"),
+            &music.path().to_string_lossy(),
+        )
+        .await;
+    assert!(report.ok);
+    assert_eq!(
+        report.message, "Mornye is ready, with a warning below.",
+        "{:?}",
+        report.checks
+    );
+    assert!(
+        texts(&report, "warn")[0].contains("The switch is off"),
+        "{:?}",
+        report.checks
+    );
+}
+
+#[tokio::test]
+async fn several_warnings_say_warnings() {
     let server = spotiflac(info(true, false), two_extensions()).await;
     let music = tempfile::tempdir().expect("a folder");
     let report = client(SpotiflacSettings::default())
@@ -309,14 +477,234 @@ async fn a_ready_spotiflac_with_the_switch_off_says_so() {
         )
         .await;
     assert!(report.ok);
-    assert_eq!(report.message, "Mornye is ready, with a warning below.");
-    assert!(
-        texts(&report, "warn")
-            .iter()
-            .any(|text| text.contains("The switch is off")),
+    assert_eq!(
+        report.message, "Mornye is ready, with warnings below.",
         "{:?}",
         report.checks
     );
+}
+
+#[tokio::test]
+async fn an_old_name_or_version_is_told_to_update() {
+    for (name, version, said) in [
+        (
+            "SpotiFLAC",
+            "5.0.5",
+            "This is SpotiFLAC 5.0.5, from before its rename to Mornye. Run Mornye 1.0.4 or later.",
+        ),
+        (
+            "Mornye",
+            "1.0.3",
+            "This Mornye is 1.0.3; versions before 1.0.4 cannot pass the check. Update it.",
+        ),
+    ] {
+        let music = tempfile::tempdir().expect("a folder");
+        let server = mornye(
+            mornye_info(name, version),
+            mornye_extensions(),
+            one_service(),
+            no_sessions(),
+            LooksInOctosFolder {
+                music: music.path().to_path_buf(),
+            },
+        )
+        .await;
+        let report = client(SpotiflacSettings::default())
+            .test(
+                &connection(&server.uri(), "t"),
+                true,
+                Some("/downloads"),
+                &music.path().to_string_lossy(),
+            )
+            .await;
+        assert_eq!(
+            texts(&report, "warn"),
+            vec![said.to_string()],
+            "{:?}",
+            report.checks
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_mornye_without_its_utilities_says_that_alone() {
+    // Mornye 1.1.0 with a registry that has no utilities extension: no services, and the check
+    // read names what is missing.
+    let music = tempfile::tempdir().expect("a folder");
+    let server = mornye(
+        mornye_info("Mornye", "1.1.0"),
+        mornye_extensions(),
+        json!({"result": {"services": []}}),
+        json!({"result": {"sessions": [], "error": "The optional utilities extension is not installed; 'mornye.core.signed_session_status' requires 'utilities.sflx' to be available."}}),
+        LooksInOctosFolder {
+            music: music.path().to_path_buf(),
+        },
+    )
+    .await;
+    let report = client(SpotiflacSettings::default())
+        .test(
+            &connection(&server.uri(), "t"),
+            true,
+            Some("/downloads"),
+            &music.path().to_string_lossy(),
+        )
+        .await;
+    assert!(!report.ok);
+    assert!(
+        report.message.starts_with("Mornye needs its utilities extension"),
+        "{}",
+        report.message
+    );
+    assert_eq!(texts(&report, "fail").len(), 1, "{:?}", report.checks);
+    assert!(texts(&report, "warn").is_empty(), "{:?}", report.checks);
+}
+
+#[tokio::test]
+async fn extensions_that_cannot_download_fail_the_test() {
+    let music = tempfile::tempdir().expect("a folder");
+    let server = mornye(
+        mornye_info("Mornye", "1.0.5"),
+        mornye_extensions(),
+        json!({"result": {"services": []}}),
+        no_sessions(),
+        LooksInOctosFolder {
+            music: music.path().to_path_buf(),
+        },
+    )
+    .await;
+    let report = client(SpotiflacSettings::default())
+        .test(
+            &connection(&server.uri(), "t"),
+            true,
+            Some("/downloads"),
+            &music.path().to_string_lossy(),
+        )
+        .await;
+    assert!(!report.ok);
+    assert_eq!(report.message, "Mornye has extensions but none that downloads.");
+}
+
+#[tokio::test]
+async fn an_installed_extensions_last_failure_is_warned_and_a_removed_ones_is_not() {
+    let music = tempfile::tempdir().expect("a folder");
+    let extensions = json!({"providers": [
+        {"provider": "example-ext", "installed": false, "attempts": 4, "failures": 3, "last_outcome": "failure",
+         "last_error": "EACCES: permission denied \u{2014} open x.flac"},
+        {"provider": "ext:example-ext", "installed": true, "attempts": 0, "last_outcome": "", "last_error": ""},
+        {"provider": "gone-ext", "installed": false, "attempts": 2, "failures": 2, "last_outcome": "failure", "last_error": "old trouble"}
+    ]});
+    let server = mornye(
+        mornye_info("Mornye", "1.0.5"),
+        extensions,
+        one_service(),
+        no_sessions(),
+        LooksInOctosFolder {
+            music: music.path().to_path_buf(),
+        },
+    )
+    .await;
+    let report = client(SpotiflacSettings::default())
+        .test(
+            &connection(&server.uri(), "t"),
+            true,
+            Some("/downloads"),
+            &music.path().to_string_lossy(),
+        )
+        .await;
+    assert_eq!(
+        texts(&report, "warn"),
+        vec!["example-ext failed its last try: EACCES: permission denied, open x.flac".to_string()],
+        "{:?}",
+        report.checks
+    );
+}
+
+#[tokio::test]
+async fn a_paused_check_is_warned_with_its_next_try() {
+    let music = tempfile::tempdir().expect("a folder");
+    let sessions = json!({"result": {"sessions": [
+        {"key": "gateway-v2-abc-6836abb49bb0e8c9", "kind": "gateway", "label": "Example", "extensions": ["example-ext"],
+         "state": "unverified", "auth_paused_s": 900.0}
+    ]}});
+    let server = mornye(
+        mornye_info("Mornye", "1.0.5"),
+        mornye_extensions(),
+        one_service(),
+        sessions,
+        LooksInOctosFolder {
+            music: music.path().to_path_buf(),
+        },
+    )
+    .await;
+    let report = client(SpotiflacSettings::default())
+        .test(
+            &connection(&server.uri(), "t"),
+            true,
+            Some("/downloads"),
+            &music.path().to_string_lossy(),
+        )
+        .await;
+    let warned = texts(&report, "warn");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(
+        warned[0].starts_with("Mornye's check for Example is paused; it allows its next try at "),
+        "{warned:?}"
+    );
+}
+
+/// The words the client pushes when a read of `server` opens a paused check, with slskd switched
+/// on or off in the settings and `link` as its running link.
+async fn paused_check_words(
+    server: &MockServer,
+    slskd_switched_on: bool,
+    link: Arc<dyn crate::services::soulseek::ISoulseekLink>,
+) -> Vec<String> {
+    let mut settings = AppSettings::default();
+    settings.spotiflac.enabled = true;
+    settings.spotiflac.url = server.uri();
+    settings.spotiflac.token = "t".into();
+    settings.soulseek.enabled = slskd_switched_on;
+    settings.soulseek.base_url = Some("http://slskd.test:5030".into());
+    let pushed = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&pushed);
+    let client = SpotiflacClient::new(Arc::new(SettingsStore::for_tests(settings)))
+        .with_slskd(link)
+        .with_check(MornyeCheck::new(
+            Arc::new(MornyeCheckStore::new(None)),
+            CheckTimes::default(),
+            Some(Arc::new(move |words: String| sink.lock().push(words))),
+        ));
+    client.check_view(None).await.expect("a read of Mornye");
+    pushed.lock().clone()
+}
+
+/// The paused check's words name Soulseek by slskd's running link, as the downloads do, not by
+/// the live switch.
+#[tokio::test]
+async fn the_paused_check_words_read_slskd_by_its_link() {
+    use crate::services::common::test_fakes::{LoggedInLink, OffLink};
+    let sessions = json!({"result": {"sessions": [
+        {"key": "gateway-v2-abc-6836abb49bb0e8c9", "kind": "gateway", "label": "Example", "extensions": ["example-ext"],
+         "state": "unverified", "auth_paused_s": 900.0}
+    ]}});
+    let server = mornye(
+        mornye_info("Mornye", "1.0.5"),
+        mornye_extensions(),
+        one_service(),
+        sessions,
+        ResponseTemplate::new(404),
+    )
+    .await;
+
+    // Switched off since startup: the running slskd is still asked.
+    let words = paused_check_words(&server, false, Arc::new(LoggedInLink)).await;
+    assert_eq!(words.len(), 1, "{words:?}");
+    assert!(words[0].contains(", so Octo asks Soulseek"), "{words:?}");
+
+    // Switched on since startup: slskd is not running, so the words never promise it.
+    let words = paused_check_words(&server, true, Arc::new(OffLink)).await;
+    assert_eq!(words.len(), 1, "{words:?}");
+    assert!(!words[0].contains("Soulseek"), "{words:?}");
 }
 
 #[tokio::test]

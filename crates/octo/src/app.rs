@@ -161,7 +161,7 @@ use crate::services::soulseek::{
     SoulseekLink, SoulseekMetadataService, SoulseekPortCheck, SoulseekShareSwitch, SoulseekSharing,
     SoulseekStartupValidator,
 };
-use crate::services::spotiflac::SpotiflacClient;
+use crate::services::spotiflac::{CheckTimes, MornyeCheck, MornyeCheckStore, SpotiflacClient};
 use crate::services::subsonic::{
     CredentialCheck, NavidromeIdentityService, RecentScrobbles, RequestIdentity, SearchSongOrderCache,
     SubsonicDiscoveryService, SubsonicProxyService, SyncCatalogService,
@@ -173,6 +173,7 @@ use crate::services::validation::{
 };
 use crate::services::you_tube::{PinRecheck, StreamSizeWarmer, YouTubeMusicClient, YouTubeResolver};
 use crate::workers::WorkerSupervisor;
+use octo_core::notifications::{NotificationEvent, NotificationEventType};
 
 /// Cheap to clone; handlers and workers receive it by value.
 #[derive(Clone)]
@@ -350,6 +351,8 @@ pub struct AppInner {
     pub admin_role_check: Arc<AdminRoleCheck>,
     /// The signed-out `GET /api/admin/status` answer, kept ten seconds.
     pub anonymous_status: crate::controllers::admin::system::AnonymousStatusCache,
+    /// Mornye's row of the admin status, kept between answers.
+    pub mornye_row: crate::controllers::admin::system::MornyeRowKeeper,
     /// `RejectedPeerRegistry`: peer files that proved wrong, `rejected-peers.json` (flushed by
     /// a worker), with `Soulseek:RejectedPeerTtlDays` read live.
     pub rejected_peers: Arc<RejectedPeerRegistry>,
@@ -742,6 +745,7 @@ fn prefetch_service(
         concurrency: Some(stores.download_concurrency.clone()),
         names: Some(stores.external_id_registry.clone()),
         soulseek: Some(soulseek_link),
+        spotiflac: Some(acquisition.spotiflac.clone()),
         clock: Clock::system(),
     })
 }
@@ -918,7 +922,26 @@ impl Acquisition {
             Clock::system(),
         );
         let upgrade_queue = stores.upgrade_queue.clone();
-        let upgrade_sources = Arc::new(UpgradeSources::new(settings.clone(), Some(soulseek_link.clone())));
+        // Mornye: its check is kept in mornye-check.json and pushes once per stretch of failing.
+        let check_notifications = integrations.notifications.clone();
+        let spotiflac = Arc::new(
+            SpotiflacClient::new(settings.clone())
+                .with_slskd(soulseek_link.clone())
+                .with_check(MornyeCheck::new(
+                    stores.mornye_check.clone(),
+                    CheckTimes::default(),
+                    Some(Arc::new(move |words: String| {
+                        check_notifications.notify(NotificationEvent {
+                            detail: Some(words),
+                            ..NotificationEvent::new(NotificationEventType::MornyeCheck)
+                        });
+                    })),
+                )),
+        );
+        let upgrade_sources = Arc::new(
+            UpgradeSources::new(settings.clone(), Some(soulseek_link.clone()))
+                .with_spotiflac(spotiflac.clone()),
+        );
         let library_ownership = Arc::new(LibraryOwnership::new(
             settings.clone(),
             Some(OwnershipNavidrome {
@@ -943,7 +966,6 @@ impl Acquisition {
             lidarr_album_claims.clone(),
         ));
         let lidarr_track_fetcher: Arc<dyn ILidarrTrackFetcher> = lidarr_fetcher.clone();
-        let spotiflac = Arc::new(SpotiflacClient::new(settings.clone()));
 
         // The gates of hearted albums' chains, which every source's check point files tracks by.
         let album_gates = Arc::new(AlbumGates::new());
@@ -1361,7 +1383,8 @@ impl Acquisition {
         }
     }
 
-    /// `AcquisitionWorker`, `SoulseekHoldResumer` and `CacheCleanupService`, as workers.
+    /// `AcquisitionWorker`, `SoulseekHoldResumer`, `CacheCleanupService` and
+    /// `MornyeLeftPassJobs`, as workers.
     fn register_workers(
         &self,
         workers: &WorkerSupervisor,
@@ -1396,6 +1419,10 @@ impl Acquisition {
         let cleanup = Arc::new(CacheCleanupService::new(settings.clone()));
         workers.register("CacheCleanupService", move |stopping| {
             cleanup.clone().run(stopping)
+        });
+        let spotiflac = self.spotiflac.clone();
+        workers.register("MornyeLeftPassJobs", move |stopping| {
+            spotiflac.clone().clean_left_pass_jobs(stopping)
         });
     }
 }
@@ -1603,6 +1630,8 @@ struct Stores {
     download_concurrency: Arc<DownloadConcurrency>,
     download_picks: Arc<DownloadPicks>,
     soulseek_holds: Arc<SoulseekHoldStore>,
+    /// Mornye's check episodes and the songs it refused while paused, `mornye-check.json`.
+    mornye_check: Arc<MornyeCheckStore>,
     you_tube_resolver: Arc<YouTubeResolver>,
     stream_size_warmer: Arc<StreamSizeWarmer>,
     local_cover_cache: Arc<LocalCoverCache>,
@@ -1714,6 +1743,7 @@ impl Stores {
             download_concurrency: Arc::new(DownloadConcurrency::new(settings.clone())),
             download_picks: Arc::new(DownloadPicks::default()),
             soulseek_holds,
+            mornye_check: Arc::new(MornyeCheckStore::new(Some(config_dir.join("mornye-check.json")))),
             you_tube_resolver,
             subsonic_response_builder: Arc::new(SubsonicResponseBuilder::new(
                 stream_size_warmer.clone(),
@@ -2241,6 +2271,7 @@ impl Imports {
                 downloads: acquisition.track_acquisition_queue.clone(),
                 tracker: acquisition.acquisition_tracker.clone(),
                 soulseek: soulseek_link,
+                spotiflac: Some(acquisition.spotiflac.clone()),
             },
         );
         let service = ImportService::new(ImportParts {
@@ -3583,6 +3614,7 @@ impl AppState {
             admin_recovery_code: admin_sign_in.recovery_code,
             admin_role_check: admin_sign_in.role_check,
             anonymous_status: Default::default(),
+            mornye_row: Default::default(),
             rejected_peers: stores.rejected_peers,
             release_check: stores.release_check,
             http: navidrome.http,
@@ -4039,6 +4071,7 @@ impl AppState {
             admin_recovery_code: admin_sign_in.recovery_code,
             admin_role_check: admin_sign_in.role_check,
             anonymous_status: Default::default(),
+            mornye_row: Default::default(),
             rejected_peers: stores.rejected_peers,
             release_check: stores.release_check,
             http: navidrome.http,
@@ -4280,7 +4313,7 @@ mod tests {
         );
     }
 
-    /// The acquisition pipeline: its three background services run as workers, the activity
+    /// The acquisition pipeline: its background services run as workers, the activity
     /// sees the download service, and StarOnArrival is already listening to the tracker.
     #[tokio::test]
     async fn the_acquisition_pipeline_is_wired_with_its_workers() {
@@ -4291,6 +4324,7 @@ mod tests {
             "SoulseekHoldResumer",
             "CacheCleanupService",
             "PrefetchService",
+            "MornyeLeftPassJobs",
         ] {
             assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
         }

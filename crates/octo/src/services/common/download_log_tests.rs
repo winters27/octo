@@ -793,6 +793,78 @@ async fn with_every_source_off_a_look_fails_at_once_and_says_why() {
     );
 }
 
+/// Find songs counts slskd as set up by the rule Better quality uses: its link, not its sign-in.
+#[tokio::test]
+async fn find_songs_counts_slskd_by_its_link_as_better_quality_does() {
+    use crate::services::common::test_fakes::{LoggedInLink, OffLink};
+    use crate::services::soulseek::ISoulseekLink;
+    let soulseek_text = |link: Arc<dyn ISoulseekLink>, soulseek: SoulseekSettings| async move {
+        let settings = Arc::new(octo_core::settings::SettingsStore::for_tests(
+            octo_core::settings::AppSettings {
+                soulseek,
+                ..Default::default()
+            },
+        ));
+        let finder = Arc::new(SongFinder::new(SongFinderServices {
+            settings: Some(settings.clone()),
+            upgrade_sources: Some(Arc::new(crate::services::library::UpgradeSources::new(
+                settings,
+                Some(link),
+            ))),
+            ..Default::default()
+        }));
+        let looked_for = target("Air", "Sexy Boy", None, None);
+        finder.seams(|seams| {
+            seams.resolve = Arc::new(move |_, _| {
+                let target = looked_for.clone();
+                async move { Some(target) }.boxed()
+            })
+        });
+        let look = finder
+            .start("id", "alice", &CancellationToken::new())
+            .await
+            .expect("a look");
+        // The Soulseek row, and its text.
+        look.sources
+            .into_iter()
+            .find(|source| source.name == "Soulseek")
+            .map(|source| source.text)
+    };
+    let not_set_up = Some("Soulseek is not set up on this server".to_string());
+    let signed_in = SoulseekSettings {
+        base_url: Some("http://slskd:5030".into()),
+        username: Some("u".into()),
+        password: Some("p".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        soulseek_text(Arc::new(OffLink), signed_in.clone()).await,
+        Some(not_set_up.clone()),
+        "off at startup, its sign-in kept"
+    );
+    let no_sign_in = SoulseekSettings {
+        base_url: Some("http://slskd:5030".into()),
+        ..Default::default()
+    };
+    let row = soulseek_text(Arc::new(LoggedInLink), no_sign_in)
+        .await
+        .expect("a Soulseek row");
+    assert_ne!(
+        row, not_set_up,
+        "on with no sign-in, as an slskd without one runs"
+    );
+    // Switched off since startup while the running slskd is on: the link wins, as it does for
+    // the downloads.
+    let since_off = SoulseekSettings {
+        enabled: false,
+        ..signed_in
+    };
+    let row = soulseek_text(Arc::new(LoggedInLink), since_off)
+        .await
+        .expect("a Soulseek row");
+    assert_ne!(row, not_set_up, "switched off since startup, still running");
+}
+
 fn fetching(fetched: Arc<Mutex<Option<FoundCopy>>>) -> super::song_finder::FetchFn {
     Arc::new(move |_, copy, _, _| {
         *fetched.lock() = Some(copy);
@@ -1133,6 +1205,7 @@ pub(crate) fn upgrade_worker(
         describe: Arc::new(|_| async { None }.boxed()),
         width: Arc::new(|| 1),
         soulseek_offline: Arc::new(|| async { false }.boxed()),
+        mornye_hold_over: Arc::new(|_| async { false }.boxed()),
         source_name: Arc::new(|| "Soulseek".to_string()),
     };
     Arc::new(UpgradeWorker::with_seams(queue.clone(), seams, tracker, None, None).with_picks(Some(picks)))

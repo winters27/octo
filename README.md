@@ -305,10 +305,10 @@ tell you a starred track landed, or quietly settled for a lossy copy.
 - **Two transports, either works alone**: [ntfy](https://ntfy.sh/) (paste a topic URL,
   subscribe to the same topic in the ntfy app) and Discord webhooks (rich embed with
   album art). A transport is on when its URL is set.
-- **Five events, each with its own toggle** in the dashboard's Notifications tab:
+- **Six events, each with its own toggle** in the dashboard's Notifications tab:
   download started (did it find lossless, or is it settling?), download completed,
-  lossless fallback, download failed, and one summary per album instead of a ping per
-  track.
+  lossless fallback, download failed, one summary per album instead of a ping per
+  track, and Mornye could not pass its check (with a link to pass it on the dashboard).
 - A **Send test** button verifies your URLs and tokens without waiting for a real
   download, and reports each transport's outcome separately.
 
@@ -946,21 +946,25 @@ A heart waits for Lidarr's import, up to `LIDARR_IMPORT_TIMEOUT_SECONDS` (defaul
 
 For songs Soulseek does not have, Octo can ask a Mornye server you run yourself. Mornye is the SpotiFLAC Python module under its new name (since October 2026), and an older SpotiFLAC (5.x) still works the same way. It is off by default. Octo includes no Mornye, no extensions and no places to download from: Mornye (its Python module, `pip install mornye`, or its Docker image) loads the extension registry you choose, it installs every extension your registry lists by itself, and what it can find depends on them. Octo finds the song in Mornye's catalog (by ISRC first, then by artist, title, version and length), asks Mornye to save it into a hidden folder of the music folder, and checks the file like a Soulseek download: its length, the version its own title names, AcoustID and the spectrum. A file that fails is thrown away and the next source is asked. A file that passes is tagged by Octo, never by Mornye's tags alone.
 
-1. In `.env`, add `spotiflac` to `COMPOSE_PROFILES` (comma-separated, for example `COMPOSE_PROFILES=navidrome,spotiflac`), set `SPOTIFLAC_REGISTRIES` to your registry's address and `SPOTIFLAC_WEB_TOKEN` to a long random string, then run `docker compose up -d`. This builds Mornye from its own repository at a pinned commit (a few minutes and about 2 GB the first time, cached afterwards) and starts it beside Octo, with the music folder mounted at the same path.
+1. In `.env`, add `spotiflac` to `COMPOSE_PROFILES` (comma-separated, for example `COMPOSE_PROFILES=navidrome,spotiflac`), set `SPOTIFLAC_REGISTRIES` to your registry's address and `SPOTIFLAC_WEB_TOKEN` to a long random string, then run `docker compose up -d`. This gets Octo's Mornye image ready (Mornye's own published 1.0.5 image, pinned by digest, with Octo's small helper added; about 2 GB to download the first time, cached afterwards) and starts it beside Octo, with the music folder mounted at the same path.
 2. Mornye installs every extension your registry lists by itself, when it starts and again every hour. Its page on port 8010 (`SPOTIFLAC_PORT`, opened with `?token=` and your token) shows them.
 3. In Octo's dashboard, open **Mornye (SpotiFLAC)**, set the address to `http://spotiflac:8000` and the same token, press **Test connection**, turn on **Download with Mornye** and save. (Or set `SPOTIFLAC_ENABLED=true` and `SPOTIFLAC_URL=http://spotiflac:8000` in `.env`.)
 
 Mornye takes Soulseek's place in **Heart download priority**: after Soulseek finds nothing (the default), before it, or before it only for songs written in Chinese, Japanese, Korean or Thai script. With Soulseek off, Mornye is asked alone. A Mornye running elsewhere works too (`mornye --web --host 0.0.0.0 --web-token <token>`): it must see Octo's music folder, and **Music folder in Mornye** says where when its path differs. Multi-user mode (`--web-multiuser`) is not supported, since it saves into each account's own folder.
 
+**Pass Mornye's check:** some extensions reach their downloads through a gateway that first checks a person is there. Mornye passes that check by itself; when it cannot, it pauses that gateway for a while, and songs only Mornye could bring fail until it passes (Octo says so on the download, and sends one push with a link). On the dashboard's Mornye page, **Pass Mornye's check** ends Mornye's own pause, asks Mornye again for the last song it could not get so that Mornye opens its check, and shows you Mornye's own check browser, live, to pass with your own mouse or finger. Octo never clicks or types into it by itself, and keeps a pause the gateway itself asked for. It needs `SPOTIFLAC_WEB_TOKEN`, and Octo's `spotiflac` service (or `SPOTIFLAC_ASSIST_URL` pointing at a Mornye running Octo's image). Once it passes, songs ask Mornye again; the ones it could not get during the pause need a heart again.
+
 **Coming from SpotiFLAC:** the `spotiflac` service now runs Mornye, at the same address, with your `.env` unchanged. Mornye keeps its own settings folder (`spotiflac-data/mornye`) and installs your registry's extensions into it by itself on its first start. Your old SpotiFLAC folder is left as it was.
 
-Mornye is not part of Octo, so it never holds Octo back: when it can't be built, `install.sh` and **Update now** start Octo without it and say so. A plain `docker compose pull` leaves it alone, since it is never pulled.
+**Which Mornye:** the `spotiflac` service runs Mornye 1.0.5, Mornye's release with its dependencies pinned. `SPOTIFLAC_BUILD_REF` is no longer read; to run another Mornye, set `SPOTIFLAC_IMAGE` to its image (for Mornye 1.1.0, `ghcr.io/mornyeapp/mornye-python@sha256:4a63ebef218f02cd2072a3e683641565cdaa87b2f4d1764bb960d977dcbee862`, which also needs the utilities extension in your registry), then run `docker compose build spotiflac && docker compose up -d spotiflac`. Each release gets its own Mornye image ready, and an update removes the ones before it.
+
+Mornye is not part of Octo, so it never holds Octo back: when its image can't be got ready, `install.sh` and **Update now** start Octo without it and say so. A plain `docker compose pull` leaves it alone, since it is never pulled.
 
 | `.env` | Default | What it does |
 | --- | --- | --- |
 | `SPOTIFLAC_ENABLED` | `false` | Downloads ask Mornye |
 | `SPOTIFLAC_URL` | blank | Mornye's address, as Octo's container reaches it |
-| `SPOTIFLAC_WEB_TOKEN` | blank | Mornye's web token; the `spotiflac` service starts with the same one |
+| `SPOTIFLAC_WEB_TOKEN` | blank | Mornye's web token; the `spotiflac` service starts with the same one, and Octo needs it to pass Mornye's check |
 | `SPOTIFLAC_PLACEMENT` | `AfterSoulseek` | `AfterSoulseek`, `BeforeSoulseek` or `BeforeSoulseekForAsianScripts` |
 | `SPOTIFLAC_QUALITY` | `LOSSLESS` | `LOSSLESS`, or `HI_RES_LOSSLESS` for hi-res where there is one |
 | `SPOTIFLAC_SERVICES` | blank | Your extension ids to try, in order, separated by commas; blank leaves the order to Mornye |
@@ -969,7 +973,10 @@ Mornye is not part of Octo, so it never holds Octo back: when it can't be built,
 | `SPOTIFLAC_AT_ONCE` | `2` | Songs Mornye is asked for at once (1 to 4) |
 | `SPOTIFLAC_REGISTRIES` | blank | For the `spotiflac` service: your extension registry addresses, separated by commas |
 | `SPOTIFLAC_PORT` | `8010` | For the `spotiflac` service: the port of Mornye's page |
-| `SPOTIFLAC_BUILD_REF` | `5660533b…` (Mornye 1.0.3) | For the `spotiflac` service: the Mornye commit or tag Compose builds |
+| `SPOTIFLAC_WEB_URL` | blank | Mornye's page as your browser reaches it, for the dashboard's **Open Mornye**; blank is this machine at `SPOTIFLAC_PORT` with the `spotiflac` service, else `SPOTIFLAC_URL` |
+| `SPOTIFLAC_ASSIST_URL` | blank | Octo's helper beside Mornye, for **Pass Mornye's check**; blank is `http://spotiflac:8011` with the `spotiflac` service |
+| `SPOTIFLAC_IMAGE` | blank (Mornye 1.0.5) | For the `spotiflac` service: another Mornye image to run with Octo's helper; then `docker compose build spotiflac && docker compose up -d spotiflac` |
+| `NOTIFY_MORNYE_CHECK` | `true` | A push when Mornye could not pass its check, once until it passes again, with a link to pass it |
 | `SPOTIFLAC_DATA_DIR` | `./spotiflac-data` | For the `spotiflac` service: Mornye's settings and the extensions it installed, in its `mornye` folder |
 | `SPOTIFLAC_PUID`, `SPOTIFLAC_PGID` | `1000` | For the `spotiflac` service: the user Mornye runs as |
 

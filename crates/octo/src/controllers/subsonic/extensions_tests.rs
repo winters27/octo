@@ -1615,11 +1615,15 @@ async fn a_bad_api_key_is_refused_and_never_asks_token_info() {
 
 // octoLibraryActions v2: upgrade and getUpgrades
 
-/// Better quality searches Soulseek, so it is offered only where slskd is set up.
+/// Better quality searches Soulseek, so it is offered only where slskd is in use: switched on
+/// with an address, as the heart chain uses it.
 fn better_quality_on(settings: &mut AppSettings, dry_run: bool, slskd: bool) {
     let login = |value: &str| Some(if slskd { value.to_string() } else { String::new() });
     settings.soulseek.username = login("slskd-user");
     settings.soulseek.password = login("slskd-pass");
+    if !slskd {
+        settings.soulseek.base_url = None;
+    }
     settings.library_actions.actions.push(LibraryActionDefinition {
         action: LibraryAction::BetterQuality,
         enabled: true,

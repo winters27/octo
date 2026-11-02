@@ -169,6 +169,7 @@ function activateTab(name, { focus = false } = {}) {
   if (name === 'soulseek' && typeof loadSharing === 'function') loadSharing();
   if (name === 'family' && typeof loadFamily === 'function') loadFamily();
   if (name === 'downloads' && typeof loadPrefetch === 'function') loadPrefetch();
+  if (name === 'spotiflac' && typeof loadMornyeNow === 'function') loadMornyeNow();
   if (typeof showListening === 'function') showListening(name === 'listening');
   if (focus) {
     window.scrollTo({ top: 0 });
@@ -503,8 +504,7 @@ async function refreshStatus() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
 
-    setStatusCard('octo', data.octo);
-    Object.entries(data.services || {}).forEach(([k, v]) => setStatusCard(k, v));
+    statusCards(data).forEach(([k, v]) => setStatusCard(k, v));
     renderLidarrFollows(data.services?.lidarr?.follows);
     renderDownloadChecks(data.downloads);
     renderAcoustIdKeyHelp(data.acoustIdBuiltInKey);
@@ -529,6 +529,7 @@ async function refreshStatus() {
       const body = card.querySelector('.status-card-body');
       if (dot) dot.className = 'status-dot bad';
       if (body) body.textContent = `Octo did not answer: ${e.message}`;
+      card.querySelectorAll('[data-status-action]').forEach(action => { action.hidden = true; });
     });
     setStatusBadge('!', 'Octo did not answer the status check');
   }
@@ -553,7 +554,14 @@ function setStatusCard(svc, probe) {
   const body = card.querySelector('.status-card-body');
   if (dot)  dot.className  = `status-dot ${state}`;
   if (body) body.textContent = probe.detail || (probe.ok ? 'online' : 'unreachable');
+  // Mornye's card leads to its page when a person can pass its check there.
+  const action = card.querySelector('[data-status-action]');
+  if (action) action.hidden = probe.action !== 'pass';
 }
+
+document.querySelectorAll('[data-status-action]').forEach(button => {
+  button.addEventListener('click', () => openTab(button.dataset.statusAction));
+});
 
 // What a blank AcoustID key means on this server: Octo's own key when this build carries one
 // (the published images do), else AcoustID off until a key is added. Unknown (an older server)
@@ -730,6 +738,7 @@ async function loadSettings() {
   });
 
   syncPlaybackSourceControl();
+  syncMornyeNotifyRow();
   updateStreamSettings();
   updateRadioPublicationSettings();
   renderHeartSourceOrder(currentSettings?.Subsonic?.HeartDownloadSources);
@@ -758,6 +767,7 @@ async function loadSettings() {
   loadLastFmScrobbling();
   // Only when it is the tab on screen; opening the tab later checks then.
   if (document.querySelector('[data-pane="lastfm"].active')) loadLastFmAccount();
+  if (document.querySelector('[data-pane="spotiflac"].active')) loadMornyeNow();
 
   // Meta references
   const cfgPath = document.getElementById('meta-config-path');
@@ -1117,8 +1127,13 @@ document.querySelectorAll('form[data-section]').forEach(form => {
       if (form.dataset.section?.startsWith('lastfm')) setTimeout(loadLastFmScrobbling, 700);
       if (form.dataset.section === 'animated-art') setTimeout(loadAnimatedArt, 700);
       if (form.dataset.section === 'prefetch') setTimeout(loadPrefetch, 700);
-      // The heart priority's Soulseek row says whether SpotiFLAC rides with it.
-      if (form.dataset.section?.startsWith('spotiflac')) renderHeartSourceOrder();
+      // The heart priority's Soulseek row says whether SpotiFLAC rides with it, and the Mornye
+      // now card asks again once the running settings have caught up with the file.
+      if (form.dataset.section?.startsWith('spotiflac')) {
+        renderHeartSourceOrder();
+        syncMornyeNotifyRow();
+        setTimeout(loadMornyeNow, 700);
+      }
       // The re-check offer on the Verify card follows the saved match score.
       if (form.dataset.section === 'soulseek-verify' || form.dataset.section?.startsWith('library-actions')) {
         setTimeout(loadReviewSweep, 700);
@@ -3436,6 +3451,677 @@ function renderSpotiflacTest(checks) {
   }).join('');
   row.hidden = checks.length === 0;
 }
+
+// ────────────────────────────────────────────────────────────────
+// Mornye now, and Pass Mornye's check
+// ────────────────────────────────────────────────────────────────
+// From mornyeWhen to passInputQueue the rules read only their arguments (and esc and icon), so
+// tests/mornye_pass.test.mjs runs them outside the page.
+
+// A moment in this browser's own time: the time alone today, with the date on another day and
+// with the year in another year. roundUp gives a wait's end the next whole minute, so a "next
+// try" is never earlier than the real one. A time never wraps between its hour and its AM or PM.
+function mornyeWhen(iso, now = new Date(), roundUp = false, locale = undefined) {
+  let ms = new Date(iso ?? '').getTime();
+  if (!Number.isFinite(ms)) return '';
+  if (roundUp) ms = Math.ceil(ms / 60000) * 60000;
+  const at = new Date(ms);
+  const time = at.toLocaleTimeString(locale, { hour: 'numeric', minute: '2-digit' }).replace(/\s/g, ' ');
+  if (at.toDateString() === now.toDateString()) return time;
+  const day = { month: 'short', day: 'numeric' };
+  if (at.getFullYear() !== now.getFullYear()) day.year = 'numeric';
+  return `${at.toLocaleDateString(locale, day)}, ${time}`;
+}
+
+// Mornye's own words end as a sentence, whether or not Mornye ended them.
+const mornyeSentence = text => (/[.!?]$/.test(text) ? text : `${text}.`);
+
+// The status card for a Mornye the status does not list: switched off, as the server words it.
+const MORNYE_OFF_PROBE = { ok: true, configured: false, warning: false, detail: 'Off. Optional.' };
+
+// The status cards one status answer draws: Octo, each service it lists, and Mornye's card off
+// when the status lists no Mornye (it lists one only while Mornye is switched on).
+function statusCards(data) {
+  const cards = [['octo', data?.octo], ...Object.entries(data?.services || {})];
+  if (!data?.services?.mornye) cards.push(['mornye', MORNYE_OFF_PROBE]);
+  return cards;
+}
+
+// Whether the Notifications page shows the switch for Mornye's check: only while Mornye is
+// switched on in the saved settings.
+function mornyeNotifyShown(settings) {
+  return !!settings?.Spotiflac?.Enabled;
+}
+
+// Shows or hides `row`, the Notifications switch for Mornye's check, by the saved `settings`.
+function applyMornyeNotifyRow(row, settings) {
+  if (row) row.hidden = !mornyeNotifyShown(settings);
+}
+
+// What the Mornye now card says for one answer of GET /api/admin/spotiflac/status: a tone, a
+// headline, one line per finding (plain words, escaped where drawn), the address of Mornye's
+// own page, and whether Pass Mornye's check can start.
+function mornyeCard(status, now = new Date()) {
+  if (status?.on === false && status.enabled) {
+    return { tone: 'warn', title: 'Mornye is switched on but has no address. Set it under Connection.', lines: [], canPass: false, webUrl: null };
+  }
+  if (!status || status.on === false) {
+    return { tone: 'off', title: 'Mornye is off. Switch on Download with Mornye under Connection to use it.', lines: [], canPass: false, webUrl: null };
+  }
+  const lines = [];
+  const add = (state, text) => { if (text) lines.push({ state, text: mornyeSentence(String(text)) }); };
+  const webUrl = status.webUrl || null;
+  if (!status.reachable) {
+    add('fail', status.problem || 'Mornye did not answer at its address. Test the connection below.');
+    return { tone: 'bad', title: 'Octo cannot reach Mornye.', lines, canPass: false, webUrl };
+  }
+  const name = [status.name || 'Mornye', status.version].filter(Boolean).join(' ');
+  add('warn', status.problem);
+  if (status.utilitiesMissing) {
+    add('fail', 'Mornye needs its utilities extension, which your registry does not list.');
+    return { tone: 'bad', title: `${name} answers but cannot download.`, lines, canPass: false, webUrl };
+  }
+
+  const checks = Array.isArray(status.checks) ? status.checks : [];
+  const paused = checks.filter(check => check.pausedUntilUtc);
+  const unpassed = checks.filter(check => !check.pausedUntilUtc && check.since);
+  for (const check of checks) {
+    const label = check.label || 'an extension';
+    if (!check.pausedUntilUtc) {
+      if (check.since) add('warn', `Mornye has not passed its check for ${label} since ${mornyeWhen(check.since, now)}; the next song lets it try again`);
+      continue;
+    }
+    const opening = check.since
+      ? `Mornye has not passed its check for ${label} since ${mornyeWhen(check.since, now)}`
+      : `Mornye's check for ${label} is paused`;
+    const until = mornyeWhen(check.pausedUntilUtc, now, true);
+    add('warn', check.gatewayAsked ? `${opening}; the gateway asked it to wait until ${until}` : `${opening}; next try ${until}`);
+  }
+  const failing = (Array.isArray(status.extensions) ? status.extensions : []).filter(ext => ext.state === 'failing');
+  failing.forEach(ext => add('warn', ext.lastError ? `${ext.name} failed its last try: ${ext.lastError}` : `${ext.name} failed its last try`));
+  if (status.reportsCheck === false) add('info', 'This Mornye does not report its check');
+
+  const checkSongs = Number(status.checkSongs) || 0;
+  if (status.helper === 'no token') add('info', 'Set a web token for Mornye (SPOTIFLAC_WEB_TOKEN) to pass its check from Octo');
+  if (status.helper === 'refused') add('info', "Octo's helper beside Mornye refused the web token. Octo and Mornye must share SPOTIFLAC_WEB_TOKEN");
+  if (paused.length && status.helper === 'absent') add('info', "Passing the check from here needs the spotiflac service in Octo's compose file");
+  if (paused.length && status.helper === 'ok' && checkSongs === 0) {
+    add('info', 'No song has asked Mornye since its check paused. Once one has, you can pass the check here');
+  }
+
+  const title = paused.length ? `${name} answers, but its check is paused.`
+    : unpassed.length ? `${name} answers, but has not passed its check.`
+    : failing.length === 1 ? `${name} answers, but an extension failed its last try.`
+    : failing.length ? `${name} answers, but ${failing.length} extensions failed their last try.`
+    : status.problem ? `${name} answers.`
+    : `${name} is ready.`;
+  const tone = paused.length || unpassed.length || failing.length || status.problem ? 'warn' : 'ok';
+  // The server decides when Pass can help (a pause Mornye made, the helper answering, a song to
+  // ask with), the same rule the status grid's link follows.
+  return { tone, title, lines, canPass: status.passable === true, webUrl };
+}
+
+// The card's findings as list items, each Mornye word escaped.
+function mornyeLinesHtml(lines) {
+  const glyph = { ok: 'i-check-circle-fill', warn: 'i-warning-circle-fill', fail: 'i-x-circle-fill', info: 'i-info-fill' };
+  const words = { ok: 'Passed', warn: 'Warning', fail: 'Problem', info: 'Note' };
+  return lines.map(line => {
+    const state = glyph[line.state] ? line.state : 'info';
+    return `<li class="test-check ${state}">${icon(glyph[state])}<span class="visually-hidden">${words[state]}: </span><span>${esc(line.text)}</span></li>`;
+  }).join('');
+}
+
+// The Pass panel's zoom: a phone's narrow screen starts close enough to press the check's box.
+const PASS_ZOOMS = [1, 2, 3, 4];
+const passZoomDefault = viewportWidth => (viewportWidth < 600 ? 3 : 1);
+
+// Where a pointer at (clientX, clientY) falls in the frame, in the frame's CSS pixels. rect is the
+// drawn image's own box, which already holds the zoom and the scroll; the point is kept inside
+// the frame.
+function passPoint(clientX, clientY, rect, frameWidth, frameHeight) {
+  const inside = (value, size) => Math.min(Math.max(value, 0), Math.max(size - 1, 0));
+  return {
+    x: Math.round(inside(((clientX - rect.left) / rect.width) * frameWidth, frameWidth)),
+    y: Math.round(inside(((clientY - rect.top) / rect.height) * frameHeight, frameHeight)),
+  };
+}
+
+// What the Pass panel shows for one answer of GET /api/admin/spotiflac/assist: its words, their
+// tone, whether the live picture shows, whether to keep asking, the button that starts again,
+// and the gateway's own waits.
+function passView(assist, now = new Date()) {
+  const state = assist?.state || 'idle';
+  const waits = [...new Set((Array.isArray(assist?.gatewayAsked) ? assist.gatewayAsked : [])
+    .map(row => mornyeWhen(row.until, now, true)).filter(Boolean))]
+    .map(until => `The gateway asked Mornye to wait until ${until}.`);
+  const another = Number(assist?.checkSongs) > 0;
+  const views = {
+    opening: { text: "Opening Mornye's check…", busy: true, polls: true },
+    live: { text: "Mornye's check, live. Click or tap its box here; Octo passes on only your own pointer.", live: true, polls: true },
+    passed: { text: 'Passed. Songs ask Mornye again from now on; ones it could not get during the pause need a heart again.', tone: 'ok' },
+    closed: { text: 'The check closed before it was passed.', tone: 'warn', retry: 'Try again' },
+    'no-check': another
+      ? { text: "That song did not reach Mornye's check.", tone: 'warn', retry: 'Try another song' }
+      : { text: "That song did not reach Mornye's check. No other song is waiting to try.", tone: 'warn' },
+    unavailable: { text: assist?.why || "Octo cannot open Mornye's check now.", tone: 'warn' },
+  };
+  const view = views[state] || { text: assist?.why || "Mornye's check is not open.", tone: 'warn', retry: 'Try again' };
+  return { state, tone: 'info', busy: false, live: false, polls: false, retry: null, ...view, notes: waits };
+}
+
+// One line of pointer events into Mornye's check browser. Each post waits for the one before, so
+// the browser gets them in the order they happened. Moves waiting their turn merge (the latest
+// point wins), at most one goes every `gap` ms, and presses and releases are never merged or
+// dropped. A release that fails is sent once more, so the check's box is never left held down.
+function passInputQueue(send, { now = () => Date.now(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), gap = 50, failed = () => {} } = {}) {
+  const waiting = [];
+  let lastMove = -Infinity;
+  let running = null;
+  async function run() {
+    while (waiting.length) {
+      const head = waiting[0];
+      if (head.type === 'mouseMoved') {
+        const rest = lastMove + gap - now();
+        if (rest > 0) { await sleep(rest); continue; }
+        lastMove = now();
+      }
+      waiting.shift();
+      for (let tries = head.type === 'mouseReleased' ? 2 : 1; tries > 0; tries--) {
+        try { await send(head); break; } catch (error) { if (tries === 1) failed(head, error); }
+      }
+    }
+    running = null;
+  }
+  return {
+    push(event) {
+      const last = waiting[waiting.length - 1];
+      if (event.type === 'mouseMoved' && last?.type === 'mouseMoved') waiting[waiting.length - 1] = event;
+      else waiting.push(event);
+      if (!running) running = run();
+      return running;
+    },
+    idle: () => running || Promise.resolve(),
+    clear() { waiting.length = 0; },
+  };
+}
+
+const PASS_TAB_KEY = 'octo.passTab';
+const PASS_TAB_OPEN_KEY = 'octo.passTabOpen';
+
+// Which tab and page this load is, as Octo counts the pages on a Pass run. A reload (`reload`)
+// keeps the tab kept in sessionStorage, so it takes its old seat back; any other load (a new
+// visit, Back or Forward, a copied tab) takes a tab of its own, since another tab may carry the
+// same stored name. The page is new on every load, so a stop sent by the page before never gives
+// up the seat of the page after it. While a page of the tab is open its mark is set, and leaving
+// clears it: a reload that finds the mark set was copied from an open tab (Duplicate tab copies
+// sessionStorage) and takes a tab of its own too.
+function passViewer(store, makeId, reload = false) {
+  const page = makeId();
+  let tab = null;
+  try {
+    const kept = store.getItem(PASS_TAB_KEY);
+    tab = reload && kept && store.getItem(PASS_TAB_OPEN_KEY) !== kept ? kept : makeId();
+    store.setItem(PASS_TAB_KEY, tab);
+    store.setItem(PASS_TAB_OPEN_KEY, tab);
+  } catch {
+    tab = tab || page;
+  }
+  return { tab, page };
+}
+
+// The tab's mark while one of its pages is open: cleared as the page leaves, set again when the
+// browser brings the same page back.
+function passViewerShown(store, viewer, shown) {
+  try {
+    if (shown) store.setItem(PASS_TAB_OPEN_KEY, viewer.tab);
+    else store.removeItem(PASS_TAB_OPEN_KEY);
+  } catch { /* a blocked store marks nothing */ }
+}
+
+// What the page does as it leaves and comes back. Leaving: its tab's open mark goes (so a reload
+// finds the same tab), and an open panel, or a start that still owes its stop, closes with the
+// stop sent by the leaving sender. Brought back from the browser's page cache: its seat went as it
+// left and a copy of this tab may hold the old name, so it takes a tab of its own and marks it
+// open.
+function passLifecycle(target, { store, viewer, makeId, isOpen, owesStop, close }) {
+  target.addEventListener('pagehide', () => {
+    passViewerShown(store, viewer, false);
+    if (isOpen() || owesStop()) close();
+  });
+  target.addEventListener('pageshow', event => {
+    if (!event.persisted) return;
+    viewer.tab = makeId();
+    try { store.setItem(PASS_TAB_KEY, viewer.tab); } catch { /* a blocked store keeps nothing */ }
+    passViewerShown(store, viewer, true);
+  });
+}
+
+// The Pass panel's starts and stops, in order. A start waits for the stop sent before it, so a
+// Pass right after a Close opens a new check instead of joining the one being stopped, and a
+// Close while it waits ends it before it is sent. Each stop names the run its page was on (null
+// while the start had not answered, or when its answer never came) and the page itself.
+// `send(call, body)` posts to .../assist/<call> and answers the parsed reply; a stop may go by
+// another sender (the page's leaving one).
+function passCalls(send, viewer) {
+  let run = null;
+  let turn = 0;
+  let stopping = null;
+  let owed = false;
+  return {
+    async start() {
+      // Owed from the moment it is asked, so a Close while it waits stops it.
+      owed = true;
+      const entered = turn;
+      const before = stopping;
+      stopping = null;
+      if (before) await before;
+      if (turn !== entered) return { started: false, stopped: true };
+      const asked = ++turn;
+      let answer;
+      try {
+        answer = await send('start', { tab: viewer.tab, page: viewer.page });
+      } catch (error) {
+        if (asked === turn) run = null;
+        throw error;
+      }
+      if (asked === turn) run = typeof answer?.run === 'string' ? answer.run : null;
+      return answer;
+    },
+    // Whether a start went out since the last stop: Octo may hold its seat even when the
+    // start's answer never came.
+    owesStop: () => owed,
+    stop(by = send) {
+      turn += 1;
+      owed = false;
+      const body = { run, tab: viewer.tab, page: viewer.page };
+      run = null;
+      // Sent before this returns, so a page that is leaving still gets it out.
+      let sent;
+      try { sent = Promise.resolve(by('stop', body)); } catch (error) { sent = Promise.reject(error); }
+      stopping = sent.then(() => {}, () => {});
+      return stopping;
+    },
+    run: () => run,
+  };
+}
+
+let mornyeNowLoad = null;
+let mornyeNowView = null;
+
+// The Notifications switch for Mornye's check, shown only while Mornye is switched on.
+function syncMornyeNotifyRow() {
+  applyMornyeNotifyRow(document.getElementById('f-notify-mornye-check')?.closest('.set-row'), currentSettings);
+}
+
+// The Mornye now card: asked when the page opens, after a Mornye setting is saved, after a pass,
+// and from its refresh button. With Mornye switched off in the saved settings it is one quiet line.
+function loadMornyeNow() {
+  if (!document.getElementById('mornye-card')) return Promise.resolve();
+  if (currentSettings && !currentSettings.Spotiflac?.Enabled) {
+    drawMornyeNow(mornyeCard({ on: false }));
+    return Promise.resolve();
+  }
+  if (mornyeNowLoad) return mornyeNowLoad;
+  const refresh = document.getElementById('mornye-refresh');
+  refresh?.classList.add('busy');
+  mornyeNowLoad = (async () => {
+    try {
+      const r = await api('/api/admin/spotiflac/status', { cache: 'no-store' });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+      drawMornyeNow(mornyeCard(body));
+    } catch (error) {
+      drawMornyeNow({ tone: 'bad', title: "Octo could not read Mornye's state.", lines: [{ state: 'fail', text: mornyeSentence(error.message || 'No answer') }], canPass: false, webUrl: null });
+    } finally {
+      refresh?.classList.remove('busy');
+      mornyeNowLoad = null;
+    }
+  })();
+  return mornyeNowLoad;
+}
+
+function drawMornyeNow(view) {
+  mornyeNowView = view;
+  const card = document.getElementById('mornye-card');
+  const dot = document.getElementById('mornye-dot');
+  const title = document.getElementById('mornye-title');
+  const findings = document.getElementById('mornye-findings');
+  const actions = document.getElementById('mornye-actions');
+  const open = document.getElementById('mornye-open');
+  const passButton = document.getElementById('mornye-pass-open');
+  const refresh = document.getElementById('mornye-refresh');
+  if (!card || !title) return;
+  card.classList.toggle('off', view.tone === 'off');
+  if (dot) dot.className = `status-dot ${view.tone}`;
+  title.textContent = view.title;
+  if (findings) {
+    findings.innerHTML = mornyeLinesHtml(view.lines);
+    findings.hidden = view.lines.length === 0;
+  }
+  const url = safeHttpUrl(view.webUrl);
+  if (open) {
+    open.hidden = !url;
+    if (url) open.href = url;
+  }
+  if (passButton) passButton.hidden = !view.canPass || passState.open;
+  if (actions) actions.hidden = !url && !view.canPass;
+  if (refresh) refresh.hidden = view.tone === 'off';
+}
+
+document.getElementById('mornye-refresh')?.addEventListener('click', () => loadMornyeNow());
+
+// ── The Pass panel ──
+// Opens Mornye's check through POST .../assist/start, then asks .../assist each second. While the
+// check is live it draws Mornye's check browser from .../assist/frame about five times a second
+// and sends the person's own pointer, and only that, to .../assist/input.
+const passState = {
+  open: false,
+  run: 0,             // which opening of the panel the timers and loops belong to
+  view: null,
+  browser: null,
+  seq: 0,
+  frameWidth: 0,
+  frameHeight: 0,
+  zoom: 1,
+  pointer: null,      // the pointer held down on the picture, if any
+  frameUrl: null,
+  pollTimer: null,
+  queue: null,
+};
+
+const passEl = id => document.getElementById(id);
+
+let passStore = null;
+try { passStore = window.sessionStorage; } catch { /* a blocked store: each load is its own tab */ }
+const passId = () => Array.from(crypto.getRandomValues(new Uint8Array(12)), b => b.toString(16).padStart(2, '0')).join('');
+// How this page was loaded, from the browser's own navigation entry.
+const passReloaded = (() => {
+  try {
+    const entry = performance.getEntriesByType?.('navigation')?.[0];
+    return entry ? entry.type === 'reload' : performance.navigation?.type === 1;
+  } catch {
+    return false;
+  }
+})();
+const passPage = passViewer(passStore, passId, passReloaded);
+
+async function passSend(call, body) {
+  const r = await api(`/api/admin/spotiflac/assist/${call}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const answer = await r.json().catch(() => ({}));
+  if (!r.ok && !answer.state) return { started: false, why: answer.error || `Octo answered HTTP ${r.status}.` };
+  return answer;
+}
+
+// A stop sent as the page leaves: the browser still delivers it once the page has gone.
+const passLeaveSend = (call, body) => fetch(`/api/admin/spotiflac/assist/${call}`, {
+  method: 'POST',
+  keepalive: true,
+  credentials: 'same-origin',
+  headers: { 'Content-Type': 'application/json', 'X-Octo-Admin': '1' },
+  body: JSON.stringify(body),
+});
+
+const passLine = passCalls(passSend, passPage);
+
+passLifecycle(window, {
+  store: passStore,
+  viewer: passPage,
+  makeId: passId,
+  isOpen: () => passState.open,
+  owesStop: () => passLine.owesStop(),
+  close: () => closePass(passLeaveSend),
+});
+
+function passQueue() {
+  if (passState.queue) return passState.queue;
+  passState.queue = passInputQueue(async event => {
+    const r = await api('/api/admin/spotiflac/assist/input', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(event),
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.error || `HTTP ${r.status}`);
+    }
+    if (event.type !== 'mouseMoved') passNote('');
+  }, {
+    failed: (event, error) => {
+      if (event.type !== 'mouseMoved') passNote(`Octo could not pass that on to Mornye's browser: ${mornyeSentence(error.message)}`);
+    },
+  });
+  return passState.queue;
+}
+
+function passNote(message) {
+  const note = passEl('mornye-pass-note');
+  if (!note) return;
+  note.textContent = message;
+  note.hidden = !message;
+}
+
+function openPass() {
+  const panel = passEl('mornye-pass');
+  if (!panel) return;
+  passState.open = true;
+  panel.hidden = false;
+  passEl('mornye-pass-open').hidden = true;
+  setPassZoom(passZoomDefault(window.innerWidth), false);
+  const heading = passEl('mornye-pass-title');
+  heading?.focus({ preventScroll: true });
+  panel.scrollIntoView({ block: 'nearest', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+  startPass();
+}
+
+// `by` sends the stop another way (the leaving page's).
+function closePass(by = undefined) {
+  // The run this page started or joined is left on the server too (stopped once no other page
+  // is on it, its song's job cancelled), whatever the panel shows; a Pass right after waits for
+  // that first.
+  if (passLine.owesStop()) passLine.stop(by);
+  passState.open = false;
+  passState.run += 1;
+  clearTimeout(passState.pollTimer);
+  passState.queue?.clear();
+  passState.pointer = null;
+  passEl('mornye-pass').hidden = true;
+  showPassFrame(null);
+  passState.browser = null;
+  const button = passEl('mornye-pass-open');
+  if (button) {
+    button.hidden = !mornyeNowView?.canPass;
+    if (!button.hidden) button.focus();
+  }
+}
+
+async function startPass() {
+  const run = ++passState.run;
+  clearTimeout(passState.pollTimer);
+  passNote('');
+  drawPass(passView({ state: 'opening' }));
+  let answer = null;
+  try {
+    // A Close just before has left the old run first, so this one is new.
+    answer = await passLine.start();
+  } catch (error) {
+    answer = { started: false, why: `Octo did not answer: ${error.message}` };
+  }
+  if (run !== passState.run) return;
+  // A start that did not open a check shows why, unless a check this one joined is already open.
+  const joined = answer.state === 'opening' || answer.state === 'live';
+  if (answer.started === false && !joined) {
+    drawPass(passView({ ...answer, state: 'unavailable', why: answer.why || answer.error }));
+    return;
+  }
+  if (answer.state) drawPass(passView(answer), answer);
+  if (!answer.state || passState.view?.polls) passState.pollTimer = setTimeout(() => pollPass(run), 1000);
+}
+
+async function pollPass(run) {
+  if (run !== passState.run || !passState.open) return;
+  let assist = null;
+  try {
+    const r = await api('/api/admin/spotiflac/assist', { cache: 'no-store' });
+    if (r.ok) assist = await r.json();
+  } catch { /* asked again below */ }
+  if (run !== passState.run || !passState.open) return;
+  if (assist) drawPass(passView(assist), assist);
+  if (!assist || passState.view?.polls) passState.pollTimer = setTimeout(() => pollPass(run), 1000);
+}
+
+function drawPass(view, assist = null) {
+  const before = passState.view?.state;
+  passState.view = view;
+  const line = passEl('mornye-pass-line');
+  if (line) {
+    const glyph = view.busy ? 'i-circle-notch' : view.tone === 'ok' ? 'i-check-circle-fill'
+      : view.tone === 'warn' ? 'i-warning-circle-fill' : 'i-info-fill';
+    line.className = `pass-line ${view.busy ? 'busy' : view.tone}`;
+    line.innerHTML = `${icon(glyph)}<span>${esc(view.text)}</span>`;
+  }
+  const notes = passEl('mornye-pass-notes');
+  if (notes) {
+    notes.innerHTML = mornyeLinesHtml(view.notes.map(text => ({ state: 'warn', text })));
+    notes.hidden = view.notes.length === 0;
+  }
+  const retry = passEl('mornye-pass-retry');
+  if (retry) {
+    retry.hidden = !view.retry;
+    retry.querySelector('span').textContent = view.retry || '';
+  }
+  passEl('mornye-pass-actions').hidden = !view.retry;
+  passEl('mornye-pass-live').hidden = !view.live;
+
+  const browser = view.live ? assist?.browser ?? null : null;
+  if (browser?.id && String(browser.id) !== passState.browser) {
+    passState.browser = String(browser.id);
+    passState.seq = 0;
+    showPassFrame(null);
+    setPassFrameSize(Number(browser.width) || 0, Number(browser.height) || 0);
+    passFrames(passState.run, passState.browser);
+  } else if (!view.live && passState.browser) {
+    passState.browser = null;
+    showPassFrame(null);
+  }
+  if (view.state === 'passed' && before !== 'passed') {
+    loadMornyeNow();
+    refreshStatus();
+  }
+}
+
+function setPassFrameSize(width, height) {
+  if (!(width > 0 && height > 0)) return;
+  passState.frameWidth = width;
+  passState.frameHeight = height;
+  passEl('mornye-pass-box')?.style.setProperty('aspect-ratio', `${width} / ${height}`);
+}
+
+function showPassFrame(blob) {
+  const img = passEl('mornye-pass-frame');
+  const wait = passEl('mornye-pass-wait');
+  if (!img) return;
+  if (!blob) {
+    img.hidden = true;
+    img.removeAttribute('src');
+    if (passState.frameUrl) URL.revokeObjectURL(passState.frameUrl);
+    passState.frameUrl = null;
+    if (wait) wait.hidden = false;
+    return;
+  }
+  const old = passState.frameUrl;
+  const url = URL.createObjectURL(blob);
+  passState.frameUrl = url;
+  img.onload = img.onerror = () => { if (old) URL.revokeObjectURL(old); };
+  img.src = url;
+  img.hidden = false;
+  if (wait) wait.hidden = true;
+}
+
+// Frames, while the panel is open on this browser, the page is on screen and the check is live.
+async function passFrames(run, browser) {
+  const current = () => run === passState.run && passState.open && passState.browser === browser && passState.view?.live;
+  while (current()) {
+    const onScreen = !document.hidden && document.querySelector('section[data-pane="spotiflac"].active');
+    if (onScreen) {
+      try {
+        const r = await api(`/api/admin/spotiflac/assist/frame?browser=${encodeURIComponent(browser)}&after=${passState.seq}`, { cache: 'no-store' });
+        if (r.status === 200 && current()) {
+          const seq = Number(r.headers.get('X-Frame-Seq'));
+          const blob = await r.blob();
+          if (current()) {
+            if (Number.isFinite(seq)) passState.seq = seq;
+            setPassFrameSize(Number(r.headers.get('X-Frame-Width')), Number(r.headers.get('X-Frame-Height')));
+            showPassFrame(blob);
+          }
+        }
+      } catch { /* the state, asked each second, says what happened */ }
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+}
+
+// A new zoom keeps the spot of the frame at the view's top left corner where it was. Mornye's
+// check sits at the top left of its page, so zooming in from the whole frame keeps it in view.
+function setPassZoom(zoom, keepView = true) {
+  const box = passEl('mornye-pass-box');
+  if (!box) return;
+  const scale = zoom / (passState.zoom || 1);
+  const [left, top] = keepView ? [box.scrollLeft * scale, box.scrollTop * scale] : [0, 0];
+  passState.zoom = zoom;
+  box.dataset.zoom = String(zoom);
+  box.style.setProperty('--pass-zoom', String(zoom));
+  document.querySelectorAll('#mornye-pass-zoom button').forEach(button => {
+    button.setAttribute('aria-pressed', String(Number(button.dataset.zoom) === zoom));
+  });
+  box.scrollLeft = left;
+  box.scrollTop = top;
+}
+
+function relayPointer(type, event) {
+  const img = passEl('mornye-pass-frame');
+  if (!img || img.hidden || !passState.browser || !passState.frameWidth) return;
+  const point = passPoint(event.clientX, event.clientY, img.getBoundingClientRect(), passState.frameWidth, passState.frameHeight);
+  passQueue().push({ browser: passState.browser, type, x: point.x, y: point.y });
+}
+
+(() => {
+  const img = passEl('mornye-pass-frame');
+  if (!img) return;
+  img.addEventListener('pointerdown', event => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    if (passState.pointer !== null) return;
+    event.preventDefault();
+    passState.pointer = event.pointerId;
+    img.setPointerCapture?.(event.pointerId);
+    relayPointer('mousePressed', event);
+  });
+  img.addEventListener('pointermove', event => {
+    // A mouse moving over the picture is passed on too; a finger only while it is down.
+    if (passState.pointer === null ? event.pointerType !== 'mouse' : event.pointerId !== passState.pointer) return;
+    relayPointer('mouseMoved', event);
+  });
+  const lift = event => {
+    if (event.pointerId !== passState.pointer) return;
+    passState.pointer = null;
+    relayPointer('mouseReleased', event);
+  };
+  img.addEventListener('pointerup', lift);
+  img.addEventListener('pointercancel', lift);
+  img.addEventListener('contextmenu', event => event.preventDefault());
+  img.addEventListener('dragstart', event => event.preventDefault());
+})();
+
+passEl('mornye-pass-open')?.addEventListener('click', openPass);
+passEl('mornye-pass-close')?.addEventListener('click', () => closePass());
+passEl('mornye-pass-retry')?.addEventListener('click', startPass);
+passEl('mornye-pass-zoom')?.addEventListener('click', event => {
+  const button = event.target.closest('button[data-zoom]');
+  if (button) setPassZoom(Number(button.dataset.zoom));
+});
 
 function isFieldDirty(el) {
   if (!currentSettings || !el.name?.includes('.')) return false;
@@ -6207,12 +6893,21 @@ function heartSourceReachable() {
   const steps = currentSettings?.Subsonic?.HeartDownloadSources || [];
   const enabled = steps.filter(step => step.SongEnabled || step.AlbumEnabled).map(step => step.Source);
   if (!enabled.length) return { ok: false, detail: 'No heart source is switched on, so a heart downloads nothing.' };
-  const reachable = enabled.filter(source => {
-    if (source === 'Soulseek') return services.slskd?.ok && !services.slskd?.warning;
-    if (source === 'YouTube') return services.ytDlpShim?.ok;
+  // A service answers when it is set up, reachable and not warning. The Soulseek step answers
+  // through slskd, or through Mornye, which takes its place when switched on.
+  const answers = probe => !!probe?.ok && probe.configured !== false && !probe.warning;
+  const reachable = enabled.flatMap(source => {
+    if (source === 'Soulseek') {
+      return [['Soulseek', services.slskd], ['Mornye', services.mornye]]
+        .filter(([, probe]) => answers(probe)).map(([name]) => name);
+    }
+    if (source === 'YouTube') return services.ytDlpShim?.ok ? ['YouTube'] : [];
     // A warning about Lidarr's indexers is not its setup: it answers, and its card says the rest.
-    if (source === 'Lidarr') return services.lidarr?.ok && services.lidarr?.configured !== false && (!services.lidarr?.warning || services.lidarr?.indexers);
-    return false;
+    if (source === 'Lidarr') {
+      const lidarr = services.lidarr;
+      return answers(lidarr) || (answers({ ...lidarr, warning: false }) && lidarr?.indexers) ? ['Lidarr'] : [];
+    }
+    return [];
   });
   return reachable.length
     ? { ok: true, detail: `${reachable.join(', ')} answering.` }
@@ -8531,12 +9226,16 @@ function renderTrickle() {
     off: 'Off',
     yielding: 'Waiting for other downloads',
     waitingForSoulseek: 'Waiting for Soulseek',
+    waitingForMornye: 'Waiting for Mornye',
+    waitingForMornyeCheck: "Waiting for Mornye's check",
     waitingForMusicDatabase: 'Waiting for MusicBrainz',
   };
   impEl('imp-trickle-title').textContent = t.label || words[t.state] || t.state;
   const parts = [];
   if (t.state === 'yielding') parts.push('Someone\'s own downloads come first; it goes on once they finish.');
   if (t.state === 'waitingForSoulseek') parts.push('slskd is not logged in to Soulseek; it goes on once it is back.');
+  if (t.state === 'waitingForMornye') parts.push('Mornye is the only lossless source, and it is not answering or cannot download now (its card on the Mornye page says why); it goes on once it can.');
+  if (t.state === 'waitingForMornyeCheck') parts.push("Mornye could not pass its check and Soulseek cannot be used; it goes on when Mornye may try its check again, or once you pass it on the Mornye page.");
   if (t.state === 'waitingForMusicDatabase') parts.push('MusicBrainz is not answering; songs it has to check go on once it is back.');
   if (t.state === 'off') parts.push('Songs an hour is 0, so nothing starts. Change it above.');
   else parts.push(`Up to ${t.perHour}\u00a0${t.perHour === 1 ? 'song' : 'songs'} an hour.`);

@@ -24,6 +24,9 @@ pub enum NotificationEventType {
     FamilyRequestFailed,
     /// A device was seen for the first time: a member's new device, or a new app of the owner.
     FamilyDeviceNew,
+    /// Mornye could not pass its check for a gateway: once per stretch of it failing. `detail`
+    /// carries the words.
+    MornyeCheck,
 }
 
 /// One thing that happened, in domain terms. Rendering to title/body text happens

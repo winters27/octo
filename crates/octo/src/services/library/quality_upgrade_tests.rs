@@ -331,6 +331,288 @@ async fn during_a_soulseek_outage_no_song_is_tried_and_the_run_is_not_spent() {
 }
 
 #[tokio::test]
+async fn a_song_mornyes_check_kept_is_not_put_off_for_four_weeks() {
+    let store = Arc::new(QualityUpgradeStore::new());
+    let (w, calls) = worker(7, true, Some(store.clone()));
+    let applied = calls.clone();
+    w.configure(|s| {
+        s.apply = Arc::new(move |_| {
+            applied.apply.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok(LibraryActionOutcome {
+                    code: Some(LibraryActionCodes::MORNYE_KEPT.to_string()),
+                    ..LibraryActionOutcome::new(
+                        LibraryActionState::Failed,
+                        Some("Waiting for Mornye's check.".into()),
+                    )
+                })
+            }
+            .boxed()
+        })
+    });
+
+    assert_eq!(w.tick().await, Tick::Offline);
+    assert_eq!(calls.apply.load(Ordering::SeqCst), 1);
+    let state = store.snapshot();
+    assert!(state.attempts.is_empty(), "the song is not stamped");
+    assert_eq!(state.last_outcome.as_deref(), Some("Waiting for Mornye's check"));
+}
+
+#[tokio::test]
+async fn a_kept_song_is_passed_over_so_the_next_run_tries_the_next_song() {
+    let store = Arc::new(QualityUpgradeStore::new());
+    let (w, _) = worker(7, true, Some(store.clone()));
+    let now = Arc::new(Mutex::new(chrono::Utc::now()));
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (clock_now, seen) = (now.clone(), asked.clone());
+    let until = chrono::Utc::now() + chrono::TimeDelta::days(30);
+    w.configure(|s| {
+        s.clock = Clock::new(move || *clock_now.lock());
+        s.list_songs = Arc::new(|| async { (vec![row("a", "A/a.mp3"), row("b", "B/b.mp3")], true) }.boxed());
+        s.apply = Arc::new(move |request| {
+            seen.lock().push(request.navidrome_id.clone());
+            let kept = request.navidrome_id == "a";
+            async move {
+                Ok(if kept {
+                    LibraryActionOutcome {
+                        code: Some(LibraryActionCodes::MORNYE_KEPT.to_string()),
+                        mornye_wait: Some(Box::new(octo_core::spotiflac::check::CheckPause {
+                            until_utc: until,
+                            labels: vec!["Example".into()],
+                            holding: Vec::new(),
+                            url: String::new(),
+                        })),
+                        ..LibraryActionOutcome::new(
+                            LibraryActionState::Failed,
+                            Some("Waiting for Mornye's check.".into()),
+                        )
+                    }
+                } else {
+                    LibraryActionOutcome::new(LibraryActionState::Failed, Some("nothing better".into()))
+                })
+            }
+            .boxed()
+        });
+    });
+
+    assert_eq!(w.tick().await, Tick::Offline);
+    *now.lock() += chrono::TimeDelta::days(2);
+    assert_eq!(w.tick().await, Tick::Ran);
+
+    assert_eq!(
+        *asked.lock(),
+        vec!["a".to_string(), "b".to_string()],
+        "the kept song does not block the run"
+    );
+    assert!(
+        store
+            .snapshot()
+            .mornye_holds
+            .contains_key(&QualityUpgradeWorker::key_of(&row("a", "A/a.mp3")))
+    );
+
+    // Once a's pause has ended, the next run picks a again.
+    *now.lock() += chrono::TimeDelta::days(31);
+    w.tick().await;
+    assert_eq!(
+        *asked.lock(),
+        vec!["a".to_string(), "b".to_string(), "a".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_hold_on_a_pause_that_names_no_check_ends_once_its_mornye_is_off() {
+    let store = Arc::new(QualityUpgradeStore::new());
+    let key = QualityUpgradeWorker::key_of(&row("a", "A/a.mp3"));
+    store.update(|s| {
+        s.mornye_holds.set(
+            key.clone(),
+            MornyeHold {
+                url: "http://spotiflac:8000".into(),
+                ..MornyeHold::until(chrono::Utc::now() + chrono::TimeDelta::days(30))
+            },
+        );
+    });
+    let (w, _) = worker(7, true, Some(store.clone()));
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = asked.clone();
+    w.configure(|s| {
+        s.list_songs = Arc::new(|| async { (vec![row("a", "A/a.mp3")], true) }.boxed());
+        s.apply = Arc::new(move |request| {
+            seen.lock().push(request.navidrome_id.clone());
+            async {
+                Ok(LibraryActionOutcome::new(
+                    LibraryActionState::Failed,
+                    Some("nothing better".into()),
+                ))
+            }
+            .boxed()
+        });
+        // The Mornye that paused is off now.
+        s.mornye_hold_over = Arc::new(|_| async { true }.boxed());
+    });
+
+    w.tick().await;
+
+    assert_eq!(*asked.lock(), vec!["a".to_string()]);
+    assert!(store.snapshot().mornye_holds.is_empty());
+}
+
+/// The weekly run as Octo builds it, with Mornye on at `url` and song a held on check A of that
+/// Mornye for another month; Navidrome and the action are stood in for, so whether the hold is
+/// over is the worker's own. Answers the worker, its settings, its store and the songs it asked.
+fn weekly_run_as_octo_builds_it(
+    url: &str,
+) -> (
+    Arc<QualityUpgradeWorker>,
+    Arc<SettingsStore>,
+    Arc<QualityUpgradeStore>,
+    Arc<Mutex<Vec<String>>>,
+) {
+    let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+        library_actions: LibraryActionSettings {
+            enabled: true,
+            allowed_users: vec!["alice".into()],
+            actions: vec![LibraryActionDefinition {
+                action: LibraryAction::BetterQuality,
+                enabled: true,
+                ..Default::default()
+            }],
+            dry_run: false,
+            upgrade_per_week: 7,
+            ..Default::default()
+        },
+        soulseek: octo_core::settings::SoulseekSettings {
+            base_url: Some("http://slskd:5030".into()),
+            username: Some("u".into()),
+            password: Some("p".into()),
+            ..Default::default()
+        },
+        spotiflac: octo_core::settings::SpotiflacSettings {
+            enabled: true,
+            url: url.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let sources = Arc::new(
+        UpgradeSources::new(settings.clone(), None).with_spotiflac(Arc::new(
+            crate::services::spotiflac::SpotiflacClient::new(settings.clone()),
+        )),
+    );
+    let http = crate::services::http_client_factory::default_client();
+    let identity = crate::services::subsonic::NavidromeIdentityService::new(settings.clone(), http.clone());
+    let store = Arc::new(QualityUpgradeStore::new());
+    let key = QualityUpgradeWorker::key_of(&row("a", "A/a.mp3"));
+    store.update(|s| {
+        s.mornye_holds.set(
+            key.clone(),
+            MornyeHold {
+                labels: vec!["A".into()],
+                url: url.into(),
+                ..MornyeHold::until(chrono::Utc::now() + chrono::TimeDelta::days(30))
+            },
+        );
+    });
+    let w = Arc::new(QualityUpgradeWorker::new(
+        store.clone(),
+        crate::services::library::library_action_test_support::executor(&settings, Default::default()),
+        Arc::new(AcquisitionActivity::new(Arc::new(TrackAcquisitionQueue::new()))),
+        Arc::new(NavidromePlaylistApi::new(
+            http,
+            identity.clone(),
+            settings.clone(),
+        )),
+        identity,
+        settings.clone(),
+        None,
+        None,
+        Some(sources),
+    ));
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = asked.clone();
+    w.configure(|s| {
+        s.has_admin_identity = Arc::new(|| true);
+        s.list_songs = Arc::new(|| async { (vec![row("a", "A/a.mp3")], true) }.boxed());
+        s.apply = Arc::new(move |request| {
+            seen.lock().push(request.navidrome_id.clone());
+            async {
+                Ok(LibraryActionOutcome::new(
+                    LibraryActionState::Failed,
+                    Some("nothing better".into()),
+                ))
+            }
+            .boxed()
+        });
+    });
+    (w, settings, store, asked)
+}
+
+#[tokio::test]
+async fn the_weekly_runs_own_wiring_lets_a_hold_go_once_its_mornye_is_off_without_asking_it() {
+    let mornye = wiremock::MockServer::builder().start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mornye)
+        .await;
+    let (w, settings, store, asked) = weekly_run_as_octo_builds_it(&mornye.uri());
+    let mut off = (*settings.current()).clone();
+    off.spotiflac.enabled = false;
+    settings.set(off);
+
+    w.tick().await;
+
+    assert_eq!(*asked.lock(), vec!["a".to_string()]);
+    assert!(store.snapshot().mornye_holds.is_empty());
+    mornye.verify().await;
+}
+
+#[tokio::test]
+async fn the_weekly_runs_own_wiring_keeps_a_hold_while_the_same_mornye_reports_its_check_paused() {
+    let mornye = wiremock::MockServer::builder().start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/api/get_signed_sessions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {"result": {"sessions": [{"key": "gateway-a-1", "kind": "gateway", "label": "A",
+                 "extensions": ["a-ext"], "state": "unverified", "auth_paused_s": 900.0}]}}
+            )),
+        )
+        .mount(&mornye)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::path("/api/get_download_services"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {"result": {"services": [{"id": "ext:a-ext", "label": "A", "extensions": ["a-ext"]}]}}
+            )),
+        )
+        .mount(&mornye)
+        .await;
+    let (w, _, store, asked) = weekly_run_as_octo_builds_it(&mornye.uri());
+
+    w.tick().await;
+
+    assert!(asked.lock().is_empty(), "the held song is not tried");
+    assert_eq!(store.snapshot().mornye_holds.len(), 1);
+}
+
+#[test]
+fn the_weekly_runs_holds_survive_a_restart() {
+    let mut state = QualityUpgradeState::default();
+    let hold = MornyeHold {
+        until_utc: chrono::Utc.with_ymd_and_hms(2026, 11, 1, 12, 0, 0).unwrap(),
+        labels: vec!["Example".into()],
+        holding: vec!["Example".into(), "Example two".into()],
+        moved: 2,
+        url: "http://spotiflac:8000".into(),
+    };
+    state.mornye_holds.set("A/a.mp3".to_string(), hold.clone());
+    let text = serde_json::to_string(&state).expect("writes");
+    let back: QualityUpgradeState = serde_json::from_str(&text).expect("reads");
+    assert_eq!(back.mornye_holds.get("A/a.mp3"), Some(&hold));
+}
+
+#[tokio::test]
 async fn when_navidrome_cannot_list_the_library_the_weeks_run_is_not_spent() {
     let store = Arc::new(QualityUpgradeStore::new());
     let (w, calls) = worker(7, true, Some(store.clone()));

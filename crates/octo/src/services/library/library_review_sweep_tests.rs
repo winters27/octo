@@ -259,6 +259,8 @@ struct Options {
     replacer: Option<Arc<FakeReplacer>>,
     /// The download source; Soulseek when none.
     source: Option<DownloadSource>,
+    /// slskd switched off in the settings (switched on otherwise).
+    slskd_switched_off: bool,
 }
 
 impl Sweep {
@@ -323,7 +325,7 @@ impl Sweep {
                 ..Default::default()
             },
             soulseek: SoulseekSettings {
-                enabled: true,
+                enabled: !options.slskd_switched_off,
                 base_url: Some("http://slskd.test".into()),
                 ..Default::default()
             },
@@ -981,6 +983,12 @@ struct FakeReplacer {
     sources: Mutex<Vec<Option<DownloadSource>>>,
     /// The code every outcome carries.
     code: Option<&'static str>,
+    /// Whether Mornye's check keeps it from every extension now.
+    mornye_kept: Mutex<bool>,
+    /// The checks a kept outcome's pause watches.
+    pause_labels: Vec<&'static str>,
+    /// What slskd's link says about slskd being in use; None leaves it to the settings.
+    slskd_in_use: Option<bool>,
 }
 
 impl FakeReplacer {
@@ -992,18 +1000,44 @@ impl FakeReplacer {
             requests: Mutex::new(Vec::new()),
             sources: Mutex::new(Vec::new()),
             code: None,
+            mornye_kept: Mutex::new(false),
+            pause_labels: vec!["Example"],
+            slskd_in_use: None,
         })
     }
 
     /// Wrong song that finds Soulseek out: it fails with the code that makes a sweep wait.
     fn soulseek_out() -> Arc<Self> {
+        Self::out(LibraryActionCodes::SOULSEEK_OFFLINE)
+    }
+
+    /// Wrong song whose only source is out, failing with `code`.
+    fn out(code: &'static str) -> Arc<Self> {
         Arc::new(FakeReplacer {
             shown: true,
             marked: Some(false),
             state: Mutex::new(LibraryActionState::Failed),
             requests: Mutex::new(Vec::new()),
             sources: Mutex::new(Vec::new()),
-            code: Some(LibraryActionCodes::SOULSEEK_OFFLINE),
+            code: Some(code),
+            mornye_kept: Mutex::new(false),
+            pause_labels: vec!["Example"],
+            slskd_in_use: None,
+        })
+    }
+
+    /// Wrong song whose sources had no copy and whose Mornye was kept by its check.
+    fn kept_by_mornye() -> Arc<Self> {
+        Arc::new(FakeReplacer {
+            shown: true,
+            marked: Some(false),
+            state: Mutex::new(LibraryActionState::Failed),
+            requests: Mutex::new(Vec::new()),
+            sources: Mutex::new(Vec::new()),
+            code: Some(LibraryActionCodes::MORNYE_KEPT),
+            mornye_kept: Mutex::new(true),
+            pause_labels: vec!["Example"],
+            slskd_in_use: None,
         })
     }
 
@@ -1016,6 +1050,9 @@ impl FakeReplacer {
             requests: Mutex::new(Vec::new()),
             sources: Mutex::new(Vec::new()),
             code: None,
+            mornye_kept: Mutex::new(false),
+            pause_labels: vec!["Example"],
+            slskd_in_use: None,
         })
     }
 
@@ -1047,10 +1084,26 @@ impl SweepReplacer for FakeReplacer {
         Ok(match self.code {
             Some(code) => LibraryActionOutcome {
                 code: Some(code.to_string()),
+                mornye_wait: (code == LibraryActionCodes::MORNYE_KEPT).then(|| {
+                    Box::new(octo_core::spotiflac::check::CheckPause {
+                        until_utc: chrono::Utc::now() + chrono::Duration::days(30),
+                        labels: self.pause_labels.iter().map(|label| label.to_string()).collect(),
+                        holding: Vec::new(),
+                        url: String::new(),
+                    })
+                }),
                 ..LibraryActionOutcome::new(*self.state.lock(), Some("done".into()))
             },
             None => LibraryActionOutcome::new(*self.state.lock(), Some("done".into())),
         })
+    }
+
+    async fn mornye_wait_over(&self, _: &MornyeHold) -> bool {
+        !*self.mornye_kept.lock()
+    }
+
+    fn slskd_in_use(&self, soulseek: &SoulseekSettings) -> bool {
+        self.slskd_in_use.unwrap_or_else(|| soulseek.is_on())
     }
 }
 
@@ -1132,6 +1185,7 @@ fn classify_then_decide_replaces_only_a_confident_other_song() {
             &question,
             &file_titled(title),
             &settings,
+            settings.soulseek.is_on(),
             "bob",
             Today::default(),
             None,
@@ -1169,6 +1223,12 @@ fn classify_then_decide_replaces_only_a_confident_other_song() {
 /// A file the preview says is another song, replaced with the preview's replacing on and every
 /// other gate open, unless `change` closes one.
 fn decide_by_preview(change: impl FnOnce(&mut AppSettings)) -> AutoReplace {
+    decide_by_preview_with(None, change)
+}
+
+/// [`decide_by_preview`], with slskd in use as its link says (`Some`) instead of as the settings
+/// say.
+fn decide_by_preview_with(slskd_in_use: Option<bool>, change: impl FnOnce(&mut AppSettings)) -> AutoReplace {
     let mut settings = app_settings(replacing_by_preview(60));
     settings.soulseek = SoulseekSettings {
         enabled: true,
@@ -1185,6 +1245,7 @@ fn decide_by_preview(change: impl FnOnce(&mut AppSettings)) -> AutoReplace {
         &question,
         &file_titled("Teardrop"),
         &settings,
+        slskd_in_use.unwrap_or_else(|| settings.soulseek.is_on()),
         "bob",
         Today::default(),
         Some(PreviewWitness {
@@ -1230,6 +1291,67 @@ fn the_preview_replaces_nothing_without_a_lossless_source_switched_on() {
         s.spotiflac.url = "http://spotiflac:8000".into();
     };
     assert_eq!(decide_by_preview(spotiflac), AutoReplace::Replace);
+}
+
+/// The gate reads slskd as the downloads do, by its link: switched off in settings while the
+/// running slskd is on still replaces, and on in settings while its link is off asks.
+#[test]
+fn the_preview_gate_reads_slskd_by_its_link_not_the_switch() {
+    let off = |s: &mut AppSettings| s.soulseek.enabled = false;
+    assert_eq!(decide_by_preview_with(Some(true), off), AutoReplace::Replace);
+    assert_eq!(decide_by_preview_with(Some(false), |_| {}), AutoReplace::Ask);
+}
+
+/// The sweep asks its replacer whether slskd is in use: with the link off and Mornye off, a file
+/// the preview says is another song is asked about, never sent to a replacement that could only
+/// wait.
+#[tokio::test]
+async fn the_sweep_reads_slskd_through_its_replacer() {
+    let replacer = Arc::new(FakeReplacer {
+        slskd_in_use: Some(false),
+        ..Arc::into_inner(FakeReplacer::ending(LibraryActionState::Applied)).expect("the only one")
+    });
+
+    let (_sweep, _, queue) =
+        preview_says_wrong(&["a.flac"], replacing_by_preview(60), replacer.clone(), None, 0.5).await;
+
+    assert!(replacer.requests().is_empty());
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_ne!(entries[0].state, NoticeState::Acted);
+}
+
+/// The other way round: switched off since startup with slskd still running, the sweep replaces,
+/// as the downloads still ask slskd.
+#[tokio::test]
+async fn the_sweep_replaces_while_slskd_still_runs_after_a_switch_off() {
+    let replacer = Arc::new(FakeReplacer {
+        slskd_in_use: Some(true),
+        ..Arc::into_inner(FakeReplacer::ending(LibraryActionState::Applied)).expect("the only one")
+    });
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+        Options {
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            slskd_switched_off: true,
+            ..Default::default()
+        },
+    );
+    for _ in 0..2 {
+        worker.tick().await;
+    }
+
+    assert_eq!(
+        replacer.requests(),
+        [(
+            LibraryAction::WrongSong,
+            "nd-a.flac".to_string(),
+            "bob".to_string()
+        )]
+    );
 }
 
 /// The sweep builds the request for a replacement it holds to the preview: Soulseek alone under
@@ -1292,6 +1414,133 @@ async fn a_replacement_that_finds_soulseek_out_waits_without_counting() {
     assert_eq!(worker.status().fine, 0);
 }
 
+/// The same when the only source is a Mornye that is not answering.
+#[tokio::test]
+async fn a_replacement_that_finds_mornye_not_answering_waits_without_counting() {
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let replacer = FakeReplacer::out(LibraryActionCodes::MORNYE_OUT);
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            source: Some(DownloadSource::SoulseekThenYouTube),
+            ..Default::default()
+        },
+    );
+
+    worker.tick().await;
+    worker.tick().await;
+
+    assert_eq!(replacer.requests().len(), 2, "tried again, not given up on");
+    assert_eq!(worker.status().today.failed, 0);
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+}
+
+/// A pause read from Mornye's words can name no check; switching Mornye off still ends it.
+#[tokio::test]
+async fn a_song_held_on_a_pause_that_names_no_check_is_asked_again_once_mornye_is_off() {
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let replacer = Arc::new(FakeReplacer {
+        pause_labels: Vec::new(),
+        ..Arc::into_inner(FakeReplacer::kept_by_mornye()).expect("the only one")
+    });
+    let now = Arc::new(Mutex::new(Utc::now()));
+    let reading = now.clone();
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+        Options {
+            queue: Some(Arc::new(NoticeQueue::new())),
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            source: Some(DownloadSource::SoulseekThenYouTube),
+            clock: Some(Clock::new(move || *reading.lock())),
+            ..Default::default()
+        },
+    );
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+    assert_eq!(replacer.requests().len(), 1);
+
+    // The next pass, while the pause holds: a is passed over.
+    *now.lock() += LibraryReviewSweepWorker::PASS_INTERVAL + TimeDelta::minutes(1);
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+    assert_eq!(
+        replacer.requests().len(),
+        1,
+        "a is not asked for while its pause holds"
+    );
+
+    // Mornye is switched off: the next pass asks for a again, long before its pause ends.
+    *replacer.mornye_kept.lock() = false;
+    *now.lock() += LibraryReviewSweepWorker::PASS_INTERVAL + TimeDelta::minutes(1);
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+    assert_eq!(replacer.requests().len(), 2, "a is asked for again");
+}
+
+#[tokio::test]
+async fn a_replacement_mornyes_check_kept_is_passed_over_and_the_sweep_goes_on() {
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    sweep.teardrop("b.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let replacer = FakeReplacer::kept_by_mornye();
+    let now = Arc::new(Mutex::new(Utc::now()));
+    let reading = now.clone();
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            source: Some(DownloadSource::SoulseekThenYouTube),
+            clock: Some(Clock::new(move || *reading.lock())),
+            ..Default::default()
+        },
+    );
+
+    worker.tick().await;
+    worker.tick().await;
+    worker.tick().await;
+    let asked = || -> Vec<String> { replacer.requests().into_iter().map(|(_, id, _)| id).collect() };
+    assert_eq!(
+        asked(),
+        vec!["nd-a.flac".to_string(), "nd-b.flac".to_string()],
+        "a is not searched again while its pause holds, and b is next"
+    );
+    assert_eq!(worker.status().today.failed, 0);
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+
+    // The next pass, while both pauses still hold: both are passed over, nothing is searched.
+    *now.lock() += LibraryReviewSweepWorker::PASS_INTERVAL + TimeDelta::minutes(1);
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+    assert_eq!(asked().len(), 2, "{:?}", asked());
+
+    // Someone passes the check: the pass after asks for a again.
+    *replacer.mornye_kept.lock() = false;
+    *now.lock() += LibraryReviewSweepWorker::PASS_INTERVAL + TimeDelta::minutes(1);
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+    assert_eq!(
+        asked().get(2).map(String::as_str),
+        Some("nd-a.flac"),
+        "{:?}",
+        asked()
+    );
+}
+
 /// Off, a dry run, a keeper off the allowlist, Wrong song off, the day's cap and the breaker each
 /// keep it a question.
 #[test]
@@ -1299,7 +1548,15 @@ fn decide_keeps_to_the_switch_dry_run_allowlist_and_the_day() {
     let (_, question) = LibraryReviewSweepWorker::classify(heard_as("Roads", 0.97));
     let file = file_titled("Teardrop");
     let decide = |actions: LibraryActionSettings, keeper: &str, today: Today| {
-        LibraryReviewSweepWorker::decide(&question, &file, &app_settings(actions), keeper, today, None)
+        LibraryReviewSweepWorker::decide(
+            &question,
+            &file,
+            &app_settings(actions),
+            false,
+            keeper,
+            today,
+            None,
+        )
     };
     assert_eq!(
         decide(replacing(60), "bob", Today::default()),
@@ -1780,6 +2037,9 @@ async fn a_file_navidrome_does_not_show_is_asked_about() {
         requests: Mutex::new(Vec::new()),
         sources: Mutex::new(Vec::new()),
         code: None,
+        mornye_kept: Mutex::new(false),
+        pause_labels: vec!["Example"],
+        slskd_in_use: None,
     });
     sweep
         .worker(
@@ -2343,6 +2603,126 @@ mod other_listeners {
         let n = navidrome(Some(admin_and(&["teen", "guest"])), &["teen"], true).await;
         member_song(&n, "teen", MemberSong::Plain).await;
         assert_eq!(n.replacer.marked("nd-1").await, None);
+    }
+
+    /// The real replacer over an executor whose Better quality sources include Mornye, with
+    /// Mornye at `url` switched on or off.
+    fn mornye_replacer(url: &str, enabled: bool) -> ExecutorSweepReplacer {
+        let settings = store(AppSettings {
+            spotiflac: octo_core::settings::SpotiflacSettings {
+                enabled,
+                url: url.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let sources = Arc::new(
+            crate::services::library::UpgradeSources::new(settings.clone(), None).with_spotiflac(Arc::new(
+                crate::services::spotiflac::SpotiflacClient::new(settings.clone()),
+            )),
+        );
+        replacer_over(
+            settings,
+            Extras {
+                sources: Some(sources),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The real replacer over an executor built from `extras`.
+    fn replacer_over(settings: Arc<SettingsStore>, extras: Extras) -> ExecutorSweepReplacer {
+        let http = crate::services::http_client_factory::default_client();
+        let identity = NavidromeIdentityService::new(settings.clone(), http.clone());
+        ExecutorSweepReplacer::new(
+            Arc::new(NavidromeSongPathResolver::new(
+                identity.clone(),
+                Arc::new(crate::services::local::test_support::FakeLocalLibrary::default()),
+                http.clone(),
+                settings.clone(),
+            )),
+            executor(&settings, extras),
+            Arc::new(NavidromePlaylistApi::new(
+                http.clone(),
+                identity.clone(),
+                settings.clone(),
+            )),
+            None,
+            Arc::new(NavidromeOtherListeners::new(
+                Arc::new(NavidromeAdmin::new(identity, http, settings)),
+                Arc::new(FamilyStore::in_memory()),
+            )),
+        )
+    }
+
+    /// The sweep's own replacer lets a hold go once the Mornye that paused is switched off or
+    /// moved, without asking it, and keeps it while that Mornye still reports the check paused.
+    #[tokio::test]
+    async fn the_real_replacer_ends_a_hold_once_its_mornye_is_off_or_moved_and_keeps_it_otherwise() {
+        let untouched = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&untouched)
+            .await;
+        let paused = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/get_signed_sessions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": {"sessions": [
+                    {"key": "gateway-a-1", "kind": "gateway", "label": "A", "extensions": ["a-ext"],
+                     "state": "unverified", "auth_paused_s": 900.0}
+                ]}})),
+            )
+            .mount(&paused)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/get_download_services"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": {"services": [
+                    {"id": "ext:a-ext", "label": "A", "extensions": ["a-ext"]}
+                ]}})),
+            )
+            .mount(&paused)
+            .await;
+        let hold_on = |url: String| MornyeHold {
+            labels: vec!["A".into()],
+            url,
+            ..MornyeHold::until(Utc::now() + TimeDelta::days(30))
+        };
+
+        let off = mornye_replacer(&untouched.uri(), false);
+        assert!(
+            off.mornye_wait_over(&hold_on(untouched.uri())).await,
+            "switched off"
+        );
+        let moved = mornye_replacer(&paused.uri(), true);
+        assert!(moved.mornye_wait_over(&hold_on(untouched.uri())).await, "moved");
+        let same = mornye_replacer(&paused.uri(), true);
+        assert!(
+            !same.mornye_wait_over(&hold_on(paused.uri())).await,
+            "the same Mornye with its check still paused"
+        );
+        untouched.verify().await;
+    }
+
+    /// The sweep's own replacer reads slskd by the executor's link, as the downloads do: switched
+    /// off in settings while the running slskd is on, it is in use.
+    #[tokio::test]
+    async fn the_real_replacer_reads_slskd_by_its_link() {
+        let settings = store(AppSettings::default());
+        let soulseek = settings.current().soulseek.clone();
+        assert!(!soulseek.is_on());
+        let linked = replacer_over(
+            settings.clone(),
+            Extras {
+                soulseek_link: Some(Arc::new(crate::services::common::test_fakes::LoggedInLink)),
+                ..Default::default()
+            },
+        );
+        assert!(linked.slskd_in_use(&soulseek));
+        let unlinked = replacer_over(settings, Extras::default());
+        assert!(!unlinked.slskd_in_use(&soulseek));
     }
 }
 
@@ -3054,6 +3434,7 @@ fn a_song_one_submission_names_is_never_clearly_another() {
             question,
             &file_titled("Teardrop"),
             &settings,
+            settings.soulseek.is_on(),
             "bob",
             Today::default(),
             None,
@@ -3080,6 +3461,7 @@ fn acoust_id_replaces_only_with_the_original_kept() {
             &question,
             &file_titled("Teardrop"),
             &app_settings(actions),
+            false,
             "bob",
             Today::default(),
             None,

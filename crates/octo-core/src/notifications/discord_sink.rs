@@ -74,6 +74,7 @@ pub fn color_for(r#type: NotificationEventType) -> i32 {
         NotificationEventType::FamilyRequestAdded => 0x22C55E,
         NotificationEventType::FamilyRequestFailed => 0xEF4444,
         NotificationEventType::FamilyDeviceNew => 0x8B5CF6,
+        NotificationEventType::MornyeCheck => 0xF59E0B,
     }
 }
 

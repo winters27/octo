@@ -34,6 +34,7 @@ use crate::services::library::GeneratedPlaylistService;
 use crate::services::local::ILocalLibraryService;
 use crate::services::soulseek::soulseek_link::SoulseekLinkState;
 use crate::services::soulseek::{ExternalIdRegistry, ISoulseekLink, RadioQueueStore};
+use crate::services::spotiflac::{SpotiflacClient, mornye_waited};
 
 /// A saved play queue older than this no longer says what plays next.
 const SAVED_QUEUE_FOR: Duration = Duration::hours(6);
@@ -76,6 +77,9 @@ pub struct PrefetchParts {
     pub names: Option<Arc<ExternalIdRegistry>>,
     /// Whether Soulseek is connected: nothing is fetched while it is not, unless SpotiFLAC is on.
     pub soulseek: Option<Arc<dyn ISoulseekLink>>,
+    /// Mornye, whose check can keep it from every extension: nothing is fetched then either,
+    /// while Soulseek cannot be used.
+    pub spotiflac: Option<Arc<SpotiflacClient>>,
     pub clock: Clock,
 }
 
@@ -139,6 +143,9 @@ struct State {
     running: HashMap<String, (Job, CancellationToken)>,
     /// Songs not tried again until then: they failed, or turned out to be the listener's already.
     resting: HashMap<String, DateTime<Utc>>,
+    /// For a resting song Mornye's check kept: the address of that Mornye and the checks the
+    /// song waits on.
+    resting_for_mornye: HashMap<String, (String, Vec<String>)>,
     errors: VecDeque<String>,
     last_played: Option<DateTime<Utc>>,
     last_sweep: Option<DateTime<Utc>>,
@@ -505,13 +512,24 @@ impl PrefetchService {
     async fn wanted(&self, provider: &str, external_id: &str) -> bool {
         let key = format!("{provider}:{external_id}");
         let now = self.now();
+        let kept = self.state.lock().resting_for_mornye.get(&key).cloned();
+        // A song Mornye's check kept rests until that pause ends, until its checks pass, or until
+        // the Mornye that kept it is switched off or moved.
+        let passed = match kept {
+            Some((url, labels)) => match self.parts.spotiflac.as_ref() {
+                Some(client) => client.wait_over(&url, &labels).await,
+                None => true,
+            },
+            None => false,
+        };
         {
             let mut state = self.state.lock();
             if let Some(until) = state.resting.get(&key) {
-                if *until > now {
+                if *until > now && !passed {
                     return false;
                 }
                 state.resting.remove(&key);
+                state.resting_for_mornye.remove(&key);
             }
         }
         if self.parts.store.is_ready(provider, external_id)
@@ -609,9 +627,30 @@ impl PrefetchService {
             return Some("The disk is nearly full".to_string());
         }
         if self.soulseek_down().await {
-            return Some("Waiting for Soulseek to connect".to_string());
+            return Some(self.step_out_words().to_string());
+        }
+        if self.mornye_kept().await {
+            return Some("Waiting for Mornye's check".to_string());
         }
         None
+    }
+
+    /// Mornye is the lossless source left (Soulseek off, unreachable or logged out) and its
+    /// check keeps it from every extension a song could use.
+    async fn mornye_kept(&self) -> bool {
+        let Some(client) = self.parts.spotiflac.as_ref().filter(|client| client.is_on()) else {
+            return false;
+        };
+        if !self.soulseek_unusable().await {
+            return false;
+        }
+        let Some(view) = client.check_view(None).await else {
+            return false;
+        };
+        view.stands_in(&client.settings().effective_services())
+            && view
+                .pause(&client.settings().effective_services(), chrono::Utc::now())
+                .is_some()
     }
 
     /// Nobody played anything lately, and nothing new starts then (PauseWhenStopped).
@@ -625,11 +664,36 @@ impl PrefetchService {
     }
 
     /// Soulseek is the only lossless source and cannot be used: it is off, slskd cannot be
-    /// reached, or slskd is not logged in.
+    /// reached, or slskd is not logged in, and Mornye cannot stand in for it (off, not
+    /// answering, or unable to download). slskd is read first, so Mornye is never asked while
+    /// slskd can be used.
     async fn soulseek_down(&self) -> bool {
-        if self.parts.settings.current().spotiflac.is_on() {
+        if !self.soulseek_unusable().await {
             return false;
         }
+        match &self.parts.spotiflac {
+            Some(client) => !client.stands_in().await,
+            None => !self.parts.settings.current().spotiflac.is_on(),
+        }
+    }
+
+    /// What prefetch waits for while the Soulseek step is out: Mornye, when it is that step's only
+    /// source (slskd is not in use, by the rule Better quality and imports use), else Soulseek.
+    fn step_out_words(&self) -> &'static str {
+        let mornye_only = self.parts.spotiflac.as_ref().is_some_and(|client| client.is_on())
+            && !crate::services::library::UpgradeSources::slskd_in_use_with(
+                &self.parts.settings.current().soulseek,
+                self.parts.soulseek.as_deref(),
+            );
+        if mornye_only {
+            "Waiting for Mornye"
+        } else {
+            "Waiting for Soulseek to connect"
+        }
+    }
+
+    /// Soulseek cannot be used: it is off, slskd cannot be reached, or slskd is not logged in.
+    async fn soulseek_unusable(&self) -> bool {
         let Some(link) = &self.parts.soulseek else {
             return false;
         };
@@ -812,16 +876,28 @@ impl PrefetchService {
             Err(e) => {
                 let words = format!("{e:#}");
                 info!("Could not download {key} ahead: {words}");
-                // A source that could not be reached says nothing about the song.
-                let unreachable = unreachable(&e) || self.soulseek_down().await;
+                // A source that could not be reached says nothing about the song. Mornye's check
+                // keeping it says only that Mornye was not asked: the song rests until Mornye may
+                // try its check again, so the other sources are not asked again in the meantime.
+                let rest = match mornye_waited(&e) {
+                    Some(wait) => (wait.pause.until_utc - now).max(RETRY_UNREACHABLE_AFTER),
+                    None if unreachable(&e) || self.soulseek_down().await => RETRY_UNREACHABLE_AFTER,
+                    None => RETRY_AFTER,
+                };
+                let kept = mornye_waited(&e).map(|wait| (wait.pause.url.clone(), wait.pause.labels.clone()));
                 let named = self.view(job);
                 let mut state = self.state.lock();
-                let rest = if unreachable {
-                    RETRY_UNREACHABLE_AFTER
-                } else {
-                    RETRY_AFTER
-                };
-                state.resting.insert(key, now + rest);
+                state.resting.insert(key.clone(), now + rest);
+                // A Pass of those checks, or that Mornye switched off or moved, ends the rest
+                // before its time.
+                match kept {
+                    Some(kept) => {
+                        state.resting_for_mornye.insert(key, kept);
+                    }
+                    None => {
+                        state.resting_for_mornye.remove(&key);
+                    }
+                }
                 let line = match (named.artist, named.title) {
                     (Some(artist), Some(title)) => format!("{artist} - {title}: {words}"),
                     _ => words,

@@ -19,12 +19,13 @@ pub struct RestartTracker {
 impl RestartTracker {
     /// Keys whose consumers capture the value when they are constructed. Keep in step with the
     /// dashboard's data-restart markers, which name the same settings as "Section.Key".
-    pub const KEYS: [&'static str; 15] = [
+    pub const KEYS: [&'static str; 16] = [
         "Library:DownloadPath", // BaseDownloadService, LocalLibraryService, PlaylistSyncService
         "YouTube:ShimUrl",      // YouTubeResolver
         "Subsonic:Url",         // live in most places; a restart is still the safe advice
         "Subsonic:LibraryPath", //
         "Subsonic:WaitForLosslessOnPlay", // SubsonicResponseBuilder, deliberately
+        "Soulseek:Enabled",     // SoulseekClient and the Soulseek link read it at startup
         "Soulseek:BaseUrl",     // SoulseekClient and SoulseekDownloadService read it at startup
         "Soulseek:Username",
         "Soulseek:Password",
@@ -116,6 +117,17 @@ mod tests {
         config.set("Soulseek:Password", Some("changed".into()));
 
         assert_eq!(tracker.pending(&config), ["Soulseek:Password"]);
+    }
+
+    /// Switching Soulseek on or off reaches slskd's client only at startup.
+    #[test]
+    fn pending_names_soulseek_switched_on_or_off() {
+        let mut config = config(&[("Soulseek:Enabled", "true")]);
+        let tracker = RestartTracker::new(&config);
+
+        config.set("Soulseek:Enabled", Some("false".into()));
+
+        assert_eq!(tracker.pending(&config), ["Soulseek:Enabled"]);
     }
 
     /// A hot-reload setting is not a restart setting, however it changes.

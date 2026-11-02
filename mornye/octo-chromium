@@ -1,0 +1,48 @@
+#!/bin/sh
+# Mornye starts the browser for its check through this file (CHROME_PATH). It notes the
+# browser's DevTools port in $MORNYE_DATA_DIR/octo-assist/browser-<pid>.port, where Octo's assist
+# helper looks for it, then becomes the browser itself (same process, so the pid in the name is
+# the browser's). A folder it cannot write never stops the browser.
+port=""
+take_next=""
+for arg in "$@"; do
+  if [ -n "$take_next" ]; then
+    port="$arg"
+    take_next=""
+    continue
+  fi
+  case "$arg" in
+    --remote-debugging-port=*) port="${arg#--remote-debugging-port=}" ;;
+    --remote-debugging-port) take_next=1 ;;
+  esac
+done
+case "$port" in
+  "" | *[!0-9]*) port="" ;;
+esac
+
+dir="${MORNYE_DATA_DIR:-$HOME/.mornye}/octo-assist"
+if [ -n "$port" ] && mkdir -p "$dir" 2>/dev/null; then
+  printf '%s\n' "$port" 2>/dev/null > "$dir/browser-$$.tmp" \
+    && mv -f "$dir/browser-$$.tmp" "$dir/browser-$$.port" 2>/dev/null
+  rm -f "$dir/browser-$$.tmp" 2>/dev/null
+fi
+
+# The browser Mornye would have started: OCTO_CHROMIUM, else the first of the places Mornye's own
+# solver looks on Linux.
+browser="${OCTO_CHROMIUM:-}"
+if [ -z "$browser" ]; then
+  for candidate in /usr/bin/google-chrome-stable /usr/bin/google-chrome /usr/bin/chromium-browser \
+      /usr/bin/chromium /usr/bin/brave-browser /usr/bin/microsoft-edge-stable; do
+    if [ -x "$candidate" ]; then
+      browser="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$browser" ]; then
+  for name in google-chrome chrome chromium chromium-browser msedge brave; do
+    browser="$(command -v "$name" 2>/dev/null)" && [ -n "$browser" ] && break
+    browser=""
+  done
+fi
+exec "${browser:-/usr/bin/chromium}" "$@"

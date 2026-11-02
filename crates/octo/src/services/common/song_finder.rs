@@ -1663,9 +1663,10 @@ async fn library_song(
 /// from; a library song the sources Better quality uses.
 fn default_sources(services: &SongFinderServices, target: &FindTarget) -> Vec<(String, Option<String>)> {
     let current = services.settings.as_ref().map(|s| s.current());
-    let soulseek_up = current
-        .as_ref()
-        .is_some_and(|c| UpgradeSources::soulseek_set_up(&c.soulseek));
+    let soulseek_up = match services.upgrade_sources.as_ref() {
+        Some(sources) => sources.slskd_in_use(),
+        None => current.as_ref().is_some_and(|c| c.soulseek.is_on()),
+    };
     let lidarr_up = current
         .as_ref()
         .is_some_and(|c| UpgradeSources::lidarr_set_up(&c.lidarr));

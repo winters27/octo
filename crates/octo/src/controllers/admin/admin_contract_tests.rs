@@ -193,6 +193,416 @@ async fn effective_document_keeps_spotiflac() {
     assert_eq!(missing_from(&document), Vec::<String>::new());
 }
 
+/// A Mornye 1.0.5 whose one gateway session is in `state`, and Octo's helper beside it, whose
+/// pause file the gateway itself asked for when `gateway_asked`.
+async fn mornye_and_helper(state: &str, gateway_asked: bool) -> (MockServer, MockServer) {
+    let mornye = MockServer::builder().start().await;
+    let paused_s = if state == "active" { 0.0 } else { 900.0 };
+    let answers = [
+        (
+            "GET",
+            "/api/v1/info",
+            serde_json::json!({"name": "Mornye", "version": "1.0.5", "api_version": "v1", "multiuser": false, "authenticated": true}),
+        ),
+        (
+            "GET",
+            "/api/v1/extensions",
+            serde_json::json!({"providers": [{"provider": "ext:example-ext", "installed": true}]}),
+        ),
+        (
+            "POST",
+            "/api/get_signed_sessions",
+            serde_json::json!({"result": {"sessions": [
+            {"key": "gateway-v2-abc-6836abb49bb0e8c9", "kind": "gateway", "label": "Example",
+             "extensions": ["example-ext"], "state": state, "auth_paused_s": paused_s}]}}),
+        ),
+        (
+            "POST",
+            "/api/get_download_services",
+            serde_json::json!({"result": {"services": [
+            {"id": "ext:example-ext", "label": "Example", "extensions": ["example-ext"]}]}}),
+        ),
+    ];
+    for (verb, at, body) in answers {
+        Mock::given(method(verb))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&mornye)
+            .await;
+    }
+    let helper = MockServer::builder().start().await;
+    Mock::given(method("GET"))
+        .and(path("/assist"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"browsers": [], "paused": [
+            {"file": ".gateway-v2-abc-b97a94207d0a.auth-backoff.json", "gateway": "gateway-v2-abc", "seconds": 900,
+             "gatewayAsked": gateway_asked, "stampedAfterArm": false}]})))
+        .mount(&helper)
+        .await;
+    (mornye, helper)
+}
+
+fn mornye_state(mornye: &MockServer, helper: Option<&MockServer>) -> AppState {
+    let mut settings = factory_settings();
+    settings.spotiflac.enabled = true;
+    settings.spotiflac.url = mornye.uri();
+    settings.spotiflac.token = "t".into();
+    settings.spotiflac.assist_url = helper.map(MockServer::uri).unwrap_or_default();
+    AppState::for_tests(settings)
+}
+
+fn remember_a_song(state: &AppState) {
+    state
+        .spotiflac
+        .check
+        .store
+        .remember(crate::services::spotiflac::CheckSong {
+            link: "https://open.spotify.com/track/a".into(),
+            artist: "Artist".into(),
+            title: "Title".into(),
+            utc: chrono::Utc::now(),
+        });
+}
+
+#[tokio::test]
+async fn mornyes_status_offers_pass_only_when_pass_can_help() {
+    let (mornye, helper) = mornye_and_helper("unverified", false).await;
+
+    // No helper beside Mornye, and no song yet.
+    let alone = mornye_state(&mornye, None);
+    let status = get(&app(alone.clone()), "/api/admin/spotiflac/status")
+        .await
+        .json();
+    assert_eq!(status["paused"], Value::Bool(true));
+    assert_eq!(status["checks"][0]["label"], "Example");
+    assert_eq!(status["helper"], "absent");
+    assert_eq!(status["passable"], Value::Bool(false));
+    assert!(super::system::probe_mornye(&alone).await.get("action").is_none());
+
+    // The helper answers and a song is kept: Pass is offered, on the card and in the status.
+    let ready = mornye_state(&mornye, Some(&helper));
+    remember_a_song(&ready);
+    let status = get(&app(ready.clone()), "/api/admin/spotiflac/status")
+        .await
+        .json();
+    assert_eq!(status["passable"], Value::Bool(true), "{status}");
+    let probe = super::system::probe_mornye(&ready).await;
+    assert_eq!(probe["action"], "pass", "{probe}");
+    assert!(
+        probe["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Check paused; next try "),
+        "{probe}"
+    );
+}
+
+#[tokio::test]
+async fn a_pause_the_gateway_asked_for_offers_no_pass() {
+    let (mornye, helper) = mornye_and_helper("unverified", true).await;
+    let state = mornye_state(&mornye, Some(&helper));
+    remember_a_song(&state);
+    let status = get(&app(state.clone()), "/api/admin/spotiflac/status")
+        .await
+        .json();
+    assert_eq!(status["checks"][0]["gatewayAsked"], Value::Bool(true));
+    assert_eq!(status["passable"], Value::Bool(false));
+    assert!(super::system::probe_mornye(&state).await.get("action").is_none());
+}
+
+#[tokio::test]
+async fn a_helper_that_refuses_the_token_reads_as_refused_not_absent() {
+    let (mornye, _) = mornye_and_helper("unverified", false).await;
+    let helper = MockServer::builder().start().await;
+    Mock::given(method("GET"))
+        .and(path("/assist"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&helper)
+        .await;
+    let state = mornye_state(&mornye, Some(&helper));
+    let status = get(&app(state), "/api/admin/spotiflac/status").await.json();
+    assert_eq!(status["helper"], "refused");
+    assert_eq!(status["passable"], Value::Bool(false));
+}
+
+#[tokio::test]
+async fn a_passing_check_reads_as_mornye_and_its_version() {
+    let (mornye, helper) = mornye_and_helper("active", false).await;
+    let state = mornye_state(&mornye, Some(&helper));
+    let status = get(&app(state.clone()), "/api/admin/spotiflac/status")
+        .await
+        .json();
+    assert_eq!(status["paused"], Value::Bool(false));
+    let probe = super::system::probe_mornye(&state).await;
+    assert_eq!(probe["detail"], "Mornye 1.0.5", "{probe}");
+    assert_eq!(probe["ok"], Value::Bool(true), "{probe}");
+}
+
+#[tokio::test]
+async fn status_lists_no_mornye_while_it_is_off_and_every_other_service_as_before() {
+    let address = crate::services::test_support::refused_address();
+    let (_, app) = factory_at(&format!("http://{address}"));
+
+    let body = get(&app, "/api/admin/status").await.json();
+
+    let mut names: Vec<&String> = body["services"].as_object().expect("services").keys().collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["lastfm", "lidarr", "navidrome", "slskd", "sonic", "ytDlpShim"]
+    );
+}
+
+#[tokio::test]
+async fn status_says_a_mornye_switched_on_with_no_address_needs_one() {
+    let mut settings = factory_settings();
+    settings.subsonic.url = Some(format!(
+        "http://{}",
+        crate::services::test_support::refused_address()
+    ));
+    settings.spotiflac.enabled = true;
+    settings.spotiflac.url = "  ".into();
+    let state = AppState::for_tests(settings);
+
+    let body = get(&app(state.clone()), "/api/admin/status").await.json();
+    let row = &body["services"]["mornye"];
+    assert_eq!(
+        row["detail"],
+        "Switched on, but it has no address. Set it on the Mornye page."
+    );
+    assert_eq!(row["warning"], Value::Bool(true));
+    let card = get(&app(state), "/api/admin/spotiflac/status").await.json();
+    assert_eq!(card, serde_json::json!({"on": false, "enabled": true}));
+}
+
+#[tokio::test]
+async fn a_mornye_that_refuses_reads_as_unreachable() {
+    let address = crate::services::test_support::refused_address();
+    let mut settings = factory_settings();
+    settings.spotiflac.enabled = true;
+    settings.spotiflac.url = format!("http://{address}");
+    let probe = super::system::probe_mornye(&AppState::for_tests(settings)).await;
+    assert_eq!(probe["ok"], Value::Bool(false), "{probe}");
+    assert!(
+        probe["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("Octo could not reach Mornye")),
+        "{probe}"
+    );
+}
+
+/// Mornye's client as Octo builds it reads slskd by the running link, as the downloads do: switched
+/// off in settings since startup, slskd is still in use until a restart.
+#[tokio::test]
+async fn mornyes_client_as_octo_builds_it_reads_slskd_by_its_link() {
+    let mut settings = factory_settings();
+    settings.soulseek.enabled = true;
+    settings.soulseek.base_url = Some("http://slskd.test:5030".into());
+    // Its files go in a folder that is removed with the test.
+    let config = tempfile::tempdir().expect("a temp dir");
+    let state = AppState::for_tests_with(
+        settings,
+        crate::app::TestServices {
+            config_dir: Some(config.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    assert!(state.spotiflac.slskd_in_use());
+
+    let mut next = (*state.settings.current()).clone();
+    next.soulseek.enabled = false;
+    state.settings.set(next);
+
+    assert!(state.spotiflac.slskd_in_use());
+}
+
+/// A Mornye whose info answers after a minute, so a probe of it ends only at its own bound.
+async fn silent_mornye() -> MockServer {
+    let mornye = MockServer::builder().start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/info"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name": "Mornye", "version": "1.0.5", "api_version": "v1"}))
+                .set_delay(std::time::Duration::from_secs(60)),
+        )
+        .mount(&mornye)
+        .await;
+    mornye
+}
+
+/// A state with Mornye on at `url` and Navidrome refusing at once.
+fn mornye_status_state(url: &str) -> AppState {
+    let mut settings = factory_settings();
+    settings.subsonic.url = Some(format!(
+        "http://{}",
+        crate::services::test_support::refused_address()
+    ));
+    settings.spotiflac.enabled = true;
+    settings.spotiflac.url = url.into();
+    AppState::for_tests(settings)
+}
+
+/// Mornye's row of the admin status, or null when the status lists none.
+async fn mornye_row_of(app: &App) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(30), get(app, "/api/admin/status"))
+        .await
+        .expect("the status answered")
+        .json()["services"]["mornye"]
+        .clone()
+}
+
+fn change_mornye(state: &AppState, change: impl FnOnce(&mut octo_core::settings::SpotiflacSettings)) {
+    let mut next = (*state.settings.current()).clone();
+    change(&mut next.spotiflac);
+    state.settings.set(next);
+}
+
+#[tokio::test]
+async fn status_never_waits_for_a_slow_mornye_and_shows_its_last_answer() {
+    let mornye = silent_mornye().await;
+    let state = mornye_status_state(&mornye.uri());
+    // No wait at all, so the answer never races the probe.
+    state.mornye_row.set_wait(std::time::Duration::ZERO);
+    let app = app(state.clone());
+
+    assert_eq!(
+        mornye_row_of(&app).await["detail"],
+        "Mornye has not answered yet."
+    );
+
+    // Once the probe has given up, the next status shows its row at once.
+    let url = state.spotiflac.settings().effective_url();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while state
+            .mornye_row
+            .kept_for(&url, state.settings.spotiflac_changes())
+            .is_none()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the probe kept its row");
+    assert_eq!(
+        mornye_row_of(&app).await["detail"],
+        "Mornye did not answer within 5 seconds."
+    );
+}
+
+#[tokio::test]
+async fn a_mornye_that_answers_within_the_wait_shows_on_the_first_status() {
+    let (mornye, _) = mornye_and_helper("active", false).await;
+    let state = mornye_status_state(&mornye.uri());
+    state.mornye_row.set_wait(std::time::Duration::from_secs(30));
+
+    assert_eq!(mornye_row_of(&app(state)).await["detail"], "Mornye 1.0.5");
+}
+
+#[tokio::test]
+async fn a_moved_mornye_never_shows_the_row_of_the_one_before() {
+    let (before, _) = mornye_and_helper("active", false).await;
+    let state = mornye_status_state(&before.uri());
+    state.mornye_row.set_wait(std::time::Duration::from_secs(30));
+    let app = app(state.clone());
+    assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
+
+    let after = silent_mornye().await;
+    state.mornye_row.set_wait(std::time::Duration::ZERO);
+    change_mornye(&state, |mornye| mornye.url = after.uri());
+
+    assert_eq!(
+        mornye_row_of(&app).await["detail"],
+        "Mornye has not answered yet."
+    );
+}
+
+/// From now on `mornye` answers its info after a minute, so no probe of it finishes in a test.
+async fn answer_after_a_minute(mornye: &MockServer) {
+    mornye.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/info"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(mornye)
+        .await;
+}
+
+#[tokio::test]
+async fn a_mornye_switched_off_and_on_again_never_shows_a_row_from_before() {
+    let (mornye, _) = mornye_and_helper("active", false).await;
+    let state = mornye_status_state(&mornye.uri());
+    state.mornye_row.set_wait(std::time::Duration::from_secs(30));
+    let app = app(state.clone());
+    assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
+
+    change_mornye(&state, |mornye| mornye.enabled = false);
+    assert_eq!(mornye_row_of(&app).await, Value::Null);
+
+    // On again at the same address, which now answers after a minute: only a kept row could
+    // answer the next status.
+    answer_after_a_minute(&mornye).await;
+    state.mornye_row.set_wait(std::time::Duration::ZERO);
+    change_mornye(&state, |mornye| mornye.enabled = true);
+
+    assert_eq!(
+        mornye_row_of(&app).await["detail"],
+        "Mornye has not answered yet."
+    );
+}
+
+#[tokio::test]
+async fn a_mornye_switched_off_and_on_again_with_no_status_between_never_shows_a_row_from_before() {
+    let (mornye, _) = mornye_and_helper("active", false).await;
+    let state = mornye_status_state(&mornye.uri());
+    state.mornye_row.set_wait(std::time::Duration::from_secs(30));
+    let app = app(state.clone());
+    assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
+
+    // Off and on again with no status between, at an address that now answers after a minute.
+    answer_after_a_minute(&mornye).await;
+    change_mornye(&state, |mornye| mornye.enabled = false);
+    change_mornye(&state, |mornye| mornye.enabled = true);
+    state.mornye_row.set_wait(std::time::Duration::ZERO);
+
+    assert_eq!(
+        mornye_row_of(&app).await["detail"],
+        "Mornye has not answered yet."
+    );
+}
+
+#[test]
+fn a_kept_row_shows_only_while_mornyes_settings_stay_as_they_were() {
+    let keeper = super::system::MornyeRowKeeper::default();
+    let row = serde_json::json!({"detail": "Mornye 1.0.5"});
+    let asked = "http://spotiflac:8000";
+
+    keeper.keep(3, asked.into(), row.clone());
+    assert_eq!(keeper.kept_for(asked, 3), Some(row));
+    assert_eq!(keeper.kept_for(asked, 4), None, "Mornye's settings changed since");
+    assert_eq!(
+        keeper.kept_for("http://mornye.lan:8000", 3),
+        None,
+        "another address"
+    );
+}
+
+#[tokio::test]
+async fn saving_another_setting_keeps_mornyes_row() {
+    let (mornye, _) = mornye_and_helper("active", false).await;
+    let state = mornye_status_state(&mornye.uri());
+    state.mornye_row.set_wait(std::time::Duration::from_secs(30));
+    let app = app(state.clone());
+    assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
+
+    // Another section saved, and Mornye now slow: only the kept row could answer.
+    answer_after_a_minute(&mornye).await;
+    let mut next = (*state.settings.current()).clone();
+    next.genre.max_genres = 2;
+    state.settings.set(next);
+    state.mornye_row.set_wait(std::time::Duration::ZERO);
+
+    assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
+}
+
 /// With Prefetch at its defaults neither document lists it, so the settings answers stay as they
 /// were; once it is on (or saved in settings.json) both list every Prefetch property.
 #[tokio::test]
@@ -871,8 +1281,9 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // replacing two: LibraryActions:ReviewSweepAutoReplace and :ReviewSweepAutoReplacePerDay,
     // then LibraryActions:KeepRatedCopies, Subsonic:DownloadAlbumOnSongStar,
     // Metadata:AnimatedArt and Subsonic:CoverBadge, then LibraryActions:YoutubeCheckPerHour and
-    // the sweep's preview replacing, LibraryActions:ReviewSweepAutoReplacePreview, listed last.
-    assert_eq!(rows.len(), 207);
+    // the sweep's preview replacing, LibraryActions:ReviewSweepAutoReplacePreview, then
+    // Notifications:NotifyMornyeCheck, listed last.
+    assert_eq!(rows.len(), 208);
     assert!(!rows.iter().any(|r| {
         r["Key"]
             .as_str()
@@ -889,6 +1300,8 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     assert_eq!(rows[205]["Key"], "LibraryActions:YoutubeCheckPerHour");
     assert_eq!(row("LibraryActions:YoutubeCheckPerHour")["IsSecret"], false);
     assert_eq!(rows[206]["Key"], "LibraryActions:ReviewSweepAutoReplacePreview");
+    assert_eq!(rows[207]["Key"], "Notifications:NotifyMornyeCheck");
+    assert_eq!(row("Notifications:NotifyMornyeCheck")["IsSecret"], false);
     assert_eq!(
         row("LibraryActions:ReviewSweepAutoReplacePreview")["IsSecret"],
         false

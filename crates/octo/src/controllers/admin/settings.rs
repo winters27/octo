@@ -611,6 +611,7 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             ),
             ("NotifyDownloadFailed", Node::Bool(notif.notify_download_failed)),
             ("NotifyAlbumCompleted", Node::Bool(notif.notify_album_completed)),
+            ("NotifyMornyeCheck", Node::Bool(notif.notify_mornye_check)),
         ]),
     );
     // Present even when unset: a section missing from this document is a section the next
@@ -731,6 +732,9 @@ fn spotiflac_section(spotiflac: &SpotiflacSettings) -> Node {
         ("Placement", name(spotiflac.placement)),
         ("TimeoutSeconds", n_num(spotiflac.timeout_seconds)),
         ("AtOnce", n_num(spotiflac.at_once)),
+        ("WebUrl", n_str(&spotiflac.web_url)),
+        ("WebPort", n_num(spotiflac.web_port)),
+        ("AssistUrl", n_str(&spotiflac.assist_url)),
     ])
 }
 

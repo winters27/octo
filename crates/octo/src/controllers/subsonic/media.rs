@@ -815,6 +815,14 @@ async fn play_external(
 /// Wait for a queued acquisition and serve the file, with what the play heard. With no
 /// acquisition (AcoustID is off, so nothing could prove a lossless copy) the wait is skipped.
 ///
+/// The words other Subsonic apps show whoever played when no lossless copy came: the first
+/// sentence of why, with no server paths.
+fn lossless_failure_words(message: &str) -> String {
+    let said = octo_core::common::acquisition_tracker::user_safe(Some(message))
+        .unwrap_or_else(|| "no source had it".to_string());
+    format!("Could not fetch a lossless copy: {said}")
+}
+
 /// Wherever the play would serve nothing lossless (no acquisition, a copy the gate could not
 /// prove, a bounded wait that ran out) the preview stands in as a whole FLAC file, so the
 /// listing's promise holds and no lossy bytes go out under it.
@@ -898,7 +906,7 @@ async fn serve_acquired(
             return Ok((
                 state
                     .subsonic_response_builder
-                    .create_error(format, 70, &format!("Could not fetch a lossless copy: {message}"))
+                    .create_error(format, 70, &lossless_failure_words(&message))
                     .into_response(),
                 None,
             ));
@@ -2156,6 +2164,23 @@ fn direct_play_response(state: &AppState) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn other_apps_read_the_first_sentence_of_why_and_no_server_path() {
+        let message = "Mornye could not pass its check for Example, so it could not get this song. \
+                       It allows its next try at 14:05 UTC; files go to /music/.octo-incoming/spotiflac/x.";
+        assert_eq!(
+            lossless_failure_words(message),
+            "Could not fetch a lossless copy: Mornye could not pass its check for Example, so it could not get this song"
+        );
+        let with_path =
+            lossless_failure_words("Nothing arrived in /music/.octo-incoming/spotiflac/0123/x.flac");
+        assert!(!with_path.contains("/music/"), "{with_path}");
+        assert_eq!(
+            lossless_failure_words(""),
+            "Could not fetch a lossless copy: no source had it"
+        );
+    }
 
     #[test]
     fn a_file_is_typed_by_its_extension() {

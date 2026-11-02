@@ -2873,3 +2873,126 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .test-check.warn .icon { color: var(--warn); }
 .test-check.fail { color: var(--ink); }
 .test-check.fail .icon { color: var(--bad); }
+.test-check.info .icon { color: var(--text-secondary); }
+
+/* Mornye now: a status dot, the headline and the refresh button on one 21 px line. The dot and
+ * the button center on the headline's cap height midline, which for Inter at this size is the
+ * line's own middle (10.5 px down), so they keep to the first line when the headline wraps. */
+.mornye-head {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  column-gap: var(--s-l);
+  align-items: start;
+}
+.mornye-head .status-dot { margin-top: 6.5px; }
+.mornye-title { margin: 0; font-size: var(--t-body); font-weight: 600; line-height: 21px; color: var(--ink); overflow-wrap: break-word; }
+.mornye-head > .btn-icon { margin: -6.5px 0; color: var(--text-secondary); }
+.mornye-head > .btn-icon:hover { color: var(--ink); }
+.btn-icon.busy .icon { animation: spin 0.9s linear infinite; }
+.mornye-card.off .mornye-title { font-weight: 400; color: var(--text-muted); }
+.mornye-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-m); }
+.status-card-action { align-self: flex-start; font-size: var(--t-meta); }
+
+/* The Pass panel, under the card's state. Close sits on the title's cap height midline: a 28 px
+ * button on a 21 px line. */
+.pass-panel { animation: pane-in var(--t-card) var(--ease); }
+.pass-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s-l); }
+.pass-title { margin: 0; font-size: var(--t-body); font-weight: 600; line-height: 21px; color: var(--ink); }
+.pass-title:focus { outline: none; }
+.pass-title:focus-visible { outline: 2px solid var(--focus); outline-offset: 4px; border-radius: var(--r-row); }
+.pass-head > .btn { margin: -3.5px 0; color: var(--text-secondary); }
+.pass-head > .btn:hover { color: var(--ink); }
+.pass-line {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  column-gap: var(--s-m);
+  font-size: var(--t-meta);
+  line-height: 1.5;
+  color: var(--ink-1);
+}
+.pass-line .icon { width: 16px; height: 16px; margin-top: 3px; color: var(--text-secondary); }
+.pass-line.busy .icon { animation: spin 0.9s linear infinite; }
+.pass-line.ok .icon { color: var(--good); }
+.pass-line.warn .icon { color: var(--warn); }
+.pass-note { margin: 0; font-size: var(--t-meta); line-height: 1.5; color: #ff7b72; }
+.pass-actions { display: flex; flex-wrap: wrap; gap: var(--s-m); }
+.pass-live { display: flex; flex-direction: column; gap: var(--s-l); }
+
+/* The zoom: the chosen size is filled with the accent and ticked; the others are outlined. Every
+ * button keeps room for the tick, so choosing one moves nothing. */
+.pass-zoom { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-s); }
+.pass-zoom-label { margin-right: var(--s-xs); font-size: var(--t-meta); color: var(--text-muted); }
+.pass-zoom button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  height: var(--h-s);
+  min-width: 54px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  font: inherit;
+  font-size: var(--t-meta);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  transition: background-color var(--t-hover) var(--ease), color var(--t-hover) var(--ease), box-shadow var(--t-hover) var(--ease);
+}
+.pass-zoom button .icon { width: 12px; height: 12px; display: none; }
+.pass-zoom button:hover { color: var(--ink); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.32); }
+.pass-zoom button[aria-pressed="true"] { background: var(--accent-fill); color: var(--accent-ink); box-shadow: none; }
+.pass-zoom button[aria-pressed="true"] .icon { display: block; }
+/* On touch the refresh and Close buttons keep their size beside the headline, which keeps them
+ * clear of the card's edge, and their hit area reaches 44 px past them instead. A zoom choice
+ * grows to 40 px, like a segmented choice. */
+@media (pointer: coarse) {
+  .mornye-head > .btn-icon, .pass-head > .btn { position: relative; min-height: 0; }
+  .mornye-head > .btn-icon::before { content: ''; position: absolute; inset: -5px; }
+  .pass-head > .btn::before { content: ''; position: absolute; inset: -8px -4px; }
+  .pass-zoom button { min-height: 40px; }
+}
+
+/* Mornye's check browser, drawn at its own shape. At 2x to 4x the picture is wider than the box
+ * and the box scrolls. A finger on the picture is the person's pointer in Mornye's browser, so
+ * the page does not scroll under it. */
+.pass-box {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1279 / 756;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-radius: var(--r-control);
+  background: var(--inset);
+  box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.pass-box[data-zoom="1"] { overflow: hidden; }
+.pass-box img {
+  display: block;
+  width: calc(var(--pass-zoom, 1) * 100%);
+  max-width: none;
+  height: auto;
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+  -webkit-touch-callout: none;
+}
+.pass-wait {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: var(--s-l);
+  text-align: center;
+  font-size: var(--t-meta);
+  color: var(--text-muted);
+}
+@media (prefers-reduced-motion: reduce) {
+  .pass-panel { animation: none; }
+  .pass-zoom button { transition: none; }
+}

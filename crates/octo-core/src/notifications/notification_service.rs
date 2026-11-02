@@ -20,6 +20,7 @@ pub fn is_enabled(s: &NotificationSettings, r#type: NotificationEventType) -> bo
         | NotificationEventType::FamilyRequestAdded
         | NotificationEventType::FamilyRequestFailed => s.notify_family_requests,
         NotificationEventType::FamilyDeviceNew => s.notify_family_devices,
+        NotificationEventType::MornyeCheck => s.notify_mornye_check,
     }
 }
 
@@ -270,6 +271,13 @@ pub fn render(evt: &NotificationEvent) -> NotificationMessage {
         | NotificationEventType::FamilyRequestAdded
         | NotificationEventType::FamilyRequestFailed
         | NotificationEventType::FamilyDeviceNew => render_family(evt),
+
+        NotificationEventType::MornyeCheck => NotificationMessage::new(
+            evt.r#type,
+            "Mornye could not pass its check",
+            evt.detail.clone().unwrap_or_default(),
+            None,
+        ),
     }
 }
 
@@ -387,6 +395,25 @@ mod tests {
         assert!(msg.body.contains("FLAC via Soulseek"), "{}", msg.body);
         assert!(msg.body.contains("33.1 MB"), "{}", msg.body);
         assert!(msg.title.starts_with("Downloading:"), "{}", msg.title);
+    }
+
+    #[test]
+    fn mornyes_check_push_carries_its_words_and_has_its_own_switch() {
+        let words = "Mornye could not pass the check for Example, so Octo asks Soulseek in the meantime.";
+        let msg = render(&NotificationEvent {
+            detail: Some(words.into()),
+            ..event(NotificationEventType::MornyeCheck)
+        });
+        assert_eq!(msg.title, "Mornye could not pass its check");
+        assert_eq!(msg.body, words);
+        let on = NotificationSettings::default();
+        assert!(on.notify_mornye_check, "on unless switched off");
+        assert!(is_enabled(&on, NotificationEventType::MornyeCheck));
+        let off = NotificationSettings {
+            notify_mornye_check: false,
+            ..Default::default()
+        };
+        assert!(!is_enabled(&off, NotificationEventType::MornyeCheck));
     }
 
     #[test]

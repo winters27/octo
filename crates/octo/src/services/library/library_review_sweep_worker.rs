@@ -2,7 +2,7 @@
 //! check it asks. With the switch on, a file AcoustID clearly hears as another song is replaced
 //! through Wrong song, and Octo's own downloads can be checked again in one pass.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -40,6 +40,7 @@ use super::navidrome_playlist_api::{NavidromePlaylistApi, SongMarks};
 use super::navidrome_song_path_resolver::get_full_path;
 use super::notice_queue::{NoticeOrigin, NoticeQueue, set_aside};
 use super::quality_upgrade_worker::compare_ordinal;
+use super::upgrade_queue::MornyeHold;
 use crate::services::common::IAcquisitionActivity;
 use crate::services::family::family_store::FamilyStore;
 use crate::services::family::{LibraryScope, NavidromeAdmin, ScopeResolver, ScopeView};
@@ -185,6 +186,18 @@ pub trait SweepReplacer: Send + Sync {
         let _ = song_id;
         false
     }
+
+    /// Whether a held song's Mornye pause may end early: its checks pass, or the Mornye that
+    /// paused is switched off or moved.
+    async fn mornye_wait_over(&self, hold: &MornyeHold) -> bool {
+        let _ = hold;
+        false
+    }
+
+    /// Whether slskd is in use, by the rule the downloads follow
+    /// ([`crate::services::library::UpgradeSources::slskd_in_use_with`]): the running link, with
+    /// `soulseek` deciding only where there is none.
+    fn slskd_in_use(&self, soulseek: &octo_core::settings::SoulseekSettings) -> bool;
 }
 
 /// The people besides the admin who can star or rate songs, whose marks the admin's own sign-in
@@ -326,6 +339,14 @@ impl SweepReplacer for ExecutorSweepReplacer {
         tokio::spawn(async move { executor.apply(request).await })
             .await
             .map_err(|e| anyhow::anyhow!("the replacement stopped: {e}"))?
+    }
+
+    async fn mornye_wait_over(&self, hold: &MornyeHold) -> bool {
+        self.executor.mornye_wait_over(hold).await
+    }
+
+    fn slskd_in_use(&self, soulseek: &octo_core::settings::SoulseekSettings) -> bool {
+        self.executor.slskd_in_use(soulseek)
     }
 
     async fn wrong_version_asked(&self, song_id: &str) -> bool {
@@ -736,6 +757,12 @@ enum Replacing {
     Declined,
     /// Soulseek is out and the replacement may come from nowhere else: the song stays unchecked.
     Waits,
+    /// Every source is out because of Mornye's check: the song stays unchecked and the sweep
+    /// waits, as for an outage.
+    WaitsForMornye,
+    /// The sources asked had no copy and Mornye's check kept the song: it stays unchecked, is
+    /// passed over until that pause ends or its checks pass, and the sweep goes on.
+    SkipsForMornye,
     /// The person said the song is the wrong version and Octo could not tell it apart by sound:
     /// the copy is theirs to pick, so the file stays a question that says so.
     PickInFindSongs,
@@ -827,6 +854,9 @@ pub struct LibraryReviewSweepWorker {
     /// library-relative path, stamp, verdict.
     retry_verdict: Mutex<Option<(String, String, VerificationResult)>>,
     unfingerprinted: AtomicI32,
+    /// Songs whose replacement Mornye's check kept, by path, with that pause: passed over until
+    /// it ends or its checks pass, so the sweep goes on with the other files.
+    mornye_holds: Mutex<HashMap<String, MornyeHold>>,
     hold: Mutex<(String, Option<String>)>,
     /// With Family on, the sweep keeps to the shared library: a member's own songs are never
     /// asked about.
@@ -875,6 +905,7 @@ impl LibraryReviewSweepWorker {
             lookup_failures: AtomicI32::new(0),
             retry_verdict: Mutex::new(None),
             unfingerprinted: AtomicI32::new(0),
+            mornye_holds: Mutex::new(HashMap::new()),
             hold: Mutex::new(("Off".to_string(), None)),
             scope: None,
             replacer: None,
@@ -1057,8 +1088,10 @@ impl LibraryReviewSweepWorker {
             return Duration::ZERO;
         };
         let octo_files = self.octo_files.lock().clone();
+        let mut skip = (*octo_files).clone();
+        skip.extend(self.mornye_held().await);
         let cursor = self.store.read(|s| s.cursor.clone());
-        let pick = self.next_target(&files, &root, cursor, &octo_files);
+        let pick = self.next_target(&files, &root, cursor, &skip);
 
         let Some(target) = pick.target.clone() else {
             let present: HashSet<&str> = files.iter().map(String::as_str).collect();
@@ -1119,7 +1152,8 @@ impl LibraryReviewSweepWorker {
                 .map(|recheck| recheck.cursor.clone())
                 .unwrap_or_default()
         });
-        let pick = self.next_target(&files, step.root, cursor, &HashSet::new());
+        let held = self.mornye_held().await;
+        let pick = self.next_target(&files, step.root, cursor, &held);
         let Some(target) = pick.target.clone() else {
             let now = step.now;
             self.record(step.generation, |s| {
@@ -1137,6 +1171,35 @@ impl LibraryReviewSweepWorker {
             return self.hold("Done", Some(Self::RECHECKED), Self::IDLE_CHECK);
         };
         self.check(step, &target, pick).await
+    }
+
+    /// The songs Mornye's check still keeps: each one whose pause has not ended, whose checks do
+    /// not pass yet, and whose Mornye is still on at the same address. The others are let go.
+    async fn mornye_held(&self) -> HashSet<String> {
+        let holds: Vec<(String, MornyeHold)> = self
+            .mornye_holds
+            .lock()
+            .iter()
+            .map(|(path, hold)| (path.clone(), hold.clone()))
+            .collect();
+        if holds.is_empty() {
+            return HashSet::new();
+        }
+        let now = self.clock.now();
+        let mut held = HashSet::new();
+        for (path, hold) in holds {
+            let over = now >= hold.until_utc
+                || match &self.replacer {
+                    Some(replacer) => replacer.mornye_wait_over(&hold).await,
+                    None => true,
+                };
+            if !over {
+                held.insert(path);
+            } else {
+                self.mornye_holds.lock().remove(&path);
+            }
+        }
+        held
     }
 
     /// The next file after `cursor` to check, and the last one passed over on the way. A file
@@ -1395,6 +1458,7 @@ impl LibraryReviewSweepWorker {
 
         self.lookup_failures.store(0, Ordering::SeqCst);
         self.unfingerprinted.store(0, Ordering::SeqCst);
+        let settings_now = self.settings.current();
         let mut pick_in_find_songs = false;
         let replaced = if outcome == Outcome::Ask
             // A file someone was asked about while this check looked at it stays theirs to answer.
@@ -1402,7 +1466,11 @@ impl LibraryReviewSweepWorker {
             && Self::decide(
                 &question,
                 &file,
-                &self.settings.current(),
+                &settings_now,
+                self.replacer.as_ref().map_or_else(
+                    || settings_now.soulseek.is_on(),
+                    |replacer| replacer.slskd_in_use(&settings_now.soulseek),
+                ),
                 step.keeper,
                 self.store.read(|s| s.today(self.clock.now())),
                 witness,
@@ -1426,6 +1494,24 @@ impl LibraryReviewSweepWorker {
                         Some("Soulseek is out; trying that song again."),
                         interval,
                     );
+                }
+                Replacing::WaitsForMornye => {
+                    if pick.passed != pick.cursor {
+                        self.record(generation, |s| set_cursor(s, lane, &pick.passed));
+                    }
+                    return self.hold(
+                        "Waiting",
+                        Some(
+                            "Mornye could not pass its check and no other source can be asked; trying that song again once one can.",
+                        ),
+                        interval,
+                    );
+                }
+                // Left unchecked and passed over while its pause holds: the sweep goes on past it
+                // and comes back to it in a later pass.
+                Replacing::SkipsForMornye => {
+                    self.record(generation, |s| set_cursor(s, lane, target));
+                    return self.hold("Running", running, interval);
                 }
             }
         } else {
@@ -1600,6 +1686,35 @@ impl LibraryReviewSweepWorker {
                 );
                 Replacing::Waits
             }
+            Ok(outcome) if outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_OUT) => {
+                info!(
+                    "Library review sweep: '{} - {}' waits, because Mornye is not answering or cannot download and the replacement may come from nowhere else",
+                    song.artist, song.title
+                );
+                Replacing::Waits
+            }
+            Ok(outcome) if LibraryActionCodes::waits_on_mornye(outcome.code.as_deref()) => {
+                if outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_KEPT) {
+                    // The sources that were asked had none: the song is passed over until
+                    // Mornye may try again, and the sweep goes on.
+                    info!(
+                        "Library review sweep: '{} - {}' is passed over while Mornye's check keeps it; the sweep goes on",
+                        song.artist, song.title
+                    );
+                    let hold = outcome
+                        .mornye_wait
+                        .as_deref()
+                        .map(MornyeHold::of)
+                        .unwrap_or_else(|| MornyeHold::until(now));
+                    self.mornye_holds.lock().insert(path.to_string(), hold);
+                    return Replacing::SkipsForMornye;
+                }
+                info!(
+                    "Library review sweep: '{} - {}' waits, because Mornye could not pass its check and the replacement may come from nowhere else",
+                    song.artist, song.title
+                );
+                Replacing::WaitsForMornye
+            }
             Ok(outcome) => {
                 if outcome.state == LibraryActionState::Failed {
                     self.count_today(now, false);
@@ -1635,12 +1750,14 @@ impl LibraryReviewSweepWorker {
     /// and either `ReviewSweepAutoReplace` on with AcoustID clearly hearing another song, or
     /// `ReviewSweepAutoReplacePreview` on with the song's YouTube preview clearly not matching (at least [`Self::PREVIEW_REPLACE_FROM`] of its bits differ).
     /// Either needs `KeepReplacedOriginals` on. The preview's replacing also needs a download
-    /// source other than YouTube alone, and Soulseek or SpotiFLAC switched on to fetch from. It
-    /// also needs the preview to be a YouTube Music row from the file's own album.
+    /// source other than YouTube alone, and slskd in use (`slskd_in_use`, the downloads' rule) or
+    /// Mornye switched on to fetch from. It also needs the preview to be a YouTube Music row from
+    /// the file's own album.
     pub fn decide(
         question: &VerificationResult,
         file: &SweptFile,
         settings: &AppSettings,
+        slskd_in_use: bool,
         keeper: &str,
         today: Today,
         witness: Option<PreviewWitness>,
@@ -1670,7 +1787,7 @@ impl LibraryReviewSweepWorker {
             })
             && actions.keep_replaced_originals
             && settings.subsonic.download_source != DownloadSource::YouTube
-            && (settings.soulseek.is_on() || settings.spotiflac.is_on());
+            && (slskd_in_use || settings.spotiflac.is_on());
         if may && (by_acoustid || by_preview) {
             AutoReplace::Replace
         } else {

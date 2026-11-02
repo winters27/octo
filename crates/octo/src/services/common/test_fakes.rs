@@ -412,6 +412,33 @@ impl ISoulseekLink for OfflineLink {
     }
 }
 
+/// slskd is logged in.
+pub(crate) struct LoggedInLink;
+
+#[async_trait]
+impl ISoulseekLink for LoggedInLink {
+    async fn read(&self, _fresh: bool) -> Option<SoulseekServerReading> {
+        Some(SoulseekServerReading::new(
+            SoulseekLinkState::LoggedIn,
+            None,
+            None,
+            None,
+        ))
+    }
+
+    fn hold_limit(&self) -> TimeDelta {
+        TimeDelta::hours(6)
+    }
+
+    fn utc_now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    async fn wait_for_login(&self, _deadline_utc: DateTime<Utc>) -> bool {
+        true
+    }
+}
+
 /// Soulseek is switched off: no step uses it.
 pub(crate) struct OffLink;
 

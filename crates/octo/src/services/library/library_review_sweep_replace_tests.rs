@@ -1408,6 +1408,11 @@ impl SweepReplacer for MarkedReplacer {
     async fn wrong_version_asked(&self, song_id: &str) -> bool {
         self.marked && song_id == "nd-1"
     }
+
+    // A running slskd.
+    fn slskd_in_use(&self, _: &SoulseekSettings) -> bool {
+        true
+    }
 }
 
 /// The Review sweep never replaces a song its person said is the wrong version, which Octo cannot

@@ -54,6 +54,10 @@ pub struct NotificationSettings {
 
     /// Family: a member's device, or a new app of the owner, was seen for the first time.
     pub notify_family_devices: bool,
+
+    /// Mornye could not pass its check for a gateway: once per stretch of it failing, with the
+    /// way to pass it on the dashboard. On by default: songs only Mornye can bring fail meanwhile.
+    pub notify_mornye_check: bool,
 }
 
 impl Default for NotificationSettings {
@@ -69,6 +73,7 @@ impl Default for NotificationSettings {
             notify_album_completed: true,
             notify_family_requests: true,
             notify_family_devices: true,
+            notify_mornye_check: true,
         }
     }
 }

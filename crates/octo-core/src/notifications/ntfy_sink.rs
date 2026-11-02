@@ -83,6 +83,7 @@ pub fn tag_for(r#type: NotificationEventType) -> &'static str {
         NotificationEventType::FamilyRequestAdded => "white_check_mark",
         NotificationEventType::FamilyRequestFailed => "x",
         NotificationEventType::FamilyDeviceNew => "iphone",
+        NotificationEventType::MornyeCheck => "lock",
     }
 }
 

@@ -168,6 +168,17 @@ pub enum Fetched {
     AlreadyThere,
     /// It could not be got, with the reason.
     Failed(String),
+    /// Mornye's check kept it from Mornye, with the words: a FLAC request keeps them rather than
+    /// reading as "no real FLAC".
+    MornyeCheck(String),
+}
+
+/// How a request's failed download reads: Mornye's check, or the reason as given.
+fn fetched_failure(error: &anyhow::Error) -> Fetched {
+    match crate::services::spotiflac::mornye_waited(error) {
+        Some(wait) => Fetched::MornyeCheck(wait.shown.clone()),
+        None => Fetched::Failed(error.to_string()),
+    }
 }
 
 /// What requests start.
@@ -1142,10 +1153,12 @@ impl RequestService {
                 let reason = if request.quality == RequestQuality::Flac {
                     NO_REAL_FLAC.to_string()
                 } else {
-                    reason
+                    // The member reads this, on a phone: the first sentence, no server paths.
+                    octo_core::common::acquisition_tracker::user_safe(Some(&reason)).unwrap_or(reason)
                 };
                 self.failed(request, &reason);
             }
+            Fetched::MornyeCheck(words) => self.failed(request, &words),
         }
     }
 
@@ -1506,7 +1519,7 @@ impl RequestFetcher for LiveRequestFetcher {
                         crate::services::common::heart_acquisition_coordinator::waiting_line(waiting)
                             .to_string(),
                     ),
-                    Err(e) => Fetched::Failed(e.to_string()),
+                    Err(e) => fetched_failure(&e),
                 };
             }
             RequestQuality::Flac => DownloadSource::Soulseek,
@@ -1535,7 +1548,7 @@ impl RequestFetcher for LiveRequestFetcher {
             Err(e) => {
                 let reason = e.to_string();
                 self.tracker.fail(provider, external_id, Some(&reason));
-                Fetched::Failed(reason)
+                fetched_failure(&e)
             }
         }
     }
