@@ -88,7 +88,10 @@ impl CheckView {
     /// Whether Mornye's check keeps every extension a song could use, with the Services setting
     /// `setting`, at `now`.
     pub fn pause(&self, setting: &[String], now: DateTime<Utc>) -> Option<CheckPause> {
-        paused_for(&self.rows, &usable(setting, &self.services), now)
+        paused_for(&self.rows, &usable(setting, &self.services), now).map(|pause| CheckPause {
+            url: self.connection.url.clone(),
+            ..pause
+        })
     }
 
     /// The pause that keeps extension `provider` at `now`, from its own covering rows.
@@ -104,17 +107,18 @@ impl CheckView {
             until_utc: until,
             labels,
             holding: Vec::new(),
+            url: self.connection.url.clone(),
         })
     }
 }
 
-/// A wait read from Mornye's own words for extension `provider`, until `until`, beside `view`
-/// (None when Octo could not read Mornye's check). It watches the rows holding the extension that
-/// are not working in that read, so only a change after the wait (one of them passing) lets it
-/// go early; none when every one already works (that read cannot tell a pass, so the wait lasts
-/// until its own end). It shares every row holding the extension with other waits. With no row
-/// holding it, the extension's id, which a later read's rows can still name.
-pub fn words_pause(view: Option<&CheckView>, provider: &str, until: DateTime<Utc>) -> CheckPause {
+/// A wait read from the words of the Mornye at `url` for extension `provider`, until `until`,
+/// beside `view` (None when Octo could not read Mornye's check). It watches the rows holding the
+/// extension that are not working in that read, so only a change after the wait (one of them
+/// passing) lets it go early; none when every one already works (that read cannot tell a pass,
+/// so the wait lasts until its own end). It shares every row holding the extension with other
+/// waits. With no row holding it, the extension's id, which a later read's rows can still name.
+pub fn words_pause(view: Option<&CheckView>, url: &str, provider: &str, until: DateTime<Utc>) -> CheckPause {
     let id = octo_core::spotiflac::check::extension_id(provider);
     let holding: Vec<&CheckRow> = view
         .and_then(|view| view.rows.known())
@@ -125,6 +129,7 @@ pub fn words_pause(view: Option<&CheckView>, provider: &str, until: DateTime<Utc
             until_utc: until,
             labels: vec![id],
             holding: Vec::new(),
+            url: url.to_string(),
         };
     }
     let sorted = |mut labels: Vec<String>| {
@@ -142,6 +147,7 @@ pub fn words_pause(view: Option<&CheckView>, provider: &str, until: DateTime<Utc
                 .collect(),
         ),
         holding: sorted(holding.iter().map(|row| row.label.clone()).collect()),
+        url: url.to_string(),
     }
 }
 

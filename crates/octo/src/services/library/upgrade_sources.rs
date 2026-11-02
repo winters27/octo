@@ -24,8 +24,11 @@ pub struct UpgradeSources {
 /// Why every source is out, so a request waits instead of failing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourcesOut {
-    /// slskd is not logged in, and Mornye is off.
+    /// slskd is not logged in, and Mornye is off or cannot stand in for it.
     Soulseek,
+    /// Mornye is the Soulseek step's only source (slskd is not set up), and it is not answering
+    /// or cannot download.
+    Mornye,
     /// Mornye's check keeps it from every extension, and slskd cannot be used either.
     MornyeCheck(octo_core::spotiflac::check::CheckPause),
 }
@@ -57,12 +60,14 @@ impl UpgradeSources {
         self.mornye_pause().await.is_some()
     }
 
-    /// Whether the checks a wait named (`labels`) pass now: a Pass, or Mornye's own next try that
-    /// passed. A Mornye that cannot be read says no.
-    pub async fn mornye_passed(&self, labels: &[String]) -> bool {
+    /// Whether a wait on the check of the Mornye at `made_at`, on the checks `labels`, may end
+    /// before its pause does: that Mornye is off or has another address now, or a read shows the
+    /// checks passing (a Pass, or Mornye's own next try that passed). With no Mornye at all,
+    /// nothing keeps the song.
+    pub async fn mornye_wait_over(&self, made_at: &str, labels: &[String]) -> bool {
         match self.spotiflac.as_ref() {
-            Some(client) => client.checks_pass(labels).await,
-            None => false,
+            Some(client) => client.wait_over(made_at, labels).await,
+            None => true,
         }
     }
 
@@ -182,6 +187,7 @@ impl UpgradeSources {
         }
         Some(match self.mornye_pause().await {
             Some(pause) => SourcesOut::MornyeCheck(pause),
+            None if !Self::soulseek_set_up(&self.settings.current().soulseek) => SourcesOut::Mornye,
             None => SourcesOut::Soulseek,
         })
     }
@@ -460,6 +466,7 @@ mod tests {
                 Some(SourcesOut::MornyeCheck(pause)) => {
                     assert_eq!(pause.labels, vec!["Example".to_string()]);
                     assert!(pause.until_utc > chrono::Utc::now());
+                    assert_eq!(pause.url, server.uri(), "the pause names its Mornye");
                 }
                 other => panic!("waits for Mornye's check, not {other:?}"),
             }
@@ -475,6 +482,65 @@ mod tests {
         );
         assert!(sources.available().await.is_empty());
         assert_eq!(sources.waiting_for().await, Some(SourcesOut::Soulseek));
+    }
+
+    #[tokio::test]
+    async fn with_no_slskd_a_mornye_that_does_not_answer_is_what_the_request_waits_for() {
+        let sources = with_mornye("http://127.0.0.1:1", None, SoulseekLinkState::NotLoggedIn);
+        assert_eq!(sources.plan(), [DownloadSource::Soulseek]);
+        assert!(sources.available().await.is_empty());
+        assert_eq!(sources.waiting_for().await, Some(SourcesOut::Mornye));
+    }
+
+    /// Mornye switched off, or switched on with no address: Better quality answers exactly as it
+    /// does with no Mornye at all, and Mornye is never asked.
+    #[tokio::test]
+    async fn mornye_off_or_without_an_address_changes_nothing_and_is_never_asked() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, ResponseTemplate};
+        let server = wiremock::MockServer::builder().start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let off = [
+            octo_core::settings::SpotiflacSettings {
+                enabled: false,
+                url: server.uri(),
+                ..Default::default()
+            },
+            octo_core::settings::SpotiflacSettings {
+                enabled: true,
+                url: "  ".into(),
+                ..Default::default()
+            },
+        ];
+        for spotiflac in off {
+            for soulseek in [None, Some(slskd())] {
+                for lidarr in [None, Some(lidarr())] {
+                    for link in [SoulseekLinkState::LoggedIn, SoulseekLinkState::NotLoggedIn] {
+                        let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+                            soulseek: soulseek.clone().unwrap_or_default(),
+                            lidarr: lidarr.clone().unwrap_or_default(),
+                            spotiflac: spotiflac.clone(),
+                            ..Default::default()
+                        }));
+                        let without =
+                            UpgradeSources::new(Arc::clone(&settings), Some(Arc::new(FixedLink(link))));
+                        let with =
+                            UpgradeSources::new(Arc::clone(&settings), Some(Arc::new(FixedLink(link))))
+                                .with_spotiflac(Arc::new(SpotiflacClient::new(settings)));
+                        assert_eq!(with.plan(), without.plan());
+                        assert_eq!(with.name(), without.name());
+                        assert_eq!(with.step_word(DownloadSource::Soulseek), "Soulseek");
+                        assert_eq!(with.available().await, without.available().await);
+                        assert_eq!(with.waiting_for().await, without.waiting_for().await);
+                    }
+                }
+            }
+        }
+        server.verify().await;
     }
 
     #[tokio::test]

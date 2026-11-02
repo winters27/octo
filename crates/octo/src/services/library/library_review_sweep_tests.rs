@@ -1070,6 +1070,7 @@ impl SweepReplacer for FakeReplacer {
                         until_utc: chrono::Utc::now() + chrono::Duration::days(30),
                         labels: vec!["Example".into()],
                         holding: Vec::new(),
+                        url: String::new(),
                     })
                 }),
                 ..LibraryActionOutcome::new(*self.state.lock(), Some("done".into()))
@@ -1078,7 +1079,7 @@ impl SweepReplacer for FakeReplacer {
         })
     }
 
-    async fn mornye_passed(&self, _: &[String]) -> bool {
+    async fn mornye_wait_over(&self, _: &MornyeHold) -> bool {
         !*self.mornye_kept.lock()
     }
 }

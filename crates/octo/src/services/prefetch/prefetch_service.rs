@@ -143,8 +143,9 @@ struct State {
     running: HashMap<String, (Job, CancellationToken)>,
     /// Songs not tried again until then: they failed, or turned out to be the listener's already.
     resting: HashMap<String, DateTime<Utc>>,
-    /// The Mornye checks a resting song waits on, when its check kept it.
-    resting_for_mornye: HashMap<String, Vec<String>>,
+    /// For a resting song Mornye's check kept: the address of that Mornye and the checks the
+    /// song waits on.
+    resting_for_mornye: HashMap<String, (String, Vec<String>)>,
     errors: VecDeque<String>,
     last_played: Option<DateTime<Utc>>,
     last_sweep: Option<DateTime<Utc>>,
@@ -511,11 +512,15 @@ impl PrefetchService {
     async fn wanted(&self, provider: &str, external_id: &str) -> bool {
         let key = format!("{provider}:{external_id}");
         let now = self.now();
-        let checks = self.state.lock().resting_for_mornye.get(&key).cloned();
-        // A song Mornye's check kept rests until that pause ends, or until its checks pass.
-        let passed = match (checks, self.parts.spotiflac.as_ref()) {
-            (Some(labels), Some(client)) => client.checks_pass(&labels).await,
-            _ => false,
+        let kept = self.state.lock().resting_for_mornye.get(&key).cloned();
+        // A song Mornye's check kept rests until that pause ends, until its checks pass, or until
+        // the Mornye that kept it is switched off or moved.
+        let passed = match kept {
+            Some((url, labels)) => match self.parts.spotiflac.as_ref() {
+                Some(client) => client.wait_over(&url, &labels).await,
+                None => true,
+            },
+            None => false,
         };
         {
             let mut state = self.state.lock();
@@ -622,7 +627,7 @@ impl PrefetchService {
             return Some("The disk is nearly full".to_string());
         }
         if self.soulseek_down().await {
-            return Some("Waiting for Soulseek to connect".to_string());
+            return Some(self.step_out_words().to_string());
         }
         if self.mornye_kept().await {
             return Some("Waiting for Mornye's check".to_string());
@@ -660,16 +665,28 @@ impl PrefetchService {
 
     /// Soulseek is the only lossless source and cannot be used: it is off, slskd cannot be
     /// reached, or slskd is not logged in, and Mornye cannot stand in for it (off, not
-    /// answering, or unable to download).
+    /// answering, or unable to download). slskd is read first, so Mornye is never asked while
+    /// slskd can be used.
     async fn soulseek_down(&self) -> bool {
-        let mornye_stands_in = match &self.parts.spotiflac {
-            Some(client) => client.stands_in().await,
-            None => self.parts.settings.current().spotiflac.is_on(),
-        };
-        if mornye_stands_in {
+        if !self.soulseek_unusable().await {
             return false;
         }
-        self.soulseek_unusable().await
+        match &self.parts.spotiflac {
+            Some(client) => !client.stands_in().await,
+            None => !self.parts.settings.current().spotiflac.is_on(),
+        }
+    }
+
+    /// What prefetch waits for while the Soulseek step is out: Mornye, when it is that step's only
+    /// source (slskd is not set up), else Soulseek.
+    fn step_out_words(&self) -> &'static str {
+        let mornye_only = self.parts.spotiflac.as_ref().is_some_and(|client| client.is_on())
+            && self.parts.soulseek.as_ref().is_some_and(|link| link.is_off());
+        if mornye_only {
+            "Waiting for Mornye to answer"
+        } else {
+            "Waiting for Soulseek to connect"
+        }
     }
 
     /// Soulseek cannot be used: it is off, slskd cannot be reached, or slskd is not logged in.
@@ -864,16 +881,17 @@ impl PrefetchService {
                     None if unreachable(&e) || self.soulseek_down().await => RETRY_UNREACHABLE_AFTER,
                     None => RETRY_AFTER,
                 };
-                let checks = mornye_waited(&e).map(|wait| wait.pause.labels.clone());
+                let kept = mornye_waited(&e).map(|wait| (wait.pause.url.clone(), wait.pause.labels.clone()));
                 let named = self.view(job);
                 let mut state = self.state.lock();
                 state.resting.insert(key.clone(), now + rest);
-                // A Pass of those checks ends the rest before its time.
-                match checks {
-                    Some(labels) if !labels.is_empty() => {
-                        state.resting_for_mornye.insert(key, labels);
+                // A Pass of those checks, or that Mornye switched off or moved, ends the rest
+                // before its time.
+                match kept {
+                    Some(kept) => {
+                        state.resting_for_mornye.insert(key, kept);
                     }
-                    _ => {
+                    None => {
                         state.resting_for_mornye.remove(&key);
                     }
                 }

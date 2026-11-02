@@ -463,15 +463,94 @@ pub async fn get_status(State(state): State<AppState>, caller: Caller) -> Respon
     if !caller_of(&caller).is_some_and(AdminCaller::is_admin) {
         return json_ok(&anonymous_status(&state).await);
     }
-    let (mut services, mornye) = tokio::join!(probe_all(&state), probe_mornye(&state));
-    // Only for an admin: a signed-out caller never learns that a Mornye exists.
-    services.insert("mornye".to_string(), mornye);
+    let (mut services, mornye) = tokio::join!(probe_all(&state), mornye_row(&state));
+    // Only for an admin, so a signed-out caller never learns that a Mornye exists, and only while
+    // Mornye is switched on: a server that never set it up lists no row for it.
+    if let Some(mornye) = mornye {
+        services.insert("mornye".to_string(), mornye);
+    }
     json_ok(&json!({
         "octo": ServiceProbe::new(true, "Octo is responding"),
         "services": services,
         "downloads": download_lines(&state),
         "time": round_trip_offset(Utc::now()),
     }))
+}
+
+/// Mornye's row of the admin status, kept between answers so a slow Mornye never holds the
+/// status up: one probe at a time, each keeping its row for the address it asked.
+#[derive(Default)]
+pub struct MornyeRowKeeper {
+    kept: parking_lot::Mutex<Option<(String, serde_json::Value)>>,
+    asking: std::sync::atomic::AtomicBool,
+    answered: tokio::sync::Notify,
+}
+
+impl MornyeRowKeeper {
+    /// How long a status answer waits for a probe of Mornye before it uses the kept row.
+    pub const WAIT: Duration = Duration::from_secs(1);
+
+    /// The row the last probe of the Mornye at `url` kept.
+    pub(super) fn kept_for(&self, url: &str) -> Option<serde_json::Value> {
+        self.kept
+            .lock()
+            .as_ref()
+            .filter(|(asked, _)| asked == url)
+            .map(|(_, row)| row.clone())
+    }
+}
+
+/// Ends a probe: lets the next one start and wakes the answers waiting for it, also when the
+/// probe stopped short.
+struct ProbeDone(AppState);
+
+impl Drop for ProbeDone {
+    fn drop(&mut self) {
+        let keeper = &self.0.mornye_row;
+        keeper.asking.store(false, std::sync::atomic::Ordering::Release);
+        keeper.answered.notify_waiters();
+    }
+}
+
+/// Mornye's row for an admin: None while Mornye is switched off. Switched on with no address, a
+/// warning that says so. Otherwise the row of a probe that answers within
+/// [`MornyeRowKeeper::WAIT`], else the row the last probe of this address kept, else a warning
+/// that Mornye has not answered yet; a probe still asking keeps its row for the next answer.
+async fn mornye_row(state: &AppState) -> Option<serde_json::Value> {
+    let settings = state.spotiflac.settings();
+    if !settings.enabled {
+        return None;
+    }
+    if !settings.is_on() {
+        return Some(json!(
+            ServiceProbe::new(
+                true,
+                "Switched on, but it has no address. Set it on the Mornye page."
+            )
+            .warning(true)
+        ));
+    }
+    let url = settings.effective_url();
+    let keeper = &state.mornye_row;
+    let answered = keeper.answered.notified();
+    tokio::pin!(answered);
+    answered.as_mut().enable();
+    if !keeper.asking.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        let state = state.clone();
+        let asked = url.clone();
+        tokio::spawn(async move {
+            let done = ProbeDone(state.clone());
+            let row = probe_mornye(&state).await;
+            *state.mornye_row.kept.lock() = Some((asked, row));
+            drop(done);
+        });
+    }
+    let _ = tokio::time::timeout(MornyeRowKeeper::WAIT, answered).await;
+    Some(
+        keeper
+            .kept_for(&url)
+            .unwrap_or_else(|| json!(ServiceProbe::new(true, "Mornye has not answered yet.").warning(true))),
+    )
 }
 
 /// Mornye's row: off (optional), unreachable, its check paused (with "pass" when the dashboard can

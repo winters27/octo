@@ -418,6 +418,27 @@ async fn status_tells_anyone_only_whether_each_service_is_up() {
     }
 }
 
+/// A signed-out caller never learns that a Mornye exists, and their status never asks Mornye.
+#[tokio::test]
+async fn status_never_names_mornye_to_a_signed_out_caller() {
+    let factory = SignInFactory::new().await;
+    let mornye = wiremock::MockServer::builder().start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mornye)
+        .await;
+    let mut on = (*factory.state.settings.current()).clone();
+    on.spotiflac.enabled = true;
+    on.spotiflac.url = mornye.uri();
+    factory.state.settings.set(on);
+
+    let document = get(&factory.app, "/api/admin/status").await.json();
+
+    assert!(document["services"].get("mornye").is_none(), "{document}");
+    mornye.verify().await;
+}
+
 #[tokio::test]
 async fn status_gives_a_signed_in_admin_the_details() {
     let factory = SignInFactory::new().await;

@@ -23,9 +23,9 @@ const rules = new Function(
   'esc',
   'icon',
   `${slice('function mornyeWhen', 'let mornyeNowLoad')}
-   return { mornyeWhen, mornyeCard, mornyeLinesHtml, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passLifecycle, passCalls };`,
+   return { mornyeWhen, mornyeCard, mornyeLinesHtml, MORNYE_OFF_PROBE, mornyeNotifyShown, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passLifecycle, passCalls };`,
 )(esc, icon);
-const { mornyeWhen, mornyeCard, mornyeLinesHtml, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passLifecycle, passCalls } = rules;
+const { mornyeWhen, mornyeCard, mornyeLinesHtml, MORNYE_OFF_PROBE, mornyeNotifyShown, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passLifecycle, passCalls } = rules;
 
 const heartSourceReachable = new Function(
   'lastStatus',
@@ -89,10 +89,30 @@ test('a time never wraps between its hour and its AM or PM', () => {
 });
 
 test('the card is one quiet line while Mornye is off', () => {
-  const card = mornyeCard({ on: false }, now);
-  assert.equal(card.tone, 'off');
-  assert.equal(card.lines.length, 0);
+  for (const status of [{ on: false }, { on: false, enabled: false }]) {
+    const card = mornyeCard(status, now);
+    assert.equal(card.tone, 'off');
+    assert.equal(card.lines.length, 0);
+    assert.equal(card.canPass, false);
+  }
+});
+
+test('a Mornye switched on with no address says to set one, not to switch it on', () => {
+  const card = mornyeCard({ on: false, enabled: true }, now);
+  assert.equal(card.tone, 'warn');
+  assert.equal(card.title, 'Mornye is switched on but has no address. Set it under Connection.');
   assert.equal(card.canPass, false);
+});
+
+test("a status that lists no Mornye draws its card off, in the server's words for off", () => {
+  assert.deepEqual(MORNYE_OFF_PROBE, { ok: true, configured: false, warning: false, detail: 'Off. Optional.' });
+});
+
+test("the Notifications switch for Mornye's check shows only while Mornye is switched on", () => {
+  assert.equal(mornyeNotifyShown(null), false);
+  assert.equal(mornyeNotifyShown({}), false);
+  assert.equal(mornyeNotifyShown({ Spotiflac: { Enabled: false } }), false);
+  assert.equal(mornyeNotifyShown({ Spotiflac: { Enabled: true } }), true);
 });
 
 test('an unreachable Mornye says so with its problem', () => {

@@ -228,6 +228,7 @@ impl IDownloadService for FailingDownloads {
                 until_utc: chrono::Utc::now(),
                 labels: vec!["Example".into()],
                 holding: Vec::new(),
+                url: String::new(),
             };
             return Err(
                 crate::services::spotiflac::MornyeWaiting::new(pause, false, chrono::Utc::now()).into_error(),

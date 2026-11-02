@@ -407,6 +407,37 @@ async fn a_mornye_that_cannot_download_does_not_stand_in_for_a_logged_out_slskd(
 }
 
 #[tokio::test]
+async fn mornye_off_leaves_the_wait_for_soulseek_as_it_was_and_a_logged_in_slskd_never_asks_mornye() {
+    use crate::services::common::test_fakes::{LoggedInLink, OfflineLink};
+    let server = wiremock::MockServer::builder().start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let settings = |enabled: bool| {
+        let mut all = AppSettings::default();
+        all.spotiflac.enabled = enabled;
+        all.spotiflac.url = server.uri();
+        Arc::new(SettingsStore::for_tests(all))
+    };
+
+    // Off: a logged-out slskd keeps the step exactly as with no Mornye, and no check keeps it.
+    let off = settings(false);
+    let client = SpotiflacClient::new(Arc::clone(&off));
+    assert!(soulseek_keeps_the_step(&off, &OfflineLink, Some(&client)).await);
+    assert!(soulseek_keeps_the_step(&off, &OfflineLink, None).await);
+    assert!(!mornye_keeps_the_step(&off, &OfflineLink, Some(&client)).await);
+
+    // On, with slskd logged in: nothing keeps the step, and Mornye is not asked.
+    let on = settings(true);
+    let client = SpotiflacClient::new(Arc::clone(&on));
+    assert!(!soulseek_keeps_the_step(&on, &LoggedInLink, Some(&client)).await);
+    assert!(!mornye_keeps_the_step(&on, &LoggedInLink, Some(&client)).await);
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn none_an_hour_or_a_pause_starts_nothing() {
     let rig = rig();
     rig.settings.set(settings(0));

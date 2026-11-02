@@ -1133,7 +1133,7 @@ pub(crate) fn upgrade_worker(
         describe: Arc::new(|_| async { None }.boxed()),
         width: Arc::new(|| 1),
         soulseek_offline: Arc::new(|| async { false }.boxed()),
-        mornye_passed: Arc::new(|_| async { false }.boxed()),
+        mornye_hold_over: Arc::new(|_| async { false }.boxed()),
         source_name: Arc::new(|| "Soulseek".to_string()),
     };
     Arc::new(UpgradeWorker::with_seams(queue.clone(), seams, tracker, None, None).with_picks(Some(picks)))

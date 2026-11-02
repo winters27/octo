@@ -618,6 +618,7 @@ fn kept_by_mornye() -> anyhow::Error {
         until_utc: chrono::Utc::now() + chrono::Duration::minutes(15),
         labels: Vec::new(),
         holding: vec!["Example".into()],
+        url: String::new(),
     };
     crate::services::spotiflac::MornyeWaiting::new(pause, false, chrono::Utc::now()).into_error()
 }

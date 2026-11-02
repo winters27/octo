@@ -16,8 +16,8 @@ use octo_core::spotiflac::{
 
 use super::*;
 use crate::services::spotiflac::{
-    CheckSong, Connection, MornyeWaiting, SPOTIFLAC_FOLDER, SpotiflacClient, make_shared_folder,
-    mornye_waited, octo_folder_name,
+    CheckSong, Connection, MornyeWaiting, SPOTIFLAC_FOLDER, SpotiflacClient, SpotiflacError,
+    make_shared_folder, mornye_waited, octo_folder_name,
 };
 use octo_core::spotiflac::ExtensionsAnswer;
 use octo_core::spotiflac::check::{FailureFacts, failure_words, named_provider};
@@ -164,7 +164,15 @@ impl SoulseekDownloadService {
             })
             .await;
             let found = match found {
-                Err(e) if e.downcast_ref::<OperationCanceled>().is_none() => {
+                // A search Mornye did not answer goes on at once: a read of its check would not
+                // be answered either.
+                Err(e)
+                    if e.downcast_ref::<OperationCanceled>().is_none()
+                        && !matches!(
+                            e.downcast_ref::<SpotiflacError>(),
+                            Some(SpotiflacError::Unreachable { .. })
+                        ) =>
+                {
                     // Mornye 1.1 without its utilities extension cannot search: say that, with
                     // its fix, rather than the search's own failure.
                     if client
@@ -233,13 +241,14 @@ impl SoulseekDownloadService {
             return Err(wait);
         }
         let _slot = or_canceled(ct, async { Ok(client.slot().await) }).await?;
-        if let Some(wait) = self
-            .mornye_gate(base, client, &settings, &track_key, &check_song)
-            .await
-        {
+        // The second look and the health read the failure words compare with, side by side.
+        let (gate, before) = tokio::join!(
+            self.mornye_gate(base, client, &settings, &track_key, &check_song),
+            bounded_extensions(client, &connection),
+        );
+        if let Some(wait) = gate {
             return Err(wait);
         }
-        let before = bounded_extensions(client, &connection).await;
         client.count_job();
         let at_start = client.activity();
         let job_dir = combine(&combine(&download_path, SPOTIFLAC_FOLDER), &new_guid());
@@ -732,7 +741,11 @@ impl SoulseekDownloadService {
     ) -> Explained {
         let seen = Instant::now();
         let provider = provider.and_then(named_provider);
-        let view = client.check_view(Some(seen)).await;
+        // Both reads at once, so the words cost one read's time before the next source is asked.
+        let (view, after) = tokio::join!(
+            client.check_view(Some(seen)),
+            bounded_extensions(client, connection)
+        );
         let now = Utc::now();
         if let Some(view) = &view {
             let pause = provider
@@ -742,7 +755,6 @@ impl SoulseekDownloadService {
                 return Explained::Waiting(MornyeWaiting::new(pause, true, now));
             }
         }
-        let after = bounded_extensions(client, connection).await;
         let health = provider.and_then(|name| after.as_ref().and_then(|answer| answer.row(name)));
         // Mornye's own "verification paused ... next try in" words, in the job's reason or in
         // the extension's last error (where Mornye 1.1 keeps them) when that error is new since
@@ -761,11 +773,17 @@ impl SoulseekDownloadService {
         });
         if let Some(until) = paused_words {
             let pause = match provider {
-                Some(name) => crate::services::spotiflac::check::words_pause(view.as_deref(), name, until),
+                Some(name) => crate::services::spotiflac::check::words_pause(
+                    view.as_deref(),
+                    &connection.url,
+                    name,
+                    until,
+                ),
                 None => octo_core::spotiflac::check::CheckPause {
                     until_utc: until,
                     labels: Vec::new(),
                     holding: Vec::new(),
+                    url: connection.url.clone(),
                 },
             };
             return Explained::Waiting(MornyeWaiting::new(pause, true, now));

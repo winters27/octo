@@ -74,8 +74,9 @@ struct FakeSpotiflac {
     /// Mornye's signed sessions, one answer per read, the last one repeating; none answers 404.
     sessions: Vec<Value>,
     sessions_read: Arc<AtomicUsize>,
-    /// How long Mornye takes to answer a check read.
+    /// How long Mornye takes to answer a check read, from read number `sessions_delay_from` on.
     sessions_delay: Option<Duration>,
+    sessions_delay_from: usize,
     /// Mornye's download services; None answers 404.
     services: Option<Value>,
     /// Mornye's extension health, one answer per read, the last one repeating; none answers 404.
@@ -103,10 +104,11 @@ impl Respond for FakeSpotiflac {
         let path = request.url.path().to_string();
         let method = request.method.as_str();
         if path == "/api/get_signed_sessions" {
+            let read = self.sessions_read.load(Ordering::SeqCst);
             let answer = in_turn(&self.sessions, &self.sessions_read);
             return match self.sessions_delay {
-                Some(delay) => answer.set_delay(delay),
-                None => answer,
+                Some(delay) if read >= self.sessions_delay_from => answer.set_delay(delay),
+                _ => answer,
             };
         }
         if path == "/api/get_download_services" {
@@ -279,6 +281,8 @@ struct Setup {
     isrc: Option<&'static str>,
     /// How long a read of Mornye's check stays fresh (zero reads it again at every look).
     check_fresh_for: Duration,
+    /// How long each call of a check read may take.
+    check_call_bound: Duration,
 }
 
 const ISRC: &str = "USCM51100524";
@@ -312,6 +316,7 @@ impl Setup {
                 sessions: Vec::new(),
                 sessions_read: Arc::default(),
                 sessions_delay: None,
+                sessions_delay_from: 0,
                 services: None,
                 extensions: Vec::new(),
                 extensions_read: Arc::default(),
@@ -324,6 +329,7 @@ impl Setup {
             seconds: 277,
             isrc: Some(ISRC),
             check_fresh_for: Duration::from_secs(60),
+            check_call_bound: Duration::from_millis(200),
         }
     }
 
@@ -455,12 +461,13 @@ impl Setup {
             None,
             None,
         ));
-        // Check reads bound to a fifth of a second, so a hung read is seen in a test's time.
+        // Check reads bound to a fifth of a second unless a test says, so a hung read is seen in
+        // a test's time.
         let check = crate::services::spotiflac::MornyeCheck::new(
             Arc::new(crate::services::spotiflac::MornyeCheckStore::new(None)),
             crate::services::spotiflac::CheckTimes {
                 fresh_for: self.check_fresh_for,
-                call_bound: Duration::from_millis(200),
+                call_bound: self.check_call_bound,
             },
             None,
         );
@@ -904,6 +911,25 @@ async fn a_paused_check_keeps_the_song_from_mornye_and_keeps_it_for_pass() {
 }
 
 #[tokio::test]
+async fn a_wait_on_the_check_of_the_jobs_own_extension_names_its_mornye() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.fake.sessions = vec![gateway("active"), gateway("unverified")];
+    setup.fake.services = Some(example_service());
+    setup.fake.file = None;
+    setup.fake.status = "failed";
+    setup.fake.error = Some("download_failed");
+    setup.fake.provider = Some("ext:example-ext");
+    let fetch = setup.build(events).await;
+
+    let error = fetch.acquire().await.expect_err("the check stopped it");
+
+    let wait = mornye_waited(&error).expect("a Mornye wait");
+    assert_eq!(wait.pause.labels, vec!["Example".to_string()]);
+    assert_eq!(wait.pause.url, fetch.spotiflac.settings().effective_url());
+}
+
+#[tokio::test]
 async fn a_job_that_runs_into_the_check_is_a_wait_and_its_song_is_kept() {
     let events: Events = Arc::default();
     let mut setup = Setup::new(&events);
@@ -919,6 +945,7 @@ async fn a_job_that_runs_into_the_check_is_a_wait_and_its_song_is_kept() {
 
     let wait = mornye_waited(&error).expect("a Mornye wait");
     assert!(wait.asked);
+    assert_eq!(wait.pause.url, fetch.spotiflac.settings().effective_url());
     assert_eq!(
         wait.shown,
         "Mornye could not pass its check for Example, so it could not get this song."
@@ -947,6 +974,7 @@ async fn mornyes_own_paused_words_are_a_wait_when_it_does_not_report_its_check()
 
     let wait = mornye_waited(&error).expect("a Mornye wait");
     assert_eq!(wait.pause.labels, vec!["example-ext".to_string()]);
+    assert_eq!(wait.pause.url, fetch.spotiflac.settings().effective_url());
 }
 
 #[tokio::test]
@@ -967,6 +995,7 @@ async fn a_wait_from_mornyes_words_is_not_let_go_by_the_working_read_it_was_made
 
     let wait = mornye_waited(&error).expect("a Mornye wait");
     assert!(wait.pause.labels.is_empty(), "{:?}", wait.pause.labels);
+    assert_eq!(wait.pause.url, fetch.spotiflac.settings().effective_url());
     // It still shares the extension's gateway with other waits on it, and names it.
     assert_eq!(wait.pause.holding, vec!["Example".to_string()]);
     assert_eq!(
@@ -1098,10 +1127,55 @@ async fn a_check_read_that_hangs_never_holds_a_song_up() {
         .expect("Mornye is asked, since Octo cannot tell");
 
     assert!(
-        started.elapsed() < Duration::from_secs(20),
+        started.elapsed() < Duration::from_secs(2),
         "{:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+async fn a_search_mornye_did_not_answer_goes_on_without_reading_its_check() {
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.spotiflac.url = "http://127.0.0.1:1".into();
+    let fetch = setup.build(events).await;
+
+    fetch.acquire().await.expect_err("Mornye is not there");
+
+    // No read was kept while the song was asked for: this one is new.
+    let after = std::time::Instant::now();
+    let view = fetch.spotiflac.check_view(None).await.expect("Mornye is on");
+    assert!(
+        view.read_started >= after,
+        "Mornye's check was read after a search it did not answer"
+    );
+}
+
+#[tokio::test]
+async fn the_words_for_a_failed_job_read_mornyes_check_and_its_health_side_by_side() {
+    // The check read after the failure takes as long as its bound allows; the health read must
+    // not wait for it.
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.fake.status = "failed";
+    setup.fake.error = Some("Provider error");
+    setup.fake.sessions_delay = Some(Duration::from_secs(60));
+    setup.fake.sessions_delay_from = 1;
+    setup.check_call_bound = Duration::from_secs(30);
+    let health_reads = setup.fake.extensions_read.clone();
+    let fetch = setup.build(events).await;
+
+    let both = async {
+        while health_reads.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let side_by_side = tokio::select! {
+        _ = fetch.acquire() => false,
+        read = tokio::time::timeout(Duration::from_secs(5), both) => read.is_ok(),
+    };
+
+    assert!(side_by_side, "the health read waited for the check read");
 }
 
 #[tokio::test]

@@ -132,8 +132,9 @@ pub async fn mornye_status(state: &AppState, dashboard_host: &str) -> serde_json
     use octo_core::spotiflac::check::{extension_id, plain_dashes};
     let client = &state.spotiflac;
     let settings = client.settings();
+    // Off, or switched on with no address yet (`enabled`), which the card tells apart.
     if !settings.is_on() {
-        return serde_json::json!({ "on": false });
+        return serde_json::json!({ "on": false, "enabled": settings.enabled });
     }
     let connection = Connection::of(&settings);
     let bound = client.check.times.call_bound;

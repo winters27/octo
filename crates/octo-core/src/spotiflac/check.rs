@@ -210,6 +210,18 @@ pub struct CheckPause {
     /// `labels`. A wait read from Mornye's own words beside a read that shows those checks
     /// working watches none, yet shares the checks that hold its extension.
     pub holding: Vec<String>,
+    /// The address of the Mornye whose check this is; empty when Octo does not know it.
+    pub url: String,
+}
+
+/// Whether a wait on the check of the Mornye at `made_at` is over because that Mornye is no
+/// longer the one Octo asks: Mornye is off now (`live` is None) or has another address. A wait
+/// whose address Octo does not know (empty) is over only once Mornye is off.
+pub fn mornye_moved(made_at: &str, live: Option<&str>) -> bool {
+    match live {
+        None => true,
+        Some(live) => !made_at.is_empty() && made_at != live,
+    }
 }
 
 impl CheckPause {
@@ -224,7 +236,8 @@ impl CheckPause {
 }
 
 /// Whether Mornye's check keeps every usable extension at `now`. None when Octo cannot tell, when
-/// no extension is usable, or when one of them is free.
+/// no extension is usable, or when one of them is free. The pause names no address; the read
+/// it came from adds it.
 pub fn paused_for(
     rows: &Reading<Vec<CheckRow>>,
     usable: &BTreeSet<String>,
@@ -248,6 +261,7 @@ pub fn paused_for(
         until_utc: until?,
         labels: labels.into_iter().filter(|label| !label.is_empty()).collect(),
         holding: Vec::new(),
+        url: String::new(),
     })
 }
 

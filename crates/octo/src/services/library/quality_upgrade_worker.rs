@@ -22,7 +22,7 @@ use tracing::{debug, error, info, warn};
 use super::duplicate_scan_worker::is_lossless_file;
 use super::library_action_executor::{LibraryActionCodes, LibraryActionExecutor, LibraryActionRequest};
 use super::upgrade_queue::{
-    ApplyFn, ChecksPassFn, MornyeHold, OfflineFn, apply_with, mornye_passed_with, soulseek_offline_with,
+    ApplyFn, HoldOverFn, MornyeHold, OfflineFn, apply_with, mornye_hold_over_with, soulseek_offline_with,
 };
 use super::{LibraryActionOutcome, LibraryActionState, NavidromePlaylistApi, UpgradeQueue, UpgradeSources};
 use crate::services::common::IAcquisitionActivity;
@@ -229,8 +229,9 @@ pub struct QualityUpgradeSeams {
     pub apply: ApplyFn,
     pub list_songs: ListSongsFn,
     pub soulseek_offline: OfflineFn,
-    /// Whether the Mornye checks a held song's pause named pass now.
-    pub mornye_passed: ChecksPassFn,
+    /// Whether a held song's Mornye pause may end early: its checks pass, or the Mornye that
+    /// paused is switched off or moved.
+    pub mornye_hold_over: HoldOverFn,
     pub source_ready: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
@@ -247,7 +248,7 @@ impl QualityUpgradeSeams {
             }),
             list_songs: Arc::new(|| async { (Vec::new(), true) }.boxed()),
             soulseek_offline: Arc::new(|| async { false }.boxed()),
-            mornye_passed: Arc::new(|_| async { false }.boxed()),
+            mornye_hold_over: Arc::new(|_| async { false }.boxed()),
             source_ready: Arc::new(|| true),
         }
     }
@@ -311,7 +312,7 @@ impl QualityUpgradeWorker {
             }),
             // Out only when every source is: a Soulseek outage leaves Lidarr when it is set up.
             soulseek_offline: soulseek_offline_with(sources.clone(), soulseek),
-            mornye_passed: mornye_passed_with(sources),
+            mornye_hold_over: mornye_hold_over_with(sources),
             source_ready: Arc::new(move || ready_sources.as_ref().is_none_or(|s| s.ready())),
         };
         Self::with_seams(store, settings, upgrades, seams)
@@ -519,11 +520,11 @@ impl QualityUpgradeWorker {
             }
             return Tick::Unreachable;
         }
-        // A song Mornye's check kept is passed over until that pause ends or its checks pass.
+        // A song Mornye's check kept is passed over until that pause ends, its checks pass, or
+        // the Mornye that paused is switched off or moved.
         let mut over: Vec<String> = Vec::new();
         for (key, hold) in state.mornye_holds.iter() {
-            let passed = !hold.labels.is_empty() && (seams.mornye_passed)(hold.labels.clone()).await;
-            if now >= hold.until_utc || passed {
+            if now >= hold.until_utc || (seams.mornye_hold_over)(hold.clone()).await {
                 over.push(key.clone());
             }
         }

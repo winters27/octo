@@ -380,6 +380,7 @@ async fn a_kept_song_is_passed_over_so_the_next_run_tries_the_next_song() {
                             until_utc: until,
                             labels: vec!["Example".into()],
                             holding: Vec::new(),
+                            url: String::new(),
                         })),
                         ..LibraryActionOutcome::new(
                             LibraryActionState::Failed,
@@ -427,6 +428,7 @@ fn the_weekly_runs_holds_survive_a_restart() {
         labels: vec!["Example".into()],
         holding: vec!["Example".into(), "Example two".into()],
         moved: 2,
+        url: "http://spotiflac:8000".into(),
     };
     state.mornye_holds.set("A/a.mp3".to_string(), hold.clone());
     let text = serde_json::to_string(&state).expect("writes");

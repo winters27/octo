@@ -117,7 +117,8 @@ fn soulseek_step_alone(settings: &SettingsStore) -> bool {
 
 /// slskd is logged out on a Soulseek step with nothing after it, and Mornye cannot stand in for
 /// it (off, not answering, or unable to download). A Mornye that only waits for its check stands
-/// in: that wait is [`mornye_keeps_the_step`].
+/// in: that wait is [`mornye_keeps_the_step`]. slskd is read first, so Mornye is never asked
+/// while slskd can be used.
 pub(crate) async fn soulseek_keeps_the_step(
     settings: &SettingsStore,
     soulseek: &dyn ISoulseekLink,
@@ -126,15 +127,17 @@ pub(crate) async fn soulseek_keeps_the_step(
     if !soulseek_step_alone(settings) {
         return false;
     }
-    if let Some(client) = mornye
-        && client.stands_in().await
-    {
-        return false;
-    }
-    soulseek
+    let logged_out = soulseek
         .read(false)
         .await
-        .is_some_and(|reading| reading.link == SoulseekLinkState::NotLoggedIn)
+        .is_some_and(|reading| reading.link == SoulseekLinkState::NotLoggedIn);
+    if !logged_out {
+        return false;
+    }
+    match mornye {
+        Some(client) => !client.stands_in().await,
+        None => true,
+    }
 }
 
 /// Mornye is the lossless source left on a Soulseek step with nothing after it (slskd off,
@@ -147,16 +150,16 @@ pub(crate) async fn mornye_keeps_the_step(
     let Some(client) = mornye.filter(|client| client.is_on()) else {
         return false;
     };
-    if !soulseek_step_alone(settings) || !client.stands_in().await {
+    if !soulseek_step_alone(settings) {
         return false;
     }
-    // slskd still fetches: Mornye's check keeps nothing from the step.
+    // slskd still fetches: Mornye's check keeps nothing from the step, and Mornye is not asked.
     let slskd_out = soulseek.is_off()
         || soulseek
             .read(false)
             .await
             .is_none_or(|reading| reading.link == SoulseekLinkState::NotLoggedIn);
-    if !slskd_out {
+    if !slskd_out || !client.stands_in().await {
         return false;
     }
     let Some(view) = client.check_view(None).await else {

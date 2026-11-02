@@ -36,7 +36,7 @@ use super::rejections::RejectionStore;
 use super::replacement_handoff::{
     BeforeReveal, OnRevealed, ReplacementHandoff, ReplacementRejectedException,
 };
-use super::upgrade_queue::{KEPT_BUSY, KeptFor, KeptRechecks, OriginalSound};
+use super::upgrade_queue::{KEPT_BUSY, KeptFor, KeptRechecks, MornyeHold, OriginalSound};
 use super::upgrade_sources::{SourcesOut, UpgradeSources};
 use super::{NavidromeSongPathResolver, ResolvedSongFile};
 use crate::services::common::download_picks::AnywaySong;
@@ -168,6 +168,10 @@ impl LibraryActionCodes {
     /// slskd is not logged in to Soulseek, so a replacement could only fail.
     pub const SOULSEEK_OFFLINE: &'static str = "soulseekOffline";
 
+    /// Mornye is the only source that could look (slskd is not set up) and it is not answering
+    /// or cannot download, so the request waits like an outage, until it answers again.
+    pub const MORNYE_OUT: &'static str = "mornyeOut";
+
     /// The search found no copy good enough to replace the song with.
     pub const NO_REPLACEMENT: &'static str = "noReplacement";
 
@@ -184,6 +188,9 @@ impl LibraryActionCodes {
         matches!(code, Some(Self::MORNYE_CHECK | Self::MORNYE_KEPT))
     }
 }
+
+/// The words of a request waiting for a Mornye that is not answering.
+const MORNYE_OUT_TEXT: &str = "Mornye is not answering, and no other source can look for this song now.";
 
 /// The words of a request waiting for Mornye's check.
 fn mornye_wait_text(pause: &octo_core::spotiflac::check::CheckPause) -> String {
@@ -784,6 +791,11 @@ impl LibraryActionExecutor {
                             Some(LibraryActionCodes::MORNYE_CHECK),
                         )
                     },
+                    Some(SourcesOut::Mornye) => LibraryActionOutcome::coded(
+                        LibraryActionState::Failed,
+                        MORNYE_OUT_TEXT,
+                        Some(LibraryActionCodes::MORNYE_OUT),
+                    ),
                     _ => LibraryActionOutcome::coded(
                         LibraryActionState::Failed,
                         OFFLINE_TEXT,
@@ -1933,11 +1945,12 @@ impl LibraryActionExecutor {
         }
     }
 
-    /// Whether the Mornye checks a wait named (`labels`) pass now.
-    pub async fn mornye_passed(&self, labels: &[String]) -> bool {
+    /// Whether a wait on Mornye's check may end before its pause does (see
+    /// [`UpgradeSources::mornye_wait_over`]).
+    pub async fn mornye_wait_over(&self, hold: &MornyeHold) -> bool {
         match &self.sources {
-            Some(sources) => sources.mornye_passed(labels).await,
-            None => false,
+            Some(sources) => sources.mornye_wait_over(&hold.url, &hold.labels).await,
+            None => true,
         }
     }
 

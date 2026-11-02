@@ -351,6 +351,8 @@ pub struct AppInner {
     pub admin_role_check: Arc<AdminRoleCheck>,
     /// The signed-out `GET /api/admin/status` answer, kept ten seconds.
     pub anonymous_status: crate::controllers::admin::system::AnonymousStatusCache,
+    /// Mornye's row of the admin status, kept between answers.
+    pub mornye_row: crate::controllers::admin::system::MornyeRowKeeper,
     /// `RejectedPeerRegistry`: peer files that proved wrong, `rejected-peers.json` (flushed by
     /// a worker), with `Soulseek:RejectedPeerTtlDays` read live.
     pub rejected_peers: Arc<RejectedPeerRegistry>,
@@ -3587,6 +3589,7 @@ impl AppState {
             admin_recovery_code: admin_sign_in.recovery_code,
             admin_role_check: admin_sign_in.role_check,
             anonymous_status: Default::default(),
+            mornye_row: Default::default(),
             rejected_peers: stores.rejected_peers,
             release_check: stores.release_check,
             http: navidrome.http,
@@ -4043,6 +4046,7 @@ impl AppState {
             admin_recovery_code: admin_sign_in.recovery_code,
             admin_role_check: admin_sign_in.role_check,
             anonymous_status: Default::default(),
+            mornye_row: Default::default(),
             rejected_peers: stores.rejected_peers,
             release_check: stores.release_check,
             http: navidrome.http,

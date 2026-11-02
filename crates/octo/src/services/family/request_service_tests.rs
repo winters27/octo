@@ -150,6 +150,7 @@ impl RequestFetcher for Fetcher {
                 until_utc: chrono::Utc::now() + chrono::Duration::minutes(15),
                 labels: vec!["Example".into()],
                 holding: Vec::new(),
+                url: String::new(),
             };
             let error =
                 crate::services::spotiflac::MornyeWaiting::new(pause, false, chrono::Utc::now()).into_error();
@@ -867,6 +868,7 @@ fn a_failed_download_reads_as_mornyes_check_only_when_it_was() {
         until_utc: chrono::Utc::now(),
         labels: vec!["Example".into()],
         holding: Vec::new(),
+        url: String::new(),
     };
     let wait = crate::services::spotiflac::MornyeWaiting::new(pause, true, chrono::Utc::now());
     let shown = wait.shown.clone();

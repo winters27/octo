@@ -136,7 +136,8 @@ pub struct UpgradeJob {
 }
 
 /// The Mornye pause a job waits on: it goes back once the pause ends (one job at a time, the
-/// others following once that one's try is known) or a read shows its checks passing.
+/// others following once that one's try is known), once a read shows its checks passing, or all
+/// at once when the Mornye that paused is switched off or moved to another address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct MornyeHold {
@@ -153,6 +154,9 @@ pub struct MornyeHold {
     /// read before such a try never lets the job go.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub moved: u32,
+    /// The address of the Mornye whose check paused; empty when Octo does not know it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
 }
 
 fn is_zero(count: &u32) -> bool {
@@ -166,6 +170,7 @@ impl MornyeHold {
             labels: pause.labels.clone(),
             holding: pause.holding.clone(),
             moved: 0,
+            url: pause.url.clone(),
         }
     }
 
@@ -176,6 +181,7 @@ impl MornyeHold {
             labels: Vec::new(),
             holding: Vec::new(),
             moved: 0,
+            url: String::new(),
         }
     }
 
@@ -749,22 +755,24 @@ pub struct UpgradeWorkerSeams {
     pub describe: DescribeFn,
     pub width: Arc<dyn Fn() -> i32 + Send + Sync>,
     pub soulseek_offline: OfflineFn,
-    /// Whether the Mornye checks a hold named pass now (a Pass, or Mornye's own try passing).
-    pub mornye_passed: ChecksPassFn,
+    /// Whether a Mornye hold may end before its pause does (a Pass, Mornye's own try passing,
+    /// or the Mornye that paused switched off or moved).
+    pub mornye_hold_over: HoldOverFn,
     pub source_name: Arc<dyn Fn() -> String + Send + Sync>,
 }
 
-/// Whether the Mornye checks named pass now.
-pub type ChecksPassFn = Arc<dyn Fn(Vec<String>) -> BoxFuture<'static, bool> + Send + Sync>;
+/// Whether a Mornye hold may end before its pause does.
+pub type HoldOverFn = Arc<dyn Fn(MornyeHold) -> BoxFuture<'static, bool> + Send + Sync>;
 
-/// The default `mornye_passed` seam: a read of Mornye shows every check the hold named working.
-pub(crate) fn mornye_passed_with(sources: Option<Arc<UpgradeSources>>) -> ChecksPassFn {
-    Arc::new(move |labels| {
+/// The default `mornye_hold_over` seam: the Mornye the hold was made against is off or has
+/// another address now, or a read of Mornye shows every check the hold named working.
+pub(crate) fn mornye_hold_over_with(sources: Option<Arc<UpgradeSources>>) -> HoldOverFn {
+    Arc::new(move |hold| {
         let sources = sources.clone();
         async move {
             match sources {
-                Some(sources) => sources.mornye_passed(&labels).await,
-                None => false,
+                Some(sources) => sources.mornye_wait_over(&hold.url, &hold.labels).await,
+                None => true,
             }
         }
         .boxed()
@@ -815,7 +823,7 @@ impl UpgradeWorker {
             }),
             width: Arc::new(move || concurrency.as_ref().map_or(1, |c| c.current()).max(1)),
             soulseek_offline: soulseek_offline_with(parts.sources.clone(), parts.soulseek),
-            mornye_passed: mornye_passed_with(parts.sources),
+            mornye_hold_over: mornye_hold_over_with(parts.sources),
             source_name: Arc::new(move || {
                 name_sources
                     .as_ref()
@@ -859,18 +867,26 @@ impl UpgradeWorker {
             .count()
     }
 
-    /// One pass: waiting jobs back in the queue once what each waits for is over (a source that
-    /// can search, or Mornye free to try its check again), then queued jobs started while there
-    /// is room. Answers how many it started.
+    /// One pass: waiting jobs back in the queue once a source can search, queued jobs started
+    /// while there is room, then the jobs Mornye's check kept back once Mornye may try again (and
+    /// started too). Mornye is read only after the start, so a slow Mornye never holds up a song
+    /// that is ready to go. Answers how many it started.
     pub async fn tick(self: &Arc<Self>, ct: &CancellationToken) -> usize {
+        if self.queue.any_waiting() && !(self.seams.soulseek_offline)().await {
+            self.queue.requeue();
+        }
+        let mut started = self.start_queued(ct);
         if self.queue.any_waiting() {
-            let sources_back = !(self.seams.soulseek_offline)().await;
             let passing = self.mornye_passing().await;
-            self.queue.release_mornye(&passing, Utc::now());
-            if sources_back {
-                self.queue.requeue();
+            if self.queue.release_mornye(&passing, Utc::now()) > 0 {
+                started += self.start_queued(ct);
             }
         }
+        started
+    }
+
+    /// Starts queued jobs while there is room. Answers how many it started.
+    fn start_queued(self: &Arc<Self>, ct: &CancellationToken) -> usize {
         let mut started = 0;
         self.running.lock().retain(|task| !task.is_finished());
         while (self.running() as i64) < i64::from((self.seams.width)()) {
@@ -892,31 +908,33 @@ impl UpgradeWorker {
         started
     }
 
-    /// The jobs Mornye's check kept whose checks a read shows passing now, each with the hold the
-    /// read judged. Which of the others goes back alone once its pause ends is decided by the
-    /// queue as it stands after this read.
+    /// The jobs Mornye's check kept that may go back now, all at once: a read shows their checks
+    /// passing, or the Mornye that paused is switched off or moved. Each comes with the hold that
+    /// was judged. Which of the others goes back alone once its pause ends is decided by the queue
+    /// as it stands after this.
     async fn mornye_passing(&self) -> HashMap<String, MornyeHold> {
         let holds = self.queue.mornye_holds();
         let mut released = HashMap::new();
         if holds.is_empty() {
             return released;
         }
-        let mut passing: Vec<(Vec<String>, bool)> = Vec::new();
+        // One answer per Mornye and set of checks.
+        let mut judged: Vec<((String, Vec<String>), bool)> = Vec::new();
         for (id, hold) in &holds {
-            let known = passing
+            let key = (hold.url.clone(), hold.labels.clone());
+            let known = judged
                 .iter()
-                .find(|(labels, _)| *labels == hold.labels)
-                .map(|(_, pass)| *pass);
-            let pass = match known {
-                Some(pass) => pass,
+                .find(|(seen, _)| *seen == key)
+                .map(|(_, over)| *over);
+            let over = match known {
+                Some(over) => over,
                 None => {
-                    let pass =
-                        !hold.labels.is_empty() && (self.seams.mornye_passed)(hold.labels.clone()).await;
-                    passing.push((hold.labels.clone(), pass));
-                    pass
+                    let over = (self.seams.mornye_hold_over)(hold.clone()).await;
+                    judged.push((key, over));
+                    over
                 }
             };
-            if pass {
+            if over {
                 released.insert(id.clone(), hold.clone());
             }
         }
@@ -1040,6 +1058,9 @@ impl UpgradeWorker {
         let mornye_check = LibraryActionCodes::waits_on_mornye(outcome.code.as_deref());
         let detail = match state {
             UpgradeStates::WAITING if mornye_check => outcome.detail.clone(),
+            UpgradeStates::WAITING if outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_OUT) => {
+                Some("Waiting for Mornye, which is not answering".to_string())
+            }
             UpgradeStates::WAITING => Some("Waiting for Soulseek".to_string()),
             UpgradeStates::UPGRADED if result.as_ref().is_some_and(|r| r.after.is_some()) => {
                 let result = result.as_ref().expect("checked above");
@@ -1231,6 +1252,7 @@ impl UpgradeWorker {
                 _,
                 Some(
                     LibraryActionCodes::SOULSEEK_OFFLINE
+                    | LibraryActionCodes::MORNYE_OUT
                     | LibraryActionCodes::MORNYE_CHECK
                     | LibraryActionCodes::MORNYE_KEPT,
                 ),

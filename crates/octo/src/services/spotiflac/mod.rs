@@ -386,6 +386,22 @@ impl SpotiflacClient {
         }
     }
 
+    /// The address Octo asks Mornye at now; None while Mornye is off or has no address.
+    pub fn live_url(&self) -> Option<String> {
+        let settings = self.settings();
+        settings.is_on().then(|| settings.effective_url())
+    }
+
+    /// Whether a wait on the check of the Mornye at `made_at`, on the checks `labels`, may end
+    /// before its pause does: that Mornye is off or has another address now, so nothing it said
+    /// keeps the song, or a read shows the checks passing. Mornye is read only in the last case.
+    pub async fn wait_over(&self, made_at: &str, labels: &[String]) -> bool {
+        if octo_core::spotiflac::check::mornye_moved(made_at, self.live_url().as_deref()) {
+            return true;
+        }
+        !labels.is_empty() && self.checks_pass(labels).await
+    }
+
     /// Mornye can stand in for Soulseek now: on, answering, and able to download, from the kept
     /// read of its check.
     pub async fn stands_in(&self) -> bool {

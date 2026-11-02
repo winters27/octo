@@ -187,9 +187,10 @@ pub trait SweepReplacer: Send + Sync {
         false
     }
 
-    /// Whether the Mornye checks a held song's pause named pass now.
-    async fn mornye_passed(&self, labels: &[String]) -> bool {
-        let _ = labels;
+    /// Whether a held song's Mornye pause may end early: its checks pass, or the Mornye that
+    /// paused is switched off or moved.
+    async fn mornye_wait_over(&self, hold: &MornyeHold) -> bool {
+        let _ = hold;
         false
     }
 }
@@ -335,8 +336,8 @@ impl SweepReplacer for ExecutorSweepReplacer {
             .map_err(|e| anyhow::anyhow!("the replacement stopped: {e}"))?
     }
 
-    async fn mornye_passed(&self, labels: &[String]) -> bool {
-        self.executor.mornye_passed(labels).await
+    async fn mornye_wait_over(&self, hold: &MornyeHold) -> bool {
+        self.executor.mornye_wait_over(hold).await
     }
 
     async fn wrong_version_asked(&self, song_id: &str) -> bool {
@@ -1163,8 +1164,8 @@ impl LibraryReviewSweepWorker {
         self.check(step, &target, pick).await
     }
 
-    /// The songs Mornye's check still keeps: each one whose pause has not ended and whose checks
-    /// do not pass yet. The others are let go.
+    /// The songs Mornye's check still keeps: each one whose pause has not ended, whose checks do
+    /// not pass yet, and whose Mornye is still on at the same address. The others are let go.
     async fn mornye_held(&self) -> HashSet<String> {
         let holds: Vec<(String, MornyeHold)> = self
             .mornye_holds
@@ -1178,11 +1179,12 @@ impl LibraryReviewSweepWorker {
         let now = self.clock.now();
         let mut held = HashSet::new();
         for (path, hold) in holds {
-            let passed = match &self.replacer {
-                Some(replacer) if !hold.labels.is_empty() => replacer.mornye_passed(&hold.labels).await,
-                _ => false,
-            };
-            if now < hold.until_utc && !passed {
+            let over = now >= hold.until_utc
+                || match &self.replacer {
+                    Some(replacer) => replacer.mornye_wait_over(&hold).await,
+                    None => true,
+                };
+            if !over {
                 held.insert(path);
             } else {
                 self.mornye_holds.lock().remove(&path);
@@ -1666,6 +1668,13 @@ impl LibraryReviewSweepWorker {
             Ok(outcome) if outcome.code.as_deref() == Some(LibraryActionCodes::SOULSEEK_OFFLINE) => {
                 info!(
                     "Library review sweep: '{} - {}' waits, because Soulseek is out and the replacement may come from nowhere else",
+                    song.artist, song.title
+                );
+                Replacing::Waits
+            }
+            Ok(outcome) if outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_OUT) => {
+                info!(
+                    "Library review sweep: '{} - {}' waits, because Mornye is not answering and the replacement may come from nowhere else",
                     song.artist, song.title
                 );
                 Replacing::Waits

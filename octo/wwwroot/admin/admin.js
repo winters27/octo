@@ -506,6 +506,8 @@ async function refreshStatus() {
 
     setStatusCard('octo', data.octo);
     Object.entries(data.services || {}).forEach(([k, v]) => setStatusCard(k, v));
+    // The status lists Mornye only while it is switched on; otherwise its card says it is off.
+    if (!data.services?.mornye) setStatusCard('mornye', MORNYE_OFF_PROBE);
     renderDownloadChecks(data.downloads);
 
     // Update sidebar badge with bad count, if any. An optional service nobody set up reports
@@ -672,6 +674,7 @@ async function loadSettings() {
   });
 
   syncPlaybackSourceControl();
+  syncMornyeNotifyRow();
   updateStreamSettings();
   updateRadioPublicationSettings();
   renderHeartSourceOrder(currentSettings?.Subsonic?.HeartDownloadSources);
@@ -1064,6 +1067,7 @@ document.querySelectorAll('form[data-section]').forEach(form => {
       // now card asks again once the running settings have caught up with the file.
       if (form.dataset.section?.startsWith('spotiflac')) {
         renderHeartSourceOrder();
+        syncMornyeNotifyRow();
         setTimeout(loadMornyeNow, 700);
       }
       // The re-check offer on the Verify card follows the saved match score.
@@ -3408,10 +3412,22 @@ function mornyeWhen(iso, now = new Date(), roundUp = false, locale = undefined) 
 // Mornye's own words end as a sentence, whether or not Mornye ended them.
 const mornyeSentence = text => (/[.!?]$/.test(text) ? text : `${text}.`);
 
+// The status card for a Mornye the status does not list: switched off, as the server words it.
+const MORNYE_OFF_PROBE = { ok: true, configured: false, warning: false, detail: 'Off. Optional.' };
+
+// Whether the Notifications page shows the switch for Mornye's check: only while Mornye is
+// switched on in the saved settings.
+function mornyeNotifyShown(settings) {
+  return !!settings?.Spotiflac?.Enabled;
+}
+
 // What the Mornye now card says for one answer of GET /api/admin/spotiflac/status: a tone, a
 // headline, one line per finding (plain words, escaped where drawn), the address of Mornye's
 // own page, and whether Pass Mornye's check can start.
 function mornyeCard(status, now = new Date()) {
+  if (status?.on === false && status.enabled) {
+    return { tone: 'warn', title: 'Mornye is switched on but has no address. Set it under Connection.', lines: [], canPass: false, webUrl: null };
+  }
   if (!status || status.on === false) {
     return { tone: 'off', title: 'Mornye is off. Switch on Download with Mornye under Connection to use it.', lines: [], canPass: false, webUrl: null };
   }
@@ -3654,6 +3670,12 @@ function passCalls(send, viewer) {
 
 let mornyeNowLoad = null;
 let mornyeNowView = null;
+
+// The Notifications switch for Mornye's check, shown only while Mornye is switched on.
+function syncMornyeNotifyRow() {
+  const row = document.getElementById('f-notify-mornye-check')?.closest('.set-row');
+  if (row) row.hidden = !mornyeNotifyShown(currentSettings);
+}
 
 // The Mornye now card: asked when the page opens, after a Mornye setting is saved, after a pass,
 // and from its refresh button. With Mornye switched off in the saved settings it is one quiet line.

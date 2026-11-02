@@ -312,6 +312,7 @@ fn the_gate_says_who_and_when() {
         until_utc: at(14, 4, 30),
         labels: vec!["gateway-v2-abc".into(), "gateway-v2-def".into()],
         holding: Vec::new(),
+        url: String::new(),
     };
     let (shown, detail) = gate_words(&pause, at(12, 0, 0));
     assert_eq!(
@@ -330,12 +331,24 @@ fn the_gate_names_the_checks_a_wait_shares_when_it_watches_none() {
         until_utc: at(14, 4, 30),
         labels: Vec::new(),
         holding: vec!["gateway-v2-abc".into()],
+        url: String::new(),
     };
     let (shown, _) = gate_words(&pause, at(12, 0, 0));
     assert_eq!(
         shown,
         "Mornye could not pass its check for gateway-v2-abc, so Octo did not ask it for this song."
     );
+}
+
+#[test]
+fn a_wait_ends_once_its_mornye_is_off_or_has_another_address() {
+    let made_at = "http://spotiflac:8000";
+    assert!(!mornye_moved(made_at, Some(made_at)));
+    assert!(mornye_moved(made_at, None));
+    assert!(mornye_moved(made_at, Some("http://mornye.lan:8000")));
+    // A wait whose Mornye Octo does not know holds while Mornye is on.
+    assert!(!mornye_moved("", Some(made_at)));
+    assert!(mornye_moved("", None));
 }
 
 fn paused_row(

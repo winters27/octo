@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::app::{AppState, TestServices};
 use crate::services::common::DownloadConcurrency;
-use crate::services::common::test_fakes::{OffLink, OfflineLink, until};
+use crate::services::common::test_fakes::{LoggedInLink, OffLink, OfflineLink, until};
 use crate::services::family::FamilyCaller;
 use crate::services::family::test_support::member;
 use crate::services::i_download_service::{Ahead, AudioStream, DirectStreamInfo, IDownloadService};
@@ -104,6 +104,7 @@ impl IDownloadService for AheadDownloads {
                 until_utc: Utc::now() + Duration::minutes(15),
                 labels: vec!["Example".into()],
                 holding: Vec::new(),
+                url: String::new(),
             };
             return Err(crate::services::spotiflac::MornyeWaiting::new(pause, true, Utc::now()).into_error());
         }
@@ -567,10 +568,37 @@ async fn songs_are_fetched_while_mornyes_check_passes() {
     assert_eq!(w.service.status().await.paused, None);
 }
 
+/// A Mornye client, on at `url`, over a settings store of its own that a test may change.
+fn mornye_client(url: &str) -> (Arc<octo_core::settings::SettingsStore>, Arc<SpotiflacClient>) {
+    let store = Arc::new(octo_core::settings::SettingsStore::for_tests(AppSettings {
+        spotiflac: octo_core::settings::SpotiflacSettings {
+            enabled: true,
+            url: url.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let client = Arc::new(SpotiflacClient::new(Arc::clone(&store)));
+    (store, client)
+}
+
+/// A Mornye that must never be asked.
+async fn untouched_mornye() -> wiremock::MockServer {
+    let server = wiremock::MockServer::builder().start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    server
+}
+
 #[tokio::test]
 async fn a_song_mornyes_check_kept_rests_until_mornye_may_try_again() {
-    // The wait says Mornye allows its next try in 15 minutes (the stand-in's pause).
-    let w = world(|s| s.prefetch.count = 1);
+    // The wait says Mornye allows its next try in 15 minutes (the stand-in's pause). Mornye
+    // stays on and no read shows its check passing.
+    let (_, client) = mornye_client("http://127.0.0.1:1");
+    let w = world_full(|s| s.prefetch.count = 1, None, Some(client));
     *w.downloads.mornye_waits.lock() = true;
     w.save_queue("alice", 0);
     w.service.on_playing("alice", &w.ids[0], None).await;
@@ -669,6 +697,87 @@ async fn a_pass_ends_the_rest_of_a_song_mornyes_check_kept() {
     assert!(
         w.service.store().is_ready("soulseek", &w.ids[2]),
         "tried again after the Pass"
+    );
+}
+
+#[tokio::test]
+async fn switching_mornye_off_ends_the_rest_of_a_song_its_check_kept() {
+    let (store, client) = mornye_client("http://127.0.0.1:1");
+    let w = world_full(|s| s.prefetch.count = 1, None, Some(client));
+    *w.downloads.mornye_waits.lock() = true;
+    w.save_queue("alice", 0);
+    w.service.on_playing("alice", &w.ids[0], None).await;
+    w.run_jobs().await;
+    assert_eq!(w.asked(), w.ids_of(&[2]));
+
+    // Mornye is switched off a minute later, long before its pause ends: the song goes again.
+    *w.downloads.mornye_waits.lock() = false;
+    let mut off = (*store.current()).clone();
+    off.spotiflac.enabled = false;
+    store.set(off);
+    w.later(Duration::minutes(1));
+    w.service.on_playing("alice", &w.ids[1], None).await;
+    w.service.on_playing("alice", &w.ids[0], None).await;
+    w.run_jobs().await;
+    assert!(
+        w.service.store().is_ready("soulseek", &w.ids[2]),
+        "tried again once Mornye was off"
+    );
+}
+
+#[tokio::test]
+async fn with_mornye_off_prefetch_waits_for_soulseek_as_before_and_never_asks_mornye() {
+    let server = untouched_mornye().await;
+    let (store, client) = mornye_client(&server.uri());
+    let mut off = (*store.current()).clone();
+    off.spotiflac.enabled = false;
+    store.set(off);
+    let w = world_full(
+        |s| s.prefetch.count = 1,
+        Some(Arc::new(OfflineLink)),
+        Some(client),
+    );
+    w.save_queue("alice", 0);
+    w.service.on_playing("alice", &w.ids[0], None).await;
+    w.run_jobs().await;
+
+    assert!(w.asked().is_empty());
+    assert_eq!(
+        w.service.status().await.paused.as_deref(),
+        Some("Waiting for Soulseek to connect")
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn while_slskd_is_logged_in_prefetch_never_asks_mornye() {
+    let server = untouched_mornye().await;
+    let (_, client) = mornye_client(&server.uri());
+    let w = world_full(
+        |s| s.prefetch.count = 1,
+        Some(Arc::new(LoggedInLink)),
+        Some(client),
+    );
+    w.save_queue("alice", 0);
+    w.service.on_playing("alice", &w.ids[0], None).await;
+    w.run_jobs().await;
+
+    assert_eq!(w.asked(), w.ids_of(&[2]));
+    assert_eq!(w.service.status().await.paused, None);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn with_no_slskd_a_mornye_that_does_not_answer_is_what_prefetch_waits_for() {
+    let w = mornye_world("http://127.0.0.1:1".to_string());
+    w.save_queue("alice", 0);
+    w.service.on_playing("alice", &w.ids[0], None).await;
+    w.run_jobs().await;
+
+    assert!(w.asked().is_empty());
+    assert_eq!(
+        w.service.status().await.paused.as_deref(),
+        Some("Waiting for Mornye to answer")
     );
 }
 
