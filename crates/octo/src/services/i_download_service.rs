@@ -157,6 +157,11 @@ pub trait IDownloadService: Send + Sync {
         false
     }
 
+    /// The one hold path every held file waits in, when the download path is known.
+    fn held_root(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Places a file a Lidarr follow held back from the library, now that no follow holds it:
     /// moved where the layout files it, with the library's record moved along. Where it landed,
     /// or None when it could not be placed (it then stays where it plays from).

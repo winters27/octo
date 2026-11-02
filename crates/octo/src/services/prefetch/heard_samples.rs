@@ -1085,8 +1085,9 @@ impl HeardSamples {
         };
         let whole = match &file {
             HeardFile::Held(_) => true,
-            HeardFile::Fetched(scratch) => std::fs::metadata(scratch.path())
-                .is_ok_and(|meta| meta.len() < WHOLE_SONG_CAP_BYTES),
+            HeardFile::Fetched(scratch) => {
+                std::fs::metadata(scratch.path()).is_ok_and(|meta| meta.len() < WHOLE_SONG_CAP_BYTES)
+            }
         };
         let _slot = self.slot(FpcalcClass::Heart).await;
         match self.printer().raw(file.path(), 0, self.timeout_seconds()).await {
@@ -1109,8 +1110,7 @@ impl HeardSamples {
         else {
             return None;
         };
-        self.prefetch
-            .copy_video(key, *ready_at, source_file.as_deref())
+        self.prefetch.copy_video(key, *ready_at, source_file.as_deref())
     }
 
     // ---- Copies a hold keeps --------------------------------------------------------------
@@ -1419,9 +1419,10 @@ impl HeardSamples {
             .keep_requested
             .iter()
             .any(|asker| asker.trim().eq_ignore_ascii_case(&user));
-        // The files of a hold nobody else waits in go with the last holder.
-        let ended = self.holds.release_holder(&wait.hold_key, &wait.user).is_none();
-        let held_files = if ended {
+        // The files of a hold nobody else waits in go with the last holder: they are filed under
+        // the new hold before the old one ends, so its end never takes them.
+        let last = record.holders.len() <= 1;
+        let held_files = if last {
             record.held_files.clone()
         } else {
             Vec::new()
@@ -1434,6 +1435,7 @@ impl HeardSamples {
             line: Some(STUCK_LINE.to_string()),
             ..record
         });
+        self.holds.release_holder(&wait.hold_key, &wait.user);
         let moved = self
             .holds
             .update(&moved.key(), |r| {

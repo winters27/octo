@@ -56,6 +56,43 @@ pub struct Holder {
     /// How this person's heard video has answered the shim's rounds.
     #[serde(skip_serializing_if = "ShimTries::is_clear")]
     pub shim_tries: ShimTries,
+    /// Which of this person's hearts keep them in the hold, when they are in it by more than the
+    /// hold's own: a song heart and an album heart of one held track each keep them in it, and
+    /// taking one back leaves the other. None listed is the hold's own route ([`HoldRoute::of`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<HoldRoute>,
+}
+
+/// Which heart keeps a person in a hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HoldRoute {
+    /// Their heart of the song itself.
+    Song,
+    /// Their heart of the album the held track is on.
+    Album,
+}
+
+impl HoldRoute {
+    /// The route a hold keeps its holders by when they list none: a hearted album's held track by
+    /// the album, every other hold by the song.
+    pub fn of(record: &HeldAcquisition) -> Self {
+        if record.album_track.is_some() {
+            HoldRoute::Album
+        } else {
+            HoldRoute::Song
+        }
+    }
+}
+
+impl Holder {
+    /// The hearts that keep this person in `record`.
+    pub fn routes_in(&self, record: &HeldAcquisition) -> Vec<HoldRoute> {
+        if self.routes.is_empty() {
+            vec![HoldRoute::of(record)]
+        } else {
+            self.routes.clone()
+        }
+    }
 }
 
 /// How a heard video has answered the shim's rounds since its last other answer.
@@ -396,10 +433,11 @@ impl SoulseekHoldStore {
         list
     }
 
-    /// Records a hold, its holders seeded from its requester when it lists none. A hold already
-    /// there under the same key keeps its first start time and takes in the new record's holders:
-    /// a person not listed yet joins it, and a listed person's entry is replaced only by one heard
-    /// later. Answers the hold as kept.
+    /// Records a hold, its holders seeded from its requester when it lists none, in one write. A
+    /// hold already there under the same key keeps its first start time and takes in what the new
+    /// record brings: a person not listed yet joins it (a listed person's entry is replaced only by
+    /// one heard later, and takes in their routes), and its held files, their Lidarr labels, the
+    /// keeps asked for and its line join the hold's own. Answers the hold as kept.
     pub fn hold(&self, mut held: HeldAcquisition) -> HeldAcquisition {
         held.seed_holders();
         held.tidy_lidarr_files();
@@ -407,9 +445,39 @@ impl SoulseekHoldStore {
         let key = held.key();
         if let Some(existing) = map.get(&key) {
             let mut kept = existing.clone();
-            if !merge_holders(&mut kept.holders, held.holders) {
+            let own = HoldRoute::of(&kept);
+            let mut changed = merge_holders(&mut kept.holders, held.holders, own);
+            for file in held.held_files {
+                if !kept.held_files.contains(&file) {
+                    kept.held_files.push(file);
+                    changed = true;
+                }
+            }
+            for file in held.lidarr_files {
+                if !kept.lidarr_files.contains(&file) {
+                    kept.lidarr_files.retain(|known| known.path != file.path);
+                    kept.lidarr_files.push(file);
+                    changed = true;
+                }
+            }
+            for user in held.keep_requested {
+                if !kept
+                    .keep_requested
+                    .iter()
+                    .any(|known| dotnet::eq_ignore_case(known.trim(), user.trim()))
+                {
+                    kept.keep_requested.push(user);
+                    changed = true;
+                }
+            }
+            if let Some(line) = held.line.filter(|line| kept.line.as_ref() != Some(line)) {
+                kept.line = Some(line);
+                changed = true;
+            }
+            if !changed {
                 return kept;
             }
+            kept.tidy_lidarr_files();
             map.set(key, kept.clone());
             self.save(&map);
             return kept;
@@ -419,11 +487,16 @@ impl SoulseekHoldStore {
         held
     }
 
+    /// Ends the hold `key`: its held files that no other hold names go with it, and the labels of
+    /// those Lidarr brought with them.
     pub fn release(&self, key: &str) {
         let mut map = self.held.lock();
-        if map.remove(key) {
-            self.save(&map);
-        }
+        let Some(ended) = map.get(key).cloned() else {
+            return;
+        };
+        map.remove(key);
+        delete_unnamed_files(&ended, &map);
+        self.save(&map);
     }
 
     /// The hold under `key`, when there is one.
@@ -432,9 +505,9 @@ impl SoulseekHoldStore {
     }
 
     /// Takes `user` off the hold `key`, with any keep they asked for. The hold ends when nobody is
-    /// left: None then, and None when there is no such hold. A hold that lists nobody, or not
-    /// this person, is answered as it is. When the person who asked first leaves, the next holder
-    /// is the one it is requested by.
+    /// left (its held files going with it, as [`Self::release`] takes them): None then, and None
+    /// when there is no such hold. A hold that lists nobody, or not this person, is answered as it
+    /// is. When the person who asked first leaves, the next holder is the one it is requested by.
     pub fn release_holder(&self, key: &str, user: &str) -> Option<HeldAcquisition> {
         let user = user.trim();
         let mut map = self.held.lock();
@@ -449,6 +522,7 @@ impl SoulseekHoldStore {
             .retain(|asked| !dotnet::eq_ignore_case(asked.trim(), user));
         if kept.holders.is_empty() {
             map.remove(key);
+            delete_unnamed_files(&kept, &map);
             self.save(&map);
             return None;
         }
@@ -492,7 +566,8 @@ impl SoulseekHoldStore {
         let kept = match map.get(&new_key) {
             Some(existing) => {
                 let mut kept = existing.clone();
-                merge_holders(&mut kept.holders, moved.holders);
+                let own = HoldRoute::of(&kept);
+                merge_holders(&mut kept.holders, moved.holders, own);
                 kept
             }
             None => moved,
@@ -520,6 +595,46 @@ impl SoulseekHoldStore {
         Some(kept)
     }
 
+    /// Every file under `root` (the one hold path) that waits in a hold's own folder and that no
+    /// hold names: a hold that ended before its files went, or a crash between. Other folders
+    /// there (a Lidarr follow's) are not a hold's and are left alone; an emptied hold folder goes.
+    /// Answers how many files went.
+    pub fn sweep_unnamed(&self, root: &Path) -> usize {
+        let named: std::collections::HashSet<PathBuf> = self
+            .held
+            .lock()
+            .values()
+            .flat_map(|record| record.held_files.iter().map(PathBuf::from))
+            .collect();
+        let Ok(folders) = std::fs::read_dir(root) else {
+            return 0;
+        };
+        let mut swept = 0;
+        for folder in folders.flatten().map(|entry| entry.path()) {
+            let is_holds = folder.is_dir()
+                && folder.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    [HeldKind::Track, HeldKind::Album]
+                        .iter()
+                        .any(|kind| name.starts_with(&format!("{}_", kind.name())))
+                });
+            if !is_holds {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(&folder) else {
+                continue;
+            };
+            for file in files.flatten().map(|entry| entry.path()) {
+                if file.is_file() && !named.contains(&file) && std::fs::remove_file(&file).is_ok() {
+                    swept += 1;
+                }
+            }
+            // Only an empty folder goes.
+            let _ = std::fs::remove_dir(&folder);
+        }
+        swept
+    }
+
     // Called with the lock held.
     fn save(&self, map: &DotnetDictionary<HeldAcquisition>) {
         let Some(path) = &self.path else { return };
@@ -530,10 +645,21 @@ impl SoulseekHoldStore {
     }
 }
 
-/// Takes `joining` into `holders`, one entry per person (ignoring case): a person not listed is
-/// added; a listed person's entry is replaced by one heard later, and otherwise takes the album
-/// context it lacked. True when anything changed.
-fn merge_holders(holders: &mut Vec<Holder>, joining: Vec<Holder>) -> bool {
+/// Deletes the held files of `ended`, a hold that just ended, that no hold left in `map` names.
+fn delete_unnamed_files(ended: &HeldAcquisition, map: &DotnetDictionary<HeldAcquisition>) {
+    for file in &ended.held_files {
+        if !map.values().any(|record| record.held_files.contains(file)) {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
+/// Takes `joining` into `holders` of a hold whose own route is `own`, one entry per person
+/// (ignoring case): a person not listed is added; a listed person's entry is replaced by one heard
+/// later (keeping the album context and the routes it had), otherwise takes the album context it
+/// lacked, and either way takes in the routes the joining entry lists beside those it had. True
+/// when anything changed.
+fn merge_holders(holders: &mut Vec<Holder>, joining: Vec<Holder>, own: HoldRoute) -> bool {
     let mut changed = false;
     for holder in joining {
         if holder.user.trim().is_empty() {
@@ -552,12 +678,29 @@ fn merge_holders(holders: &mut Vec<Holder>, joining: Vec<Holder>) -> bool {
             (None, Some(_)) => true,
             (Some(was), Some(now)) => now.heard_at > was.heard_at,
         };
+        let routes: Vec<HoldRoute> = holder.routes.clone();
         if heard_later {
+            let context = known.context.take();
+            let had = std::mem::take(&mut known.routes);
             *known = holder;
+            if known.context.is_none() {
+                known.context = context;
+            }
+            known.routes = had;
             changed = true;
         } else if known.context.is_none() && holder.context.is_some() {
             known.context = holder.context;
             changed = true;
+        }
+        // A person kept in the hold by its own route only lists none; one more route lists both.
+        if known.routes.is_empty() && routes.iter().any(|route| *route != own) {
+            known.routes.push(own);
+        }
+        for route in routes {
+            if !known.routes.contains(&route) {
+                known.routes.push(route);
+                changed = true;
+            }
         }
     }
     changed
@@ -1005,6 +1148,98 @@ mod tests {
         reopened.release(&key);
         assert!(reopened.snapshot().is_empty());
         assert!(SoulseekHoldStore::new(Some(&path)).snapshot().is_empty());
+    }
+
+    /// A second record of a held key brings its files, their labels, its keeps and its line into
+    /// the hold, in one write; a hold that ends takes its files with it, except those another hold
+    /// names; at start, files of a hold's folder no hold names go, and a Lidarr follow's folder
+    /// is left alone.
+    #[test]
+    fn a_hold_takes_in_what_joins_it_and_its_files_end_with_it() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().join("held");
+        let folder = root.join("Track_soulseek_x");
+        std::fs::create_dir_all(&folder).expect("a folder");
+        let file = |name: &str| {
+            let path = folder.join(name);
+            std::fs::write(&path, b"x").expect("written");
+            path.to_string_lossy().into_owned()
+        };
+        let (first, second, shared) = (file("a.flac"), file("b.flac"), file("c.flac"));
+        let store = SoulseekHoldStore::new(None::<PathBuf>);
+        let mut record = held(HeldKind::Track, "x", 1);
+        record.waiting_for = Some(WaitingFor::AcoustId);
+        record.held_files = vec![first.clone()];
+        let key = store.hold(record.clone()).key();
+        let brought = HeldLidarrFile::of(&second, &LabelSource::None);
+        let kept = store.hold(HeldAcquisition {
+            held_files: vec![second.clone(), shared.clone()],
+            lidarr_files: vec![brought.clone()],
+            keep_requested: vec!["anna".into()],
+            line: Some("Waiting for AcoustID".into()),
+            holders: Vec::new(),
+            requested_by: None,
+            ..record.clone()
+        });
+        assert_eq!(kept.held_files, [first.clone(), second.clone(), shared.clone()]);
+        assert_eq!(kept.lidarr_files, [brought]);
+        assert_eq!(kept.keep_requested, ["anna"]);
+        assert_eq!(kept.line.as_deref(), Some("Waiting for AcoustID"));
+
+        // Another hold names one of its files: that one stays when this hold ends.
+        let mut other = held(HeldKind::Track, "x", 2);
+        other.waiting_for = Some(WaitingFor::NotYetProven);
+        other.held_files = vec![shared.clone()];
+        store.hold(other);
+        assert!(store.release_holder(&key, "brandon").is_none());
+        assert!(!Path::new(&first).exists() && !Path::new(&second).exists());
+        assert!(Path::new(&shared).exists(), "another hold names it");
+
+        // At start: a file no hold names goes, the named one stays, a follow's folder is not a hold's.
+        let stray = file("stray.flac");
+        let follow = root.join("lidarr-follow-x");
+        std::fs::create_dir_all(&follow).expect("a folder");
+        std::fs::write(follow.join("kept.flac"), b"x").expect("written");
+        assert_eq!(store.sweep_unnamed(&root), 1);
+        assert!(!Path::new(&stray).exists());
+        assert!(Path::new(&shared).exists());
+        assert!(follow.join("kept.flac").exists());
+    }
+
+    /// A person's entry replaced by one heard later keeps the album they listened from and the
+    /// hearts that keep them in the hold; a second route joins the first.
+    #[test]
+    fn a_holder_heard_later_keeps_their_context_and_routes() {
+        let store = SoulseekHoldStore::new(None::<PathBuf>);
+        let mut record = held(HeldKind::Track, "x", 1);
+        record.waiting_for = Some(WaitingFor::NotYetProven);
+        record.album_track = Some(HeldAlbumTrack::default());
+        record.holders = vec![Holder {
+            user: "brandon".into(),
+            context: Some(AlbumContext {
+                catalog_album_id: "302127".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let key = store.hold(record.clone()).key();
+        let kept = store.hold(HeldAcquisition {
+            holders: vec![Holder {
+                user: "Brandon".into(),
+                heard: Some(heard("v", 5)),
+                routes: vec![HoldRoute::Song],
+                ..Default::default()
+            }],
+            ..record
+        });
+        let holder = &kept.holders[0];
+        assert!(holder.heard.is_some());
+        assert_eq!(
+            holder.context.as_ref().map(|c| c.catalog_album_id.as_str()),
+            Some("302127")
+        );
+        assert_eq!(holder.routes, [HoldRoute::Album, HoldRoute::Song]);
+        assert_eq!(store.get(&key).expect("held").holders.len(), 1);
     }
 
     /// A file Lidarr brought with Lidarr writing its tags, or whose delivered copy was not read,
