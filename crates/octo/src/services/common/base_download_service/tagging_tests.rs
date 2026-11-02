@@ -146,6 +146,8 @@ struct Options {
     soulseek: SoulseekSettings,
     loudness: Option<Loudness>,
     layout: FolderStructure,
+    /// The albums template, for the Custom layout.
+    template: Option<&'static str>,
     /// The downloads log the download reports to, when a test reads it.
     tracker: Option<Arc<AcquisitionTracker>>,
 }
@@ -157,6 +159,7 @@ impl Default for Options {
             soulseek: SoulseekSettings::default(),
             loudness: Some(Loudness::new(-11.5, 6.3, -0.3)),
             layout: FolderStructure::Flat,
+            template: None,
             tracker: None,
         }
     }
@@ -172,6 +175,10 @@ async fn build_with_catalog(metadata: Arc<FakeMetadata>, server: MockServer, opt
     let settings = AppSettings {
         subsonic: SubsonicSettings {
             folder_structure: options.layout,
+            folder_template: options
+                .template
+                .unwrap_or(octo_core::common::layout::ORGANIZED)
+                .to_string(),
             download_mode: octo_core::settings::DownloadMode::Track,
             storage_mode: octo_core::settings::StorageMode::Permanent,
             ..Default::default()
@@ -833,6 +840,146 @@ async fn joining_an_album_folder_carries_the_albums_own_grouping_values() {
         (identity.album_id.as_deref(), identity.release_date.as_deref()),
         (Some(THEIRS), Some("2006-03-27"))
     );
+}
+
+/// An album sibling with its grouping values, at `relative` under the music folder, of disc
+/// `disc` of `discs` when given.
+fn sibling_in(root: &Path, relative: &str, album: &str, discs: Option<(u32, u32)>) -> String {
+    let path = root.join(relative);
+    std::fs::create_dir_all(path.parent().expect("a folder")).expect("made");
+    std::fs::write(&path, flac()).expect("written");
+    let mut file = TagFile::open(&path).expect("opens");
+    file.set_title(Some("Unfinished Sympathy"));
+    file.set_album(Some(album));
+    file.set_performers(&["Massive Attack".to_string()]);
+    file.set_album_artists(&["Massive Attack".to_string()]);
+    if let Some((disc, count)) = discs {
+        file.set_disc(disc);
+        file.set_disc_count(count);
+    }
+    set_vorbis(
+        &mut file,
+        "MUSICBRAINZ_ALBUMID",
+        "99999999-8888-4777-8666-555555555555",
+    );
+    set_vorbis(&mut file, "RELEASEDATE", "2006-03-27");
+    file.save().expect("saved");
+    path.to_string_lossy().into_owned()
+}
+
+/// A rehearsal download of Teardrop, which files it under the catalog's album `album`, in
+/// `layout` (with `template` for Custom).
+async fn sibling_rig(album: &str, layout: FolderStructure, template: Option<&'static str>) -> Tagging {
+    let tagging = build_with(
+        vec![("1", teardrop())],
+        serve(mezzanine_routes(album)).await,
+        Options {
+            layout,
+            template,
+            metadata: MetadataSettings {
+                tag_rehearsal: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .await;
+    let root = tagging.root().to_path_buf();
+    tagging.harness.backend.land(move |song, _| {
+        confirm(song, confirmed_teardrop());
+        landed_flac(&root, "peer share", |_| {})
+    });
+    tagging
+}
+
+fn grouping_of(path: &str) -> (Option<String>, Option<String>) {
+    let identity = KeptIdentityTags::read(Path::new(path), None).expect("reads");
+    (identity.album_id, identity.release_date)
+}
+
+fn their_grouping() -> (Option<String>, Option<String>) {
+    (
+        Some("99999999-8888-4777-8666-555555555555".to_string()),
+        Some("2006-03-27".to_string()),
+    )
+}
+
+/// The album's folder was named by an older Octo, with a character Windows refuses: identify
+/// still finds the sibling there, and the new track joins it.
+#[cfg(unix)]
+#[tokio::test]
+async fn sibling_found_in_old_named_album_folder() {
+    let tagging = sibling_rig("Collected?", FolderStructure::Organized, None).await;
+    sibling_in(
+        tagging.root(),
+        "Massive Attack/Collected?/01 - Unfinished Sympathy.flac",
+        "Collected?",
+        None,
+    );
+
+    let path = tagging.download("1").await.expect("downloaded");
+
+    assert_eq!(
+        Path::new(&path).parent(),
+        Some(tagging.root().join("Massive Attack/Collected?").as_path())
+    );
+    assert_eq!(grouping_of(&path), their_grouping());
+}
+
+#[tokio::test]
+async fn custom_album_folder_joins_its_sibling() {
+    let tagging = sibling_rig(
+        "Collected",
+        FolderStructure::Custom,
+        Some("{Album Artist} - {Album}/{Track:00} - {Title}"),
+    )
+    .await;
+    sibling_in(
+        tagging.root(),
+        "Massive Attack - Collected/01 - Unfinished Sympathy.flac",
+        "Collected",
+        None,
+    );
+
+    let path = tagging.download("1").await.expect("downloaded");
+
+    assert_eq!(
+        Path::new(&path).parent(),
+        Some(tagging.root().join("Massive Attack - Collected").as_path())
+    );
+    assert_eq!(grouping_of(&path), their_grouping());
+}
+
+/// A disc 1 track whose release did not say how many discs there are joins an album already
+/// filed by disc in disc 1's folder, and takes the album's disc count from its sibling.
+#[tokio::test]
+async fn disc_folder_is_consistent_when_the_count_is_unknown() {
+    let tagging = sibling_rig(
+        "Collected",
+        FolderStructure::Custom,
+        Some("{Artist}/{Album}/Disc {Disc}/{Track:00} - {Title}"),
+    )
+    .await;
+    sibling_in(
+        tagging.root(),
+        "Massive Attack/Collected/Disc 1/01 - Unfinished Sympathy.flac",
+        "Collected",
+        Some((1, 2)),
+    );
+    sibling_in(
+        tagging.root(),
+        "Massive Attack/Collected/Disc 2/01 - Safe From Harm.flac",
+        "Collected",
+        Some((2, 2)),
+    );
+
+    let path = tagging.download("1").await.expect("downloaded");
+
+    assert_eq!(
+        Path::new(&path).parent(),
+        Some(tagging.root().join("Massive Attack/Collected/Disc 1").as_path())
+    );
+    assert_eq!(vorbis(&path, "DISCTOTAL").as_deref(), Some("2"));
 }
 
 /// "Money Trees" twice in the catalog: the explicit copy first, then the clean edit, each with

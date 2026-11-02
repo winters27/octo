@@ -22,6 +22,7 @@ use std::path::Path;
 use octo_core::fingerprint::VerificationResult;
 use octo_core::models::domain::Song;
 
+use octo_core::common::layout::song_year;
 use octo_core::common::song_identity::SongIdentity;
 
 use octo_core::common::dotnet::is_null_or_white_space;
@@ -112,7 +113,10 @@ pub fn write_song(file: &mut TagFile, song: &Song, genres: &GenreWrite, filed_el
         }
     }
     release_fact_tags::drop_other_totals(file);
-    if let Some(year) = song.year {
+    // The year a file layout's `{Year}` shows: the song's own, else its release date's. The
+    // date tag carries the year alone; the full release date stays an album grouping value,
+    // written only as the album already in the library has it.
+    if let Some(year) = song_year(song) {
         file.set_year(year as u32);
         fields.push(&field_names::YEAR);
     }
@@ -311,7 +315,7 @@ pub fn write_album_facts(path: &Path, song: &Song) -> Result<(), TagError> {
     if blank(&song.original_date) {
         extras::clear_original_date(&mut file);
     }
-    if song.year.is_none() {
+    if song_year(song).is_none() {
         file.set_year(0);
     }
     if song.total_tracks.is_none() {
@@ -382,6 +386,37 @@ mod tests {
                 expected,
                 "{rehearsed}"
             );
+        }
+    }
+
+    /// A song with only a release date gets that date's year as its year tag, read back as a
+    /// file layout's `{Year}` reads it, in a FLAC and in an MP3; a song's own year wins.
+    #[test]
+    fn the_year_tag_is_the_year_a_file_layout_shows() {
+        use crate::tags::test_support::mp3;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        for (name, bytes) in [("song.flac", flac()), ("song.mp3", mp3())] {
+            for (year, expected) in [(None, 2018), (Some(2019), 2019)] {
+                let path = write(dir.path(), name, &bytes);
+                // The peer's own year, which the song's must replace.
+                let mut file = TagFile::open(&path).expect("opens");
+                file.set_year(1999);
+                file.save().expect("saved");
+                let song = Song {
+                    title: "All The Stars".into(),
+                    year,
+                    release_date: Some("2018-02-09".into()),
+                    ..Default::default()
+                };
+                let mut file = TagFile::open(&path).expect("opens");
+                write_song(&mut file, &song, &GenreWrite::Keep, false);
+                file.save().expect("saved");
+                assert_eq!(
+                    TagFile::open(&path).expect("opens").year(),
+                    expected,
+                    "{name} {year:?}"
+                );
+            }
         }
     }
 

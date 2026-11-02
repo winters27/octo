@@ -382,22 +382,31 @@ impl LibraryActionJournal {
     /// Follow a folder the library tidy moved: an action's source and revealed paths name
     /// where the file is now. Answers how many entries followed.
     pub fn move_paths(&self, from: &str, to: &str) -> usize {
+        self.move_paths_batch(&[(from.to_string(), to.to_string())])
+    }
+
+    /// [`Self::move_paths`] for each `(from, to)` in order, so `a` to `b` then `b` to `c` ends at
+    /// `c`, with the journal marked for saving once. Answers how many entries followed, each move
+    /// counted on its own.
+    pub fn move_paths_batch(&self, moves: &[(String, String)]) -> usize {
         let mut moved = 0;
         {
             let mut entries = self.entries.lock();
-            for entry in entries.by_key.values_mut() {
-                let mut changed = false;
-                for path in [&mut entry.source_path, &mut entry.revealed_path] {
-                    if let Some(now) = path
-                        .as_deref()
-                        .and_then(|old| octo_core::common::PathHelper::moved_path(old, from, to))
-                    {
-                        *path = Some(now);
-                        changed = true;
+            for (from, to) in moves {
+                for entry in entries.by_key.values_mut() {
+                    let mut changed = false;
+                    for path in [&mut entry.source_path, &mut entry.revealed_path] {
+                        if let Some(now) = path
+                            .as_deref()
+                            .and_then(|old| octo_core::common::PathHelper::moved_path(old, from, to))
+                        {
+                            *path = Some(now);
+                            changed = true;
+                        }
                     }
-                }
-                if changed {
-                    moved += 1;
+                    if changed {
+                        moved += 1;
+                    }
                 }
             }
         }

@@ -752,12 +752,20 @@ impl TagEditJournal {
     /// Follow a folder the library tidy moved, so an undo of an edit still finds its file.
     /// Answers how many entries followed.
     pub fn move_paths(&self, from: &str, to: &str) -> usize {
+        self.move_paths_batch(&[(from.to_string(), to.to_string())])
+    }
+
+    /// [`Self::move_paths`] for each `(from, to)` in order, so `a` to `b` then `b` to `c` ends at
+    /// `c`, saved once. Answers how many entries followed, each move counted on its own.
+    pub fn move_paths_batch(&self, moves: &[(String, String)]) -> usize {
         let mut entries = self.entries.lock();
         let mut moved = 0;
-        for entry in entries.iter_mut() {
-            if let Some(now) = octo_core::common::PathHelper::moved_path(&entry.path, from, to) {
-                entry.path = now;
-                moved += 1;
+        for (from, to) in moves {
+            for entry in entries.iter_mut() {
+                if let Some(now) = octo_core::common::PathHelper::moved_path(&entry.path, from, to) {
+                    entry.path = now;
+                    moved += 1;
+                }
             }
         }
         if moved > 0 {

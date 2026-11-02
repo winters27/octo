@@ -324,13 +324,15 @@ echo
 # Storage / layout (keep the simple defaults visible)
 # ─────────────────────────────────────────────────────────────────
 bold "─── Storage / layout ───────────────────────────────────────"
-echo "  Stream     — preview only; star a song to download (recommended)"
-echo "  Permanent  — download every song you play"
-echo "  Cache      — temporary, auto-cleanup"
+echo "  Stream     plays songs from outside your library; star one to download it (recommended)"
+echo "  Permanent  downloads every song you play"
+echo "  Cache      keeps songs you play for a while, then cleans them up"
 STORAGE_MODE=$(ask "Storage mode" "$(existing STORAGE_MODE "Stream")")
 echo
-echo "  Flat       — Artist - Title.flac (no subfolders, easier to browse)"
-echo "  Organized  — Artist/Title/file.flac"
+echo "  Flat       Artist - Title.flac, all in one folder (easier to browse)"
+echo "  ByArtist   Artist/Title.flac, a folder per artist"
+echo "  Organized  Artist/Album/01 - Title.flac"
+echo "  Custom     your own layout, set later on the dashboard (Library folder, File layout)"
 FOLDER_STRUCTURE=$(ask "Folder layout" "$(existing FOLDER_STRUCTURE "Flat")")
 echo
 

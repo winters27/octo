@@ -1,9 +1,11 @@
-//! "Tidy artists": preview, apply, resume, cancel and undo, and the paged preview.
+//! The library tidy, for its two tasks (Artists, File layout): preview, apply, resume, cancel and
+//! undo, and the paged preview.
 //!
 //! Every endpoint needs a Navidrome admin sign-in: these read and change library files. Apply
-//! does only what a finished preview of the same files showed, never against a Navidrome older
-//! than 0.55, never while another library job writes the music folder, and for the whole
-//! library only with the music path typed back.
+//! does only what a finished preview of the same task and files showed, never against a
+//! Navidrome older than 0.55, never while another library job writes the music folder, for the
+//! File layout only with the layout the preview was made with, and for the whole library only with
+//! the music path typed back.
 
 use std::time::Duration;
 
@@ -21,7 +23,7 @@ use crate::app::AppState;
 use crate::http::routes::RouteSet;
 use crate::services::library::library_write_gate::LibraryWriteGate;
 use crate::services::library::tidy::planner::{TidyKind, TidyRow};
-use crate::services::library::tidy::{TidyMode, TidyRequest, TidyScope, TidyStatus, TidyWorker};
+use crate::services::library::tidy::{TidyMode, TidyRequest, TidyScope, TidyStatus, TidyTask, TidyWorker};
 use crate::services::subsonic::navidrome_version;
 
 pub fn routes() -> RouteSet {
@@ -42,10 +44,13 @@ const ALREADY_RUNNING: &str = "A library tidy is already running.";
 #[serde(default)]
 struct TidyBody {
     scope: Option<String>,
+    task: Option<String>,
     confirm: Option<String>,
     ticked: Option<Vec<String>>,
     excluded: Option<Vec<String>>,
     all_runs: bool,
+    /// The run an Undo was shown for (`undoRun`).
+    run: Option<String>,
 }
 
 impl FromBody for TidyBody {
@@ -55,6 +60,10 @@ impl FromBody for TidyBody {
         members: &[
             Member {
                 name: "scope",
+                kind: Kind::Text,
+            },
+            Member {
+                name: "task",
                 kind: Kind::Text,
             },
             Member {
@@ -72,6 +81,10 @@ impl FromBody for TidyBody {
             Member {
                 name: "allRuns",
                 kind: Kind::Bool,
+            },
+            Member {
+                name: "run",
+                kind: Kind::Text,
             },
         ],
     };
@@ -112,19 +125,30 @@ async fn preview(State(state): State<AppState>, request: Request) -> Response {
         Err(answer) => return answer,
     };
     let scope = TidyScope::parse(body.scope.as_deref());
+    let task = TidyTask::parse(body.task.as_deref());
+    if task == TidyTask::FileLayout
+        && let Some(why) = worker(&state).layout_refusal(TidyMode::Preview)
+    {
+        return error(StatusCode::BAD_REQUEST, why);
+    }
     let request = TidyRequest {
         mode: TidyMode::Preview,
         scope,
+        task,
         excluded: body.excluded.unwrap_or_default(),
         ..TidyRequest::default()
     };
     if !worker(&state).try_enqueue(request) {
         return error(StatusCode::CONFLICT, ALREADY_RUNNING);
     }
-    info!("Library tidy preview requested: scope {}", scope.name());
+    info!(
+        "Library tidy preview requested: {} task, scope {}",
+        task.name(),
+        scope.name()
+    );
     status(
         StatusCode::ACCEPTED,
-        &json!({ "started": true, "scope": scope.name(), "mode": "Preview" }),
+        &json!({ "started": true, "scope": scope.name(), "task": task.name(), "mode": "Preview" }),
     )
 }
 
@@ -139,6 +163,7 @@ async fn apply(State(state): State<AppState>, request: Request) -> Response {
         Err(answer) => return *answer,
     };
     let scope = TidyScope::parse(body.scope.as_deref());
+    let task = TidyTask::parse(body.task.as_deref());
     if let Some(refused) = path_typed_back(&state, scope, body.confirm.as_deref()) {
         return refused;
     }
@@ -147,11 +172,16 @@ async fn apply(State(state): State<AppState>, request: Request) -> Response {
         return error(StatusCode::CONFLICT, ALREADY_RUNNING);
     }
     let run = tidy.current();
-    if !run.is_finished_preview() || run.scope != scope {
+    if !run.is_finished_preview() || run.scope != scope || run.task != task {
         return error(
             StatusCode::BAD_REQUEST,
             "Preview first. Apply only does what a finished preview of the same files showed.",
         );
+    }
+    if task == TidyTask::FileLayout
+        && let Some(why) = tidy.layout_refusal(TidyMode::Apply)
+    {
+        return error(StatusCode::BAD_REQUEST, why);
     }
     if let Some(busy) = other_job_writing(&state) {
         return busy;
@@ -163,16 +193,21 @@ async fn apply(State(state): State<AppState>, request: Request) -> Response {
     let request = TidyRequest {
         mode: TidyMode::Apply,
         scope,
+        task,
         ticked: body.ticked.unwrap_or_default(),
         ..TidyRequest::default()
     };
     if !tidy.try_enqueue(request) {
         return error(StatusCode::CONFLICT, ALREADY_RUNNING);
     }
-    info!("Library tidy apply requested: scope {}", scope.name());
+    info!(
+        "Library tidy apply requested: {} task, scope {}",
+        task.name(),
+        scope.name()
+    );
     status(
         StatusCode::ACCEPTED,
-        &json!({ "started": true, "scope": scope.name(), "mode": "Apply" }),
+        &json!({ "started": true, "scope": scope.name(), "task": task.name(), "mode": "Apply" }),
     )
 }
 
@@ -194,12 +229,18 @@ async fn resume(State(state): State<AppState>, request: Request) -> Response {
     if let Some(refused) = path_typed_back(&state, run.scope, body.confirm.as_deref()) {
         return refused;
     }
+    if run.task == TidyTask::FileLayout
+        && let Some(why) = tidy.layout_refusal(TidyMode::Apply)
+    {
+        return error(StatusCode::BAD_REQUEST, why);
+    }
     if let Some(busy) = other_job_writing(&state) {
         return busy;
     }
     let request = TidyRequest {
         mode: TidyMode::Apply,
         scope: run.scope,
+        task: run.task,
         resume: true,
         ..TidyRequest::default()
     };
@@ -241,6 +282,7 @@ async fn undo(State(state): State<AppState>, request: Request) -> Response {
     let request = TidyRequest {
         mode: TidyMode::Undo,
         all_runs: body.all_runs,
+        run: body.run.filter(|run| !run.trim().is_empty()),
         ..TidyRequest::default()
     };
     if !tidy.try_enqueue(request) {
@@ -256,6 +298,7 @@ fn kind_name(kind: TidyKind) -> &'static str {
         TidyKind::Respell => "Respell",
         TidyKind::Rename => "Rename",
         TidyKind::Guest => "Guest",
+        TidyKind::Layout => "Layout",
         TidyKind::Skip => "Skip",
     }
 }
@@ -293,6 +336,7 @@ async fn get_tidy(State(state): State<AppState>, request: Request) -> Response {
         TidyKind::Respell,
         TidyKind::Rename,
         TidyKind::Guest,
+        TidyKind::Layout,
         TidyKind::Skip,
     ] {
         let count = plan.as_ref().map_or(0, |plan| {
@@ -306,6 +350,7 @@ async fn get_tidy(State(state): State<AppState>, request: Request) -> Response {
         "status": run.status.name(),
         "mode": run.mode.name(),
         "scope": run.scope.name(),
+        "task": run.task.name(),
         "pending": tidy.is_pending(),
         "phase": run.phase,
         "startedUtc": utc_opt(&run.started_utc),
@@ -314,8 +359,10 @@ async fn get_tidy(State(state): State<AppState>, request: Request) -> Response {
         "inScope": run.in_scope,
         "plannedRetags": run.planned_retags,
         "plannedMoves": run.planned_moves,
+        "plannedFileMoves": run.planned_file_moves,
         "retagged": run.retagged,
         "moved": run.moved,
+        "movedFiles": run.moved_files,
         "held": run.held,
         "failed": run.failed,
         "lookupsAsked": run.lookups_asked,
@@ -328,6 +375,11 @@ async fn get_tidy(State(state): State<AppState>, request: Request) -> Response {
         "previewed": run.is_finished_preview(),
         "canResume": run.can_resume() && plan.as_ref().is_some_and(|plan| plan.work.is_some()),
         "canUndo": tidy.journal().exists(),
+        "undoTask": tidy.journal().last_run_task().map(TidyTask::name),
+        // The run Undo puts back, which an Undo sends back, so a page another apply has gone past
+        // puts back nothing.
+        "undoRun": tidy.journal().last_run(),
+        "layoutRefusal": tidy.layout_refusal(TidyMode::Apply),
         "running": run.status == TidyStatus::Running,
         "otherJob": state.library_write_gate.job().filter(|holder| holder != TidyWorker::JOB_NAME),
         "navidromeVersion": gate.version,

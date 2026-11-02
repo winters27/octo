@@ -593,18 +593,30 @@ impl CoverUpgradeJournal {
     /// Follow a folder the library tidy moved: each entry names where its file is now. Answers
     /// how many entries followed.
     pub fn move_paths(&self, from: &str, to: &str) -> usize {
+        self.move_paths_batch(&[(from.to_string(), to.to_string())])
+    }
+
+    /// [`Self::move_paths`] for each `(from, to)` in order, so `a` to `b` then `b` to `c` ends at
+    /// `c`, with the journal read and rewritten once. Answers how many entries followed, each
+    /// move counted on its own.
+    pub fn move_paths_batch(&self, moves: &[(String, String)]) -> usize {
+        if moves.is_empty() {
+            return 0;
+        }
         let mut entries = self.read_all();
         let mut moved = 0;
-        for entry in &mut entries {
-            if let Some(now) = octo_core::common::PathHelper::moved_path(&entry.path, from, to) {
-                entry.path = now;
-                moved += 1;
+        for (from, to) in moves {
+            for entry in &mut entries {
+                if let Some(now) = octo_core::common::PathHelper::moved_path(&entry.path, from, to) {
+                    entry.path = now;
+                    moved += 1;
+                }
             }
         }
         if moved > 0 {
             entries.reverse();
             if let Err(failure) = self.rewrite(&entries) {
-                warn!("cover upgrade journal could not follow {from}: {failure}");
+                warn!("cover upgrade journal could not follow {}: {failure}", moves[0].0);
                 return 0;
             }
         }

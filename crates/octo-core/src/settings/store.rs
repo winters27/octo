@@ -7,6 +7,7 @@
 //! - [`SettingsStore::subscribe`]: every new snapshot;
 //! - [`SettingsStore::for_tests`] + [`SettingsStore::set`]: a store a test controls.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Weak};
@@ -19,6 +20,7 @@ use tracing::{error, info, warn};
 
 use super::AppSettings;
 use super::text::lower_invariant;
+use crate::common::layout::caps_to_remember;
 use crate::config::{ConfigNode, ConfigTree};
 use crate::json::dom::Node;
 
@@ -33,6 +35,10 @@ pub const DEFAULT_SETTINGS_PATH: &str = "/app/config/settings.json";
 
 /// Overrides [`DEFAULT_SETTINGS_PATH`], for running outside the container.
 pub const SETTINGS_PATH_ENV: &str = "OCTO_SETTINGS_PATH";
+
+/// The file beside settings.json that remembers the folder caps of every template the settings
+/// have held (`SubsonicSettings::layout_caps`), so they outlive an edit and a restart.
+pub const LAYOUT_CAPS_FILE: &str = "layout-caps.json";
 
 /// How long a burst of file changes must settle before the file is read again.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -89,6 +95,11 @@ struct Inner {
     spotiflac_changes: std::sync::atomic::AtomicU64,
     /// Serializes reloads, so two never interleave their reads and stores.
     reload_lock: Mutex<()>,
+    /// `layout-caps.json` beside settings.json; None for a test store.
+    layout_caps_path: Option<PathBuf>,
+    /// The folder caps every template the settings have held gives, beside the built-in ones
+    /// (`SubsonicSettings::layout_caps`), and whether the file is behind them.
+    layout_caps: Mutex<RememberedCaps>,
     /// The file watcher, kept alive for as long as the store is.
     watcher: Mutex<Option<Box<dyn notify::Watcher + Send>>>,
 }
@@ -136,7 +147,16 @@ impl SettingsStore {
         };
         let mut tree = base.clone();
         tree.merge(&file_layer);
-        let settings = bind_logged(&tree);
+        let layout_caps_path = settings_path.as_deref().map(layout_caps_path);
+        let layout_caps = Mutex::new(RememberedCaps {
+            caps: layout_caps_path
+                .as_deref()
+                .map(read_layout_caps)
+                .unwrap_or_default(),
+            unsaved: None,
+        });
+        let mut settings = bind_logged(&tree);
+        remember_layout_caps(&layout_caps, layout_caps_path.as_deref(), &mut settings);
         let settings = Arc::new(settings);
         let (tx, _) = watch::channel(settings.clone());
 
@@ -151,6 +171,8 @@ impl SettingsStore {
                 tx,
                 spotiflac_changes: std::sync::atomic::AtomicU64::new(0),
                 reload_lock: Mutex::new(()),
+                layout_caps_path,
+                layout_caps,
                 watcher: Mutex::new(None),
             }),
         }
@@ -172,6 +194,8 @@ impl SettingsStore {
                 tx,
                 spotiflac_changes: std::sync::atomic::AtomicU64::new(0),
                 reload_lock: Mutex::new(()),
+                layout_caps_path: None,
+                layout_caps: Mutex::new(RememberedCaps::default()),
                 watcher: Mutex::new(None),
             }),
         }
@@ -202,6 +226,22 @@ impl SettingsStore {
     /// settings.json's path; None for a test store.
     pub fn settings_path(&self) -> Option<&Path> {
         self.inner.settings_path.as_deref()
+    }
+
+    /// One line naming `layout-caps.json` and the error, while the caps are not saved; None once
+    /// they are. While they are not, each call tries the write once more before it answers (as
+    /// each settings reload does), so a fixed folder clears the line at the next look.
+    pub fn layout_caps_problem(&self) -> Option<String> {
+        let path = self.inner.layout_caps_path.as_deref()?;
+        let mut known = self.inner.layout_caps.lock();
+        if known.unsaved.is_some() {
+            save_layout_caps(&mut known, path);
+        }
+        let error = known.unsaved.clone()?;
+        Some(format!(
+            "Octo could not save {}, which remembers how older layouts shortened long folder names: {error}. It tries again each time the settings are read.",
+            path.display()
+        ))
     }
 
     /// The receiver sees every new snapshot: on every reload, changed or not, and every `set`.
@@ -321,7 +361,13 @@ impl Inner {
         };
         let mut tree = inner.base.clone();
         tree.merge(&file_layer);
-        let settings = Arc::new(bind_logged(&tree));
+        let mut settings = bind_logged(&tree);
+        remember_layout_caps(
+            &inner.layout_caps,
+            inner.layout_caps_path.as_deref(),
+            &mut settings,
+        );
+        let settings = Arc::new(settings);
         inner.tree.store(Arc::new(tree));
         let previous = inner.current.swap(settings.clone());
         Inner::note_spotiflac(inner, &previous, &settings);
@@ -348,6 +394,105 @@ fn bind_logged(tree: &ConfigTree) -> AppSettings {
         warn!(path = %w.path, "Setting {} could not be used, so a lower source or the default applies: {}", w.path, w.message);
     }
     settings
+}
+
+/// `layout-caps.json` beside `settings_path`.
+fn layout_caps_path(settings_path: &Path) -> PathBuf {
+    settings_path.parent().map_or_else(
+        || PathBuf::from(LAYOUT_CAPS_FILE),
+        |dir| dir.join(LAYOUT_CAPS_FILE),
+    )
+}
+
+/// The caps `layout-caps.json` remembers, a JSON list of numbers. A missing file remembers
+/// none, and so does one that does not read, with a warning: the next cap written replaces it.
+fn read_layout_caps(path: &Path) -> BTreeSet<usize> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BTreeSet::new(),
+        Err(e) => {
+            warn!(
+                "{} could not be read, so older layouts' folder caps are not known: {e}",
+                path.display()
+            );
+            return BTreeSet::new();
+        }
+    };
+    match serde_json::from_str::<Vec<usize>>(&text) {
+        Ok(caps) => caps.into_iter().collect(),
+        Err(e) => {
+            warn!(
+                "{} is not a list of numbers, so older layouts' folder caps are not known: {e}",
+                path.display()
+            );
+            BTreeSet::new()
+        }
+    }
+}
+
+/// Writes `caps` to `path` as a sorted JSON list, through a temporary file renamed into place
+/// (removed again when the rename fails).
+fn write_layout_caps(path: &Path, caps: &BTreeSet<usize>) -> std::io::Result<()> {
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let list: Vec<String> = caps.iter().map(usize::to_string).collect();
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, format!("[{}]\n", list.join(", ")))?;
+    std::fs::rename(&temporary, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })
+}
+
+/// The caps remembered in `layout-caps.json`, beside the built-in ones.
+#[derive(Default)]
+struct RememberedCaps {
+    caps: BTreeSet<usize>,
+    /// Why the last write of `caps` failed: Some while the file is behind them, and each
+    /// settings reload writes it again until a write succeeds.
+    unsaved: Option<String>,
+}
+
+/// Adds the caps of the three templates in `settings` to the `known` ones, writes them to `path`
+/// when they grew or an earlier write failed, and gives `settings` every known cap
+/// (`SubsonicSettings::layout_caps`).
+fn remember_layout_caps(known: &Mutex<RememberedCaps>, path: Option<&Path>, settings: &mut AppSettings) {
+    let subsonic = &mut settings.subsonic;
+    let mut known = known.lock();
+    let before = known.caps.len();
+    known.caps.extend(caps_to_remember([
+        subsonic.folder_template.as_str(),
+        subsonic.folder_template_singles.as_str(),
+        subsonic.folder_template_compilations.as_str(),
+    ]));
+    if let Some(path) = path
+        && (known.caps.len() > before || known.unsaved.is_some())
+    {
+        save_layout_caps(&mut known, path);
+    }
+    subsonic.layout_caps = known.caps.iter().copied().collect();
+}
+
+/// Writes the known caps to `path` once: a success clears why the last write failed, and a
+/// failure keeps why, logged when the reason is new.
+fn save_layout_caps(known: &mut RememberedCaps, path: &Path) {
+    match write_layout_caps(path, &known.caps) {
+        Ok(()) => {
+            if known.unsaved.take().is_some() {
+                info!("{} is written now", path.display());
+            }
+        }
+        Err(e) => {
+            let error = e.to_string();
+            if known.unsaved.as_deref() != Some(error.as_str()) {
+                warn!(
+                    "Could not write {}: {error}. Octo tries again each time the settings are read.",
+                    path.display()
+                );
+            }
+            known.unsaved = Some(error);
+        }
+    }
 }
 
 /// The process environment, with names and values that are not UTF-8 read lossily.

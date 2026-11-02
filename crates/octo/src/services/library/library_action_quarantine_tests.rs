@@ -487,3 +487,42 @@ fn sidecars_go_to_the_trash_with_the_song_and_come_back() {
     std::fs::write(format!("{folder}/03 - Digital Love.mp3"), "the other copy").expect("written");
     assert!(LibraryActionQuarantine::sidecars_of(&file.absolute_path).is_empty());
 }
+
+/// Put back never makes a second name that Windows and SMB read as one already there: a file of
+/// the song's name in other capitals, or (on a disk that tells capitals apart) its folder by
+/// another spelling.
+#[test]
+fn restore_refuses_a_case_twin() {
+    let f = Fixture::new();
+    let track = f.write_track("Artist/Album/Song.flac", 1024);
+    let quarantine = default_quarantine();
+    let trashed = quarantine
+        .move_file(&track, &f.root, LibraryAction::Delete, "alice")
+        .quarantine_path
+        .expect("a path");
+    f.write_track("Artist/Album/SONG.flac", 2048);
+
+    let restored = quarantine.restore(&trashed, None);
+    assert!(!restored.moved);
+    assert!(exists(&trashed), "it stays in the trash");
+    assert!(!restored.error.unwrap_or_default().is_empty());
+
+    #[cfg(unix)]
+    {
+        let track = f.write_track("Other/Album/Song.flac", 1024);
+        let trashed = quarantine
+            .move_file(&track, &f.root, LibraryAction::Delete, "alice")
+            .quarantine_path
+            .expect("a path");
+        let _ = std::fs::remove_dir_all(format!("{}/Other", f.root));
+        f.write_track("other/Album/Else.flac", 10);
+
+        let restored = quarantine.restore(&trashed, None);
+        assert!(!restored.moved);
+        assert!(!exists(&format!("{}/Other", f.root)), "no twin folder made");
+        assert_eq!(
+            restored.error.as_deref(),
+            Some("something of the same name in other capitals is already at the original path")
+        );
+    }
+}

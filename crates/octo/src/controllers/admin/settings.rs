@@ -11,11 +11,12 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Response;
 use octo_core::common::dotnet::{is_blank, ordinal_ignore_case_key, utf16_len};
+use octo_core::common::layout::Layout;
 use octo_core::json::dom::Node;
 use octo_core::settings::{
-    AnimatedArtMode, FamilySettings, GenreMatchMode, JsonObject, LastFmUserSession, LibraryAction,
-    LibraryActionSettings, ListeningSettings, LyricsSaveTo, PrefetchScope, PrefetchSettings,
-    SettingsWriteError, SpotiflacSettings,
+    AnimatedArtMode, FamilySettings, FolderStructure, GenreMatchMode, JsonObject, LastFmUserSession,
+    LibraryAction, LibraryActionSettings, ListeningSettings, LyricsSaveTo, PrefetchScope, PrefetchSettings,
+    SettingsWriteError, SpotiflacSettings, SubsonicSettings,
 };
 use std::collections::HashSet;
 use tracing::{error, info, warn};
@@ -203,6 +204,12 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             ),
             ("LibraryPath", n_str(&subsonic.library_path)),
             ("FolderStructure", name(subsonic.folder_structure)),
+            ("FolderTemplate", n_str(&subsonic.folder_template)),
+            ("FolderTemplateSingles", n_str(&subsonic.folder_template_singles)),
+            (
+                "FolderTemplateCompilations",
+                n_str(&subsonic.folder_template_compilations),
+            ),
             ("UseLocalStaging", Node::Bool(subsonic.use_local_staging)),
             ("ExplicitFilter", name(subsonic.explicit_filter)),
             ("CacheDurationHours", n_num(subsonic.cache_duration_hours)),
@@ -758,6 +765,15 @@ pub async fn get_settings(State(state): State<AppState>) -> Response {
             ("ConfigFileValid", Node::Bool(state.settings_writer.is_readable())),
             // Restart-only settings whose saved value has not reached the running services.
             ("RestartPending", n_str_array(&pending)),
+            // Why layout-caps.json beside settings.json is not saved, for the File layout card;
+            // null while it is.
+            (
+                "LayoutCapsProblem",
+                state
+                    .settings
+                    .layout_caps_problem()
+                    .map_or(Node::Null, |line| n_str(&line)),
+            ),
             // What a saved-but-hidden secret reads as, so the dashboard can recognize it.
             ("SecretPlaceholder", n_str(SECRET_PLACEHOLDER)),
             // So a bug report can name a build.
@@ -1163,6 +1179,49 @@ fn taken_folders(state: &AppState) -> Vec<std::path::PathBuf> {
     taken
 }
 
+/// Why a save would leave a Custom file layout that does not parse: the field and the words, or
+/// None. The request's Subsonic values are read over the saved ones (keys in any case), so a save
+/// that only switches to Custom is checked against the templates already saved, and a save on any
+/// other layout is never refused for a template.
+pub fn layout_refusal(patch: &JsonObject, current: &SubsonicSettings) -> Option<(&'static str, String)> {
+    let section = child(patch, "Subsonic");
+    let text = |name: &str, saved: &str| -> String {
+        section
+            .and_then(|subsonic| {
+                key_of(subsonic, name).and_then(|key| string_value(subsonic.get(&key)).map(str::to_string))
+            })
+            .unwrap_or_else(|| saved.to_string())
+    };
+    let saved_structure = match current.folder_structure {
+        FolderStructure::Flat => "Flat",
+        FolderStructure::ByArtist => "ByArtist",
+        FolderStructure::Organized => "Organized",
+        FolderStructure::Custom => "Custom",
+    };
+    if !text("FolderStructure", saved_structure)
+        .trim()
+        .eq_ignore_ascii_case("Custom")
+    {
+        return None;
+    }
+    let layout = Layout::custom_or_preset(
+        FolderStructure::Custom,
+        &text("FolderTemplate", &current.folder_template),
+        &text("FolderTemplateSingles", &current.folder_template_singles),
+        &text(
+            "FolderTemplateCompilations",
+            &current.folder_template_compilations,
+        ),
+    );
+    let problem = layout.problems().first()?;
+    let label = match problem.setting {
+        "FolderTemplateSingles" => "Singles",
+        "FolderTemplateCompilations" => "Compilations",
+        _ => "Albums",
+    };
+    Some((problem.setting, format!("{label}: {}", problem.message)))
+}
+
 /// `POST /api/admin/settings`: writes a partial settings patch to the JSON file. The body
 /// shape matches the GET; any subset of keys may be supplied. The live settings are read again
 /// before the answer, so the very next request sees the save, but services that captured a
@@ -1236,6 +1295,12 @@ pub async fn save_settings(
         && let Some(message) = validate_spotiflac_token(spotiflac_patch)
     {
         return Ok(error_json(StatusCode::BAD_REQUEST, message));
+    }
+    if let Some((field, message)) = layout_refusal(&patch, &current.subsonic) {
+        let mut answer = JsonObject::new();
+        answer.insert("error".into(), n_str(&message));
+        answer.insert("field".into(), n_str(field));
+        return Ok(json_node(StatusCode::BAD_REQUEST, &Node::Object(answer)));
     }
 
     drop_untouched_answer_actions(&mut patch);
@@ -1654,5 +1719,69 @@ mod tests {
             Some("alice")
         );
         assert_eq!(session_key_typed_into_placeholder(&obj("{}")), None);
+    }
+
+    /// The File layout card fills its fields from the settings answer: the layout and its three
+    /// templates as they are saved, through the real handler.
+    #[tokio::test]
+    async fn the_settings_answer_carries_the_three_layout_templates() {
+        use super::super::test_app::{app, get};
+
+        let albums = "{Artist}/{Album} ({Year})/{Track:00} - {Title}";
+        let singles = "{Artist}/Singles/{Title}";
+        let compilations = "Compilations/{Album}/{Track:00} - {Track Artist} - {Title}";
+        let mut settings = octo_core::settings::AppSettings::default();
+        settings.subsonic.folder_structure = FolderStructure::Custom;
+        settings.subsonic.folder_template = albums.to_string();
+        settings.subsonic.folder_template_singles = singles.to_string();
+        settings.subsonic.folder_template_compilations = compilations.to_string();
+        let reply = get(&app(AppState::for_tests(settings)), "/api/admin/settings").await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        let document = reply.json();
+        let subsonic = &document["Subsonic"];
+        assert_eq!(subsonic["FolderStructure"], "Custom");
+        assert_eq!(subsonic["FolderTemplate"], albums);
+        assert_eq!(subsonic["FolderTemplateSingles"], singles);
+        assert_eq!(subsonic["FolderTemplateCompilations"], compilations);
+        assert!(document["_meta"]["LayoutCapsProblem"].is_null());
+    }
+
+    /// A settings store that could not write layout-caps.json (a folder of that name is in the
+    /// way) gives its line in the settings answer, for the File layout card.
+    #[tokio::test]
+    async fn the_settings_answer_says_why_layout_caps_are_not_saved() {
+        use super::super::test_app::{app, get};
+        use octo_core::settings::SettingsStore;
+        use octo_core::settings::store::LAYOUT_CAPS_FILE;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"Subsonic": {"FolderStructure": "Custom", "FolderTemplate": "{Artist}/{Album}/{Disc:00}-{Track:00} - {Track Artist} - {Title}"}}"#,
+        )
+        .expect("settings.json");
+        std::fs::create_dir(dir.path().join(LAYOUT_CAPS_FILE)).expect("a folder in the way");
+        let store = SettingsStore::from_env(vec![("Admin__SignIn".into(), "off".into())], Some(path));
+
+        let mut state = AppState::for_tests(octo_core::settings::AppSettings::default());
+        Arc::get_mut(&mut state.inner)
+            .expect("nothing else holds the test state yet")
+            .settings = Arc::new(store);
+        let reply = get(&app(state), "/api/admin/settings").await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        let document = reply.json();
+        let line = document["_meta"]["LayoutCapsProblem"]
+            .as_str()
+            .expect("the store's line");
+        assert!(
+            line.starts_with("Octo could not save ") && line.contains(LAYOUT_CAPS_FILE),
+            "{line}"
+        );
+        assert!(
+            line.ends_with("It tries again each time the settings are read."),
+            "{line}"
+        );
     }
 }

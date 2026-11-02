@@ -13,12 +13,20 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::planner::TidyTags;
+use super::store::TidyTask;
 use crate::services::state_file;
 
 /// One change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum TidyJournalEntry {
+    /// A run is about to change the library: what it is, so Undo says what it puts back. Fields
+    /// this Octo does not know (an `album` of earlier lines) are read past.
+    Begin {
+        run: String,
+        task: TidyTask,
+        at: DateTime<Utc>,
+    },
     /// A file's artist tags are about to be rewritten.
     Tags {
         path: String,
@@ -34,8 +42,20 @@ pub enum TidyJournalEntry {
         modified: DateTime<Utc>,
         run: String,
     },
-    /// An album folder is about to move.
+    /// A folder (or, with `file`, one file; with `pool`, a family pool file and every member's
+    /// link to it) is about to move.
     Move {
+        from: String,
+        to: String,
+        run: String,
+        at: DateTime<Utc>,
+        #[serde(default)]
+        file: bool,
+        #[serde(default)]
+        pool: bool,
+    },
+    /// A cover is about to be copied into a folder an album moved into.
+    Copy {
         from: String,
         to: String,
         run: String,
@@ -53,9 +73,11 @@ pub enum TidyJournalEntry {
 impl TidyJournalEntry {
     pub fn run(&self) -> &str {
         match self {
-            TidyJournalEntry::Tags { run, .. }
+            TidyJournalEntry::Begin { run, .. }
+            | TidyJournalEntry::Tags { run, .. }
             | TidyJournalEntry::Stamp { run, .. }
             | TidyJournalEntry::Move { run, .. }
+            | TidyJournalEntry::Copy { run, .. }
             | TidyJournalEntry::Playlist { run, .. } => run,
         }
     }
@@ -164,6 +186,27 @@ impl TidyJournal {
         self.read_all().last().map(|entry| entry.run().to_string())
     }
 
+    /// What the newest run did, by its first entry: a run journaled before the File layout task
+    /// was the Artists task's.
+    pub fn last_run_task(&self) -> Option<TidyTask> {
+        let entries = self.read_all();
+        let run = entries.last()?.run().to_string();
+        Some(task_of(&entries, &run))
+    }
+}
+
+/// The task of `run`, from its Begin entry; Artists when it has none.
+pub fn task_of(entries: &[TidyJournalEntry], run: &str) -> TidyTask {
+    entries
+        .iter()
+        .find_map(|entry| match entry {
+            TidyJournalEntry::Begin { run: of, task, .. } if of == run => Some(*task),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+impl TidyJournal {
     /// Replace the journal with these entries, oldest first: what an undo could not put back
     /// stays undoable. Written to a temporary file and moved into place.
     pub fn rewrite(&self, oldest_first: &[TidyJournalEntry]) -> io::Result<()> {
@@ -260,6 +303,8 @@ mod tests {
             to: "/m/B".into(),
             run: "r2".into(),
             at: Utc::now(),
+            file: false,
+            pool: false,
         };
         journal.append(&first).expect("written");
         journal.append(&second).expect("written");
@@ -271,6 +316,26 @@ mod tests {
 
         journal.rewrite(&[]).expect("emptied");
         assert!(!journal.exists());
+    }
+
+    /// A Begin line that names an album, as earlier lines did, reads back with its run and task.
+    #[test]
+    fn a_begin_line_naming_an_album_reads_back() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("tidy-journal.jsonl");
+        std::fs::write(
+            &path,
+            "{\"kind\":\"begin\",\"run\":\"r1\",\"task\":\"FileLayout\",\"album\":\"/m/A/One\",\"at\":\"2026-11-01T00:00:00Z\"}\n",
+        )
+        .expect("written");
+
+        let journal = TidyJournal::new(Some(path));
+
+        assert!(matches!(
+            &journal.read_all()[..],
+            [TidyJournalEntry::Begin { run, task: TidyTask::FileLayout, .. }] if run == "r1"
+        ));
+        assert_eq!(journal.last_run_task(), Some(TidyTask::FileLayout));
     }
 
     #[test]

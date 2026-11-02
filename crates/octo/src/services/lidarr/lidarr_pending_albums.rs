@@ -871,6 +871,13 @@ pub struct HeldPlacement {
     /// beside that file for them.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub proven_for: Vec<String>,
+    /// What the layout's names are filled from, so the file is filed against the folders there
+    /// when it is placed. None for a file held by an older Octo, placed at `target`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<octo_core::common::LayoutValues>,
+    /// The folder the layout files it under: the music folder, or the family pool's.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub root: String,
 }
 
 /// How many download ids of forgotten entries are still known as Octo's.
@@ -1989,7 +1996,7 @@ mod tests {
             kept: true,
             follows: covering,
             users: vec!["alice".into()],
-            proven_for: Vec::new(),
+            ..Default::default()
         });
         assert!(pending.kept_waits("rg-1"));
         assert_eq!(pending.kept_copies_waiting("soulseek:angel")[0].users, ["alice"]);
@@ -2038,7 +2045,7 @@ mod tests {
             kept: true,
             follows: vec!["rg-1".into()],
             users: users.iter().map(|user| (*user).to_string()).collect(),
-            proven_for: Vec::new(),
+            ..Default::default()
         };
         pending.hold_placement(held("shared", &["alice", "bob"]));
         pending.hold_placement(held("carols", &["carol"]));

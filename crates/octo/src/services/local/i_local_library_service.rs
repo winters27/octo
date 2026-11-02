@@ -135,6 +135,17 @@ pub trait ILocalLibraryService: Send + Sync {
         Ok(0)
     }
 
+    /// [`Self::update_local_path`] for each `(old, new)` in order, so `a` to `b` then `b` to `c`
+    /// ends at `c`. Answers how many mappings followed, each move counted on its own. By default
+    /// one move at a time; a service that saves its mappings saves them once for the batch.
+    async fn update_local_paths(&self, moves: &[(String, String)]) -> anyhow::Result<usize> {
+        let mut moved = 0;
+        for (old_path, new_path) in moves {
+            moved += self.update_local_path(old_path, new_path).await?;
+        }
+        Ok(moved)
+    }
+
     /// Starts a scan now, past any hold on Octo's own triggers: the scan the holder itself needs.
     async fn start_scan(&self) -> bool {
         self.trigger_library_scan(true).await

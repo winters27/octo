@@ -28,6 +28,8 @@ struct FakeNavidrome {
     /// The last scan's start and finish.
     last_scan: Mutex<(DateTime<Utc>, DateTime<Utc>)>,
     scans_finish: AtomicBool,
+    /// Navidrome says it is scanning, and never stops.
+    scanning: AtomicBool,
     starts: AtomicUsize,
     hold: ScanHold,
     on_start: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -41,6 +43,7 @@ impl FakeNavidrome {
             mappings: Mutex::new(Vec::new()),
             last_scan: Mutex::new((long_ago, long_ago + chrono::TimeDelta::seconds(1))),
             scans_finish: AtomicBool::new(true),
+            scanning: AtomicBool::new(false),
             starts: AtomicUsize::new(0),
             hold: ScanHold::new(),
             on_start: Mutex::new(None),
@@ -115,7 +118,7 @@ impl ILocalLibraryService for FakeNavidrome {
     async fn get_scan_status(&self) -> Option<ScanStatus> {
         let (start, finish) = *self.last_scan.lock();
         Some(ScanStatus {
-            scanning: false,
+            scanning: self.scanning.load(Ordering::SeqCst),
             count: Some(1),
             last_scan: Some(finish.to_rfc3339()),
             elapsed_time: (finish - start).num_nanoseconds(),
@@ -141,8 +144,11 @@ struct Rig {
     _dir: tempfile::TempDir,
     root: String,
     config: PathBuf,
+    settings: Arc<SettingsStore>,
     worker: TidyWorker,
     navidrome: Arc<FakeNavidrome>,
+    /// Run when the tidy lists Navidrome's songs, just before an apply's first change.
+    on_list: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
     notices: Arc<NoticeQueue>,
     genre: Arc<GenreBackfillJournal>,
     tag_edits: Arc<TagEditJournal>,
@@ -186,8 +192,12 @@ impl Rig {
         let tag_edits = Arc::new(TagEditJournal::new(Some(config.join("tag-edits.json"))));
         let history = Arc::new(DownloadHistoryService::new(config.join("history.json")));
         let songs: Arc<Mutex<HashMap<String, NavidromeSongEntry>>> = Arc::default();
-        let listed = songs.clone();
+        let on_list: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = Arc::default();
+        let (listed, hook) = (songs.clone(), on_list.clone());
         let list_songs: ListSongs = Arc::new(move || {
+            if let Some(hook) = hook.lock().as_ref() {
+                hook();
+            }
             let songs = listed.lock().clone();
             Box::pin(async move { songs })
         });
@@ -211,6 +221,11 @@ impl Rig {
                 lyrics_undo: Some(lyrics_undo.clone()),
                 explicit: Some(explicit.clone()),
                 quarantine: Some(Arc::new(LibraryActionQuarantine::new(settings.clone()))),
+                lidarr: Some(Arc::new(LidarrClient::new(settings.clone()))),
+                lidarr_pending: None,
+                identity: None,
+                family_pool: None,
+                lyrics_remap: Some(LyricsPathRemap::new()),
             },
         )
         .with_timing(quick());
@@ -219,8 +234,10 @@ impl Rig {
             _dir: dir,
             root: root.to_string_lossy().into_owned(),
             config,
+            settings,
             worker,
             navidrome,
+            on_list,
             notices,
             genre,
             tag_edits,
@@ -635,10 +652,10 @@ fn a_hidden_file_beside_the_songs_is_not_one_of_the_albums_songs() {
     std::fs::write(album.join(".octo-keep-0a1b.flac"), b"x").expect("written");
     std::fs::write(album.join(".hidden/02 - T.flac"), b"x").expect("written");
 
-    let contents = walk_all(&album).expect("walked");
+    let contents = walk_all(&album, &HashSet::new()).expect("walked");
     assert_eq!(
         contents.audio,
-        [album.join("01 - S.flac").to_string_lossy().into_owned()]
+        [format!("{}/01 - S.flac", album.to_string_lossy())]
     );
 }
 
@@ -1185,10 +1202,980 @@ fn remaining_a_restored_tag_entry_supersedes_newer_ones() {
         to: "/m/C".into(),
         run: "r2".into(),
         at: Utc::now(),
+        file: false,
+        pool: false,
     };
     let oldest_first = vec![tags_of("r1"), movement.clone(), tags_of("r2")];
 
     let left = remaining(&oldest_first, &[0].into());
 
     assert_eq!(left, [movement]);
+}
+
+#[test]
+fn walk_reads_a_three_dot_folder() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    for name in ["...And Justice for All/01 - One.flac", ".hidden/02 - Two.flac"] {
+        let file = dir.path().join(name);
+        std::fs::create_dir_all(file.parent().expect("a folder")).expect("made");
+        std::fs::write(&file, b"x").expect("written");
+    }
+    let found = walk(dir.path(), &AUDIO_EXTENSIONS).expect("walked");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].ends_with("...And Justice for All/01 - One.flac"),
+        "{found:?}"
+    );
+}
+
+// ---- the file layout ------------------------------------------------------------------------
+
+use octo_core::settings::FolderStructure;
+
+impl Rig {
+    fn set_layout(&self, structure: FolderStructure, template: &str) {
+        let mut settings = (*self.settings.current()).clone();
+        settings.subsonic.folder_structure = structure;
+        settings.subsonic.folder_template = template.to_string();
+        self.settings.set(settings);
+    }
+
+    /// Lidarr at `url`, its root folder the music folder.
+    fn set_lidarr(&self, url: &str) {
+        let mut settings = (*self.settings.current()).clone();
+        settings.lidarr.base_url = Some(url.to_string());
+        settings.lidarr.api_key = Some("key".to_string());
+        settings.lidarr.root_folder_path = Some(self.root.clone());
+        self.settings.set(settings);
+    }
+
+    /// A real, tagged FLAC of one album track, last written ten minutes ago.
+    fn track(&self, relative: &str, artist: &str, album: &str, title: &str, track: u32, year: u32) -> String {
+        let path = self.at(relative);
+        std::fs::create_dir_all(Path::new(&path).parent().expect("a folder")).expect("made");
+        std::fs::write(&path, &self.flac).expect("written");
+        let mut file = TagFile::open(&path).expect("opens");
+        file.set_performers(&[artist.to_string()]);
+        file.set_album_artists(&[artist.to_string()]);
+        file.set_album(Some(album));
+        file.set_title(Some(title));
+        file.set_track(track);
+        if year > 0 {
+            file.set_year(year);
+        }
+        file.save().expect("saved");
+        age(&path);
+        path
+    }
+
+    async fn layout_run(&self, mode: TidyMode, resume: bool) {
+        self.run(TidyRequest {
+            mode,
+            scope: WHOLE,
+            task: TidyTask::FileLayout,
+            resume,
+            ..TidyRequest::default()
+        })
+        .await;
+    }
+
+    fn on_list(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.on_list.lock() = Some(Box::new(hook));
+    }
+}
+
+fn completed(run: &TidyRun) {
+    assert_eq!(
+        run.status,
+        TidyStatus::Completed,
+        "{:?} {:?}",
+        run.reason,
+        run.errors
+    );
+}
+
+fn held_saying(run: &TidyRun, words: &str) -> bool {
+    run.held_rows.iter().any(|row| row.evidence.contains(words))
+}
+
+#[tokio::test]
+async fn file_layout_apply_moves_files_and_undo_puts_them_back() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(FolderStructure::Organized, "");
+    let source = rig.track(
+        "Daft Punk/Discovery/1 - One More Time.flac",
+        "Daft Punk",
+        "Discovery",
+        "One More Time",
+        1,
+        2001,
+    );
+    let lyrics = rig.at("Daft Punk/Discovery/1 - One More Time.lrc");
+    std::fs::write(&lyrics, "[00:01.00]one").expect("written");
+    rig.navidrome.own(&source);
+    rig.lyrics_undo
+        .record(&lyrics, LyricsUndoJournal::BESIDE, None, "l1")
+        .expect("recorded");
+    let target = rig.at("Daft Punk/Discovery/01 - One More Time.flac");
+    let moved_lyrics = rig.at("Daft Punk/Discovery/01 - One More Time.lrc");
+
+    rig.layout_run(TidyMode::Preview, false).await;
+    let run = rig.run_state();
+    completed(&run);
+    assert_eq!((run.task, run.planned_file_moves), (TidyTask::FileLayout, 1));
+    rig.layout_run(TidyMode::Apply, false).await;
+
+    let run = rig.run_state();
+    completed(&run);
+    assert_eq!(run.moved_files, 1);
+    assert!(exists(&target) && exists(&moved_lyrics));
+    assert!(!exists(&source) && !exists(&lyrics));
+    assert_eq!(rig.navidrome.mappings.lock()[0].local_path, target);
+    assert_eq!(rig.lyrics_undo.read_all().expect("read")[0].path, moved_lyrics);
+    assert_eq!(rig.worker.journal().last_run_task(), Some(TidyTask::FileLayout));
+
+    rig.undo(false).await;
+    let run = rig.run_state();
+    completed(&run);
+    assert_eq!(run.task, TidyTask::FileLayout);
+    assert!(exists(&source) && exists(&lyrics), "{:?}", run.held_rows);
+    assert!(!exists(&target) && !exists(&moved_lyrics));
+    assert_eq!(rig.navidrome.mappings.lock()[0].local_path, source);
+    assert_eq!(rig.lyrics_undo.read_all().expect("read")[0].path, lyrics);
+    assert!(!rig.worker.journal().exists());
+}
+
+#[tokio::test]
+async fn a_file_changed_after_the_scan_is_held() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(FolderStructure::Organized, "");
+    let source = rig.track("A/X/1 - Song.flac", "A", "X", "Song", 1, 0);
+    rig.layout_run(TidyMode::Preview, false).await;
+    std::fs::File::options()
+        .write(true)
+        .open(&source)
+        .and_then(|file| file.set_modified(SystemTime::now()))
+        .expect("touched");
+
+    rig.layout_run(TidyMode::Apply, false).await;
+
+    let run = rig.run_state();
+    completed(&run);
+    assert!(exists(&source));
+    assert!(held_saying(&run, "changed after Navidrome's last scan began"));
+}
+
+#[tokio::test]
+async fn a_held_folder_holds_its_file_moves() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(
+        FolderStructure::Custom,
+        "{Artist}/{Album} ({Year})/{Artist} - {Title}",
+    );
+    let source = rig.track("A/X/01 - Song.flac", "A", "X", "Song", 1, 2001);
+    rig.layout_run(TidyMode::Preview, false).await;
+    let plan = rig.worker.store().plan().expect("kept").plan;
+    assert_eq!(plan.moves.len(), 1);
+    assert_eq!(plan.file_moves.len(), 1);
+    // Something takes the folder's new name after the plan was checked again.
+    let taken = rig.at("A/X (2001)");
+    rig.on_list(move || {
+        let _ = std::fs::create_dir_all(&taken);
+    });
+
+    rig.layout_run(TidyMode::Apply, false).await;
+
+    let run = rig.run_state();
+    completed(&run);
+    assert!(exists(&source));
+    assert!(held_saying(&run, "already there"));
+    assert!(
+        held_saying(&run, "Its folder could not be moved"),
+        "{:?}",
+        run.held_rows
+    );
+}
+
+#[tokio::test]
+async fn apply_never_creates_a_case_twin_parent() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(FolderStructure::Organized, "");
+    let source = rig.track(
+        "Daft Punk - One More Time.flac",
+        "Daft Punk",
+        "Discovery",
+        "One More Time",
+        1,
+        0,
+    );
+    rig.layout_run(TidyMode::Preview, false).await;
+    let twin = rig.at("daft punk");
+    rig.on_list(move || {
+        let _ = std::fs::create_dir_all(&twin);
+    });
+
+    rig.layout_run(TidyMode::Apply, false).await;
+
+    let run = rig.run_state();
+    completed(&run);
+    assert!(exists(&source));
+    assert!(!exists(&rig.at("daft punk/Discovery")));
+    assert!(
+        held_saying(
+            &run,
+            "daft punk is already there with other capitals or characters"
+        ),
+        "{:?}",
+        run.held_rows
+    );
+}
+
+#[tokio::test]
+async fn a_file_only_run_triggers_a_scan_and_the_check() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(FolderStructure::Organized, "");
+    let source = rig.track("A/X/1 - Song.flac", "A", "X", "Song", 1, 0);
+    let entry = |path: &str, missing: bool| NavidromeSongEntry {
+        full_path: path.to_string(),
+        album_id: None,
+        artist: None,
+        title: None,
+        album: None,
+        lyrics: None,
+        id: Some("nd-1".to_string()),
+        duration: None,
+        explicit_status: None,
+        missing,
+    };
+    rig.songs.lock().insert(source.clone(), entry(&source, false));
+    {
+        let (songs, source) = (rig.songs.clone(), source.clone());
+        *rig.navidrome.on_start.lock() = Some(Box::new(move || {
+            if !Path::new(&source).exists() {
+                songs.lock().insert(source.clone(), entry(&source, true));
+            }
+        }));
+    }
+    rig.layout_run(TidyMode::Preview, false).await;
+    let starts = rig.navidrome.starts();
+
+    rig.layout_run(TidyMode::Apply, false).await;
+
+    let run = rig.run_state();
+    completed(&run);
+    assert_eq!((run.moved, run.moved_files), (0, 1));
+    assert!(rig.navidrome.starts() > starts);
+    assert!(
+        held_saying(&run, "did not match this moved song"),
+        "{:?}",
+        run.held_rows
+    );
+}
+
+#[tokio::test]
+async fn playlists_follow_a_folder_and_a_file_move() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(
+        FolderStructure::Custom,
+        "{Artist}/{Album} ({Year})/{Artist} - {Title}",
+    );
+    rig.track("A/X/01 - Song.flac", "A", "X", "Song", 1, 2001);
+    let playlist = rig.at("Mixes/road.m3u8");
+    std::fs::create_dir_all(rig.at("Mixes")).expect("made");
+    std::fs::write(&playlist, "#EXTM3U\n../A/X/01 - Song.flac\n").expect("written");
+
+    rig.layout_run(TidyMode::Preview, false).await;
+    rig.layout_run(TidyMode::Apply, false).await;
+
+    completed(&rig.run_state());
+    assert_eq!(
+        std::fs::read_to_string(&playlist).expect("read"),
+        "#EXTM3U\n../A/X (2001)/A - Song.flac\n"
+    );
+}
+
+#[tokio::test]
+async fn already_done_still_follows() {
+    let calm = ScanWaitTiming {
+        poll: Duration::from_millis(1),
+        timeout: Duration::from_millis(200),
+    };
+    let rig = Rig::with(audio_or_skip!("flac"), None, move |worker| {
+        worker.with_timing(calm)
+    });
+    rig.set_layout(FolderStructure::Organized, "");
+    let source = rig.track("A/X/1 - Song.flac", "A", "X", "Song", 1, 0);
+    let target = rig.at("A/X/01 - Song.flac");
+    rig.navidrome.own(&source);
+    rig.layout_run(TidyMode::Preview, false).await;
+    // The apply stops before it moves anything; the file is then found moved, its records not.
+    rig.navidrome.scanning.store(true, Ordering::SeqCst);
+    rig.layout_run(TidyMode::Apply, false).await;
+    assert_eq!(rig.run_state().status, TidyStatus::Failed);
+    std::fs::rename(&source, &target).expect("moved");
+    rig.navidrome.scanning.store(false, Ordering::SeqCst);
+
+    rig.layout_run(TidyMode::Apply, true).await;
+
+    completed(&rig.run_state());
+    assert_eq!(rig.navidrome.mappings.lock()[0].local_path, target);
+}
+
+#[tokio::test]
+async fn already_done_still_follows_for_the_artists_task() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.navidrome.scans_finish.store(false, Ordering::SeqCst);
+    let source = rig.collab();
+    rig.navidrome.own(&source);
+    rig.preview(WHOLE).await;
+    rig.apply(WHOLE, &[]).await;
+    assert_eq!(rig.run_state().status, TidyStatus::Failed);
+    // The folder is found moved, its records not.
+    std::fs::create_dir_all(rig.at("Bizarrap")).expect("made");
+    std::fs::rename(rig.at("Bizarrap, Rauw Alejandro/Album"), rig.at("Bizarrap/Album")).expect("moved");
+    rig.navidrome.scans_finish.store(true, Ordering::SeqCst);
+
+    rig.run(TidyRequest {
+        mode: TidyMode::Apply,
+        scope: WHOLE,
+        resume: true,
+        ..TidyRequest::default()
+    })
+    .await;
+
+    completed(&rig.run_state());
+    assert_eq!(
+        rig.navidrome.mappings.lock()[0].local_path,
+        rig.at("Bizarrap/Album/01 - Session.flac")
+    );
+}
+
+#[tokio::test]
+async fn a_changed_row_is_held_and_others_go() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(FolderStructure::Organized, "");
+    let first = rig.track("A/X/1 - Song.flac", "A", "X", "Song", 1, 0);
+    let second = rig.track("B/Y/1 - Other.flac", "B", "Y", "Other", 1, 0);
+    rig.layout_run(TidyMode::Preview, false).await;
+    // A new song in B's folder after the preview changes that row only.
+    rig.track("B/Y/2 - New.flac", "B", "Y", "New", 2, 0);
+
+    rig.layout_run(TidyMode::Apply, false).await;
+
+    let run = rig.run_state();
+    completed(&run);
+    assert!(!exists(&first) && exists(&rig.at("A/X/01 - Song.flac")));
+    assert!(exists(&second));
+    assert!(held_saying(
+        &run,
+        "Its songs changed since the preview. Preview again."
+    ));
+}
+
+#[tokio::test]
+async fn file_layout_apply_is_refused_for_another_task_or_a_changed_layout() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(FolderStructure::Organized, "");
+    let source = rig.track("A/X/1 - Song.flac", "A", "X", "Song", 1, 0);
+    rig.layout_run(TidyMode::Preview, false).await;
+    // The Artists task never applies a File layout preview.
+    rig.apply(WHOLE, &[]).await;
+    assert!(
+        rig.run_state()
+            .reason
+            .is_some_and(|why| why.contains("Preview first"))
+    );
+
+    rig.layout_run(TidyMode::Preview, false).await;
+    rig.set_layout(FolderStructure::Flat, "");
+    rig.layout_run(TidyMode::Apply, false).await;
+    let run = rig.run_state();
+    assert_eq!(run.status, TidyStatus::Failed);
+    assert_eq!(
+        run.reason.as_deref(),
+        Some("The File layout changed since the preview. Preview again.")
+    );
+    assert!(exists(&source));
+
+    // A layout with a problem is never planned with.
+    rig.set_layout(FolderStructure::Custom, "{Artst}/{Title}");
+    rig.layout_run(TidyMode::Preview, false).await;
+    let run = rig.run_state();
+    assert_eq!(run.status, TidyStatus::Failed);
+    assert!(
+        run.reason
+            .is_some_and(|why| why.starts_with("The Albums layout has a problem"))
+    );
+}
+
+// ---- Lidarr ---------------------------------------------------------------------------------
+
+mod lidarr {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    async fn answers(server: &MockServer, root: &str, artists: serde_json::Value, files: serde_json::Value) {
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rootfolder"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "id": 1, "path": root }])),
+            )
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/artist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(artists))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/trackfile"))
+            .and(query_param("artistId", "7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(files))
+            .mount(server)
+            .await;
+    }
+
+    fn artist(root: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "id": 7,
+            "foreignArtistId": "mbid",
+            "artistName": "Daft Punk",
+            "path": format!("{root}/Daft Punk"),
+            "monitored": true,
+        }])
+    }
+
+    fn track_file(path: &str) -> serde_json::Value {
+        serde_json::json!([{ "id": 1, "artistId": 7, "albumId": 1, "path": path, "size": 10 }])
+    }
+
+    #[tokio::test]
+    async fn file_layout_preview_fails_when_lidarr_does_not_answer() {
+        let rig = Rig::new(audio_or_skip!("flac"));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        rig.set_layout(FolderStructure::Organized, "");
+        rig.set_lidarr(&server.uri());
+        rig.track("A/X/1 - Song.flac", "A", "X", "Song", 1, 0);
+
+        rig.layout_run(TidyMode::Preview, false).await;
+
+        let run = rig.run_state();
+        assert_eq!(run.status, TidyStatus::Failed);
+        assert_eq!(
+            run.reason.as_deref(),
+            Some(
+                "Lidarr did not answer, so Octo cannot tell which songs Lidarr keeps. Preview again once it answers."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_move_into_a_lidarr_artist_added_since_the_preview_is_held() {
+        let rig = Rig::new(audio_or_skip!("flac"));
+        let server = MockServer::start().await;
+        answers(&server, &rig.root, serde_json::json!([]), serde_json::json!([])).await;
+        rig.set_layout(FolderStructure::Organized, "");
+        rig.set_lidarr(&server.uri());
+        let source = rig.track(
+            "Daft Punk - One More Time.flac",
+            "Daft Punk",
+            "Discovery",
+            "One More Time",
+            1,
+            0,
+        );
+        rig.layout_run(TidyMode::Preview, false).await;
+        completed(&rig.run_state());
+        // Lidarr adds the artist, with a song in the folder the move goes to.
+        let lidarr_song = format!("{}/Daft Punk/Discovery/02 - Aerodynamic.flac", rig.root);
+        answers(&server, &rig.root, artist(&rig.root), track_file(&lidarr_song)).await;
+
+        rig.layout_run(TidyMode::Apply, false).await;
+
+        let run = rig.run_state();
+        completed(&run);
+        assert!(exists(&source));
+        assert!(
+            held_saying(&run, "Lidarr keeps a song here now."),
+            "{:?}",
+            run.held_rows
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_asks_lidarr_for_the_remaining_rows() {
+        let calm = ScanWaitTiming {
+            poll: Duration::from_millis(1),
+            timeout: Duration::from_millis(200),
+        };
+        let rig = Rig::with(audio_or_skip!("flac"), None, move |worker| {
+            worker.with_timing(calm)
+        });
+        let server = MockServer::start().await;
+        answers(&server, &rig.root, artist(&rig.root), serde_json::json!([])).await;
+        rig.set_layout(FolderStructure::Organized, "");
+        rig.set_lidarr(&server.uri());
+        let source = rig.track(
+            "Daft Punk/Discovery/1 - One More Time.flac",
+            "Daft Punk",
+            "Discovery",
+            "One More Time",
+            1,
+            0,
+        );
+        rig.layout_run(TidyMode::Preview, false).await;
+        rig.navidrome.scanning.store(true, Ordering::SeqCst);
+        rig.layout_run(TidyMode::Apply, false).await;
+        assert_eq!(rig.run_state().status, TidyStatus::Failed);
+        // Lidarr took the song over meanwhile.
+        answers(&server, &rig.root, artist(&rig.root), track_file(&source)).await;
+        rig.navidrome.scanning.store(false, Ordering::SeqCst);
+
+        rig.layout_run(TidyMode::Apply, true).await;
+
+        let run = rig.run_state();
+        completed(&run);
+        assert!(exists(&source));
+        assert!(held_saying(&run, "Lidarr keeps a song here now."));
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|request| request.url.path().to_string())
+            .collect();
+        assert!(asked.iter().any(|path| path == "/api/v1/trackfile"));
+    }
+
+    #[tokio::test]
+    async fn apply_asks_lidarr_again_while_paused() {
+        let gate = LibraryWriteGate::new();
+        let shared = gate.clone();
+        let rig = Rig::with(audio_or_skip!("flac"), None, move |worker| {
+            worker.with_write_gate(shared)
+        });
+        let server = MockServer::start().await;
+        answers(&server, &rig.root, serde_json::json!([]), serde_json::json!([])).await;
+        rig.set_layout(FolderStructure::Organized, "");
+        rig.set_lidarr(&server.uri());
+        rig.track("A/X/1 - Song.flac", "A", "X", "Song", 1, 0);
+        rig.layout_run(TidyMode::Preview, false).await;
+        // Lidarr answers slowly at apply, so a placement can be let in meanwhile.
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/rootfolder"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{ "id": 1, "path": rig.root }]))
+                    .set_delay(Duration::from_millis(600)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/artist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let placed = async {
+            while rig.run_state().phase != "Asking Lidarr" {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            tokio::time::timeout(Duration::from_millis(400), gate.write())
+                .await
+                .is_ok()
+        };
+        let (placed, ()) = tokio::join!(placed, rig.layout_run(TidyMode::Apply, false));
+
+        assert!(placed, "a download waited while the tidy asked Lidarr");
+        completed(&rig.run_state());
+    }
+}
+
+// ---- a loose album of two discs -----------------------------------------------------------------
+
+impl Rig {
+    /// A two-disc album with every song loose in its folder, as placement leaves a disc 2 song
+    /// that comes after its album's loose disc 1: two songs of disc 1, one of disc 2, every file
+    /// Octo's.
+    fn loose_two_discs(&self) -> Vec<String> {
+        [
+            ("01 - One.flac", "One", 1, 1),
+            ("02 - Two.flac", "Two", 2, 1),
+            ("01 - Three.flac", "Three", 1, 2),
+        ]
+        .into_iter()
+        .map(|(name, title, track, disc)| {
+            let path = self.track(
+                &format!("Artist/Album/{name}"),
+                "Artist",
+                "Album",
+                title,
+                track,
+                0,
+            );
+            let mut file = TagFile::open(&path).expect("opens");
+            file.set_disc(disc);
+            file.set_disc_count(2);
+            file.save().expect("saved");
+            age(&path);
+            self.navidrome.own(&path);
+            path
+        })
+        .collect()
+    }
+
+    fn records(&self) -> Vec<String> {
+        self.navidrome
+            .mappings
+            .lock()
+            .iter()
+            .map(|mapping| mapping.local_path.clone())
+            .collect()
+    }
+}
+
+/// The disc folders the preview offers a loose two-disc album, applied by the person: every song
+/// moves into its disc's folder, with its lyrics, Octo's records and the playlists naming it, and
+/// Undo puts every song back.
+#[tokio::test]
+async fn applied_disc_folders_move_every_song_and_undo_puts_them_back() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(
+        FolderStructure::Custom,
+        "{Artist}/{Album}/Disc {Disc}/{Track:00} - {Title}",
+    );
+    let loose = rig.loose_two_discs();
+    let filed = [
+        rig.at("Artist/Album/Disc 1/01 - One.flac"),
+        rig.at("Artist/Album/Disc 1/02 - Two.flac"),
+        rig.at("Artist/Album/Disc 2/01 - Three.flac"),
+    ];
+    let lyrics = rig.at("Artist/Album/01 - One.lrc");
+    std::fs::write(&lyrics, "[00:01.00]one").expect("written");
+    let playlist = rig.at("Mixes/road.m3u");
+    std::fs::create_dir_all(rig.at("Mixes")).expect("made");
+    std::fs::write(&playlist, "../Artist/Album/01 - Three.flac\n").expect("written");
+
+    rig.layout_run(TidyMode::Preview, false).await;
+    let run = rig.run_state();
+    completed(&run);
+    assert_eq!(run.planned_file_moves, 3);
+    rig.layout_run(TidyMode::Apply, false).await;
+
+    let run = rig.run_state();
+    completed(&run);
+    assert_eq!(run.moved_files, 3);
+    for (was, now) in loose.iter().zip(&filed) {
+        assert!(exists(now) && !exists(was), "{now} {:?}", run.held_rows);
+    }
+    assert!(exists(&rig.at("Artist/Album/Disc 1/01 - One.lrc")) && !exists(&lyrics));
+    assert_eq!(rig.records(), filed);
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read_to_string(&playlist).expect("read"),
+        "../Artist/Album/Disc 2/01 - Three.flac\n"
+    );
+
+    rig.undo(false).await;
+
+    let run = rig.run_state();
+    completed(&run);
+    for (was, now) in loose.iter().zip(&filed) {
+        assert!(exists(was) && !exists(now), "{was} {:?}", run.held_rows);
+    }
+    assert!(exists(&lyrics));
+    assert_eq!(rig.records(), loose);
+    assert_eq!(
+        std::fs::read_to_string(&playlist).expect("read"),
+        "../Artist/Album/01 - Three.flac\n"
+    );
+    assert!(!rig.worker.journal().exists());
+}
+
+/// An Undo the page showed for one run puts nothing back once the last run is another, and the
+/// run it was shown for is put back when it is still the last.
+#[tokio::test]
+async fn an_undo_shown_for_another_run_puts_nothing_back() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(FolderStructure::Organized, "");
+    let source = rig.track("A/X/1 - Song.flac", "A", "X", "Song", 1, 0);
+    let target = rig.at("A/X/01 - Song.flac");
+    rig.layout_run(TidyMode::Preview, false).await;
+    rig.layout_run(TidyMode::Apply, false).await;
+    completed(&rig.run_state());
+    let last = rig.worker.journal().last_run().expect("journaled");
+    let undo = |run: &str| TidyRequest {
+        mode: TidyMode::Undo,
+        run: Some(run.to_string()),
+        ..TidyRequest::default()
+    };
+
+    rig.run(undo("an-older-run")).await;
+
+    let run = rig.run_state();
+    assert_eq!(run.status, TidyStatus::Failed);
+    assert_eq!(
+        run.reason.as_deref(),
+        Some(
+            "The last tidy changed since this page showed Undo, so nothing was put back. Look at what Undo puts back now."
+        )
+    );
+    assert!(exists(&target) && !exists(&source));
+
+    rig.run(undo(&last)).await;
+    completed(&rig.run_state());
+    assert!(exists(&source) && !exists(&target));
+}
+
+// ---- batched records ------------------------------------------------------------------------
+
+#[tokio::test]
+async fn one_save_per_group() {
+    let rig = Rig::new(audio_or_skip!("flac"));
+    rig.set_layout(FolderStructure::Organized, "");
+    for (name, title, track) in [("1 - One.flac", "One", 1), ("2 - Two.flac", "Two", 2)] {
+        let path = rig.track(&format!("A/X/{name}"), "A", "X", title, track, 0);
+        rig.history.record(DownloadHistoryEntry {
+            path,
+            ..DownloadHistoryEntry::default()
+        });
+    }
+    rig.layout_run(TidyMode::Preview, false).await;
+    let saves = rig.history.saves();
+
+    rig.layout_run(TidyMode::Apply, false).await;
+
+    let run = rig.run_state();
+    completed(&run);
+    assert_eq!(run.moved_files, 2);
+    assert_eq!(rig.history.saves(), saves + 1, "one folder, one save");
+    let paths: Vec<String> = rig
+        .history
+        .get_recent(10)
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    assert!(paths.contains(&rig.at("A/X/01 - One.flac")) && paths.contains(&rig.at("A/X/02 - Two.flac")));
+}
+
+// ---- the family pool --------------------------------------------------------------------------
+
+/// Members' songs: the pool's files are filed by the layout too, and each member's library
+/// joins the check after the moves.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pool_move_is_checked_in_each_member_library() {
+    use crate::services::family::test_support::World;
+
+    let flac = audio_or_skip!("flac");
+    let world = World::new(None);
+    let mut settings = (*world.settings.current()).clone();
+    settings.subsonic.folder_structure = FolderStructure::Organized;
+    world.settings.set(settings);
+    let old = world.pool_file("Artist/Album/1 - Song.flac", 1);
+    std::fs::write(&old, &flac).expect("written");
+    {
+        let mut file = TagFile::open(&old).expect("opens");
+        file.set_performers(&["Artist".to_string()]);
+        file.set_album(Some("Album"));
+        file.set_title(Some("Song"));
+        file.set_track(1);
+        file.save().expect("saved");
+    }
+    age(&old);
+    world.pool.link(&old, "alex").await.expect("linked");
+    let members = world.members();
+    let (was, now) = (
+        format!("{members}/alex/Artist/Album/1 - Song.flac"),
+        format!("{members}/alex/Artist/Album/01 - Song.flac"),
+    );
+    let new = format!("{}/Artist/Album/01 - Song.flac", world.pool.pool_root_path());
+
+    let navidrome = Arc::new(FakeNavidrome::new());
+    let entry = |path: &str, id: &str, missing: bool| NavidromeSongEntry {
+        full_path: path.to_string(),
+        album_id: None,
+        artist: None,
+        title: None,
+        album: None,
+        lyrics: None,
+        id: Some(id.to_string()),
+        duration: None,
+        explicit_status: None,
+        missing,
+    };
+    let songs: Arc<Mutex<HashMap<String, NavidromeSongEntry>>> = Arc::default();
+    songs.lock().insert(was.clone(), entry(&was, "nd-1", false));
+    {
+        // Navidrome sees the member's song gone from its old place and a new one at the new.
+        let (songs, was, now) = (songs.clone(), was.clone(), now.clone());
+        *navidrome.on_start.lock() = Some(Box::new(move || {
+            if !Path::new(&was).exists() {
+                let mut songs = songs.lock();
+                songs.insert(was.clone(), entry(&was, "nd-1", true));
+                songs.insert(now.clone(), entry(&now, "nd-2", false));
+            }
+        }));
+    }
+    let listed = songs.clone();
+    let list_songs: ListSongs = Arc::new(move || {
+        let songs = listed.lock().clone();
+        Box::pin(async move { songs })
+    });
+    let worker = TidyWorker::new(
+        Arc::new(TidyStore::new(None, None)),
+        Arc::new(TidyJournal::new(None)),
+        world.settings.clone(),
+        TidyServices {
+            library: Some(navidrome.clone()),
+            list_songs: Some(list_songs),
+            family_pool: Some(world.pool.clone()),
+            ..TidyServices::default()
+        },
+    )
+    .with_timing(quick());
+    let run = |mode| TidyRequest {
+        mode,
+        scope: WHOLE,
+        task: TidyTask::FileLayout,
+        ..TidyRequest::default()
+    };
+
+    worker
+        .run_once(run(TidyMode::Preview), &CancellationToken::new())
+        .await;
+    let plan = worker.store().plan().expect("kept").plan;
+    assert_eq!(plan.pool_moves.len(), 1, "{:?}", plan.rows);
+    assert!(plan.rows.iter().any(|row| row.path == "pool:Artist/Album"));
+    worker
+        .run_once(run(TidyMode::Apply), &CancellationToken::new())
+        .await;
+
+    let state = worker.current();
+    completed(&state);
+    assert_eq!(state.moved_files, 1);
+    assert!(Path::new(&new).is_file() && !Path::new(&old).exists());
+    assert!(std::fs::symlink_metadata(&now).is_ok(), "alex's link moved");
+    assert!(
+        state
+            .held_rows
+            .iter()
+            .any(|row| row.evidence.contains("did not match this moved song")),
+        "{:?}",
+        state.held_rows
+    );
+}
+
+/// The pool's files move while the job holds the gate whole: a download, a member's placement or
+/// a lyrics write that takes its share meanwhile never sees a song move under it. A file another
+/// pool change is working on (here one that then waits for the gate, as a promotion does) makes
+/// the folder wait for it, with the gate let go, and the folder moves once it is free; the
+/// lyrics jobs waiting are told where the songs went.
+#[tokio::test]
+async fn pool_moves_wait_for_a_busy_file_and_never_move_under_a_share() {
+    use crate::services::family::test_support::World;
+
+    let flac = audio_or_skip!("flac");
+    let world = World::new(None);
+    let mut settings = (*world.settings.current()).clone();
+    settings.subsonic.folder_structure = FolderStructure::Organized;
+    world.settings.set(settings);
+    let pool_root = world.pool.pool_root_path();
+    let mut olds = Vec::new();
+    for (name, title, track) in [("1 - One.flac", "One", 1), ("2 - Two.flac", "Two", 2)] {
+        let old = world.pool_file(&format!("Artist/Album/{name}"), 1);
+        std::fs::write(&old, &flac).expect("written");
+        let mut file = TagFile::open(&old).expect("opens");
+        file.set_performers(&["Artist".to_string()]);
+        file.set_album(Some("Album"));
+        file.set_title(Some(title));
+        file.set_track(track);
+        file.save().expect("saved");
+        age(&old);
+        olds.push(old);
+    }
+    let news = [
+        format!("{pool_root}/Artist/Album/01 - One.flac"),
+        format!("{pool_root}/Artist/Album/02 - Two.flac"),
+    ];
+    let gate = LibraryWriteGate::new();
+    world.pool.set_write_gate(gate.clone());
+    let remap = LyricsPathRemap::new();
+    let waiting = remap.hold_for_test();
+    let worker = TidyWorker::new(
+        Arc::new(TidyStore::new(None, None)),
+        Arc::new(TidyJournal::new(None)),
+        world.settings.clone(),
+        TidyServices {
+            library: Some(Arc::new(FakeNavidrome::new())),
+            family_pool: Some(world.pool.clone()),
+            lyrics_remap: Some(remap.clone()),
+            ..TidyServices::default()
+        },
+    )
+    .with_timing(quick())
+    .with_write_gate(gate.clone());
+    worker.set_pool_retry(Duration::from_millis(10));
+    let run = |mode| TidyRequest {
+        mode,
+        scope: WHOLE,
+        task: TidyTask::FileLayout,
+        ..TidyRequest::default()
+    };
+    worker
+        .run_once(run(TidyMode::Preview), &CancellationToken::new())
+        .await;
+    assert_eq!(worker.store().plan().expect("kept").plan.pool_moves.len(), 2);
+    let on_disk = || -> Vec<bool> {
+        olds.iter()
+            .chain(&news)
+            .map(|path| Path::new(path).exists())
+            .collect()
+    };
+    // Another change holds the second song, as a promotion holds its file before the gate.
+    let busy = world.pool.try_hold(&[&olds[1]]).expect("free");
+
+    let other_change = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.current().phase != "Moving members' songs" {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the apply reaches the members' songs");
+        let share = tokio::time::timeout(Duration::from_secs(5), gate.write())
+            .await
+            .expect("the job lets the gate go while the song is busy");
+        let before = on_disk();
+        drop(busy);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after = on_disk();
+        drop(share);
+        (before, after)
+    };
+    let token = CancellationToken::new();
+    let applied = tokio::time::timeout(
+        Duration::from_secs(10),
+        worker.run_once(run(TidyMode::Apply), &token),
+    );
+    let ((before, after), applied) = tokio::join!(other_change, applied);
+
+    applied.expect("the apply never waits on the busy song while it holds the gate");
+    assert_eq!(before, after, "nothing moved while the share was held");
+    let state = worker.current();
+    completed(&state);
+    assert_eq!(state.moved_files, 2, "{:?}", state.held_rows);
+    assert!(news.iter().all(|path| Path::new(path).is_file()));
+    assert!(olds.iter().all(|path| !Path::new(path).exists()));
+    assert_eq!(remap.map(&olds[0]), news[0]);
+    assert_eq!(remap.map(&olds[1]), news[1]);
+    remap.release_for_test(waiting);
 }

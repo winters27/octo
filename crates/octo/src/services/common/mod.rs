@@ -4,6 +4,7 @@ pub mod acquisition_activity;
 pub mod acquisition_tracker;
 pub mod acquisition_worker;
 pub mod album_gates;
+pub mod album_identity;
 pub mod base_download_service;
 pub mod cache_cleanup_service;
 pub mod download_arrivals;

@@ -135,7 +135,7 @@ fn hold_kept_copy(f: &Fixture) -> HeldPlacement {
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
         users: vec!["alice".into()],
-        proven_for: Vec::new(),
+        ..Default::default()
     };
     f.pending.hold_placement(held.clone());
     let (provider, id) = teardrop(f);
@@ -972,7 +972,7 @@ async fn another_hearts_proven_soulseek_file_ends_the_follow_and_lands() {
         kept: false,
         follows: vec![ALBUM_ID.into()],
         users: Vec::new(),
-        proven_for: Vec::new(),
+        ..Default::default()
     });
     assert!(f.pending.request_end(ALBUM_ID, FollowEnd::ProvenElsewhere));
 
@@ -1116,7 +1116,7 @@ async fn a_copy_held_for_an_open_follow_has_its_row_back_after_a_restart() {
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
         users: vec!["alice".into()],
-        proven_for: Vec::new(),
+        ..Default::default()
     });
     let service = f.service(None, 1);
     assert!(f.tracker.for_user("alice").is_empty(), "nothing listed yet");

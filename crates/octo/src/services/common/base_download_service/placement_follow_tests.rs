@@ -7,14 +7,17 @@
 //! members it is still for. A file is moved into place only where nothing lies, never over a file
 //! that lands there meanwhile.
 
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use octo_core::common::Clock;
 use octo_core::fingerprint::{VerificationResult, VerificationVerdict};
 use octo_core::models::subsonic::ScanStatus;
-use octo_core::settings::{AppSettings, SubsonicSettings};
+use octo_core::settings::{AppSettings, FolderStructure, SubsonicSettings};
+use octo_media::tags::TagFile;
 use parking_lot::Mutex;
 use tempfile::TempDir;
 
@@ -23,6 +26,7 @@ use super::super::{DownloadServices, RequestedIdentity};
 use super::*;
 use crate::services::common::AcquisitionTracker;
 use crate::services::family::{FamilyPlacement, PoolFile};
+use crate::services::library::library_write_gate::LibraryWriteGate;
 use crate::services::lidarr::{LidarrPendingAlbums, PendingAlbum};
 use crate::services::local::test_support::FakeLocalLibrary;
 use crate::services::local::{
@@ -168,10 +172,19 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
-        Rig::with_family(None)
+        Rig::with(None, None)
     }
 
     fn with_family(family: Option<Arc<dyn FamilyPlacement>>) -> Rig {
+        Rig::with(family, None)
+    }
+
+    /// The rig, with the library's write gate when one is given.
+    fn with_gate(write_gate: Option<LibraryWriteGate>) -> Rig {
+        Rig::with(None, write_gate)
+    }
+
+    fn with(family: Option<Arc<dyn FamilyPlacement>>, write_gate: Option<LibraryWriteGate>) -> Rig {
         let dir = tempfile::tempdir().expect("a temp dir");
         let pending = Arc::new(LidarrPendingAlbums::new(None));
         let library = Arc::new(FakeLocalLibrary::default());
@@ -191,6 +204,7 @@ impl Rig {
                 lidarr_pending: Some(pending.clone()),
                 tracker: Some(tracker.clone()),
                 family,
+                write_gate,
                 ..Default::default()
             },
         );
@@ -790,7 +804,8 @@ fn a_move_never_lands_over_a_file() {
     std::fs::write(&from, b"the kept copy").expect("written");
     std::fs::write(&to, b"Lidarr's import").expect("written");
 
-    let moved = move_file(&from.to_string_lossy(), &to.to_string_lossy());
+    let staging = dir.path().join(".octo-incoming");
+    let moved = move_file(&staging, &from.to_string_lossy(), &to.to_string_lossy());
 
     assert_eq!(
         moved.expect_err("refused").kind(),
@@ -800,7 +815,7 @@ fn a_move_never_lands_over_a_file() {
     assert_eq!(std::fs::read(&from).expect("still held"), b"the kept copy");
 
     std::fs::remove_file(&to).expect("removed");
-    move_file(&from.to_string_lossy(), &to.to_string_lossy()).expect("moved");
+    move_file(&staging, &from.to_string_lossy(), &to.to_string_lossy()).expect("moved");
     assert_eq!(std::fs::read(&to).expect("moved"), b"the kept copy");
     assert!(!from.exists());
 }
@@ -847,4 +862,127 @@ fn a_copy_never_lands_over_a_file_or_leaves_half_a_file() {
     copy_new(&from, &elsewhere).expect("copied");
     assert_eq!(std::fs::read(&elsewhere).expect("copied"), b"the kept copy");
     assert!(from.is_file(), "a copy leaves its source");
+}
+
+/// The held file is filed against the folders there when it is placed: an album folder of
+/// another name that appeared while it waited (Lidarr's own import, a tidy rename) is joined.
+#[tokio::test]
+async fn a_held_file_joins_a_folder_that_appeared() {
+    let rig = Rig::new();
+    rig.follow("rg-mezzanine", "Massive Attack", "Mezzanine", false);
+    rig.place(&kept_teardrop(), &teardrop_request(), DownloadSource::YouTube)
+        .await;
+    assert!(
+        rig.pending.held()[0].values.is_some(),
+        "the values it is filed from are kept"
+    );
+
+    let folder = rig.dir.path().join("Massive Attack/Mezzanine (1998)");
+    std::fs::create_dir_all(&folder).expect("made");
+    let angel = folder.join("01 - Angel.flac");
+    std::fs::write(&angel, flac()).expect("written");
+    {
+        let mut file = TagFile::open(&angel).expect("opens");
+        file.set_title(Some("Angel"));
+        file.set_album(Some("Mezzanine"));
+        file.set_performers(&["Massive Attack".to_string()]);
+        file.set_album_artists(&["Massive Attack".to_string()]);
+        file.save().expect("saved");
+    }
+    assert!(rig.pending.request_end("rg-mezzanine", FollowEnd::Done));
+    let free = rig.pending.release("rg-mezzanine");
+    let placed = placed(rig.harness.service.place_held_file(&free[0]).await);
+
+    assert_eq!(
+        slashed(&placed),
+        slashed(&folder.join("03 - Teardrop.flac").to_string_lossy())
+    );
+    assert!(!rig.dir.path().join("Massive Attack/Mezzanine").exists());
+}
+
+/// A held kept copy for one follow, released and ready to place.
+async fn released_kept_copy(rig: &Rig) -> HeldPlacement {
+    rig.follow("rg-mezzanine", "Massive Attack", "Mezzanine", false);
+    rig.place(&kept_teardrop(), &teardrop_request(), DownloadSource::YouTube)
+        .await;
+    assert!(rig.pending.request_end("rg-mezzanine", FollowEnd::Done));
+    rig.pending.release("rg-mezzanine").remove(0)
+}
+
+/// Where a held file was placed; a test fails when it was not.
+fn placed(end: HeldEnd) -> String {
+    match end {
+        HeldEnd::Placed(path) => path,
+        other => panic!("the held file was not placed: {other:?}"),
+    }
+}
+
+/// A download that holds the download lock and is about to take the gate's share, a held file's
+/// `route` started meanwhile, and a library job queued for the whole gate after it: all three
+/// finish only when the route waits for the download lock before it takes the share (the gate is
+/// fair, so a queued job holds back new shares).
+async fn all_three_finish<F, Fut>(service: Arc<BaseDownloadService>, gate: LibraryWriteGate, route: F)
+where
+    F: FnOnce(Arc<BaseDownloadService>) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (done, finished) = std::sync::mpsc::channel::<&'static str>();
+    let (locked, is_locked) = tokio::sync::oneshot::channel::<()>();
+    let (go, goes) = tokio::sync::oneshot::channel::<()>();
+    {
+        let (service, gate, done) = (service.clone(), gate.clone(), done.clone());
+        tokio::spawn(async move {
+            let _permit = service.download_lock().acquire().await.expect("open");
+            let _ = locked.send(());
+            let _ = goes.await;
+            let _share = gate.write().await;
+            let _ = done.send("the download");
+        });
+    }
+    is_locked.await.expect("the download holds its lock");
+    {
+        let done = done.clone();
+        tokio::spawn(async move {
+            route(service).await;
+            let _ = done.send("the held file");
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    {
+        let (gate, done) = (gate.clone(), done.clone());
+        tokio::spawn(async move {
+            let job = gate.begin_job("The library tidy").await;
+            drop(job);
+            let _ = done.send("the job");
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = go.send(());
+    for _ in 0..3 {
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("each one finishes; none waits on the others for good");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_placement_takes_the_download_lock_first() {
+    let gate = LibraryWriteGate::new();
+    let rig = Rig::with_gate(Some(gate.clone()));
+    let held = released_kept_copy(&rig).await;
+    all_three_finish(rig.harness.service.clone(), gate, move |service| async move {
+        service.place_held_file(&held).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_held_copy_takes_the_download_lock_first() {
+    let gate = LibraryWriteGate::new();
+    let rig = Rig::with_gate(Some(gate.clone()));
+    let held = released_kept_copy(&rig).await;
+    all_three_finish(rig.harness.service.clone(), gate, move |service| async move {
+        service.drop_held_copy(&held, &["alice".to_string()]).await;
+    })
+    .await;
 }

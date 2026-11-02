@@ -341,31 +341,40 @@ impl NoticeQueue {
     /// file where it used to be, and a settled one would no longer stop Octo asking again.
     /// Answers how many entries followed.
     pub fn move_paths(&self, from: &str, to: &str) -> usize {
+        self.move_paths_batch(&[(from.to_string(), to.to_string())])
+    }
+
+    /// [`Self::move_paths`] for each `(from, to)` in order, so `a` to `b` then `b` to `c` ends at
+    /// `c`, with the queue marked for saving once. Answers how many entries followed, each move
+    /// counted on its own.
+    pub fn move_paths_batch(&self, moves: &[(String, String)]) -> usize {
         let mut moved = 0;
         {
             let mut entries = self.entries.lock();
-            let keys: Vec<String> = entries.keys().cloned().collect();
-            for key in keys {
-                let Some(entry) = entries.get(&key) else {
-                    continue;
-                };
-                let Some(now) = PathHelper::moved_path(&entry.local_path, from, to) else {
-                    continue;
-                };
-                let mut entry = entry.clone();
-                let new_key = if entry.kind == NoticeKind::Review {
-                    Self::review_key(&entry.username, &now)
-                } else {
-                    entry.key.clone()
-                };
-                if new_key != key && entries.contains_key(&new_key) {
-                    continue;
+            for (from, to) in moves {
+                let keys: Vec<String> = entries.keys().cloned().collect();
+                for key in keys {
+                    let Some(entry) = entries.get(&key) else {
+                        continue;
+                    };
+                    let Some(now) = PathHelper::moved_path(&entry.local_path, from, to) else {
+                        continue;
+                    };
+                    let mut entry = entry.clone();
+                    let new_key = if entry.kind == NoticeKind::Review {
+                        Self::review_key(&entry.username, &now)
+                    } else {
+                        entry.key.clone()
+                    };
+                    if new_key != key && entries.contains_key(&new_key) {
+                        continue;
+                    }
+                    entries.remove(&key);
+                    entry.key = new_key.clone();
+                    entry.local_path = now;
+                    entries.set(new_key, entry);
+                    moved += 1;
                 }
-                entries.remove(&key);
-                entry.key = new_key.clone();
-                entry.local_path = now;
-                entries.set(new_key, entry);
-                moved += 1;
             }
         }
         if moved > 0 {

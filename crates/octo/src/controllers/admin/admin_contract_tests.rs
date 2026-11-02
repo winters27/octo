@@ -1282,26 +1282,31 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // then LibraryActions:KeepRatedCopies, Subsonic:DownloadAlbumOnSongStar,
     // Metadata:AnimatedArt and Subsonic:CoverBadge, then LibraryActions:YoutubeCheckPerHour and
     // the sweep's preview replacing, LibraryActions:ReviewSweepAutoReplacePreview, then
-    // Notifications:NotifyMornyeCheck, listed last.
-    assert_eq!(rows.len(), 208);
+    // Notifications:NotifyMornyeCheck, listed last, and the file layout's three templates beside
+    // Subsonic:FolderStructure: Subsonic:FolderTemplate, :FolderTemplateSingles and
+    // :FolderTemplateCompilations.
+    assert_eq!(rows.len(), 211);
     assert!(!rows.iter().any(|r| {
         r["Key"]
             .as_str()
             .is_some_and(|k| k.starts_with("Imports:Spotify"))
     }));
-    assert_eq!(rows[195]["Key"], "GeneratedPlaylists:Years");
-    assert_eq!(rows[198]["Key"], "GeneratedPlaylists:ArtistCount");
-    assert_eq!(rows[199]["Key"], "LibraryActions:ReviewSweepAutoReplace");
-    assert_eq!(rows[200]["Key"], "LibraryActions:ReviewSweepAutoReplacePerDay");
-    assert_eq!(rows[201]["Key"], "LibraryActions:KeepRatedCopies");
-    assert_eq!(rows[202]["Key"], "Subsonic:DownloadAlbumOnSongStar");
-    assert_eq!(rows[203]["Key"], "Metadata:AnimatedArt");
-    assert_eq!(rows[204]["Key"], "Subsonic:CoverBadge");
-    assert_eq!(rows[205]["Key"], "LibraryActions:YoutubeCheckPerHour");
+    assert_eq!(rows[198]["Key"], "GeneratedPlaylists:Years");
+    assert_eq!(rows[201]["Key"], "GeneratedPlaylists:ArtistCount");
+    assert_eq!(rows[202]["Key"], "LibraryActions:ReviewSweepAutoReplace");
+    assert_eq!(rows[203]["Key"], "LibraryActions:ReviewSweepAutoReplacePerDay");
+    assert_eq!(rows[204]["Key"], "LibraryActions:KeepRatedCopies");
+    assert_eq!(rows[205]["Key"], "Subsonic:DownloadAlbumOnSongStar");
+    assert_eq!(rows[206]["Key"], "Metadata:AnimatedArt");
+    assert_eq!(rows[207]["Key"], "Subsonic:CoverBadge");
+    assert_eq!(rows[208]["Key"], "LibraryActions:YoutubeCheckPerHour");
     assert_eq!(row("LibraryActions:YoutubeCheckPerHour")["IsSecret"], false);
-    assert_eq!(rows[206]["Key"], "LibraryActions:ReviewSweepAutoReplacePreview");
-    assert_eq!(rows[207]["Key"], "Notifications:NotifyMornyeCheck");
+    assert_eq!(rows[209]["Key"], "LibraryActions:ReviewSweepAutoReplacePreview");
+    assert_eq!(rows[210]["Key"], "Notifications:NotifyMornyeCheck");
     assert_eq!(row("Notifications:NotifyMornyeCheck")["IsSecret"], false);
+    assert_eq!(row("Subsonic:FolderTemplate")["IsSecret"], false);
+    assert_eq!(row("Subsonic:FolderTemplateSingles")["IsSecret"], false);
+    assert_eq!(row("Subsonic:FolderTemplateCompilations")["IsSecret"], false);
     assert_eq!(
         row("LibraryActions:ReviewSweepAutoReplacePreview")["IsSecret"],
         false

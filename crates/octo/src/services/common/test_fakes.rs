@@ -285,6 +285,8 @@ pub(crate) struct FakeMetadata {
     pub album_searches: Mutex<usize>,
     /// What the catalog's own track search answers; None is "could not answer".
     pub catalog_tracks: Mutex<Option<Vec<(String, String)>>>,
+    /// How long an album listing takes to answer.
+    pub album_wait: Mutex<Option<std::time::Duration>>,
 }
 
 #[async_trait]
@@ -357,6 +359,10 @@ impl IMusicMetadataService for FakeMetadata {
     }
 
     async fn get_album(&self, provider: &str, id: &str) -> Option<Album> {
+        let wait = *self.album_wait.lock();
+        if let Some(wait) = wait {
+            tokio::time::sleep(wait).await;
+        }
         self.albums
             .lock()
             .get(&(provider.to_string(), id.to_string()))

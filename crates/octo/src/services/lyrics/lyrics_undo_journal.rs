@@ -125,12 +125,24 @@ impl LyricsUndoJournal {
     /// Follow a folder the library tidy moved: each entry names where its file is now. Answers
     /// how many entries followed.
     pub fn move_paths(&self, from: &str, to: &str) -> io::Result<usize> {
+        self.move_paths_batch(&[(from.to_string(), to.to_string())])
+    }
+
+    /// [`Self::move_paths`] for each `(from, to)` in order, so `a` to `b` then `b` to `c` ends at
+    /// `c`, with the journal read and written once. Answers how many entries followed, each move
+    /// counted on its own.
+    pub fn move_paths_batch(&self, moves: &[(String, String)]) -> io::Result<usize> {
+        if moves.is_empty() {
+            return Ok(0);
+        }
         let mut entries = self.read_all()?;
         let mut moved = 0;
-        for entry in &mut entries {
-            if let Some(now) = octo_core::common::PathHelper::moved_path(&entry.path, from, to) {
-                entry.path = now;
-                moved += 1;
+        for (from, to) in moves {
+            for entry in &mut entries {
+                if let Some(now) = octo_core::common::PathHelper::moved_path(&entry.path, from, to) {
+                    entry.path = now;
+                    moved += 1;
+                }
             }
         }
         if moved == 0 {

@@ -784,6 +784,9 @@ async function loadSettings() {
   updateDiscoveryBanner();
   buildSegments();
   syncSegments(false);
+  renderLayoutRows();
+  showLayoutCapsProblem(currentSettings?._meta?.LayoutCapsProblem);
+  loadLayoutPreview(true);
   if (currentSettings?.Lidarr?.BaseUrl && currentSettings?.Lidarr?.ApiKey) {
     loadLidarrOptions();
   }
@@ -2064,12 +2067,191 @@ document.getElementById('genre-backfill-undo')?.addEventListener('click', async 
   await loadGenreBackfill();
 });
 
-// ---- Tidy artists -----------------------------------------------------------------
-// Preview (writes nothing), then apply what the preview showed: tags, a Navidrome scan, then
-// whole album folders. Renames that lose stars only run when ticked. Every call needs the
-// browse sign-in, like the genre re-tag.
+// ---- Tidy the library -------------------------------------------------------------
+// Two tasks, Artists and File layout. Preview (writes nothing), then apply what the preview
+// showed: for Artists tags, a Navidrome scan, then whole album folders, with renames that lose
+// stars only when ticked; for File layout folders, then songs one folder at a time. Every call
+// needs the browse sign-in, like the genre re-tag.
 
 let libraryTidyPoll = null;
+// ---- File layout ----------------------------------------------------------------------
+// The examples come from the server's own layout engine, so the page shows the path a download
+// gets. Typing asks again after a short pause, and only the newest answer is drawn.
+
+let layoutSeq = 0;
+// The newest request made with the saved settings (on load, and after a save): the saved-layout
+// notice is drawn from its answer, whatever typing has asked since.
+let layoutSavedSeq = 0;
+let layoutTimer = null;
+let layoutLastField = null;
+let layoutTypedAt = 0;
+const LAYOUT_TYPING_PAUSE_MS = 800;
+
+const layoutFields = {
+  FolderTemplate: 'f-folder-template',
+  FolderTemplateSingles: 'f-folder-template-singles',
+  FolderTemplateCompilations: 'f-folder-template-compilations',
+};
+
+// Each template field's name on the card, and what Octo files by while a saved one is broken.
+const layoutFieldWords = {
+  FolderTemplate: { name: 'Albums', fallback: 'new songs are filed as Organized' },
+  FolderTemplateSingles: { name: 'Singles', fallback: 'singles are filed like album tracks' },
+  FolderTemplateCompilations: { name: 'Compilations', fallback: 'compilation tracks are filed like album tracks' },
+};
+
+function renderLayoutRows() {
+  const custom = document.getElementById('f-folder-structure')?.value === 'Custom';
+  document.querySelectorAll('[data-layout-custom]').forEach(row => { row.hidden = !custom; });
+  document.querySelectorAll('.layout-template').forEach(fitLayoutTemplate);
+}
+
+function showLayoutProblems(problems) {
+  for (const [field, id] of Object.entries(layoutFields)) {
+    const holder = document.getElementById(`${id}-error`);
+    const input = document.getElementById(id);
+    if (!holder || !input) continue;
+    const problem = problems.find(p => p.field === field);
+    holder.hidden = !problem;
+    // A name in braces never breaks across two lines.
+    holder.textContent = problem ? problem.message.replace(/\{[^}]*\}/g, name => name.replace(/ /g, ' ')) : '';
+    if (problem) input.setAttribute('aria-invalid', 'true'); else input.removeAttribute('aria-invalid');
+  }
+}
+
+// An example whose template has a problem says which field to fix rather than showing the path
+// of the layout Octo would fall back to.
+function showLayoutExamples(examples, failure, problems = []) {
+  const holder = document.getElementById('layout-examples');
+  if (!holder) return;
+  const broken = new Set(problems.map(p => p.field));
+  const waiting = examples.filter(example => example.field && broken.has(example.field));
+  // Every example waiting on a fix is said once, not once per song.
+  if (!failure && examples.length > 0 && waiting.length === examples.length) {
+    const names = [...new Set(waiting.map(example => layoutFieldWords[example.field]?.name ?? 'layout'))];
+    const which = names.length === 1 ? `the ${names[0]} layout is` : `the ${names.join(' and ')} layouts are`;
+    holder.innerHTML = `<div class="layout-example-wait layout-example-all">Shown once ${esc(which)} fixed.</div>`;
+    return;
+  }
+  holder.innerHTML = failure
+    ? `<div class="set-info-d">${esc(failure)}</div>`
+    : examples.map(example => {
+      const blocked = example.field && broken.has(example.field);
+      const path = blocked
+        ? `<span class="layout-example-wait">Shown once the ${esc(layoutFieldWords[example.field]?.name ?? 'layout')} layout is fixed.</span>`
+        : `<code class="layout-example-p">${esc(example.path).replaceAll('/', '/<wbr>')}</code>`;
+      return `
+      <div class="layout-example">
+        <span class="layout-example-k">${esc(example.label)}</span>
+        ${path}
+      </div>`;
+    }).join('');
+}
+
+// A saved template can only be broken through .env or the config file (the card refuses to save
+// one), and then Octo files by the fallback: the card says so until a saved layout is whole.
+function showLayoutFallback(problems) {
+  const holder = document.getElementById('layout-fallback');
+  if (!holder) return;
+  const lines = problems
+    .map(p => layoutFieldWords[p.field])
+    .filter(Boolean)
+    .map(words => `The saved <strong>${esc(words.name)}</strong> layout has a problem, so ${esc(words.fallback)} until it is fixed.`);
+  holder.hidden = lines.length === 0;
+  holder.innerHTML = lines.join(' ');
+}
+
+// The server's line when it could not save what it remembers of older layouts' folder names
+// (the settings answer's LayoutCapsProblem); hidden while there is none.
+function showLayoutCapsProblem(line) {
+  const holder = document.getElementById('layout-caps-problem');
+  if (!holder) return;
+  holder.hidden = !line;
+  holder.textContent = line || '';
+}
+
+async function loadLayoutPreview(saved = false) {
+  const seq = ++layoutSeq;
+  if (saved) layoutSavedSeq = seq;
+  const value = id => document.getElementById(id)?.value ?? '';
+  const body = {
+    seq,
+    folderStructure: value('f-folder-structure') || 'Flat',
+    folderTemplate: value('f-folder-template'),
+    folderTemplateSingles: value('f-folder-template-singles'),
+    folderTemplateCompilations: value('f-folder-template-compilations'),
+  };
+  let answer;
+  try {
+    const response = await api('/api/admin/layout/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    answer = await response.json();
+  } catch {
+    if (seq === layoutSeq) showLayoutExamples([], 'The example could not be shown right now. Saving still works.');
+    return;
+  }
+  const problems = answer.problems ?? [];
+  if (saved && seq === layoutSavedSeq) showLayoutFallback(problems);
+  // An answer to an older request is never drawn over a newer one.
+  if (answer.seq !== layoutSeq) return;
+  // A half-typed name is a mistake for a moment: a new one in the field being typed shows after a
+  // pause or when the field is left. A fix shows at once.
+  const typing = document.activeElement?.classList?.contains('layout-template') ? document.activeElement.id : null;
+  const fresh = problems.some(p => layoutFields[p.field] === typing && document.getElementById(`${typing}-error`)?.hidden);
+  const idle = Date.now() - layoutTypedAt;
+  if (!saved && fresh && idle < LAYOUT_TYPING_PAUSE_MS) {
+    clearTimeout(layoutTimer);
+    layoutTimer = setTimeout(loadLayoutPreview, LAYOUT_TYPING_PAUSE_MS - idle);
+    return;
+  }
+  showLayoutProblems(problems);
+  showLayoutExamples(answer.examples ?? [], null, problems);
+}
+
+function scheduleLayoutPreview() {
+  clearTimeout(layoutTimer);
+  layoutTimer = setTimeout(loadLayoutPreview, 250);
+}
+
+// A template is one line that grows to show all of itself (where the browser cannot size a field
+// to its text), and Enter never starts a second line.
+function fitLayoutTemplate(input) {
+  if (!input.offsetParent) return;
+  input.style.height = 'auto';
+  input.style.height = `${input.scrollHeight + 2}px`;
+}
+
+document.getElementById('f-folder-structure')?.addEventListener('change', () => {
+  renderLayoutRows();
+  loadLayoutPreview();
+});
+document.querySelectorAll('.layout-template').forEach(input => {
+  input.addEventListener('input', () => {
+    layoutTypedAt = Date.now();
+    if (input.value.includes('\n')) input.value = input.value.replace(/\r?\n/g, '');
+    fitLayoutTemplate(input);
+    scheduleLayoutPreview();
+  });
+  input.addEventListener('keydown', event => { if (event.key === 'Enter') event.preventDefault(); });
+  input.addEventListener('focus', () => { layoutLastField = input; });
+  input.addEventListener('blur', () => { layoutTypedAt = 0; loadLayoutPreview(); });
+});
+document.getElementById('layout-names')?.addEventListener('click', event => {
+  const button = event.target.closest('[data-layout-name]');
+  if (!button) return;
+  const input = layoutLastField ?? document.getElementById('f-folder-template');
+  if (!input) return;
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? start;
+  input.setRangeText(button.dataset.layoutName, start, end, 'end');
+  input.focus();
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+});
+
 let lastTidyRun = null;
 let tidyScopeInitialised = false;
 let tidyOffset = 0;
@@ -2081,8 +2263,117 @@ const tidyKindLabels = {
   Respell: 'Spelling',
   Rename: 'Rename',
   Guest: 'Guests',
+  Layout: 'Into the layout',
   Skip: 'Left alone',
 };
+
+// What the card says for each task.
+const TIDY_WORDS = {
+  Artists: {
+    desc: 'New downloads are filed under their first artist, with one spelling per artist and guests listed in their own tag. This brings music already in your library in line. Nothing is written until you have seen a preview.',
+    scope: 'Every file is read either way, because the spelling most of your library uses is the one that wins. Only downloads Octo made are changed, or the whole library, your own rips and purchases included.',
+    notice: '<strong>Back up your music folder first.</strong> Apply rewrites artist tags, waits for Navidrome to finish a scan that saw them, and only then moves whole album folders, so each song keeps its stars, plays and playlist entries. That needs Navidrome 0.55 or newer. A rename marked with a warning changes which artist Navidrome files the songs under, and stars and ratings on the old artist are lost for every user, so those rows only run when you tick them. Undo moves folders back and restores the artist tags.',
+    preview: 'Reads every file and lists what would change and what is left alone, with the reason. Writes nothing. Folders whose songs say nothing are looked up on MusicBrainz, about one a second, so a large library may need a second preview to finish asking.',
+    applyTitle: 'Tidy these artists?',
+    applyMessage: 'Re-tags files first, waits for Navidrome to scan them, then moves whole album folders. This can take a while.',
+    applyConfirm: 'Tidy',
+    applying: 'Tidying. Tags first, then a Navidrome scan, then the folders.',
+    undoMessage: 'Moves its album folders back and restores the artist tags. A folder whose old place is taken, or a song changed since, stays as it is.',
+    wholeLibrary: 'This re-tags and moves files anywhere under:',
+  },
+  FileLayout: {
+    desc: "New downloads follow the File layout. This moves and renames songs already in your library into it, family members' folders included. Songs Lidarr keeps stay as Lidarr names them. Nothing is moved until you have seen a preview.",
+    scope: 'Only downloads Octo made are moved, or the whole library, your own rips and purchases included.',
+    notice: '<strong>Back up your music folder first.</strong> Apply renames folders, then moves songs one folder at a time, each only while Navidrome is not scanning and the song is as its last scan saw it, so each song keeps its stars, plays and playlist entries. That needs Navidrome 0.55 or newer. An album only moves whole, and lyrics move with their song. Undo puts the songs and folders back.',
+    preview: 'Reads every file and lists which folders and songs would move into the File layout, and what is left alone, with the reason. Writes nothing.',
+    applyTitle: 'Move these songs into the File layout?',
+    applyMessage: 'Renames folders, then moves songs one folder at a time, waiting whenever Navidrome scans. This can take a while.',
+    applyConfirm: 'Move',
+    applying: 'Moving songs into the File layout, one folder at a time.',
+    undoMessage: 'Moves its songs and folders back where they were. A song whose old place is taken, or that changed since, stays as it is.',
+    wholeLibrary: 'This moves and renames files anywhere under:',
+  },
+};
+
+function tidyWords(task) {
+  return TIDY_WORDS[task] ?? TIDY_WORDS.Artists;
+}
+
+function tidyTask() {
+  return document.getElementById('library-tidy-task')?.value || 'Artists';
+}
+
+// The card's words for the task chosen, and the kinds its filter offers.
+function showTidyTask(task) {
+  const words = tidyWords(task);
+  for (const [id, html] of [
+    ['library-tidy-desc', words.desc],
+    ['library-tidy-scope-desc', words.scope],
+    ['library-tidy-notice', words.notice],
+    ['library-tidy-preview-note', words.preview],
+  ]) {
+    const holder = document.getElementById(id);
+    if (holder) holder.innerHTML = html;
+  }
+  const kind = document.getElementById('library-tidy-kind');
+  if (kind?.options) {
+    for (const option of Array.from(kind.options)) {
+      option.hidden = Boolean(option.dataset?.task) && option.dataset.task !== task;
+    }
+    if (Array.from(kind.options).some(option => option.value === kind.value && option.hidden)) kind.value = 'Changes';
+  }
+}
+
+// Picks a task as the switch does.
+function chooseTidyTask(task) {
+  const select = document.getElementById('library-tidy-task');
+  if (!select) return;
+  select.value = task;
+  document.querySelectorAll('.seg[data-seg-for="library-tidy-task"]').forEach(seg => syncSegment(seg, false));
+  showTidyTask(task);
+  if (lastTidyRun) renderLibraryTidy(lastTidyRun);
+}
+
+// A link that names a task (the File layout card's) opens this card with that task chosen.
+function wireTidyTaskLinks(scope) {
+  scope.querySelectorAll('[data-tidy-task]').forEach(link => link.addEventListener('click', event => {
+    event.preventDefault();
+    chooseTidyTask(link.dataset.tidyTask);
+    if (typeof openTab === 'function') openTab('tags');
+    const card = document.getElementById('library-tidy');
+    requestAnimationFrame(() => {
+      const calm = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+      card?.scrollIntoView({ block: 'start', behavior: calm ? 'auto' : 'smooth' });
+      card?.querySelector('.seg button.active')?.focus({ preventScroll: true });
+    });
+  }));
+}
+
+// What a run did or plans, in folders and files for the File layout task.
+function tidyCounts(run) {
+  const layout = run.task === 'FileLayout';
+  const n = (count, one, many) => `${count} ${count === 1 ? one : many}`;
+  let counts;
+  if (run.mode === 'Preview') {
+    counts = layout
+      ? [n(run.files, 'file read', 'files read'), n(run.plannedMoves, 'folder to move', 'folders to move'), n(run.plannedFileMoves, 'song to move', 'songs to move')]
+      : [n(run.files, 'file read', 'files read'), `${run.plannedRetags} to re-tag`, n(run.plannedMoves, 'album folder to move', 'album folders to move')];
+    if (run.rows?.Skip) counts.push(`${run.rows.Skip} left alone`);
+  } else {
+    if (run.mode === 'Undo') {
+      counts = layout
+        ? [n(run.moved, 'folder moved back', 'folders moved back'), n(run.movedFiles, 'song moved back', 'songs moved back')]
+        : [n(run.moved, 'folder moved back', 'folders moved back'), n(run.retagged, 'tag restored', 'tags restored')];
+    } else {
+      counts = layout
+        ? [n(run.moved, 'folder moved', 'folders moved'), n(run.movedFiles, 'song moved', 'songs moved')]
+        : [`${run.retagged} re-tagged`, n(run.moved, 'album folder moved', 'album folders moved')];
+    }
+    if (run.held) counts.push(`${run.held} held back`);
+    if (run.failed) counts.push(`${run.failed} failed`);
+  }
+  return counts.join(' · ');
+}
 
 async function libraryTidyFetch(url, options = {}, retry = true) {
   const response = await api(url, options);
@@ -2112,21 +2403,30 @@ function renderLibraryTidy(run) {
   const scopeSelect = document.getElementById('library-tidy-scope');
   const scopeChanged = previewed && scopeSelect && scopeSelect.value !== run.scope;
   document.getElementById('library-tidy-scope-hint').hidden = !scopeChanged;
+  const taskChanged = previewed && tidyTask() !== (run.task ?? 'Artists');
+  const taskHint = document.getElementById('library-tidy-task-hint');
+  if (taskHint) taskHint.hidden = !taskChanged;
+  const layoutRefused = previewed && run.task === 'FileLayout' && run.layoutRefusal;
 
   const changes = Object.entries(run.rows ?? {})
     .filter(([kind]) => kind !== 'Skip').reduce((sum, [, count]) => sum + count, 0);
   const applyNote = document.getElementById('library-tidy-apply-note');
-  applyNote.textContent = previewed && !run.applyAllowed && run.applyBlockedReason
-    ? run.applyBlockedReason
-    : run.otherJob
-      ? `${run.otherJob} is changing the music folder right now. Apply is available once it is done.`
-      : 'Once a preview has finished, for the same files it previewed.';
+  applyNote.textContent = running
+    ? 'Cancel stops it after the current file.'
+    : layoutRefused
+    ? run.layoutRefusal
+    : previewed && !run.applyAllowed && run.applyBlockedReason
+      ? run.applyBlockedReason
+      : run.otherJob
+        ? `${run.otherJob} is changing the music folder right now. Apply is available once it is done.`
+        : 'Once a preview has finished, for the same files it previewed.';
 
   document.getElementById('library-tidy-cancel').hidden = !running;
-  document.getElementById('library-tidy-apply').hidden =
-    !previewed || changes === 0 || scopeChanged || !run.applyAllowed || Boolean(run.otherJob);
+  document.getElementById('library-tidy-apply').hidden = !previewed || changes === 0 || scopeChanged
+    || taskChanged || Boolean(layoutRefused) || !run.applyAllowed || Boolean(run.otherJob);
   document.getElementById('library-tidy-resume').hidden = !run.canResume || running;
-  document.getElementById('library-tidy-undo').hidden = !run.canUndo || running;
+  const undo = document.getElementById('library-tidy-undo');
+  undo.hidden = !run.canUndo || running;
   document.getElementById('library-tidy-preview').disabled = running;
   document.getElementById('library-tidy-filter').hidden = !previewed && !run.rows?.Skip;
 
@@ -2142,24 +2442,12 @@ function renderLibraryTidy(run) {
         Interrupted: 'Interrupted',
         Failed: 'Stopped',
       }[run.status] ?? run.status;
-  const counts = (run.mode === 'Preview'
-    ? [
-        `${run.files} files read`,
-        `${run.plannedRetags} to re-tag`,
-        `${run.plannedMoves} album folders to move`,
-        run.rows?.Skip ? `${run.rows.Skip} left alone` : null,
-      ]
-    : [
-        run.mode === 'Undo' ? `${run.moved} folders moved back` : `${run.retagged} re-tagged`,
-        run.mode === 'Undo' ? `${run.retagged} tags restored` : `${run.moved} album folders moved`,
-        run.held ? `${run.held} held back` : null,
-        run.failed ? `${run.failed} failed` : null,
-      ]).filter(Boolean).join(' · ');
+  const counts = tidyCounts(run);
   const unasked = run.lookupsNotAsked
-    ? `<div class="set-info-d">MusicBrainz was not asked about ${run.lookupsNotAsked} name(s) yet. Preview again to ask about the next batch.</div>`
+    ? `<div class="set-info-d">MusicBrainz was not asked about ${run.lookupsNotAsked === 1 ? '1 name' : `${run.lookupsNotAsked} names`} yet. Preview again to ask about the next batch.</div>`
     : '';
   const held = run.heldRows?.length ? `
-    <div class="set-info-t">Held back</div>
+    <div class="tidy-held-t">Held back</div>
     ${tidyTable(run.heldRows, false)}` : '';
   const errors = run.errors?.length
     ? `<div class="field-error" role="alert">${esc(run.errors[run.errors.length - 1])}</div>` : '';
@@ -2172,21 +2460,46 @@ function renderLibraryTidy(run) {
     ${held}${errors}`;
 }
 
+// A Layout row is one folder's songs: Leave out takes that whole folder, where an artist row's
+// takes its artist folder.
+function tidyLeaveOut(row) {
+  return row.kind === 'Layout' ? row.path : row.path.split('/')[0];
+}
+
+// A row of the family pool's songs keeps `pool:` in its path for Leave out; it reads as
+// members' songs.
+function tidyShownPath(path) {
+  return path.startsWith('pool:') ? `Members' songs, ${path.slice('pool:'.length)}` : path;
+}
+
+// A path breaks after its slashes before it breaks inside a name.
+function tidyPath(text) { return esc(text).replaceAll('/', '/<wbr>'); }
+
+// The What column: the kind, then the path the row is about.
+function tidyWhat(row) {
+  const kind = esc(tidyKindLabels[row.kind] ?? row.kind);
+  if (row.kind === 'Layout') return row.path.startsWith('pool:') ? `${kind}, members' songs` : kind;
+  return row.path ? `${kind}: ${tidyPath(tidyShownPath(row.path))}` : kind;
+}
+
 function tidyTable(rows, withTicks) {
+  const classes = 'config-row genre-change-row tidy-row';
+  const table = `config-table tidy-table${rows.some(row => row.kind === 'Layout') ? ' layout' : ''}`;
   const body = rows.map(row => `
-    <div class="config-row genre-change-row">
+    <div class="${classes}">
       <span class="key">${withTicks && row.optIn
-        ? `<label><input type="checkbox" data-tidy-tick="${esc(row.id)}"${tidyTicked.has(row.id) ? ' checked' : ''}> ${esc(tidyKindLabels[row.kind] ?? row.kind)}</label>`
-        : esc(tidyKindLabels[row.kind] ?? row.kind)}${row.path ? `: ${esc(row.path)}` : ''}</span>
-      <span class="value">${esc(row.before || '')}</span>
-      <span class="value">${esc(row.after || '')}</span>
-      <span class="value">${esc(row.evidence || '')}${withTicks && row.path
-        ? ` <button class="btn btn-ghost" type="button" data-tidy-exclude="${esc(row.path.split('/')[0])}">Leave out</button>` : ''}</span>
+        ? `<label><input type="checkbox" data-tidy-tick="${esc(row.id)}"${tidyTicked.has(row.id) ? ' checked' : ''}> ${tidyWhat(row)}</label>`
+        : tidyWhat(row)}</span>
+      <span class="value" data-label="Before">${tidyPath(row.before || (row.kind === 'Layout' ? 'The music folder' : ''))}</span>
+      <span class="value" data-label="After">${tidyPath(row.after || (row.kind === 'Layout' ? 'The music folder' : ''))}</span>
+      <span class="value why">${tidyPath(row.evidence || '')}</span>
+      <span class="tidy-act">${withTicks && row.path
+        ? `<button class="btn btn-ghost btn-sm" type="button" data-tidy-exclude="${esc(tidyLeaveOut(row))}">Leave out</button>` : ''}</span>
     </div>`).join('');
   return `
-    <div class="config-table">
-      <div class="config-row config-row-head genre-change-row">
-        <span>What</span><span>Before</span><span>After</span><span>Why</span>
+    <div class="${table}">
+      <div class="${classes} config-row-head">
+        <span>What</span><span>Before</span><span>After</span><span>Why</span><span></span>
       </div>
       ${body}
     </div>`;
@@ -2227,6 +2540,9 @@ async function loadTidy(retry = false) {
   if (!tidyScopeInitialised && scopeSelect && run.previewed && run.scope) scopeSelect.value = run.scope;
   const excluded = document.getElementById('library-tidy-excluded');
   if (!tidyScopeInitialised && excluded && run.excluded?.length) excluded.value = run.excluded.join('\n');
+  const shownTask = run.status !== 'Idle' ? run.task : run.undoTask;
+  if (!tidyScopeInitialised && shownTask) chooseTidyTask(shownTask);
+  else if (!tidyScopeInitialised) showTidyTask(tidyTask());
   tidyScopeInitialised = true;
   renderLibraryTidy(run);
   if (previous?.status === 'Running' && run.status !== 'Running') {
@@ -2268,7 +2584,7 @@ async function confirmTidyPath(run, action) {
   if (run.scope !== 'WholeLibrary') return '';
   return askDialog({
     title: `${action} in your whole library?`,
-    message: `This re-tags and moves files anywhere under:\n${run.musicPath}\nincluding music Octo never downloaded. Type that path exactly to continue.`,
+    message: `${tidyWords(run.task).wholeLibrary}\n${run.musicPath}\nincluding music Octo never downloaded. Type that path exactly to continue.`,
     confirm: action, danger: true,
     input: { label: 'Music folder', placeholder: run.musicPath, mustEqual: run.musicPath },
   });
@@ -2277,13 +2593,18 @@ async function confirmTidyPath(run, action) {
 document.getElementById('library-tidy-preview')?.addEventListener('click', async () => {
   const scope = document.getElementById('library-tidy-scope')?.value ?? 'OctoDownloads';
   tidyTicked.clear();
-  if (await postTidy('/api/admin/tidy/preview', { scope, excluded: tidyExcluded() })) {
+  if (await postTidy('/api/admin/tidy/preview', { scope, task: tidyTask(), excluded: tidyExcluded() })) {
     tidyNote('Previewing. Nothing is being written.', 'info');
   }
 });
 document.getElementById('library-tidy-scope')?.addEventListener('change', () => {
   if (lastTidyRun) renderLibraryTidy(lastTidyRun);
 });
+document.getElementById('library-tidy-task')?.addEventListener('change', () => {
+  showTidyTask(tidyTask());
+  if (lastTidyRun) renderLibraryTidy(lastTidyRun);
+});
+wireTidyTaskLinks(document);
 document.getElementById('library-tidy-kind')?.addEventListener('change', () => {
   tidyOffset = 0;
   loadTidyRows();
@@ -2312,17 +2633,17 @@ document.getElementById('library-tidy-results')?.addEventListener('click', event
 document.getElementById('library-tidy-apply')?.addEventListener('click', async () => {
   const run = await loadTidy();
   if (!run || !run.applyAllowed) return;
+  const words = tidyWords(run.task);
   const ticked = [...tidyTicked];
   const renames = ticked.length
-    ? ` ${ticked.length} rename(s) you ticked will lose the stars and ratings on the old artist for every user.`
+    ? ` ${ticked.length === 1 ? '1 rename you ticked will' : `${ticked.length} renames you ticked will`} lose the stars and ratings on the old artist for every user.`
     : '';
-  if (!(await askConfirm('Tidy these artists?',
-    `Re-tags files first, waits for Navidrome to scan them, then moves whole album folders. This can take a while.${renames}`,
-    'Tidy', ticked.length > 0))) return;
-  const confirm = await confirmTidyPath(run, 'Tidy');
+  if (!(await askConfirm(words.applyTitle, `${words.applyMessage}${renames}`,
+    words.applyConfirm, ticked.length > 0))) return;
+  const confirm = await confirmTidyPath(run, words.applyConfirm);
   if (confirm === null) return;
-  if (await postTidy('/api/admin/tidy/apply', { scope: run.scope, ticked, confirm })) {
-    tidyNote('Tidying. Tags first, then a Navidrome scan, then the folders.', 'info');
+  if (await postTidy('/api/admin/tidy/apply', { scope: run.scope, task: run.task ?? 'Artists', ticked, confirm })) {
+    tidyNote(words.applying, 'info');
   }
 });
 document.getElementById('library-tidy-resume')?.addEventListener('click', async () => {
@@ -2343,10 +2664,11 @@ document.getElementById('library-tidy-cancel')?.addEventListener('click', async 
   await loadTidy();
 });
 document.getElementById('library-tidy-undo')?.addEventListener('click', async () => {
-  if (!(await askConfirm('Undo the last tidy?',
-    'Moves its album folders back and restores the artist tags. A folder whose old place is taken, or a song changed since, stays as it is.',
-    'Undo the tidy'))) return;
-  if (await postTidy('/api/admin/tidy/undo', {})) tidyNote('Undoing the tidy.', 'info');
+  if (!(await askConfirm('Undo the last tidy?', tidyWords(lastTidyRun?.undoTask).undoMessage, 'Undo the tidy'))) return;
+  // The run this page showed, so an apply from another page since puts nothing back.
+  if (await postTidy('/api/admin/tidy/undo', { run: lastTidyRun?.undoRun ?? null })) {
+    tidyNote('Undoing the tidy.', 'info');
+  }
 });
 
 // ---- Mark explicit songs ----------------------------------------------------------
@@ -6709,6 +7031,9 @@ function buildSegments() {
       seg.appendChild(b);
     });
     seg.dataset.built = '1';
+    // The highlight is placed in pixels, so it is placed again whenever the control's size
+    // changes: the web font arriving, or the page holding it being opened.
+    if ('ResizeObserver' in window) new ResizeObserver(() => syncSegment(seg, false)).observe(seg);
   });
 }
 function syncSegment(seg, animate) {
@@ -6738,6 +7063,8 @@ buildHints();
 labelSettingControls();
 buildSegments();
 window.addEventListener('resize', () => syncSegments(false));
+// A font can change the buttons' widths without changing the control's own width.
+document.fonts?.ready.then(() => syncSegments(false));
 
 // ────────────────────────────────────────────────────────────────
 // "Point your apps at Octo" address + copy

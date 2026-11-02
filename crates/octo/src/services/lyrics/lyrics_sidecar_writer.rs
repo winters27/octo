@@ -4,7 +4,7 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -170,6 +170,138 @@ impl LyricsTagAccess for TagLibLyricsTags {
     }
 }
 
+/// Where the library tidy moved songs, for the lyrics jobs that were already waiting when it
+/// moved them. A job keeps its age, the remap's clock when its path was last known true; when the
+/// writer takes the gate's share for it, and on each try again, the job's path follows every move
+/// recorded after that age, oldest first, so a move and then its undo lands where the file is. A
+/// move is kept only while some queued or retrying job is older than it. Clones share one table.
+#[derive(Clone, Default)]
+pub struct LyricsPathRemap {
+    inner: Arc<parking_lot::Mutex<RemapTable>>,
+}
+
+#[derive(Default)]
+struct RemapTable {
+    /// The age of the newest move recorded.
+    clock: u64,
+    /// The moves still needed, oldest first: (age, from, to).
+    moves: std::collections::VecDeque<(u64, String, String)>,
+    /// The ages of the jobs queued, being written, or waiting to be tried again, with how many
+    /// jobs have each.
+    waiting: std::collections::BTreeMap<u64, usize>,
+}
+
+impl RemapTable {
+    /// Drops the moves no waiting job is older than.
+    fn prune(&mut self) {
+        let oldest = self.waiting.keys().next().copied();
+        while let Some((age, ..)) = self.moves.front() {
+            if oldest.is_some_and(|oldest| oldest < *age) {
+                break;
+            }
+            self.moves.pop_front();
+        }
+    }
+
+    fn release(&mut self, age: u64) {
+        if let Some(count) = self.waiting.get_mut(&age) {
+            *count -= 1;
+            if *count == 0 {
+                self.waiting.remove(&age);
+            }
+        }
+        self.prune();
+    }
+
+    fn hold(&mut self) -> u64 {
+        *self.waiting.entry(self.clock).or_default() += 1;
+        self.clock
+    }
+
+    fn follow(&self, path: &str, since: u64) -> String {
+        let mut path = path.to_string();
+        for (_, from, to) in self.moves.iter().filter(|(age, ..)| *age > since) {
+            if let Some(now) = octo_core::common::PathHelper::moved_path(&path, from, to) {
+                path = now;
+            }
+        }
+        path
+    }
+}
+
+impl LyricsPathRemap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records the tidy's moves (`from`, `to`), in the order it made them. Called while the tidy
+    /// still holds the gate, so no job takes its share between a move and its record.
+    pub fn record(&self, moves: &[(String, String)]) {
+        let mut table = self.inner.lock();
+        for (from, to) in moves {
+            table.clock += 1;
+            let age = table.clock;
+            table.moves.push_back((age, from.clone(), to.clone()));
+        }
+        table.prune();
+    }
+
+    /// Where `path` is now, through every move kept, oldest first.
+    pub fn map(&self, path: &str) -> String {
+        self.inner.lock().follow(path, 0)
+    }
+
+    /// A new job's age: its path is true now. Every age handed out is let go of once
+    /// ([`Self::release`]).
+    fn hold(&self) -> u64 {
+        self.inner.lock().hold()
+    }
+
+    /// Lets go of a job's age, and of the moves only it was waiting on.
+    fn release(&self, age: u64) {
+        self.inner.lock().release(age);
+    }
+
+    /// A job of age `age` at `path` once the gate's share is held: where its file is now, and its
+    /// new age (the old one let go of).
+    fn advance(&self, path: &Path, age: u64) -> (PathBuf, u64) {
+        let mut table = self.inner.lock();
+        let now = PathBuf::from(table.follow(&path.to_string_lossy(), age));
+        let fresh = table.hold();
+        table.release(age);
+        (now, fresh)
+    }
+
+    /// How many moves are kept (tests).
+    #[cfg(test)]
+    pub(crate) fn kept(&self) -> usize {
+        self.inner.lock().moves.len()
+    }
+
+    /// How many jobs hold an age (tests).
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.inner.lock().waiting.values().sum()
+    }
+
+    /// A job's age, held as a waiting job holds it (tests).
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self) -> u64 {
+        self.hold()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_for_test(&self, age: u64) {
+        self.release(age);
+    }
+}
+
+/// A queued job and its age in the [`LyricsPathRemap`].
+struct Queued {
+    job: LyricsJob,
+    age: u64,
+}
+
 /// What a Save tells the undo journal before each write: the path, its kind
 /// ([`LyricsUndoJournal::BESIDE`] or [`LyricsUndoJournal::INSIDE`]), and what was there.
 pub type UndoRecord<'a> = &'a (dyn Fn(&Path, &str, Option<&str>) -> anyhow::Result<()> + Send + Sync);
@@ -198,8 +330,15 @@ pub struct LyricsSidecarWriter {
     tags: Arc<dyn LyricsTagAccess>,
     /// Set once the library service exists. Without it no scan is asked for (the tests).
     library: OnceLock<Arc<dyn ILocalLibraryService>>,
-    sender: mpsc::Sender<LyricsJob>,
-    receiver: tokio::sync::Mutex<mpsc::Receiver<LyricsJob>>,
+    sender: mpsc::Sender<Queued>,
+    receiver: tokio::sync::Mutex<mpsc::Receiver<Queued>>,
+    /// Where the library tidy moved songs while their jobs waited.
+    remap: LyricsPathRemap,
+    /// How long a job whose services did not answer waits before it is tried again
+    /// ([`Self::RETRY_DELAY`]; tests make it seconds).
+    retry_delay: Duration,
+    /// Tries again the full queue had no room for.
+    dropped_retries: Arc<AtomicUsize>,
     scan_pending: Arc<AtomicBool>,
     /// The downloads log a download's look reports to; set once the tracker exists.
     tracker: OnceLock<Arc<AcquisitionTracker>>,
@@ -242,11 +381,44 @@ impl LyricsSidecarWriter {
             library: OnceLock::new(),
             sender,
             receiver: tokio::sync::Mutex::new(receiver),
+            remap: LyricsPathRemap::new(),
+            retry_delay: Self::RETRY_DELAY,
+            dropped_retries: Arc::new(AtomicUsize::new(0)),
             scan_pending: Arc::new(AtomicBool::new(false)),
             tracker: OnceLock::new(),
             write_gate: OnceLock::new(),
             undo: OnceLock::new(),
         }
+    }
+
+    /// The writer following `remap`, the table the library tidy records its moves in, in place of
+    /// a table of its own.
+    pub fn with_remap(mut self, remap: LyricsPathRemap) -> Self {
+        self.remap = remap;
+        self
+    }
+
+    /// The writer trying a job again `delay` after its services did not answer, in place of
+    /// [`Self::RETRY_DELAY`] (tests).
+    pub fn with_retry_delay(mut self, delay: Duration) -> Self {
+        self.retry_delay = delay;
+        self
+    }
+
+    /// The table this writer's jobs follow the library tidy's moves through; clones share it.
+    pub fn path_remap(&self) -> LyricsPathRemap {
+        self.remap.clone()
+    }
+
+    /// How many tries again were dropped because the queue was full.
+    pub fn dropped_retries(&self) -> usize {
+        self.dropped_retries.load(Ordering::SeqCst)
+    }
+
+    /// How many jobs wait in the queue (tests).
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        Self::QUEUE_CAPACITY - self.sender.capacity()
     }
 
     /// The lyrics undo journal a replacement records into. Only the first call counts.
@@ -276,36 +448,53 @@ impl LyricsSidecarWriter {
 
     /// Queue a song. False when the queue is full and the job was dropped.
     pub fn try_enqueue(&self, job: LyricsJob) -> bool {
-        self.sender.try_send(job).is_ok()
+        let age = self.remap.hold();
+        if self.sender.try_send(Queued { job, age }).is_err() {
+            self.remap.release(age);
+            return false;
+        }
+        true
     }
 
     /// The worker's loop: one job at a time until `stopping`.
     pub async fn run(self: Arc<Self>, stopping: CancellationToken) -> anyhow::Result<()> {
         let mut queue = self.receiver.lock().await;
         loop {
-            let job = tokio::select! {
-                job = queue.recv() => job,
+            let queued = tokio::select! {
+                queued = queue.recv() => queued,
                 () = stopping.cancelled() => break,
             };
-            let Some(job) = job else {
+            let Some(Queued { mut job, age }) = queued else {
                 break;
             };
             let share = match self.write_gate.get() {
                 Some(gate) => Some(gate.write().await),
                 None => None,
             };
+            // The tidy may have moved the song while the job waited; it cannot move it while the
+            // share is held.
+            let (now, age) = self.remap.advance(&job.audio_path, age);
+            job.audio_path = now;
             let written = self.write(&job, false, &stopping).await;
             drop(share);
             // One job's failure is logged and the loop goes on.
             match written {
-                _ if stopping.is_cancelled() => break,
+                _ if stopping.is_cancelled() => {
+                    self.remap.release(age);
+                    break;
+                }
                 Ok(write) => {
                     self.report(&job, &write);
                     if write.outcome == LyricsWriteOutcome::Retrying {
-                        self.retry_later(job.clone().with_attempt(job.attempt + 1), stopping.clone());
+                        self.retry_later(job.clone().with_attempt(job.attempt + 1), age, stopping.clone());
+                    } else {
+                        self.remap.release(age);
                     }
                 }
-                Err(error) => warn!("Could not write lyrics for {}: {error}", job.audio_path.display()),
+                Err(error) => {
+                    self.remap.release(age);
+                    warn!("Could not write lyrics for {}: {error}", job.audio_path.display());
+                }
             }
         }
         Ok(())
@@ -711,15 +900,31 @@ impl LyricsSidecarWriter {
         });
     }
 
-    fn retry_later(&self, job: LyricsJob, stopping: CancellationToken) {
-        let sender = self.sender.clone();
+    /// Queues `job` again after the retry delay, keeping its age, so it follows the moves made
+    /// meanwhile. A try again the full queue has no room for is dropped, counted and its age let
+    /// go of.
+    fn retry_later(&self, job: LyricsJob, age: u64, stopping: CancellationToken) {
+        let (sender, remap, dropped, delay) = (
+            self.sender.clone(),
+            self.remap.clone(),
+            self.dropped_retries.clone(),
+            self.retry_delay,
+        );
         tokio::spawn(async move {
             tokio::select! {
-                () = tokio::time::sleep(Self::RETRY_DELAY) => {
-                    let _ = sender.try_send(job);
+                () = tokio::time::sleep(delay) => {
+                    let path = job.audio_path.clone();
+                    if sender.try_send(Queued { job, age }).is_err() {
+                        dropped.fetch_add(1, Ordering::SeqCst);
+                        remap.release(age);
+                        warn!(
+                            "The lyrics queue was full, so {} was not looked up again",
+                            path.display()
+                        );
+                    }
                 }
                 // Shutting down.
-                () = stopping.cancelled() => {}
+                () = stopping.cancelled() => remap.release(age),
             }
         });
     }

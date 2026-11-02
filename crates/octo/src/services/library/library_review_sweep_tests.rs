@@ -2057,6 +2057,53 @@ async fn a_file_navidrome_does_not_show_is_asked_about() {
     assert_eq!(queue.open_count(NoticeOrigin::LibrarySweep), 1);
 }
 
+// ---- Navidrome's hidden names ---------------------------------------------------------------
+
+/// Navidrome hides a name with one leading dot only, so a folder like `...And Justice for All`
+/// is swept and re-checked like any other, while names with one dot stay out.
+#[tokio::test]
+async fn three_dot_folder_is_swept() {
+    let sweep = Sweep::new();
+    for folder in ["Metallica/...And Justice for All", ".hidden", "Metallica/.Album"] {
+        std::fs::create_dir_all(sweep.root.path().join(folder)).expect("a folder");
+    }
+    let justice = sweep.song("Metallica/...And Justice for All/01 Blackened.flac");
+    let hidden = sweep.song(".hidden/a.flac");
+    let in_hidden_album = sweep.song("Metallica/.Album/b.flac");
+    let verifier = FakeVerifier::confirming();
+    let worker = sweep.worker(
+        verifier.clone(),
+        Options {
+            settings: Some(LibraryActionSettings {
+                review_sweep_octo_downloads: true,
+                ..settings_of(60)
+            }),
+            ..Default::default()
+        },
+    );
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+    // The verifier hears each song by its file name: the songs in one-dot folders were never
+    // asked about.
+    assert_eq!(verifier.asked(), ["01 Blackened.flac"]);
+
+    let worker = sweep.worker(
+        FakeVerifier::confirming(),
+        Options {
+            settings: Some(settings_of(0)),
+            octo_downloads: vec![justice, hidden, in_hidden_album],
+            ..Default::default()
+        },
+    );
+    worker.set_paused(true);
+    assert_eq!(
+        worker.recheck_octo().await,
+        1,
+        "only the three-dot folder's download"
+    );
+}
+
 // ---- Re-check Octo's downloads -----------------------------------------------------------
 
 /// The re-check forgets only Octo's own downloads, walks only them once at 60 an hour with the
