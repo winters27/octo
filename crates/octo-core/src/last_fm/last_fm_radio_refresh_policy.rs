@@ -9,7 +9,8 @@ use crate::common::dotnet;
 use crate::models::radio::LastFmRadioUserState;
 use crate::settings::LastFmSettings;
 
-const FAILURE_RETRY_DELAY: TimeDelta = TimeDelta::minutes(15);
+/// How long after a failed refresh, or one that kept stations as they were, the next try waits.
+pub const FAILURE_RETRY_DELAY: TimeDelta = TimeDelta::minutes(15);
 
 /// A refresh still marked as running this long after it started has died (a refresh gives up
 /// well within a minute), so it no longer holds the next one back.

@@ -3678,7 +3678,10 @@ async function loadRadioStatus() {
       : learning.needed > 0 ? `${learning.plays} completed plays learned · ${learning.needed} more before Your Radio.`
       : learning.refreshing ? 'Refreshing now. The last good snapshots remain playable.'
       : failure ? `Last refresh failed: ${failure}` : `${learning.plays} completed plays learned.`;
-    const carriedLine = carried ? `<p class="radio-state-copy">${escapeHtml(`${carried}. Octo tries again every 15 minutes.`)}</p>` : '';
+    // A no-break space keeps the number and its unit on one line.
+    const carriedLine = carried
+      ? `<p class="radio-carried-note">${escapeHtml(`${carried}. Octo tries again every ${learning.carriedRetryMinutes} minutes.`)}</p>`
+      : '';
     output.innerHTML = `<p class="radio-state-copy">${escapeHtml(stateMessage)}</p>` + carriedLine + ((data.stations || []).length
       ? `<div class="radio-station-grid">${data.stations.map(station => `<article class="radio-station-item"><div><strong>${escapeHtml(station.name)}</strong><span>${escapeHtml(station.kind)} · ${station.trackCount} tracks</span></div><p>${(station.preview || []).map(track => `${escapeHtml(track.title)} by ${escapeHtml(track.artist)}`).join(' · ') || 'Snapshot has no preview yet.'}</p></article>`).join('')}</div>`
       : '<div class="radio-empty">No ready snapshots yet. Stations are offered automatically as listening signals arrive.</div>');

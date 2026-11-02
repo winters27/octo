@@ -51,7 +51,14 @@ async function render(learning) {
   return output.innerHTML;
 }
 
-const learned = { plays: 12, needed: 0, refreshing: false, lastRefreshError: null, carriedNote: null };
+const learned = {
+  plays: 12,
+  needed: 0,
+  refreshing: false,
+  lastRefreshError: null,
+  carriedNote: null,
+  carriedRetryMinutes: 15,
+};
 const note = "Couldn't update Discovery Radio, so it kept its songs";
 
 test('a refresh that kept stations gets its own line and never reads as failed', async () => {
@@ -59,21 +66,21 @@ test('a refresh that kept stations gets its own line and never reads as failed',
   assert.match(html, /<p class="radio-state-copy">12 completed plays learned\.<\/p>/);
   assert.match(
     html,
-    /<p class="radio-state-copy">Couldn&#39;t update Discovery Radio, so it kept its songs\. Octo tries again every 15 minutes\.<\/p>/,
+    /<p class="radio-carried-note">Couldn&#39;t update Discovery Radio, so it kept its songs\. Octo tries again every 15 minutes\.<\/p>/,
   );
   assert.doesNotMatch(html, /failed/);
 });
 
-test('the kept line shows while radio is still learning', async () => {
-  const html = await render({ ...learned, plays: 4, needed: 6, lastRefreshError: note, carriedNote: note });
+test('the kept line shows while radio is still learning, with the wait the server says', async () => {
+  const html = await render({ ...learned, plays: 4, needed: 6, lastRefreshError: note, carriedNote: note, carriedRetryMinutes: 20 });
   assert.match(html, /4 completed plays learned · 6 more before Your Radio\./);
-  assert.match(html, /Octo tries again every 15 minutes\./);
+  assert.match(html, /Octo tries again every 20 minutes\./);
 });
 
 test('a real failure still reads as failed, beside the kept line', async () => {
   const html = await render({ ...learned, lastRefreshError: 'Provider returned no usable replacement stations', carriedNote: note });
   assert.match(html, /Last refresh failed: Provider returned no usable replacement stations/);
-  assert.match(html, /Octo tries again every 15 minutes\./);
+  assert.match(html, /Octo tries again every 15 minutes\./);
 });
 
 test('nothing kept, no kept line', async () => {

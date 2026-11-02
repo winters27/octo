@@ -8,6 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use octo_core::common::dotnet::is_blank;
 use octo_core::last_fm::last_fm_radio_recommendation_service::carried_note;
+use octo_core::last_fm::last_fm_radio_refresh_policy::FAILURE_RETRY_DELAY;
 use octo_core::last_fm::last_fm_scrobble_service::LastFmScrobbleException;
 use octo_core::settings::SettingsWriteError;
 use serde::Deserialize;
@@ -85,6 +86,7 @@ pub async fn get_last_fm_radio(
             // The apps show this line as it is, so a refresh that kept stations says so here too.
             "lastRefreshError": user.last_refresh_error.clone().or_else(|| note.clone()),
             "carriedNote": note,
+            "carriedRetryMinutes": FAILURE_RETRY_DELAY.num_minutes(),
         })
     });
     let stations: Vec<serde_json::Value> = user_state
