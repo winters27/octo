@@ -397,7 +397,15 @@ async fn mornyes_client_as_octo_builds_it_reads_slskd_by_its_link() {
     let mut settings = factory_settings();
     settings.soulseek.enabled = true;
     settings.soulseek.base_url = Some("http://slskd.test:5030".into());
-    let state = AppState::for_tests(settings);
+    // Its files go in a folder that is removed with the test.
+    let config = tempfile::tempdir().expect("a temp dir");
+    let state = AppState::for_tests_with(
+        settings,
+        crate::app::TestServices {
+            config_dir: Some(config.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
     assert!(state.spotiflac.slskd_in_use());
 
     let mut next = (*state.settings.current()).clone();

@@ -652,6 +652,61 @@ async fn a_paused_check_is_warned_with_its_next_try() {
     );
 }
 
+/// The words the client pushes when a read of `server` opens a paused check, with slskd switched
+/// on or off in the settings and `link` as its running link.
+async fn paused_check_words(
+    server: &MockServer,
+    slskd_switched_on: bool,
+    link: Arc<dyn crate::services::soulseek::ISoulseekLink>,
+) -> Vec<String> {
+    let mut settings = AppSettings::default();
+    settings.spotiflac.enabled = true;
+    settings.spotiflac.url = server.uri();
+    settings.spotiflac.token = "t".into();
+    settings.soulseek.enabled = slskd_switched_on;
+    settings.soulseek.base_url = Some("http://slskd.test:5030".into());
+    let pushed = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&pushed);
+    let client = SpotiflacClient::new(Arc::new(SettingsStore::for_tests(settings)))
+        .with_slskd(link)
+        .with_check(MornyeCheck::new(
+            Arc::new(MornyeCheckStore::new(None)),
+            CheckTimes::default(),
+            Some(Arc::new(move |words: String| sink.lock().push(words))),
+        ));
+    client.check_view(None).await.expect("a read of Mornye");
+    pushed.lock().clone()
+}
+
+/// The paused check's words name Soulseek by slskd's running link, as the downloads do, not by
+/// the live switch.
+#[tokio::test]
+async fn the_paused_check_words_read_slskd_by_its_link() {
+    use crate::services::common::test_fakes::{LoggedInLink, OffLink};
+    let sessions = json!({"result": {"sessions": [
+        {"key": "gateway-v2-abc-6836abb49bb0e8c9", "kind": "gateway", "label": "Example", "extensions": ["example-ext"],
+         "state": "unverified", "auth_paused_s": 900.0}
+    ]}});
+    let server = mornye(
+        mornye_info("Mornye", "1.0.5"),
+        mornye_extensions(),
+        one_service(),
+        sessions,
+        ResponseTemplate::new(404),
+    )
+    .await;
+
+    // Switched off since startup: the running slskd is still asked.
+    let words = paused_check_words(&server, false, Arc::new(LoggedInLink)).await;
+    assert_eq!(words.len(), 1, "{words:?}");
+    assert!(words[0].contains(", so Octo asks Soulseek"), "{words:?}");
+
+    // Switched on since startup: slskd is not running, so the words never promise it.
+    let words = paused_check_words(&server, true, Arc::new(OffLink)).await;
+    assert_eq!(words.len(), 1, "{words:?}");
+    assert!(!words[0].contains("Soulseek"), "{words:?}");
+}
+
 #[tokio::test]
 async fn a_download_is_asked_with_the_quality_the_extensions_and_the_folder() {
     let server = MockServer::builder().start().await;

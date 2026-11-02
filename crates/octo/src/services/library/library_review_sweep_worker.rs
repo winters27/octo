@@ -195,10 +195,9 @@ pub trait SweepReplacer: Send + Sync {
     }
 
     /// Whether slskd is in use, by the rule the downloads follow
-    /// ([`crate::services::library::UpgradeSources::slskd_in_use_with`]).
-    fn slskd_in_use(&self, soulseek: &octo_core::settings::SoulseekSettings) -> bool {
-        soulseek.is_on()
-    }
+    /// ([`crate::services::library::UpgradeSources::slskd_in_use_with`]): the running link, with
+    /// `soulseek` deciding only where there is none.
+    fn slskd_in_use(&self, soulseek: &octo_core::settings::SoulseekSettings) -> bool;
 }
 
 /// The people besides the admin who can star or rate songs, whose marks the admin's own sign-in

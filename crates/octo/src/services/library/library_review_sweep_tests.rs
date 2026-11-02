@@ -259,6 +259,8 @@ struct Options {
     replacer: Option<Arc<FakeReplacer>>,
     /// The download source; Soulseek when none.
     source: Option<DownloadSource>,
+    /// slskd switched off in the settings (switched on otherwise).
+    slskd_switched_off: bool,
 }
 
 impl Sweep {
@@ -323,7 +325,7 @@ impl Sweep {
                 ..Default::default()
             },
             soulseek: SoulseekSettings {
-                enabled: true,
+                enabled: !options.slskd_switched_off,
                 base_url: Some("http://slskd.test".into()),
                 ..Default::default()
             },
@@ -1317,6 +1319,39 @@ async fn the_sweep_reads_slskd_through_its_replacer() {
     let entries = queue.for_user("bob", NoticeKind::Review);
     assert_eq!(entries.len(), 1);
     assert_ne!(entries[0].state, NoticeState::Acted);
+}
+
+/// The other way round: switched off since startup with slskd still running, the sweep replaces,
+/// as the downloads still ask slskd.
+#[tokio::test]
+async fn the_sweep_replaces_while_slskd_still_runs_after_a_switch_off() {
+    let replacer = Arc::new(FakeReplacer {
+        slskd_in_use: Some(true),
+        ..Arc::into_inner(FakeReplacer::ending(LibraryActionState::Applied)).expect("the only one")
+    });
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+        Options {
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            slskd_switched_off: true,
+            ..Default::default()
+        },
+    );
+    for _ in 0..2 {
+        worker.tick().await;
+    }
+
+    assert_eq!(
+        replacer.requests(),
+        [(
+            LibraryAction::WrongSong,
+            "nd-a.flac".to_string(),
+            "bob".to_string()
+        )]
+    );
 }
 
 /// The sweep builds the request for a replacement it holds to the preview: Soulseek alone under

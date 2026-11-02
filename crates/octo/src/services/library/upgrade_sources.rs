@@ -92,7 +92,8 @@ impl UpgradeSources {
     /// slskd is in use: its link is not off, the same thing the heart chain's slskd client reads
     /// (switched on with an address, at startup; switching it is a restart setting). With no link,
     /// the settings say. A sign-in is not needed: slskd can run without one. The one rule Better
-    /// quality, imports, prefetch and Find songs share, so a server never gets two answers.
+    /// quality, imports, prefetch, Find songs, Mornye's paused-check words and the Review sweep's
+    /// preview gate share, so a server never gets two answers.
     pub fn slskd_in_use_with(settings: &SoulseekSettings, link: Option<&dyn ISoulseekLink>) -> bool {
         match link {
             Some(link) => !link.is_off(),
