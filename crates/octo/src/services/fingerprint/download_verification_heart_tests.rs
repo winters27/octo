@@ -435,7 +435,10 @@ async fn a_heard_lookup_is_never_sent_with_a_zero_length() {
     let body = String::from_utf8_lossy(&sent[0].body).to_string();
     assert!(body.contains("duration=300"), "{body}");
     assert!(!body.contains("duration=0"), "{body}");
-    assert!(prints.whole_heard.is_some(), "the whole print serves the clip too");
+    assert!(
+        prints.whole_heard.is_some(),
+        "the whole print serves the clip too"
+    );
     assert_eq!(gate_of(built).reading, HeardReading::OnlyHeardOrMaster);
 }
 
@@ -471,7 +474,10 @@ async fn a_heart_never_played_with_nothing_to_prove_ends_and_with_a_video_holds_
     let GateBuild::End { gate, line } = built else {
         panic!("it did not end: {built:?}");
     };
-    assert_eq!(line, crate::services::common::heart_acquisition_coordinator::HEARD_GONE);
+    assert_eq!(
+        line,
+        crate::services::common::heart_acquisition_coordinator::HEARD_GONE
+    );
     assert_eq!(gate.reading, HeardReading::NotHeard);
 
     let with_video = heart.rig.registry.register(SoulseekRouting {

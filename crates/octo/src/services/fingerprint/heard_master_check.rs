@@ -515,7 +515,12 @@ impl HeardMasterCheck {
 
     /// A round of one candidate of the acquisition `acquisition_key`, which takes its turn at the
     /// acquisition's place as the acquisition's open rounds do.
-    pub async fn check_once_in(&self, acquisition_key: Option<&str>, heard: HeardAudio, file: &Path) -> HeardMaster {
+    pub async fn check_once_in(
+        &self,
+        acquisition_key: Option<&str>,
+        heard: HeardAudio,
+        file: &Path,
+    ) -> HeardMaster {
         let round = HeardRound::new(
             Arc::clone(&self.parts),
             heard,

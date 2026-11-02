@@ -240,7 +240,9 @@ async fn three_peoples_rounds_in_one_pass_take_turns_at_one_place() {
     // A check of one file with no open round of its own takes its turn too.
     let once = check.check_once_in(Some(key), heard_video(), &file);
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(10), once).await.expect("it ends"),
+        tokio::time::timeout(Duration::from_secs(10), once)
+            .await
+            .expect("it ends"),
         HeardMaster::Differs
     );
     assert!(guards.iter().all(|guard| !guard.round().has_copy()));

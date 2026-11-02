@@ -501,7 +501,10 @@ async fn a_file_fpcalc_could_not_print_is_judged_without_acoust_id() {
         GateVerdict::Undecided(octo_core::fingerprint::heart_gate::Undecided::KeepHeardCopy)
     );
     let master = file(&rig, "master", "help-2009", "help-2009-master", "help", None);
-    let check = rig.service.verify_for_heart(&master, &candidate("x"), &gate).await;
+    let check = rig
+        .service
+        .verify_for_heart(&master, &candidate("x"), &gate)
+        .await;
     assert!(
         matches!(
             check.verdict,

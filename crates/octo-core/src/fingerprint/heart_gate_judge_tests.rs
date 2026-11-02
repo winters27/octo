@@ -895,13 +895,7 @@ fn a_file_kept_as_heard_claims_only_the_codes_its_sound_proved() {
         recording("y1", "Yesterday", BEATLES, &[shared], 1),
     ]);
     assert!(heard_codes(&only_shared, HELP_2009).is_empty());
-    let (became_r, tag) = became(
-        &heard,
-        &weighed(&heard, HELP_2009),
-        &[],
-        &help_r(),
-        MATCH_SCORE,
-    );
+    let (became_r, tag) = became(&heard, &weighed(&heard, HELP_2009), &[], &help_r(), MATCH_SCORE);
     assert_eq!(tag.as_deref(), Some(HELP_2009));
     assert_eq!(became_r.tag_isrcs, [ISRC_2009]);
 
@@ -956,7 +950,9 @@ fn a_label_musicbrainz_gave_up_on_refuses_nothing() {
     assert_eq!(verdict_of(&gate, by_id, Some(HeardMaster::Differs)), accepted);
     let code = "GBUM72306558";
     let mut by_code = with_isrc(AcoustIdOutcome::Busy, code);
-    by_code.isrc_recordings.push((code.into(), MusicBrainzFact::GaveUp));
+    by_code
+        .isrc_recordings
+        .push((code.into(), MusicBrainzFact::GaveUp));
     assert_eq!(
         verdict_of(&gate, by_code, Some(HeardMaster::Differs)),
         GateVerdict::Hold(WaitingFor::AcoustId),
@@ -1169,12 +1165,18 @@ fn only_a0_or_a2_when_nothing_proves_what_played() {
 }
 
 /// The heard audio and the heard master carry the heard answer's clear recording as their tag,
-/// with R's ISRCs.
+/// with the codes the heard answer proved are its own.
 #[test]
 fn a0_and_a2_carry_the_heard_answers_clear_recording() {
-    let tagged = gate(HeardReading::RStays {
-        tag: Some(HELP_2009.into()),
-    });
+    let tagged = HeartGate {
+        r: Some(HeardRecording {
+            tag_isrcs: vec![ISRC_2009.into()],
+            ..help_r()
+        }),
+        ..gate(HeardReading::RStays {
+            tag: Some(HELP_2009.into()),
+        })
+    };
     let recording_tags = TagClaim::Recording {
         id: HELP_2009.into(),
         isrcs: vec![ISRC_2009.into()],

@@ -444,7 +444,8 @@ async fn an_old_shim_holds_for_the_shim_and_a_gone_video_reads_unclear() {
     Mock::given(path("/facts"))
         .and(query_param("id", HEARD))
         .respond_with(
-            ResponseTemplate::new(200).set_body_raw(r#"{"channel":"The Beatles - Topic"}"#, "application/json"),
+            ResponseTemplate::new(200)
+                .set_body_raw(r#"{"channel":"The Beatles - Topic"}"#, "application/json"),
         )
         .up_to_n_times(1)
         .with_priority(1)
@@ -559,5 +560,9 @@ async fn a_copy_fetched_ahead_passes_only_by_the_channel_of_its_own_video() {
             .await,
         ClipReading::ThisSong
     );
-    assert_eq!(asked(&youtube.server, "/facts").await, 1, "its video's channel was read");
+    assert_eq!(
+        asked(&youtube.server, "/facts").await,
+        1,
+        "its video's channel was read"
+    );
 }

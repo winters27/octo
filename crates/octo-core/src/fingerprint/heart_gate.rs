@@ -635,7 +635,10 @@ pub fn heard_codes(answer: &AcoustIdAnswer, recording_id: &str) -> Vec<String> {
     let carried_elsewhere = |code: &str| {
         recordings().any(|other| {
             !other.id.eq_ignore_ascii_case(recording_id)
-                && other.isrcs.iter().any(|isrc| isrc.trim().eq_ignore_ascii_case(code))
+                && other
+                    .isrcs
+                    .iter()
+                    .any(|isrc| isrc.trim().eq_ignore_ascii_case(code))
         })
     };
     let mut codes: Vec<String> = Vec::new();

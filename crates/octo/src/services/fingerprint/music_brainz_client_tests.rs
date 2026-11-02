@@ -747,6 +747,7 @@ async fn each_kind_of_answer_is_read_and_only_a_refused_question_is_warned() {
             Asked::NotKnown => "not known",
             Asked::Refused => "refused",
             Asked::Busy { .. } => "busy",
+            Asked::GaveUp => "gave up",
         };
         assert_eq!(kind, expected);
     }
@@ -1464,7 +1465,10 @@ async fn a_label_question_given_up_on_is_never_read_as_known_nothing_by() {
     assert_eq!(ending(&mut code_ended).await, ReAsked::GaveUp);
     let sent = asked(&server).await.len();
 
-    assert_eq!(client.current_recording(YESTERDAY_1987).await, MusicBrainzFact::GaveUp);
+    assert_eq!(
+        client.current_recording(YESTERDAY_1987).await,
+        MusicBrainzFact::GaveUp
+    );
     assert_eq!(
         client.isrc_songs_for_heart(YESTERDAY_CODE).await,
         MusicBrainzFact::GaveUp
