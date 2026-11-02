@@ -4995,12 +4995,15 @@ document.getElementById('fetched-list')?.addEventListener('toggle', fetchedLogTo
 document.getElementById('health-fetched-results')?.addEventListener('toggle', fetchedLogToggle, true);
 
 // Library health: look up one fetched song by name, however old, to see how it was tagged (the
-// release that won and its distance) and its download log. Searches every entry Octo kept.
+// release that won and its distance) and its download log. Searches every entry Octo kept. Only
+// the latest lookup draws its answer, so a slow earlier one never replaces it.
+let healthFetchedToken = 0;
 document.getElementById('health-fetched-form')?.addEventListener('submit', async event => {
   event.preventDefault();
   const out = document.getElementById('health-fetched-results');
   const q = document.getElementById('health-fetched-q')?.value.trim() || '';
   if (!out) return;
+  const token = ++healthFetchedToken;
   out.hidden = false;
   if (!q) { out.innerHTML = stateBlock('empty', 'Type a title, an artist or both.'); return; }
   out.innerHTML = stateBlock('loading', 'Looking through the fetched songs…');
@@ -5008,10 +5011,12 @@ document.getElementById('health-fetched-form')?.addEventListener('submit', async
     const r = await api(`/api/admin/downloads?q=${encodeURIComponent(q)}`, { cache: 'no-store' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const items = (await r.json()).downloads || [];
+    if (token !== healthFetchedToken) return;
     out.innerHTML = items.length
       ? items.map(fetchedRow).join('')
       : stateBlock('empty', 'No fetched song matches. Only songs Octo downloaded are listed, and only the newest 500 are kept.');
   } catch (e) {
+    if (token !== healthFetchedToken) return;
     out.innerHTML = stateBlock('error', `Couldn't search the fetched songs: ${e.message || 'error'}`);
   }
 });
