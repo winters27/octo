@@ -536,23 +536,20 @@ impl MornyeRowKeeper {
             .map(|kept| kept.row.clone())
     }
 
-    /// Keeps `row`, from a probe of the Mornye at `asked` made under the settings `under`, only
-    /// while those are still the settings (`now`): a probe that outlived a change says nothing
-    /// about the Mornye now.
+    /// Keeps `row`, from a probe of the Mornye at `asked` made under the settings `under`. One
+    /// that outlived a change is kept too, but [`Self::kept_for`] never shows it; with one probe
+    /// at a time, it can only replace a row as old as itself.
     pub(super) fn keep(
         &self,
         under: std::sync::Arc<octo_core::settings::AppSettings>,
-        now: &std::sync::Arc<octo_core::settings::AppSettings>,
         asked: String,
         row: serde_json::Value,
     ) {
-        if std::sync::Arc::ptr_eq(&under, now) {
-            *self.kept.lock() = Some(KeptRow {
-                url: asked,
-                under,
-                row,
-            });
-        }
+        *self.kept.lock() = Some(KeptRow {
+            url: asked,
+            under,
+            row,
+        });
     }
 }
 
@@ -600,9 +597,7 @@ async fn mornye_row(state: &AppState) -> Option<serde_json::Value> {
         tokio::spawn(async move {
             let done = ProbeDone(state.clone());
             let row = probe_mornye(&state).await;
-            state
-                .mornye_row
-                .keep(under, &state.settings.current(), asked, row);
+            state.mornye_row.keep(under, asked, row);
             drop(done);
         });
     }

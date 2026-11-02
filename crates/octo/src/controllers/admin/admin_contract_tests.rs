@@ -545,20 +545,14 @@ async fn a_mornye_switched_off_and_on_again_with_no_status_between_never_shows_a
 }
 
 #[test]
-fn a_probe_keeps_its_row_only_under_the_settings_it_was_asked_under() {
+fn a_kept_row_shows_only_under_the_settings_it_was_probed_under() {
     let keeper = super::system::MornyeRowKeeper::default();
     let row = serde_json::json!({"detail": "Mornye 1.0.5"});
     let asked = "http://spotiflac:8000";
     let before = std::sync::Arc::new(AppSettings::default());
     let after = std::sync::Arc::new(AppSettings::default());
 
-    keeper.keep(before.clone(), &after, asked.into(), row.clone());
-    assert_eq!(
-        keeper.kept_for(asked, &after),
-        None,
-        "the settings changed while it asked"
-    );
-    keeper.keep(before.clone(), &before, asked.into(), row.clone());
+    keeper.keep(before.clone(), asked.into(), row.clone());
     assert_eq!(keeper.kept_for(asked, &before), Some(row));
     assert_eq!(keeper.kept_for(asked, &after), None, "the settings changed since");
     assert_eq!(
