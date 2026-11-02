@@ -194,6 +194,7 @@ pub struct DeezerStandIn {
     seeds: MemoryCache<Arc<Value>>,
     tracklists: MemoryCache<Arc<Vec<Value>>>,
     twins: Arc<TwinMap>,
+    twin_wait: Duration,
     artist_ids: MemoryCache<String>,
     deezer_artists: MemoryCache<Option<DeezerArtist>>,
 }
@@ -201,6 +202,7 @@ pub struct DeezerStandIn {
 impl DeezerStandIn {
     pub fn new(reach: Arc<DeezerReach>, apple: Arc<AppleCatalog>) -> Self {
         Self {
+            twin_wait: TWIN_WAIT,
             reach,
             apple,
             door: OnceLock::new(),
@@ -211,6 +213,12 @@ impl DeezerStandIn {
             artist_ids: MemoryCache::new(MAP_ENTRIES * 2),
             deezer_artists: MemoryCache::new(MAP_ENTRIES),
         }
+    }
+
+    /// The same stand-in waiting at most `wait` for an answer's twin lookups (a test's short wait).
+    pub fn with_twin_wait(mut self, wait: Duration) -> Self {
+        self.twin_wait = wait;
+        self
     }
 
     /// The door the stand-in's own Deezer questions go through; set once, when it is wired.
@@ -234,6 +242,21 @@ impl DeezerStandIn {
         self.twins.clear();
         self.artist_ids.clear();
         self.deezer_artists.clear();
+    }
+
+    /// From now on, clears what the stand-in learned at every catalog switch: nothing learned
+    /// under one catalog is read under the other, and its memory is freed.
+    pub fn follow_switches(self: &Arc<Self>) {
+        let mut switches = self.reach.switches();
+        let this = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while switches.changed().await.is_ok() {
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                this.clear();
+            }
+        });
     }
 
     /// Where a request to Deezer's API goes, from its path and query.
@@ -903,8 +926,8 @@ impl DeezerStandIn {
     }
 
     /// Looks the twins of `albums` up on Deezer's interactive lane, each in a task of its own that
-    /// records its verdict whenever it finishes; waits [`TWIN_WAIT`] at most. True when a lookup
-    /// went unanswered or is still running.
+    /// records its verdict whenever it finishes; waits [`TWIN_WAIT`] (or the stand-in's own wait)
+    /// at most. True when a lookup went unanswered or is still running.
     async fn look_up_twins(&self, albums: Vec<(u64, Value)>, origin: &str, generation: u64) -> bool {
         if albums.is_empty() {
             return false;
@@ -925,7 +948,7 @@ impl DeezerStandIn {
                 })
             })
             .collect();
-        match tokio::time::timeout(TWIN_WAIT, futures::future::join_all(lookups)).await {
+        match tokio::time::timeout(self.twin_wait, futures::future::join_all(lookups)).await {
             Ok(done) => done.iter().any(|done| !matches!(done, Ok(true))),
             Err(_) => true,
         }
@@ -1068,6 +1091,9 @@ impl DeezerStandIn {
             }
         };
         let deezer_id = chosen.get("id").map(Value::to_string).unwrap_or_default();
+        if apple_id(&deezer_id).is_some() {
+            return None;
+        }
         self.artist_ids
             .set(key(generation, "a2d", apple), deezer_id.clone(), 1, KEPT_FOR);
         let artist = DeezerArtist {
@@ -1234,8 +1260,8 @@ impl DeezerStandIn {
     }
 }
 
-/// A GET through the door, None when Deezer did not answer with a 200. Boxed: the door's own
-/// answer can come back here.
+/// A GET straight to Deezer through the door, never routed by the stand-in (so never answered
+/// from Apple); None when Deezer did not answer with a 200. Boxed so a detached task can hold it.
 fn deezer_get(
     door: Option<Weak<DeezerRateLimitHandler>>,
     url: String,
@@ -1243,7 +1269,7 @@ fn deezer_get(
 ) -> BoxFuture<'static, Option<HttpAnswer>> {
     async move {
         let door = door?.upgrade()?;
-        let answer = door.get_for(&url, purpose, None).await.ok()?;
+        let answer = door.get_with_outcome(&url, purpose).await.0.ok()?;
         answer.is_success().then_some(answer)
     }
     .boxed()

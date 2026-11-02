@@ -256,7 +256,8 @@ impl DeezerRateLimitHandler {
     }
 
     /// A GET straight to Deezer, never routed by the stand-in, and what happened to it (told to the
-    /// reach like every request to the API host): how `/infos` is read.
+    /// reach like every request to the API host): how `/infos` and the stand-in's own Deezer
+    /// questions are asked.
     pub(crate) async fn get_with_outcome(
         &self,
         url: &str,

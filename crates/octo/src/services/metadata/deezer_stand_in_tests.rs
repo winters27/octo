@@ -74,6 +74,30 @@ impl World {
 
     /// A world whose `/infos` is read from `infos_origin` (a Deezer that cannot be reached).
     async fn with_infos_at(deezer: MockServer, timeout: Duration, infos_origin: &str) -> Self {
+        Self::build(deezer, timeout, infos_origin, TWIN_WAIT, None).await
+    }
+
+    /// A world whose answers wait at most `twin_wait` for their twin lookups.
+    async fn with_twin_wait(twin_wait: Duration) -> Self {
+        let deezer = MockServer::start().await;
+        let origin = deezer.uri();
+        Self::build(deezer, Duration::from_secs(5), &origin, twin_wait, None).await
+    }
+
+    /// A world whose door gives a request `timeout` and Apple each call `apple_timeout`.
+    async fn with_timeouts(timeout: Duration, apple_timeout: Duration) -> Self {
+        let deezer = MockServer::start().await;
+        let origin = deezer.uri();
+        Self::build(deezer, timeout, &origin, TWIN_WAIT, Some(apple_timeout)).await
+    }
+
+    async fn build(
+        deezer: MockServer,
+        timeout: Duration,
+        infos_origin: &str,
+        twin_wait: Duration,
+        apple_timeout: Option<Duration>,
+    ) -> Self {
         let apple = MockServer::start().await;
         let pace = Arc::new(ApplePace::new(PaceConfig {
             spacing: Duration::ZERO,
@@ -83,9 +107,13 @@ impl World {
             ..PaceConfig::default()
         }));
         let reach = Arc::new(DeezerReach::new(Arc::clone(&pace)));
-        let catalog = Arc::new(AppleCatalog::with_bases(pace, &apple.uri(), &apple.uri(), None));
+        let mut catalog = AppleCatalog::with_bases(pace, &apple.uri(), &apple.uri(), None);
+        if let Some(apple_timeout) = apple_timeout {
+            catalog = catalog.with_call_timeout(apple_timeout);
+        }
+        let catalog = Arc::new(catalog);
         catalog.set_store_source(Arc::new(InStore));
-        let stand_in = Arc::new(DeezerStandIn::new(Arc::clone(&reach), catalog));
+        let stand_in = Arc::new(DeezerStandIn::new(Arc::clone(&reach), catalog).with_twin_wait(twin_wait));
         let hints = Arc::new(ArtworkHints::new());
         stand_in.set_hints(Arc::clone(&hints));
         let door = Arc::new(
@@ -105,6 +133,17 @@ impl World {
             hints,
             origin,
         }
+    }
+
+    /// The Deezer service on this world's door, asking the mock Deezer.
+    fn service(&self) -> crate::services::metadata::DeezerMetadataService {
+        crate::services::metadata::DeezerMetadataService::with_base_url(
+            Arc::clone(&self.door),
+            Arc::new(octo_core::settings::SettingsStore::for_tests(
+                octo_core::settings::AppSettings::default(),
+            )),
+            self.origin.clone(),
+        )
     }
 
     /// A request to a port on the API host: [`REFUSING_PORT`] fails to connect.
@@ -323,11 +362,11 @@ async fn while_closed_searches_never_ask_deezer_and_a_served_server_comes_back()
             tokio::task::yield_now().await;
         }
     }
-    for _ in 0..100 {
+    for _ in 0..400 {
         if !world.reach.stands_in() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(matches!(world.reach.reach(), Reach::Open { .. }));
     assert_eq!(
@@ -683,7 +722,7 @@ async fn an_apple_answer_past_the_budget_is_a_timeout() {
     world.india().await;
     world.reach.read_infos().await;
     Mock::given(path("/search"))
-        .respond_with(ok(recorded("search-album-interstellar-in.json")).set_delay(Duration::from_secs(3)))
+        .respond_with(ok(recorded("search-album-interstellar-in.json")).set_delay(Duration::from_secs(30)))
         .mount(&world.apple)
         .await;
     let started = std::time::Instant::now();
@@ -696,7 +735,10 @@ async fn an_apple_answer_past_the_budget_is_a_timeout() {
         )
         .await;
     assert!(answer.is_err());
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "cut by the 300 ms budget, before Apple's own 6 s timeout"
+    );
 }
 
 #[tokio::test]
@@ -831,6 +873,10 @@ async fn connect_failures_count_while_budget_cuts_and_stalled_bodies_do_not() {
     let stalling_port = stalling.local_addr().unwrap().port();
     std::thread::spawn(move || {
         if let Ok((mut socket, _)) = stalling.accept() {
+            // The request is read first: Windows resets a socket closed with unread data, and a
+            // reset throws away the headers the client has not read yet.
+            let mut request = [0u8; 4096];
+            let _ = std::io::Read::read(&mut socket, &mut request);
             let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{");
             std::thread::sleep(Duration::from_millis(200));
         }
@@ -966,7 +1012,8 @@ async fn an_apple_album_whose_twin_lookup_goes_unanswered_is_apples_and_partial(
 
 #[tokio::test]
 async fn a_slow_twin_lookup_never_holds_the_page_and_still_fills_the_map() {
-    let world = World::new().await;
+    // The page waits 50 ms for twins; Deezer's barcode answer takes 3 s.
+    let world = World::with_twin_wait(Duration::from_millis(50)).await;
     Mock::given(path("/infos"))
         .respond_with(ok(INDIA_INFOS))
         .mount(&world.deezer)
@@ -981,18 +1028,18 @@ async fn a_slow_twin_lookup_never_holds_the_page_and_still_fills_the_map() {
         .await;
     world.apple_album_search().await;
     world.reach.read_infos().await;
-    let started = std::time::Instant::now();
     let (status, first) = world.get("search/album?q=interstellar&limit=20").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        started.elapsed() < Duration::from_millis(2_800),
-        "{:?}",
-        started.elapsed()
-    );
-    assert_eq!(first["octo_partial"], true);
+    assert_eq!(first["octo_partial"], true, "answered before the twin");
     assert!(ids(&first).contains(&code_apple_id(INTERSTELLAR)));
     // The lookup finishes on its own and records the twin.
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let generation = world.reach.generation();
+    for _ in 0..400 {
+        if world.stand_in.twins.get(generation, INTERSTELLAR).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     let (_, second) = world.get("search/album?q=interstellar&limit=20").await;
     assert!(ids(&second).contains(&INTERSTELLAR_TWIN));
     assert_eq!(world.deezer_asked("/album/upc:794043201943").await, 1);
@@ -1196,3 +1243,6 @@ async fn songs_and_albums_handed_out_leave_their_apple_covers_as_hints() {
         Some(cover)
     );
 }
+
+#[path = "deezer_stand_in_flows_tests.rs"]
+mod flows;

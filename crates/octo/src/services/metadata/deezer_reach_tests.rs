@@ -290,6 +290,99 @@ async fn a_read_someone_waits_on_never_joins_a_background_read() {
 }
 
 #[tokio::test]
+async fn a_read_whose_waiter_leaves_still_finishes_lands_and_is_joined() {
+    let hold = Arc::new(Notify::new());
+    let (reach, reader, _) = reach_with(closed(), Some(Arc::clone(&hold)));
+    let left = tokio::spawn({
+        let reach = Arc::clone(&reach);
+        async move { reach.read_infos().await }
+    });
+    settle(&reader, 1).await;
+    left.abort();
+    let _ = left.await;
+    // A later caller joins the read still in flight rather than sending another.
+    let joined = tokio::spawn({
+        let reach = Arc::clone(&reach);
+        async move { reach.read_infos().await }
+    });
+    settle(&reader, 2).await;
+    assert_eq!(reader.reads.load(Ordering::SeqCst), 1);
+    joined.abort();
+    let _ = joined.await;
+    // With no one waiting at all, the read still finishes and its answer lands.
+    hold.notify_waiters();
+    for _ in 0..50 {
+        if reach.stands_in() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(reach.reach(), Reach::Closed { .. }));
+    assert_eq!(reader.reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn the_infos_answer_that_ends_unreachable_lands() {
+    let hold = Arc::new(Notify::new());
+    let (reach, _, _) = reach_with(closed(), Some(Arc::clone(&hold)));
+    for _ in 0..FAILURES_TO_UNREACHABLE {
+        reach.observe(&Outcome::NetworkFailed("connect refused".into()));
+    }
+    let read = tokio::spawn({
+        let reach = Arc::clone(&reach);
+        async move { reach.read_infos().await }
+    });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    // The read's own request answered: the door tells the reach before the answer is read.
+    reach.observe(&Outcome::Answered(200));
+    assert_eq!(reach.reach(), Reach::Unknown);
+    hold.notify_waiters();
+    assert_eq!(read.await.unwrap(), closed());
+    assert!(
+        matches!(reach.reach(), Reach::Closed { .. }),
+        "the answer that proved Deezer reachable is no older than itself"
+    );
+}
+
+#[tokio::test]
+async fn every_reach_change_is_logged_once_and_a_repeat_not_at_all() {
+    use tracing::Level;
+    let (logs, _guard) = crate::services::test_support::LogCapture::start();
+    let (reach, reader, _) = reach_with(open(), None);
+    reach.read_infos().await;
+    reach.read_infos().await;
+    *reader.answer.lock() = closed();
+    reach.read_infos().await;
+    reach.read_infos().await;
+    for _ in 0..FAILURES_TO_UNREACHABLE + 2 {
+        reach.observe(&Outcome::NetworkFailed("connect refused".into()));
+    }
+    reach.observe(&Outcome::Answered(200));
+    for _ in 0..50 {
+        if reach.stands_in() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let count = |level: Level, words: &str| logs.at(level).iter().filter(|line| line.contains(words)).count();
+    assert_eq!(count(Level::INFO, "answers this server's catalog searches"), 1);
+    assert_eq!(
+        count(Level::WARN, "does not serve India"),
+        2,
+        "Closed, then Closed again after Unreachable"
+    );
+    assert_eq!(count(Level::WARN, "cannot reach Deezer"), 1);
+    assert_eq!(count(Level::INFO, "being checked again"), 1);
+    assert_eq!(
+        count(Level::INFO, "catalog switched"),
+        1,
+        "Open to Closed is the one switch"
+    );
+}
+
+#[tokio::test]
 async fn with_no_reader_infos_is_silent_and_nothing_changes() {
     let pace = Arc::new(ApplePace::new(PaceConfig::default()));
     let reach = Arc::new(DeezerReach::new(pace));

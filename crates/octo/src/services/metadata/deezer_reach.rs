@@ -135,8 +135,9 @@ pub struct ReachStatus {
 struct State {
     reach: Reach,
     failures: u32,
-    /// Bumped by every observation; an `/infos` answer from a read started before the last
-    /// applied observation is dropped.
+    /// Bumped by every applied `/infos` answer and every set of catalog rows; an `/infos` answer
+    /// from a read started before the last of them is dropped. Answers and failures of other
+    /// requests leave it alone: they say whether Deezer answers, which an `/infos` answer says too.
     seen: u64,
     settled: Option<bool>,
     generation: u64,
@@ -228,7 +229,6 @@ impl DeezerReach {
                 Outcome::Answered(_) => {
                     state.failures = 0;
                     if matches!(state.reach, Reach::Unreachable { .. }) {
-                        state.seen += 1;
                         state.changed = true;
                         self.set(&mut state, Reach::Unknown);
                         true
@@ -241,7 +241,6 @@ impl DeezerReach {
                     if state.failures >= FAILURES_TO_UNREACHABLE
                         && !matches!(state.reach, Reach::Unreachable { .. })
                     {
-                        state.seen += 1;
                         state.changed = true;
                         self.set(&mut state, Reach::Unreachable { error: error.clone() });
                     }
@@ -313,7 +312,8 @@ impl DeezerReach {
     }
 
     /// A read joins one in flight on the same lane or a better one: an interactive read never
-    /// waits on a background one, which Deezer's limiter may refuse.
+    /// waits on a background one, which Deezer's limiter may refuse. Each read runs as a task of
+    /// its own, so it finishes and lands even when everyone waiting on it has gone.
     async fn read(self: &Arc<Self>, background: bool) -> Infos {
         let read = {
             let mut reading = self.reading.lock();
@@ -326,7 +326,7 @@ impl DeezerReach {
                     let started_at = self.state.lock().seen;
                     let id = self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let this = Arc::clone(self);
-                    let read = async move {
+                    let task = tokio::spawn(async move {
                         let infos = reader.read(background).await;
                         this.apply_infos(&infos, started_at);
                         let mut reading = this.reading.lock();
@@ -334,9 +334,10 @@ impl DeezerReach {
                             *reading = None;
                         }
                         infos
-                    }
-                    .boxed()
-                    .shared();
+                    });
+                    let read = async move { task.await.unwrap_or(Infos::Silent) }
+                        .boxed()
+                        .shared();
                     *reading = Some(Reading {
                         id,
                         background,
