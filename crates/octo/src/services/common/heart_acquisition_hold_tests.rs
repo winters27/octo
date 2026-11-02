@@ -3933,8 +3933,7 @@ async fn an_album_track_left_to_its_song_heart_runs_as_a_hearts_hold() {
     let key = holds.hold(record).key();
     let (rig, _album_gates) = album_rig(Arc::new(RouteGates::default()), holds);
     assert_eq!(
-        rig.coordinator
-            .leave_album_holds("soulseek", "album-1", "anna"),
+        rig.coordinator.leave_album_holds("soulseek", "album-1", "anna"),
         1
     );
     let song = rig.holds.get(&key).expect("brandon's song heart keeps it");
