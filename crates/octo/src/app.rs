@@ -306,9 +306,11 @@ pub struct AppInner {
     /// `<config>/covers` replace the generated cover of the playlist they are named after.
     /// Warmed in the background at startup by the "CoverArtService" worker.
     pub cover_art_service: Arc<CoverArtService>,
-    /// `AmbientPaletteService` ("ambient-palette" client, 6 s): the colors of the fetched songs'
-    /// covers, the dashboard's light.
+    /// `AmbientPaletteService`: the colors of the fetched songs' covers, the dashboard's light.
     pub ambient_palettes: Arc<crate::services::admin::AmbientPaletteService>,
+    /// `FetchedCovers` (its own 6 s client): every cover the dashboard draws, served from Octo,
+    /// read from the song's file first.
+    pub fetched_covers: Arc<crate::services::admin::FetchedCovers>,
     /// `DownloadHistoryService`: the fetched-songs log, `downloads-history.json` beside settings.json.
     pub download_history: Arc<DownloadHistoryService>,
     /// `DownloadConcurrency`: how many downloads transfer at once.
@@ -3759,6 +3761,7 @@ impl AppState {
             cover_art_archive: clients.cover_art_archive,
             cover_art_service,
             ambient_palettes: Arc::new(crate::services::admin::AmbientPaletteService::new()),
+            fetched_covers: Arc::new(crate::services::admin::FetchedCovers::new()),
             last_fm: integrations.last_fm,
             last_fm_scrobbles: integrations.last_fm_scrobbles,
             listen_brainz: integrations.listen_brainz,
@@ -4239,6 +4242,7 @@ impl AppState {
             cover_art_archive: clients.cover_art_archive,
             cover_art_service,
             ambient_palettes: Arc::new(crate::services::admin::AmbientPaletteService::new()),
+            fetched_covers: Arc::new(crate::services::admin::FetchedCovers::new()),
             last_fm: integrations.last_fm,
             last_fm_scrobbles: integrations.last_fm_scrobbles,
             listen_brainz: integrations.listen_brainz,

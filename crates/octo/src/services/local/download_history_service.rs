@@ -95,6 +95,16 @@ impl DownloadHistoryService {
             .cloned()
     }
 
+    /// The entry written at this moment, as listed (DownloadedAt), or None.
+    pub fn find_written(&self, downloaded_at: &str) -> Option<DownloadHistoryEntry> {
+        if octo_core::common::dotnet::is_blank(downloaded_at) {
+            return None;
+        }
+        let mut cache = self.cache.lock();
+        let list = self.load_locked(&mut cache);
+        list.iter().find(|e| e.downloaded_at == downloaded_at).cloned()
+    }
+
     /// When an entry was written, from its DownloadedAt; None when that does not read.
     pub fn written_at(entry: &DownloadHistoryEntry) -> Option<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(entry.downloaded_at.trim())

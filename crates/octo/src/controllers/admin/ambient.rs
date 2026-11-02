@@ -14,6 +14,7 @@ use serde::Serialize;
 use super::request_binding::ok;
 use crate::app::AppState;
 use crate::http::routes::RouteSet;
+use crate::services::admin::fetched_covers::{LARGE_SIDE, entry_cover_path};
 
 pub fn routes() -> RouteSet {
     RouteSet::new().route("/api/admin/ambient", get(get_ambient))
@@ -34,6 +35,8 @@ pub struct AmbientSong {
     pub format: String,
     pub source: String,
     pub cover_art_url: Option<String>,
+    /// Where Octo serves the song's cover, None when it has no picture for it.
+    pub cover: Option<String>,
     pub size_bytes: i64,
     pub downloaded_at: String,
     pub colors: Option<Vec<String>>,
@@ -47,26 +50,33 @@ struct AmbientAnswer {
 
 async fn get_ambient(State(state): State<AppState>) -> Response {
     let recent = newest_per_cover(state.download_history.get_recent(LOOK_BACK), SONG_COUNT);
+    // The large copy Latest fetched draws is the one read for the colors.
     let found = futures::future::join_all(
         recent
             .iter()
-            .map(|entry| state.ambient_palettes.palette_for(entry.cover_art_url.as_deref())),
+            .map(|entry| state.fetched_covers.entry_cover(entry, LARGE_SIDE)),
     )
     .await;
     let songs = recent
         .into_iter()
         .zip(found)
-        .map(|(e, palette)| AmbientSong {
-            artist: e.artist,
-            title: e.title,
-            album: e.album,
-            format: e.format,
-            source: e.source,
-            cover_art_url: e.cover_art_url,
-            size_bytes: e.size_bytes,
-            downloaded_at: e.downloaded_at,
-            colors: palette.as_ref().map(|p| p.colors.clone()),
-            accent: palette.map(|p| p.accent),
+        .map(|(e, picture)| {
+            let palette = picture
+                .as_deref()
+                .and_then(|picture| state.ambient_palettes.palette_of(picture));
+            AmbientSong {
+                cover: picture.is_some().then(|| entry_cover_path(&e.downloaded_at)),
+                artist: e.artist,
+                title: e.title,
+                album: e.album,
+                format: e.format,
+                source: e.source,
+                cover_art_url: e.cover_art_url,
+                size_bytes: e.size_bytes,
+                downloaded_at: e.downloaded_at,
+                colors: palette.as_ref().map(|p| p.colors.clone()),
+                accent: palette.map(|p| p.accent),
+            }
         })
         .collect();
     ok(&AmbientAnswer { songs })

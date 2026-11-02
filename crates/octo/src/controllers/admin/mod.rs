@@ -95,6 +95,7 @@ pub fn admin_controller_routes() -> RouteSet {
         .route("/api/admin/browse/session", get(browse::browse_session))
         .route("/api/admin/browse/signout", post(browse::browse_sign_out))
         .route("/api/admin/downloads", get(system::downloads))
+        .route("/api/admin/downloads/cover", get(system::download_cover))
         .route("/api/admin/tags/preview", post(browse::preview_tags))
         .route("/api/admin/acquisitions", get(system::acquisitions))
         // Settings and configuration.
@@ -206,6 +207,10 @@ mod admin_secret_tests;
 #[cfg(test)]
 #[path = "admin_downloads_tests.rs"]
 mod admin_downloads_tests;
+
+#[cfg(test)]
+#[path = "admin_covers_tests.rs"]
+mod admin_covers_tests;
 
 #[cfg(test)]
 #[path = "download_checks_tests.rs"]
