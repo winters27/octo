@@ -22,8 +22,10 @@
 //!   follow with the admin's "Put Lidarr back", which counts it gone and ends the follow.
 //! - **Octo's own copies.** A copy Octo placed while a follow on its artist stays open (a kept
 //!   copy whose person stopped waiting) is Octo's, never the user's, while that follow is listed:
-//!   a rescan linking it never makes Octo step aside. A link of it waits in the hold path, and
-//!   when Octo's own import replaces it, it is put back from that link.
+//!   a rescan linking it never makes Octo step aside. A link of it waits in the hold path. When
+//!   Octo's own import replaces it, it gives way to the song's Lidarr file if that passes the
+//!   gates of everyone it was kept for; otherwise (refused, deleted, or put back) it comes back
+//!   from its link. The library never ends with both.
 //! - **Octo's turn.** While a download of Octo's is finished and waits for its import, the
 //!   commands are read at a sub-second pace; a rescan that covers the artist, or a manual import
 //!   or scan that is not Octo's, makes Octo remove its items before its import could replace
@@ -993,8 +995,8 @@ impl Inner {
 
     /// Tells, on the downloads entry, of each file of the user's that Lidarr deleted as an upgrade
     /// while importing Octo's download: a file at a path no import of Octo's had filled before. A
-    /// copy Octo placed during the follow is put back instead (its link was kept), and nothing is
-    /// told.
+    /// copy Octo placed during the follow is marked replaced instead, and nothing is told: it gives
+    /// way to the song's file if that passes its people's gates, else it comes back from its link.
     async fn tell_replaced(&self, entry: &mut PendingAlbum, reading: &Reading, settings: &LidarrSettings) {
         let Some(since) = entry.searched_at else {
             return;
@@ -1035,16 +1037,20 @@ impl Inner {
                 !octos_before && by_octo
             })
             .collect();
-        if replaced.is_empty() {
+        // Octo's own placed copies are marked first, before anything is awaited, so the hold
+        // folder judging their songs meanwhile knows they were replaced.
+        let mut told = Vec::new();
+        for row in replaced {
+            entry.replaced_told.push(row.id);
+            if !self.mark_replaced_copy(&row.source_title, settings) {
+                told.push(row.source_title.clone());
+            }
+        }
+        if told.is_empty() {
             return;
         }
         let bin = self.client.recycle_bin().await.ok().flatten();
-        for row in replaced {
-            entry.replaced_told.push(row.id);
-            let path = row.source_title.clone();
-            if self.restore_placed(&path, settings) {
-                continue;
-            }
+        for path in told {
             warn!("{REPLACED_YOURS}: {path}");
             let detail = match &bin {
                 Some(bin) => format!("{path}. Lidarr moved it to its recycle bin, {bin}"),
@@ -1352,7 +1358,7 @@ impl Inner {
                 // a link of it waits in the hold path in case Octo's own import replaces it.
                 if self.pending.any_following(&held.follows) {
                     let backup = self.keep_link(&path);
-                    self.pending.placed_copy(&path, &held.follows, backup);
+                    self.pending.placed_copy(&held, &path, backup);
                 }
             }
             None => {
@@ -1396,46 +1402,57 @@ impl Inner {
         Some(link.to_string_lossy().into_owned())
     }
 
-    /// The copy Octo placed during this follow that Lidarr deleted as an upgrade at `lidarr_path`
-    /// (Octo's own import replaced it) comes back from the link Octo kept: where it was, or beside
-    /// the file Lidarr imported there. True when it is back.
-    fn restore_placed(&self, lidarr_path: &str, settings: &LidarrSettings) -> bool {
+    /// Lidarr deleted the file at `lidarr_path` as an upgrade while importing Octo's download:
+    /// when it is a copy Octo placed during the follow, it is marked replaced and true is answered.
+    /// It comes back only once Lidarr's file for its song is known not to land for its people.
+    fn mark_replaced_copy(&self, lidarr_path: &str, settings: &LidarrSettings) -> bool {
         let octo_root = self.music.octo_root();
-        let Ok(local) =
-            translate_imported_path(lidarr_path, settings.root_folder_path.as_deref(), &octo_root)
-        else {
-            return false;
-        };
-        let Some(backup) = self
-            .pending
-            .backup_of(&local)
-            .filter(|backup| Path::new(backup).is_file())
-        else {
-            return false;
-        };
-        let target = if Path::new(&local).exists() {
-            octo_core::common::PathHelper::resolve_unique_path(&local)
-        } else {
-            local.clone()
-        };
-        if let Some(folder) = Path::new(&target).parent() {
-            let _ = std::fs::create_dir_all(folder);
+        translate_imported_path(lidarr_path, settings.root_folder_path.as_deref(), &octo_root)
+            .is_ok_and(|local| self.pending.mark_replaced(&local))
+    }
+
+    /// The copies Octo placed during the follow `key` (of `song` only, when one is named) that
+    /// Lidarr replaced, and whose song's Lidarr file did not land for their people, come back from
+    /// the links Octo kept: where each was, or beside a file lying there now.
+    pub(super) fn restore_replaced(&self, key: &str, song: Option<&str>) {
+        for copy in self.pending.replaced_copies(key, song) {
+            if !Path::new(&copy.backup).is_file() {
+                warn!(
+                    "The copy Octo placed at {} was replaced, and its link is gone",
+                    copy.path
+                );
+                continue;
+            }
+            let target = if Path::new(&copy.path).exists() {
+                octo_core::common::PathHelper::resolve_unique_path(&copy.path)
+            } else {
+                copy.path.clone()
+            };
+            if let Some(folder) = Path::new(&target).parent() {
+                let _ = std::fs::create_dir_all(folder);
+            }
+            let back = std::fs::hard_link(&copy.backup, &target).is_ok()
+                || std::fs::copy(&copy.backup, &target).is_ok();
+            if !back {
+                warn!(
+                    "Lidarr's import replaced the copy Octo placed at {}, and Octo could not put it back",
+                    copy.path
+                );
+                continue;
+            }
+            self.pending.copy_restored(&copy.path, &target);
+            info!(
+                "Lidarr's file for the song did not land; the copy Octo placed at {} is back at {target}",
+                copy.path
+            );
         }
-        let back = std::fs::hard_link(&backup, &target).is_ok() || std::fs::copy(&backup, &target).is_ok();
-        if !back {
-            warn!("Lidarr's import replaced the copy Octo placed at {local}, and Octo could not put it back");
-            return false;
-        }
-        if target != local {
-            self.pending.placed_copy_moved(&local, &target);
-        }
-        info!("Lidarr's import replaced the copy Octo placed at {local}; it is back at {target}");
-        true
     }
 
     /// The follow is over: the pipeline's work waited for, the album's hold folder settled for the
-    /// last time (its tracks handed on when a hearted song passed, else deleted), the pick put back
-    /// unless its song landed (the pin restored either way), and the hearts still waiting told.
+    /// last time (its tracks handed on when a hearted song passed, else deleted), a copy Octo
+    /// placed during the follow that Lidarr replaced back from its link unless its song's Lidarr
+    /// file landed for its people, the pick put back unless its song landed (the pin restored
+    /// either way), and the hearts still waiting told.
     async fn finish_follow(self: &Arc<Self>, job: &Arc<AlbumJob>, run: FollowRun) {
         for handoff in run.handed {
             let _ = handoff.await;
@@ -1443,6 +1460,7 @@ impl Inner {
         let lidarr_gone = run.lidarr_gone;
         let key = run.key;
         self.clone().settle(job.clone(), key.clone(), true).await;
+        self.restore_replaced(&key, None);
         let landed_titles = job
             .landed
             .lock()

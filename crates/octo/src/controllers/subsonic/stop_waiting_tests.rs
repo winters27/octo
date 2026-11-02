@@ -417,6 +417,7 @@ async fn one_persons_stop_waiting_ends_only_their_wait_on_a_shared_follow() {
             reading: HeardReading::NotHeard,
             stand_in: None,
         },
+        stopped: false,
     };
     t.pending.remember(PendingAlbum {
         foreign_album_id: "rg-mezzanine".into(),
@@ -466,7 +467,14 @@ async fn one_persons_stop_waiting_ends_only_their_wait_on_a_shared_follow() {
     let entry = t.pending.get("rg-mezzanine").expect("listed");
     assert!(entry.following(), "bob still waits on the follow");
     assert_eq!(entry.holders, ["bob"]);
-    assert!(entry.gates_of("soulseek:teardrop").is_empty());
+    assert!(
+        entry
+            .gates
+            .iter()
+            .filter(|gate| gate.song == "soulseek:teardrop")
+            .all(|gate| gate.stopped),
+        "alice's gate stays, stopped, to judge Lidarr's Teardrop for her copy"
+    );
     assert!(Path::new(&bobs.held_path).is_file(), "bob's copy still waits");
     assert_eq!(t.rows("bob").await["soulseek:angel"]["stopWaiting"], true);
 

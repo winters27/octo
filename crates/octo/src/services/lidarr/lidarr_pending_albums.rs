@@ -540,12 +540,27 @@ pub struct SongGate {
     pub title: String,
     pub artist: String,
     pub gate: HeartGate,
+    /// The person stopped waiting for Lidarr on the song: their kept copy was placed, so they no
+    /// longer hold the follow, but their gate still judges Lidarr's file for the song, which the
+    /// copy gives way to when it passes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
 }
 
 impl SongGate {
     /// Whether two gates are one person's for one song.
     pub fn same_person(&self, other: &SongGate) -> bool {
         self.song == other.song && dotnet::eq_ignore_case(self.gate.user.trim(), other.gate.user.trim())
+    }
+
+    /// Whether the person still waits on the follow by this gate: a heart's (song or album), not
+    /// stopped.
+    pub(crate) fn holds_follow(&self) -> bool {
+        !self.stopped
+            && matches!(
+                self.gate.origin,
+                AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart
+            )
     }
 
     /// Whether the gate is a heart's or a play's: such a song's file is proven by its own sound
@@ -800,11 +815,40 @@ struct PendingFile {
 struct PlacedCopy {
     /// Where it was placed, on Octo's side.
     path: String,
+    /// The song whose copy it is, as `provider:id`.
+    song: String,
+    /// The people it was kept for.
+    users: Vec<String>,
     /// The follows, by foreign album id, it was placed during.
     follows: Vec<String>,
     /// The link (or copy) of it Octo keeps in the hold path while it counts.
     #[serde(skip_serializing_if = "Option::is_none")]
     backup: Option<String>,
+    /// Lidarr deleted it as an upgrade while importing Octo's download: it comes back from its
+    /// link unless Lidarr's file for the song lands for its people.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    replaced: bool,
+    /// Lidarr's file for the song passed the gates of everyone it was kept for, so it gave way to
+    /// that file: it never comes back.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    gave_way: bool,
+}
+
+/// A copy Octo placed during a follow that Lidarr replaced and that comes back now: where it was,
+/// and the link it comes back from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacedCopy {
+    pub path: String,
+    pub backup: String,
+}
+
+/// A copy Octo placed during a follow that gives way to Lidarr's proven file for its song.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GivingWay {
+    pub path: String,
+    pub song: String,
+    pub users: Vec<String>,
+    pub backup: Option<String>,
 }
 
 #[derive(Default)]
@@ -1103,13 +1147,7 @@ impl LidarrPendingAlbums {
                 {
                     album.album_hearts.retain(|known| known != heart);
                 }
-                if !album.gates.iter().any(|gate| {
-                    theirs(gate)
-                        && matches!(
-                            gate.gate.origin,
-                            AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart
-                        )
-                }) {
+                if !album.gates.iter().any(|gate| theirs(gate) && gate.holds_follow()) {
                     album
                         .holders
                         .retain(|holder| !dotnet::eq_ignore_case(holder.trim(), user.trim()));
@@ -1130,10 +1168,11 @@ impl LidarrPendingAlbums {
 
     /// `user` stops waiting for Lidarr on `song`: every kept copy of the song kept for them that
     /// waits for an open follow is taken off the list, to be placed now, and they leave those
-    /// follows' waits for the song (their gate for it goes, and they stop holding a follow unless a
-    /// heart of theirs is still on it). A follow nobody's heart is on any more is asked to end, as
-    /// un-hearting ends it; one others still wait on stays open. The copies, and the follows asked
-    /// to end.
+    /// follows' waits for the song (their gate for it is marked stopped: it still judges Lidarr's
+    /// file for the song, which their placed copy gives way to, but they stop holding a follow
+    /// unless a heart of theirs still waits on it). A follow nobody's heart waits on any more is
+    /// asked to end, as un-hearting ends it; one others still wait on stays open. The copies, and
+    /// the follows asked to end.
     pub fn stop_waiting(&self, song: &str, user: &str) -> (Vec<HeldPlacement>, Vec<String>) {
         let theirs_name = |name: &str| dotnet::eq_ignore_case(name.trim(), user.trim());
         let (copies, ending) = {
@@ -1161,16 +1200,18 @@ impl LidarrPendingAlbums {
                     continue;
                 }
                 let before = album.holders.len();
-                album
+                for gate in album
                     .gates
-                    .retain(|gate| !(gate.song == song && theirs_name(&gate.gate.user) && gate.personal()));
-                if !album.gates.iter().any(|gate| {
-                    theirs_name(&gate.gate.user)
-                        && matches!(
-                            gate.gate.origin,
-                            AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart
-                        )
-                }) {
+                    .iter_mut()
+                    .filter(|gate| gate.song == song && theirs_name(&gate.gate.user) && gate.personal())
+                {
+                    gate.stopped = true;
+                }
+                if !album
+                    .gates
+                    .iter()
+                    .any(|gate| theirs_name(&gate.gate.user) && gate.holds_follow())
+                {
                     album.holders.retain(|holder| !theirs_name(holder));
                 }
                 if before > 0 && album.holders.is_empty() {
@@ -1424,13 +1465,14 @@ impl LidarrPendingAlbums {
         })
     }
 
-    /// A held file was placed at `path` while `follows` waited for it, with `backup` the link of
-    /// it kept in the hold path: when one of them is still open, it is Octo's own copy there
+    /// The held file `held` was placed at `path`, with `backup` the link of it kept in the hold
+    /// path: when one of the follows it waited for is still open, it is Octo's own copy there
     /// (never the user's music) for as long as one of the follows it was placed during is listed.
     /// Otherwise it is a file of the library like any other, and the link goes.
-    pub fn placed_copy(&self, path: &str, follows: &[String], backup: Option<String>) {
+    pub fn placed_copy(&self, held: &HeldPlacement, path: &str, backup: Option<String>) {
         let mut listed = self.listed.lock();
-        let open: Vec<String> = follows
+        let open: Vec<String> = held
+            .follows
             .iter()
             .filter(|follow| {
                 listed
@@ -1456,8 +1498,12 @@ impl LidarrPendingAlbums {
         } else {
             listed.placed.push(PlacedCopy {
                 path: path.to_string(),
+                song: held.song.clone(),
+                users: held.users.clone(),
                 follows: open,
                 backup,
+                replaced: false,
+                gave_way: false,
             });
         }
         self.save(&listed);
@@ -1470,32 +1516,115 @@ impl LidarrPendingAlbums {
         self.listed.lock().placed_at(path).is_some()
     }
 
-    /// The link Octo keeps of the copy it placed at `path`, while that copy counts as its own.
-    pub fn backup_of(&self, path: &str) -> Option<String> {
-        self.listed
-            .lock()
-            .placed_at(path)
-            .and_then(|copy| copy.backup.clone())
+    /// Lidarr deleted the file at `path` as an upgrade while importing Octo's download: when it
+    /// was a copy Octo placed, it is marked replaced (it comes back unless it gave way) and the
+    /// answer is true.
+    pub fn mark_replaced(&self, path: &str) -> bool {
+        let full = get_full_path(path);
+        let mut listed = self.listed.lock();
+        let albums: Vec<String> = listed.albums.keys().cloned().collect();
+        let Some(copy) = listed.placed.iter_mut().find(|copy| {
+            get_full_path(&copy.path) == full
+                && copy.follows.iter().any(|follow| albums.contains(&key(follow)))
+        }) else {
+            return false;
+        };
+        if !copy.gave_way {
+            copy.replaced = true;
+        }
+        self.save(&listed);
+        true
     }
 
-    /// The copy Octo placed at `from` is at `to` now.
-    pub fn placed_copy_moved(&self, from: &str, to: &str) {
+    /// The copies Octo placed during the follow `follow` (of `song` only, when one is named) that
+    /// Lidarr replaced and that did not give way, each with the link it comes back from.
+    pub fn replaced_copies(&self, follow: &str, song: Option<&str>) -> Vec<ReplacedCopy> {
+        self.listed
+            .lock()
+            .placed
+            .iter()
+            .filter(|copy| copy.replaced && !copy.gave_way)
+            .filter(|copy| copy.follows.iter().any(|known| key(known) == key(follow)))
+            .filter(|copy| song.is_none_or(|song| copy.song == song))
+            .filter_map(|copy| {
+                copy.backup.clone().map(|backup| ReplacedCopy {
+                    path: copy.path.clone(),
+                    backup,
+                })
+            })
+            .collect()
+    }
+
+    /// The copy Octo placed at `from` came back, at `to`.
+    pub fn copy_restored(&self, from: &str, to: &str) {
         let mut listed = self.listed.lock();
         let full = get_full_path(from);
-        let moved = match listed
+        let restored = match listed
             .placed
             .iter_mut()
             .find(|copy| get_full_path(&copy.path) == full)
         {
             Some(copy) => {
                 copy.path = to.to_string();
+                copy.replaced = false;
                 true
             }
             None => false,
         };
-        if moved {
+        if restored {
             self.save(&listed);
         }
+    }
+
+    /// Lidarr's file for `song` passed the gates of `users`: every copy Octo placed of the song
+    /// during a follow still listed, kept for no one else, gives way to it. They are marked so
+    /// (never to come back) and answered with their links, which the caller lets go of with the
+    /// copies still lying where they were placed.
+    pub fn giving_way(&self, song: &str, users: &[String]) -> Vec<GivingWay> {
+        let passed = |user: &String| {
+            users
+                .iter()
+                .any(|known| dotnet::eq_ignore_case(known.trim(), user.trim()))
+        };
+        let mut listed = self.listed.lock();
+        let albums: Vec<String> = listed.albums.keys().cloned().collect();
+        let mut giving = Vec::new();
+        for copy in listed.placed.iter_mut().filter(|copy| {
+            !copy.gave_way
+                && copy.song == song
+                && !copy.users.is_empty()
+                && copy.users.iter().all(passed)
+                && copy.follows.iter().any(|follow| albums.contains(&key(follow)))
+        }) {
+            copy.gave_way = true;
+            copy.replaced = false;
+            giving.push(GivingWay {
+                path: copy.path.clone(),
+                song: copy.song.clone(),
+                users: copy.users.clone(),
+                backup: copy.backup.take(),
+            });
+        }
+        if !giving.is_empty() {
+            self.save(&listed);
+        }
+        giving
+    }
+
+    /// Whether a person's kept copy is the song's file: one waiting for a follow, or one Octo
+    /// placed during a follow still listed that did not give way. Lidarr's file for that song then
+    /// lands only by passing that person's gate, never as one of the album's other tracks.
+    pub fn kept_copy_for(&self, song: &str) -> bool {
+        let listed = self.listed.lock();
+        listed.held.iter().any(|held| held.kept && held.song == song)
+            || listed.placed.iter().any(|copy| {
+                !copy.gave_way
+                    && copy.song == song
+                    && copy
+                        .follows
+                        .iter()
+                        .any(|follow| listed.albums.contains_key(&key(follow)))
+            })
     }
 
     /// Whether any copy Octo placed still counts as its own.
@@ -1602,6 +1731,7 @@ mod tests {
             title: "Teardrop".into(),
             artist: "Massive Attack".into(),
             gate: heart_gate(user),
+            stopped: false,
         }
     }
 
@@ -2108,13 +2238,25 @@ mod tests {
             link.to_string_lossy().into_owned()
         };
         let (teardrop_link, roads_link) = (link("teardrop-link.m4a"), link("roads-link.m4a"));
+        let held = |song: &str, follows: &[&str]| HeldPlacement {
+            song: song.into(),
+            kept: true,
+            follows: follows.iter().map(|follow| follow.to_string()).collect(),
+            users: vec!["alice".into()],
+            ..Default::default()
+        };
         assert!(!pending.has_octos_copies());
-        pending.placed_copy(&teardrop, &["rg-1".into()], Some(teardrop_link.clone()));
-        pending.placed_copy(&angel, &["rg-1".into()], None);
-        pending.placed_copy(&roads, &[], Some(roads_link.clone()));
+        pending.placed_copy(
+            &held("soulseek:teardrop", &["rg-1"]),
+            &teardrop,
+            Some(teardrop_link.clone()),
+        );
+        pending.placed_copy(&held("soulseek:angel", &["rg-1"]), &angel, None);
+        pending.placed_copy(&held("soulseek:roads", &[]), &roads, Some(roads_link.clone()));
         assert!(pending.has_octos_copies());
         assert!(pending.is_octos_copy(&teardrop));
-        assert_eq!(pending.backup_of(&teardrop), Some(teardrop_link.clone()));
+        assert!(pending.kept_copy_for("soulseek:teardrop"));
+        assert!(!pending.kept_copy_for("soulseek:roads"));
         assert!(
             !pending.is_octos_copy(&roads),
             "placed once no follow waited for it"
@@ -2134,6 +2276,74 @@ mod tests {
         assert!(!reloaded.has_octos_copies());
         assert!(!std::path::Path::new(&teardrop_link).exists(), "its link goes");
         assert!(std::path::Path::new(&teardrop).is_file(), "the copy itself stays");
+        assert!(!reloaded.kept_copy_for("soulseek:teardrop"));
+    }
+
+    /// A placed copy Lidarr replaced comes back only while it did not give way: once Lidarr's file
+    /// for its song passed the gates of everyone it was kept for, it is never listed to come back,
+    /// and its link is handed over to go; one kept for someone the file did not pass stays.
+    #[test]
+    fn a_replaced_copy_comes_back_unless_it_gave_way() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let pending = LidarrPendingAlbums::new(None);
+        pending.remember(PendingAlbum {
+            search_command: 3,
+            ..album("rg-1", Utc::now())
+        });
+        let place = |name: &str, song: &str, users: &[&str]| {
+            let path = dir.path().join(name).to_string_lossy().into_owned();
+            let link = dir
+                .path()
+                .join(format!("{name}.link"))
+                .to_string_lossy()
+                .into_owned();
+            std::fs::write(&path, b"kept").expect("written");
+            std::fs::write(&link, b"kept").expect("written");
+            pending.placed_copy(
+                &HeldPlacement {
+                    song: song.into(),
+                    kept: true,
+                    follows: vec!["rg-1".into()],
+                    users: users.iter().map(|user| user.to_string()).collect(),
+                    ..Default::default()
+                },
+                &path,
+                Some(link.clone()),
+            );
+            (path, link)
+        };
+        let (teardrop, teardrop_link) = place("teardrop.m4a", "soulseek:teardrop", &["alice"]);
+        let (angel, _) = place("angel.m4a", "soulseek:angel", &["alice", "carol"]);
+        assert!(
+            pending.replaced_copies("rg-1", None).is_empty(),
+            "nothing replaced yet"
+        );
+        assert!(pending.mark_replaced(&teardrop));
+        assert!(pending.mark_replaced(&angel));
+        assert!(!pending.mark_replaced(&dir.path().join("x.m4a").to_string_lossy()));
+        assert_eq!(
+            pending.replaced_copies("RG-1", Some("soulseek:teardrop")).len(),
+            1
+        );
+
+        let giving = pending.giving_way("soulseek:teardrop", &["ALICE".into()]);
+        assert_eq!(giving.len(), 1);
+        assert_eq!(giving[0].backup.as_deref(), Some(teardrop_link.as_str()));
+        assert!(
+            pending.giving_way("soulseek:angel", &["alice".into()]).is_empty(),
+            "kept for carol too, whom the file did not pass"
+        );
+        let back: Vec<String> = pending
+            .replaced_copies("rg-1", None)
+            .into_iter()
+            .map(|copy| copy.path)
+            .collect();
+        assert_eq!(back, [angel.clone()], "the copy that gave way never comes back");
+        assert!(!pending.kept_copy_for("soulseek:teardrop"));
+        assert!(pending.kept_copy_for("soulseek:angel"));
+
+        pending.copy_restored(&angel, &angel);
+        assert!(pending.replaced_copies("rg-1", None).is_empty());
     }
 
     /// A follow Octo cannot settle is listed until the admin puts Lidarr back: that counts its

@@ -9,7 +9,10 @@ use octo_core::fingerprint::heart_gate::{HeardReading, HeardRecording};
 use octo_core::lidarr::lidarr_client::LidarrReleaseChoice;
 use tokio::task::JoinHandle;
 
+use octo_core::models::domain::Song;
+
 use super::*;
+use crate::services::lidarr::StopWaiting;
 use crate::services::lidarr::fake_lidarr::GrabFile;
 use crate::services::lidarr::lidarr_pick::put_back_searched;
 
@@ -488,6 +491,182 @@ async fn a_kept_copy_gives_way_to_the_songs_proven_lidarr_import() {
     assert!(f.placed.lock().is_empty(), "the kept copy is never placed");
     assert!(!Path::new(&held.held_path).exists());
     assert!(f.pending.held().is_empty());
+}
+
+/// `user`'s gate for Angel.
+fn angel_gate(user: &str) -> HeartGate {
+    HeartGate {
+        r: Some(HeardRecording {
+            ids: vec!["rec-1".into()],
+            title: "Angel".into(),
+            artist: "Massive Attack".into(),
+            ..Default::default()
+        }),
+        ..teardrop_gate(user)
+    }
+}
+
+/// Alice hearts Teardrop and Bob hearts Angel of Mezzanine, each with their own gate, on one
+/// follow of Octo's download of both; Alice's kept copy of Teardrop waits for it, and she stops
+/// waiting: her copy is placed at once while Bob still waits on the follow. With `rescan`, a
+/// rescan then links her copy into the album, so Lidarr's import replaces it.
+async fn alice_stops_while_bob_waits(
+    f: &Fixture,
+    rescan: bool,
+) -> (LidarrHeartAcquisitionService, HeldPlacement) {
+    f.lidarr.plan_grab(
+        7,
+        Grab::of("dl-1", &[(1, "Angel", "FLAC"), (3, "Teardrop", "FLAC")]),
+    );
+    let service = f.service(None, 1);
+    f.metadata.songs.lock().insert(
+        ("soulseek".into(), "angel-heart".into()),
+        Song {
+            title: "Angel".into(),
+            artist: "Massive Attack".into(),
+            album: "Mezzanine".into(),
+            track: Some(1),
+            external_provider: Some("soulseek".into()),
+            external_id: Some(f.id("Angel")),
+            ..Default::default()
+        },
+    );
+    let alice = gated_heart(f, &service, "alice", false);
+    watching(f, "dl-1").await;
+    let bob = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            within(service.try_acquire_track(
+                "soulseek",
+                "angel-heart",
+                false,
+                Some("bob"),
+                AcquisitionOrigin::Heart,
+                &[angel_gate("bob")],
+            ))
+            .await
+        })
+    };
+    assert!(!alice.await.expect("the task"));
+    assert!(!bob.await.expect("the task"));
+    let held = hold_kept_copy(f);
+    assert_eq!(
+        service
+            .stop_waiting_for_lidarr("soulseek", &f.id("Teardrop"), "alice")
+            .await,
+        StopWaiting::Stopped
+    );
+    until(|| f.placed.lock().len() == 1).await;
+    assert!(Path::new(&held.target).is_file(), "alice's copy is placed");
+    let entry = f.pending.get(ALBUM_ID).expect("listed");
+    assert!(entry.following(), "bob still waits on the follow");
+    assert_eq!(entry.holders, ["bob"]);
+    if rescan {
+        f.lidarr.queue_command(
+            "RescanFolders",
+            serde_json::json!({ "folders": ["/data/music/Massive Attack"], "artistIds": [5] }),
+            "manual",
+        );
+    }
+    (service, held)
+}
+
+/// The library's files of a song, by their path under the octo root.
+fn files_of(f: &Fixture, title: &str) -> Vec<String> {
+    audio_files(f)
+        .into_iter()
+        .filter(|path| path.contains(title))
+        .collect()
+}
+
+/// Alice stopped waiting, so her kept Teardrop was placed; Lidarr's Teardrop then passes her own
+/// gate, which still judges it: her copy gives way to it, its link goes, and it never comes back.
+/// The library ends with one Teardrop, Lidarr's proven one; Bob's Angel lands too.
+#[tokio::test]
+async fn a_stoppers_placed_copy_gives_way_to_lidarrs_file_that_passes_their_gate() {
+    let f = Fixture::new().await;
+    let (_service, held) = alice_stops_while_bob_waits(&f, false).await;
+
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
+
+    until(|| f.taken.lock().len() == 2).await;
+    over(&f).await;
+    assert_eq!(f.taken(), ["Angel", "Teardrop"]);
+    assert_eq!(
+        files_of(&f, "Teardrop"),
+        ["Massive Attack - Teardrop.flac"],
+        "one Teardrop, Lidarr's proven one"
+    );
+    assert!(!Path::new(&held.target).exists(), "alice's copy gave way");
+    assert_eq!(
+        f.dropped
+            .lock()
+            .iter()
+            .map(|(copy, users)| (copy.held_path.clone(), users.clone()))
+            .collect::<Vec<_>>(),
+        [(held.target.clone(), vec!["alice".to_string()])]
+    );
+    assert!(
+        !f.root
+            .path()
+            .join(".octo-incoming/held/lidarr-placed")
+            .read_dir()
+            .is_ok_and(|mut links| links.next().is_some()),
+        "its link went"
+    );
+}
+
+/// Alice stopped waiting, so her kept Teardrop was placed, and a rescan linked it, so Lidarr's
+/// import replaced it. Lidarr's Teardrop is refused by her gate: it is not kept as one of the
+/// album's tracks though Bob's Angel passed, and her copy comes back from its link. The library
+/// ends with one Teardrop, hers.
+#[tokio::test]
+async fn a_stoppers_replaced_copy_comes_back_when_lidarrs_file_is_refused() {
+    let f = Fixture::new().await;
+    f.refused_for_hearts.lock().insert("Teardrop".into());
+    let (_service, held) = alice_stops_while_bob_waits(&f, true).await;
+
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
+
+    until(|| !f.taken.lock().is_empty()).await;
+    over(&f).await;
+    assert_eq!(f.taken(), ["Angel"]);
+    assert_eq!(
+        files_of(&f, "Teardrop"),
+        ["Massive Attack/Mezzanine/03 - Teardrop.m4a"],
+        "one Teardrop, alice's copy, back where it was placed"
+    );
+    assert!(Path::new(&held.target).is_file());
+    assert!(f.dropped.lock().is_empty(), "nothing gave way");
+}
+
+/// A heart joining the follow after Alice stopped waiting saves the job into its entry again:
+/// Alice, whose only gate on it is stopped, never holds the follow again, and her gate stays to
+/// judge Lidarr's Teardrop for her copy.
+#[tokio::test]
+async fn a_heart_joining_after_a_stop_never_has_the_stopper_hold_the_follow_again() {
+    let f = Fixture::new().await;
+    let (service, _held) = alice_stops_while_bob_waits(&f, false).await;
+
+    let carol = gated_heart(&f, &service, "carol", false);
+    until(|| {
+        f.pending
+            .get(ALBUM_ID)
+            .is_some_and(|entry| entry.holders.iter().any(|holder| holder == "carol"))
+    })
+    .await;
+    let entry = f.pending.get(ALBUM_ID).expect("listed");
+    assert_eq!(entry.holders, ["bob", "carol"]);
+    assert!(
+        entry
+            .gates
+            .iter()
+            .filter(|gate| gate.gate.user == "alice")
+            .all(|gate| gate.stopped)
+    );
+    assert!(!carol.await.expect("the task"));
 }
 
 /// A folder import of the user's that Lidarr gave a guessed id of Octo's names no client: it is

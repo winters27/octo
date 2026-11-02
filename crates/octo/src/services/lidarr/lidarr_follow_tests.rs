@@ -1075,8 +1075,14 @@ async fn a_copy_octo_placed_during_an_open_follow_is_not_the_artists_music() {
     );
     f.lidarr
         .queue_command("RescanFolders", serde_json::json!({}), "manual");
-    f.pending
-        .placed_copy(&copy.to_string_lossy(), &[ALBUM_ID.to_string()], None);
+    let kept = HeldPlacement {
+        song: teardrop_key(&f),
+        kept: true,
+        follows: vec![ALBUM_ID.to_string()],
+        users: vec!["alice".into()],
+        ..Default::default()
+    };
+    f.pending.placed_copy(&kept, &copy.to_string_lossy(), None);
     let artist = service
         .artist_music()
         .read(ARTIST_ID)

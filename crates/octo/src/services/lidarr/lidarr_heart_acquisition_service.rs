@@ -623,6 +623,28 @@ impl AlbumJob {
         }
     }
 
+    /// `user` stopped waiting for Lidarr on `song`: their gates for it are marked stopped (they
+    /// still judge Lidarr's file for it), and they stop holding the job unless a heart's gate of
+    /// theirs still waits on it, so no later save of the job has them hold the follow again.
+    fn stopped_waiting(&self, song: &str, user: &str) {
+        let theirs = |name: &str| dotnet::eq_ignore_case(name.trim(), user.trim());
+        let waits = {
+            let mut gates = self.gates.lock();
+            for gate in gates
+                .iter_mut()
+                .filter(|gate| gate.song == song && theirs(&gate.gate.user) && gate.personal())
+            {
+                gate.stopped = true;
+            }
+            gates
+                .iter()
+                .any(|gate| theirs(&gate.gate.user) && gate.holds_follow())
+        };
+        if !waits {
+            self.holders.lock().retain(|holder| !theirs(holder));
+        }
+    }
+
     fn match_by_number(&self) -> bool {
         self.songs.lock().match_by_number
     }
@@ -1208,6 +1230,7 @@ impl Inner {
                 title: song.title.clone(),
                 artist: song.artist.clone(),
                 gate: gate.clone(),
+                stopped: false,
             })
             .collect();
 
@@ -1688,6 +1711,7 @@ impl Inner {
                         title: song.title.clone(),
                         artist: song.artist.clone(),
                         gate: gate.clone(),
+                        stopped: false,
                     })
                 })
                 .collect(),
@@ -2869,6 +2893,16 @@ impl Inner {
         let (copies, ending) = self.pending.stop_waiting(&song, user);
         if copies.is_empty() {
             return StopWaiting::NothingWaits;
+        }
+        for follow in copies.iter().flat_map(|held| held.follows.iter()) {
+            let job = self
+                .jobs
+                .lock()
+                .get(&dotnet::ordinal_ignore_case_key(follow))
+                .cloned();
+            if let Some(job) = job {
+                job.stopped_waiting(&song, user);
+            }
         }
         for held in copies {
             info!("{user} stopped waiting for Lidarr: the kept copy of {song} is placed");

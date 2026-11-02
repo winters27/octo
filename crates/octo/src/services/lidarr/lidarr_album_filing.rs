@@ -61,6 +61,7 @@ pub(super) fn album_song_gates(provider: &str, album: &Album, gate: &AlbumGate) 
                 title: track.title.clone(),
                 artist: track.artist.clone(),
                 gate: gate.gate_for(track),
+                stopped: false,
             }
         })
         .collect()
