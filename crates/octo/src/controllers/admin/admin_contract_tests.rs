@@ -348,7 +348,15 @@ async fn status_lists_no_mornye_while_it_is_off_and_every_other_service_as_befor
     names.sort();
     assert_eq!(
         names,
-        ["lastfm", "lidarr", "navidrome", "slskd", "sonic", "ytDlpShim"]
+        [
+            "catalog",
+            "lastfm",
+            "lidarr",
+            "navidrome",
+            "slskd",
+            "sonic",
+            "ytDlpShim"
+        ]
     );
 }
 
