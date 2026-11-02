@@ -924,6 +924,36 @@ async fn a_slow_mornye_never_holds_up_a_song_that_is_ready_to_go() {
 }
 
 #[tokio::test]
+async fn a_slow_read_of_whether_a_source_can_search_never_holds_up_a_song_that_is_ready_to_go() {
+    let queue = Arc::new(UpgradeQueue::new());
+    queue.add(asks(&["waiting", "ready"]), "alice", "app");
+    queue.update("waiting", |job| {
+        job.state = UpgradeStates::WAITING.to_string();
+        job.wait = Some(LibraryActionCodes::SOULSEEK_OFFLINE.to_string());
+    });
+    let started = Arc::new(tokio::sync::Notify::new());
+    let tell = started.clone();
+    let apply: Apply = Arc::new(move |_| {
+        tell.notify_one();
+        async { outcome(LibraryActionState::Applied, "Upgraded") }.boxed()
+    });
+    let mut seams = seams(2, apply, Arc::default());
+    // Whether slskd can be used goes through Mornye when slskd cannot; that read never ends here.
+    seams.soulseek_offline = Arc::new(|| futures::future::pending().boxed());
+    let worker = Arc::new(UpgradeWorker::with_seams(queue.clone(), seams, None, None, None));
+    let ct = CancellationToken::new();
+    let ticking = {
+        let (worker, ct) = (worker.clone(), ct.clone());
+        tokio::spawn(async move { worker.tick(&ct).await })
+    };
+
+    let ran = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+    ticking.abort();
+
+    assert!(ran.is_ok(), "the ready song waited for the read");
+}
+
+#[tokio::test]
 async fn a_job_waiting_for_a_mornye_that_does_not_answer_says_so_and_goes_back_once_it_can() {
     let queue = Arc::new(UpgradeQueue::new());
     queue.add(asks(&["a"]), "alice", "app");

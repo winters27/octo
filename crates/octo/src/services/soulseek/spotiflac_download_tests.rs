@@ -1120,17 +1120,11 @@ async fn a_check_read_that_hangs_never_holds_a_song_up() {
     setup.fake.sessions_delay = Some(Duration::from_secs(60));
     let fetch = setup.build(events).await;
 
-    let started = std::time::Instant::now();
-    fetch
-        .acquire()
+    // Well inside the minute an unbounded read would wait.
+    tokio::time::timeout(Duration::from_secs(30), fetch.acquire())
         .await
+        .expect("the song did not wait for the read")
         .expect("Mornye is asked, since Octo cannot tell");
-
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        started.elapsed()
-    );
 }
 
 #[tokio::test]

@@ -867,16 +867,17 @@ impl UpgradeWorker {
             .count()
     }
 
-    /// One pass: waiting jobs back in the queue once a source can search, queued jobs started
-    /// while there is room, then the jobs Mornye's check kept back once Mornye may try again (and
-    /// started too). Mornye is read only after the start, so a slow Mornye never holds up a song
-    /// that is ready to go. Answers how many it started.
+    /// One pass: queued jobs started while there is room, then waiting jobs back in the queue
+    /// once a source can search, then the jobs Mornye's check kept back once Mornye may try
+    /// again, each set started too. Whether a source can search, and Mornye's checks, are read
+    /// only after the first start, so a slow Mornye never holds up a song that is ready to go.
+    /// Answers how many it started.
     pub async fn tick(self: &Arc<Self>, ct: &CancellationToken) -> usize {
-        if self.queue.any_waiting() && !(self.seams.soulseek_offline)().await {
-            self.queue.requeue();
-        }
         let mut started = self.start_queued(ct);
         if self.queue.any_waiting() {
+            if !(self.seams.soulseek_offline)().await && self.queue.requeue() > 0 {
+                started += self.start_queued(ct);
+            }
             let passing = self.mornye_passing().await;
             if self.queue.release_mornye(&passing, Utc::now()) > 0 {
                 started += self.start_queued(ct);

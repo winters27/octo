@@ -19,6 +19,7 @@ struct Rig {
     finished: Arc<Mutex<Vec<TrickleJob>>>,
     busy: Arc<AtomicBool>,
     soulseek_out: Arc<AtomicBool>,
+    mornye_down: Arc<AtomicBool>,
     mornye_out: Arc<AtomicBool>,
     held: Arc<Mutex<HashSet<String>>>,
 }
@@ -63,6 +64,7 @@ fn rig_with(owned: Owned, outcome: Outcome) -> Rig {
     let started: Arc<Mutex<Vec<String>>> = Arc::default();
     let busy = Arc::new(AtomicBool::new(false));
     let out = Arc::new(AtomicBool::new(false));
+    let mornye_down = Arc::new(AtomicBool::new(false));
     let mornye_out = Arc::new(AtomicBool::new(false));
     let held: Arc<Mutex<HashSet<String>>> = Arc::default();
     let seams = TrickleSeams {
@@ -94,6 +96,13 @@ fn rig_with(owned: Owned, outcome: Outcome) -> Rig {
             let out = out.clone();
             Arc::new(move || {
                 let value = out.load(Ordering::SeqCst);
+                Box::pin(async move { value })
+            })
+        },
+        mornye_down: {
+            let down = mornye_down.clone();
+            Arc::new(move || {
+                let value = down.load(Ordering::SeqCst);
                 Box::pin(async move { value })
             })
         },
@@ -133,6 +142,7 @@ fn rig_with(owned: Owned, outcome: Outcome) -> Rig {
         finished,
         busy,
         soulseek_out: out,
+        mornye_down,
         mornye_out,
         held,
     }
@@ -309,6 +319,52 @@ async fn it_waits_while_mornyes_check_keeps_the_only_source() {
     );
     rig.mornye_out.store(false, Ordering::SeqCst);
     assert!(rig.tick().await);
+}
+
+#[tokio::test]
+async fn it_waits_while_mornye_is_the_only_source_and_does_not_answer() {
+    let rig = rig();
+    rig.mornye_down.store(true, Ordering::SeqCst);
+    rig.add(&["a"]);
+    assert!(!rig.tick().await);
+    assert!(rig.started.lock().is_empty(), "no song is started to fail");
+    assert_eq!(
+        rig.worker.status_for("alice").state,
+        trickle_states::WAITING_FOR_MORNYE
+    );
+    assert_eq!(
+        trickle_states::label(trickle_states::WAITING_FOR_MORNYE, false),
+        "Waiting for Mornye to answer"
+    );
+    rig.mornye_down.store(false, Ordering::SeqCst);
+    assert!(rig.tick().await);
+}
+
+#[tokio::test]
+async fn mornye_is_down_for_the_step_only_when_it_is_on_slskd_is_not_set_up_and_it_cannot_stand_in() {
+    use crate::services::common::test_fakes::{OffLink, OfflineLink};
+    let clear = mornye("active").await;
+    let down = |url: String, enabled: bool, link: Arc<dyn ISoulseekLink>| async move {
+        let mut all = AppSettings::default();
+        all.spotiflac.enabled = enabled;
+        all.spotiflac.url = url;
+        let settings = Arc::new(SettingsStore::for_tests(all));
+        let client = SpotiflacClient::new(Arc::clone(&settings));
+        mornye_down_with_no_slskd(&settings, link.as_ref(), Some(&client)).await
+    };
+    assert!(down("http://127.0.0.1:1".into(), true, Arc::new(OffLink)).await);
+    assert!(
+        !down(clear.uri(), true, Arc::new(OffLink)).await,
+        "an answering Mornye carries the step"
+    );
+    assert!(
+        !down("http://127.0.0.1:1".into(), false, Arc::new(OffLink)).await,
+        "with Mornye off, imports run as they did without it"
+    );
+    assert!(
+        !down("http://127.0.0.1:1".into(), true, Arc::new(OfflineLink)).await,
+        "a set-up slskd has its own wait"
+    );
 }
 
 /// A Mornye whose one gateway session is in `state`.

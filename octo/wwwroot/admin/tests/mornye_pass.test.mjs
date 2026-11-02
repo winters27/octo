@@ -23,9 +23,9 @@ const rules = new Function(
   'esc',
   'icon',
   `${slice('function mornyeWhen', 'let mornyeNowLoad')}
-   return { mornyeWhen, mornyeCard, mornyeLinesHtml, MORNYE_OFF_PROBE, mornyeNotifyShown, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passLifecycle, passCalls };`,
+   return { mornyeWhen, mornyeCard, mornyeLinesHtml, statusCards, applyMornyeNotifyRow, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passLifecycle, passCalls };`,
 )(esc, icon);
-const { mornyeWhen, mornyeCard, mornyeLinesHtml, MORNYE_OFF_PROBE, mornyeNotifyShown, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passLifecycle, passCalls } = rules;
+const { mornyeWhen, mornyeCard, mornyeLinesHtml, statusCards, applyMornyeNotifyRow, passZoomDefault, passPoint, passView, passInputQueue, passViewer, passViewerShown, passLifecycle, passCalls } = rules;
 
 const heartSourceReachable = new Function(
   'lastStatus',
@@ -104,15 +104,44 @@ test('a Mornye switched on with no address says to set one, not to switch it on'
   assert.equal(card.canPass, false);
 });
 
-test("a status that lists no Mornye draws its card off, in the server's words for off", () => {
-  assert.deepEqual(MORNYE_OFF_PROBE, { ok: true, configured: false, warning: false, detail: 'Off. Optional.' });
+test("a status that lists no Mornye draws its card off, in the server's words for off; a listed one as it is", () => {
+  const octo = { ok: true, detail: 'Octo is responding' };
+  const slskd = { ok: false, detail: 'unreachable' };
+  assert.deepEqual(statusCards({ octo, services: { slskd } }), [
+    ['octo', octo],
+    ['slskd', slskd],
+    ['mornye', { ok: true, configured: false, warning: false, detail: 'Off. Optional.' }],
+  ]);
+  const mornye = { ok: true, warning: true, detail: 'Check paused', action: 'pass' };
+  assert.deepEqual(statusCards({ octo, services: { slskd, mornye } }), [
+    ['octo', octo],
+    ['slskd', slskd],
+    ['mornye', mornye],
+  ]);
 });
 
 test("the Notifications switch for Mornye's check shows only while Mornye is switched on", () => {
-  assert.equal(mornyeNotifyShown(null), false);
-  assert.equal(mornyeNotifyShown({}), false);
-  assert.equal(mornyeNotifyShown({ Spotiflac: { Enabled: false } }), false);
-  assert.equal(mornyeNotifyShown({ Spotiflac: { Enabled: true } }), true);
+  for (const [settings, hidden] of [
+    [null, true],
+    [{}, true],
+    [{ Spotiflac: { Enabled: false } }, true],
+    [{ Spotiflac: { Enabled: true } }, false],
+  ]) {
+    const row = { hidden: !hidden };
+    applyMornyeNotifyRow(row, settings);
+    assert.equal(row.hidden, hidden, JSON.stringify(settings));
+  }
+  applyMornyeNotifyRow(null, { Spotiflac: { Enabled: true } });
+});
+
+test('the page draws the status cards, and syncs the switch on load and after a Mornye save', () => {
+  assert.ok(slice('async function refreshStatus()', 'renderDownloadChecks').includes('statusCards(data)'));
+  assert.ok(slice('async function loadSettings()', 'updateStreamSettings();').includes('syncMornyeNotifyRow()'));
+  assert.ok(
+    slice("form.dataset.section?.startsWith('spotiflac')", 'setTimeout(loadMornyeNow').includes('syncMornyeNotifyRow()'),
+  );
+  const imports = slice('function renderTrickle()', 'impEl(');
+  assert.ok(imports.includes("waitingForMornye: 'Waiting for Mornye to answer'"));
 });
 
 test('an unreachable Mornye says so with its problem', () => {

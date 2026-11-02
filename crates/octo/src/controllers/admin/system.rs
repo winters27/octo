@@ -479,16 +479,39 @@ pub async fn get_status(State(state): State<AppState>, caller: Caller) -> Respon
 
 /// Mornye's row of the admin status, kept between answers so a slow Mornye never holds the
 /// status up: one probe at a time, each keeping its row for the address it asked.
-#[derive(Default)]
 pub struct MornyeRowKeeper {
     kept: parking_lot::Mutex<Option<(String, serde_json::Value)>>,
     asking: std::sync::atomic::AtomicBool,
     answered: tokio::sync::Notify,
+    /// How long a status answer waits for a probe, in milliseconds.
+    wait_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Default for MornyeRowKeeper {
+    fn default() -> Self {
+        MornyeRowKeeper {
+            kept: parking_lot::Mutex::new(None),
+            asking: std::sync::atomic::AtomicBool::new(false),
+            answered: tokio::sync::Notify::new(),
+            wait_ms: std::sync::atomic::AtomicU64::new(Self::WAIT.as_millis() as u64),
+        }
+    }
 }
 
 impl MornyeRowKeeper {
     /// How long a status answer waits for a probe of Mornye before it uses the kept row.
     pub const WAIT: Duration = Duration::from_secs(1);
+
+    fn wait(&self) -> Duration {
+        Duration::from_millis(self.wait_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Waits `wait` for a probe instead (tests).
+    #[cfg(test)]
+    pub(super) fn set_wait(&self, wait: Duration) {
+        self.wait_ms
+            .store(wait.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 
     /// The row the last probe of the Mornye at `url` kept.
     pub(super) fn kept_for(&self, url: &str) -> Option<serde_json::Value> {
@@ -497,6 +520,14 @@ impl MornyeRowKeeper {
             .as_ref()
             .filter(|(asked, _)| asked == url)
             .map(|(_, row)| row.clone())
+    }
+
+    /// Keeps `row`, from a probe of the Mornye at `asked`, while Mornye is on at that address
+    /// (`live`); one switched off or moved while it was asked says nothing about the Mornye now.
+    pub(super) fn keep(&self, live: Option<&str>, asked: String, row: serde_json::Value) {
+        if live == Some(asked.as_str()) {
+            *self.kept.lock() = Some((asked, row));
+        }
     }
 }
 
@@ -513,11 +544,15 @@ impl Drop for ProbeDone {
 }
 
 /// Mornye's row for an admin: None while Mornye is switched off. Switched on with no address, a
-/// warning that says so. Otherwise the row of a probe that answers within
-/// [`MornyeRowKeeper::WAIT`], else the row the last probe of this address kept, else a warning
-/// that Mornye has not answered yet; a probe still asking keeps its row for the next answer.
+/// warning that says so. Otherwise the row of a probe that answers within the keeper's wait
+/// ([`MornyeRowKeeper::WAIT`]), else the row the last probe of this address kept, else a warning
+/// that Mornye has not answered yet; a probe still asking keeps its row for the next answer, as
+/// long as Mornye is still on at the address it asked. A row is forgotten while Mornye is off.
 async fn mornye_row(state: &AppState) -> Option<serde_json::Value> {
     let settings = state.spotiflac.settings();
+    if !settings.is_on() {
+        *state.mornye_row.kept.lock() = None;
+    }
     if !settings.enabled {
         return None;
     }
@@ -541,11 +576,13 @@ async fn mornye_row(state: &AppState) -> Option<serde_json::Value> {
         tokio::spawn(async move {
             let done = ProbeDone(state.clone());
             let row = probe_mornye(&state).await;
-            *state.mornye_row.kept.lock() = Some((asked, row));
+            state
+                .mornye_row
+                .keep(state.spotiflac.live_url().as_deref(), asked, row);
             drop(done);
         });
     }
-    let _ = tokio::time::timeout(MornyeRowKeeper::WAIT, answered).await;
+    let _ = tokio::time::timeout(keeper.wait(), answered).await;
     Some(
         keeper
             .kept_for(&url)

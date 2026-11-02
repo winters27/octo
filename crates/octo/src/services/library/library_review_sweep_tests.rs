@@ -2514,6 +2514,102 @@ mod other_listeners {
         member_song(&n, "teen", MemberSong::Plain).await;
         assert_eq!(n.replacer.marked("nd-1").await, None);
     }
+
+    /// The real replacer over an executor whose Better quality sources include Mornye, with
+    /// Mornye at `url` switched on or off.
+    fn mornye_replacer(url: &str, enabled: bool) -> ExecutorSweepReplacer {
+        let settings = store(AppSettings {
+            spotiflac: octo_core::settings::SpotiflacSettings {
+                enabled,
+                url: url.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let http = crate::services::http_client_factory::default_client();
+        let identity = NavidromeIdentityService::new(settings.clone(), http.clone());
+        let sources = Arc::new(
+            crate::services::library::UpgradeSources::new(settings.clone(), None).with_spotiflac(Arc::new(
+                crate::services::spotiflac::SpotiflacClient::new(settings.clone()),
+            )),
+        );
+        ExecutorSweepReplacer::new(
+            Arc::new(NavidromeSongPathResolver::new(
+                identity.clone(),
+                Arc::new(crate::services::local::test_support::FakeLocalLibrary::default()),
+                http.clone(),
+                settings.clone(),
+            )),
+            executor(
+                &settings,
+                Extras {
+                    sources: Some(sources),
+                    ..Default::default()
+                },
+            ),
+            Arc::new(NavidromePlaylistApi::new(
+                http.clone(),
+                identity.clone(),
+                settings.clone(),
+            )),
+            None,
+            Arc::new(NavidromeOtherListeners::new(
+                Arc::new(NavidromeAdmin::new(identity, http, settings)),
+                Arc::new(FamilyStore::in_memory()),
+            )),
+        )
+    }
+
+    /// The sweep's own replacer lets a hold go once the Mornye that paused is switched off or
+    /// moved, without asking it, and keeps it while that Mornye still reports the check paused.
+    #[tokio::test]
+    async fn the_real_replacer_ends_a_hold_once_its_mornye_is_off_or_moved_and_keeps_it_otherwise() {
+        let untouched = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&untouched)
+            .await;
+        let paused = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/get_signed_sessions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": {"sessions": [
+                    {"key": "gateway-a-1", "kind": "gateway", "label": "A", "extensions": ["a-ext"],
+                     "state": "unverified", "auth_paused_s": 900.0}
+                ]}})),
+            )
+            .mount(&paused)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/get_download_services"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"result": {"services": [
+                    {"id": "ext:a-ext", "label": "A", "extensions": ["a-ext"]}
+                ]}})),
+            )
+            .mount(&paused)
+            .await;
+        let hold_on = |url: String| MornyeHold {
+            labels: vec!["A".into()],
+            url,
+            ..MornyeHold::until(Utc::now() + TimeDelta::days(30))
+        };
+
+        let off = mornye_replacer(&untouched.uri(), false);
+        assert!(
+            off.mornye_wait_over(&hold_on(untouched.uri())).await,
+            "switched off"
+        );
+        let moved = mornye_replacer(&paused.uri(), true);
+        assert!(moved.mornye_wait_over(&hold_on(untouched.uri())).await, "moved");
+        let same = mornye_replacer(&paused.uri(), true);
+        assert!(
+            !same.mornye_wait_over(&hold_on(paused.uri())).await,
+            "the same Mornye with its check still paused"
+        );
+        untouched.verify().await;
+    }
 }
 
 // ---- A sound AcoustID has never heard, put to its song's YouTube preview ------------------

@@ -504,10 +504,7 @@ async function refreshStatus() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
 
-    setStatusCard('octo', data.octo);
-    Object.entries(data.services || {}).forEach(([k, v]) => setStatusCard(k, v));
-    // The status lists Mornye only while it is switched on; otherwise its card says it is off.
-    if (!data.services?.mornye) setStatusCard('mornye', MORNYE_OFF_PROBE);
+    statusCards(data).forEach(([k, v]) => setStatusCard(k, v));
     renderDownloadChecks(data.downloads);
 
     // Update sidebar badge with bad count, if any. An optional service nobody set up reports
@@ -3415,10 +3412,23 @@ const mornyeSentence = text => (/[.!?]$/.test(text) ? text : `${text}.`);
 // The status card for a Mornye the status does not list: switched off, as the server words it.
 const MORNYE_OFF_PROBE = { ok: true, configured: false, warning: false, detail: 'Off. Optional.' };
 
+// The status cards one status answer draws: Octo, each service it lists, and Mornye's card off
+// when the status lists no Mornye (it lists one only while Mornye is switched on).
+function statusCards(data) {
+  const cards = [['octo', data?.octo], ...Object.entries(data?.services || {})];
+  if (!data?.services?.mornye) cards.push(['mornye', MORNYE_OFF_PROBE]);
+  return cards;
+}
+
 // Whether the Notifications page shows the switch for Mornye's check: only while Mornye is
 // switched on in the saved settings.
 function mornyeNotifyShown(settings) {
   return !!settings?.Spotiflac?.Enabled;
+}
+
+// Shows or hides `row`, the Notifications switch for Mornye's check, by the saved `settings`.
+function applyMornyeNotifyRow(row, settings) {
+  if (row) row.hidden = !mornyeNotifyShown(settings);
 }
 
 // What the Mornye now card says for one answer of GET /api/admin/spotiflac/status: a tone, a
@@ -3673,8 +3683,7 @@ let mornyeNowView = null;
 
 // The Notifications switch for Mornye's check, shown only while Mornye is switched on.
 function syncMornyeNotifyRow() {
-  const row = document.getElementById('f-notify-mornye-check')?.closest('.set-row');
-  if (row) row.hidden = !mornyeNotifyShown(currentSettings);
+  applyMornyeNotifyRow(document.getElementById('f-notify-mornye-check')?.closest('.set-row'), currentSettings);
 }
 
 // The Mornye now card: asked when the page opens, after a Mornye setting is saved, after a pass,
@@ -9083,6 +9092,7 @@ function renderTrickle() {
     off: 'Off',
     yielding: 'Waiting for other downloads',
     waitingForSoulseek: 'Waiting for Soulseek',
+    waitingForMornye: 'Waiting for Mornye to answer',
     waitingForMornyeCheck: "Waiting for Mornye's check",
     waitingForMusicDatabase: 'Waiting for MusicBrainz',
   };
@@ -9090,6 +9100,7 @@ function renderTrickle() {
   const parts = [];
   if (t.state === 'yielding') parts.push('Someone\'s own downloads come first; it goes on once they finish.');
   if (t.state === 'waitingForSoulseek') parts.push('slskd is not logged in to Soulseek; it goes on once it is back.');
+  if (t.state === 'waitingForMornye') parts.push('Mornye is the only source and it is not answering; it goes on once it answers again.');
   if (t.state === 'waitingForMornyeCheck') parts.push("Mornye could not pass its check and Soulseek cannot be used; it goes on when Mornye may try its check again, or once you pass it on the Mornye page.");
   if (t.state === 'waitingForMusicDatabase') parts.push('MusicBrainz is not answering; songs it has to check go on once it is back.');
   if (t.state === 'off') parts.push('Songs an hour is 0, so nothing starts. Change it above.');

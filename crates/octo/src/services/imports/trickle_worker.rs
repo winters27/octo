@@ -80,6 +80,9 @@ pub mod trickle_states {
     pub const WAITING_FOR_SOULSEEK: &str = "waitingForSoulseek";
     /// Mornye is the lossless source left, and its check keeps it from every extension.
     pub const WAITING_FOR_MORNYE_CHECK: &str = "waitingForMornyeCheck";
+    /// Mornye is the step's only source (slskd is not set up), and it is not answering or cannot
+    /// download.
+    pub const WAITING_FOR_MORNYE: &str = "waitingForMornye";
     /// MusicBrainz is not answering and every waiting song has an ISRC it has to check.
     pub const WAITING_FOR_MUSIC_DATABASE: &str = "waitingForMusicDatabase";
 
@@ -95,6 +98,7 @@ pub mod trickle_states {
             YIELDING => "Waiting for other downloads",
             WAITING_FOR_SOULSEEK => "Waiting for Soulseek",
             WAITING_FOR_MORNYE_CHECK => "Waiting for Mornye's check",
+            WAITING_FOR_MORNYE => "Waiting for Mornye to answer",
             WAITING_FOR_MUSIC_DATABASE => "Waiting for MusicBrainz",
             _ => "Working on it",
         }
@@ -169,6 +173,19 @@ pub(crate) async fn mornye_keeps_the_step(
         .is_some()
 }
 
+/// Mornye is the only source on a Soulseek step with nothing after it (slskd is not set up), and
+/// it is on but not answering or unable to download, so a song started now could only fail.
+pub(crate) async fn mornye_down_with_no_slskd(
+    settings: &SettingsStore,
+    soulseek: &dyn ISoulseekLink,
+    mornye: Option<&SpotiflacClient>,
+) -> bool {
+    let Some(client) = mornye.filter(|client| client.is_on()) else {
+        return false;
+    };
+    soulseek_step_alone(settings) && soulseek.is_off() && !client.stands_in().await
+}
+
 /// A song the library already has: its id there, when Navidrome said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedSong(pub Option<String>);
@@ -192,6 +209,8 @@ pub struct TrickleSeams {
     pub row: RowSeam,
     pub people_downloading: BusySeam,
     pub soulseek_out: SoulseekOutSeam,
+    /// Mornye is the step's only source and it is not answering or cannot download.
+    pub mornye_down: SoulseekOutSeam,
     /// Mornye is the lossless source left and its check keeps it from every extension.
     pub mornye_out: SoulseekOutSeam,
     /// The places, in the jobs it is given, of the queued songs that wait for MusicBrainz to answer.
@@ -210,6 +229,7 @@ impl Default for TrickleSeams {
             row: Arc::new(|_| None),
             people_downloading: Arc::new(|| false),
             soulseek_out: Arc::new(|| Box::pin(async { false })),
+            mornye_down: Arc::new(|| Box::pin(async { false })),
             mornye_out: Arc::new(|| Box::pin(async { false })),
             held: Arc::new(|_| Box::pin(async { HashSet::new() })),
             clock: Clock::system(),
@@ -295,6 +315,9 @@ impl TrickleWorker {
         let mornye_settings = settings.clone();
         let mornye_soulseek = soulseek.clone();
         let mornye_client = spotiflac.clone();
+        let down_settings = settings.clone();
+        let down_soulseek = soulseek.clone();
+        let down_client = spotiflac.clone();
         let start_queue = queue.clone();
         let look_queue = queue.clone();
         let start_tracker = tracker.clone();
@@ -385,6 +408,13 @@ impl TrickleWorker {
                     (out_settings.clone(), soulseek.clone(), spotiflac.clone());
                 Box::pin(async move {
                     soulseek_keeps_the_step(&settings, soulseek.as_ref(), mornye.as_deref()).await
+                })
+            }),
+            mornye_down: Arc::new(move || {
+                let (settings, soulseek, mornye) =
+                    (down_settings.clone(), down_soulseek.clone(), down_client.clone());
+                Box::pin(async move {
+                    mornye_down_with_no_slskd(&settings, soulseek.as_ref(), mornye.as_deref()).await
                 })
             }),
             mornye_out: Arc::new(move || {
@@ -484,6 +514,7 @@ impl TrickleWorker {
                 waiting,
                 trickle_states::YIELDING
                     | trickle_states::WAITING_FOR_SOULSEEK
+                    | trickle_states::WAITING_FOR_MORNYE
                     | trickle_states::WAITING_FOR_MORNYE_CHECK
             ) {
                 return TrickleStatus {
@@ -547,6 +578,10 @@ impl TrickleWorker {
         }
         if (seams.soulseek_out)().await {
             *self.waiting_for.lock() = trickle_states::WAITING_FOR_SOULSEEK;
+            return false;
+        }
+        if (seams.mornye_down)().await {
+            *self.waiting_for.lock() = trickle_states::WAITING_FOR_MORNYE;
             return false;
         }
         if (seams.mornye_out)().await {

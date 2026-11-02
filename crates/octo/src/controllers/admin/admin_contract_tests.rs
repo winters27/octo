@@ -390,53 +390,140 @@ async fn a_mornye_that_refuses_reads_as_unreachable() {
     );
 }
 
-#[tokio::test]
-async fn status_never_waits_for_a_slow_mornye_and_shows_its_last_answer() {
-    // Every Mornye call answers after a second and a half.
-    let (mornye, _) = mornye_and_helper("active", false).await;
-    mornye.reset().await;
+/// A Mornye whose info answers after a minute, so a probe of it ends only at its own bound.
+async fn silent_mornye() -> MockServer {
+    let mornye = MockServer::builder().start().await;
     Mock::given(method("GET"))
         .and(path("/api/v1/info"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"name": "Mornye", "version": "1.0.5", "api_version": "v1"}))
-                .set_delay(std::time::Duration::from_millis(1500)),
+                .set_delay(std::time::Duration::from_secs(60)),
         )
         .mount(&mornye)
         .await;
+    mornye
+}
+
+/// A state with Mornye on at `url` and Navidrome refusing at once.
+fn mornye_status_state(url: &str) -> AppState {
     let mut settings = factory_settings();
     settings.subsonic.url = Some(format!(
         "http://{}",
         crate::services::test_support::refused_address()
     ));
     settings.spotiflac.enabled = true;
-    settings.spotiflac.url = mornye.uri();
-    let state = AppState::for_tests(settings);
+    settings.spotiflac.url = url.into();
+    AppState::for_tests(settings)
+}
+
+/// Mornye's row of the admin status, or null when the status lists none.
+async fn mornye_row_of(app: &App) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(30), get(app, "/api/admin/status"))
+        .await
+        .expect("the status answered")
+        .json()["services"]["mornye"]
+        .clone()
+}
+
+fn change_mornye(state: &AppState, change: impl FnOnce(&mut octo_core::settings::SpotiflacSettings)) {
+    let mut next = (*state.settings.current()).clone();
+    change(&mut next.spotiflac);
+    state.settings.set(next);
+}
+
+#[tokio::test]
+async fn status_never_waits_for_a_slow_mornye_and_shows_its_last_answer() {
+    let mornye = silent_mornye().await;
+    let state = mornye_status_state(&mornye.uri());
     let app = app(state.clone());
 
-    let first = tokio::time::timeout(std::time::Duration::from_secs(3), get(&app, "/api/admin/status"))
-        .await
-        .expect("the status did not wait for Mornye")
-        .json();
     assert_eq!(
-        first["services"]["mornye"]["detail"],
+        mornye_row_of(&app).await["detail"],
         "Mornye has not answered yet."
     );
 
-    // Once the probe has its answer, the next status shows it at once.
+    // Once the probe has given up, the next status shows its row at once.
     let url = state.spotiflac.settings().effective_url();
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while state.mornye_row.kept_for(&url).is_none() {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("the probe kept its answer");
-    let second = tokio::time::timeout(std::time::Duration::from_secs(3), get(&app, "/api/admin/status"))
-        .await
-        .expect("the status did not wait for Mornye")
-        .json();
-    assert_eq!(second["services"]["mornye"]["detail"], "Mornye 1.0.5");
+    .expect("the probe kept its row");
+    assert_eq!(
+        mornye_row_of(&app).await["detail"],
+        "Mornye did not answer within 5 seconds."
+    );
+}
+
+#[tokio::test]
+async fn a_mornye_that_answers_within_the_wait_shows_on_the_first_status() {
+    let (mornye, _) = mornye_and_helper("active", false).await;
+    let state = mornye_status_state(&mornye.uri());
+    state.mornye_row.set_wait(std::time::Duration::from_secs(30));
+
+    assert_eq!(mornye_row_of(&app(state)).await["detail"], "Mornye 1.0.5");
+}
+
+#[tokio::test]
+async fn a_moved_mornye_never_shows_the_row_of_the_one_before() {
+    let (before, _) = mornye_and_helper("active", false).await;
+    let state = mornye_status_state(&before.uri());
+    state.mornye_row.set_wait(std::time::Duration::from_secs(30));
+    let app = app(state.clone());
+    assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
+
+    let after = silent_mornye().await;
+    state.mornye_row.set_wait(super::system::MornyeRowKeeper::WAIT);
+    change_mornye(&state, |mornye| mornye.url = after.uri());
+
+    assert_eq!(
+        mornye_row_of(&app).await["detail"],
+        "Mornye has not answered yet."
+    );
+}
+
+#[tokio::test]
+async fn a_mornye_switched_off_and_on_again_never_shows_a_row_from_before() {
+    let (mornye, _) = mornye_and_helper("active", false).await;
+    let state = mornye_status_state(&mornye.uri());
+    state.mornye_row.set_wait(std::time::Duration::from_secs(30));
+    let app = app(state.clone());
+    assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
+
+    change_mornye(&state, |mornye| mornye.enabled = false);
+    assert_eq!(mornye_row_of(&app).await, Value::Null);
+
+    // On again at the same address, which now answers after a minute.
+    mornye.reset().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/info"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+        .mount(&mornye)
+        .await;
+    state.mornye_row.set_wait(super::system::MornyeRowKeeper::WAIT);
+    change_mornye(&state, |mornye| mornye.enabled = true);
+
+    assert_eq!(
+        mornye_row_of(&app).await["detail"],
+        "Mornye has not answered yet."
+    );
+}
+
+#[test]
+fn a_probe_keeps_its_row_only_while_mornye_is_on_at_the_address_it_asked() {
+    let keeper = super::system::MornyeRowKeeper::default();
+    let row = serde_json::json!({"detail": "Mornye 1.0.5"});
+    let asked = "http://spotiflac:8000";
+
+    keeper.keep(None, asked.into(), row.clone());
+    assert_eq!(keeper.kept_for(asked), None, "switched off while it asked");
+    keeper.keep(Some("http://mornye.lan:8000"), asked.into(), row.clone());
+    assert_eq!(keeper.kept_for(asked), None, "moved while it asked");
+    keeper.keep(Some(asked), asked.into(), row.clone());
+    assert_eq!(keeper.kept_for(asked), Some(row));
 }
 
 /// With Prefetch at its defaults neither document lists it, so the settings answers stay as they
