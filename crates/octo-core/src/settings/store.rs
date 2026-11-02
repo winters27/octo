@@ -85,6 +85,8 @@ struct Inner {
     tree: ArcSwap<ConfigTree>,
     current: ArcSwap<AppSettings>,
     tx: watch::Sender<Arc<AppSettings>>,
+    /// How many times a new snapshot changed the Spotiflac (Mornye) section.
+    spotiflac_changes: std::sync::atomic::AtomicU64,
     /// Serializes reloads, so two never interleave their reads and stores.
     reload_lock: Mutex<()>,
     /// The file watcher, kept alive for as long as the store is.
@@ -147,6 +149,7 @@ impl SettingsStore {
                 tree: ArcSwap::from_pointee(tree),
                 current: ArcSwap::new(settings),
                 tx,
+                spotiflac_changes: std::sync::atomic::AtomicU64::new(0),
                 reload_lock: Mutex::new(()),
                 watcher: Mutex::new(None),
             }),
@@ -167,6 +170,7 @@ impl SettingsStore {
                 tree: ArcSwap::from_pointee(ConfigTree::new()),
                 current: ArcSwap::new(settings),
                 tx,
+                spotiflac_changes: std::sync::atomic::AtomicU64::new(0),
                 reload_lock: Mutex::new(()),
                 watcher: Mutex::new(None),
             }),
@@ -208,8 +212,18 @@ impl SettingsStore {
     /// Replaces the snapshot and tells subscribers. The merged configuration is left as it was.
     pub fn set(&self, settings: AppSettings) {
         let settings = Arc::new(settings);
+        Inner::note_spotiflac(&self.inner, &settings);
         self.inner.current.store(settings.clone());
         self.inner.tx.send_replace(settings);
+    }
+
+    /// How many times the Spotiflac (Mornye) section has changed since the store was made, so a
+    /// reader can tell whether it changed in between, a switch off and on again included. A new
+    /// snapshot that leaves the section as it was does not count.
+    pub fn spotiflac_changes(&self) -> u64 {
+        self.inner
+            .spotiflac_changes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Sets one raw key (`Soulseek:Password`, say). The snapshot is not rebound.
@@ -309,9 +323,20 @@ impl Inner {
         tree.merge(&file_layer);
         let settings = Arc::new(bind_logged(&tree));
         inner.tree.store(Arc::new(tree));
+        Inner::note_spotiflac(inner, &settings);
         inner.current.store(settings.clone());
         inner.tx.send_replace(settings);
         Ok(())
+    }
+
+    /// Counts `next` as a change of the Spotiflac section when it differs from the snapshot it
+    /// replaces.
+    fn note_spotiflac(inner: &Inner, next: &AppSettings) {
+        if inner.current.load().spotiflac != next.spotiflac {
+            inner
+                .spotiflac_changes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 

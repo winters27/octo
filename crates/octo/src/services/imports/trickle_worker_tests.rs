@@ -342,7 +342,7 @@ async fn it_waits_while_mornye_is_the_only_source_and_does_not_answer() {
 
 #[tokio::test]
 async fn mornye_is_down_for_the_step_only_when_it_is_on_slskd_is_not_in_use_and_it_cannot_stand_in() {
-    use crate::services::common::test_fakes::{OffLink, OfflineLink};
+    use crate::services::common::test_fakes::{LoggedInLink, OffLink, OfflineLink};
     let clear = mornye("active").await;
     // Answers, but without its utilities extension it cannot download.
     let no_utilities = wiremock::MockServer::builder().start().await;
@@ -405,10 +405,18 @@ async fn mornye_is_down_for_the_step_only_when_it_is_on_slskd_is_not_in_use_and_
     assert!(
         down(Case {
             slskd: Some(false),
-            ..case(refused(), Arc::new(OfflineLink))
+            ..case(refused(), Arc::new(OffLink))
         })
         .await,
-        "slskd switched off with its sign-in kept is not in use"
+        "slskd switched off at startup with its sign-in kept is not in use"
+    );
+    assert!(
+        !down(Case {
+            slskd: Some(true),
+            ..case(refused(), Arc::new(LoggedInLink))
+        })
+        .await,
+        "an slskd whose link is on is in use, as the heart chain uses it"
     );
     assert!(
         !down(case(clear.uri(), Arc::new(OffLink))).await,
@@ -455,7 +463,15 @@ async fn the_worker_octo_builds_waits_for_a_mornye_that_does_not_answer_or_whose
         let mut all = settings(12);
         all.spotiflac.enabled = true;
         all.spotiflac.url = url;
-        let state = crate::app::AppState::for_tests(all);
+        // Its files go in a folder that is removed with the test.
+        let config = tempfile::tempdir().expect("a temp dir");
+        let state = crate::app::AppState::for_tests_with(
+            all,
+            crate::app::TestServices {
+                config_dir: Some(config.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
         let worker = state.imports.trickle();
         worker.queue.add("alice", &[song("a")]);
 

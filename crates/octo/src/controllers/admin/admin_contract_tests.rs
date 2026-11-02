@@ -450,7 +450,7 @@ async fn status_never_waits_for_a_slow_mornye_and_shows_its_last_answer() {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while state
             .mornye_row
-            .kept_for(&url, &state.settings.current())
+            .kept_for(&url, state.settings.spotiflac_changes())
             .is_none()
         {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -545,21 +545,37 @@ async fn a_mornye_switched_off_and_on_again_with_no_status_between_never_shows_a
 }
 
 #[test]
-fn a_kept_row_shows_only_under_the_settings_it_was_probed_under() {
+fn a_kept_row_shows_only_while_mornyes_settings_stay_as_they_were() {
     let keeper = super::system::MornyeRowKeeper::default();
     let row = serde_json::json!({"detail": "Mornye 1.0.5"});
     let asked = "http://spotiflac:8000";
-    let before = std::sync::Arc::new(AppSettings::default());
-    let after = std::sync::Arc::new(AppSettings::default());
 
-    keeper.keep(before.clone(), asked.into(), row.clone());
-    assert_eq!(keeper.kept_for(asked, &before), Some(row));
-    assert_eq!(keeper.kept_for(asked, &after), None, "the settings changed since");
+    keeper.keep(3, asked.into(), row.clone());
+    assert_eq!(keeper.kept_for(asked, 3), Some(row));
+    assert_eq!(keeper.kept_for(asked, 4), None, "Mornye's settings changed since");
     assert_eq!(
-        keeper.kept_for("http://mornye.lan:8000", &before),
+        keeper.kept_for("http://mornye.lan:8000", 3),
         None,
         "another address"
     );
+}
+
+#[tokio::test]
+async fn saving_another_setting_keeps_mornyes_row() {
+    let (mornye, _) = mornye_and_helper("active", false).await;
+    let state = mornye_status_state(&mornye.uri());
+    state.mornye_row.set_wait(std::time::Duration::from_secs(30));
+    let app = app(state.clone());
+    assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
+
+    // Another section saved, and Mornye now slow: only the kept row could answer.
+    answer_after_a_minute(&mornye).await;
+    let mut next = (*state.settings.current()).clone();
+    next.genre.max_genres = 2;
+    state.settings.set(next);
+    state.mornye_row.set_wait(std::time::Duration::ZERO);
+
+    assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
 }
 
 /// With Prefetch at its defaults neither document lists it, so the settings answers stay as they

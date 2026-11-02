@@ -203,6 +203,40 @@ fn reload_now_picks_up_a_rewrite_and_keeps_the_last_good_snapshot_on_a_bad_one()
 }
 
 #[test]
+fn only_a_change_to_the_spotiflac_section_counts_as_a_spotiflac_change() {
+    // Through a set.
+    let store = SettingsStore::for_tests(AppSettings::default());
+    let mut other = AppSettings::default();
+    other.genre.max_genres = 2;
+    store.set(other.clone());
+    assert_eq!(store.spotiflac_changes(), 0, "another section changed");
+    let mut on = other.clone();
+    on.spotiflac.enabled = true;
+    store.set(on);
+    store.set(other);
+    assert_eq!(store.spotiflac_changes(), 2, "switched on, then off again");
+
+    // Through a reload of settings.json.
+    let file = settings_file(Some(r#"{"Genre": {"MaxGenres": 3}}"#));
+    let store = SettingsStore::from_env(env(&[]), Some(file.path.clone()));
+    std::fs::write(&file.path, r#"{"Genre": {"MaxGenres": 4}}"#).unwrap();
+    store.reload_now().unwrap();
+    store.reload_now().unwrap();
+    assert_eq!(
+        store.spotiflac_changes(),
+        0,
+        "another section, and a reload with no change"
+    );
+    std::fs::write(
+        &file.path,
+        r#"{"Genre": {"MaxGenres": 4}, "Spotiflac": {"Enabled": true}}"#,
+    )
+    .unwrap();
+    store.reload_now().unwrap();
+    assert_eq!(store.spotiflac_changes(), 1);
+}
+
+#[test]
 fn for_tests_set_notifies_subscribers() {
     let store = SettingsStore::for_tests(AppSettings::default());
     let mut rx = store.subscribe();

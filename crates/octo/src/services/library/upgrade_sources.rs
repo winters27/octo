@@ -26,8 +26,8 @@ pub struct UpgradeSources {
 pub enum SourcesOut {
     /// slskd is not logged in, and Mornye is off or cannot stand in for it.
     Soulseek,
-    /// Mornye is the Soulseek step's only source (slskd is not set up), and it is not answering
-    /// or cannot download.
+    /// Mornye is the Soulseek step's only source (slskd is not in use, by
+    /// [`UpgradeSources::slskd_in_use_with`]), and it is not answering or cannot download.
     Mornye,
     /// Mornye's check keeps it from every extension, and slskd cannot be used either.
     MornyeCheck(octo_core::spotiflac::check::CheckPause),
@@ -84,21 +84,20 @@ impl UpgradeSources {
         }
     }
 
-    fn slskd_in_use(&self) -> bool {
+    /// slskd is in use on this server, by [`Self::slskd_in_use_with`].
+    pub fn slskd_in_use(&self) -> bool {
         Self::slskd_in_use_with(&self.settings.current().soulseek, self.soulseek_link.as_deref())
     }
 
-    /// slskd is in use: set up ([`Self::soulseek_set_up`]) and its link not off. The one rule
-    /// Better quality and imports share, so a server never gets two answers.
+    /// slskd is in use: its link is not off, the same thing the heart chain's slskd client reads
+    /// (switched on with an address, at startup; switching it is a restart setting). With no link,
+    /// the settings say. A sign-in is not needed: slskd can run without one. The one rule Better
+    /// quality, imports, prefetch and Find songs share, so a server never gets two answers.
     pub fn slskd_in_use_with(settings: &SoulseekSettings, link: Option<&dyn ISoulseekLink>) -> bool {
-        Self::soulseek_set_up(settings) && !link.is_some_and(|link| link.is_off())
-    }
-
-    /// slskd is set up: switched on, with its address and sign-in set.
-    pub fn soulseek_set_up(settings: &SoulseekSettings) -> bool {
-        settings.is_on()
-            && !dotnet::is_null_or_white_space(settings.username.as_deref())
-            && !dotnet::is_null_or_white_space(settings.password.as_deref())
+        match link {
+            Some(link) => !link.is_off(),
+            None => settings.is_on(),
+        }
     }
 
     /// Lidarr's address, key and the choices it needs to add an album are set.
@@ -266,12 +265,29 @@ mod tests {
         }
     }
 
-    struct FixedLink(SoulseekLinkState);
+    /// slskd's link in one state, off as Octo's own link is when slskd was not switched on with
+    /// an address at startup.
+    struct FixedLink {
+        state: SoulseekLinkState,
+        off: bool,
+    }
+
+    /// The link Octo would build for `soulseek`, reading `state`.
+    fn link_for(soulseek: &SoulseekSettings, state: SoulseekLinkState) -> Arc<dyn ISoulseekLink> {
+        Arc::new(FixedLink {
+            state,
+            off: !soulseek.is_on(),
+        })
+    }
 
     #[async_trait]
     impl ISoulseekLink for FixedLink {
         async fn read(&self, _fresh: bool) -> Option<SoulseekServerReading> {
-            Some(SoulseekServerReading::new(self.0, None, None, None))
+            Some(SoulseekServerReading::new(self.state, None, None, None))
+        }
+
+        fn is_off(&self) -> bool {
+            self.off
         }
 
         fn hold_limit(&self) -> TimeDelta {
@@ -293,17 +309,19 @@ mod tests {
         lidarr: Option<LidarrSettings>,
         link: SoulseekLinkState,
     ) -> UpgradeSources {
+        let soulseek = soulseek.unwrap_or_default();
+        let link = link_for(&soulseek, link);
         UpgradeSources::new(
             Arc::new(SettingsStore::for_tests(AppSettings {
                 library_actions: LibraryActionSettings {
                     upgrade_source: choice,
                     ..Default::default()
                 },
-                soulseek: soulseek.unwrap_or_default(),
+                soulseek,
                 lidarr: lidarr.unwrap_or_default(),
                 ..Default::default()
             })),
-            Some(Arc::new(FixedLink(link))),
+            Some(link),
         )
     }
 
@@ -429,8 +447,10 @@ mod tests {
 
     /// Better quality with Mornye at `url` and this slskd.
     fn with_mornye(url: &str, soulseek: Option<SoulseekSettings>, link: SoulseekLinkState) -> UpgradeSources {
+        let soulseek = soulseek.unwrap_or_default();
+        let link = link_for(&soulseek, link);
         let settings = Arc::new(SettingsStore::for_tests(AppSettings {
-            soulseek: soulseek.unwrap_or_default(),
+            soulseek,
             spotiflac: octo_core::settings::SpotiflacSettings {
                 enabled: true,
                 url: url.into(),
@@ -438,7 +458,7 @@ mod tests {
             },
             ..Default::default()
         }));
-        UpgradeSources::new(Arc::clone(&settings), Some(Arc::new(FixedLink(link))))
+        UpgradeSources::new(Arc::clone(&settings), Some(link))
             .with_spotiflac(Arc::new(SpotiflacClient::new(settings)))
     }
 
@@ -488,33 +508,60 @@ mod tests {
         assert_eq!(sources.waiting_for().await, Some(SourcesOut::Soulseek));
     }
 
-    /// slskd switched off, or its link off, with its address and sign-in still saved, is not in
-    /// use: the same server shape imports wait on.
+    /// slskd is in use exactly when its link is on, the same thing the heart chain's client
+    /// reads: a sign-in is not needed, and switched off its sign-in can stay saved. With no link
+    /// the settings say.
     #[tokio::test]
-    async fn a_switched_off_slskd_with_its_sign_in_kept_is_not_in_use() {
-        let switched_off = SoulseekSettings {
-            enabled: false,
-            ..slskd()
-        };
-        let link_off: Arc<dyn ISoulseekLink> = Arc::new(crate::services::common::test_fakes::OffLink);
-        let logged_in: Arc<dyn ISoulseekLink> = Arc::new(FixedLink(SoulseekLinkState::LoggedIn));
-        for (soulseek, link) in [(switched_off, logged_in), (slskd(), link_off)] {
-            let settings = Arc::new(SettingsStore::for_tests(AppSettings {
-                soulseek: soulseek.clone(),
+    async fn slskd_is_in_use_exactly_when_its_link_is_on() {
+        let mornye_refusing = |soulseek: SoulseekSettings| {
+            Arc::new(SettingsStore::for_tests(AppSettings {
+                soulseek,
                 spotiflac: octo_core::settings::SpotiflacSettings {
                     enabled: true,
                     url: "http://127.0.0.1:1".into(),
                     ..Default::default()
                 },
                 ..Default::default()
-            }));
-            assert!(!UpgradeSources::slskd_in_use_with(&soulseek, Some(link.as_ref())));
-            let sources = UpgradeSources::new(Arc::clone(&settings), Some(link))
-                .with_spotiflac(Arc::new(SpotiflacClient::new(settings)));
-            assert_eq!(sources.step_word(DownloadSource::Soulseek), "Mornye");
-            assert!(sources.available().await.is_empty());
-            assert_eq!(sources.waiting_for().await, Some(SourcesOut::Mornye));
-        }
+            }))
+        };
+
+        // Off at startup, its sign-in still saved: not in use; the step is Mornye's alone.
+        let link_off: Arc<dyn ISoulseekLink> = Arc::new(crate::services::common::test_fakes::OffLink);
+        assert!(!UpgradeSources::slskd_in_use_with(
+            &slskd(),
+            Some(link_off.as_ref())
+        ));
+        let settings = mornye_refusing(slskd());
+        let sources = UpgradeSources::new(Arc::clone(&settings), Some(link_off))
+            .with_spotiflac(Arc::new(SpotiflacClient::new(settings)));
+        assert_eq!(sources.step_word(DownloadSource::Soulseek), "Mornye");
+        assert!(sources.available().await.is_empty());
+        assert_eq!(sources.waiting_for().await, Some(SourcesOut::Mornye));
+
+        // On with an address and no sign-in, as an slskd without one runs: in use.
+        let no_sign_in = SoulseekSettings {
+            username: None,
+            password: None,
+            ..slskd()
+        };
+        let link_on = link_for(&no_sign_in, SoulseekLinkState::LoggedIn);
+        assert!(UpgradeSources::slskd_in_use_with(
+            &no_sign_in,
+            Some(link_on.as_ref())
+        ));
+        let settings = mornye_refusing(no_sign_in);
+        let sources = UpgradeSources::new(Arc::clone(&settings), Some(link_on))
+            .with_spotiflac(Arc::new(SpotiflacClient::new(settings)));
+        assert_eq!(sources.step_word(DownloadSource::Soulseek), "Soulseek or Mornye");
+        assert_eq!(sources.available().await, [DownloadSource::Soulseek]);
+
+        // No link: switched on with an address is in use, switched off is not.
+        assert!(UpgradeSources::slskd_in_use_with(&slskd(), None));
+        let switched_off = SoulseekSettings {
+            enabled: false,
+            ..slskd()
+        };
+        assert!(!UpgradeSources::slskd_in_use_with(&switched_off, None));
     }
 
     #[tokio::test]
@@ -559,10 +606,11 @@ mod tests {
                             spotiflac: spotiflac.clone(),
                             ..Default::default()
                         }));
+                        let slskd_settings = soulseek.clone().unwrap_or_default();
                         let without =
-                            UpgradeSources::new(Arc::clone(&settings), Some(Arc::new(FixedLink(link))));
+                            UpgradeSources::new(Arc::clone(&settings), Some(link_for(&slskd_settings, link)));
                         let with =
-                            UpgradeSources::new(Arc::clone(&settings), Some(Arc::new(FixedLink(link))))
+                            UpgradeSources::new(Arc::clone(&settings), Some(link_for(&slskd_settings, link)))
                                 .with_spotiflac(Arc::new(SpotiflacClient::new(settings)));
                         assert_eq!(with.plan(), without.plan());
                         assert_eq!(with.name(), without.name());
