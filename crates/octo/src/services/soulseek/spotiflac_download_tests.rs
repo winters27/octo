@@ -1152,6 +1152,32 @@ async fn a_search_mornye_did_not_answer_goes_on_without_reading_its_check() {
 }
 
 #[tokio::test]
+async fn the_second_look_and_the_health_read_before_a_job_go_side_by_side() {
+    // Every look reads Mornye again; the second look takes as long as its bound allows, and the
+    // health read before the job must not wait for it.
+    let events: Events = Arc::default();
+    let mut setup = Setup::new(&events);
+    setup.check_fresh_for = Duration::ZERO;
+    setup.fake.sessions_delay = Some(Duration::from_secs(60));
+    setup.fake.sessions_delay_from = 1;
+    setup.check_call_bound = Duration::from_secs(30);
+    let health_reads = setup.fake.extensions_read.clone();
+    let fetch = setup.build(events).await;
+
+    let read = async {
+        while health_reads.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let side_by_side = tokio::select! {
+        _ = fetch.acquire() => false,
+        read = tokio::time::timeout(Duration::from_secs(5), read) => read.is_ok(),
+    };
+
+    assert!(side_by_side, "the health read waited for the second look");
+}
+
+#[tokio::test]
 async fn the_words_for_a_failed_job_read_mornyes_check_and_its_health_side_by_side() {
     // The check read after the failure takes as long as its bound allows; the health read must
     // not wait for it.

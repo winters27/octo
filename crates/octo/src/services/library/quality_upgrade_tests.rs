@@ -420,6 +420,44 @@ async fn a_kept_song_is_passed_over_so_the_next_run_tries_the_next_song() {
     );
 }
 
+#[tokio::test]
+async fn a_hold_on_a_pause_that_names_no_check_ends_once_its_mornye_is_off() {
+    let store = Arc::new(QualityUpgradeStore::new());
+    let key = QualityUpgradeWorker::key_of(&row("a", "A/a.mp3"));
+    store.update(|s| {
+        s.mornye_holds.set(
+            key.clone(),
+            MornyeHold {
+                url: "http://spotiflac:8000".into(),
+                ..MornyeHold::until(chrono::Utc::now() + chrono::TimeDelta::days(30))
+            },
+        );
+    });
+    let (w, _) = worker(7, true, Some(store.clone()));
+    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = asked.clone();
+    w.configure(|s| {
+        s.list_songs = Arc::new(|| async { (vec![row("a", "A/a.mp3")], true) }.boxed());
+        s.apply = Arc::new(move |request| {
+            seen.lock().push(request.navidrome_id.clone());
+            async {
+                Ok(LibraryActionOutcome::new(
+                    LibraryActionState::Failed,
+                    Some("nothing better".into()),
+                ))
+            }
+            .boxed()
+        });
+        // The Mornye that paused is off now.
+        s.mornye_hold_over = Arc::new(|_| async { true }.boxed());
+    });
+
+    w.tick().await;
+
+    assert_eq!(*asked.lock(), vec!["a".to_string()]);
+    assert!(store.snapshot().mornye_holds.is_empty());
+}
+
 #[test]
 fn the_weekly_runs_holds_survive_a_restart() {
     let mut state = QualityUpgradeState::default();

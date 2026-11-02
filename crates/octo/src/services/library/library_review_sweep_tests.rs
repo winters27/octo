@@ -983,6 +983,8 @@ struct FakeReplacer {
     code: Option<&'static str>,
     /// Whether Mornye's check keeps it from every extension now.
     mornye_kept: Mutex<bool>,
+    /// The checks a kept outcome's pause watches.
+    pause_labels: Vec<&'static str>,
 }
 
 impl FakeReplacer {
@@ -995,19 +997,26 @@ impl FakeReplacer {
             sources: Mutex::new(Vec::new()),
             code: None,
             mornye_kept: Mutex::new(false),
+            pause_labels: vec!["Example"],
         })
     }
 
     /// Wrong song that finds Soulseek out: it fails with the code that makes a sweep wait.
     fn soulseek_out() -> Arc<Self> {
+        Self::out(LibraryActionCodes::SOULSEEK_OFFLINE)
+    }
+
+    /// Wrong song whose only source is out, failing with `code`.
+    fn out(code: &'static str) -> Arc<Self> {
         Arc::new(FakeReplacer {
             shown: true,
             marked: Some(false),
             state: Mutex::new(LibraryActionState::Failed),
             requests: Mutex::new(Vec::new()),
             sources: Mutex::new(Vec::new()),
-            code: Some(LibraryActionCodes::SOULSEEK_OFFLINE),
+            code: Some(code),
             mornye_kept: Mutex::new(false),
+            pause_labels: vec!["Example"],
         })
     }
 
@@ -1021,6 +1030,7 @@ impl FakeReplacer {
             sources: Mutex::new(Vec::new()),
             code: Some(LibraryActionCodes::MORNYE_KEPT),
             mornye_kept: Mutex::new(true),
+            pause_labels: vec!["Example"],
         })
     }
 
@@ -1034,6 +1044,7 @@ impl FakeReplacer {
             sources: Mutex::new(Vec::new()),
             code: None,
             mornye_kept: Mutex::new(false),
+            pause_labels: vec!["Example"],
         })
     }
 
@@ -1068,7 +1079,7 @@ impl SweepReplacer for FakeReplacer {
                 mornye_wait: (code == LibraryActionCodes::MORNYE_KEPT).then(|| {
                     Box::new(octo_core::spotiflac::check::CheckPause {
                         until_utc: chrono::Utc::now() + chrono::Duration::days(30),
-                        labels: vec!["Example".into()],
+                        labels: self.pause_labels.iter().map(|label| label.to_string()).collect(),
                         holding: Vec::new(),
                         url: String::new(),
                     })
@@ -1320,6 +1331,66 @@ async fn a_replacement_that_finds_soulseek_out_waits_without_counting() {
     assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
     assert_eq!(worker.status().found, 0);
     assert_eq!(worker.status().fine, 0);
+}
+
+/// The same when the only source is a Mornye that is not answering.
+#[tokio::test]
+async fn a_replacement_that_finds_mornye_not_answering_waits_without_counting() {
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let queue = Arc::new(NoticeQueue::new());
+    let replacer = FakeReplacer::out(LibraryActionCodes::MORNYE_OUT);
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+        Options {
+            queue: Some(queue.clone()),
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            source: Some(DownloadSource::SoulseekThenYouTube),
+            ..Default::default()
+        },
+    );
+
+    worker.tick().await;
+    worker.tick().await;
+
+    assert_eq!(replacer.requests().len(), 2, "tried again, not given up on");
+    assert_eq!(worker.status().today.failed, 0);
+    assert!(queue.for_user("bob", NoticeKind::Review).is_empty());
+}
+
+/// A pause read from Mornye's words can name no check; switching Mornye off still ends it.
+#[tokio::test]
+async fn a_song_held_on_a_pause_that_names_no_check_is_asked_again_once_mornye_is_off() {
+    let sweep = Sweep::new();
+    sweep.teardrop("a.flac");
+    let replacer = Arc::new(FakeReplacer {
+        pause_labels: Vec::new(),
+        ..Arc::into_inner(FakeReplacer::kept_by_mornye()).expect("the only one")
+    });
+    let now = Arc::new(Mutex::new(Utc::now()));
+    let reading = now.clone();
+    let worker = sweep.worker(
+        FakeVerifier::never_heard(Some(compared(Heard::Mismatch, 0.5))),
+        Options {
+            queue: Some(Arc::new(NoticeQueue::new())),
+            settings: Some(replacing_by_preview(60)),
+            replacer: Some(replacer.clone()),
+            source: Some(DownloadSource::SoulseekThenYouTube),
+            clock: Some(Clock::new(move || *reading.lock())),
+            ..Default::default()
+        },
+    );
+    worker.tick().await;
+    assert_eq!(replacer.requests().len(), 1);
+
+    // Mornye is switched off: the next pass asks for a again, long before its pause ends.
+    *replacer.mornye_kept.lock() = false;
+    *now.lock() += LibraryReviewSweepWorker::PASS_INTERVAL + TimeDelta::minutes(1);
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+    assert_eq!(replacer.requests().len(), 2, "a is asked for again");
 }
 
 #[tokio::test]
@@ -1865,6 +1936,7 @@ async fn a_file_navidrome_does_not_show_is_asked_about() {
         sources: Mutex::new(Vec::new()),
         code: None,
         mornye_kept: Mutex::new(false),
+        pause_labels: vec!["Example"],
     });
     sweep
         .worker(

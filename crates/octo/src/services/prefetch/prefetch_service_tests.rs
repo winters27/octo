@@ -41,6 +41,8 @@ struct AheadDownloads {
     refuse: Mutex<Option<std::io::ErrorKind>>,
     /// Every download fails because Mornye's check is paused.
     mornye_waits: Mutex<bool>,
+    /// That pause names no check, as one read from Mornye's words can.
+    mornye_names_no_check: Mutex<bool>,
 }
 
 #[async_trait]
@@ -102,7 +104,11 @@ impl IDownloadService for AheadDownloads {
         if *self.mornye_waits.lock() {
             let pause = octo_core::spotiflac::check::CheckPause {
                 until_utc: Utc::now() + Duration::minutes(15),
-                labels: vec!["Example".into()],
+                labels: if *self.mornye_names_no_check.lock() {
+                    Vec::new()
+                } else {
+                    vec!["Example".into()]
+                },
                 holding: Vec::new(),
                 url: String::new(),
             };
@@ -705,6 +711,8 @@ async fn switching_mornye_off_ends_the_rest_of_a_song_its_check_kept() {
     let (store, client) = mornye_client("http://127.0.0.1:1");
     let w = world_full(|s| s.prefetch.count = 1, None, Some(client));
     *w.downloads.mornye_waits.lock() = true;
+    // A pause that names no check: no read could end it, only Mornye switched off.
+    *w.downloads.mornye_names_no_check.lock() = true;
     w.save_queue("alice", 0);
     w.service.on_playing("alice", &w.ids[0], None).await;
     w.run_jobs().await;

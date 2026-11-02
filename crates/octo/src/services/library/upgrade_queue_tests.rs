@@ -785,7 +785,8 @@ async fn untouched_mornye() -> (MockServer, Arc<SettingsStore>, UpgradeWorkerSea
     (server, settings, seams)
 }
 
-/// Three jobs Mornye's check at `url` kept for another hour, and one waiting for Soulseek.
+/// Three jobs Mornye's check at `url` kept for another hour (c on a pause that names no check, as
+/// one read from Mornye's words can), and one waiting for Soulseek.
 fn three_kept_and_one_waiting(queue: &UpgradeQueue, url: &str) {
     queue.add(asks(&["a", "b", "c", "d"]), "alice", "app");
     for id in ["a", "b", "c"] {
@@ -793,7 +794,11 @@ fn three_kept_and_one_waiting(queue: &UpgradeQueue, url: &str) {
             job.state = UpgradeStates::WAITING.to_string();
             job.wait = Some(LibraryActionCodes::MORNYE_KEPT.to_string());
             job.mornye_hold = Some(MornyeHold {
-                labels: vec!["A".to_string()],
+                labels: if id == "c" {
+                    Vec::new()
+                } else {
+                    vec!["A".to_string()]
+                },
                 url: url.to_string(),
                 ..MornyeHold::until(Utc::now() + chrono::Duration::hours(1))
             });
