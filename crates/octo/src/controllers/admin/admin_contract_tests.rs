@@ -932,7 +932,7 @@ async fn last_fm_and_listen_brainz_reads_have_the_recorded_shapes() {
     assert_eq!(radio["selectedUser"], "admin");
     assert_eq!(
         radio["learning"],
-        serde_json::json!({"plays":0,"needed":10,"source":"waiting for completed scrobbles","refreshing":false,"lastRefreshAttemptUtc":null,"lastRefreshSuccessUtc":null,"lastRefreshError":null})
+        serde_json::json!({"plays":0,"needed":10,"source":"waiting for completed scrobbles","refreshing":false,"lastRefreshAttemptUtc":null,"lastRefreshSuccessUtc":null,"lastRefreshError":null,"carriedNote":null})
     );
 
     let scrobble = get(&app, "/api/admin/lastfm/scrobble").await;

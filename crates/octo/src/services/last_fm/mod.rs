@@ -17,6 +17,7 @@ pub mod last_fm_radio_track_resolver;
 pub mod last_fm_radio_warmup_service;
 pub mod last_fm_scrobble_service;
 pub mod last_fm_service;
+pub mod lookup_trouble;
 pub mod radio_tune_in_selector;
 
 pub use icy_metadata_stream::IcyMetadataStream;

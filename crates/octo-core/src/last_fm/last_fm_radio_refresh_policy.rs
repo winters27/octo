@@ -63,6 +63,23 @@ pub fn should_schedule_periodic_refresh(
             .is_none_or(|attempt| attempt <= now_utc - FAILURE_RETRY_DELAY)
 }
 
+/// The minute scan, for stations the last refresh kept as they were because their lookups did
+/// not answer: some are kept, radio and at least one kind of station are on, nothing is
+/// refreshing, and the last try was at least a quarter of an hour ago.
+pub fn should_retry_carried(
+    user: &LastFmRadioUserState,
+    settings: &LastFmSettings,
+    now_utc: DateTime<Utc>,
+) -> bool {
+    !user.carried_station_keys.is_empty()
+        && settings.enable_radio
+        && (settings.enable_personalized_stations || settings.enable_discovery_stations)
+        && !is_refreshing(user, now_utc)
+        && user
+            .last_refresh_attempt_utc
+            .is_none_or(|attempt| attempt <= now_utc - FAILURE_RETRY_DELAY)
+}
+
 /// A deterministic 100–499 ms per listener, so a restart does not refresh every profile at once.
 pub fn startup_jitter(username: &str) -> Duration {
     let hash = Sha256::digest(dotnet::to_lower_invariant(username.trim()).as_bytes());
@@ -129,6 +146,42 @@ mod tests {
         let jitter = startup_jitter("Alice");
         assert_eq!(jitter, startup_jitter("alice"));
         assert!((100..=499).contains(&jitter.as_millis()));
+    }
+
+    /// Kept stations are tried again a quarter of an hour after the last try, and only while
+    /// radio and a kind of station are on.
+    #[test]
+    fn carried_stations_are_tried_again_a_quarter_of_an_hour_after_the_last_try() {
+        let settings = LastFmSettings::default();
+        let now = Utc::now();
+        let mut user = LastFmRadioUserState {
+            carried_station_keys: vec!["discovery".into()],
+            last_refresh_attempt_utc: Some(now - TimeDelta::minutes(14)),
+            ..Default::default()
+        };
+        assert!(!should_retry_carried(&user, &settings, now));
+        user.last_refresh_attempt_utc = Some(now - TimeDelta::minutes(15));
+        assert!(should_retry_carried(&user, &settings, now));
+        for off in [
+            LastFmSettings {
+                enable_radio: false,
+                ..settings.clone()
+            },
+            LastFmSettings {
+                enable_personalized_stations: false,
+                enable_discovery_stations: false,
+                ..settings.clone()
+            },
+        ] {
+            assert!(!should_retry_carried(&user, &off, now));
+        }
+        let pinned_only = LastFmSettings {
+            enable_personalized_stations: false,
+            ..settings.clone()
+        };
+        assert!(should_retry_carried(&user, &pinned_only, now));
+        user.carried_station_keys.clear();
+        assert!(!should_retry_carried(&user, &settings, now));
     }
 
     /// Through a day of listening a station is drawn again on the refresh interval and on

@@ -17,10 +17,10 @@ use octo_core::last_fm::last_fm_radio_recommendation_service::{
     ARTIST_RADIO_NEIGHBOURS, Candidate, FRONTIER_ARTIST_CAP, FRONTIER_ARTISTS, FRONTIER_FEWEST_SONGS,
     FRONTIER_NEIGHBOURS, FRONTIER_SEEDS, FRONTIER_TRACKS_EACH, FrontierScores, HEARTED_SEED_AFFINITY,
     IgnoreCaseKeys, NEIGHBOUR_ARTIST_AFFINITY, Randomizer, SECOND_STEP_SEEDS, SECOND_STEP_WEIGHT,
-    SEED_RECENCY_DECAY, SEEDS_AT_ONCE, artist_cap, artist_key, create, default_randomizer,
-    definition_version, discount_known, key, known_artists, ranked, score_artists, score_local_tags,
-    seed_score, shape, shape_walk, shape_with_reserve, source_weight, suppress_station_overlap, title,
-    to_candidate, unknown_neighbours_first,
+    SEED_RECENCY_DECAY, SEEDS_AT_ONCE, artist_cap, artist_key, blocked_tracks, create, default_randomizer,
+    definition_version, discount_known, is_learned, key, known_artists, ranked, score_artists,
+    score_local_tags, seed_score, shape, shape_walk, shape_with_reserve, still_unavailable,
+    suppress_station_overlap, title, to_candidate, unknown_neighbours_first,
 };
 use octo_core::last_fm::last_fm_radio_seed_normalizer as seed_normalizer;
 use octo_core::last_fm::last_fm_radio_state_store::user_key;
@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::last_fm_radio_state_store::LastFmRadioStateStore;
+use super::lookup_trouble;
 use super::{LastFmService, OperationCanceled};
 use crate::services::radio::RadioSourceSet;
 
@@ -150,19 +151,63 @@ impl<'a> Budget<'a> {
     }
 
     /// The call, or [`OperationCanceled`] once the caller cancels or the deadline passes. (A
-    /// canceled call is dropped, which cancels its request.)
+    /// canceled call is dropped, which cancels its request.) A call cut off this way is a lookup
+    /// that did not answer.
     async fn run<F: Future>(&self, call: F) -> Result<F::Output, OperationCanceled> {
-        tokio::select! {
+        let output = tokio::select! {
             biased;
             () = self.caller.cancelled() => Err(OperationCanceled),
             () = tokio::time::sleep_until(self.deadline) => Err(OperationCanceled),
             output = call => Ok(output),
+        };
+        if output.is_err() {
+            lookup_trouble::note_core();
         }
+        output
     }
 }
 
 /// A walk on past a station's snapshot under way, which every ask for the same station joins.
 type Walk = Shared<BoxFuture<'static, ()>>;
+
+/// What a full build made, and what it carried over from the listener's stations.
+#[derive(Debug, Clone, Default)]
+pub struct BuiltStations {
+    /// The stations to save, in build order: the ones made and the ones carried over, kept apart
+    /// from each other by the overlap pass.
+    pub stations: Vec<LastFmRadioStation>,
+    /// The same stations before the overlap pass, for a retry that puts some of them back
+    /// among saved stations they were not built with.
+    pub unshared: Vec<LastFmRadioStation>,
+    /// The keys of the stations carried over.
+    pub carried: Vec<String>,
+    /// Whether a station the build was asked for got no answer and was not made, carried over
+    /// or not.
+    pub unanswered: bool,
+}
+
+/// Carries over the first station the listener has that `matches`, has songs and is not in the
+/// build yet: it goes next in the build, in the place the station it stands in for would have.
+/// Answers whether one was carried.
+fn carry(
+    previous: &[LastFmRadioStation],
+    stations: &mut Vec<LastFmRadioStation>,
+    carried: &mut Vec<String>,
+    matches: impl Fn(&LastFmRadioStation) -> bool,
+) -> bool {
+    let Some(station) = previous.iter().find(|station| {
+        !station.tracks.is_empty()
+            && matches(station)
+            && !stations
+                .iter()
+                .any(|built| dotnet::eq_ignore_case(&built.key, &station.key))
+    }) else {
+        return false;
+    };
+    carried.push(station.key.clone());
+    stations.push(station.clone());
+    true
+}
 
 /// Builds canonical station snapshots from bounded listening signals. Which candidates make the
 /// cut is a weighted draw rather than a fixed top-N, so two refreshes of the same profile give
@@ -233,10 +278,22 @@ impl LastFmRadioRecommendationService {
         username: &str,
         cancellation_token: &CancellationToken,
     ) -> anyhow::Result<Vec<LastFmRadioStation>> {
+        Ok(self.build_stations(username, cancellation_token).await?.stations)
+    }
+
+    /// [`Self::build`], saying which stations it carried over. A station the listener has whose
+    /// own lookups got no answer this time (see [`lookup_trouble`]) keeps its songs and takes
+    /// the place the new one would have; one whose lookups answered with too little goes, as
+    /// before.
+    pub async fn build_stations(
+        &self,
+        username: &str,
+        cancellation_token: &CancellationToken,
+    ) -> anyhow::Result<BuiltStations> {
         let snapshot = self.settings.current();
         let settings = &snapshot.last_fm;
         if !settings.enable_radio {
-            return Ok(Vec::new());
+            return Ok(BuiltStations::default());
         }
         let user = self.state.get_user(username);
         let now = Utc::now();
@@ -277,31 +334,47 @@ impl LastFmRadioRecommendationService {
             caller: cancellation_token,
             deadline: Instant::now() + PROVIDER_BUDGET,
         };
-        for (artist, _) in artist_scores.iter().take(5) {
-            match budget.run(self.last_fm.get_artist_top_tags(artist, 6)).await {
-                Ok(top_tags) => {
-                    for tag in top_tags? {
-                        tags.add(&tag, 1.0);
+        // The genre ranking: whether it got every answer decides whether genre stations the
+        // listener has may stand in for ones it could not rank.
+        let (ranked, ranking_trouble) = lookup_trouble::watch(async {
+            for (artist, _) in artist_scores.iter().take(5) {
+                match budget.run(self.last_fm.get_artist_top_tags(artist, 6)).await {
+                    Ok(top_tags) => {
+                        for tag in top_tags? {
+                            tags.add(&tag, 1.0);
+                        }
                     }
+                    Err(canceled) if cancellation_token.is_cancelled() => {
+                        return Err(anyhow::Error::from(canceled));
+                    }
+                    Err(_) => break,
                 }
-                Err(canceled) if cancellation_token.is_cancelled() => return Err(canceled.into()),
-                Err(_) => break,
             }
-        }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        ranked?;
 
+        // What the listener has now: a station the build is asked for but gets no answer for
+        // keeps its place with these songs.
+        let previous_stations = &user.stations;
         let mut stations: Vec<LastFmRadioStation> = Vec::new();
+        let mut carried: Vec<String> = Vec::new();
+        let mut unanswered = false;
         if settings.enable_personalized_stations {
-            let learned: f64 = plays
-                .iter()
-                .filter(|play| play.learned_signal)
-                .map(source_weight)
-                .sum();
-            let learned = learned >= f64::from(settings.effective_minimum_plays());
+            let learned = is_learned(&plays, settings);
             let mix_key = if learned { "your-mix" } else { "starter" };
             if settings.enable_your_mix {
-                let mut mix_candidates = self
-                    .tracks_from_seeds(username, &track_seeds[..track_seeds.len().min(6)], 12, &budget)
-                    .await;
+                let (mut mix_candidates, mix_trouble) = lookup_trouble::watch(self.tracks_from_seeds(
+                    username,
+                    &track_seeds[..track_seeds.len().min(6)],
+                    12,
+                    &budget,
+                ))
+                .await;
+                // Nothing came back because nothing answered: the station would be the
+                // listener's own plays alone.
+                let fell_short = mix_candidates.is_empty() && mix_trouble.any();
                 let familiar: Vec<Candidate> = plays
                     .iter()
                     .enumerate()
@@ -331,7 +404,7 @@ impl LastFmRadioRecommendationService {
                     Some(&banned),
                     Some(&disliked),
                 );
-                stations.push(create(
+                let made = create(
                     username,
                     mix_key,
                     if learned { "Your Radio" } else { "Starter Radio" },
@@ -345,7 +418,21 @@ impl LastFmRadioRecommendationService {
                     tracks,
                     1,
                     Utc::now(),
-                ));
+                );
+                if fell_short {
+                    unanswered = true;
+                }
+                let kept = fell_short
+                    && carry(previous_stations, &mut stations, &mut carried, |station| {
+                        matches!(
+                            station.kind,
+                            LastFmRadioStationKind::Starter | LastFmRadioStationKind::YourMix
+                        ) && (dotnet::eq_ignore_case(&station.key, "your-mix")
+                            || dotnet::eq_ignore_case(&station.key, "starter"))
+                    });
+                if !kept {
+                    stations.push(made);
+                }
             }
 
             if learned {
@@ -353,47 +440,61 @@ impl LastFmRadioRecommendationService {
                 // The artist and genre stations' candidates are asked for first, so a slow walk
                 // for Discovery Radio never spends their time; the stations are still drawn and
                 // listed in the same order as before.
-                let mut artist_candidates: Vec<(String, Vec<Candidate>)> = Vec::new();
+                let mut artist_candidates: Vec<(String, Vec<Candidate>, bool)> = Vec::new();
                 for (artist, _) in artist_scores
                     .iter()
                     .take(settings.effective_artist_station_count().max(0) as usize)
                 {
-                    let candidates = self
-                        .tracks_from_artist(username, artist, candidate_target, &known, &budget)
-                        .await?;
-                    artist_candidates.push((artist.clone(), candidates));
+                    let (candidates, trouble) = lookup_trouble::watch(self.tracks_from_artist(
+                        username,
+                        artist,
+                        candidate_target,
+                        &known,
+                        &budget,
+                    ))
+                    .await;
+                    artist_candidates.push((artist.clone(), candidates?, trouble.core));
                 }
-                let mut genre_candidates: Vec<(String, Vec<Candidate>)> = Vec::new();
+                let mut genre_candidates: Vec<(String, Vec<Candidate>, bool)> = Vec::new();
                 for tag in tags.top_by_score(settings.effective_genre_station_count().max(0) as usize) {
                     // A genre station is for finding: the listener's own artists keep a third of
                     // their weight, so the genre's other names lead.
-                    let candidates = discount_known(
-                        self.tracks_from_tags(
-                            username,
-                            std::slice::from_ref(&tag),
-                            candidate_target,
-                            &budget,
-                        )
-                        .await?,
-                        &known,
-                    );
-                    genre_candidates.push((tag, candidates));
+                    let (candidates, trouble) = lookup_trouble::watch(self.tracks_from_tags(
+                        username,
+                        std::slice::from_ref(&tag),
+                        candidate_target,
+                        &budget,
+                    ))
+                    .await;
+                    let candidates = discount_known(candidates?, &known);
+                    genre_candidates.push((tag, candidates, trouble.core));
                 }
 
                 if settings.enable_discovery_mix {
                     // New artists first, found through the ones the listener plays, within the
                     // walk's own few seconds; the tag charts only when the walk finds too few
                     // songs.
-                    let walk_budget = budget.within(DISCOVERY_WALK_BUDGET);
-                    let mut discovery = self
-                        .tracks_from_frontier(&artist_scores, &known, &disliked, &walk_budget)
-                        .await;
-                    let mut discovery_cap = FRONTIER_ARTIST_CAP;
-                    if discovery.len() < FRONTIER_FEWEST_SONGS && !top_tags.is_empty() {
-                        discovery = self
-                            .tracks_from_tags(username, &top_tags, candidate_target, &budget)
-                            .await?;
-                        discovery_cap = artist_cap(settings, LastFmRadioStationKind::Discovery);
+                    let (found, discovery_trouble) = lookup_trouble::watch(async {
+                        let walk_budget = budget.within(DISCOVERY_WALK_BUDGET);
+                        let mut discovery = self
+                            .tracks_from_frontier(&artist_scores, &known, &disliked, &walk_budget)
+                            .await;
+                        let mut discovery_cap = FRONTIER_ARTIST_CAP;
+                        if discovery.len() < FRONTIER_FEWEST_SONGS && !top_tags.is_empty() {
+                            discovery = self
+                                .tracks_from_tags(username, &top_tags, candidate_target, &budget)
+                                .await?;
+                            discovery_cap = artist_cap(settings, LastFmRadioStationKind::Discovery);
+                        }
+                        Ok::<_, anyhow::Error>((discovery, discovery_cap))
+                    })
+                    .await;
+                    let (discovery, discovery_cap) = found?;
+                    if discovery.len() < 5 && discovery_trouble.core {
+                        unanswered = true;
+                        carry(previous_stations, &mut stations, &mut carried, |station| {
+                            station.kind == LastFmRadioStationKind::Discovery
+                        });
                     }
                     if discovery.len() >= 5 {
                         // The reserve stands in for library songs past the Discovery balance's
@@ -426,8 +527,15 @@ impl LastFmRadioRecommendationService {
                     }
                 }
 
-                for (artist, candidates) in artist_candidates {
+                for (artist, candidates, troubled) in artist_candidates {
                     let station_key = format!("artist-{}", key(&artist));
+                    if candidates.len() < 5 && troubled {
+                        unanswered = true;
+                        carry(previous_stations, &mut stations, &mut carried, |station| {
+                            station.kind == LastFmRadioStationKind::Artist
+                                && dotnet::eq_ignore_case(&station.key, &station_key)
+                        });
+                    }
                     if candidates.len() >= 5 {
                         let tracks = shape(
                             candidates,
@@ -456,10 +564,17 @@ impl LastFmRadioRecommendationService {
                     }
                 }
 
-                for (tag, candidates) in genre_candidates {
+                for (tag, candidates, troubled) in genre_candidates {
                     let station_key = format!("genre-{}", key(&tag));
                     let artists: IgnoreCaseKeys =
                         candidates.iter().map(|item| item.track.artist.as_str()).collect();
+                    if artists.len() < 4 && troubled {
+                        unanswered = true;
+                        carry(previous_stations, &mut stations, &mut carried, |station| {
+                            station.kind == LastFmRadioStationKind::Genre
+                                && dotnet::eq_ignore_case(&station.key, &station_key)
+                        });
+                    }
                     if artists.len() >= 4 {
                         let tracks = shape(
                             candidates,
@@ -487,6 +602,25 @@ impl LastFmRadioRecommendationService {
                         ));
                     }
                 }
+
+                // A ranking that got no answer may have left out the listener's genres, so the
+                // genre stations they have fill the places it could not.
+                if ranking_trouble.core {
+                    let wanted = settings.effective_genre_station_count().max(0) as usize;
+                    while stations
+                        .iter()
+                        .filter(|station| station.kind == LastFmRadioStationKind::Genre)
+                        .count()
+                        < wanted
+                    {
+                        if !carry(previous_stations, &mut stations, &mut carried, |station| {
+                            station.kind == LastFmRadioStationKind::Genre
+                        }) {
+                            break;
+                        }
+                        unanswered = true;
+                    }
+                }
             }
         }
 
@@ -496,9 +630,33 @@ impl LastFmRadioRecommendationService {
                 .into_iter()
                 .filter(|item| item.enabled)
             {
-                let mut candidates = self
-                    .tracks_from_tags(username, &definition.tags, candidate_target, &budget)
-                    .await?;
+                let (candidates, trouble) = lookup_trouble::watch(self.tracks_from_tags(
+                    username,
+                    &definition.tags,
+                    candidate_target,
+                    &budget,
+                ))
+                .await;
+                let mut candidates = candidates?;
+                let station_key = format!("pinned-{}", definition.id);
+                // Last.fm's own tag charts make a pinned station; when they got no answer, the
+                // station the listener has stands in for a thinner one, and for one made of
+                // their plays.
+                let charted = candidates
+                    .iter()
+                    .filter(|candidate| candidate.source.starts_with("tag:"))
+                    .count();
+                if trouble.core && charted < FRONTIER_FEWEST_SONGS {
+                    unanswered = true;
+                    let version = definition_version(&definition);
+                    if carry(previous_stations, &mut stations, &mut carried, |station| {
+                        station.kind == LastFmRadioStationKind::Pinned
+                            && dotnet::eq_ignore_case(&station.key, &station_key)
+                            && station.definition_version == version
+                    }) {
+                        continue;
+                    }
+                }
                 if candidates.is_empty() {
                     candidates.extend(
                         plays
@@ -512,7 +670,6 @@ impl LastFmRadioRecommendationService {
                             .map(|(rank, play)| to_candidate(play, rank)),
                     );
                 }
-                let station_key = format!("pinned-{}", definition.id);
                 if !candidates.is_empty() {
                     let tracks = shape(
                         candidates,
@@ -542,16 +699,53 @@ impl LastFmRadioRecommendationService {
             }
         }
 
-        suppress_station_overlap(&mut stations);
-        for station in &mut stations {
-            station.valid_until_utc = station.changed_utc
-                + TimeDelta::hours(i64::from(settings.effective_refresh_interval_hours()));
+        // Songs a carried station walked on to stay with it; any of them rated one star or found
+        // unplayable since are dropped.
+        let is_carried = |station: &LastFmRadioStation| {
+            carried
+                .iter()
+                .any(|key| dotnet::eq_ignore_case(key, &station.key))
+        };
+        if !carried.is_empty() {
+            let blocked = blocked_tracks(&user, Utc::now());
+            for station in stations.iter().filter(|station| is_carried(station)) {
+                self.drop_blocked_walked(&continuation_key(username, station), &blocked);
+            }
         }
-        info!("Built {} Last.fm radio stations for {username}", stations.len());
-        Ok(stations
-            .into_iter()
-            .filter(|station| !station.tracks.is_empty())
-            .collect())
+        let interval = TimeDelta::hours(i64::from(settings.effective_refresh_interval_hours()));
+        for station in &mut stations {
+            // A carried station is as good as the stations made with it, until the next refresh.
+            let from = if is_carried(station) {
+                now
+            } else {
+                station.changed_utc
+            };
+            station.valid_until_utc = from + interval;
+        }
+        let unshared = stations.clone();
+        suppress_station_overlap(&mut stations);
+        let made = stations.len() - carried.len();
+        info!("Built {made} Last.fm radio stations for {username}");
+        if !carried.is_empty() {
+            info!(
+                "Kept {} of {username}'s Last.fm radio stations as they were: their lookups got no answer",
+                carried.len()
+            );
+        }
+        let has_songs = |station: &LastFmRadioStation| !station.tracks.is_empty();
+        Ok(BuiltStations {
+            stations: stations.into_iter().filter(has_songs).collect(),
+            unshared: unshared.into_iter().filter(has_songs).collect(),
+            carried,
+            unanswered,
+        })
+    }
+
+    /// Drops songs that may not play from the songs one station snapshot walked on to.
+    fn drop_blocked_walked(&self, key: &str, blocked: &IgnoreCaseKeys) {
+        if let Some(tracks) = self.continuations.lock().get_mut(key) {
+            tracks.retain(|track| !blocked.contains(&track_key(track)));
+        }
     }
 
     /// Up to `count` songs for the listener's station `station_id`, none of them in `exclude`
@@ -1319,12 +1513,7 @@ impl Signals {
     fn of(user: &LastFmRadioUserState) -> Self {
         let mut plays = user.plays.clone();
         plays.sort_by_key(|a| std::cmp::Reverse(a.played_at_utc));
-        let unavailable: IgnoreCaseKeys = user
-            .unavailable_tracks
-            .iter()
-            .filter(|track| track.retry_after_utc > Utc::now())
-            .map(|track| track.key.as_str())
-            .collect();
+        let unavailable = still_unavailable(user, Utc::now());
         let banned: IgnoreCaseKeys = user.radio_bans.iter().map(|ban| ban.key.as_str()).collect();
         let disliked: IgnoreCaseKeys = user
             .radio_bans

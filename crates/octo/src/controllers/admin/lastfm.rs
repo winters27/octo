@@ -7,6 +7,7 @@ use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use octo_core::common::dotnet::is_blank;
+use octo_core::last_fm::last_fm_radio_recommendation_service::carried_note;
 use octo_core::last_fm::last_fm_scrobble_service::LastFmScrobbleException;
 use octo_core::settings::SettingsWriteError;
 use serde::Deserialize;
@@ -60,6 +61,20 @@ pub async fn get_last_fm_radio(
         } else {
             "waiting for completed scrobbles"
         };
+        // Stations the last refresh kept as they were, while something will try them again.
+        let trying = settings.enable_radio
+            && (settings.enable_personalized_stations || settings.enable_discovery_stations);
+        let carried: Vec<&str> = user
+            .stations
+            .iter()
+            .filter(|station| {
+                user.carried_station_keys
+                    .iter()
+                    .any(|key| octo_core::common::dotnet::eq_ignore_case(key, &station.key))
+            })
+            .map(|station| station.name.as_str())
+            .collect();
+        let note = if trying { carried_note(&carried) } else { None };
         json!({
             "plays": learned,
             "needed": (settings.effective_minimum_plays() - learned).max(0),
@@ -67,7 +82,9 @@ pub async fn get_last_fm_radio(
             "refreshing": user.refreshing,
             "lastRefreshAttemptUtc": user.last_refresh_attempt_utc.as_ref().map(octo_core::json::datetime::format_utc),
             "lastRefreshSuccessUtc": user.last_refresh_success_utc.as_ref().map(octo_core::json::datetime::format_utc),
-            "lastRefreshError": user.last_refresh_error,
+            // The apps show this line as it is, so a refresh that kept stations says so here too.
+            "lastRefreshError": user.last_refresh_error.clone().or_else(|| note.clone()),
+            "carriedNote": note,
         })
     });
     let stations: Vec<serde_json::Value> = user_state
@@ -448,4 +465,71 @@ pub async fn reset_last_fm_radio(State(state): State<AppState>, RawQuery(query):
         "removedStations": if removed { before.stations.len() } else { 0 },
         "message": "Radio history and generated snapshots were removed. Downloaded music was untouched.",
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use octo_core::models::radio::{LastFmRadioStation, LastFmRadioTrack};
+    use octo_core::settings::{AppSettings, LastFmSettings, SubsonicSettings};
+
+    use super::super::test_app::{app, get};
+    use crate::app::AppState;
+
+    fn station(key: &str, name: &str) -> LastFmRadioStation {
+        LastFmRadioStation {
+            id: key.into(),
+            key: key.into(),
+            name: name.into(),
+            owner: "alice".into(),
+            tracks: vec![LastFmRadioTrack {
+                artist: "A".into(),
+                title: name.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn settings(last_fm: LastFmSettings) -> AppSettings {
+        AppSettings {
+            subsonic: SubsonicSettings {
+                url: Some("http://127.0.0.1:1".into()),
+                auto_detect_download_path: false,
+                ..Default::default()
+            },
+            last_fm,
+            ..Default::default()
+        }
+    }
+
+    /// The Radio page and the apps' admin screens say which stations the last refresh kept as
+    /// they were, while something will try them again.
+    #[tokio::test]
+    async fn the_radio_status_names_the_kept_stations_while_they_are_tried_again() {
+        let state = AppState::for_tests(settings(LastFmSettings::default()));
+        state.last_fm_radio_state.replace_stations_carrying(
+            "alice",
+            &[
+                station("your-mix", "Your Radio"),
+                station("discovery", "Discovery Radio"),
+            ],
+            &["discovery".into()],
+        );
+        let app = app(state.clone());
+        let radio = get(&app, "/api/admin/lastfm/radio?user=alice").await.json();
+        let note = "Couldn't update Discovery Radio, so it kept its songs";
+        assert_eq!(radio["learning"]["carriedNote"], note);
+        assert_eq!(radio["learning"]["lastRefreshError"], note);
+
+        state.settings.set(settings(LastFmSettings {
+            enable_radio: false,
+            ..Default::default()
+        }));
+        let radio = get(&app, "/api/admin/lastfm/radio?user=alice").await.json();
+        assert!(
+            radio["learning"]["carriedNote"].is_null(),
+            "radio off tries nothing again"
+        );
+        assert!(radio["learning"]["lastRefreshError"].is_null());
+    }
 }

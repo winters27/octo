@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use indexmap::IndexMap;
 use octo_core::common::{Clock, SingleFlight, dotnet};
+use octo_core::last_fm::last_fm_radio_recommendation_service::trim_against;
 use octo_core::last_fm::last_fm_radio_refresh_policy::{
-    is_stale, should_schedule_periodic_refresh, startup_jitter,
+    is_stale, should_retry_carried, should_schedule_periodic_refresh, startup_jitter,
 };
-use octo_core::models::radio::LastFmRadioStation;
+use octo_core::models::radio::{LastFmRadioStation, LastFmRadioStationKind};
 use octo_core::settings::{AppSettings, LastFmSettings, SettingsStore};
 use parking_lot::Mutex;
 use tokio::sync::watch;
@@ -188,7 +189,8 @@ impl LastFmRadioRefreshWorker {
     }
 
     /// One pass of the minute scan: every known listener whose stations are due a rebuild is
-    /// queued, whether or not they have listened since. Answers how many were queued.
+    /// queued, whether or not they have listened since, and every other one whose last refresh
+    /// carried stations over is queued for another try at those. Answers how many were queued.
     pub fn queue_due(&self) -> usize {
         let settings = self.settings.current();
         if !settings.last_fm.enable_radio {
@@ -197,8 +199,12 @@ impl LastFmRadioRefreshWorker {
         let now = self.clock.now();
         let mut queued = 0;
         for username in self.state.known_users() {
-            if should_schedule_periodic_refresh(&self.state.get_user(&username), &settings.last_fm, now) {
+            let user = self.state.get_user(&username);
+            if should_schedule_periodic_refresh(&user, &settings.last_fm, now) {
                 self.queue.enqueue(&username, None);
+                queued += 1;
+            } else if should_retry_carried(&user, &settings.last_fm, now) {
+                self.queue.enqueue_carried(&username);
                 queued += 1;
             }
         }
@@ -239,44 +245,137 @@ impl LastFmRadioRefreshWorker {
         if !settings.enable_radio
             || (!settings.enable_personalized_stations && !settings.enable_discovery_stations)
         {
+            // Nothing tries carried stations again while no kind of station is built.
+            self.state.clear_carried(&job.username);
             return Ok(false);
+        }
+        if job.carried_only {
+            return self.retry_carried(job, cancellation_token).await;
         }
         self.state.mark_refreshing(&job.username);
         let built = self
             .recommendations
-            .build(&job.username, cancellation_token)
+            .build_stations(&job.username, cancellation_token)
             .await?;
-        let mut stations = built.clone();
         if let Some(definition_id) = job.station_definition_id.as_deref().filter(|id| !id.is_empty()) {
             let pinned_key = format!("pinned-{definition_id}");
-            let Some(replacement) = built.into_iter().find(|station| station.key == pinned_key) else {
+            // Only a station made now replaces the one the listener has.
+            let carried = &built.carried;
+            let Some(replacement) = built
+                .stations
+                .into_iter()
+                .find(|station| station.key == pinned_key && !carried.contains(&station.key))
+            else {
                 anyhow::bail!("Pinned station returned no usable tracks");
             };
-            let mut merged: Vec<LastFmRadioStation> = self
-                .state
-                .get_user(&job.username)
+            let saved = self.state.get_user(&job.username);
+            let mut merged: Vec<LastFmRadioStation> = saved
                 .stations
                 .into_iter()
                 .filter(|station| station.key != replacement.key)
                 .collect();
             merged.push(replacement);
-            stations = merged;
+            let still: Vec<String> = saved
+                .carried_station_keys
+                .into_iter()
+                .filter(|key| !dotnet::eq_ignore_case(key, &pinned_key))
+                .collect();
+            self.state
+                .replace_stations_carrying(&job.username, &merged, &still);
+            self.queue_warmup(&job.username);
+            return Ok(true);
         }
-        // An empty build normally means the provider failed, and replacing a user's stations with
-        // nothing is worse than keeping a stale snapshot. Switching every station kind off is the
-        // one empty build that is a choice, so it is the only one excused here.
-        if stations.is_empty()
-            && !self.state.get_user(&job.username).stations.is_empty()
-            && !settings.stations_explicitly_empty()
-        {
+        // A build that made nothing because its lookups got no answer keeps the stations the
+        // listener has (they are tried again soon); one that was asked for nothing leaves none.
+        let made = built.stations.len() - built.carried.len();
+        if made == 0 && built.unanswered && !self.state.get_user(&job.username).stations.is_empty() {
             anyhow::bail!("Provider returned no usable replacement stations");
         }
-        self.state.replace_stations(&job.username, &stations);
-        if let Some(warmup) = &self.warmup {
-            warmup.queue_user(&job.username);
+        self.state
+            .replace_stations_carrying(&job.username, &built.stations, &built.carried);
+        self.queue_warmup(&job.username);
+        Ok(true)
+    }
+
+    /// Another try at the stations the last refresh carried over, replacing only those: a station
+    /// made now takes its place, one that still got no answer stays carried, and one answered
+    /// with too little, or no longer asked for, goes. The other stations, and the refresh
+    /// schedule, are left as they were.
+    async fn retry_carried(
+        &self,
+        job: &LastFmRadioRefreshJob,
+        cancellation_token: &CancellationToken,
+    ) -> anyhow::Result<bool> {
+        // Asked again here: a refresh since the job was queued may have settled them.
+        let before = self.state.get_user(&job.username);
+        if !should_retry_carried(&before, &self.settings.current().last_fm, self.clock.now()) {
+            return Ok(false);
+        }
+        self.state.mark_refreshing(&job.username);
+        let built = self
+            .recommendations
+            .build_stations(&job.username, cancellation_token)
+            .await?;
+        let saved = self.state.get_user(&job.username);
+        let was_carried = |key: &str| {
+            built
+                .carried
+                .iter()
+                .any(|carried| dotnet::eq_ignore_case(carried, key))
+        };
+        let mut stations = saved.stations.clone();
+        let mut still: Vec<String> = Vec::new();
+        for key in &saved.carried_station_keys {
+            let Some(index) = stations
+                .iter()
+                .position(|station| dotnet::eq_ignore_case(&station.key, key))
+            else {
+                continue;
+            };
+            let your_slot = is_your_slot(&stations[index]);
+            // The station as it was made, before it was kept apart from stations it is not
+            // going in beside.
+            let made = built.unshared.iter().find(|station| {
+                !was_carried(&station.key)
+                    && (dotnet::eq_ignore_case(&station.key, key) || (your_slot && is_your_slot(station)))
+            });
+            if let Some(made) = made {
+                let mut made = made.clone();
+                let others: Vec<LastFmRadioStation> = stations
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, _)| *at != index)
+                    .map(|(_, station)| station.clone())
+                    .collect();
+                trim_against(&mut made, &others);
+                stations[index] = made;
+            } else if was_carried(key) {
+                still.push(key.clone());
+            } else {
+                stations.remove(index);
+            }
+        }
+        let changed = stations != saved.stations;
+        self.state.replace_carried(&job.username, &stations, &still);
+        if changed {
+            self.queue_warmup(&job.username);
         }
         Ok(true)
     }
+
+    fn queue_warmup(&self, username: &str) {
+        if let Some(warmup) = &self.warmup {
+            warmup.queue_user(username);
+        }
+    }
+}
+
+/// Starter Radio or Your Radio: one place in a listener's stations, whichever it is now.
+fn is_your_slot(station: &LastFmRadioStation) -> bool {
+    matches!(
+        station.kind,
+        LastFmRadioStationKind::Starter | LastFmRadioStationKind::YourMix
+    ) && (dotnet::eq_ignore_case(&station.key, "your-mix") || dotnet::eq_ignore_case(&station.key, "starter"))
 }
 
 /// Everything that decides WHICH personalized stations get built, as one value.
@@ -346,12 +445,17 @@ mod tests {
     }
 
     async fn fixture(last_fm: LastFmSettings, delay: Option<Duration>) -> WorkerFixture {
-        let dir = TempDir::new().unwrap();
-        let server = MockServer::start().await;
         let mut answer = ResponseTemplate::new(200).set_body_string("{}");
         if let Some(delay) = delay {
             answer = answer.set_delay(delay);
         }
+        fixture_answering(last_fm, answer).await
+    }
+
+    /// The worker against a Last.fm that gives every request `answer`.
+    async fn fixture_answering(last_fm: LastFmSettings, answer: ResponseTemplate) -> WorkerFixture {
+        let dir = TempDir::new().unwrap();
+        let server = MockServer::start().await;
         Mock::given(any()).respond_with(answer).mount(&server).await;
         let settings = Arc::new(SettingsStore::for_tests(AppSettings {
             last_fm,
@@ -399,16 +503,20 @@ mod tests {
         }
     }
 
+    /// A refresh that made nothing because Last.fm gave no answer keeps the stations the
+    /// listener has, and records the failure.
     #[tokio::test]
     async fn worker_retains_stale_snapshot_and_records_failed_replacement() {
-        let fixture = fixture(
+        let fixture = fixture_answering(
             LastFmSettings {
+                api_key: "key".into(),
                 enable_radio: true,
                 enable_personalized_stations: false,
                 enable_discovery_stations: true,
+                discovery_stations: vec![pinned("rock", "Rock", "rock")],
                 ..Default::default()
             },
-            None,
+            ResponseTemplate::new(500),
         )
         .await;
         let prior = LastFmRadioStation {
@@ -624,6 +732,7 @@ mod tests {
         let job = LastFmRadioRefreshJob {
             username: "alice".into(),
             station_definition_id: Some("rock".into()),
+            carried_only: false,
         };
         assert!(fixture.worker.process(&job).await.unwrap());
         let keys: Vec<String> = fixture
@@ -638,6 +747,7 @@ mod tests {
         let missing = LastFmRadioRefreshJob {
             username: "alice".into(),
             station_definition_id: Some("jazz".into()),
+            carried_only: false,
         };
         let error = fixture.worker.process(&missing).await.unwrap_err();
         assert_eq!(error.to_string(), "Pinned station returned no usable tracks");

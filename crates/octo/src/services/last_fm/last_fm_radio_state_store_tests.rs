@@ -482,3 +482,148 @@ fn playlist_serializer_has_json_xml_symmetry_and_read_only_metadata() {
     let child = xml.lines().nth(2).unwrap();
     assert!(child.contains(r#"id="local-1""#), "{child}");
 }
+
+fn song(artist: &str, title: &str) -> LastFmRadioTrack {
+    LastFmRadioTrack {
+        artist: artist.into(),
+        title: title.into(),
+        is_local: true,
+        ..Default::default()
+    }
+}
+
+fn titles(tracks: &[LastFmRadioTrack]) -> Vec<&str> {
+    tracks.iter().map(|track| track.title.as_str()).collect()
+}
+
+/// A saved station a day old, holding `tracks` and `reserve`.
+fn day_old(id: &str, tracks: Vec<LastFmRadioTrack>, reserve: Vec<LastFmRadioTrack>) -> LastFmRadioStation {
+    let then = Utc::now() - TimeDelta::days(1);
+    LastFmRadioStation {
+        id: id.into(),
+        key: id.into(),
+        name: format!("{id} Radio"),
+        owner: "alice".into(),
+        created_utc: then,
+        changed_utc: then,
+        tracks,
+        reserve,
+        ..Default::default()
+    }
+}
+
+/// A refresh saves what it built after a song was rated one star or found unplayable: the song
+/// stays out of the saved station, from its songs and its reserve.
+#[test]
+fn a_save_leaves_out_songs_rated_one_star_or_found_unplayable_meanwhile() {
+    let fixture = StateFixture::new(None, None);
+    assert!(fixture.store.set_radio_ban("alice", "", "A", "Rated", true));
+    fixture.store.reject_track("alice", &song("A", "Broken"), None);
+    let built = day_old(
+        "s1",
+        vec![song("A", "Rated"), song("A", "Broken"), song("A", "Kept")],
+        vec![song("A", "Rated"), song("A", "Broken"), song("A", "Spare")],
+    );
+    fixture.store.replace_stations("alice", &[built]);
+    let saved = &fixture.store.get_user("alice").stations[0];
+    assert_eq!(titles(&saved.tracks), ["Kept"]);
+    assert_eq!(titles(&saved.reserve), ["Spare"]);
+}
+
+/// A song held out because it would not play comes back once its time is up.
+#[test]
+fn a_song_whose_hold_has_passed_is_saved() {
+    let fixture = StateFixture::new(None, None);
+    fixture
+        .store
+        .reject_track("alice", &song("A", "Back"), Some(Utc::now() - TimeDelta::days(2)));
+    fixture
+        .store
+        .replace_stations("alice", &[day_old("s1", vec![song("A", "Back")], Vec::new())]);
+    assert_eq!(
+        titles(&fixture.store.get_user("alice").stations[0].tracks),
+        ["Back"]
+    );
+}
+
+/// A station left with no song is not saved.
+#[test]
+fn a_station_left_with_no_song_is_not_saved() {
+    let fixture = StateFixture::new(None, None);
+    assert!(fixture.store.set_radio_ban("alice", "", "A", "Only", true));
+    fixture.store.replace_stations(
+        "alice",
+        &[
+            day_old("empty", vec![song("A", "Only")], Vec::new()),
+            day_old("full", vec![song("A", "Other")], Vec::new()),
+        ],
+    );
+    let keys: Vec<String> = fixture
+        .store
+        .get_user("alice")
+        .stations
+        .into_iter()
+        .map(|station| station.key)
+        .collect();
+    assert_eq!(keys, ["full"]);
+}
+
+/// A one-star rating or an unplayable song leaves a station's reserve too, and says the station
+/// changed; the count of songs taken out is of listed songs only.
+#[test]
+fn rating_one_star_or_rejecting_clears_the_reserve_and_marks_the_change() {
+    let fixture = StateFixture::new(None, None);
+    let saved = day_old(
+        "s1",
+        vec![song("A", "Listed")],
+        vec![song("A", "Spare one"), song("A", "Spare two")],
+    );
+    let then = saved.changed_utc;
+    fixture.store.replace_stations("alice", &[saved]);
+
+    assert!(fixture.store.set_radio_ban("alice", "", "A", "Spare one", true));
+    let station = fixture.store.get_user("alice").stations[0].clone();
+    assert_eq!(titles(&station.reserve), ["Spare two"]);
+    assert!(station.changed_utc > then);
+
+    let changed = station.changed_utc;
+    assert_eq!(
+        fixture.store.reject_track("alice", &song("A", "Spare two"), None),
+        0
+    );
+    let station = fixture.store.get_user("alice").stations[0].clone();
+    assert!(station.reserve.is_empty());
+    assert!(station.changed_utc >= changed);
+    assert_eq!(titles(&station.tracks), ["Listed"]);
+}
+
+/// A copy saved again with other songs says it changed now, even when the copy was made
+/// earlier; a first save keeps its own time.
+#[test]
+fn a_changed_copy_saved_again_is_marked_changed_now() {
+    let fixture = StateFixture::new(None, None);
+    let first = day_old("s1", vec![song("A", "One")], Vec::new());
+    let then = first.changed_utc;
+    fixture.store.replace_stations("alice", &[first]);
+    assert_eq!(fixture.store.get_user("alice").stations[0].changed_utc, then);
+
+    let before = Utc::now();
+    let copy = day_old("s1", vec![song("A", "One"), song("A", "Two")], Vec::new());
+    fixture.store.replace_stations("alice", &[copy]);
+    assert!(fixture.store.get_user("alice").stations[0].changed_utc >= before);
+}
+
+/// The reserve is part of what a station holds: other reserve songs are a change.
+#[test]
+fn a_different_reserve_is_a_changed_station() {
+    let fixture = StateFixture::new(None, None);
+    let first = day_old("s1", vec![song("A", "One")], vec![song("A", "Spare")]);
+    fixture.store.replace_stations("alice", &[first]);
+    let before = Utc::now();
+    let copy = day_old("s1", vec![song("A", "One")], vec![song("A", "Other spare")]);
+    fixture.store.replace_stations("alice", &[copy]);
+    assert!(fixture.store.get_user("alice").stations[0].changed_utc >= before);
+}
+
+#[path = "last_fm_radio_carry_over_tests.rs"]
+mod carry_over;

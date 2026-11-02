@@ -59,6 +59,11 @@ pub struct LastFmRadioUserState {
     /// from new plays, never from a starting profile. Absent from the file until set.
     #[serde(with = "datetime::utc_option", skip_serializing_if = "Option::is_none")]
     pub history_cleared_utc: Option<DateTime<Utc>>,
+    /// The keys of the stations the last refresh kept as they were because their lookups did not
+    /// answer. Each is tried again on its own until it is made or no longer wanted. Absent from
+    /// the file while empty.
+    #[serde(deserialize_with = "null_as_default", skip_serializing_if = "Vec::is_empty")]
+    pub carried_station_keys: Vec<String>,
 }
 
 impl Default for LastFmRadioUserState {
@@ -76,6 +81,7 @@ impl Default for LastFmRadioUserState {
             last_refresh_error: None,
             refreshing: false,
             history_cleared_utc: None,
+            carried_station_keys: Vec::new(),
         }
     }
 }

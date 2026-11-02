@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::common::{Clock, dotnet};
-use octo_core::last_fm::last_fm_radio_recommendation_service::IgnoreCaseKeys;
+use octo_core::last_fm::last_fm_radio_recommendation_service::{
+    IgnoreCaseKeys, blocked_tracks, strip_blocked,
+};
 use octo_core::last_fm::last_fm_radio_seed_normalizer as seed_normalizer;
 use octo_core::last_fm::last_fm_radio_state_store::{
     CURRENT_VERSION, DUPLICATE_WINDOW, MAX_PLAYS_PER_USER, MAX_RADIO_BANS_PER_USER,
@@ -251,17 +253,18 @@ impl LastFmRadioStateStore {
         let now = now_utc.unwrap_or_else(|| self.clock.now());
         let user = get_or_create(state, username, self.clock.now());
         let key = seed_normalizer::track_key(&track.artist, &track.title);
+        let blocked: IgnoreCaseKeys = std::iter::once(key.as_str()).collect();
+        // Counts listed songs only: a song gone from a reserve leaves the station as full.
         let mut removed = 0;
         for station in &mut user.stations {
             let before = station.tracks.len();
-            station
-                .tracks
-                .retain(|candidate| seed_normalizer::track_key(&candidate.artist, &candidate.title) != key);
+            let (tracks, reserve) = strip_blocked(station, &blocked);
             removed += before - station.tracks.len();
-            if before != station.tracks.len() {
+            if tracks || reserve {
                 station.changed_utc = now;
             }
         }
+        drop_emptied(user);
         let mut unavailable: Vec<LastFmRadioUnavailableTrack> =
             std::iter::once(LastFmRadioUnavailableTrack {
                 key: key.clone(),
@@ -320,15 +323,14 @@ impl LastFmRadioStateStore {
                     banned_at_utc: now,
                 },
             );
+            let blocked: IgnoreCaseKeys = std::iter::once(key.as_str()).collect();
             for station in &mut user.stations {
-                let before = station.tracks.len();
-                station
-                    .tracks
-                    .retain(|track| seed_normalizer::track_key(&track.artist, &track.title) != key);
-                if before != station.tracks.len() {
+                let (tracks, reserve) = strip_blocked(station, &blocked);
+                if tracks || reserve {
                     station.changed_utc = now;
                 }
             }
+            drop_emptied(user);
         } else if !had {
             return false;
         }
@@ -347,6 +349,47 @@ impl LastFmRadioStateStore {
     }
 
     pub fn replace_stations(&self, username: &str, stations: &[LastFmRadioStation]) {
+        self.replace_stations_carrying(username, stations, &[]);
+    }
+
+    /// A full refresh's stations. `carried` holds the keys of the ones it kept as they were
+    /// because their lookups did not answer; they are tried again on their own.
+    pub fn replace_stations_carrying(
+        &self,
+        username: &str,
+        stations: &[LastFmRadioStation],
+        carried: &[String],
+    ) {
+        self.save_stations(username, stations, carried, Stamps::Refresh);
+    }
+
+    /// A retry of carried stations: saved like a refresh, but the refresh schedule is left as it
+    /// was, so the stations it did not touch are drawn again on time.
+    pub fn replace_carried(&self, username: &str, stations: &[LastFmRadioStation], carried: &[String]) {
+        self.save_stations(username, stations, carried, Stamps::Retry);
+    }
+
+    /// Forgets which stations were carried, for a listener nothing will try them again for.
+    pub fn clear_carried(&self, username: &str) {
+        let mut guard = self.state.lock();
+        let state = self.load_locked(&mut guard);
+        let Some(user) = state.get_mut(&user_key(username)) else {
+            return;
+        };
+        if user.carried_station_keys.is_empty() {
+            return;
+        }
+        user.carried_station_keys.clear();
+        self.save_locked(state);
+    }
+
+    fn save_stations(
+        &self,
+        username: &str,
+        stations: &[LastFmRadioStation],
+        carried: &[String],
+        stamps: Stamps,
+    ) {
         let mut guard = self.state.lock();
         let state = self.load_locked(&mut guard);
         let now = self.clock.now();
@@ -361,24 +404,48 @@ impl LastFmRadioStateStore {
         {
             return;
         }
+        // Songs rated one star or found unplayable while the refresh ran stay out, and a station
+        // left with no song is not kept.
+        let blocked = blocked_tracks(user, now);
         let existing = std::mem::take(&mut user.stations);
         let prior_of = |id: &str| existing.iter().find(|station| station.id == id);
         user.stations = stations
             .iter()
-            .map(|source| {
+            .filter_map(|source| {
                 let mut station = source.clone();
+                strip_blocked(&mut station, &blocked);
+                if station.tracks.is_empty() {
+                    return None;
+                }
                 if let Some(prior) = prior_of(&station.id) {
                     station.created_utc = prior.created_utc;
                     if same_snapshot(prior, &station) {
                         station.changed_utc = prior.changed_utc;
+                    } else if station.changed_utc < now {
+                        // A copy that changed since it was read says so, even one made earlier.
+                        station.changed_utc = now;
                     }
                 }
-                station
+                Some(station)
             })
             .collect();
-        user.new_plays_since_refresh = 0;
-        user.last_refresh_success_utc = Some(now);
-        user.last_refresh_attempt_utc = user.last_refresh_success_utc;
+        user.carried_station_keys = carried
+            .iter()
+            .filter(|key| {
+                user.stations
+                    .iter()
+                    .any(|station| dotnet::eq_ignore_case(&station.key, key))
+            })
+            .cloned()
+            .collect();
+        match stamps {
+            Stamps::Refresh => {
+                user.new_plays_since_refresh = 0;
+                user.last_refresh_success_utc = Some(now);
+                user.last_refresh_attempt_utc = user.last_refresh_success_utc;
+            }
+            Stamps::Retry => user.last_refresh_attempt_utc = Some(now),
+        }
         user.last_refresh_error = None;
         user.refreshing = false;
         user.last_seen_utc = now;
@@ -578,17 +645,39 @@ pub fn route_track(registry: &ExternalIdRegistry, track: &mut LastFmRadioTrack) 
     }
 }
 
+/// Whether two copies of a station hold the same songs. The reserve counts: Discovery Radio
+/// serves reserve songs in place of library songs past its share.
 fn same_snapshot(left: &LastFmRadioStation, right: &LastFmRadioStation) -> bool {
-    left.definition_version == right.definition_version
-        && left.name == right.name
-        && left
-            .tracks
+    let keys = |tracks: &[LastFmRadioTrack]| -> Vec<String> {
+        tracks
             .iter()
             .map(|track| seed_normalizer::track_key(&track.artist, &track.title))
-            .eq(right
-                .tracks
-                .iter()
-                .map(|track| seed_normalizer::track_key(&track.artist, &track.title)))
+            .collect()
+    };
+    left.definition_version == right.definition_version
+        && left.name == right.name
+        && keys(&left.tracks) == keys(&right.tracks)
+        && keys(&left.reserve) == keys(&right.reserve)
+}
+
+/// Which stamps a station save writes.
+#[derive(Debug, Clone, Copy)]
+enum Stamps {
+    /// A refresh: the success that the next scheduled one counts from.
+    Refresh,
+    /// A retry of carried stations: only the attempt.
+    Retry,
+}
+
+/// Leaves out the stations that no longer hold a song, and forgets that any of them was carried.
+fn drop_emptied(user: &mut LastFmRadioUserState) {
+    user.stations.retain(|station| !station.tracks.is_empty());
+    let stations = &user.stations;
+    user.carried_station_keys.retain(|key| {
+        stations
+            .iter()
+            .any(|station| dotnet::eq_ignore_case(&station.key, key))
+    });
 }
 
 /// The span in fractional minutes.
