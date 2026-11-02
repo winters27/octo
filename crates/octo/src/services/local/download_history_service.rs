@@ -216,6 +216,29 @@ impl DownloadHistoryService {
         list.iter().take(limit.max(0) as usize).cloned().collect()
     }
 
+    /// The entries whose artist, title, album or file path hold every word of `text`, ignoring
+    /// case, newest first, at most `limit`. Searches every kept entry, not only the newest
+    /// that the Fetched songs list shows. Blank text finds nothing.
+    pub fn search(&self, text: &str, limit: usize) -> Vec<DownloadHistoryEntry> {
+        let words: Vec<String> = text.split_whitespace().map(str::to_lowercase).collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
+        let mut cache = self.cache.lock();
+        let list = self.load_locked(&mut cache);
+        list.iter()
+            .filter(|entry| {
+                let album = entry.album.as_deref().unwrap_or_default();
+                let said = [entry.artist.as_str(), &entry.title, album, &entry.path]
+                    .join("\n")
+                    .to_lowercase();
+                words.iter().all(|word| said.contains(word.as_str()))
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     fn load_locked<'a>(
         &self,
         cache: &'a mut Option<Vec<DownloadHistoryEntry>>,
@@ -313,6 +336,45 @@ mod tests {
         assert_eq!(all.len(), 500);
         assert_eq!(all[0].title, "504");
         assert_eq!(all[499].title, "5");
+    }
+
+    #[test]
+    fn a_search_finds_every_word_in_any_field_ignoring_case_newest_first() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let service = DownloadHistoryService::new(dir.path().join("downloads-history.json"));
+        for i in 0..300 {
+            service.record(entry(&format!("Filler {i}")));
+        }
+        service.record(DownloadHistoryEntry {
+            album: Some("Blue Album".into()),
+            path: "/music/A/Blue Album/01 Night Drive.flac".into(),
+            ..entry("Night Drive")
+        });
+        service.record(entry("Night Drive (Live)"));
+        for i in 0..250 {
+            service.record(entry(&format!("Later {i}")));
+        }
+
+        let found = service.search("  night DRIVE ", 50);
+        assert_eq!(found.len(), 2, "older than the newest 200 is still found");
+        assert_eq!(found[0].title, "Night Drive (Live)");
+        assert_eq!(found[1].title, "Night Drive");
+        assert_eq!(
+            service.search("blue night", 50).len(),
+            1,
+            "album and title together"
+        );
+        assert_eq!(
+            service.search("01 night drive.flac", 50).len(),
+            1,
+            "the file path"
+        );
+        assert!(
+            service.search("night blues", 50).is_empty(),
+            "every word must be there"
+        );
+        assert!(service.search("   ", 50).is_empty());
+        assert_eq!(service.search("later", 7).len(), 7, "the limit holds");
     }
 
     // ---- The saved log --------------------------------------------------------------------

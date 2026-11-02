@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use chrono::Utc;
 use octo_core::common::dotnet::is_blank;
@@ -20,6 +20,7 @@ use tracing::{info, warn};
 use super::json_body::bind_body;
 use super::json_body::{FromBody, Shape, text_record};
 use super::plumbing::{camel_case_value, object_result, ok};
+use super::request_binding::query;
 use crate::app::AppState;
 use crate::http::error::json_ok;
 use crate::middleware::admin_sign_in_gate::{Caller, caller_of};
@@ -91,9 +92,13 @@ pub async fn test_notification(State(state): State<AppState>) -> Response {
 
 /// `GET /api/admin/downloads`: the running log of songs Octo has fetched, newest first. Each
 /// entry's saved download log stays out of the list (it can run to hundreds of lines); `hasLog`
-/// says one was kept, and `downloads/log` reads it.
-pub async fn downloads(State(state): State<AppState>) -> Response {
-    let recent = state.download_history.get_recent(200);
+/// says one was kept, and `downloads/log` reads it. With `q`, the kept entries matching every
+/// word of it instead (artist, title, album or path), so an older download can be looked up.
+pub async fn downloads(State(state): State<AppState>, uri: Uri) -> Response {
+    let recent = match query(&uri, "q").filter(|q| !is_blank(q)) {
+        Some(q) => state.download_history.search(&q, DOWNLOAD_SEARCH_LIMIT),
+        None => state.download_history.get_recent(200),
+    };
     // The entries are written to disk PascalCase; the API answer is camelCase, with the
     // report's dictionaries keeping their keys.
     let downloads: Vec<serde_json::Value> = recent
@@ -113,6 +118,9 @@ pub async fn downloads(State(state): State<AppState>) -> Response {
         .collect();
     ok(&json!({ "downloads": downloads }))
 }
+
+/// The most entries a search of the fetched-songs log answers with.
+const DOWNLOAD_SEARCH_LIMIT: usize = 50;
 
 /// `GET /api/admin/acquisitions`: every hearted download in flight or ended in the last half
 /// hour, everyone's, newest first. The rows the app reads through getAcquisitions, plus the
