@@ -275,12 +275,12 @@ pub fn artist_object(artist: &Value) -> Option<Value> {
 
 /// The album objects of an Apple answer, in its order.
 pub fn albums(answer: &Value) -> AppleRead<Vec<Value>> {
-    read_results(answer, |result| album_object(result))
+    read_results(answer, album_object)
 }
 
 /// The artist objects of an Apple answer, in its order.
 pub fn artists(answer: &Value) -> AppleRead<Vec<Value>> {
-    read_results(answer, |result| artist_object(result))
+    read_results(answer, artist_object)
 }
 
 /// The track objects of an Apple answer, in its order, each with its album's record type when

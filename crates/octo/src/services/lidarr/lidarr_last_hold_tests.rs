@@ -358,7 +358,7 @@ async fn with_lidarr_last_an_album_heart_whose_lookup_got_no_answer_holds_and_re
 }
 
 /// An album heart of the album whose Lidarr step, run last, got no answer from Deezer for its
-/// album: held as one, saved, "Waiting for Deezer".
+/// album: held as one, saved, "Waiting for the music catalog".
 async fn album_held_for_deezer(rig: &Rig) {
     *rig.lidarr.waits.lock() = Some(LidarrWaits::Answer(HeartBusy::Deezer));
     heart_the_album(rig).await;
@@ -371,7 +371,7 @@ async fn album_held_for_deezer(rig: &Rig) {
     assert!(rig.tracker.is_held("soulseek", ALBUM));
     assert_eq!(
         rig.tracker.note_of("soulseek", ALBUM).as_deref(),
-        Some("Waiting for Deezer")
+        Some("Waiting for the music catalog")
     );
 }
 
