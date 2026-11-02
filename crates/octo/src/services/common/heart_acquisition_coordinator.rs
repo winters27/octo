@@ -223,6 +223,9 @@ pub const KEPT_BESIDE_OWNED: &str = "You already had a copy; Octo kept the versi
 /// The downloads line of a play over a library copy: nothing is downloaded.
 pub const PLAY_OVER_OWNED: &str =
     "You already have this song; Octo could not check it is the version you heard";
+/// The downloads line of a heart that waited for MusicBrainz, which gave up on its question, and
+/// ended with nothing.
+pub const MUSIC_BRAINZ_GAVE_UP: &str = "MusicBrainz could not answer for this song";
 
 /// How a heart's chain ended when no source brought a file its gates passed.
 struct ChainEnd<'a> {
@@ -2572,10 +2575,37 @@ impl HeartAcquisitionCoordinator {
             Box::new(move |ended| {
                 debug!("MusicBrainz {ended:?} the question {key} waited on");
                 if let Some(coordinator) = coordinator.upgrade() {
-                    coordinator.resume_held(&key);
+                    if ended == crate::services::fingerprint::music_brainz_client::ReAsked::GaveUp {
+                        coordinator.resume_after_gave_up(&key);
+                    } else {
+                        coordinator.resume_held(&key);
+                    }
                 }
             }),
         );
+    }
+
+    /// MusicBrainz gave up on the question a hold waited on: the hold runs again, and when the
+    /// heart ends with nothing (nothing landed, and nothing of the song is held any more) its row
+    /// says MusicBrainz could not answer for it.
+    fn resume_after_gave_up(self: &Arc<Self>, key: &str) {
+        let Some(record) = self.extras.holds.as_ref().and_then(|holds| holds.get(key)) else {
+            return;
+        };
+        let coordinator = Arc::clone(self);
+        let key = key.to_string();
+        tokio::spawn(async move {
+            coordinator.recheck_held(&key).await;
+            let song = track_base_key(&record.provider, &record.external_id);
+            let held = coordinator
+                .extras
+                .holds
+                .as_ref()
+                .is_some_and(|holds| !holds.records_for(&song).is_empty());
+            if !held && let Some(tracker) = coordinator.tracker() {
+                tracker.ended_with_nothing(&record.provider, &record.external_id, MUSIC_BRAINZ_GAVE_UP);
+            }
+        });
     }
 
     /// The download held instead of landing: the holders it holds for are filed under its wait

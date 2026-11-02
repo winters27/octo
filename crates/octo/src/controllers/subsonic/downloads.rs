@@ -143,7 +143,9 @@ pub async fn keep_acquisition_anyway(State(state): State<AppState>, req: Request
         });
     }
     let outcome = coordinator.keep_anyway(&key, &username);
-    if matches!(outcome, KeepAnyway::NotAHolder | KeepAnyway::NothingHeld)
+    // The admin is asked to name a person only for a row others hold; with nothing held, nothing
+    // waits to be kept.
+    if outcome == KeepAnyway::NotAHolder
         && named.is_empty()
         && super::extensions::is_caller_admin(&call, &username).await
     {
@@ -178,10 +180,12 @@ pub(super) fn mark_stop_waiting(state: &AppState, user: &str, row: &mut Acquisit
 }
 
 /// octoAcquisitions version 4: "Stop waiting for Lidarr" on a downloads row, by the key
-/// getAcquisitions lists. It ends every Lidarr follow a kept copy of the row's song waits for, so
-/// that copy lands now. Only someone whose heart kept that copy may ask (error 50 for anyone else);
-/// the admin asks for a holder by naming them with `user` (error 10 without one). A plain ok once
-/// asked; error 70 when no copy of the song waits for Lidarr.
+/// getAcquisitions lists. The copy of the row's song kept for the person lands now, and they leave
+/// the Lidarr follows it waited for; a follow anyone else's heart still waits on goes on. Only
+/// someone whose heart kept that copy may ask; the admin asks for a holder by naming them with
+/// `user` (error 10 without one, while a copy waits). A plain ok once asked; error 70 when nothing
+/// waits for Lidarr for that person and the row is theirs (or the caller is the admin), error 50
+/// for anyone the row is not listed for.
 pub async fn stop_waiting_for_lidarr(State(state): State<AppState>, req: Request) -> AppResult {
     let call = match SubsonicCall::read(&state, req).await {
         Ok(call) => call,
@@ -212,8 +216,8 @@ pub async fn stop_waiting_for_lidarr(State(state): State<AppState>, req: Request
             .iter()
             .any(|waiter| dotnet::eq_ignore_case(waiter, user.trim()))
     };
-    let stop = || async {
-        match hearts.stop_waiting_for_lidarr(provider, external_id).await {
+    let stop = |user: String| async move {
+        match hearts.stop_waiting_for_lidarr(provider, external_id, &user).await {
             StopWaiting::Stopped => builder
                 .create_response(FORMAT, "stopWaitingForLidarr")
                 .into_response(),
@@ -229,15 +233,19 @@ pub async fn stop_waiting_for_lidarr(State(state): State<AppState>, req: Request
         if !waits_for(&named) {
             return Ok(refused(70, NOTHING_WAITS_FOR_LIDARR));
         }
-        return Ok(stop().await);
+        return Ok(stop(named).await);
     }
     if waits_for(&username) {
-        return Ok(stop().await);
+        return Ok(stop(username.trim().to_string()).await);
     }
-    if named.is_empty() && super::extensions::is_caller_admin(&call, &username).await {
+    let admin = super::extensions::is_caller_admin(&call, &username).await;
+    if named.is_empty() && admin && !waiters.is_empty() {
         return Ok(refused(10, STOP_NAME_THE_PERSON));
     }
-    if waiters.is_empty() {
+    // Someone the row is theirs (they hearted the song) with nothing waiting for them, and the
+    // admin, are told nothing waits; anyone else may not ask.
+    let listed_for_them = state.acquisition_tracker.detail(&key, Some(&username)).is_some();
+    if admin || listed_for_them {
         return Ok(refused(70, NOTHING_WAITS_FOR_LIDARR));
     }
     Ok(refused(50, STOP_NOT_YOURS))

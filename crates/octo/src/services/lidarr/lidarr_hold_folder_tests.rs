@@ -464,12 +464,15 @@ async fn a_hearted_songs_file_that_waits_for_acoust_id_holds_the_heart_with_it()
 
 /// The heart kept the heard audio while Octo's download still moved (Lidarr last, its timeout
 /// passed), and the copy waits for the follow. The song's late import passes Alice's gate: the kept
-/// copy is dropped for it, never placed, and Alice ends with the proven file alone.
+/// copy is dropped for it, never placed, and Alice ends with the proven file alone. The judging
+/// takes longer than the follow takes to see every download accounted for, and the follow still
+/// lets go of nothing before it is done.
 #[tokio::test]
 async fn a_kept_copy_gives_way_to_the_songs_proven_lidarr_import() {
     let f = Fixture::new().await;
     f.lidarr
         .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    f.slow.lock().insert("Teardrop".into());
     let service = f.service(None, 1);
     assert!(!gated_heart(&f, &service, "alice", true).await.expect("the task"));
     watching(&f, "dl-1").await;
@@ -478,7 +481,7 @@ async fn a_kept_copy_gives_way_to_the_songs_proven_lidarr_import() {
     f.lidarr.complete("dl-1");
     f.lidarr.refresh();
 
-    until(|| f.taken.lock().len() == 1).await;
+    until(|| !f.dropped.lock().is_empty() || !f.placed.lock().is_empty()).await;
     over(&f).await;
     assert_eq!(f.taken(), ["Teardrop"]);
     assert_eq!(*f.dropped.lock(), [(held.clone(), vec!["alice".to_string()])]);

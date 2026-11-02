@@ -63,15 +63,16 @@ impl ILidarrHeartAcquisitionService for Waits {
         Ok(false)
     }
 
-    async fn stop_waiting_for_lidarr(&self, provider: &str, external_id: &str) -> StopWaiting {
+    async fn stop_waiting_for_lidarr(&self, provider: &str, external_id: &str, user: &str) -> StopWaiting {
         self.stopped
             .lock()
-            .push((provider.to_string(), external_id.to_string()));
+            .push((format!("{provider}:{external_id}"), user.to_string()));
         let mut waiting = self.waiting.lock();
-        if waiting.is_empty() {
+        let before = waiting.len();
+        waiting.retain(|waiter| !waiter.eq_ignore_ascii_case(user));
+        if waiting.len() == before {
             return StopWaiting::NothingWaits;
         }
-        waiting.clear();
         StopWaiting::Stopped
     }
 
@@ -180,6 +181,29 @@ impl Dashboard {
             .json()
     }
 
+    /// Record who asked, switched as the settings page saves it.
+    fn record_who_asked(&self, on: bool) {
+        let mut settings = (*self.state.settings.current()).clone();
+        settings.subsonic.record_requested_by = on;
+        self.state.settings.set(settings);
+    }
+}
+
+/// The labels a holder menu shows, in order.
+fn labels(menu: &Value) -> Vec<String> {
+    menu.as_array()
+        .expect("a menu")
+        .iter()
+        .map(|person| person["label"].as_str().expect("a label").to_string())
+        .collect()
+}
+
+/// The token of the `index`th person of a holder menu.
+fn token_of(menu: &Value, index: usize) -> String {
+    menu[index]["token"].as_str().expect("a token").to_string()
+}
+
+impl Dashboard {
     /// The song "help" held while AcoustID is off for alice and bob, who each heard a video of it.
     fn hold_song(&self) -> HeldAcquisition {
         let heard = |video: &str| HeardRecord {
@@ -312,13 +336,17 @@ async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_nam
         "the list names nobody while Record who asked is off"
     );
 
+    // Record who asked is off: the menu names nobody, each person a numbered listener with a token.
+    let menu = dash.holders("soulseek:help").await;
+    assert_eq!(menu["key"], "soulseek:help");
+    assert_eq!(labels(&menu["keepers"]), ["Listener 1", "Listener 2"]);
+    assert_eq!(menu["stopWaiters"], json!([]));
+    let text = menu.to_string();
+    assert!(!text.contains("alice") && !text.contains("bob"), "{text}");
+    assert_ne!(token_of(&menu["keepers"], 0), token_of(&menu["keepers"], 1));
     assert_eq!(
-        dash.holders("soulseek:help").await,
-        json!({ "key": "soulseek:help", "keepers": ["alice", "bob"], "stopWaiters": [] })
-    );
-    assert_eq!(
-        dash.holders("soulseek:help-album").await["keepers"],
-        json!(["alice"])
+        labels(&dash.holders("soulseek:help-album").await["keepers"]),
+        ["Listener 1"]
     );
 
     let board = &dash;
@@ -333,8 +361,13 @@ async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_nam
     let stranger = keep(json!({ "key": "soulseek:help", "user": "carol" })).await;
     assert_eq!(stranger.status, StatusCode::CONFLICT);
     assert_eq!(stranger.json()["error"], NOTHING_WAITING);
+    // A token is good for its own row only.
+    let elsewhere =
+        keep(json!({ "key": "soulseek:help-album", "token": token_of(&menu["keepers"], 1) })).await;
+    assert_eq!(elsewhere.status, StatusCode::CONFLICT);
+    assert_eq!(elsewhere.json()["error"], NOTHING_WAITING);
 
-    let kept = keep(json!({ "key": "soulseek:help", "user": " bob " })).await;
+    let kept = keep(json!({ "key": "soulseek:help", "token": token_of(&menu["keepers"], 1) })).await;
     assert_eq!(kept.status, StatusCode::OK, "{}", kept.text());
     assert_eq!(kept.json(), json!({ "status": "ok" }));
     let saved = dash
@@ -343,9 +376,16 @@ async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_nam
         .get(&song.key())
         .expect("held while it is carried out");
     assert_eq!(saved.keep_requested, ["bob"], "saved before the answer");
-    assert_eq!(dash.holders("soulseek:help").await["keepers"], json!(["alice"]));
-    let again = keep(json!({ "key": "soulseek:help", "user": "bob" })).await;
+    assert_eq!(
+        labels(&dash.holders("soulseek:help").await["keepers"]),
+        ["Listener 1"]
+    );
+    let again = keep(json!({ "key": "soulseek:help", "user": " bob " })).await;
     assert_eq!(again.status, StatusCode::CONFLICT, "bob asked already");
+
+    // With Record who asked on, the menu names each person.
+    dash.record_who_asked(true);
+    assert_eq!(labels(&dash.holders("soulseek:help").await["keepers"]), ["alice"]);
 
     let album = keep(json!({ "key": "soulseek:help-album", "user": "alice" })).await;
     assert_eq!(album.status, StatusCode::OK, "{}", album.text());
@@ -396,10 +436,9 @@ async fn the_dashboard_stops_waiting_for_lidarr_for_the_person_it_names() {
     let rows = dash.rows().await;
     assert_eq!(rows["soulseek:teardrop"]["stopWaiting"], true);
     assert!(rows["soulseek:angel"].get("stopWaiting").is_none());
-    assert_eq!(
-        dash.holders("soulseek:teardrop").await,
-        json!({ "key": "soulseek:teardrop", "keepers": [], "stopWaiters": ["alice", "carol"] })
-    );
+    let menu = dash.holders("soulseek:teardrop").await;
+    assert_eq!(menu["keepers"], json!([]));
+    assert_eq!(labels(&menu["stopWaiters"]), ["Listener 1", "Listener 2"]);
 
     let board = &dash;
     let stop = |body: Value| async move {
@@ -415,13 +454,22 @@ async fn the_dashboard_stops_waiting_for_lidarr_for_the_person_it_names() {
     assert_eq!(bob.json()["error"], NOTHING_WAITS_FOR_LIDARR);
     assert!(dash.waits.stopped.lock().is_empty(), "nothing stopped for bob");
 
-    let stopped = stop(json!({ "key": "soulseek:teardrop", "user": "Alice" })).await;
+    let stopped =
+        stop(json!({ "key": "soulseek:teardrop", "token": token_of(&menu["stopWaiters"], 0) })).await;
     assert_eq!(stopped.status, StatusCode::OK, "{}", stopped.text());
     assert_eq!(stopped.json(), json!({ "status": "ok" }));
     assert_eq!(
         *dash.waits.stopped.lock(),
-        [("soulseek".to_string(), "teardrop".to_string())]
+        [("soulseek:teardrop".to_string(), "alice".to_string())],
+        "stopped for alice alone"
     );
+    assert_eq!(
+        dash.rows().await["soulseek:teardrop"]["stopWaiting"],
+        true,
+        "carol's copy still waits"
+    );
+    let carol = stop(json!({ "key": "soulseek:teardrop", "user": "carol" })).await;
+    assert_eq!(carol.status, StatusCode::OK, "{}", carol.text());
     assert!(
         dash.rows().await["soulseek:teardrop"]
             .get("stopWaiting")

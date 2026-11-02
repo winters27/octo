@@ -1035,6 +1035,36 @@ impl AcquisitionTracker {
         self.raise(ended);
     }
 
+    /// A heart that ended with nothing says `why` on its row: a row left looking for a source
+    /// fails with it, and a row that already failed says `why` instead of what it failed with. A
+    /// row with a file on its way, or one that landed, keeps its line.
+    pub fn ended_with_nothing(&self, provider: &str, external_id: &str, why: &str) {
+        if blank(provider) || blank(external_id) {
+            return;
+        }
+        let key = key_of(provider, external_id);
+        let looking = {
+            let now = self.now();
+            let mut state = self.state.lock();
+            let Some(entry) = state.entries.get_mut(&key) else {
+                return;
+            };
+            match entry.state {
+                AcquisitionState::Failed => {
+                    entry.error = Some(why.to_string());
+                    entry.updated_at = now;
+                    add(entry, now, acquisition_event_kinds::NOTE, why, None, None);
+                    false
+                }
+                AcquisitionState::Queued | AcquisitionState::Searching => !entry.finished(),
+                _ => false,
+            }
+        };
+        if looking {
+            self.fail(provider, external_id, Some(why));
+        }
+    }
+
     /// Fail every track of a hearted album that is still running.
     pub fn fail_album(&self, provider: &str, album_id: &str, error: Option<&str>) {
         let keys = {

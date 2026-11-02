@@ -328,9 +328,11 @@ async fn the_rows_carry_stop_waiting_only_for_someone_whose_kept_copy_waits_for_
     assert_eq!(detail["acquisition"]["stopWaiting"], true);
 }
 
-/// stopWaitingForLidarr: a missing key is error 10; bob, who kept nothing, gets 50, and so does
-/// bob naming alice; the admin who names nobody gets 10. Alice's own call answers a plain ok, the
-/// follow ends and her held copy lands; her row no longer offers it, and asking again answers 70.
+/// stopWaitingForLidarr: a missing key is error 10; bob, who hearted the song but kept nothing, is
+/// told nothing waits for him (70), and carol, whose row it is not, gets 50; bob naming alice gets
+/// 50; the admin who names nobody gets 10 while a copy waits, and 70 on a row where nothing does.
+/// Alice's own call answers a plain ok, the follow nobody else waits on ends and her held copy
+/// lands; her row no longer offers it, and asking again answers 70.
 #[tokio::test]
 async fn stop_waiting_for_lidarr_lands_the_held_copy_and_answers_10_50_and_70() {
     let t = WaitApp::new().await;
@@ -342,6 +344,11 @@ async fn stop_waiting_for_lidarr_lands_the_held_copy_and_answers_10_50_and_70() 
     );
     assert_eq!(
         error_of(&t.stop("bob", "key=soulseek:teardrop").await),
+        (70, NOTHING_WAITS_FOR_LIDARR.to_string()),
+        "bob hearted it: nothing waits for him"
+    );
+    assert_eq!(
+        error_of(&t.stop("carol", "key=soulseek:teardrop").await),
         (50, STOP_NOT_YOURS.to_string())
     );
     assert_eq!(
@@ -352,6 +359,11 @@ async fn stop_waiting_for_lidarr_lands_the_held_copy_and_answers_10_50_and_70() 
     assert_eq!(
         error_of(&t.stop("admin", "key=soulseek:teardrop").await),
         (10, STOP_NAME_THE_PERSON.to_string())
+    );
+    assert_eq!(
+        error_of(&t.stop("admin", "key=soulseek:angel").await),
+        (70, NOTHING_WAITS_FOR_LIDARR.to_string()),
+        "nothing waits there, so there is nobody to name"
     );
     assert!(t.pending.get("rg-mezzanine").expect("listed").following());
 
@@ -380,6 +392,90 @@ async fn stop_waiting_for_lidarr_lands_the_held_copy_and_answers_10_50_and_70() 
         error_of(&t.stop("bob", "key=soulseek:teardrop").await),
         (70, NOTHING_WAITS_FOR_LIDARR.to_string()),
         "nothing waits for anyone now"
+    );
+}
+
+/// One follow, two people waiting on it for two songs, each with a kept copy: alice's Stop waiting
+/// lands her copy alone and ends only her wait, so the follow goes on for bob, his copy still
+/// waiting; once bob stops too, nobody waits on the follow and it ends.
+#[tokio::test]
+async fn one_persons_stop_waiting_ends_only_their_wait_on_a_shared_follow() {
+    use crate::services::lidarr::SongGate;
+    use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeardReading, HeartGate};
+
+    let t = WaitApp::new().await;
+    let gate = |song: &str, user: &str| SongGate {
+        song: format!("soulseek:{song}"),
+        title: song.into(),
+        artist: "Massive Attack".into(),
+        gate: HeartGate {
+            user: user.into(),
+            origin: AcquisitionOrigin::Heart,
+            r: None,
+            heard: None,
+            heard_seconds: None,
+            reading: HeardReading::NotHeard,
+            stand_in: None,
+        },
+    };
+    t.pending.remember(PendingAlbum {
+        foreign_album_id: "rg-mezzanine".into(),
+        artist: "Massive Attack".into(),
+        title: "Mezzanine".into(),
+        search_command: 3,
+        songs: vec!["soulseek:teardrop".into(), "soulseek:angel".into()],
+        holders: vec!["alice".into(), "bob".into()],
+        gates: vec![gate("teardrop", "alice"), gate("angel", "bob")],
+        ..Default::default()
+    });
+    let kept = |song: &str, user: &str| {
+        let held_path = t.files.path().join(format!("held-{song}.m4a"));
+        std::fs::write(&held_path, format!("the version {user} heard")).expect("written");
+        let held = HeldPlacement {
+            song: format!("soulseek:{song}"),
+            held_path: held_path.to_string_lossy().into_owned(),
+            target: t
+                .files
+                .path()
+                .join(format!("Massive Attack/Mezzanine/{song}.m4a"))
+                .to_string_lossy()
+                .into_owned(),
+            kept: true,
+            follows: vec!["rg-mezzanine".into()],
+            users: vec![user.into()],
+        };
+        t.pending.hold_placement(held.clone());
+        t.state.acquisition_tracker.begin(
+            "soulseek",
+            song,
+            None,
+            Some(user),
+            Some("Massive Attack"),
+            Some(song),
+            Some("Mezzanine"),
+        );
+        held
+    };
+    let alices = kept("teardrop", "alice");
+    let bobs = kept("angel", "bob");
+
+    let ok = t.stop("alice", "key=soulseek:teardrop").await;
+    assert_eq!(ok["status"], "ok", "{ok}");
+    until(|| t.placer.placed.lock().len() == 1).await;
+    assert!(Path::new(&alices.target).is_file(), "alice's copy landed");
+    let entry = t.pending.get("rg-mezzanine").expect("listed");
+    assert!(entry.following(), "bob still waits on the follow");
+    assert_eq!(entry.holders, ["bob"]);
+    assert!(entry.gates_of("soulseek:teardrop").is_empty());
+    assert!(Path::new(&bobs.held_path).is_file(), "bob's copy still waits");
+    assert_eq!(t.rows("bob").await["soulseek:angel"]["stopWaiting"], true);
+
+    let ok = t.stop("bob", "key=soulseek:angel").await;
+    assert_eq!(ok["status"], "ok", "{ok}");
+    until(|| t.placer.placed.lock().len() == 2).await;
+    assert!(
+        !t.pending.get("rg-mezzanine").expect("listed").following(),
+        "nobody waits on it any more"
     );
 }
 

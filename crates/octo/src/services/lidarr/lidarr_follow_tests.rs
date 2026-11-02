@@ -953,13 +953,14 @@ async fn stop_waiting_for_lidarr_ends_the_follow_and_places_the_kept_copy() {
     assert_eq!(service.stop_waiters(&provider, &id), ["alice"]);
 
     assert_eq!(
-        service.stop_waiting_for_lidarr(&provider, &id).await,
+        service.stop_waiting_for_lidarr(&provider, &id, "alice").await,
         StopWaiting::Stopped
     );
 
     until(|| f.placed.lock().len() == 1).await;
     assert!(Path::new(&held.target).is_file());
-    assert!(removed(&f, 1));
+    // Nobody else waits on the follow, so it ends and removes Octo's download.
+    until(|| removed(&f, 1)).await;
     assert!(!service.waits_for_lidarr(&provider, &id));
     assert!(service.stop_waiters(&provider, &id).is_empty());
     assert_ne!(
@@ -968,7 +969,7 @@ async fn stop_waiting_for_lidarr_ends_the_follow_and_places_the_kept_copy() {
         "the row no longer says it waits"
     );
     assert_eq!(
-        service.stop_waiting_for_lidarr(&provider, &id).await,
+        service.stop_waiting_for_lidarr(&provider, &id, "alice").await,
         StopWaiting::NothingWaits
     );
     over(&f).await;
@@ -1035,7 +1036,7 @@ async fn stop_waiting_places_the_kept_copy_even_while_lidarr_does_not_answer() {
     f.lidarr.set_down(true);
 
     assert_eq!(
-        service.stop_waiting_for_lidarr(&provider, &id).await,
+        service.stop_waiting_for_lidarr(&provider, &id, "alice").await,
         StopWaiting::Stopped
     );
 
@@ -1450,4 +1451,667 @@ async fn a_busy_walk_with_lidarr_last_leaves_what_the_heart_waits_on() {
     );
     assert_eq!(service.waits_on("soulseek", &id), None);
     assert_eq!(f.lidarr.searches(), 0);
+}
+
+// ---- Ownership bounded by each grab's own span and Lidarr's own clock ---------------------------
+
+/// Mezzanine as a saved entry of Octo's on the album the user's Lidarr holds (Lidarr's ids 7 and
+/// 5), searched.
+fn mezzanine_entry() -> PendingAlbum {
+    PendingAlbum {
+        foreign_album_id: ALBUM_ID.into(),
+        lidarr_album_id: 7,
+        lidarr_artist_id: 5,
+        foreign_artist_id: ARTIST_ID.into(),
+        artist: "Massive Attack".into(),
+        title: "Mezzanine".into(),
+        search_command: 3,
+        ..Default::default()
+    }
+}
+
+async fn put_back(f: &Fixture, entry: &PendingAlbum) {
+    let service = f.service(None, 30);
+    crate::services::lidarr::lidarr_pick::put_back_searched(
+        &f.client(),
+        Some(f.pending.as_ref()),
+        &service.artist_music(),
+        entry,
+        Duration::from_millis(20),
+    )
+    .await
+    .expect("put back");
+}
+
+/// A torrent keeps its hash, so a download id is not unique over time: the user grabbing again a
+/// release Octo was done with brings a download of the same id. Its files are the user's, and
+/// Octo's put back never deletes them.
+#[tokio::test]
+async fn a_put_back_never_deletes_the_files_of_a_later_grab_of_octos_download_id() {
+    let f = Fixture::new().await;
+    f.lidarr.user_album(ALBUM_ID, false);
+    let client = f.client();
+    let before = client.now().await.expect("Lidarr's time") - TimeDelta::hours(2);
+    let mut entry = mezzanine_entry();
+    entry.searched_at = Some(before);
+    entry.record_grab_at("dl-1", Some("qBittorrent"), Some(before));
+    entry
+        .grab_mut("dl-1")
+        .expect("recorded")
+        .account(before + TimeDelta::minutes(10));
+    f.pending.remember(entry.clone());
+    f.lidarr.user_grab(
+        7,
+        Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]).finished(),
+        "InteractiveSearch",
+    );
+    assert_eq!(client.artist_track_files(5).await.expect("read").len(), 1);
+
+    put_back(&f, &entry).await;
+
+    assert!(f.lidarr.deleted().is_empty(), "the user's file stays");
+    assert_eq!(client.artist_track_files(5).await.expect("read").len(), 1);
+    assert!(f.pending.get(ALBUM_ID).is_none());
+}
+
+/// A pick of Octo's that is over left its download id known as Octo's for the span of that grab.
+/// The user later grabs the same release again, keeping its id, while another pick of Octo's on the
+/// artist is open: that grab is the user's, so Octo steps aside before its own import could replace
+/// the user's files, and never takes the user's import.
+#[tokio::test]
+async fn a_users_grab_of_a_download_id_octo_was_done_with_makes_octo_step_aside() {
+    let f = Fixture::new().await;
+    let earlier = f.client().now().await.expect("Lidarr's time") - TimeDelta::hours(2);
+    let mut over_now = PendingAlbum {
+        foreign_album_id: "rg-earlier".into(),
+        ..Default::default()
+    };
+    over_now.record_grab_at("dl-1", Some("qBittorrent"), Some(earlier));
+    over_now
+        .grab_mut("dl-1")
+        .expect("recorded")
+        .account(earlier + TimeDelta::minutes(10));
+    f.pending.remember(over_now);
+    f.pending.forget("rg-earlier");
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-2", &[(3, "Teardrop", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!f.heart_teardrop(&service).await);
+    followed(&f, "dl-2").await;
+
+    f.lidarr.user_grab(
+        7,
+        Grab::of("dl-1", &[(1, "Angel", "FLAC")]).finished(),
+        "InteractiveSearch",
+    );
+
+    until(|| f.pending.get(ALBUM_ID).is_none_or(|entry| entry.ended.is_some())).await;
+    over(&f).await;
+    assert!(removed(&f, 1), "Octo's own item is removed");
+    assert!(
+        !f.taken().contains(&"Angel".to_string()),
+        "the user's import is never Octo's"
+    );
+    assert!(f.lidarr.deleted().is_empty(), "the user's file stays");
+}
+
+/// One open pick's put back never deletes what another open pick of Octo's imported on the same
+/// artist.
+#[tokio::test]
+async fn a_put_back_never_deletes_another_open_picks_imports_of_the_artist() {
+    let f = Fixture::new().await;
+    f.lidarr.user_album(ALBUM_ID, false);
+    f.lidarr.catalog_album(CatalogAlbum::new(
+        "rg-protection",
+        "Protection",
+        ARTIST_ID,
+        8,
+        &[(80, "Protection", 1)],
+    ));
+    f.lidarr.user_album("rg-protection", false);
+    let mut other = PendingAlbum {
+        foreign_album_id: "rg-protection".into(),
+        lidarr_album_id: 8,
+        lidarr_artist_id: 5,
+        foreign_artist_id: ARTIST_ID.into(),
+        search_command: 9,
+        ..Default::default()
+    };
+    other.record_grab("dl-2", Some("qBittorrent"));
+    f.pending.remember(other);
+    f.lidarr.user_grab(
+        8,
+        Grab::of("dl-2", &[(80, "Protection", "FLAC")])
+            .into_album(8)
+            .finished(),
+        "Search",
+    );
+    let client = f.client();
+    assert_eq!(client.artist_track_files(5).await.expect("read").len(), 1);
+    let mezzanine = mezzanine_entry();
+    f.pending.remember(mezzanine.clone());
+
+    put_back(&f, &mezzanine).await;
+
+    assert!(
+        f.lidarr.deleted().is_empty(),
+        "Protection's file is the other pick's"
+    );
+    assert_eq!(client.artist_track_files(5).await.expect("read").len(), 1);
+    assert!(f.pending.get("rg-protection").is_some());
+}
+
+/// The user grabs the album while Lidarr holds a release of Octo's search back: Lidarr clears what
+/// it held back, and the user's grab, even of the same release, is never Octo's.
+#[tokio::test]
+async fn a_users_grab_while_lidarr_holds_a_release_back_is_never_octos() {
+    let f = Fixture::new().await;
+    f.lidarr.plan_held_back(7, "delay");
+    let service = f.service(None, 30);
+    let heart = heart_later(&f, &service);
+    until(|| {
+        f.pending
+            .get(ALBUM_ID)
+            .is_some_and(|entry| !entry.pending_items.is_empty())
+    })
+    .await;
+    let queue_id = entry(&f).pending_items[0].queue_id;
+
+    f.lidarr.take_pending(
+        queue_id,
+        Grab::of("user-1", &[(3, "Teardrop", "FLAC")]).finished(),
+        "InteractiveSearch",
+    );
+
+    assert!(!heart.await.expect("the task"));
+    over(&f).await;
+    assert!(f.taken().is_empty(), "the user's grab is never taken");
+}
+
+/// Lidarr's clock runs an hour behind Octo's: the release it held back and grabbed later is still
+/// known as Octo's by Lidarr's own times.
+#[tokio::test]
+async fn a_held_back_release_becomes_octos_grab_by_lidarrs_own_clock() {
+    let f = Fixture::new().await;
+    f.lidarr.set_clock_skew(-TimeDelta::hours(1));
+    f.lidarr.plan_held_back(7, "delay");
+    let service = f.service(None, 30);
+    let heart = heart_later(&f, &service);
+    until(|| {
+        f.pending
+            .get(ALBUM_ID)
+            .is_some_and(|entry| !entry.pending_items.is_empty())
+    })
+    .await;
+    let queue_id = entry(&f).pending_items[0].queue_id;
+
+    f.lidarr
+        .grab_pending(queue_id, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]).finished());
+
+    assert!(heart.await.expect("the task"));
+    assert_eq!(f.taken(), ["Teardrop"]);
+}
+
+/// A release picked in Find songs is Octo's by its guid alone, whatever Lidarr's clock says next
+/// to Octo's.
+#[tokio::test]
+async fn a_picked_release_is_octos_by_its_guid_whatever_lidarrs_clock_says() {
+    let f = Fixture::new().await;
+    f.lidarr.set_clock_skew(-TimeDelta::hours(1));
+    f.lidarr.user_album(ALBUM_ID, false);
+    f.lidarr
+        .offer("guid-picked", 1, "Massive Attack - Mezzanine", 300_000_000);
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]).finished());
+    let service = f.service(None, 30);
+    let client = f.client();
+    let pending_at = client.now().await.expect("Lidarr's time");
+    let guid = client
+        .grab_picked(
+            7,
+            &octo_core::lidarr::LidarrReleasePick {
+                guid: "guid-picked".into(),
+                indexer_id: 1,
+                title: Some("Massive Attack - Mezzanine".into()),
+                size: Some(300_000_000),
+            },
+        )
+        .await
+        .expect("grabbed");
+    f.pending.remember(PendingAlbum {
+        search_command: 0,
+        searched_at: Some(Utc::now()),
+        search_pending: Some(pending_at),
+        picked_guid: Some(guid),
+        holders: vec!["alice".into()],
+        ..mezzanine_entry()
+    });
+
+    service.put_back_after_restart().await;
+
+    until(|| f.taken.lock().len() == 1).await;
+    assert_eq!(f.taken(), ["Teardrop"]);
+    over(&f).await;
+}
+
+/// A restart after Octo's search went out, before Lidarr's answer to it was saved: the pick is
+/// followed, never put back as unsearched, and its grab is Octo's.
+#[tokio::test]
+async fn a_restart_after_the_search_went_out_before_its_answer_was_saved_keeps_the_grab_octos() {
+    let f = Fixture::new().await;
+    f.lidarr.user_album(ALBUM_ID, false);
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]).finished());
+    let service = f.service(None, 30);
+    let client = f.client();
+    f.pending.remember(PendingAlbum {
+        search_command: 0,
+        search_pending: Some(client.now().await.expect("Lidarr's time")),
+        holders: vec!["alice".into()],
+        ..mezzanine_entry()
+    });
+    client.album_search(7).await.expect("searched");
+
+    service.put_back_after_restart().await;
+
+    until(|| f.taken.lock().len() == 1).await;
+    assert_eq!(f.taken(), ["Teardrop"]);
+    over(&f).await;
+}
+
+/// The same for a release picked in Find songs: its guid was saved before the grab went out.
+#[tokio::test]
+async fn a_restart_after_a_picked_grab_went_out_before_its_answer_was_saved_keeps_it_octos() {
+    let f = Fixture::new().await;
+    f.lidarr.user_album(ALBUM_ID, false);
+    f.lidarr
+        .offer("guid-picked", 1, "Massive Attack - Mezzanine", 300_000_000);
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]).finished());
+    let service = f.service(None, 30);
+    let client = f.client();
+    let pick = octo_core::lidarr::LidarrReleasePick {
+        guid: "guid-picked".into(),
+        indexer_id: 1,
+        title: Some("Massive Attack - Mezzanine".into()),
+        size: Some(300_000_000),
+    };
+    f.pending.remember(PendingAlbum {
+        search_command: 0,
+        search_pending: Some(client.now().await.expect("Lidarr's time")),
+        picked_guid: Some(pick.guid.clone()),
+        holders: vec!["alice".into()],
+        ..mezzanine_entry()
+    });
+    client.grab_release(&pick).await.expect("grabbed");
+
+    service.put_back_after_restart().await;
+
+    until(|| f.taken.lock().len() == 1).await;
+    assert_eq!(f.taken(), ["Teardrop"]);
+    over(&f).await;
+}
+
+/// Taking the last heart back while Octo's download is still listed keeps that download watched:
+/// its removal, which Lidarr failed, is asked again until it goes through, and only then is the
+/// pick over. Nothing of Octo's is left in Lidarr's queue.
+#[tokio::test]
+async fn unhearting_keeps_a_listed_download_watched_until_its_removal_goes_through() {
+    let f = Fixture::new().await;
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!f.heart_teardrop(&service).await);
+    followed(&f, "dl-1").await;
+    f.lidarr.fail_next("DELETE", "queue", 2);
+    let (provider, id) = teardrop(&f);
+
+    service.unhearted(&provider, &id, "alice");
+
+    over(&f).await;
+    let queue = f.client().queue().await.expect("read");
+    assert!(
+        queue
+            .iter()
+            .all(|item| item.download_id.as_deref() != Some("dl-1")),
+        "Octo's download is gone from Lidarr's queue"
+    );
+}
+
+/// Lidarr's import of Octo's download switched the album to the release it matched: the choice is
+/// still Octo's pin with only its release moved, so the put back gives the saved choice back.
+#[tokio::test]
+async fn the_release_choice_comes_back_after_lidarrs_import_switched_the_release() {
+    use octo_core::lidarr::lidarr_client::{LidarrReleaseChoice, LidarrReleaseMonitored};
+
+    let f = Fixture::new().await;
+    f.lidarr.user_album(ALBUM_ID, false);
+    let choice = |any: bool, releases: &[(i32, bool)]| LidarrReleaseChoice {
+        any_release_ok: any,
+        releases: releases
+            .iter()
+            .map(|(id, monitored)| LidarrReleaseMonitored {
+                id: *id,
+                monitored: *monitored,
+            })
+            .collect(),
+    };
+    let saved = choice(true, &[(70, true), (71, true)]);
+    f.lidarr.set_releases(7, &[(70, false), (71, true)], false);
+    let entry = PendingAlbum {
+        release_choice: Some(saved.clone()),
+        pin: Some(choice(false, &[(70, true), (71, false)])),
+        imported_releases: vec![71],
+        ..mezzanine_entry()
+    };
+    f.pending.remember(entry.clone());
+
+    put_back(&f, &entry).await;
+
+    let album = f.client().album(7).await.expect("read").expect("the album");
+    assert_eq!(album.release_choice(), saved);
+}
+
+/// Whether a release choice is still Octo's pin: exactly the pin, or the pin with only its release
+/// moved to one Octo's import switched it to; any other change is the user's.
+#[test]
+fn a_choice_is_octos_pin_only_with_nothing_but_its_release_moved_by_octos_import() {
+    use octo_core::lidarr::lidarr_client::{LidarrReleaseChoice, LidarrReleaseMonitored};
+
+    use crate::services::lidarr::lidarr_pick::still_octos_pin;
+
+    let choice = |any: bool, releases: &[(i32, bool)]| LidarrReleaseChoice {
+        any_release_ok: any,
+        releases: releases
+            .iter()
+            .map(|(id, monitored)| LidarrReleaseMonitored {
+                id: *id,
+                monitored: *monitored,
+            })
+            .collect(),
+    };
+    let pin = choice(false, &[(70, true), (71, false), (72, false)]);
+    assert!(still_octos_pin(&pin, &pin, &[]));
+    let switched = choice(false, &[(70, false), (71, true), (72, false)]);
+    assert!(still_octos_pin(&switched, &pin, &[71]));
+    assert!(
+        !still_octos_pin(&switched, &pin, &[72]),
+        "not a release Octo's import brought"
+    );
+    assert!(!still_octos_pin(
+        &choice(true, &[(70, false), (71, true), (72, false)]),
+        &pin,
+        &[71]
+    ));
+    assert!(!still_octos_pin(
+        &choice(false, &[(70, true), (71, true), (72, false)]),
+        &pin,
+        &[71]
+    ));
+}
+
+/// A pick whose import landed gives back what Octo's add created as well as the release choice:
+/// the album and the artist Octo added go from Lidarr, the files Octo moved out stay Octo's.
+#[tokio::test]
+async fn a_landed_pick_also_removes_the_album_and_artist_octos_add_created() {
+    let f = Fixture::new().await;
+    f.grabs_at_once("dl-1", &[(3, "Teardrop", "FLAC")]);
+    let service = f.service(None, 30);
+
+    assert!(f.heart_teardrop(&service).await);
+
+    over(&f).await;
+    assert_eq!(f.taken(), ["Teardrop"]);
+    assert!(album_deleted(&f));
+    assert!(
+        f.changes()
+            .iter()
+            .any(|change| change.starts_with("DELETE /api/v1/artist/5?"))
+    );
+}
+
+/// A put back Lidarr fails is tried again until it is done, not left for the next start.
+#[tokio::test]
+async fn a_put_back_lidarr_failed_is_tried_again_until_it_is_done() {
+    let f = Fixture::new().await;
+    let service = f.service(None, 30);
+    f.lidarr.fail_next("DELETE", "album", 1);
+
+    assert!(!f.heart_teardrop(&service).await, "the search grabbed nothing");
+
+    over(&f).await;
+    let deletes = f
+        .changes()
+        .iter()
+        .filter(|change| change.starts_with("DELETE /api/v1/album/"))
+        .count();
+    assert_eq!(deletes, 2, "failed once, then done");
+}
+
+/// The album and artist a put back would remove are read first: under the ids the entry saved,
+/// Lidarr now has an album and an artist that are not the entry's (another Lidarr), and nothing of
+/// them is changed. The entry is let go.
+#[tokio::test]
+async fn a_put_back_changes_nothing_that_is_not_the_entrys_own() {
+    let f = Fixture::new().await;
+    f.lidarr.user_album(ALBUM_ID, false);
+    let album = f.client().album(7).await.expect("read").expect("the album");
+    let entry = PendingAlbum {
+        foreign_album_id: "rg-of-another-lidarr".into(),
+        foreign_artist_id: "artist-of-another-lidarr".into(),
+        album_added: true,
+        artist_added: 5,
+        release_choice: Some(album.release_choice()),
+        pin: Some(album.release_choice()),
+        ..mezzanine_entry()
+    };
+    f.pending.remember(entry.clone());
+
+    put_back(&f, &entry).await;
+
+    assert!(!album_deleted(&f));
+    assert!(!f.changes().iter().any(
+        |change| change.starts_with("DELETE /api/v1/artist/") || change.starts_with("PUT /api/v1/album/")
+    ));
+    assert!(f.pending.get("rg-of-another-lidarr").is_none());
+}
+
+/// Lidarr taken out of Octo's settings mid-follow: the kept copy waiting for that follow is placed,
+/// since nobody's copy waits on a Lidarr Octo no longer has.
+#[tokio::test]
+async fn clearing_lidarr_in_the_settings_lets_the_held_copies_go() {
+    let f = Fixture::new().await;
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!f.heart_teardrop(&service).await);
+    followed(&f, "dl-1").await;
+    let held = hold_kept_copy(&f);
+    let settings = f.settings();
+    let mut cleared = (*settings.current()).clone();
+    cleared.lidarr.base_url = None;
+
+    settings.set(cleared);
+
+    until(|| f.placed.lock().len() == 1).await;
+    assert!(Path::new(&held.target).is_file());
+    service.stop_following();
+}
+
+/// Another Lidarr set in Octo's settings mid-follow: the follow ends without touching either one
+/// (the old Lidarr is no longer Octo's, and the ids name nothing of the new one), the kept copy is
+/// placed, and the entry is let go.
+#[tokio::test]
+async fn another_lidarr_set_mid_follow_ends_the_follow_and_touches_nothing() {
+    let f = Fixture::new().await;
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!f.heart_teardrop(&service).await);
+    followed(&f, "dl-1").await;
+    let held = hold_kept_copy(&f);
+    let changes_before = f.changes().len();
+    let settings = f.settings();
+    let mut swapped = (*settings.current()).clone();
+    swapped.lidarr.base_url = Some("http://127.0.0.1:1".into());
+
+    settings.set(swapped);
+
+    until(|| f.placed.lock().len() == 1).await;
+    assert!(Path::new(&held.target).is_file());
+    until(|| f.pending.get(ALBUM_ID).is_none()).await;
+    assert_eq!(
+        f.changes().len(),
+        changes_before,
+        "nothing more was asked of the old Lidarr"
+    );
+}
+
+/// A record Lidarr kept is read again before it is deleted: one that names another file now is
+/// left alone and let go; one that still names the moved file, with nothing there, is deleted.
+#[tokio::test]
+async fn a_kept_record_is_deleted_only_while_it_names_the_file_octo_moved() {
+    use crate::services::lidarr::MovedRecord;
+    use crate::services::lidarr::lidarr_pick::retry_moved_records;
+
+    let f = Fixture::new().await;
+    f.lidarr.user_album(ALBUM_ID, false);
+    f.lidarr.user_grab(
+        7,
+        Grab::of("user-1", &[(3, "Teardrop", "FLAC")]).finished(),
+        "InteractiveSearch",
+    );
+    let client = f.client();
+    let file = client.artist_track_files(5).await.expect("read")[0].clone();
+    let service = f.service(None, 30);
+    let music = service.artist_music();
+    let local = music
+        .local(file.path.as_deref().expect("a path"))
+        .expect("Octo reaches it");
+    f.pending.remember(PendingAlbum {
+        records_to_delete: vec![MovedRecord {
+            id: file.id,
+            path: Some(
+                f.root
+                    .path()
+                    .join("Massive Attack/Mezzanine/elsewhere.flac")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        }],
+        ..mezzanine_entry()
+    });
+
+    retry_moved_records(&client, &f.pending, &music, ALBUM_ID).await;
+
+    assert!(f.lidarr.deleted().is_empty(), "the record names another file now");
+    assert!(entry(&f).records_to_delete.is_empty());
+
+    std::fs::remove_file(&local).expect("moved away");
+    f.pending.update(ALBUM_ID, |entry| {
+        entry.records_to_delete = vec![MovedRecord {
+            id: file.id,
+            path: Some(local.to_string_lossy().into_owned()),
+        }];
+    });
+
+    retry_moved_records(&client, &f.pending, &music, ALBUM_ID).await;
+
+    assert_eq!(f.lidarr.deleted(), [file.id]);
+    assert!(entry(&f).records_to_delete.is_empty());
+}
+
+/// A kept copy that could not be placed when its follow ended stays on the list, waiting for no
+/// follow, and is placed at the next start.
+#[tokio::test]
+async fn a_held_copy_that_could_not_be_placed_is_placed_at_the_next_start() {
+    let f = Fixture::new().await;
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!f.heart_teardrop(&service).await);
+    followed(&f, "dl-1").await;
+    let held = hold_kept_copy(&f);
+    // A file lies where the copy's folder goes, so placing it fails.
+    let folder = Path::new(&held.target).parent().expect("a folder").to_path_buf();
+    std::fs::create_dir_all(folder.parent().expect("its parent")).expect("made");
+    std::fs::write(&folder, b"in the way").expect("written");
+    let (provider, id) = teardrop(&f);
+
+    assert_eq!(
+        service.stop_waiting_for_lidarr(&provider, &id, "alice").await,
+        StopWaiting::Stopped
+    );
+    until(|| {
+        f.pending
+            .held()
+            .iter()
+            .any(|known| known.held_path == held.held_path && known.follows.is_empty())
+    })
+    .await;
+    assert!(f.placed.lock().is_empty());
+    over(&f).await;
+    std::fs::remove_file(&folder).expect("cleared");
+
+    service.put_back_after_restart().await;
+
+    until(|| f.placed.lock().len() == 1).await;
+    assert!(Path::new(&held.target).is_file());
+    assert!(f.pending.held().is_empty());
+}
+
+/// A fresh pick of an album waits for the restart's put back of the pick a restart cut short on
+/// it: the album Octo's earlier add created is deleted first, then added again for the fresh pick,
+/// never searched while it is being put back.
+#[tokio::test]
+async fn a_fresh_pick_waits_for_the_restarts_put_back_of_its_album() {
+    let f = Fixture::new().await;
+    f.lidarr.add_album(false);
+    f.pending.remember(PendingAlbum {
+        search_command: 0,
+        album_added: true,
+        ..mezzanine_entry()
+    });
+    f.grabs_at_once("dl-1", &[(3, "Teardrop", "FLAC")]);
+    f.lidarr.slow_next("GET", "album/7", Duration::from_millis(600));
+    let service = f.service(None, 30);
+
+    service.resume_after_restart();
+    assert!(f.heart_teardrop(&service).await);
+
+    let changes = f.changes();
+    let deleted = changes
+        .iter()
+        .position(|change| change.starts_with("DELETE /api/v1/album/7"))
+        .expect("the cut-short pick was put back");
+    let added = changes
+        .iter()
+        .position(|change| change == "POST /api/v1/album")
+        .expect("the fresh pick added the album again");
+    assert!(deleted < added, "{changes:?}");
+}
+
+/// Lidarr's settings asked of a release choice: one the user changed since Octo read the album is
+/// never written over.
+#[tokio::test]
+async fn a_release_choice_changed_since_octo_read_it_is_never_written_over() {
+    let f = Fixture::new().await;
+    f.lidarr.user_album(ALBUM_ID, false);
+    let client = f.client();
+    let album = client.album(7).await.expect("read").expect("the album");
+    let before = album.release_choice();
+    let pin = album.pinned_to(70).expect("a release");
+    f.lidarr.set_releases(7, &[(70, false), (71, true)], true);
+
+    let written = client
+        .set_release_choice_if(7, |now| now.release_choice() == before, &pin)
+        .await
+        .expect("asked");
+
+    assert!(written.is_none());
+    assert!(
+        !f.changes()
+            .iter()
+            .any(|change| change.starts_with("PUT /api/v1/album/7"))
+    );
 }

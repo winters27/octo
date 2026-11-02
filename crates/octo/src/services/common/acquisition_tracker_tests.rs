@@ -988,3 +988,30 @@ fn a_check_line_keeps_what_acoust_id_heard() {
         .expect("the plain line");
     assert_eq!(plain.heard, None);
 }
+
+/// A heart that ended with nothing says why: a row that already failed says it instead of what it
+/// failed with, a row left looking fails with it, and a row with a file on its way or landed keeps
+/// its line.
+#[test]
+fn a_heart_that_ended_with_nothing_says_why_on_its_row() {
+    let tracker = new_tracker();
+    let why = "MusicBrainz could not answer for this song";
+    for id in ["failed", "looking", "landing", "landed"] {
+        tracker.begin("soulseek", id, None, Some("alice"), None, Some(id), None);
+    }
+    tracker.fail("soulseek", "failed", Some("No source had it"));
+    tracker.stage("soulseek", "landing", AcquisitionState::Importing, None, None);
+    tracker.complete("soulseek", "landed", Some("nd-1"));
+
+    for id in ["failed", "looking", "landing", "landed"] {
+        tracker.ended_with_nothing("soulseek", id, why);
+    }
+
+    let row = |id: &str| tracker.detail(&key_of("soulseek", id), None).expect("the row");
+    assert_eq!(row("failed").error.as_deref(), Some(why));
+    assert_eq!(row("looking").state, AcquisitionState::Failed);
+    assert_eq!(row("looking").error.as_deref(), Some(why));
+    assert_eq!(row("landing").state, AcquisitionState::Importing);
+    assert_eq!(row("landed").state, AcquisitionState::Done);
+    assert_ne!(row("landed").error.as_deref(), Some(why));
+}

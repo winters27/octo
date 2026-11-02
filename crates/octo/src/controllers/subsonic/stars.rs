@@ -785,10 +785,13 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
         }
     }
     // Hearted albums with held tracks: the caller leaves each, and a held track nobody is left in
-    // is deleted.
+    // is deleted. An album comes under albumId, though some clients send it as id.
+    let is_album = |key: &str, id: &str| {
+        key == "albumId" || (key == "id" && routing_kind(&state, id) == Some(RoutingKind::Album))
+    };
     let album_holds: Vec<(String, String)> = outside
         .iter()
-        .filter(|(key, _)| *key == "albumId")
+        .filter(|(key, id)| is_album(key, id))
         .map(|(_, id)| {
             let provider = state
                 .local_library
@@ -821,6 +824,41 @@ pub async fn unstar(State(state): State<AppState>, req: Request) -> axum::respon
                 state
                     .heart_acquisition_coordinator
                     .leave_album_holds(provider, album_id, &who);
+            }
+        }
+    }
+    // Every un-hearted outside song and album leaves the Lidarr follow its heart is on, held or
+    // not: a follow nobody's heart is on any more ends.
+    let followed: Vec<(String, String)> = outside
+        .iter()
+        .filter_map(|(key, id)| {
+            if is_album(key, id) {
+                let provider = state
+                    .local_library
+                    .parse_song_id(id)
+                    .1
+                    .unwrap_or_else(|| SoulseekMetadataService::PROVIDER_NAME.to_string());
+                return Some((provider, id.clone()));
+            }
+            if *key != "id" {
+                return None;
+            }
+            let (_, provider, external_id) = state.local_library.parse_song_id(id);
+            Some((provider?, external_id?))
+        })
+        .filter(|(provider, id)| state.lidarr_hearts.follows_heart(provider, id))
+        .collect();
+    if !followed.is_empty() {
+        if member.is_none() {
+            match refuse_unless_signed_in(&state, &call, &format).await {
+                Ok(None) => {}
+                Ok(Some(refused)) => return refused,
+                Err(error) => return error.into_response(),
+            }
+        }
+        if let Ok(who) = signed_in_user(&state, &call).await {
+            for (provider, id) in &followed {
+                state.lidarr_hearts.unhearted(provider, id, &who);
             }
         }
     }
