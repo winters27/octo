@@ -2095,6 +2095,10 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   .version-bar .health-actions { margin-left: 0; justify-content: flex-start; }
 }
 .health-foot { margin-top: var(--s-section); }
+/* The fetched-song lookup comes after the findings; its matches are a list card of their own
+ * under the search card, as on Fetched songs. */
+.health-fetched { margin-top: var(--s-section); }
+.health-fetched .dl-list { margin-top: var(--s-l); }
 /* A health run is one full-width row: the art, then what runs with its bar, then Stop. */
 .health-run-card { grid-column: 1 / -1; gap: var(--s-xl); padding: var(--s-l) var(--s-xl) var(--s-l) var(--s-l); }
 .health-run-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-s) var(--s-m); }

@@ -2628,6 +2628,22 @@
         </div>
 
         <p class="set-desc health-foot">Copies a fix removes wait in the server's trash, where they can be put back from <button type="button" class="link-button" id="health-trash-link">Recently removed</button> under Library actions.</p>
+
+        <div class="set-section health-fetched">
+          <div class="set-head">
+            <h3 class="set-title">How a song was fetched</h3>
+            <p class="set-desc">Look up a song Octo downloaded to see how it was tagged: the release that won, its distance, the candidates it beat, where each tag came from, and the download log.</p>
+          </div>
+          <div class="set-card">
+            <div class="set-row stack">
+              <form class="set-inline" id="health-fetched-form" role="search">
+                <input class="set-input" id="health-fetched-q" type="search" placeholder="Title, artist or both" aria-label="Fetched song to look up" autocomplete="off" spellcheck="false" />
+                <button class="btn" type="submit"><svg class="icon" aria-hidden="true"><use href="#i-magnifying-glass"/></svg><span>Look up</span></button>
+              </form>
+            </div>
+          </div>
+          <div id="health-fetched-results" class="dl-list" aria-live="polite" hidden></div>
+        </div>
       </section>
 
       <section data-pane="libraryactions">
