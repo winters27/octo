@@ -1071,6 +1071,7 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .status-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  align-items: start;
   gap: var(--s-l);
   margin-bottom: var(--s-xl);
 }
@@ -1115,7 +1116,7 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .status-card-foot { font-size: var(--t-label); color: var(--text-muted); margin-top: auto; }
 .status-grid { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
 /* Lidarr follows Octo cannot settle: a warning line each, with the admin's Put Lidarr back under it. */
-.status-card-follows { display: flex; flex-direction: column; gap: var(--s-l); }
+.status-card-follows { display: flex; flex-direction: column; gap: var(--s-2xl); }
 .status-card-follow { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s-s); }
 .status-card-follow-text {
   display: flex;
@@ -1986,7 +1987,7 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   box-shadow: var(--glass-rim), var(--glass-drop);
 }
 .acq-card {
-  display: flex; align-items: center; gap: var(--s-l);
+  display: flex; align-items: flex-start; gap: var(--s-l);
   padding: var(--s-l);
   border-radius: 16px;
   background: var(--nest);
@@ -2008,7 +2009,11 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .acq-head { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; min-width: 0; }
 .acq-head .dl-title { max-width: 100%; }
 .acq-card .dl-sub { margin-top: 6px; line-height: 1.45; overflow-wrap: anywhere; }
+.acq-card .acq-note { color: var(--ink-1); }
 .dl-badge.state { background: rgb(var(--accent-rgb) / 0.16); color: var(--accent); }
+/* A held row waits for a person: a quiet badge with the accent dot, never the busy wash. */
+.dl-badge.waiting { display: inline-flex; align-items: center; gap: 6px; background: rgba(255, 255, 255, 0.08); color: var(--ink-1); }
+.dl-badge.waiting::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 .dl-badge.failed { background: var(--bad-wash); color: #ff7b72; }
 .acq-error { font-size: var(--t-label); color: #ff9a8f; margin-top: 6px; }
 .acq-bar { height: 6px; margin-top: 10px; border-radius: var(--r-pill); background: rgba(255, 255, 255, 0.10); overflow: hidden; }
@@ -2171,10 +2176,10 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .acq-menu > summary { list-style: none; cursor: pointer; gap: 6px; }
 .acq-menu > summary::-webkit-details-marker { display: none; }
 .acq-menu > summary .icon { width: 14px; height: 14px; transition: transform var(--t-card) var(--ease); }
-.acq-menu[open] { flex: 1 1 100%; }
+.acq-menu { flex: 1 1 100%; }
 .acq-menu[open] > summary .icon { transform: rotate(180deg); }
-.acq-menu-body { padding: var(--s-s) 0 0 10px; }
-.acq-menu-caption { font-size: var(--t-label); color: var(--text-muted); margin-bottom: 6px; }
+.acq-menu-body { padding: var(--s-s) 0 0 0; }
+.acq-menu-caption { font-size: var(--t-label); color: var(--text-muted); margin-bottom: 6px; padding-left: 10px; }
 .acq-menu-people { display: flex; flex-wrap: wrap; gap: var(--s-s); }
 @media (prefers-reduced-motion: reduce) { .acq-menu > summary .icon { transition: none; } }
 .acq-card.has-log { grid-column: 1 / -1; flex-wrap: wrap; align-items: flex-start; }

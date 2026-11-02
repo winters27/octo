@@ -636,7 +636,7 @@ function renderLidarrFollows(follows) {
   if (!holder) return;
   const shown = Array.isArray(follows) ? follows.filter(follow => follow?.follow && follow.text) : [];
   const markup = shown.map(follow => {
-    const album = [follow.artist, follow.album].filter(Boolean).join(' - ');
+    const album = [follow.artist, follow.album].filter(Boolean).join(' · ');
     return `<div class="status-card-follow" data-follow="${escapeHtml(follow.follow)}">
       <div class="status-card-follow-text">${icon('i-warning-circle')}<span>${escapeHtml(follow.text)}${album ? `: ${escapeHtml(album)}` : ''}</span></div>
       <button type="button" class="btn btn-ghost btn-sm" data-put-back="${escapeHtml(follow.follow)}">Put Lidarr back</button>
@@ -648,6 +648,9 @@ function renderLidarrFollows(follows) {
     holder.dataset.rendered = markup;
   }
   holder.hidden = shown.length === 0;
+  // A follow that asks the admin to act is a warning on the card's dot, never "all fine".
+  const dot = holder.closest('.status-card')?.querySelector('.status-dot');
+  if (shown.length && dot?.classList.contains('ok')) dot.className = 'status-dot warn';
 }
 
 // Put Lidarr back for one follow, as a Navidrome admin's own sign-in (asked for when missing),
@@ -4545,7 +4548,8 @@ async function loadAcquisitions() {
   let rows = [];
   try {
     const r = await api('/api/admin/acquisitions', { cache: 'no-store' });
-    if (r.ok) rows = ((await r.json()).acquisitions || []).filter(a => a.state !== 'done');
+    // A done row whose kept copy still waits for Lidarr is still waiting, so it stays.
+    if (r.ok) rows = ((await r.json()).acquisitions || []).filter(a => a.state !== 'done' || a.waitsAside);
   } catch { /* the log below still loads */ }
 
   const moving = new Set(rows.filter(a => a.state !== 'failed').map(a => a.id));
@@ -4558,11 +4562,17 @@ async function loadAcquisitions() {
   list.innerHTML = rows.map(a => {
     const pct = typeof a.progress === 'number' ? Math.round(a.progress * 100) : null;
     const failed = a.state === 'failed';
-    const label = a.state === 'downloading' && pct !== null
-      ? `Downloading ${pct}%`
-      : a.state === 'queued' && a.ahead > 0
-        ? `Queued, ${a.ahead} ahead`
-        : (ACQ_LABELS[a.state] || a.state);
+    // A row that offers its holder menu has stopped and waits for a person, whatever its state.
+    const held = !failed && acqOffersKeep(a);
+    const label = held
+      ? 'Waiting'
+      : a.waitsAside
+        ? 'Kept'
+        : a.state === 'downloading' && pct !== null
+          ? `Downloading ${pct}%`
+          : a.state === 'queued' && a.ahead > 0
+            ? `Queued, ${a.ahead} ahead`
+            : (ACQ_LABELS[a.state] || a.state);
     const askers = Array.isArray(a.requestedBy) ? a.requestedBy.filter(Boolean) : [];
     const size = fmtSize(a.bytesTotal);
     const sub = [
@@ -4577,7 +4587,7 @@ async function loadAcquisitions() {
       : pct !== null && a.state === 'downloading'
         ? `<div class="acq-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><span style="width:${pct}%"></span></div>`
         : a.note
-          ? `<div class="dl-sub">${escapeHtml(a.note)}</div>`
+          ? `<div class="dl-sub acq-note">${escapeHtml(a.note)}</div>`
           : '';
     // No cover yet for a song still on its way: its state's glyph on a tile instead.
     const glyph = failed ? 'i-warning' : a.state === 'queued' ? 'i-clock' : 'i-tray-arrow-down';
@@ -4586,7 +4596,7 @@ async function loadAcquisitions() {
       <div class="dl-main">
         <div class="acq-head">
           <div class="dl-title">${escapeHtml(a.title || '?')}</div>
-          <span class="dl-badge ${failed ? 'failed' : 'state'}">${escapeHtml(label)}</span>
+          <span class="dl-badge ${failed ? 'failed' : held ? 'waiting' : 'state'}">${escapeHtml(label)}</span>
         </div>
         <div class="dl-sub">${sub}</div>
         ${detail}
@@ -5099,8 +5109,13 @@ function acqKeepLabel(a) {
   return a.heldTracks >= 2 ? 'Keep these anyway' : 'Keep anyway';
 }
 
+// Whether a row draws its holder menu (Keep anyway): someone waiting in its holds may keep it. The
+// row's Waiting badge reads the same, so the two never disagree.
+function acqOffersKeep(a) {
+  return Boolean(a.key && a.keepAnyway);
+}
 function acqHeldMenus(a) {
-  return a.keepAnyway ? acqMenuMarkup(a.key, 'keep', acqKeepLabel(a)) : '';
+  return acqOffersKeep(a) ? acqMenuMarkup(a.key, 'keep', acqKeepLabel(a)) : '';
 }
 
 function acqMenuMarkup(key, kind, label) {

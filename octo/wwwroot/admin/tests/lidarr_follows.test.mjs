@@ -47,7 +47,11 @@ const CANNOT_SEE = 'Octo is still following a Lidarr download it cannot see';
 
 // The block on a page holding Lidarr's card, the put-back answered by `reply`.
 function page(reply = { status: 200, body: { status: 'ok' } }) {
-  const holder = element({ hidden: true });
+  // Lidarr's card around the list, with its status dot as the status read left it.
+  const dot = { className: 'status-dot ok' };
+  dot.classList = { contains: name => dot.className.split(' ').includes(name) };
+  const card = element({ querySelector: selector => (selector === '.status-dot' ? dot : null) });
+  const holder = element({ hidden: true, closest: selector => (selector === '.status-card' ? card : null) });
   const calls = { fetches: [], refreshed: 0 };
   const context = {
     document: { getElementById: id => (id === 'lidarr-follows' ? holder : null) },
@@ -70,7 +74,7 @@ function page(reply = { status: 200, body: { status: 'ok' } }) {
     const row = element({ querySelector: selector => (selector === '.status-card-follow-status' ? status : null) });
     return { button: element({ dataset: { putBack: follow }, parentElement: row }), status };
   };
-  return { context, holder, calls, button };
+  return { context, holder, dot, calls, button };
 }
 
 test('each follow Octo cannot settle has its line and Put Lidarr back; none hides the list', () => {
@@ -79,7 +83,7 @@ test('each follow Octo cannot settle has its line and Put Lidarr back; none hide
     { follow: 'rg-mezzanine', artist: 'Massive Attack', album: 'Mezzanine', text: CANNOT_SEE },
   ]);
   assert.equal(holder.hidden, false);
-  assert.ok(holder.innerHTML.includes(`${CANNOT_SEE}: Massive Attack - Mezzanine`));
+  assert.ok(holder.innerHTML.includes(`${CANNOT_SEE}: Massive Attack · Mezzanine`));
   assert.ok(holder.innerHTML.includes('data-put-back="rg-mezzanine"'));
   assert.ok(holder.innerHTML.includes('>Put Lidarr back<'));
 
@@ -87,6 +91,17 @@ test('each follow Octo cannot settle has its line and Put Lidarr back; none hide
   assert.equal(holder.hidden, true, 'an older server, or nothing to settle');
   context.renderLidarrFollows([]);
   assert.equal(holder.hidden, true);
+});
+
+test("a follow that asks the admin to act turns Lidarr's green dot to a warning, never a red one", () => {
+  const { context, dot } = page();
+  context.renderLidarrFollows([]);
+  assert.equal(dot.className, 'status-dot ok', 'nothing to settle leaves it green');
+  context.renderLidarrFollows([{ follow: 'rg-mezzanine', text: CANNOT_SEE }]);
+  assert.equal(dot.className, 'status-dot warn');
+  dot.className = 'status-dot bad';
+  context.renderLidarrFollows([{ follow: 'rg-mezzanine', text: CANNOT_SEE }]);
+  assert.equal(dot.className, 'status-dot bad', 'an unreachable Lidarr stays red');
 });
 
 test('Put Lidarr back puts that follow back and reads the status again', async () => {

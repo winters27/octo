@@ -23,6 +23,7 @@ const checksBlock = slice('function renderDownloadChecks(lines)', "document.getE
 const menusBlock = slice('const ACQ_MENUS = {', '// Fetched songs: the log folds under the row');
 const actionsBlock = slice('function acqActions(a) {', 'function acqLog(a) {');
 const keyHelpBlock = slice('const ACOUSTID_KEY_HELP = {', '// The downloads card: what');
+const inProgressBlock = slice('const ACQ_LABELS = {', 'async function loadFetched(');
 const importKeyBlock = slice('function renderImportKeyLine(key, t)', 'function renderTrickle()');
 
 function element(extra = {}) {
@@ -286,6 +287,64 @@ test('an album row offers no Find songs in any state; a song row does', () => {
   assert.ok(landed.includes('data-dlog-toggle="soulseek:help-album"'), 'its log stays');
   const older = context.acqActions({ key: 'soulseek:help-album', kind: 'download', heldTracks: 2 });
   assert.ok(!older.includes('data-find-id'), 'an older server marks an album row by its held tracks');
+});
+
+// The In progress list drawn from `rows` as the admin API answers them, with the cards' real
+// actions and Keep anyway menus. Answers each card's markup by its title.
+async function inProgress(rows) {
+  const wrap = element({ hidden: true });
+  const list = element();
+  const context = {
+    document: {
+      getElementById: id => ({ 'acq-wrap': wrap, 'acq-list': list }[id] ?? null),
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    },
+    api: async () => ({ ok: true, json: async () => ({ acquisitions: rows }) }),
+    escapeHtml,
+    icon: name => `<svg data-icon="${name}"></svg>`,
+    stateBlock: (kind, message) => `<div class="state state-${kind}">${escapeHtml(message)}</div>`,
+    relTime: () => 'just now',
+    fmtSize: () => '',
+    dlogFocusKey: () => null,
+    dlogIsOpen: () => false,
+    dlogAfterRender: () => {},
+    acqLog: () => '',
+    loadFetched: () => {},
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+  };
+  vm.createContext(context);
+  for (const block of [menusBlock, actionsBlock, inProgressBlock]) vm.runInContext(block, context);
+  await context.loadAcquisitions();
+  const cards = list.innerHTML.split('<div class="acq-card').slice(1);
+  return { wrap, cards: Object.fromEntries(cards.map(card => [card.match(/class="dl-title">([^<]*)</)[1], card])) };
+}
+
+test("a done row whose kept copy waits for Lidarr stays in progress with its line, and says Kept", async () => {
+  const line = "Plays now; joins your library when Lidarr's download for this artist finishes";
+  const { wrap, cards } = await inProgress([
+    { id: 'a', key: 'soulseek:teardrop', title: 'Teardrop', state: 'done', waitsAside: true, note: line },
+    { id: 'b', key: 'soulseek:angel', title: 'Angel', state: 'done' },
+  ]);
+  assert.equal(wrap.hidden, false);
+  assert.deepEqual(Object.keys(cards), ['Teardrop'], 'a done row that waits for nothing is left to the log');
+  assert.ok(cards.Teardrop.includes(`<div class="dl-sub acq-note">${escapeHtml(line)}</div>`), 'its line shows');
+  assert.ok(cards.Teardrop.includes('<span class="dl-badge state">Kept</span>'));
+});
+
+test('every row that offers Keep anyway says Waiting with the quiet badge, whatever its state', async () => {
+  const { cards } = await inProgress([
+    { id: 'a', key: 'soulseek:yesterday', title: 'Yesterday', state: 'searching', keepAnyway: true, note: 'Waiting for AcoustID' },
+    { id: 'b', key: 'soulseek:rubber-soul', title: 'Rubber Soul', kind: 'album', state: 'queued', keepAnyway: true, heldTracks: 2 },
+    { id: 'c', key: 'soulseek:help', title: 'Help!', state: 'searching' },
+  ]);
+  for (const title of ['Yesterday', 'Rubber Soul']) {
+    assert.ok(cards[title].includes('<span class="dl-badge waiting">Waiting</span>'), title);
+    assert.ok(cards[title].includes('data-acq-menu="keep"'), `${title} draws its Keep anyway menu`);
+  }
+  assert.ok(cards['Help!'].includes('<span class="dl-badge state">Searching</span>'), 'nothing to keep: it still searches');
+  assert.ok(!cards['Help!'].includes('data-acq-menu'));
 });
 
 test('a menu with nobody left says nothing waits', async () => {

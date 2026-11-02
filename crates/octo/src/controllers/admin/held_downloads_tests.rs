@@ -416,6 +416,50 @@ async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_nam
     );
 }
 
+/// A song whose kept copy plays from where it waits for Lidarr's download of its artist is done as
+/// far as its own download goes, yet still waits: its row says `waitsAside` in the list and in its
+/// log, so In progress keeps showing its line; once the copy no longer waits, the row says it no
+/// more, and a row that never waited aside never says it.
+#[tokio::test]
+async fn a_row_whose_copy_waits_for_lidarr_says_it_waits_aside() {
+    use crate::services::lidarr::HELD_FOR_LIDARR;
+
+    let dash = Dashboard::new();
+    let tracker = &dash.state.acquisition_tracker;
+    tracker.begin(
+        "soulseek",
+        "angel",
+        None,
+        Some("alice"),
+        Some("Massive Attack"),
+        Some("Angel"),
+        Some("Mezzanine"),
+    );
+    // Teardrop's own download is over; its kept copy waits for Lidarr.
+    tracker.wait_aside("soulseek", "teardrop", &["alice".to_string()], HELD_FOR_LIDARR);
+
+    let rows = dash.rows().await;
+    assert_eq!(rows["soulseek:teardrop"]["state"], "done");
+    assert_eq!(rows["soulseek:teardrop"]["waitsAside"], true);
+    assert_eq!(rows["soulseek:teardrop"]["note"], HELD_FOR_LIDARR);
+    assert!(
+        rows["soulseek:angel"].get("waitsAside").is_none(),
+        "written only when it waits"
+    );
+    let log_row = dash
+        .get("admin", "/api/admin/downloads/log?key=soulseek:teardrop")
+        .await
+        .json()["row"]
+        .clone();
+    assert_eq!(log_row["waitsAside"], true);
+
+    tracker.end_aside("soulseek", "teardrop", None);
+    assert!(
+        dash.rows().await["soulseek:teardrop"].get("waitsAside").is_none(),
+        "the copy no longer waits"
+    );
+}
+
 /// A follow Octo cannot settle is on Lidarr's card for the admin (never in the signed-out status),
 /// with its line and the album "Put Lidarr back" names. Putting it back needs a Navidrome admin's
 /// own sign-in and the follow named; a follow Octo can settle by itself is a conflict and nothing

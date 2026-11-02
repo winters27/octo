@@ -123,6 +123,9 @@ pub struct AcquisitionSnapshot {
     /// How many held tracks a hearted album's row holds, filled in from the holds when a person's
     /// list is read; None on every other row.
     pub held_tracks: Option<i32>,
+    /// The row's copy plays from where it waits aside for Lidarr's download of its artist: it is
+    /// still waiting, whatever its state says.
+    pub waits_aside: bool,
 }
 
 /// How a row ended. `library_id` is set only for a song Navidrome showed; `album_keys` are
@@ -1770,6 +1773,7 @@ fn snapshot(entry: &Entry, ahead: Option<i32>, with_events: bool) -> Acquisition
         events: with_events.then(|| entry.events.clone()),
         keep_anyway: entry.held && entry.keep_anyway,
         held_tracks: None,
+        waits_aside: entry.aside,
     }
 }
 

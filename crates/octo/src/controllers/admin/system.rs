@@ -48,7 +48,7 @@ pub const SUBMISSION_KEY_REFUSED: &str = "AcoustID refused your submission key";
 /// The downloads card's line once AcoustID refused Octo's own key, set aside until the settings
 /// change.
 pub const BUILT_IN_KEY_REFUSED: &str =
-    "AcoustID refused Octo's own key. Add a free key of your own in Settings";
+    "AcoustID refused Octo's own key. Add a free key of your own under Soulseek, Verify downloads";
 /// The yt-dlp shim's line when it is too old to answer a fresh lookup.
 pub const OLD_SHIM: &str = "Update the yt-dlp shim so Octo can check YouTube";
 /// The setting the verification line's switch turns on.

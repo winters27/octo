@@ -540,6 +540,9 @@ pub fn acquisition_json(row: &AcquisitionSnapshot) -> Fields {
     if row.keep_anyway {
         fields.insert("keepAnyway".into(), true.into());
     }
+    if row.waits_aside {
+        fields.insert("waitsAside".into(), true.into());
+    }
     if let Some(held) = row.held_tracks.filter(|held| *held > 0) {
         fields.insert("heldTracks".into(), held.into());
     }
