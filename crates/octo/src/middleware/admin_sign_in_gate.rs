@@ -51,6 +51,7 @@ pub const OPEN_ENDPOINTS: &[(Method, &str)] = &[
 /// themselves.
 pub const APP_CALL_ENDPOINTS: &[(Method, &str, bool)] = &[
     (Method::GET, "/api/admin/downloads", true),
+    (Method::GET, "/api/admin/downloads/cover", true),
     (Method::GET, "/api/admin/lastfm/radio", false),
     (Method::POST, "/api/admin/lastfm/radio/refresh", false),
     (Method::GET, "/api/admin/listening", false),
@@ -393,7 +394,7 @@ mod tests {
 
     #[test]
     fn library_file_routes_match_exactly_or_below_a_prefix() {
-        let cases: [(&str, Option<&str>); 16] = [
+        let cases: [(&str, Option<&str>); 17] = [
             ("/api/admin/browse", Some("Browse session required.")),
             ("/api/admin/browse/session", None),
             ("/api/admin/browse/signout", None),
@@ -404,6 +405,7 @@ mod tests {
                 Some("Sign in with your Navidrome account first."),
             ),
             ("/api/admin/downloads", None),
+            ("/api/admin/downloads/cover", None),
             ("/api/admin/downloads/log", Some(SIGN_IN_FIRST)),
             ("/api/admin/acquisitions", None),
             ("/api/admin/acquisitions/keep", Some(SIGN_IN_FIRST)),
@@ -427,6 +429,7 @@ mod tests {
         assert!(!is_open(&Method::GET, "/api/admin/browse/auth"));
         assert_eq!(app_call(&Method::GET, "/api/admin/lastfm/radio"), Some(false));
         assert_eq!(app_call(&Method::GET, "/api/admin/downloads"), Some(true));
+        assert_eq!(app_call(&Method::GET, "/api/admin/downloads/cover"), Some(true));
         assert_eq!(app_call(&Method::GET, "/api/admin/settings"), None);
     }
 }

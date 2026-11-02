@@ -10,14 +10,12 @@
 //! their Find songs limits, and for a library file the library actions gates (switched on, on
 //! the allowed list, dry run only rehearses), exactly as in the apps.
 
-use axum::body::Body;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::{get, post};
 use octo_core::common::dotnet::{self, is_blank};
 use octo_core::soulseek::RoutingKind;
-use octo_media::cover::cover_image;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -25,12 +23,13 @@ use tracing::{debug, info};
 
 use super::json_body::bind_optional_body;
 use super::json_body::{FromBody, Kind, Member, Shape, text_record};
-use super::plumbing::{BROWSE_COOKIE_NAME, BROWSE_TOKEN_HEADER, request_cookie};
+use super::plumbing::{BROWSE_COOKIE_NAME, BROWSE_TOKEN_HEADER, cover_reply, request_cookie};
 use super::request_binding::{error, ok, query, sign_in, split};
 use crate::app::AppState;
 use crate::controllers::subsonic::downloads::{NAME_THE_PERSON, NOTHING_WAITING};
 use crate::http::error::problem;
 use crate::http::routes::RouteSet;
+use crate::services::admin::fetched_covers::side_for;
 use crate::services::common::acquisition_tracker::AcquisitionSnapshot;
 use crate::services::common::heart_acquisition_coordinator::KeepAnyway;
 use crate::services::local::DownloadHistoryService;
@@ -41,8 +40,6 @@ use crate::services::subsonic::subsonic_response_builder::{
 
 /// Outside songs a search on the Find songs page lists.
 pub const OUTSIDE_LIMIT: usize = 20;
-
-const COVER_SIDE: u32 = 160;
 
 pub fn routes() -> RouteSet {
     RouteSet::new()
@@ -446,8 +443,10 @@ pub async fn outside_songs(State(state): State<AppState>, request: Request) -> R
     ok(&json!({ "available": available, "songs": songs }))
 }
 
-/// A small cover for a song on the Find songs page: a library song's own picture, read from its
-/// file, or for an outside song the catalog's cover (a redirect to it).
+/// A cover for a song on the Find songs and Listening pages, at `size` (small unless more than
+/// 200 px is asked for): a library song's own picture, read from its file or its folder, or for
+/// an outside song the catalog's cover, fetched by Octo so the browser never loads it from the
+/// catalog's host.
 pub async fn find_cover(State(state): State<AppState>, request: Request) -> Response {
     let (parts, _) = split(request).await;
     if admin(&state, &parts.headers).is_none() {
@@ -456,6 +455,7 @@ pub async fn find_cover(State(state): State<AppState>, request: Request) -> Resp
     let Some(id) = query(&parts.uri, "id").filter(|id| !is_blank(id)) else {
         return problem(StatusCode::NOT_FOUND);
     };
+    let side = side_for(query(&parts.uri, "size").as_deref());
     let mut raw = id.trim().to_string();
     let prefix = format!("{}:", SoulseekMetadataService::PROVIDER_NAME);
     if dotnet::starts_with_ignore_case(&raw, &prefix) {
@@ -482,54 +482,21 @@ pub async fn find_cover(State(state): State<AppState>, request: Request) -> Resp
                 false,
             )
             .await;
-        let cover = meta
-            .and_then(|m| m.album_cover_url)
-            .filter(|url| !url.is_empty())
-            .and_then(|url| url::Url::parse(&url).ok())
-            .filter(|url| matches!(url.scheme(), "https" | "http"));
-        return match cover {
-            Some(cover) => {
-                let mut res = Response::new(Body::empty());
-                *res.status_mut() = StatusCode::FOUND;
-                if let Ok(location) = HeaderValue::from_str(cover.as_str()) {
-                    res.headers_mut().insert(header::LOCATION, location);
-                }
-                res.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    HeaderValue::from_static("private, max-age=3600"),
-                );
-                res
-            }
-            None => problem(StatusCode::NOT_FOUND),
+        let picture = match meta.and_then(|m| m.album_cover_url).filter(|url| !is_blank(url)) {
+            Some(url) => state.fetched_covers.outside_cover(&url, side).await,
+            None => None,
         };
+        return picture.map_or_else(|| problem(StatusCode::NOT_FOUND), cover_reply);
     }
 
     let Some(file) = state.navidrome_song_path_resolver.resolve(&raw).await else {
         return problem(StatusCode::NOT_FOUND);
     };
-    if !std::path::Path::new(&file.absolute_path).is_file() {
-        return problem(StatusCode::NOT_FOUND);
+    match state.fetched_covers.file_cover(&file.absolute_path, side).await {
+        Some(picture) => cover_reply(picture),
+        None => {
+            debug!("No picture in or beside {}", file.absolute_path);
+            problem(StatusCode::NOT_FOUND)
+        }
     }
-    let path = file.absolute_path.clone();
-    let picture = tokio::task::spawn_blocking(move || {
-        let tags = octo_media::tags::TagFile::open(&path).ok()?;
-        octo_media::tags::front_cover(&tags).map(|picture| picture.data)
-    })
-    .await
-    .ok()
-    .flatten()
-    .filter(|bytes| !bytes.is_empty());
-    let Some(bytes) = picture else {
-        debug!("No picture in {}", file.absolute_path);
-        return problem(StatusCode::NOT_FOUND);
-    };
-    let jpeg = cover_image::to_jpeg(&cover_image::fit_within(&bytes, COVER_SIDE));
-    let mut res = Response::new(Body::from(jpeg));
-    res.headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
-    res.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=3600"),
-    );
-    res
 }

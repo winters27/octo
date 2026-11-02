@@ -188,6 +188,18 @@ pub fn ok(body: &impl serde::Serialize) -> Response {
     object_result(StatusCode::OK, body)
 }
 
+/// A cover the dashboard draws, as a JPEG a browser may keep for an hour.
+pub fn cover_reply(picture: std::sync::Arc<Vec<u8>>) -> Response {
+    let mut res = Response::new(Body::from(picture.as_ref().clone()));
+    res.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=3600"),
+    );
+    res
+}
+
 /// `{"error": message}` with a status.
 pub fn error_json(status: StatusCode, message: &str) -> Response {
     object_result(status, &serde_json::json!({ "error": message }))

@@ -4624,9 +4624,9 @@ async function loadAcquisitions() {
 function fetchedRow(d) {
   const fmt = (d.format || '?').toUpperCase();
   const badgeClass = fmt === 'FLAC' ? 'flac' : 'mp3';
-  const art = d.coverArtUrl
-    ? `<img class="dl-art" src="${escapeHtml(d.coverArtUrl)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'dl-art dl-art-ph'}))">`
-    : `<div class="dl-art dl-art-ph"></div>`;
+  // Octo serves the cover (from the song's file, else the address saved with it); the page never
+  // loads one from Deezer itself.
+  const art = findArt(d.cover);
   const size = fmtSize(d.sizeBytes);
   // Absent on entries written before attribution existed, and whenever the setting
   // is off, so the row has to read the same with and without it.
@@ -4687,6 +4687,8 @@ function ambientStoreSet(key, value) {
 }
 const ambientHex = v => typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v);
 const ambientKey = s => `${s.downloadedAt}|${s.artist}|${s.title}`;
+// A clear pixel: the Latest fetched tile of a song with no picture shows only its own background.
+const NO_ART = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
 function applyAmbient(colors, accent) {
   const style = document.documentElement.style;
@@ -4734,15 +4736,12 @@ function renderLatestFetched(lights = false) {
   card.hidden = !song;
   if (!song) return;
 
+  // A song with no picture keeps the tile, filled with the page's own light, so the card's text
+  // stays where it is from song to song.
   const art = document.getElementById('latest-art');
-  if (song.coverArtUrl) {
-    art.hidden = false;
-    art.src = song.coverArtUrl;
-    art.onerror = () => { art.hidden = true; };
-  } else {
-    art.hidden = true;
-    art.removeAttribute('src');
-  }
+  art.hidden = false;
+  art.onerror = () => { art.onerror = null; art.src = NO_ART; };
+  art.src = song.cover ? `${song.cover}&size=504` : NO_ART;
   document.getElementById('latest-kicker').textContent = song === ambientSongs[0] ? 'Latest fetched' : 'Lighting the page';
   document.getElementById('latest-title').textContent = song.title;
   document.getElementById('latest-sub').textContent = [song.artist, song.album].filter(Boolean).join(' · ');
@@ -4758,8 +4757,8 @@ function renderLatestFetched(lights = false) {
   covers.innerHTML = ambientSongs.map((s, i) => {
     const on = s === song;
     const label = `Light the page with ${s.title} by ${s.artist}${s.colors ? '' : ' (no color in this cover)'}`;
-    const img = s.coverArtUrl
-      ? `<img src="${escapeHtml(s.coverArtUrl)}" alt="" loading="lazy" onerror="this.remove()">`
+    const img = s.cover
+      ? `<img src="${escapeHtml(s.cover)}" alt="" loading="lazy" onerror="this.remove()">`
       : '';
     return `<button type="button" class="now-cover" data-ambient="${i}" aria-pressed="${on}" aria-label="${escapeHtml(label)}" title="${escapeHtml(s.artist + ' · ' + s.title)}">${img}</button>`;
   }).join('');
@@ -4839,7 +4838,7 @@ function showListening(on) {
         loadAmbient();
       }
     },
-    cover: item => (item.songId ? `/api/admin/find/cover?id=${encodeURIComponent(item.songId)}` : ''),
+    cover: (item, size) => (item.songId ? `/api/admin/find/cover?id=${encodeURIComponent(item.songId)}&size=${size || ''}` : ''),
     fetch: async (days, user) => {
       const query = `range=${days}${user ? `&user=${encodeURIComponent(user)}` : ''}`;
       const r = await api(`/api/admin/listening?${query}`, { cache: 'no-store' });
@@ -5241,7 +5240,7 @@ function fetchedFindButton(d) {
   const data = d.key
     ? `data-find-id="${escapeHtml(d.key)}"`
     : `data-find-q="${escapeHtml([d.artist, title].filter(Boolean).join(' '))}"`;
-  return `<button type="button" class="btn btn-ghost btn-icon btn-sm dl-find" ${data} data-find-title="${escapeHtml(title)}" data-find-artist="${escapeHtml(d.artist || '')}" data-find-cover="${escapeHtml(d.coverArtUrl || '')}" aria-label="Find songs for ${escapeHtml(title)}" title="Find songs">${icon('i-magnifying-glass')}</button>`;
+  return `<button type="button" class="btn btn-ghost btn-icon btn-sm dl-find" ${data} data-find-title="${escapeHtml(title)}" data-find-artist="${escapeHtml(d.artist || '')}" data-find-cover="${escapeHtml(d.cover || '')}" aria-label="Find songs for ${escapeHtml(title)}" title="Find songs">${icon('i-magnifying-glass')}</button>`;
 }
 function fetchedLogToggle(event) {
   const details = event.target;
@@ -9945,7 +9944,7 @@ const ART_PAGE = 60;
 
 function artTile(album) {
   const name = `${album.album} by ${album.artist}`;
-  const art = album.poster ? `<img loading="lazy" alt="" src="${esc(album.poster)}" onerror="this.remove()">` : '';
+  const art = album.still ? `<img loading="lazy" alt="" src="${esc(album.still)}" onerror="this.remove()">` : '';
   // One badge: Hidden says the most, and a full-screen loop is worth knowing otherwise.
   const badges = album.hidden
     ? '<span class="cover-badge warn">Hidden</span>'

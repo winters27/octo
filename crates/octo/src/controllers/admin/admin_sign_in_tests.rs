@@ -687,6 +687,15 @@ async fn the_app_signs_its_admin_calls_with_its_subsonic_sign_in() {
         status("/api/admin/downloads?u=listener&p=bad&v=1.16.1&c=test").await,
         StatusCode::UNAUTHORIZED
     );
+    // A fetched song's cover: an admin's call reaches it (no such entry here), a listener's not.
+    assert_eq!(
+        status("/api/admin/downloads/cover?at=x&u=admin&p=pw&v=1.16.1&c=test").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        status("/api/admin/downloads/cover?at=x&u=listener&p=pw&v=1.16.1&c=test").await,
+        StatusCode::FORBIDDEN
+    );
     // Not an app call, so a Subsonic sign-in opens nothing here.
     assert_eq!(
         status("/api/admin/settings?u=admin&p=pw&v=1.16.1&c=test").await,

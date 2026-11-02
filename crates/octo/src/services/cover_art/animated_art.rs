@@ -763,22 +763,34 @@ impl AnimatedArt {
             .skip(offset)
             .take(limit)
             .map(|(key, k)| {
-                let still = k
-                    .square
-                    .as_ref()
-                    .or(k.tall.as_ref())
-                    .and_then(|clip| clip.poster.clone());
+                let still = still_of_kept(k);
+                // Where Octo serves the still, so the dashboard never loads it from Apple.
+                let served = still.as_ref().map(|_| {
+                    let key: String = url::form_urlencoded::byte_serialize(key.as_bytes()).collect();
+                    format!("/api/admin/animated-art/still?key={key}")
+                });
                 json!({
                     "key": key,
                     "artist": k.artist,
                     "album": k.album,
                     "poster": still,
+                    "still": served,
                     "tall": k.tall.is_some(),
                     "hidden": k.hidden,
                 })
             })
             .collect();
         (total, page)
+    }
+
+    /// The still of an album with animated art, by its key: its square loop's, else its tall
+    /// loop's. None for a key with none.
+    pub fn still_of(&self, key: &str) -> Option<String> {
+        self.kept
+            .read()
+            .get(key)
+            .filter(|k| k.found())
+            .and_then(still_of_kept)
     }
 
     /// Hides or shows an album's animated art in every app. False for a key with none.
@@ -856,6 +868,14 @@ fn album_key(artist: &str, album: &str) -> String {
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// The still an album's tile shows: its square loop's, else its tall loop's.
+fn still_of_kept(kept: &Kept) -> Option<String> {
+    kept.square
+        .as_ref()
+        .or(kept.tall.as_ref())
+        .and_then(|clip| clip.poster.clone())
 }
 
 /// A still on Apple's image hosts, over https.

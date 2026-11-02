@@ -22,13 +22,14 @@ use tracing::{info, warn};
 
 use super::json_body::bind_body;
 use super::json_body::{FromBody, Shape, text_record};
-use super::plumbing::{camel_case_value, object_result, ok};
+use super::plumbing::{camel_case_value, cover_reply, object_result, ok};
 use super::request_binding::query;
 use crate::app::AppState;
-use crate::http::error::json_ok;
+use crate::http::error::{json_ok, problem};
 use crate::middleware::admin_sign_in_gate::{Caller, caller_of};
 use crate::services::admin::AdminCaller;
 use crate::services::admin::directory_browser::is_writable;
+use crate::services::admin::fetched_covers::{entry_cover_path, side_for};
 use crate::services::common::acquisition_tracker::key_of;
 use crate::services::common::heart_acquisition_coordinator::waiting_line;
 use crate::services::http_client_factory::{connect_failure_message, timeout_message};
@@ -137,6 +138,12 @@ pub async fn downloads(State(state): State<AppState>, uri: Uri) -> Response {
                     "hasLog".into(),
                     serde_json::Value::Bool(entry.log.as_ref().is_some_and(|log| !log.is_empty())),
                 );
+                // Where Octo serves the song's cover (read from its file, else the saved
+                // address), so no page loads a cover from another host.
+                fields.insert(
+                    "cover".into(),
+                    serde_json::Value::String(entry_cover_path(&entry.downloaded_at)),
+                );
             }
             value
         })
@@ -146,6 +153,21 @@ pub async fn downloads(State(state): State<AppState>, uri: Uri) -> Response {
 
 /// The most entries a search of the fetched-songs log answers with.
 const DOWNLOAD_SEARCH_LIMIT: usize = 50;
+
+/// `GET /api/admin/downloads/cover?at=<downloadedAt>&size=`: a fetched song's cover as a JPEG,
+/// read from its file, else from the cover address saved with it, fetched by Octo. Small unless
+/// more than 200 px is asked for; 404 when Octo has no picture for it. Reaches whoever may read
+/// the list it belongs to.
+pub async fn download_cover(State(state): State<AppState>, uri: Uri) -> Response {
+    let Some(entry) = query(&uri, "at").and_then(|at| state.download_history.find_written(at.trim())) else {
+        return problem(StatusCode::NOT_FOUND);
+    };
+    let side = side_for(query(&uri, "size").as_deref());
+    match state.fetched_covers.entry_cover(&entry, side).await {
+        Some(picture) => cover_reply(picture),
+        None => problem(StatusCode::NOT_FOUND),
+    }
+}
 
 /// `GET /api/admin/acquisitions`: every hearted download in flight or ended in the last half
 /// hour, everyone's, newest first. The rows the app reads through getAcquisitions, plus the
