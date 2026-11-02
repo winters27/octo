@@ -4264,7 +4264,7 @@ mod tests {
         );
     }
 
-    /// The acquisition pipeline: its three background services run as workers, the activity
+    /// The acquisition pipeline: its background services run as workers, the activity
     /// sees the download service, and StarOnArrival is already listening to the tracker.
     #[tokio::test]
     async fn the_acquisition_pipeline_is_wired_with_its_workers() {

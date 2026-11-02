@@ -749,30 +749,54 @@ async fn a_sweep_while_mornye_is_off_keeps_every_job_and_asks_nothing() {
 }
 
 #[tokio::test]
+async fn a_sweep_while_mornye_has_no_address_keeps_every_job_and_asks_nothing() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let dir = tempfile::tempdir().expect("a folder");
+    let left = left_job(&w.client, dir.path());
+    w.client.check.store.keep_pass_job(left.clone());
+    let mut no_address = (*w.client.settings.current()).clone();
+    no_address.spotiflac.url = String::new();
+    w.client.settings.set(no_address);
+
+    w.client.end_left_pass_jobs().await;
+
+    assert_eq!(
+        requests_to(&w.mornye, "/api/v1/downloads/left-job/cancel").await,
+        0
+    );
+    assert_eq!(w.client.check.store.pass_jobs(), vec![left.clone()]);
+    assert!(std::path::Path::new(&left.dir).exists());
+}
+
+#[tokio::test]
 async fn octo_stopping_ends_the_worker_partway_through_a_sweep_and_the_rest_stay_kept() {
-    let (mornye, client) = slow_mornye(Duration::ZERO, Duration::from_secs(2)).await;
+    // Each cancel would hold the sweep for the whole half minute the client waits.
+    let (mornye, client) =
+        slow_mornye_bounded(Duration::ZERO, Duration::from_secs(60), Duration::from_secs(30)).await;
     let dir = tempfile::tempdir().expect("a folder");
     for _ in 0..5 {
         client.check.store.keep_pass_job(left_job(&client, dir.path()));
     }
     let stopping = tokio_util::sync::CancellationToken::new();
     let worker = tokio::spawn(Arc::clone(&client).clean_left_pass_jobs(stopping.clone()));
-    for _ in 0..100 {
+    for _ in 0..200 {
         if requests_to(&mornye, "/api/v1/downloads/left-job/cancel").await > 0 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let stopped = Instant::now();
     stopping.cancel();
-    let ended = tokio::time::timeout(Duration::from_millis(500), worker).await;
+    let ended = tokio::time::timeout(Duration::from_secs(5), worker).await;
 
-    assert!(ended.is_ok(), "the worker ends when Octo stops");
     assert!(
-        stopped.elapsed() < Duration::from_millis(150),
-        "{:?}",
-        stopped.elapsed()
+        ended.is_ok(),
+        "the worker ends when Octo stops, not when Mornye answers"
+    );
+    assert_eq!(
+        requests_to(&mornye, "/api/v1/downloads/left-job/cancel").await,
+        1,
+        "stopped while the first job's cancel was out"
     );
     assert_eq!(client.check.store.pass_jobs().len(), 5);
 }
@@ -982,6 +1006,15 @@ async fn a_left_job_naming_a_folder_octo_did_not_make_leaves_that_folder() {
 /// A Mornye whose check reads answer after `read_delay` and whose cancel of `left-job` answers
 /// after `cancel_delay`, and a client that waits at most a fifth of a second for either.
 async fn slow_mornye(read_delay: Duration, cancel_delay: Duration) -> (MockServer, Arc<SpotiflacClient>) {
+    slow_mornye_bounded(read_delay, cancel_delay, Duration::from_millis(200)).await
+}
+
+/// The same, with a client that waits at most `call_bound` for either.
+async fn slow_mornye_bounded(
+    read_delay: Duration,
+    cancel_delay: Duration,
+    call_bound: Duration,
+) -> (MockServer, Arc<SpotiflacClient>) {
     let mornye = MockServer::builder().start().await;
     Mock::given(method("POST"))
         .and(path("/api/get_signed_sessions"))
@@ -1023,7 +1056,7 @@ async fn slow_mornye(read_delay: Duration, cancel_delay: Duration) -> (MockServe
         Arc::new(crate::services::spotiflac::MornyeCheckStore::new(None)),
         crate::services::spotiflac::CheckTimes {
             fresh_for: Duration::ZERO,
-            call_bound: Duration::from_millis(200),
+            call_bound,
         },
         None,
     );
