@@ -23,13 +23,17 @@ fn health(source: &str, kind: &str, fragment: &str) -> Value {
 
 const FAILURES: &str = "indexers-are-unavailable-due-to-failures";
 
-/// Whether Octo asked Lidarr to run its health checks.
+/// Whether Octo asked Lidarr about its health: it ran Lidarr's health checks and read what they
+/// found. (A pick also has Lidarr queue a health check, for the time Lidarr stamps on it, and never
+/// reads what it found.)
 fn asked_for_health(f: &Fixture) -> bool {
-    f.lidarr
+    let checked = f
+        .lidarr
         .changes()
         .iter()
         .filter_map(|change| change.body.clone())
-        .any(|body| body["name"] == "CheckHealth")
+        .any(|body| body["name"] == "CheckHealth");
+    checked && health_reads(f) > 0
 }
 
 /// How often Octo read Lidarr's health.

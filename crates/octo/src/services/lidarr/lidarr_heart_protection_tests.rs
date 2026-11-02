@@ -82,6 +82,8 @@ struct Pipeline {
     asked: Arc<Mutex<Vec<Asked>>>,
     placed: Arc<Mutex<Vec<HeldPlacement>>>,
     dropped: Arc<Mutex<Vec<(HeldPlacement, Vec<String>)>>>,
+    /// The next drop of a kept copy fails (its record could not be written), when set.
+    drops_failing: Arc<Mutex<Option<()>>>,
     /// Titles whose file a hearted song's gates take half a second to judge.
     slow: Arc<Mutex<HashSet<String>>>,
     /// Held while placing a held file must wait.
@@ -272,51 +274,12 @@ impl IDownloadService for Pipeline {
     }
 
     async fn drop_held(&self, held: &HeldPlacement, users: &[String]) -> bool {
+        if self.drops_failing.lock().take().is_some() {
+            return false;
+        }
         let _ = std::fs::remove_file(&held.held_path);
         self.dropped.lock().push((held.clone(), users.to_vec()));
         true
-    }
-
-    async fn drop_placed(&self, copy: &crate::services::lidarr::GivingWay) -> bool {
-        if !copy.replaced {
-            let _ = std::fs::remove_file(&copy.path);
-        }
-        self.dropped.lock().push((
-            HeldPlacement {
-                song: copy.song.clone(),
-                held_path: copy.path.clone(),
-                target: copy.path.clone(),
-                kept: true,
-                follows: Vec::new(),
-                users: copy.users.clone(),
-                own_copies: Vec::new(),
-            },
-            copy.users.clone(),
-        ));
-        true
-    }
-
-    async fn restore_placed(
-        &self,
-        copy: &crate::services::lidarr::ReplacedCopy,
-    ) -> crate::services::i_download_service::Restored {
-        use crate::services::i_download_service::Restored;
-        if !Path::new(&copy.backup).is_file() {
-            return Restored::Lost;
-        }
-        if Path::new(&copy.path).exists() {
-            return Restored::Later;
-        }
-        if let Some(folder) = Path::new(&copy.path).parent() {
-            let _ = std::fs::create_dir_all(folder);
-        }
-        if std::fs::hard_link(&copy.backup, &copy.path).is_ok()
-            || std::fs::copy(&copy.backup, &copy.path).is_ok()
-        {
-            Restored::Back
-        } else {
-            Restored::Later
-        }
     }
 
     async fn download_album_with_source(
@@ -339,20 +302,28 @@ impl IDownloadService for Pipeline {
         Some(self.root.join(".octo-incoming/held"))
     }
 
-    async fn place_held(
-        &self,
-        held: &HeldPlacement,
-    ) -> Option<crate::services::i_download_service::PlacedHeld> {
+    /// As the shared library places a held file: a kept copy whose song's Lidarr file passed the
+    /// gate of someone it was kept for gives way to that file instead.
+    async fn place_held(&self, held: &HeldPlacement) -> crate::services::i_download_service::HeldEnd {
+        use crate::services::i_download_service::HeldEnd;
         let _wait = self.place_gate.lock().await;
-        if let Some(dir) = Path::new(&held.target).parent() {
-            std::fs::create_dir_all(dir).ok()?;
+        if held.kept && !held.proven_for.is_empty() {
+            return if self.drop_held(held, &held.proven_for).await {
+                HeldEnd::GaveWay
+            } else {
+                HeldEnd::Later
+            };
         }
-        std::fs::rename(&held.held_path, &held.target).ok()?;
+        if let Some(dir) = Path::new(&held.target).parent()
+            && std::fs::create_dir_all(dir).is_err()
+        {
+            return HeldEnd::Later;
+        }
+        if std::fs::rename(&held.held_path, &held.target).is_err() {
+            return HeldEnd::Later;
+        }
         self.placed.lock().push(held.clone());
-        Some(crate::services::i_download_service::PlacedHeld {
-            path: held.target.clone(),
-            beside: Vec::new(),
-        })
+        HeldEnd::Placed(held.target.clone())
     }
 
     async fn get_local_path_if_exists(&self, _: &str, _: &str) -> Option<String> {
@@ -401,6 +372,8 @@ struct Fixture {
     placed: Arc<Mutex<Vec<HeldPlacement>>>,
     /// The kept copies the pipeline dropped for a proven one, and for whom.
     dropped: Arc<Mutex<Vec<(HeldPlacement, Vec<String>)>>>,
+    /// The next drop of a kept copy fails, when set.
+    drops_failing: Arc<Mutex<Option<()>>>,
     /// Titles whose file the pipeline takes half a second to judge.
     slow: Arc<Mutex<HashSet<String>>>,
     /// Held while placing a held file must wait.
@@ -476,6 +449,7 @@ impl Fixture {
             tracker: Arc::new(AcquisitionTracker::new(None, Clock::system())),
             placed: Arc::default(),
             dropped: Arc::default(),
+            drops_failing: Arc::default(),
             slow: Arc::default(),
             place_gate: Arc::default(),
             settings: Mutex::new(None),
@@ -607,6 +581,7 @@ impl Fixture {
             asked: self.asked.clone(),
             placed: self.placed.clone(),
             dropped: self.dropped.clone(),
+            drops_failing: self.drops_failing.clone(),
             slow: self.slow.clone(),
             place_gate: self.place_gate.clone(),
         });
@@ -690,10 +665,13 @@ impl Fixture {
     }
 
     /// Every request that could change Lidarr, as `METHOD path?query`.
+    /// Every request that changed Lidarr, in order. A health check, which Octo has Lidarr queue
+    /// for the time Lidarr stamps on it, changes nothing.
     fn changes(&self) -> Vec<String> {
         self.lidarr
             .changes()
             .iter()
+            .filter(|r| r.body.as_ref().is_none_or(|body| body["name"] != "CheckHealth"))
             .map(|r| format!("{} {}", r.method, r.path))
             .collect()
     }

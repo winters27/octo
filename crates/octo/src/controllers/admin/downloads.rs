@@ -1,8 +1,8 @@
 //! The download log and Find songs routes: the dashboard's side of what the Octo apps already
 //! do, for admins whose listeners use other Subsonic apps. A download's full log on Fetched
 //! songs, Find songs (a search run again by hand, every copy listed, one picked), a held
-//! download's Keep anyway and Stop waiting for Lidarr for one of the people it was held for, and
-//! Put Lidarr back on a Lidarr follow Octo cannot settle.
+//! download's Keep anyway for one of the people it was held for, and Put Lidarr back on a Lidarr
+//! follow Octo cannot settle.
 //! Recently removed and Put back (`trash`, `trash/restore`) are the library edits' (see `trash`).
 //!
 //! Everything here names peers, files or people, or changes the library, so every call needs a
@@ -28,14 +28,11 @@ use super::json_body::{FromBody, Kind, Member, Shape, text_record};
 use super::plumbing::{BROWSE_COOKIE_NAME, BROWSE_TOKEN_HEADER, request_cookie};
 use super::request_binding::{error, ok, query, sign_in, split};
 use crate::app::AppState;
-use crate::controllers::subsonic::downloads::{
-    NAME_THE_PERSON, NOTHING_WAITING, NOTHING_WAITS_FOR_LIDARR, STOP_NAME_THE_PERSON,
-};
+use crate::controllers::subsonic::downloads::{NAME_THE_PERSON, NOTHING_WAITING};
 use crate::http::error::problem;
 use crate::http::routes::RouteSet;
 use crate::services::common::acquisition_tracker::AcquisitionSnapshot;
 use crate::services::common::heart_acquisition_coordinator::KeepAnyway;
-use crate::services::lidarr::StopWaiting;
 use crate::services::local::DownloadHistoryService;
 use crate::services::soulseek::SoulseekMetadataService;
 use crate::services::subsonic::subsonic_response_builder::{
@@ -52,7 +49,6 @@ pub fn routes() -> RouteSet {
         .route("/api/admin/downloads/log", get(download_log))
         .route("/api/admin/acquisitions/holders", get(held_for))
         .route("/api/admin/acquisitions/keep", post(keep_anyway))
-        .route("/api/admin/acquisitions/stop-waiting", post(stop_waiting))
         .route("/api/admin/lidarr/put-back", post(put_lidarr_back))
         .route("/api/admin/find", post(start_find))
         .route("/api/admin/find/outside", get(outside_songs))
@@ -106,15 +102,11 @@ pub async fn download_log(State(state): State<AppState>, request: Request) -> Re
             .is_none_or(|written| row.started_at <= written + chrono::TimeDelta::seconds(1)),
     });
     if let Some(mut row) = row.filter(|_| same_run) {
-        // The holds say what the row offers now, never the row's own flags, which stay set after
-        // a keep was asked or a wait was stopped.
+        // The holds say what the row offers now, never the row's own flag, which stays set after
+        // a keep was asked.
         row.keep_anyway = state.heart_acquisition_coordinator.keepable_rows().contains(
             &crate::services::common::acquisition_tracker::key_of(&row.provider, &row.external_id),
         );
-        row.stop_waiting = !state
-            .lidarr_hearts
-            .stop_waiters(&row.provider, &row.external_id)
-            .is_empty();
         let mut json = acquisition_json(&row);
         json.insert("provider".into(), json!(row.provider));
         json.insert("externalId".into(), json!(row.external_id));
@@ -129,7 +121,7 @@ pub async fn download_log(State(state): State<AppState>, request: Request) -> Re
     ok(&json!({ "key": key, "kept": "none", "row": null, "event": [] }))
 }
 
-// ---- Keep anyway and Stop waiting for Lidarr ------------------------------------------------
+// ---- Keep anyway --------------------------------------------------------------------------
 
 /// `HeldRequest(string? Key, string? User, string? Token)`: a held download's row key and the
 /// person to act for, by name or by the token the holder menu gave for them.
@@ -150,8 +142,7 @@ impl FromBody for HeldRequest {
     );
 }
 
-/// The row key and the person a Keep anyway or Stop waiting names, trimmed: by name, or by a
-/// holder menu's token, matched among `people` (who may be acted for on the row now; a token
+/// The row key and the person a Keep anyway names, trimmed: by name, or by a holder menu's token, matched among `people` (who may be acted for on the row now; a token
 /// naming nobody who still waits names nobody, and nothing waits for nobody). Or the words that
 /// say which is missing (`unnamed` when it is the person).
 fn held_request(
@@ -203,51 +194,23 @@ fn holder_token(key: &str, user: &str) -> String {
 
 /// One holder menu: each person with the token that names them back. Their name shows while
 /// Record who asked is on; with it off, nobody is named and each shows as "Listener 1", "Listener
-/// 2" and so on, numbered by their place among everyone on the row (`everyone`, in the order they
-/// joined), so one person has one number in every menu of the row.
-fn holder_menu(state: &AppState, key: &str, people: &[String], everyone: &[String]) -> Vec<Value> {
+/// 2" and so on, numbered by their place on the menu (in the order they joined).
+fn holder_menu(state: &AppState, key: &str, people: &[String]) -> Vec<Value> {
     let named = state.settings.current().subsonic.record_requested_by;
     people
         .iter()
-        .map(|user| {
-            let number = everyone
-                .iter()
-                .position(|known| dotnet::eq_ignore_case(known.trim(), user.trim()))
-                .unwrap_or(everyone.len())
-                + 1;
+        .enumerate()
+        .map(|(at, user)| {
             json!({
-                "label": if named { user.clone() } else { format!("Listener {number}") },
+                "label": if named { user.clone() } else { format!("Listener {}", at + 1) },
                 "token": holder_token(key, user),
             })
         })
         .collect()
 }
 
-/// Everyone on a row's holder menus, once each, in the order they joined: the people who may keep
-/// it anyway, then anyone else whose kept copy waits for Lidarr.
-fn everyone_on(keepers: &[String], stop_waiters: &[String]) -> Vec<String> {
-    let mut everyone: Vec<String> = Vec::new();
-    for user in keepers.iter().chain(stop_waiters) {
-        if !everyone
-            .iter()
-            .any(|known| dotnet::eq_ignore_case(known.trim(), user.trim()))
-        {
-            everyone.push(user.clone());
-        }
-    }
-    everyone
-}
-
-/// Whose kept copy of the row's song waits for Lidarr.
-fn stop_waiters_of(state: &AppState, key: &str) -> Vec<String> {
-    key.split_once(':')
-        .map(|(provider, id)| state.lidarr_hearts.stop_waiters(provider, id))
-        .unwrap_or_default()
-}
-
-/// The holder menus of one held row: who may keep it anyway now (`keepers`) and whose kept copy
-/// of its song waits for Lidarr (`stopWaiters`), each in the order they joined, each as a label
-/// and a token ([`holder_menu`]).
+/// The holder menu of one held row: who may keep it anyway now (`keepers`), in the order they
+/// joined, each as a label and a token ([`holder_menu`]).
 pub async fn held_for(State(state): State<AppState>, request: Request) -> Response {
     let (parts, _) = split(request).await;
     if admin(&state, &parts.headers).is_none() {
@@ -258,12 +221,9 @@ pub async fn held_for(State(state): State<AppState>, request: Request) -> Respon
     };
     let key = key.trim().to_string();
     let keepers = state.heart_acquisition_coordinator.keepers(&key);
-    let stop_waiters = stop_waiters_of(&state, &key);
-    let everyone = everyone_on(&keepers, &stop_waiters);
     ok(&json!({
         "key": key,
-        "keepers": holder_menu(&state, &key, &keepers, &everyone),
-        "stopWaiters": holder_menu(&state, &key, &stop_waiters, &everyone),
+        "keepers": holder_menu(&state, &key, &keepers),
     }))
 }
 
@@ -291,43 +251,6 @@ pub async fn keep_anyway(State(state): State<AppState>, request: Request) -> Res
             ok(&json!({ "status": "ok" }))
         }
         _ => error(StatusCode::CONFLICT, NOTHING_WAITING),
-    }
-}
-
-/// Stop waiting for Lidarr for one person whose kept copy of the row's song waits for an open
-/// Lidarr follow, the admin's own way to what stopWaitingForLidarr does for the apps with `user`:
-/// that person's copy lands now and they leave the follow's waits, which go on for anyone else. A
-/// conflict when no copy of that person's waits.
-pub async fn stop_waiting(State(state): State<AppState>, request: Request) -> Response {
-    let (parts, body) = split(request).await;
-    let request: Option<HeldRequest> = match bind_optional_body(&parts.headers, &body) {
-        Ok(request) => request,
-        Err(answer) => return answer,
-    };
-    let Some(admin) = admin(&state, &parts.headers) else {
-        return sign_in();
-    };
-    let (key, user) = match held_request(request, STOP_NAME_THE_PERSON, |key| stop_waiters_of(&state, key)) {
-        Ok(named) => named,
-        Err(missing) => return error(StatusCode::BAD_REQUEST, missing),
-    };
-    let Some((provider, id)) = key.split_once(':') else {
-        return error(StatusCode::CONFLICT, NOTHING_WAITS_FOR_LIDARR);
-    };
-    let hearts = &state.lidarr_hearts;
-    let waits = hearts
-        .stop_waiters(provider, id)
-        .iter()
-        .any(|waiter| dotnet::eq_ignore_case(waiter.trim(), &user));
-    if !waits {
-        return error(StatusCode::CONFLICT, NOTHING_WAITS_FOR_LIDARR);
-    }
-    match hearts.stop_waiting_for_lidarr(provider, id, &user).await {
-        StopWaiting::Stopped => {
-            info!("{admin} stopped waiting for Lidarr on {key} for {user} from the dashboard");
-            ok(&json!({ "status": "ok" }))
-        }
-        StopWaiting::NothingWaits => error(StatusCode::CONFLICT, NOTHING_WAITS_FOR_LIDARR),
     }
 }
 

@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.10
+# syntax=docker/dockerfile:1
 # Octo: the Rust server, published as ghcr.io/winters27/octo for amd64 and arm64 (docker.yml),
 # and built from this folder by docker-compose.yml's octo-source. The same contract as the C#
 # image it replaces: port 8080 (ASPNETCORE_URLS), /app/config for settings and state, /music for
@@ -68,17 +68,19 @@ RUN CARGO_PROFILE_RELEASE_LTO=off cargo build --release --locked --package octo-
 # Octo's own AcoustID application key, compiled into the server (octo-core's soulseek settings
 # read it with option_env!), never written in the source. The published images are given it by
 # docker.yml as the build secret acoustid_key (from the repository's secret), mounted into this
-# one step as an environment variable: a secret is never a build argument, so no layer, no
-# image history and no provenance holds it. OCTO_REQUIRE_ACOUSTID_KEY=1 fails the build when it
-# is blank. A build from source given neither has no built-in key: AcoustID then needs a key of
-# the user's own. OCTO_ACOUSTID_KEY_SHA256 is the key's hash, never the key: a build with a
-# rotated key differs in it, so this step runs again instead of reusing a cached build with the
-# old key.
+# one step as a file and read into the compile's environment there. A secret is never a build
+# argument, so the key is in no build argument, no image history and no provenance; the
+# compiled octo binary carries it, as a built-in key must. A file mount needs nothing newer of
+# BuildKit than any secret does, so a build from source on an older Docker still works.
+# OCTO_REQUIRE_ACOUSTID_KEY=1 fails the build when it is blank. A build from source given
+# neither has no built-in key: AcoustID then needs a key of the user's own.
+# OCTO_ACOUSTID_KEY_SHA256 is the key's hash, never the key: a build with a rotated key differs
+# in it, so this step runs again instead of reusing a cached build with the old key.
 ARG OCTO_REQUIRE_ACOUSTID_KEY
 ARG OCTO_ACOUSTID_KEY_SHA256
-RUN --mount=type=secret,id=acoustid_key,env=OCTO_ACOUSTID_APPLICATION_KEY \
-    echo "Octo's own AcoustID key: ${OCTO_ACOUSTID_KEY_SHA256:-none given} (its SHA-256)" \
-    && if [ -n "$OCTO_REQUIRE_ACOUSTID_KEY" ] && [ -z "$(printf '%s' "${OCTO_ACOUSTID_APPLICATION_KEY:-}" | tr -d '[:space:]')" ]; then \
+RUN --mount=type=secret,id=acoustid_key \
+    export OCTO_ACOUSTID_APPLICATION_KEY="$(cat /run/secrets/acoustid_key 2>/dev/null || true)" \
+    && if [ -n "$OCTO_REQUIRE_ACOUSTID_KEY" ] && [ -z "$(printf '%s' "$OCTO_ACOUSTID_APPLICATION_KEY" | tr -d '[:space:]')" ]; then \
         echo "The acoustid_key build secret is blank, and this build needs Octo's own AcoustID key." >&2; exit 1; \
     fi \
     && cargo build --release --locked --package octo --bin octo \

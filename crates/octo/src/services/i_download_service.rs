@@ -18,30 +18,21 @@ use tokio_util::sync::CancellationToken;
 
 use crate::services::common::AcquisitionPlace;
 use crate::services::library::ReplacementHandoff;
-use crate::services::lidarr::{GivingWay, HeldPlacement, ReplacedCopy};
+use crate::services::lidarr::HeldPlacement;
 
 /// An audio body being read, chunk by chunk. Dropping it closes the upstream response it reads
 /// from.
 pub type AudioStream = Pin<Box<dyn Stream<Item = std::io::Result<Bytes>> + Send>>;
 
-/// Where a held file was placed, and the files written beside it (its lyrics) that its placing
-/// moved along, by their placed paths.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PlacedHeld {
-    pub path: String,
-    pub beside: Vec<String>,
-}
-
-/// What putting back a copy Lidarr replaced came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Restored {
-    /// It is back where it was.
-    Back,
-    /// The song's own landed file for its people lies there: the copy gives way to it.
+/// What became of a file a Lidarr follow held, once nothing holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeldEnd {
+    /// Placed where the layout files it, at this path.
+    Placed(String),
+    /// Lidarr's file for its song passed the gate of someone it was kept for, and it gave way to
+    /// that file instead of landing beside it.
     GaveWay,
-    /// Its link is gone, so it can never come back.
-    Lost,
-    /// Something else lies there, or it could not be put back now: tried again later.
+    /// Neither, for now: it stays where it plays from and is tried again later.
     Later,
 }
 
@@ -183,37 +174,22 @@ pub trait IDownloadService: Send + Sync {
         None
     }
 
-    /// Places a file a Lidarr follow held back from the library, now that no follow holds it:
-    /// moved where the layout files it, with what was written beside it and the library's record
-    /// moved along. Where it landed, or None when it could not be placed (it then stays where it
-    /// plays from).
-    async fn place_held(&self, _held: &HeldPlacement) -> Option<PlacedHeld> {
-        None
+    /// Places a file a Lidarr follow held back from the library, now that no follow that may
+    /// still import holds it: moved where the layout files it, with what was written beside it and
+    /// the library's record moved along. A kept copy whose song's Lidarr file passed the gate of
+    /// someone it was kept for (`held.proven_for`) never lands beside that file: in the shared
+    /// library it gives way to it, and in the family pool it lands only in the libraries of the
+    /// members it is still for. The default leaves it where it plays from.
+    async fn place_held(&self, _held: &HeldPlacement) -> HeldEnd {
+        HeldEnd::Later
     }
 
     /// Drops a kept copy a Lidarr follow held back, its file and the library's record of it, once
-    /// a proven copy of its song passed the gate of everyone it was kept for (`users`). False, and
-    /// nothing changes, when the copy is anyone else's too. The default keeps it.
+    /// Lidarr's file for its song passed the gate of `users`: in the shared library when it was
+    /// kept for any of them (the library holds one file of a song), in the family pool only when
+    /// it was kept for no one else. False, and nothing changes, otherwise. The default keeps it.
     async fn drop_held(&self, _held: &HeldPlacement, _users: &[String]) -> bool {
         false
-    }
-
-    /// A copy Octo placed during a Lidarr follow gives way to the song's proven Lidarr file: its
-    /// file goes only while it is still the very file Octo placed (the same file as the link
-    /// Octo kept of it, or the same bytes as a copied one), with only the files its placing moved
-    /// beside it that no other file of that name shares, and only the library's record of the
-    /// kept version goes. A copy Lidarr's import replaced lets go of its record alone. Whether it
-    /// was dealt with (the caller then lets go of its link); the default keeps everything.
-    async fn drop_placed(&self, _copy: &GivingWay) -> bool {
-        false
-    }
-
-    /// Puts back a copy Octo placed during a Lidarr follow that Lidarr's import replaced, from the
-    /// link Octo kept, where it was and never beside another file: a file lying there now that is
-    /// the song's own landed file for its people makes it give way; any other leaves it for a
-    /// later try. The default tries later.
-    async fn restore_placed(&self, _copy: &ReplacedCopy) -> Restored {
-        Restored::Later
     }
 
     /// Gets the local path for a song if it has been downloaded already: the provider

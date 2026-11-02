@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 
 use super::*;
 use crate::services::lidarr::fake_lidarr::GrabFile;
-use crate::services::lidarr::{FollowEnd, PROVEN_ELSEWHERE, REPLACED_YOURS, StopWaiting};
+use crate::services::lidarr::{FollowEnd, HELD_FOR_LIDARR, PROVEN_ELSEWHERE, REPLACED_YOURS};
 
 /// The song a Teardrop heart's follow lists: the metadata's own id for it.
 fn teardrop(f: &Fixture) -> (String, String) {
@@ -135,16 +135,11 @@ fn hold_kept_copy(f: &Fixture) -> HeldPlacement {
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
         users: vec!["alice".into()],
-        own_copies: Vec::new(),
+        proven_for: Vec::new(),
     };
     f.pending.hold_placement(held.clone());
     let (provider, id) = teardrop(f);
-    f.tracker.wait_aside(
-        &provider,
-        &id,
-        &held.users,
-        crate::services::lidarr::HELD_FOR_LIDARR,
-    );
+    f.tracker.wait_aside(&provider, &id, &held.users, HELD_FOR_LIDARR);
     held
 }
 
@@ -773,7 +768,7 @@ async fn a_kept_copy_held_while_a_follow_is_open_waits_and_is_placed_when_it_end
     assert!(!f.heart_teardrop(&service).await);
     followed(&f, "dl-1").await;
     let held = hold_kept_copy(&f);
-    assert!(service.waits_for_lidarr("soulseek", &f.id("Teardrop")));
+    assert_eq!(f.pending.kept_copies_waiting(&teardrop_key(&f)).len(), 1);
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(entry(&f).following(), "a kept copy alone never ends the follow");
@@ -926,7 +921,7 @@ async fn another_hearts_proven_soulseek_file_ends_the_follow_and_lands() {
         kept: false,
         follows: vec![ALBUM_ID.into()],
         users: Vec::new(),
-        own_copies: Vec::new(),
+        proven_for: Vec::new(),
     });
     assert!(f.pending.request_end(ALBUM_ID, FollowEnd::ProvenElsewhere));
 
@@ -948,10 +943,12 @@ async fn another_hearts_proven_soulseek_file_ends_the_follow_and_lands() {
     over(&f).await;
 }
 
-/// "Stop waiting for Lidarr": the follow ends, Octo's download is removed, and the kept copy is
-/// placed at once. Nothing waits for a second tap.
+/// A follow that ends while Lidarr does not answer keeps the kept copy it held: Lidarr may still
+/// import Octo's download, so the copy waits, plays from the hold path and its row still says it
+/// waits. Once Lidarr answers, Octo's download is removed, and only then, with the follow over, is
+/// the copy placed.
 #[tokio::test]
-async fn stop_waiting_for_lidarr_ends_the_follow_and_places_the_kept_copy() {
+async fn an_ended_follow_places_its_kept_copy_only_once_it_is_over() {
     let f = Fixture::new().await;
     f.lidarr
         .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
@@ -959,169 +956,39 @@ async fn stop_waiting_for_lidarr_ends_the_follow_and_places_the_kept_copy() {
     assert!(!f.heart_teardrop(&service).await);
     followed(&f, "dl-1").await;
     let held = hold_kept_copy(&f);
-    let (provider, id) = teardrop(&f);
-    assert!(service.waits_for_lidarr(&provider, &id));
-    assert_eq!(service.stop_waiters(&provider, &id), ["alice"]);
+    f.lidarr.set_down(true);
 
+    assert!(f.pending.request_end(ALBUM_ID, FollowEnd::DeadDownload));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        f.placed.lock().is_empty(),
+        "never placed while Octo's download may still be imported"
+    );
+    assert!(
+        Path::new(&held.held_path).is_file(),
+        "it plays from the hold path"
+    );
+    assert_eq!(f.pending.held().len(), 1);
+    assert_eq!(f.pending.kept_copies_waiting(&teardrop_key(&f)).len(), 1);
+    assert_eq!(row_line(&f).as_deref(), Some(HELD_FOR_LIDARR));
     assert_eq!(
-        service.stop_waiting_for_lidarr(&provider, &id, "alice").await,
-        StopWaiting::Stopped
+        entry(&f).watched().count(),
+        1,
+        "Octo's download waits to be removed"
     );
 
+    f.lidarr.set_down(false);
+
     until(|| f.placed.lock().len() == 1).await;
+    assert!(removed(&f, 1), "removed before the copy was placed");
     assert!(Path::new(&held.target).is_file());
-    // Nobody else waits on the follow, so it ends and removes Octo's download.
-    until(|| removed(&f, 1)).await;
-    assert!(!service.waits_for_lidarr(&provider, &id));
-    assert!(service.stop_waiters(&provider, &id).is_empty());
     assert_ne!(
         row_line(&f).as_deref(),
-        Some(crate::services::lidarr::HELD_FOR_LIDARR),
+        Some(HELD_FOR_LIDARR),
         "the row no longer says it waits"
     );
-    assert_eq!(
-        service.stop_waiting_for_lidarr(&provider, &id, "alice").await,
-        StopWaiting::NothingWaits
-    );
     over(&f).await;
-}
-
-/// Two hearts on one follow: alice's kept Teardrop waits, and bob waits on Octo's download of
-/// Angel. Alice stops waiting, so her copy is placed while the follow stays open for bob, and a
-/// rescan links it into the album. It is Octo's own copy, never a file of the user's: the follow
-/// does not step aside, the artist still has no music of the user's, and bob's Angel still lands.
-/// Lidarr's import of Angel replaces every file the album had, alice's copy among them: Octo puts
-/// it back from the link it kept, and tells nobody a file of theirs was replaced.
-#[tokio::test]
-async fn a_rescan_linking_a_copy_octo_placed_never_makes_the_follow_step_aside() {
-    let f = Fixture::new().await;
-    f.lidarr.plan_grab(7, Grab::of("dl-1", &[(1, "Angel", "FLAC")]));
-    let service = f.service(None, 1);
-    assert!(!f.heart_teardrop(&service).await);
-    followed(&f, "dl-1").await;
-    let angel = format!("soulseek:{}", f.id("Angel"));
-    f.pending.update(ALBUM_ID, |entry| {
-        entry.songs.push(angel.clone());
-        entry.holders.push("bob".into());
-    });
-    let held = hold_kept_copy(&f);
-    let (provider, id) = teardrop(&f);
-
-    assert_eq!(
-        service.stop_waiting_for_lidarr(&provider, &id, "alice").await,
-        StopWaiting::Stopped
-    );
-    until(|| f.placed.lock().len() == 1).await;
-    assert!(Path::new(&held.target).is_file());
-    assert!(entry(&f).following(), "bob still waits on the follow");
-
-    f.lidarr.queue_command(
-        "RescanFolders",
-        serde_json::json!({ "folders": ["/data/music/Massive Attack"], "artistIds": [5] }),
-        "manual",
-    );
-    let linked = f.client().artist_track_files(5).await.expect("Lidarr answers");
-    assert!(
-        linked.iter().any(|file| file
-            .path
-            .as_deref()
-            .is_some_and(|path| path.ends_with("03 - Teardrop.m4a"))),
-        "the rescan linked alice's copy: {linked:?}"
-    );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let watching = entry(&f);
-    assert!(watching.following(), "Octo's own copy never makes it step aside");
-    assert!(watching.users_files.is_empty());
-    let music = service
-        .artist_music()
-        .read(ARTIST_ID)
-        .await
-        .expect("Lidarr answers");
-    assert!(
-        !music.has_music,
-        "a copy Octo placed is not the user's music for the artist"
-    );
-
-    f.lidarr.complete("dl-1");
-    f.lidarr.refresh();
-
-    until(|| f.taken() == ["Angel"]).await;
-    over(&f).await;
-    assert!(
-        Path::new(&held.target).is_file(),
-        "alice's copy is back where it was placed"
-    );
-    assert!(
-        !notes(&f, &teardrop_key(&f))
-            .iter()
-            .any(|(text, _)| text == REPLACED_YOURS),
-        "nobody is told a file of theirs was replaced"
-    );
-    let links = f.root.path().join(".octo-incoming/held/lidarr-placed");
-    assert!(
-        !std::fs::read_dir(&links).is_ok_and(|mut entries| entries.next().is_some()),
-        "the link goes once the follow is over"
-    );
-}
-
-/// The only music of an artist in Lidarr is a copy Octo placed while a follow of the artist is
-/// open, linked by a rescan and lying in the artist's folder: the artist has no music of the
-/// user's, so a pick may still use Lidarr for it. Once that follow is over, the copy is music of
-/// the library like any other, and Lidarr is left alone.
-#[tokio::test]
-async fn a_copy_octo_placed_during_an_open_follow_is_not_the_artists_music() {
-    let f = Fixture::new().await;
-    f.lidarr.user_album(ALBUM_ID, false);
-    let service = f.service(None, 1);
-    f.pending.remember(PendingAlbum {
-        foreign_album_id: ALBUM_ID.into(),
-        artist: "Massive Attack".into(),
-        title: "Mezzanine".into(),
-        search_command: 3,
-        ..Default::default()
-    });
-    let copy = f.lidarr.place_file(
-        "/data/music/Massive Attack/Mezzanine/03 - Teardrop.m4a",
-        b"the version alice heard",
-    );
-    f.lidarr
-        .queue_command("RescanFolders", serde_json::json!({}), "manual");
-    let kept = HeldPlacement {
-        song: teardrop_key(&f),
-        kept: true,
-        follows: vec![ALBUM_ID.to_string()],
-        users: vec!["alice".into()],
-        ..Default::default()
-    };
-    f.pending
-        .placed_copy(&kept, &copy.to_string_lossy(), None, Vec::new());
-    let artist = service
-        .artist_music()
-        .read(ARTIST_ID)
-        .await
-        .expect("Lidarr answers");
-    let artist_id = artist.artist.as_ref().expect("Lidarr has the artist").id;
-    assert_eq!(
-        f.client()
-            .artist_track_files(artist_id)
-            .await
-            .expect("Lidarr answers")
-            .len(),
-        1,
-        "the rescan linked the copy"
-    );
-    assert!(!artist.has_music, "Octo's own copy is not the user's music");
-
-    f.pending.forget(ALBUM_ID);
-    assert!(
-        service
-            .artist_music()
-            .read(ARTIST_ID)
-            .await
-            .expect("Lidarr answers")
-            .has_music,
-        "once the follow is over it is music of the library"
-    );
 }
 
 /// Octo's download was its client's only item and is gone from the client: Lidarr gives no proof
@@ -1172,7 +1039,7 @@ async fn a_download_octo_cannot_see_is_put_back_only_by_the_admin() {
 }
 
 /// A restart forgets every downloads row, but a copy held for an open follow still waits: its row
-/// comes back saying so, for the people it was kept for, and offers them Stop waiting.
+/// comes back saying so, for the people it was kept for.
 #[tokio::test]
 async fn a_copy_held_for_an_open_follow_has_its_row_back_after_a_restart() {
     let f = Fixture::new().await;
@@ -1198,7 +1065,7 @@ async fn a_copy_held_for_an_open_follow_has_its_row_back_after_a_restart() {
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
         users: vec!["alice".into()],
-        own_copies: Vec::new(),
+        proven_for: Vec::new(),
     });
     let service = f.service(None, 1);
     assert!(f.tracker.for_user("alice").is_empty(), "nothing listed yet");
@@ -1210,45 +1077,7 @@ async fn a_copy_held_for_an_open_follow_has_its_row_back_after_a_restart() {
         .iter()
         .find(|row| row.key == teardrop_key(&f))
         .expect("the row is back");
-    assert_eq!(
-        row.note.as_deref(),
-        Some(crate::services::lidarr::HELD_FOR_LIDARR)
-    );
-    let (provider, id) = teardrop(&f);
-    assert_eq!(service.stop_waiters(&provider, &id), ["alice"]);
-}
-
-/// "Stop waiting for Lidarr" while Lidarr does not answer: the kept copy is still placed at once;
-/// Octo's download is removed once Lidarr answers again.
-#[tokio::test]
-async fn stop_waiting_places_the_kept_copy_even_while_lidarr_does_not_answer() {
-    let f = Fixture::new().await;
-    f.lidarr
-        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]));
-    let service = f.service(None, 1);
-    assert!(!f.heart_teardrop(&service).await);
-    followed(&f, "dl-1").await;
-    let held = hold_kept_copy(&f);
-    let (provider, id) = teardrop(&f);
-    f.lidarr.set_down(true);
-
-    assert_eq!(
-        service.stop_waiting_for_lidarr(&provider, &id, "alice").await,
-        StopWaiting::Stopped
-    );
-
-    until(|| f.placed.lock().len() == 1).await;
-    assert!(Path::new(&held.target).is_file());
-    assert_eq!(
-        entry(&f).watched().count(),
-        1,
-        "Octo's download waits to be removed"
-    );
-
-    f.lidarr.set_down(false);
-
-    over(&f).await;
-    assert!(removed(&f, 1));
+    assert_eq!(row.note.as_deref(), Some(HELD_FOR_LIDARR));
 }
 
 /// The import timeout passed while Octo's download still moves: the heart's step ended, but the
@@ -2303,12 +2132,8 @@ async fn a_held_copy_that_could_not_be_placed_is_placed_at_the_next_start() {
     let folder = Path::new(&held.target).parent().expect("a folder").to_path_buf();
     std::fs::create_dir_all(folder.parent().expect("its parent")).expect("made");
     std::fs::write(&folder, b"in the way").expect("written");
-    let (provider, id) = teardrop(&f);
 
-    assert_eq!(
-        service.stop_waiting_for_lidarr(&provider, &id, "alice").await,
-        StopWaiting::Stopped
-    );
+    assert!(f.pending.request_end(ALBUM_ID, FollowEnd::DeadDownload));
     until(|| {
         f.pending
             .held()
@@ -2399,11 +2224,7 @@ async fn a_save_that_cannot_be_written_keeps_every_request_from_going_out() {
 
     assert!(!f.heart_teardrop(&service).await);
 
-    let sent: Vec<String> = f
-        .changes()
-        .into_iter()
-        .filter(|change| !change.starts_with("GET"))
-        .collect();
+    let sent = f.changes();
     assert!(sent.is_empty(), "{sent:?}");
     assert_eq!(f.lidarr.searches(), 0);
     assert!(f.pending.get(ALBUM_ID).is_none());
@@ -2640,108 +2461,15 @@ fn a_regrabbed_download_keeps_its_earlier_spans() {
     assert!(!pending.is_octos_grab_at("dl-1", start + TimeDelta::minutes(30)));
 }
 
-/// After a restart: a copy Octo placed that Lidarr replaced and that could not come back before is
-/// put back where it was, though its follow is over; a link in the hold path that no copy names
-/// any more goes.
-#[tokio::test]
-async fn a_restart_puts_back_an_owed_copy_and_sweeps_links_nothing_names() {
-    let f = Fixture::new().await;
-    let service = f.service(None, 30);
-    f.pending.remember(mezzanine_entry());
-    let links = f.root.path().join(".octo-incoming/held/lidarr-placed");
-    std::fs::create_dir_all(&links).expect("made");
-    let link = links.join("named.m4a");
-    std::fs::write(&link, b"the version alice heard").expect("written");
-    let orphan = links.join("orphan.m4a");
-    std::fs::write(&orphan, b"a copy that is over").expect("written");
-    let copy = f.root.path().join("Massive Attack/Mezzanine/03 - Teardrop.m4a");
-    let placed = f.pending.placed_copy(
-        &HeldPlacement {
-            song: teardrop_key(&f),
-            kept: true,
-            follows: vec![ALBUM_ID.to_string()],
-            users: vec!["alice".into()],
-            ..Default::default()
-        },
-        &copy.to_string_lossy(),
-        Some((link.to_string_lossy().into_owned(), true)),
-        Vec::new(),
-    );
-    assert_eq!(placed, crate::services::lidarr::PlacedAs::Octos);
-    assert!(f.pending.mark_replaced(&copy.to_string_lossy()));
-    f.pending.forget(ALBUM_ID);
-    assert_eq!(f.pending.replaced_copies(None, None).len(), 1, "owed back");
-
-    service.put_back_after_restart().await;
-
-    assert_eq!(
-        std::fs::read(&copy).expect("back where it was"),
-        b"the version alice heard"
-    );
-    assert!(f.pending.replaced_copies(None, None).is_empty());
-    assert!(!orphan.exists(), "nothing names it");
-}
-
-/// A copy Octo placed during another open follow of the artist, linked by a rescan, is the
-/// artist's only file in Lidarr: read again right before the search, it is never taken for the
-/// user's music, so the album is searched.
-#[tokio::test]
-async fn a_copy_octo_placed_during_another_follow_never_keeps_the_search_out() {
-    let f = Fixture::new().await;
-    f.lidarr.user_album(ALBUM_ID, false);
-    f.lidarr
-        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]).finished());
-    let service = f.service(None, 30);
-    f.pending.remember(PendingAlbum {
-        foreign_album_id: "rg-protection".into(),
-        artist: "Massive Attack".into(),
-        title: "Protection".into(),
-        search_command: 4,
-        ..Default::default()
-    });
-    let copy = f.lidarr.place_file(
-        "/data/music/Massive Attack/Mezzanine/03 - Teardrop.m4a",
-        b"the version alice heard",
-    );
-    f.pending.placed_copy(
-        &HeldPlacement {
-            song: "soulseek:teardrop-kept".into(),
-            kept: true,
-            follows: vec!["rg-protection".into()],
-            users: vec!["alice".into()],
-            ..Default::default()
-        },
-        &copy.to_string_lossy(),
-        None,
-        Vec::new(),
-    );
-    f.lidarr
-        .queue_command("RescanFolders", serde_json::json!({}), "manual");
-    assert_eq!(
-        f.client()
-            .artist_track_files(5)
-            .await
-            .expect("Lidarr answers")
-            .len(),
-        1,
-        "the rescan linked the copy"
-    );
-
-    f.heart_teardrop(&service).await;
-
-    assert_eq!(f.searched_albums(), [7], "searched, never left alone");
-    service.stop_following();
-}
-
-/// Behind a proxy whose clock lags Lidarr's, the `Date` header is the proxy's: a read's time on
-/// Lidarr's clock is never before the newest time Lidarr itself stamped on a command it lists.
+/// A read's time on Lidarr's clock is the newest time Lidarr itself stamped on what the read lists
+/// (a command, a queue item, a history row), never anyone else's clock; a read that lists no
+/// stamp at all has none.
 #[test]
-fn a_reads_time_is_never_before_what_lidarr_itself_stamped() {
+fn a_reads_time_is_the_newest_time_lidarr_itself_stamped() {
     use crate::services::lidarr::lidarr_heart_acquisition_service::follow::reading_now;
     use octo_core::lidarr::lidarr_client::LidarrCommand;
 
     let lidarrs = Utc::now();
-    let proxys = lidarrs - TimeDelta::hours(1);
     let command =
         |queued: Option<chrono::DateTime<Utc>>, ended: Option<chrono::DateTime<Utc>>| LidarrCommand {
             id: 1,
@@ -2753,18 +2481,92 @@ fn a_reads_time_is_never_before_what_lidarr_itself_stamped() {
             trigger: Some("scheduled".into()),
             body: serde_json::Map::new(),
         };
+    let commands = [
+        command(Some(lidarrs - TimeDelta::seconds(30)), Some(lidarrs)),
+        command(None, None),
+    ];
 
-    let now = reading_now(
-        proxys,
-        &[
-            command(Some(lidarrs - TimeDelta::seconds(30)), Some(lidarrs)),
-            command(None, None),
-        ],
-    );
-    assert_eq!(now, lidarrs);
+    assert_eq!(reading_now(&commands, &[], &[]), Some(lidarrs));
+    let imported = octo_core::lidarr::lidarr_client::LidarrHistoryRecord {
+        id: 9,
+        event: LidarrHistoryEvent::TrackFileImported,
+        date: lidarrs + TimeDelta::seconds(2),
+        album_id: 7,
+        artist_id: 5,
+        track_id: 3,
+        download_id: Some("dl-1".into()),
+        source_title: "Teardrop".into(),
+        data: Default::default(),
+    };
     assert_eq!(
-        reading_now(lidarrs, &[]),
-        lidarrs + TimeDelta::milliseconds(999),
-        "the header's second, to its end"
+        reading_now(&commands, &[], std::slice::from_ref(&imported)),
+        Some(lidarrs + TimeDelta::seconds(2)),
+        "a row Lidarr wrote after its last command"
     );
+    assert_eq!(reading_now(&[command(None, None)], &[], &[]), None);
+}
+
+/// Behind a proxy whose clock runs 30 seconds ahead of Lidarr's, the `Date` header of every answer
+/// is the proxy's. Octo's search reaches Lidarr, but its answer is lost: the follow still takes
+/// Lidarr's own command for Octo's search, since the time saved before it went out is the one
+/// Lidarr stamped on a health check, and its import lands.
+#[tokio::test]
+async fn a_proxy_clock_ahead_of_lidarrs_never_loses_octos_search() {
+    let f = Fixture::new().await;
+    f.lidarr.set_date_header_skew(TimeDelta::seconds(30));
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]).finished());
+    f.lidarr.lose_next_command_answer("AlbumSearch");
+    let service = f.service(None, 30);
+
+    assert!(f.heart_teardrop(&service).await);
+
+    assert_eq!(f.taken(), ["Teardrop"]);
+    assert_eq!(f.lidarr.searches(), 1);
+    over(&f).await;
+}
+
+/// The save of Lidarr's time right before Octo's search takes a second and a half (a slow or
+/// spun-down disk): Lidarr's time is read and saved again, so the time saved lies right before the
+/// search Lidarr queued, never the length of a slow save before it. Its answer lost, the search is
+/// still followed as Octo's.
+#[tokio::test]
+async fn a_slow_save_of_lidarrs_time_is_read_again_before_the_search() {
+    let f = Fixture::new().await;
+    f.lidarr
+        .plan_grab(7, Grab::of("dl-1", &[(3, "Teardrop", "FLAC")]).finished());
+    f.lidarr.lose_next_command_answer("AlbumSearch");
+    f.pending.slow_next_save(Duration::from_millis(1_500));
+    let service = f.service(None, 30);
+
+    assert!(f.heart_teardrop(&service).await);
+
+    let commands = f.client().commands().await.expect("Lidarr answers");
+    let search = commands
+        .iter()
+        .find(|command| command.name == "AlbumSearch")
+        .and_then(|command| command.queued)
+        .expect("Octo's search");
+    let saved = commands
+        .iter()
+        .filter(|command| command.name == "CheckHealth")
+        .filter_map(|command| command.queued)
+        .filter(|queued| *queued <= search)
+        .max()
+        .expect("Lidarr's time saved before the search");
+    assert!(
+        search - saved < TimeDelta::milliseconds(1_000),
+        "the search went out {:?} after the time saved for it",
+        search - saved
+    );
+    let health_checks = commands
+        .iter()
+        .filter(|command| command.name == "CheckHealth")
+        .count();
+    assert!(
+        health_checks >= 2,
+        "Lidarr's time was read again after the slow save"
+    );
+    assert_eq!(f.taken(), ["Teardrop"]);
+    over(&f).await;
 }

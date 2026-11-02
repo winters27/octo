@@ -5036,8 +5036,7 @@ async function dlogLoad(cacheKey, key, at, holder) {
 }
 
 // In progress: Log and Find songs under each card (an album's row is no one song, so it has no
-// Find songs), a held one's Keep anyway and Stop waiting for Lidarr, and the log across the panel
-// when open.
+// Find songs), a held one's Keep anyway, and the log across the panel when open.
 function acqActions(a) {
   if (!a.key) return '';
   const open = dlogIsOpen(a.key);
@@ -5083,17 +5082,15 @@ document.getElementById('acq-list')?.addEventListener('click', event => {
   toggle.querySelector('use')?.setAttribute('href', `#${open ? 'i-caret-down' : 'i-caret-right'}`);
 });
 
-// ── A held download: Keep anyway and Stop waiting for Lidarr ────────────────
-// A held card offers Keep anyway (Keep these anyway on an album holding two or more tracks) and,
-// while a kept copy of its song waits for a Lidarr download, Stop waiting for Lidarr. Each acts
-// for one person: its menu lists who may, read when it opens (only to a Navidrome admin's own
+// ── A held download: Keep anyway ────────────────────────────────────────────
+// A held card offers Keep anyway (Keep these anyway on an album holding two or more tracks). It
+// acts for one person: its menu lists who may, read when it opens (only to a Navidrome admin's own
 // sign-in), each with the label the server gives (their name while Record who asked is on, else
 // "Listener 1" and so on) and an opaque token that names them back. A person picked runs the
-// action the apps' keepAcquisitionAnyway and stopWaitingForLidarr run, for that token. What each
-// menu shows is kept here, so the list's redraw every few seconds leaves an open menu as it was.
+// action the apps' keepAcquisitionAnyway runs, for that token. What the menu shows is kept here,
+// so the list's redraw every few seconds leaves an open menu as it was.
 const ACQ_MENUS = {
   keep: { people: 'keepers', path: '/api/admin/acquisitions/keep', caption: 'Whose copy to keep', none: 'Nothing is waiting to be kept' },
-  stop: { people: 'stopWaiters', path: '/api/admin/acquisitions/stop-waiting', caption: 'Whose copy should stop waiting', none: 'Nothing is waiting for Lidarr' },
 };
 const acqMenu = { open: new Set(), people: new Map(), error: new Map(), busy: new Set() };
 const acqMenuId = (kind, key) => `${kind}|${key}`;
@@ -5103,8 +5100,7 @@ function acqKeepLabel(a) {
 }
 
 function acqHeldMenus(a) {
-  return (a.keepAnyway ? acqMenuMarkup(a.key, 'keep', acqKeepLabel(a)) : '')
-    + (a.stopWaiting ? acqMenuMarkup(a.key, 'stop', 'Stop waiting for Lidarr') : '');
+  return a.keepAnyway ? acqMenuMarkup(a.key, 'keep', acqKeepLabel(a)) : '';
 }
 
 function acqMenuMarkup(key, kind, label) {
@@ -5141,7 +5137,7 @@ function acqMenuFill(key) {
   });
 }
 
-// Who may keep the row, and whose kept copy of its song waits for Lidarr, read fresh.
+// Who may keep the row, read fresh.
 async function acqMenuLoad(key, holder) {
   acqMenu.people.delete(key);
   acqMenuFill(key);
@@ -5172,8 +5168,8 @@ function acqMenuToggled(details) {
   acqMenuLoad(key, details.querySelector('[data-acq-menu-body]') || details);
 }
 
-// A person picked: their copy is kept, or stops waiting. The card is drawn again either way: a
-// done row offers it no more, and a refusal shows its words in the menu.
+// A person picked: their copy is kept. The card is drawn again either way: a done row offers it
+// no more, and a refusal shows its words in the menu.
 async function acqMenuAct(button) {
   const kind = button.dataset.acqAct;
   const key = button.dataset.acqKey;

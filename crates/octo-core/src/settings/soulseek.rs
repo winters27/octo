@@ -553,8 +553,9 @@ mod acoust_id_key_tests {
     /// secret before building and hands the key to the server's build only as a build secret
     /// (never a build argument, which an image's history and provenance keep), with the
     /// requirement and the key's hash as build arguments and the provenance kept to its minimum;
-    /// the Dockerfile mounts the secret into the server's build step alone, checks it again, and
-    /// the compile refuses a blank key.
+    /// the Dockerfile mounts the secret as a file into the server's build step alone (no `env=`,
+    /// which an older BuildKit cannot build), reads the key from that file only, never prints it
+    /// or its hash, checks it again, and the compile refuses a blank key.
     #[test]
     fn the_published_image_is_built_with_octos_own_acoustid_key() {
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -589,14 +590,17 @@ mod acoust_id_key_tests {
         assert!(step.contains("provenance: mode=min"));
 
         let dockerfile = read("Dockerfile");
-        assert!(dockerfile.starts_with("# syntax=docker/dockerfile:1.10\n"));
+        assert!(dockerfile.starts_with("# syntax=docker/dockerfile:1\n"));
         assert!(
             !dockerfile.contains("ARG OCTO_ACOUSTID_APPLICATION_KEY"),
             "the key is no build argument"
         );
-        assert!(
-            !dockerfile.contains("OCTO_ACOUSTID_APPLICATION_KEY="),
-            "the Dockerfile names no key"
+        let from_the_secret =
+            "OCTO_ACOUSTID_APPLICATION_KEY=\"$(cat /run/secrets/acoustid_key 2>/dev/null || true)\"";
+        assert_eq!(
+            dockerfile.matches("OCTO_ACOUSTID_APPLICATION_KEY=").count(),
+            dockerfile.matches(from_the_secret).count(),
+            "the Dockerfile names no key: it reads it from the secret's file alone"
         );
         let required = dockerfile
             .find("ARG OCTO_REQUIRE_ACOUSTID_KEY")
@@ -605,18 +609,28 @@ mod acoust_id_key_tests {
             .find("ARG OCTO_ACOUSTID_KEY_SHA256")
             .expect("the key's hash, which rebuilds the server when the key changes");
         let mount = dockerfile
-            .find("RUN --mount=type=secret,id=acoustid_key,env=OCTO_ACOUSTID_APPLICATION_KEY")
-            .expect("the secret mounted into the server's build step");
+            .find("RUN --mount=type=secret,id=acoustid_key \\\n")
+            .expect("the secret mounted as a file into the server's build step");
         let server = dockerfile
             .find("cargo build --release --locked --package octo --bin octo")
             .expect("the server's build");
         assert!(required < mount && hash < mount && mount < server);
+        assert!(
+            !dockerfile.contains(",env="),
+            "no secret mounted as an environment variable"
+        );
         assert_eq!(
             dockerfile.matches("--mount=type=secret").count(),
             1,
             "no other step sees the key"
         );
-        assert!(dockerfile[mount..server].contains("exit 1"));
+        let step = &dockerfile[mount..server];
+        assert!(step.contains(from_the_secret));
+        assert!(step.contains("exit 1"));
+        assert!(
+            !dockerfile.contains("${OCTO_ACOUSTID_KEY_SHA256"),
+            "the build log prints neither the key nor its hash"
+        );
     }
 
     /// Only a requirement given a value asks the build for Octo's own key: one set but blank does

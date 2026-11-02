@@ -600,34 +600,18 @@ impl LidarrClient {
 
     /// When the running Lidarr started.
     pub async fn start_time(&self) -> Result<Option<DateTime<Utc>>, LidarrError> {
-        Ok(self.status_times().await?.0)
+        let status = self.get_object("/api/v1/system/status").await?;
+        nullable_date(&status, "startTime")
     }
 
-    /// The time on Lidarr's own clock, to the second, from its answer's `Date` header: every time
-    /// Octo compares with Lidarr's dates comes from Lidarr.
+    /// The time on Lidarr's own clock now, to the millisecond: when Lidarr queued a health check
+    /// Octo posts for it. Octo compares Lidarr's dates only with times Lidarr stamped itself, never
+    /// with an answer's `Date` header, which a proxy in front of Lidarr may write by its own clock.
     pub async fn now(&self) -> Result<DateTime<Utc>, LidarrError> {
-        Ok(self.status_times().await?.1)
-    }
-
-    /// When the running Lidarr started, and the time on its clock now.
-    pub async fn status_times(&self) -> Result<(Option<DateTime<Utc>>, DateTime<Utc>), LidarrError> {
-        let request = self.request(Method::GET, "/api/v1/system/status", None)?;
-        let timeout = request.timeout.unwrap_or(Self::TIMEOUT);
-        let response = self.send(request).await?;
-        let now = response
-            .headers()
-            .get(reqwest::header::DATE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| DateTime::parse_from_rfc2822(value.trim()).ok())
-            .map(|date| date.with_timezone(&Utc))
-            .ok_or_else(|| LidarrError::InvalidOperation("Lidarr's answer carries no Date header.".into()))?;
-        let text = response
-            .text()
-            .await
-            .map_err(|error| transport_error(error, timeout))?;
-        let node = serde_json::from_str(&text).map_err(|e| LidarrError::Json(e.to_string()))?;
-        let status = Self::object_of(node)?;
-        Ok((nullable_date(&status, "startTime")?, now))
+        let command = self.check_health().await?;
+        command.queued.or(command.started).ok_or_else(|| {
+            LidarrError::InvalidOperation("Lidarr's health check carries no time it was queued.".into())
+        })
     }
 
     /// Lidarr's health checks as they stand.
