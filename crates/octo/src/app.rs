@@ -53,7 +53,7 @@ use crate::services::cover_art::{
 };
 use octo_media::cover::CoverArtService;
 
-use crate::services::apple::{AppleCatalog, ApplePace, ServerStore};
+use crate::services::apple::{AppleCatalog, ApplePace, PaceConfig, ServerStore};
 use crate::services::charts::{AppleMusicPages, ChartCountryStore, ChartsWarmWorker, GenreNames};
 use crate::services::common::HeartGates;
 use crate::services::common::IAcquisitionActivity;
@@ -1838,17 +1838,22 @@ struct MetadataClients {
 impl MetadataClients {
     /// `itunes_cache`: where the iTunes matches persist, or None to keep them in memory only.
     fn build(settings: &Arc<SettingsStore>, itunes_cache: Option<PathBuf>) -> Self {
-        Self::build_with(settings, itunes_cache, None)
+        Self::build_with(settings, itunes_cache, None, None)
     }
 
-    /// `deezer_base_url`: a test's mock server in place of api.deezer.com.
+    /// `deezer_base_url`: a test's mock server in place of api.deezer.com; `deezer_api_host`: the
+    /// host the door treats as Deezer's API (the mock's, when a test wires the catalog stand-in).
     fn build_with(
         settings: &Arc<SettingsStore>,
         itunes_cache: Option<PathBuf>,
         deezer_base_url: Option<&str>,
+        deezer_api_host: Option<&str>,
     ) -> Self {
         let deezer_rate_limiter = Arc::new(DeezerRateLimiter::new());
-        let deezer_client = Arc::new(DeezerRateLimitHandler::new(Arc::clone(&deezer_rate_limiter)));
+        let deezer_client = Arc::new(match deezer_api_host {
+            Some(host) => DeezerRateLimitHandler::with_api_host(Arc::clone(&deezer_rate_limiter), host),
+            None => DeezerRateLimitHandler::new(Arc::clone(&deezer_rate_limiter)),
+        });
         let deezer_metadata = Arc::new(match deezer_base_url {
             Some(base) => {
                 DeezerMetadataService::with_base_url(Arc::clone(&deezer_client), Arc::clone(settings), base)
@@ -1898,42 +1903,81 @@ impl MetadataClients {
 struct CatalogStandIn {
     reach: Arc<DeezerReach>,
     apple: Arc<AppleCatalog>,
+    stand_in: Arc<DeezerStandIn>,
 }
 
 impl CatalogStandIn {
     fn wire(clients: &MetadataClients, config_dir: &Path) -> Self {
         let pace = ApplePace::shared();
+        let apple = Arc::new(AppleCatalog::new(
+            Arc::clone(&pace),
+            Some(config_dir.join("apple-store.json")),
+        ));
+        Self::wire_with(clients, pace, apple, DeezerMetadataService::BASE)
+    }
+
+    /// A test's stand-in: Apple at its mock server on a pace that never waits, and `/infos` read
+    /// from the test's mock Deezer.
+    fn wire_for_tests(clients: &MetadataClients, apple_base: &str, deezer_base: &str) -> Self {
+        let pace = Arc::new(ApplePace::new(PaceConfig::unpaced()));
+        let apple = Arc::new(AppleCatalog::with_bases(
+            Arc::clone(&pace),
+            apple_base,
+            apple_base,
+            None,
+        ));
+        let wired = Self::wire_with(clients, pace, apple, deezer_base);
+        clients.deezer_metadata.follow_switches();
+        wired.stand_in.follow_switches();
+        wired
+    }
+
+    fn wire_with(
+        clients: &MetadataClients,
+        pace: Arc<ApplePace>,
+        apple: Arc<AppleCatalog>,
+        infos_origin: &str,
+    ) -> Self {
         let reach = Arc::new(DeezerReach::new(Arc::clone(&pace)));
-        let apple = Arc::new(AppleCatalog::new(pace, Some(config_dir.join("apple-store.json"))));
         let stand_in = Arc::new(DeezerStandIn::new(Arc::clone(&reach), Arc::clone(&apple)));
         stand_in.set_door(Arc::downgrade(&clients.deezer_client));
         stand_in.set_hints(Arc::clone(&clients.artwork_hints));
-        clients.deezer_client.set_stand_in(stand_in);
+        clients.deezer_client.set_stand_in(Arc::clone(&stand_in));
         reach.set_reader(Arc::new(DoorInfos::new(
             Arc::downgrade(&clients.deezer_client),
-            DeezerMetadataService::BASE,
+            infos_origin,
         )));
-        Self { reach, apple }
+        Self {
+            reach,
+            apple,
+            stand_in,
+        }
     }
 
     /// Which Apple store to ask: the server's own country, once the charts can tell it.
     fn use_store_of(&self, settings: &Arc<SettingsStore>, top_songs: &TopSongsService) {
-        let top_songs = top_songs.clone();
+        let (pages, apple_has) = (top_songs.clone(), top_songs.clone());
         self.apple.set_store_source(Arc::new(ServerStore::new(
             Arc::clone(settings),
-            Arc::new(move || top_songs.known_country()),
+            Arc::new(move || pages.known_country()),
+            Arc::new(move |code: &str| apple_has.has_country(code)),
             Arc::clone(&self.reach),
         )));
     }
 
-    /// At start: Deezer's `/infos` is read once, and the Deezer service's caches are cleared at
-    /// every catalog switch from then on.
+    /// At start: Deezer's `/infos` is read once, and the Deezer service's caches and what the
+    /// stand-in learned are cleared at every catalog switch from then on.
     fn register_workers(&self, workers: &WorkerSupervisor, deezer: &Arc<DeezerMetadataService>) {
-        let (reach, deezer) = (Arc::clone(&self.reach), Arc::clone(deezer));
+        let (reach, stand_in, deezer) = (
+            Arc::clone(&self.reach),
+            Arc::clone(&self.stand_in),
+            Arc::clone(deezer),
+        );
         workers.register("DeezerReach", move |_stopping| {
-            let (reach, deezer) = (Arc::clone(&reach), Arc::clone(&deezer));
+            let (reach, stand_in, deezer) = (Arc::clone(&reach), Arc::clone(&stand_in), Arc::clone(&deezer));
             async move {
                 deezer.follow_switches();
+                stand_in.follow_switches();
                 reach.read_at_start();
                 Ok(())
             }
@@ -2813,6 +2857,10 @@ pub struct TestServices {
     pub music_brainz_base_url: Option<String>,
     /// Where AcoustID is asked (a test's mock server).
     pub acoust_id_base_url: Option<String>,
+    /// Where the catalog stand-in asks Apple (a test's mock server), with `deezer_base_url` as
+    /// Deezer's API and its `/infos`. None wires no stand-in: a mock Deezer answers as Deezer and
+    /// no test asks Apple.
+    pub apple_catalog_base_url: Option<String>,
 }
 
 /// MusicBrainz at a test's mock server, paced for a test that runs in seconds.
@@ -3811,9 +3859,25 @@ impl AppState {
         let stores = Stores::build_with(&settings, &config_dir, overrides.external_id_registry.clone());
         // The clients point at the real hosts but ask nothing until a test calls them, and
         // the iTunes matches stay in memory.
-        let mut clients = MetadataClients::build_with(&settings, None, overrides.deezer_base_url.as_deref());
-        // Test builds wire no stand-in: a mock Deezer answers as Deezer, and no test asks Apple.
-        let deezer_reach: Option<Arc<DeezerReach>> = None;
+        // Test builds wire no stand-in unless a test asks for one: a mock Deezer answers as Deezer,
+        // and no test asks Apple.
+        let stand_in_bases = overrides
+            .apple_catalog_base_url
+            .as_deref()
+            .zip(overrides.deezer_base_url.as_deref());
+        let deezer_api_host = stand_in_bases
+            .and_then(|(_, deezer)| url::Url::parse(deezer).ok())
+            .and_then(|deezer| deezer.host_str().map(str::to_string));
+        let mut clients = MetadataClients::build_with(
+            &settings,
+            None,
+            overrides.deezer_base_url.as_deref(),
+            deezer_api_host.as_deref(),
+        );
+        let catalog_stand_in =
+            stand_in_bases.map(|(apple, deezer)| CatalogStandIn::wire_for_tests(&clients, apple, deezer));
+        let deezer_reach: Option<Arc<DeezerReach>> =
+            catalog_stand_in.as_ref().map(|wired| Arc::clone(&wired.reach));
         if let Some(base) = overrides.music_brainz_base_url.as_deref() {
             clients.music_brainz = Arc::new(test_music_brainz(base));
         }
@@ -3952,6 +4016,9 @@ impl AppState {
             Some(&apple_base),
             &config_dir,
         );
+        if let Some(wired) = &catalog_stand_in {
+            wired.use_store_of(&settings, &charts.top_songs);
+        }
         let sync_catalog = Arc::new(SyncCatalogService::new(
             navidrome.subsonic_proxy.clone(),
             metadata_service.clone(),
