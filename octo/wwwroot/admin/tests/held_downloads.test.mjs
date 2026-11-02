@@ -1,7 +1,7 @@
 // Runs two blocks of admin.js against scripted fakes of the page and the admin API: the Status
 // page's downloads card (the part between `function renderDownloadChecks` and the status refresh
-// button's listener), and a held In progress card's Keep anyway and Stop waiting for Lidarr menus
-// (between `const ACQ_MENUS` and the Fetched songs log).
+// button's listener), and a held In progress card's Keep anyway menu (between `const ACQ_MENUS`
+// and the Fetched songs log).
 //
 //   node --test octo/wwwroot/admin/tests/held_downloads.test.mjs
 
@@ -195,7 +195,7 @@ const holder = (label, token) => ({ label, token });
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
-test('a held row offers Keep anyway, Keep these anyway for two or more held tracks, and Stop waiting for Lidarr', () => {
+test('a held row offers Keep anyway, and Keep these anyway for two or more held tracks', () => {
   const { context } = menusPage({});
   const song = context.acqHeldMenus({ key: 'soulseek:help', keepAnyway: true });
   assert.ok(song.includes('>Keep anyway<'));
@@ -203,17 +203,21 @@ test('a held row offers Keep anyway, Keep these anyway for two or more held trac
   assert.ok(one.includes('>Keep anyway<'), "one held track's note already says keep it anyway");
   const album = context.acqHeldMenus({ key: 'soulseek:album', keepAnyway: true, heldTracks: 3 });
   assert.ok(album.includes('>Keep these anyway<'));
-  const waits = context.acqHeldMenus({ key: 'soulseek:teardrop', stopWaiting: true });
-  assert.ok(waits.includes('>Stop waiting for Lidarr<'));
-  assert.ok(!waits.includes('Keep'));
   assert.equal(context.acqHeldMenus({ key: 'soulseek:angel' }), '', 'nothing held offers nothing');
+});
+
+test('nothing offers to stop waiting for Lidarr, whatever a row carries', () => {
+  const { context } = menusPage({});
+  assert.equal(context.acqHeldMenus({ key: 'soulseek:teardrop', stopWaiting: true }), '');
+  assert.ok(!menusBlock.includes('Stop waiting'), 'no words of it are left in the menus');
+  assert.ok(!source.includes('/api/admin/acquisitions/stop-waiting'), 'no call of it is left in admin.js');
 });
 
 test('the holder menu reads who may keep, and a person picked keeps for them by their token', async () => {
   const page = menusPage({
     '/api/admin/acquisitions/holders': {
       status: 200,
-      body: { key: 'soulseek:help', keepers: [holder('alice', 'token-a'), holder('bob', 'token-b')], stopWaiters: [] },
+      body: { key: 'soulseek:help', keepers: [holder('alice', 'token-a'), holder('bob', 'token-b')] },
     },
     '/api/admin/acquisitions/keep': { status: 200, body: { status: 'ok' } },
   });
@@ -246,7 +250,7 @@ test('with Record who asked off the menu names nobody: it shows the labels the s
   const page = menusPage({
     '/api/admin/acquisitions/holders': {
       status: 200,
-      body: { keepers: [holder('Listener 1', 'token-a'), holder('Listener 2', 'token-b')], stopWaiters: [] },
+      body: { keepers: [holder('Listener 1', 'token-a'), holder('Listener 2', 'token-b')] },
     },
   });
   const { details, body } = page.open('keep', 'soulseek:help');
@@ -258,7 +262,7 @@ test('with Record who asked off the menu names nobody: it shows the labels the s
 
 test('a refused keep shows its words in the menu, which stays open', async () => {
   const page = menusPage({
-    '/api/admin/acquisitions/holders': { status: 200, body: { keepers: [holder('alice', 'token-a')], stopWaiters: [] } },
+    '/api/admin/acquisitions/holders': { status: 200, body: { keepers: [holder('alice', 'token-a')] } },
     '/api/admin/acquisitions/keep': { status: 409, body: { error: 'Nothing is waiting to be kept' } },
   });
   const { details, body } = page.open('keep', 'soulseek:help');
@@ -268,23 +272,6 @@ test('a refused keep shows its words in the menu, which stays open', async () =>
   const redrawn = page.context.acqMenuMarkup('soulseek:help', 'keep', 'Keep anyway');
   assert.ok(redrawn.includes(' open'));
   assert.ok(redrawn.includes('Nothing is waiting to be kept'));
-});
-
-test('Stop waiting for Lidarr picks from whose kept copy waits, and stops for that person', async () => {
-  const page = menusPage({
-    '/api/admin/acquisitions/holders': { status: 200, body: { keepers: [], stopWaiters: [holder('alice', 'token-a')] } },
-    '/api/admin/acquisitions/stop-waiting': { status: 200, body: { status: 'ok' } },
-  });
-  const { details, body } = page.open('stop', 'soulseek:teardrop');
-  page.context.acqMenuToggled(details);
-  await settle();
-  assert.ok(body.innerHTML.includes('Whose copy should stop waiting'));
-  await page.pick('stop', 'soulseek:teardrop', 'token-a', body);
-  assert.deepEqual(page.calls.fetches[1], {
-    path: '/api/admin/acquisitions/stop-waiting',
-    method: 'POST',
-    body: { key: 'soulseek:teardrop', token: 'token-a' },
-  });
 });
 
 test('an album row offers no Find songs in any state; a song row does', () => {
@@ -303,13 +290,10 @@ test('an album row offers no Find songs in any state; a song row does', () => {
 
 test('a menu with nobody left says nothing waits', async () => {
   const page = menusPage({
-    '/api/admin/acquisitions/holders': { status: 200, body: { keepers: [], stopWaiters: [] } },
+    '/api/admin/acquisitions/holders': { status: 200, body: { keepers: [] } },
   });
   const keep = page.open('keep', 'soulseek:help');
   page.context.acqMenuToggled(keep.details);
-  const stop = page.open('stop', 'soulseek:help');
-  page.context.acqMenuToggled(stop.details);
   await settle();
   assert.ok(keep.body.innerHTML.includes('Nothing is waiting to be kept'));
-  assert.ok(stop.body.innerHTML.includes('Nothing is waiting for Lidarr'));
 });

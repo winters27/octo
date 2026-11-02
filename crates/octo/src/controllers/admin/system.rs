@@ -143,8 +143,8 @@ pub async fn downloads(State(state): State<AppState>) -> Response {
 /// hour, everyone's, newest first. The rows the app reads through getAcquisitions, plus the
 /// provider key, and who asked only while Record who asked is on, the rule the fetched-songs
 /// log follows too. A row says `keepAnyway` while someone waiting in its holds may keep it
-/// anyway, `heldTracks` on a hearted album holding tracks, and `stopWaiting` while a kept copy
-/// of its song waits for Lidarr; who they are is read from `acquisitions/holders`.
+/// anyway, and `heldTracks` on a hearted album holding tracks; who may keep it is read from
+/// `acquisitions/holders`.
 pub async fn acquisitions(State(state): State<AppState>) -> Response {
     let show_askers = state.settings.current().subsonic.record_requested_by;
     let coordinator = &state.heart_acquisition_coordinator;
@@ -161,10 +161,6 @@ pub async fn acquisitions(State(state): State<AppState>) -> Response {
             row.held_tracks = held
                 .held_tracks(&row.key)
                 .map(|count| i32::try_from(count).unwrap_or(i32::MAX));
-            row.stop_waiting = !state
-                .lidarr_hearts
-                .stop_waiters(&row.provider, &row.external_id)
-                .is_empty();
             row
         })
         .map(|row| {

@@ -2166,8 +2166,8 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 /* An In progress card's actions sit under its words; an open log takes the panel's whole width. */
 .acq-actions { display: flex; flex-wrap: wrap; gap: var(--s-s); margin-top: 10px; }
 .acq-actions .btn { padding: 0 10px; }
-/* A held card's Keep anyway and Stop waiting for Lidarr: a button that opens the people it can
- * act for, under the card's other actions. */
+/* A held card's Keep anyway: a button that opens the people it can act for, under the card's
+ * other actions. */
 .acq-menu > summary { list-style: none; cursor: pointer; gap: 6px; }
 .acq-menu > summary::-webkit-details-marker { display: none; }
 .acq-menu > summary .icon { width: 14px; height: 14px; transition: transform var(--t-card) var(--ease); }
