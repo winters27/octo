@@ -40,6 +40,15 @@ impl HttpAnswer {
         }
     }
 
+    /// An answer made up from a JSON document (an answer from another catalog in this one's shape).
+    pub fn from_json(status: StatusCode, document: &serde_json::Value) -> HttpAnswer {
+        HttpAnswer {
+            status,
+            body: Bytes::from(serde_json::to_vec(document).unwrap_or_default()),
+            retry_after: None,
+        }
+    }
+
     /// A success status: 200-299.
     pub fn is_success(&self) -> bool {
         self.status.is_success()
