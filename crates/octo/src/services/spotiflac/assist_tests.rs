@@ -685,21 +685,162 @@ fn cleanup_worker(client: &Arc<SpotiflacClient>) -> tokio_util::sync::Cancellati
     stopping
 }
 
+/// Runs the cleanup worker until the returned token is cancelled, past its start with nothing
+/// kept, so only a later wake makes it sweep.
+async fn cleanup_worker_started_empty(client: &Arc<SpotiflacClient>) -> tokio_util::sync::CancellationToken {
+    assert!(!client.check.store.keeps_pass_jobs());
+    let stopping = cleanup_worker(client);
+    tokio::task::yield_now().await;
+    stopping
+}
+
+/// Waits until no song job is kept, or two seconds pass.
+async fn until_no_job_is_kept(client: &SpotiflacClient) {
+    for _ in 0..200 {
+        if !client.check.store.keeps_pass_jobs() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
-async fn a_read_that_reaches_mornye_has_the_worker_end_a_job_a_stopped_run_left() {
+async fn the_worker_ends_a_job_an_earlier_octo_left_when_it_starts_with_no_read() {
     let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
     let dir = tempfile::tempdir().expect("a folder");
     let left = left_job(&w.client, dir.path());
     w.client.check.store.keep_pass_job(left.clone());
-    let stopping = cleanup_worker(&w.client);
 
-    let _ = w.client.check_view(Some(Instant::now())).await;
-    for _ in 0..200 {
-        if !w.client.check.store.keeps_pass_jobs() {
+    let stopping = cleanup_worker(&w.client);
+    until_no_job_is_kept(&w.client).await;
+    stopping.cancel();
+
+    assert_eq!(
+        requests_to(&w.mornye, "/api/get_signed_sessions").await,
+        0,
+        "no read"
+    );
+    assert_eq!(
+        requests_to(&w.mornye, "/api/v1/downloads/left-job/cancel").await,
+        1
+    );
+    assert!(!std::path::Path::new(&left.dir).exists());
+    assert!(w.client.check.store.pass_jobs().is_empty());
+}
+
+#[tokio::test]
+async fn a_sweep_while_mornye_is_off_keeps_every_job_and_asks_nothing() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let dir = tempfile::tempdir().expect("a folder");
+    let left = left_job(&w.client, dir.path());
+    w.client.check.store.keep_pass_job(left.clone());
+    let mut off = (*w.client.settings.current()).clone();
+    off.spotiflac.enabled = false;
+    w.client.settings.set(off);
+
+    w.client.end_left_pass_jobs().await;
+
+    assert_eq!(
+        requests_to(&w.mornye, "/api/v1/downloads/left-job/cancel").await,
+        0
+    );
+    assert_eq!(w.client.check.store.pass_jobs(), vec![left.clone()]);
+    assert!(std::path::Path::new(&left.dir).exists());
+}
+
+#[tokio::test]
+async fn octo_stopping_ends_the_worker_partway_through_a_sweep_and_the_rest_stay_kept() {
+    let (mornye, client) = slow_mornye(Duration::ZERO, Duration::from_secs(2)).await;
+    let dir = tempfile::tempdir().expect("a folder");
+    for _ in 0..5 {
+        client.check.store.keep_pass_job(left_job(&client, dir.path()));
+    }
+    let stopping = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(Arc::clone(&client).clean_left_pass_jobs(stopping.clone()));
+    for _ in 0..100 {
+        if requests_to(&mornye, "/api/v1/downloads/left-job/cancel").await > 0 {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+
+    let stopped = Instant::now();
+    stopping.cancel();
+    let ended = tokio::time::timeout(Duration::from_millis(500), worker).await;
+
+    assert!(ended.is_ok(), "the worker ends when Octo stops");
+    assert!(
+        stopped.elapsed() < Duration::from_millis(150),
+        "{:?}",
+        stopped.elapsed()
+    );
+    assert_eq!(client.check.store.pass_jobs().len(), 5);
+}
+
+#[tokio::test]
+async fn a_left_job_still_running_after_a_404_cancel_or_whose_read_fails_stays_kept() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/downloads/left-job/cancel"))
+        .respond_with(ResponseTemplate::new(404))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&w.mornye)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/downloads/left-job"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"id": "left-job", "status": "running"})),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&w.mornye)
+        .await;
+    let dir = tempfile::tempdir().expect("a folder");
+    let left = left_job(&w.client, dir.path());
+    w.client.check.store.keep_pass_job(left.clone());
+
+    w.client.end_left_pass_jobs().await;
+    assert_eq!(
+        w.client.check.store.pass_jobs(),
+        vec![left.clone()],
+        "Mornye still runs the job it would not cancel"
+    );
+    assert!(std::path::Path::new(&left.dir).exists());
+
+    Mock::given(method("POST"))
+        .and(path("/api/v1/downloads/left-job/cancel"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({"error": "not running"})))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&w.mornye)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/downloads/left-job"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&w.mornye)
+        .await;
+    w.client.end_left_pass_jobs().await;
+    assert_eq!(
+        w.client.check.store.pass_jobs(),
+        vec![left.clone()],
+        "a read that failed cannot tell the job is over"
+    );
+    assert!(std::path::Path::new(&left.dir).exists());
+}
+
+#[tokio::test]
+async fn a_read_that_reaches_mornye_has_the_worker_end_a_job_a_stopped_run_left() {
+    let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
+    let stopping = cleanup_worker_started_empty(&w.client).await;
+    let dir = tempfile::tempdir().expect("a folder");
+    let left = left_job(&w.client, dir.path());
+    w.client.check.store.keep_pass_job(left.clone());
+
+    let _ = w.client.check_view(Some(Instant::now())).await;
+    until_no_job_is_kept(&w.client).await;
     stopping.cancel();
 
     assert_eq!(
@@ -930,10 +1071,10 @@ async fn a_sweep_gives_up_on_a_slow_cancel_within_its_bound_and_keeps_the_job() 
 #[tokio::test]
 async fn a_read_mornye_does_not_answer_wakes_no_cleanup() {
     let (mornye, client) = slow_mornye(Duration::from_secs(1), Duration::ZERO).await;
+    let stopping = cleanup_worker_started_empty(&client).await;
     let dir = tempfile::tempdir().expect("a folder");
     let left = left_job(&client, dir.path());
     client.check.store.keep_pass_job(left.clone());
-    let stopping = cleanup_worker(&client);
 
     let view = client.check_view(Some(Instant::now())).await.expect("a read");
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -945,7 +1086,7 @@ async fn a_read_mornye_does_not_answer_wakes_no_cleanup() {
 }
 
 #[tokio::test]
-async fn the_song_job_of_a_live_run_is_kept_and_left_alone_by_reads() {
+async fn the_song_job_of_a_live_run_is_kept_and_left_alone_by_a_sweep() {
     let w = world(sessions("unverified", 900.0), no_browser(), running_job()).await;
     let folder = w.music.path().to_string_lossy().into_owned();
     let run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");

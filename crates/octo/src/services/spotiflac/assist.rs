@@ -272,23 +272,30 @@ impl SpotiflacClient {
             .unwrap_or(false)
     }
 
-    /// The cleanup worker: each time a read of Mornye's check reaches Mornye while song jobs are
-    /// kept, it ends the ones stopped Pass runs left there. Off every reader's way, one sweep at
-    /// a time. Ends when Octo stops.
+    /// The cleanup worker: ends the song jobs stopped Pass runs left at Mornye once when Octo
+    /// starts, then each time a read of Mornye's check reaches Mornye while song jobs are kept.
+    /// Off every reader's way, one sweep at a time. Ends when Octo stops, partway through a sweep
+    /// too; the jobs that sweep had not ended stay kept.
     pub async fn clean_left_pass_jobs(
         self: Arc<Self>,
         stopping: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
+        // Jobs an earlier run of Octo left are ended now, not after the next read.
+        self.left_pass_jobs_may_end();
         loop {
             tokio::select! {
                 _ = stopping.cancelled() => return Ok(()),
                 _ = self.assist.left_jobs.notified() => {}
             }
-            self.end_left_pass_jobs().await;
+            tokio::select! {
+                _ = stopping.cancelled() => return Ok(()),
+                () = self.end_left_pass_jobs() => {}
+            }
         }
     }
 
-    /// Wakes the cleanup worker when song jobs are kept; called after a read that reached Mornye.
+    /// Wakes the cleanup worker when song jobs are kept; called when it starts and after a read
+    /// that reached Mornye.
     pub(super) fn left_pass_jobs_may_end(&self) {
         if self.check.store.keeps_pass_jobs() {
             self.assist.left_jobs.notify_one();
@@ -298,10 +305,15 @@ impl SpotiflacClient {
     /// Ends the song jobs Pass runs left at Mornye when Octo stopped following them (a restart,
     /// or an end Mornye did not confirm), and removes their folders; the live run's own job is
     /// left to it. A job not over yet stays kept for a later sweep; one kept for a Mornye now at
-    /// another address cannot be asked, so it is let go.
+    /// another address cannot be asked, so it is let go. While Mornye is off or has no address,
+    /// every job stays kept.
     pub(super) async fn end_left_pass_jobs(&self) {
         let kept = self.check.store.pass_jobs();
         if kept.is_empty() {
+            return;
+        }
+        let settings = self.settings();
+        if !settings.is_on() {
             return;
         }
         let live = self
@@ -311,7 +323,7 @@ impl SpotiflacClient {
             .as_ref()
             .filter(|run| !run.finished())
             .map(|run| run.job.lock().clone());
-        let connection = Connection::of(&self.settings());
+        let connection = Connection::of(&settings);
         for left in kept {
             if live.as_ref().is_some_and(|job| job.as_ref() == Some(&left)) {
                 continue;

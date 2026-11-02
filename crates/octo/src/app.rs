@@ -1365,7 +1365,8 @@ impl Acquisition {
         }
     }
 
-    /// `AcquisitionWorker`, `SoulseekHoldResumer` and `CacheCleanupService`, as workers.
+    /// `AcquisitionWorker`, `SoulseekHoldResumer`, `CacheCleanupService` and
+    /// `MornyeLeftPassJobs`, as workers.
     fn register_workers(
         &self,
         workers: &WorkerSupervisor,
@@ -4274,6 +4275,7 @@ mod tests {
             "SoulseekHoldResumer",
             "CacheCleanupService",
             "PrefetchService",
+            "MornyeLeftPassJobs",
         ] {
             assert!(names.iter().any(|n| n == name), "{name} in {names:?}");
         }
