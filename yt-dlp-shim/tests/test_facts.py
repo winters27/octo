@@ -344,6 +344,38 @@ def test_a_fresh_stream_resolves_the_asked_format_and_keeps_nothing(monkeypatch)
     assert book.begun == []
 
 
+class Refused:
+    """googlevideo refusing a signed URL."""
+
+    status_code = 403
+    headers = {}
+
+    class raw:
+        @staticmethod
+        def read(*args, **kwargs):
+            return b"refused"
+
+    def close(self):
+        pass
+
+
+def test_a_refused_fresh_stream_never_purges_the_cache_or_updates_yt_dlp(monkeypatch):
+    vid = "freshrefus1"
+    runs_answer(
+        monkeypatch,
+        ran(stdout="251|4|webm|160\n" + URL_251 + "\n"),
+        ran(stdout="251|4|webm|160\n" + URL_251 + "\n"),
+    )
+    monkeypatch.setattr(app, "_open_upstream", lambda url, headers, video_id: Refused())
+    purged, updated = [], []
+    monkeypatch.setattr(app, "_purge_ytdlp_cache", lambda video_id: purged.append(video_id))
+    monkeypatch.setattr(app, "_maybe_self_update", lambda reason: updated.append(reason) or False)
+    answer = app.app.test_client().get(f"/stream?id={vid}&fresh=1&bg=1", headers={"Range": "bytes=0-"})
+    assert answer.status_code == 502
+    assert answer.headers["X-Octo-Fresh"] == "1"
+    assert purged == [] and updated == [], "a background proof never touches what plays use"
+
+
 def test_a_plain_answer_is_never_marked_fresh(monkeypatch):
     app._facts_put("freshplain1", {"itag": "140", "size": 6755585, "ext": "m4a", "abr": 129})
     monkeypatch.setattr(app, "_run", lambda *a, **k: pytest.fail("no yt-dlp run for a known video"))
