@@ -617,9 +617,8 @@ async fn an_apple_artist_takes_its_picture_from_the_deezer_artist_of_that_name_a
     let (_, artist) = world.get(&format!("artist/{apple}")).await;
     assert_eq!(artist["name"], "Hans Zimmer");
     assert!(artist["picture_xl"].as_str().unwrap_or("").contains("dzcdn"));
-    assert_eq!(
+    assert!(
         artist["nb_fan"].as_i64().unwrap() > 1_000_000,
-        true,
         "the followed one, by album count"
     );
     let (_, related) = world.get(&format!("artist/{apple}/related?limit=5")).await;
