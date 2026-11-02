@@ -36,6 +36,8 @@ use crate::services::test_support::refused_address;
 #[derive(Default)]
 struct Waits {
     waiting: Mutex<Vec<String>>,
+    /// The row whose song's copies wait, as `provider:id`; Teardrop's when blank.
+    row: Mutex<String>,
     stopped: Mutex<Vec<(String, String)>>,
     unsettled: Mutex<Vec<UnsettledFollow>>,
     put_back: Mutex<Vec<String>>,
@@ -85,7 +87,13 @@ impl ILidarrHeartAcquisitionService for Waits {
     }
 
     fn stop_waiters(&self, provider: &str, external_id: &str) -> Vec<String> {
-        if (provider, external_id) == ("soulseek", "teardrop") {
+        let row = self.row.lock().clone();
+        let row = if row.is_empty() {
+            "soulseek:teardrop".to_string()
+        } else {
+            row
+        };
+        if format!("{provider}:{external_id}") == row {
             self.waiting.lock().clone()
         } else {
             Vec::new()
@@ -436,6 +444,27 @@ async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_nam
             .get("keepAnyway")
             .is_none(),
         "the album's keep is asked, so its row offers it no more"
+    );
+}
+
+/// With Record who asked off, one person has one number on a row however many of its menus list
+/// them: Bob may keep the song anyway and his kept copy waits for Lidarr too, so he is Listener 2
+/// in both menus, and Carol, only in the second, is Listener 3.
+#[tokio::test]
+async fn a_person_has_one_listener_number_in_every_menu_of_a_row() {
+    let dash = Dashboard::new();
+    dash.hold_song();
+    *dash.waits.row.lock() = "soulseek:help".into();
+    *dash.waits.waiting.lock() = vec!["carol".into(), "bob".into()];
+
+    let menu = dash.holders("soulseek:help").await;
+
+    assert_eq!(labels(&menu["keepers"]), ["Listener 1", "Listener 2"]);
+    assert_eq!(labels(&menu["stopWaiters"]), ["Listener 3", "Listener 2"]);
+    assert_eq!(
+        token_of(&menu["keepers"], 1),
+        token_of(&menu["stopWaiters"], 1),
+        "bob's token names him in both"
     );
 }
 

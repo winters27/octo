@@ -203,19 +203,39 @@ fn holder_token(key: &str, user: &str) -> String {
 
 /// One holder menu: each person with the token that names them back. Their name shows while
 /// Record who asked is on; with it off, nobody is named and each shows as "Listener 1", "Listener
-/// 2" and so on, in the order they joined.
-fn holder_menu(state: &AppState, key: &str, people: &[String]) -> Vec<Value> {
+/// 2" and so on, numbered by their place among everyone on the row (`everyone`, in the order they
+/// joined), so one person has one number in every menu of the row.
+fn holder_menu(state: &AppState, key: &str, people: &[String], everyone: &[String]) -> Vec<Value> {
     let named = state.settings.current().subsonic.record_requested_by;
     people
         .iter()
-        .enumerate()
-        .map(|(index, user)| {
+        .map(|user| {
+            let number = everyone
+                .iter()
+                .position(|known| dotnet::eq_ignore_case(known.trim(), user.trim()))
+                .unwrap_or(everyone.len())
+                + 1;
             json!({
-                "label": if named { user.clone() } else { format!("Listener {}", index + 1) },
+                "label": if named { user.clone() } else { format!("Listener {number}") },
                 "token": holder_token(key, user),
             })
         })
         .collect()
+}
+
+/// Everyone on a row's holder menus, once each, in the order they joined: the people who may keep
+/// it anyway, then anyone else whose kept copy waits for Lidarr.
+fn everyone_on(keepers: &[String], stop_waiters: &[String]) -> Vec<String> {
+    let mut everyone: Vec<String> = Vec::new();
+    for user in keepers.iter().chain(stop_waiters) {
+        if !everyone
+            .iter()
+            .any(|known| dotnet::eq_ignore_case(known.trim(), user.trim()))
+        {
+            everyone.push(user.clone());
+        }
+    }
+    everyone
 }
 
 /// Whose kept copy of the row's song waits for Lidarr.
@@ -239,10 +259,11 @@ pub async fn held_for(State(state): State<AppState>, request: Request) -> Respon
     let key = key.trim().to_string();
     let keepers = state.heart_acquisition_coordinator.keepers(&key);
     let stop_waiters = stop_waiters_of(&state, &key);
+    let everyone = everyone_on(&keepers, &stop_waiters);
     ok(&json!({
         "key": key,
-        "keepers": holder_menu(&state, &key, &keepers),
-        "stopWaiters": holder_menu(&state, &key, &stop_waiters),
+        "keepers": holder_menu(&state, &key, &keepers, &everyone),
+        "stopWaiters": holder_menu(&state, &key, &stop_waiters, &everyone),
     }))
 }
 
