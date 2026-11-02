@@ -2496,11 +2496,22 @@ const LENGTH_TOLERANCE_SECONDS: i32 = 8;
 /// as fact. Requiring at least one positive match is what stops a hit that states
 /// nothing at all from matching everything.
 fn best_match(doc: Option<&Value>, artist: &str, title: &str) -> ElementResult<Option<Value>> {
-    Ok(all_matches(doc, artist, title, None)?.into_iter().next())
+    let hits = all_matches(doc, artist, title, None)?;
+    // A hit named exactly as asked goes before one that only reads the same once written plainly:
+    // "Stay" before "S.T.A.Y.".
+    let exact = hits.iter().position(|hit| {
+        hit.get("title")
+            .and_then(Value::as_str)
+            .is_some_and(|hit| hit.trim().eq_ignore_ascii_case(title.trim()))
+    });
+    Ok(match exact {
+        Some(at) => hits.into_iter().nth(at),
+        None => hits.into_iter().next(),
+    })
 }
 
 /// Every hit that positively matches on artist or title and contradicts on neither,
-/// in the catalog's order. The first is what [`best_match`] returns. Given the song's length,
+/// in the catalog's order. [`best_match`] takes the first named exactly as asked, else the first. Given the song's length,
 /// a hit whose own length is known and more than [`LENGTH_TOLERANCE_SECONDS`] away is another
 /// recording.
 fn all_matches(

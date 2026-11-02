@@ -50,6 +50,12 @@ pub fn is_apple_id(id: &str) -> bool {
     apple_id(id).is_some()
 }
 
+/// The catalog that answered for a Deezer-field id, as people read it: "Apple Music" for an Apple
+/// id, else "Deezer".
+pub fn catalog_name(id: &str) -> &'static str {
+    if is_apple_id(id) { "Apple Music" } else { "Deezer" }
+}
+
 /// [`is_apple_id`] for an id held as a number.
 pub fn is_apple_number(id: i64) -> bool {
     u64::try_from(id).is_ok_and(|id| id > APPLE_ID_BASE)

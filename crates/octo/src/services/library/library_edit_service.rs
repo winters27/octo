@@ -867,11 +867,8 @@ impl LibraryEditService {
             source: chosen.map(|chosen| chosen.source.name().to_string()).or_else(|| {
                 plan.catalog_best.as_ref().map(|best| {
                     // An id above Deezer's range is Apple's: Apple's catalog answered.
-                    let apple = best
-                        .track_id
-                        .as_deref()
-                        .is_some_and(octo_core::metadata::apple_as_deezer::is_apple_id);
-                    if apple { "Apple Music" } else { "Deezer" }.to_string()
+                    octo_core::metadata::apple_as_deezer::catalog_name(best.track_id.as_deref().unwrap_or(""))
+                        .to_string()
                 })
             }),
             release: chosen.map(TagPlan::describe),

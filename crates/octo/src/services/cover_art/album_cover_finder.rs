@@ -355,11 +355,7 @@ impl AlbumCoverFinder {
     /// Deezer's range is Apple's.
     async fn catalog_cover(&self, artist: &str, album: &str) -> Option<(Vec<u8>, &'static str)> {
         let hit = self.catalog_hit(artist, album).await?;
-        let source = if apple_as_deezer::is_apple_id(&hit.deezer_id) {
-            "Apple Music"
-        } else {
-            "Deezer"
-        };
+        let source = apple_as_deezer::catalog_name(&hit.deezer_id);
         let url = hit.cover_url.filter(|url| !url.is_empty())?;
         let attempt = async {
             let response = self.http.get(&url).timeout(Self::DOWNLOAD_TIMEOUT).send().await?;

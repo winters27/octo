@@ -373,6 +373,90 @@ async fn another_artists_release_of_a_near_name_is_never_the_albums_cover() {
 }
 
 /// The same search does give the album's own cover when the catalog has it, by its own artist.
+/// While Apple answers Deezer's hidden searches, a cover by name is left to the iTunes source next
+/// in the chain (asking here too would ask Apple twice); a cover by a known Deezer id is still
+/// fetched from Deezer.
+#[tokio::test]
+async fn while_apple_stands_in_names_are_left_to_itunes_and_ids_still_fetch() {
+    use crate::services::apple::{AppleCatalog, ApplePace, PaceConfig};
+    use crate::services::metadata::{DeezerReach, DeezerStandIn, DoorInfos};
+
+    let server = MockServer::builder().start().await;
+    let cdn = format!("http://localhost:{}/cdn", server.address().port());
+    Mock::given(any())
+        .respond_with(FakeCatalog {
+            json: HashMap::from([
+                (
+                    "/infos",
+                    r#"{"country_iso":"IN","country":"India","open":false}"#.to_string(),
+                ),
+                (
+                    "/album/302127",
+                    format!(r#"{{"id":302127,"title":"Discovery","cover_xl":"{cdn}/discovery-1000.jpg"}}"#),
+                ),
+            ]),
+        })
+        .mount(&server)
+        .await;
+    let pace = Arc::new(ApplePace::new(PaceConfig::unpaced()));
+    let reach = Arc::new(DeezerReach::new(Arc::clone(&pace)));
+    let apple = Arc::new(AppleCatalog::with_bases(
+        pace,
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:0",
+        None,
+    ));
+    let stand_in = Arc::new(DeezerStandIn::new(Arc::clone(&reach), apple));
+    let http = Arc::new(DeezerRateLimitHandler::with_api_host(
+        Arc::new(DeezerRateLimiter::new()),
+        "127.0.0.1",
+    ));
+    stand_in.set_door(Arc::downgrade(&http));
+    http.set_stand_in(Arc::clone(&stand_in));
+    reach.set_reader(Arc::new(DoorInfos::new(Arc::downgrade(&http), &server.uri())));
+    reach.read_infos().await;
+    assert!(reach.stands_in());
+    let lookup = DeezerCoverArtLookup::with_base_url(http, &MetadataSettings::default(), &server.uri());
+
+    for routing in [
+        SoulseekRouting {
+            kind: RoutingKind::Song,
+            artist: Some("Daft Punk".into()),
+            title: Some("One More Time".into()),
+            ..Default::default()
+        },
+        SoulseekRouting {
+            kind: RoutingKind::Album,
+            artist: Some("Daft Punk".into()),
+            album: Some("Homework".into()),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(lookup.try_fetch(&routing, false).await, None);
+    }
+    assert!(
+        !asked(&server)
+            .await
+            .iter()
+            .any(|r| r.url.path().starts_with("/search")),
+        "no name search was sent"
+    );
+    let by_id = lookup
+        .try_fetch(
+            &SoulseekRouting {
+                kind: RoutingKind::Album,
+                artist: Some("Daft Punk".into()),
+                album: Some("Discovery".into()),
+                external_album_id: Some("302127".into()),
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .expect("a cover by its Deezer id");
+    assert_eq!(&by_id[..], b"/cdn/discovery-1000.jpg");
+}
+
 #[tokio::test]
 async fn the_albums_own_release_by_its_artist_is_taken() {
     let (_server, lookup) = catalog(|cdn| {

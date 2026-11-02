@@ -208,6 +208,16 @@ fn apple_ids_round_trip_and_deezer_ids_are_never_apples() {
 }
 
 #[test]
+fn the_catalog_that_answered_is_named_by_its_id() {
+    assert_eq!(
+        catalog_name(&code_apple_id(INTERSTELLAR).to_string()),
+        "Apple Music"
+    );
+    assert_eq!(catalog_name("185320622"), "Deezer");
+    assert_eq!(catalog_name(""), "Deezer");
+}
+
+#[test]
 fn the_artwork_file_name_names_the_barcode() {
     let art = "https://is1-ssl.mzstatic.com/image/thumb/Music125/v4/f4/5b/73/f45b735a-8d7a-9713-b217-0f8e1593c28b/794043201943.jpg/100x100bb.jpg";
     assert_eq!(artwork_barcodes(art), vec!["794043201943".to_string()]);

@@ -494,8 +494,9 @@ pub async fn get_album(State(state): State<AppState>, req: Request) -> AppResult
     };
     let library_songs = i32::try_from(AlbumFillIn::count_songs(&library)).unwrap_or(i32::MAX);
     let candidates = AlbumFillIn::candidates(&deezer_albums, &artist_name, &album_name, library_songs);
-    // The name search found Deezer closed (it then answers from Apple): the ISRC albums first.
-    if deezer_album.is_none() && !isrc_route_ran && !isrcs.is_empty() && !candidates.is_empty() && closed() {
+    // The name search found Deezer closed (it then answers from Apple, whether or not Apple has the
+    // album): the ISRC albums first.
+    if deezer_album.is_none() && !isrc_route_ran && !isrcs.is_empty() && closed() {
         deezer_album = album_holding(&library, metadata.catalog_albums_by_isrc(&isrcs).await);
     }
     // Only when no ISRC album held the library's songs.

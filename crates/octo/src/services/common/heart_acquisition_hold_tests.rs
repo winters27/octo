@@ -93,6 +93,15 @@ impl HeartGates for CodeGates {
     }
 }
 
+#[test]
+fn a_row_waiting_on_the_catalog_names_no_one_catalog() {
+    // Deezer or Apple Music answers the catalog's questions, depending on the server's country.
+    assert_eq!(
+        crate::services::common::heart_acquisition_coordinator::waiting_line(WaitingFor::Deezer),
+        "Waiting for the music catalog"
+    );
+}
+
 /// Gates answered from a list per person: a listed wait holds, anyone else is ready.
 #[derive(Default)]
 struct ListedGates {
