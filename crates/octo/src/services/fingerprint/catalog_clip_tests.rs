@@ -168,18 +168,30 @@ async fn asked(server: &MockServer, prefix: &str) -> usize {
 }
 
 #[test]
-fn only_https_from_deezers_cdn_is_ever_fetched() {
+fn only_https_from_the_catalogs_clip_hosts_is_ever_fetched() {
     let allowed = |url: &str| clip_url_allowed(&Url::parse(url).unwrap());
     assert!(allowed(
         "https://cdnt-preview.dzcdn.net/api/1/1/a/b/c/0/abc.mp3?hdnea=x"
+    ));
+    assert!(allowed(
+        "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview125/v4/a.m4a"
     ));
     assert!(
         !allowed("http://cdnt-preview.dzcdn.net/api/1/1/a.mp3"),
         "never over http"
     );
+    assert!(
+        !allowed("http://audio-ssl.itunes.apple.com/a.m4a"),
+        "never over http"
+    );
     assert!(!allowed("https://dzcdn.net.evil.com/a.mp3"));
     assert!(!allowed("https://evil-dzcdn.net/a.mp3"));
     assert!(!allowed("https://example.com/a.mp3"));
+    assert!(
+        !allowed("https://is1-ssl.mzstatic.com/a.m4a"),
+        "Apple's other hosts are not clip hosts"
+    );
+    assert!(!allowed("https://audio-ssl.itunes.apple.com.evil.com/a.m4a"));
 }
 
 #[tokio::test]
