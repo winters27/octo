@@ -16,10 +16,11 @@
 //!   another artist leads they are deleted instead. When the follow ends and no hearted song
 //!   passed, every held track is deleted. Octo deletes held files itself, and the hold folder goes
 //!   with its pending entry.
-//! - **One file.** A copy kept as heard (or kept by the person) that waited for the follow, or
-//!   that Octo placed during it when its person stopped waiting, is dropped once the song's own
-//!   Lidarr file passes the gates of everyone it was kept for: they end with the proven file
-//!   alone. A file refused for them is never kept as one of the album's other tracks, and a
+//! - **One file.** A copy kept as heard (or kept by the person) that waited for the follow is
+//!   dropped once the song's own Lidarr file passes the gates of everyone it was kept for; one
+//!   Octo placed during it when a person stopped waiting, once that file passes the gate of
+//!   anyone it was kept for (the library holds one file of the song). They end with the proven
+//!   file alone. A file refused for them is never kept as one of the album's other tracks, and a
 //!   placed copy Lidarr's import replaced comes back from its link.
 
 use std::path::{Path, PathBuf};
@@ -41,7 +42,7 @@ use super::{AlbumJob, Inner, key_of, match_song, song_entry_key, translate_impor
 use crate::services::common::{AcquisitionHeld, AcquisitionPlace, BaseDownloadService, GateLedger};
 use crate::services::fingerprint::download_verification_service::LabelSource;
 use crate::services::lidarr::LidarrImport;
-use crate::services::lidarr::lidarr_pending_albums::{HeldPlacement, HeldTrack, SongGate};
+use crate::services::lidarr::lidarr_pending_albums::{HELD_FOR_LIDARR, HeldTrack, SongGate};
 use crate::services::lidarr::lidarr_pick::delete_moved_record;
 use crate::services::soulseek::SoulseekMetadataService;
 use crate::services::soulseek::soulseek_download_service::INCOMING_FOLDER_NAME;
@@ -307,7 +308,8 @@ impl Inner {
             Candidate::Refused { back } => {
                 // Lidarr's file is not the song for anyone a copy of it was kept for: a kept copy
                 // Lidarr's import replaced comes back.
-                self.restore_replaced(foreign_album_id, Some(song_key));
+                self.restore_replaced(Some(foreign_album_id), Some(song_key))
+                    .await;
                 let key = song_key.to_string();
                 self.pending.update(foreign_album_id, |entry| {
                     if back {
@@ -341,7 +343,8 @@ impl Inner {
                         "Lidarr's late '{}' could not be judged now and nobody waits on it; deleted",
                         track.title
                     );
-                    self.restore_replaced(foreign_album_id, Some(song_key));
+                    self.restore_replaced(Some(foreign_album_id), Some(song_key))
+                        .await;
                 }
             }
         }
@@ -568,36 +571,16 @@ impl Inner {
 
     /// A copy of the song kept as heard, or kept by its person, waits for the follow, or was placed
     /// during it when its person stopped waiting: once the song's Lidarr file passed the gates of
-    /// everyone that copy was kept for, it is dropped (a placed copy Lidarr's import replaced is
-    /// only let go of), and its link with it, so they end with the proven file alone.
+    /// everyone a waiting copy was kept for (of anyone a placed copy was kept for: the library
+    /// holds one file of the song), it is dropped (a placed copy only while it is still the file
+    /// Octo placed, one Lidarr's import replaced only let go of), and its link with it, so they
+    /// end with the proven file alone.
     async fn drop_kept_copies(&self, song_key: &str, users: &[String]) {
         let Some(downloads) = &self.downloads else {
             return;
         };
         for placed in self.pending.giving_way(song_key, users) {
-            if Path::new(&placed.path).is_file() {
-                let copy = HeldPlacement {
-                    song: placed.song.clone(),
-                    held_path: placed.path.clone(),
-                    target: placed.path.clone(),
-                    kept: true,
-                    follows: Vec::new(),
-                    users: placed.users.clone(),
-                };
-                if !downloads.drop_held(&copy, users).await {
-                    warn!(
-                        "The copy Octo placed at {} could not give way to the proven Lidarr file of {song_key}",
-                        placed.path
-                    );
-                }
-            }
-            if let Some(link) = &placed.backup {
-                let _ = std::fs::remove_file(link);
-            }
-            info!(
-                "The copy Octo placed of {song_key} gives way to its proven Lidarr file: {}",
-                placed.path
-            );
+            self.give_way(&placed).await;
         }
         for held in self
             .pending
@@ -610,7 +593,16 @@ impl Inner {
                 if let Some(tracker) = &self.tracker
                     && let Some((provider, id)) = song_key.split_once(':')
                 {
-                    tracker.end_aside(provider, id, None);
+                    let waiting = self.pending.kept_copies_waiting(song_key);
+                    if waiting.is_empty() {
+                        tracker.end_aside(provider, id, None);
+                    } else {
+                        let still: Vec<String> = waiting
+                            .iter()
+                            .flat_map(|copy| copy.users.iter().cloned())
+                            .collect();
+                        tracker.wait_aside(provider, id, &still, HELD_FOR_LIDARR);
+                    }
                 }
                 info!(
                     "The kept copy of {song_key} gives way to its proven Lidarr file: {}",

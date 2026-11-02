@@ -84,6 +84,8 @@ struct Pipeline {
     dropped: Arc<Mutex<Vec<(HeldPlacement, Vec<String>)>>>,
     /// Titles whose file a hearted song's gates take half a second to judge.
     slow: Arc<Mutex<HashSet<String>>>,
+    /// Held while placing a held file must wait.
+    place_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Pipeline {
@@ -275,6 +277,48 @@ impl IDownloadService for Pipeline {
         true
     }
 
+    async fn drop_placed(&self, copy: &crate::services::lidarr::GivingWay) -> bool {
+        if !copy.replaced {
+            let _ = std::fs::remove_file(&copy.path);
+        }
+        self.dropped.lock().push((
+            HeldPlacement {
+                song: copy.song.clone(),
+                held_path: copy.path.clone(),
+                target: copy.path.clone(),
+                kept: true,
+                follows: Vec::new(),
+                users: copy.users.clone(),
+                own_copies: Vec::new(),
+            },
+            copy.users.clone(),
+        ));
+        true
+    }
+
+    async fn restore_placed(
+        &self,
+        copy: &crate::services::lidarr::ReplacedCopy,
+    ) -> crate::services::i_download_service::Restored {
+        use crate::services::i_download_service::Restored;
+        if !Path::new(&copy.backup).is_file() {
+            return Restored::Lost;
+        }
+        if Path::new(&copy.path).exists() {
+            return Restored::Later;
+        }
+        if let Some(folder) = Path::new(&copy.path).parent() {
+            let _ = std::fs::create_dir_all(folder);
+        }
+        if std::fs::hard_link(&copy.backup, &copy.path).is_ok()
+            || std::fs::copy(&copy.backup, &copy.path).is_ok()
+        {
+            Restored::Back
+        } else {
+            Restored::Later
+        }
+    }
+
     async fn download_album_with_source(
         &self,
         _: &str,
@@ -295,13 +339,20 @@ impl IDownloadService for Pipeline {
         Some(self.root.join(".octo-incoming/held"))
     }
 
-    async fn place_held(&self, held: &HeldPlacement) -> Option<String> {
+    async fn place_held(
+        &self,
+        held: &HeldPlacement,
+    ) -> Option<crate::services::i_download_service::PlacedHeld> {
+        let _wait = self.place_gate.lock().await;
         if let Some(dir) = Path::new(&held.target).parent() {
             std::fs::create_dir_all(dir).ok()?;
         }
         std::fs::rename(&held.held_path, &held.target).ok()?;
         self.placed.lock().push(held.clone());
-        Some(held.target.clone())
+        Some(crate::services::i_download_service::PlacedHeld {
+            path: held.target.clone(),
+            beside: Vec::new(),
+        })
     }
 
     async fn get_local_path_if_exists(&self, _: &str, _: &str) -> Option<String> {
@@ -352,6 +403,8 @@ struct Fixture {
     dropped: Arc<Mutex<Vec<(HeldPlacement, Vec<String>)>>>,
     /// Titles whose file the pipeline takes half a second to judge.
     slow: Arc<Mutex<HashSet<String>>>,
+    /// Held while placing a held file must wait.
+    place_gate: Arc<tokio::sync::Mutex<()>>,
     /// The settings of the service built last.
     settings: Mutex<Option<Arc<SettingsStore>>>,
 }
@@ -424,6 +477,7 @@ impl Fixture {
             placed: Arc::default(),
             dropped: Arc::default(),
             slow: Arc::default(),
+            place_gate: Arc::default(),
             settings: Mutex::new(None),
         }
     }
@@ -554,6 +608,7 @@ impl Fixture {
             placed: self.placed.clone(),
             dropped: self.dropped.clone(),
             slow: self.slow.clone(),
+            place_gate: self.place_gate.clone(),
         });
         let client = Arc::new(LidarrClient::new(settings.clone()));
         client.set_metadata_poll(Duration::from_millis(20));

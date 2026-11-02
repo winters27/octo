@@ -15,7 +15,7 @@ use super::super::test_support::{Harness, build};
 use super::super::{DownloadServices, RequestedIdentity};
 use super::*;
 use crate::services::common::AcquisitionTracker;
-use crate::services::lidarr::{LidarrPendingAlbums, PendingAlbum};
+use crate::services::lidarr::{LidarrPendingAlbums, PendingAlbum, PlacedAs};
 use crate::services::local::test_support::FakeLocalLibrary;
 use crate::services::test_support::flac;
 
@@ -201,8 +201,17 @@ async fn a_kept_copy_for_a_followed_artist_waits_in_the_hold_path_and_is_placed_
         .place_held_file(&free[0])
         .await
         .expect("placed");
+    let lyrics_placed = placed.beside.clone();
+    let placed = placed.path;
 
     assert_eq!(slashed(&placed), slashed(&target));
+    assert_eq!(
+        lyrics_placed.iter().map(|path| slashed(path)).collect::<Vec<_>>(),
+        [slashed(
+            &Path::new(&target).with_extension("lrc").to_string_lossy()
+        )],
+        "what its placing moved beside it"
+    );
     assert!(Path::new(&target).is_file());
     assert!(Path::new(&target).with_extension("lrc").is_file());
     assert!(!Path::new(&placement.path).exists());
@@ -366,6 +375,243 @@ async fn lidarrs_own_import_waits_and_never_ends_its_follow() {
     assert_eq!(rig.pending.held().len(), 1);
 }
 
+/// The library's record of a file of Teardrop at `path`: a kept copy (as heard) or the proven
+/// recording `rec-3`, kept for Alice either way.
+fn teardrop_record(
+    path: &str,
+    kept: bool,
+) -> (
+    String,
+    String,
+    Option<String>,
+    crate::services::local::LocalSongMapping,
+) {
+    (
+        "Massive Attack".into(),
+        "Teardrop".into(),
+        Some("Mezzanine".into()),
+        crate::services::local::LocalSongMapping {
+            external_provider: "soulseek".into(),
+            external_id: "teardrop".into(),
+            local_path: path.to_string(),
+            music_brainz_recording_id: (!kept).then(|| "rec-3".to_string()),
+            heart: Some(crate::services::local::KeptHeart {
+                users: vec!["alice".into()],
+                as_heard: kept,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+}
+
+/// Alice's kept copy of Teardrop (`name` its file), placed during the follow of Mezzanine when
+/// she stopped waiting, with lyrics written beside it that its placing moved along, a link of it
+/// kept in the hold path, and the library's record of it. The copy as the follow lists it.
+async fn placed_teardrop(rig: &Rig, name: &str) -> (PlacedHeld, String) {
+    rig.follow("rg-mezzanine", "Massive Attack", "Mezzanine", false);
+    let landed = rig.landed(name);
+    std::fs::write(&landed, b"the version alice heard").expect("written");
+    let placement = rig
+        .harness
+        .service
+        .place_or_hold(
+            &kept_teardrop(),
+            &teardrop_request(),
+            &landed,
+            None,
+            Some(DownloadSource::YouTube),
+            &["alice".to_string()],
+        )
+        .await;
+    std::fs::write(
+        Path::new(&placement.path).with_extension("lrc"),
+        "[00:01.00] alice's lyrics",
+    )
+    .expect("written");
+    let stopped = rig.pending.stop_waiting("soulseek:teardrop", "alice", false);
+    assert_eq!(stopped.place.len(), 1);
+    let placed = rig
+        .harness
+        .service
+        .place_held_file(&stopped.place[0])
+        .await
+        .expect("placed");
+    assert_eq!(placed.beside.len(), 1, "its lyrics went along");
+    let links = held_root(rig.dir.path()).join("lidarr-placed");
+    std::fs::create_dir_all(&links).expect("made");
+    let link = links.join("alice.link").to_string_lossy().into_owned();
+    std::fs::hard_link(&placed.path, &link).expect("linked");
+    assert_eq!(
+        rig.pending.placed_copy(
+            &stopped.place[0],
+            &placed.path,
+            Some((link.clone(), true)),
+            placed.beside.clone(),
+        ),
+        PlacedAs::Octos
+    );
+    rig.library
+        .by_tags
+        .lock()
+        .push(teardrop_record(&placed.path, true));
+    (placed, link)
+}
+
+/// The library's records, by their keys.
+fn record_keys(rig: &Rig) -> Vec<String> {
+    let mut keys: Vec<String> = rig
+        .library
+        .by_tags
+        .lock()
+        .iter()
+        .map(|(.., mapping)| mapping.key())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Alice's placed copy is an `.m4a`; Lidarr's Teardrop, proven by her gate, landed beside it as a
+/// `.flac` of the same name, sharing the lyrics file. The copy gives way through the download
+/// service's own drop: the `.m4a` and the kept record go, and the proven `.flac`, the lyrics its
+/// name shares and its record all stay.
+#[tokio::test]
+async fn a_placed_copy_gives_way_without_touching_the_proven_file_beside_it() {
+    let rig = Rig::new();
+    let (placed, _link) = placed_teardrop(&rig, "Teardrop.m4a").await;
+    let proven = Path::new(&placed.path).with_extension("flac");
+    std::fs::write(&proven, b"Lidarr's proven Teardrop").expect("written");
+    rig.library
+        .by_tags
+        .lock()
+        .push(teardrop_record(&proven.to_string_lossy(), false));
+
+    let giving = rig.pending.giving_way("soulseek:teardrop", &["alice".into()]);
+    assert_eq!(giving.len(), 1);
+    assert!(rig.harness.service.drop_placed_copy(&giving[0]).await);
+
+    assert!(!Path::new(&placed.path).exists(), "the copy Octo placed goes");
+    assert!(proven.is_file(), "the proven file stays");
+    assert!(
+        Path::new(&placed.beside[0]).is_file(),
+        "the lyrics its name shares with the proven file stay"
+    );
+    assert_eq!(record_keys(&rig), ["soulseek:teardrop#recording:rec-3"]);
+}
+
+/// Alice's placed copy is a `.flac`, and Lidarr's import put its proven Teardrop at that very path
+/// (Octo never learned the copy was replaced), with lyrics of its own. The file there is not the
+/// one Octo placed (another file than its link), so nothing on disk goes: only the kept record.
+#[tokio::test]
+async fn a_placed_copy_never_deletes_a_file_of_the_same_name_it_did_not_place() {
+    let rig = Rig::new();
+    let (placed, link) = placed_teardrop(&rig, "Teardrop.flac").await;
+    std::fs::remove_file(&placed.path).expect("Lidarr deleted it");
+    std::fs::write(&placed.path, b"Lidarr's proven Teardrop").expect("written");
+    std::fs::write(&placed.beside[0], "[00:01.00] Lidarr's lyrics").expect("written");
+    rig.library
+        .by_tags
+        .lock()
+        .push(teardrop_record(&placed.path, false));
+
+    let giving = rig.pending.giving_way("soulseek:teardrop", &["alice".into()]);
+    assert_eq!(giving.len(), 1);
+    assert!(!giving[0].replaced);
+    assert!(rig.harness.service.drop_placed_copy(&giving[0]).await);
+
+    assert_eq!(
+        std::fs::read(&placed.path).expect("still there"),
+        b"Lidarr's proven Teardrop"
+    );
+    assert!(Path::new(&placed.beside[0]).is_file(), "its lyrics stay");
+    assert_eq!(record_keys(&rig), ["soulseek:teardrop#recording:rec-3"]);
+    assert!(Path::new(&link).is_file(), "the caller lets go of the link");
+}
+
+/// The copy is still the one Octo placed, alone in its folder: it goes with the lyrics its placing
+/// moved beside it and its kept record, and a file of the user's in that folder stays.
+#[tokio::test]
+async fn a_placed_copy_alone_goes_with_what_its_placing_moved_beside_it() {
+    let rig = Rig::new();
+    let (placed, _link) = placed_teardrop(&rig, "Teardrop.flac").await;
+    let users = Path::new(&placed.path).with_file_name("03 - Teardrop (Live).flac");
+    std::fs::write(&users, b"the user's live take").expect("written");
+
+    let giving = rig.pending.giving_way("soulseek:teardrop", &["alice".into()]);
+    assert!(rig.harness.service.drop_placed_copy(&giving[0]).await);
+
+    assert!(!Path::new(&placed.path).exists());
+    assert!(!Path::new(&placed.beside[0]).exists());
+    assert!(users.is_file());
+    assert!(record_keys(&rig).is_empty());
+}
+
+/// A copy Lidarr's import replaced (Octo learned so) lets go of its kept record alone: the file at
+/// its path, Lidarr's, stays.
+#[tokio::test]
+async fn a_replaced_placed_copy_lets_go_of_its_record_alone() {
+    let rig = Rig::new();
+    let (placed, _link) = placed_teardrop(&rig, "Teardrop.flac").await;
+    std::fs::remove_file(&placed.path).expect("Lidarr deleted it");
+    assert!(rig.pending.mark_replaced(&placed.path));
+    std::fs::write(&placed.path, b"Lidarr's proven Teardrop").expect("written");
+
+    let giving = rig.pending.giving_way("soulseek:teardrop", &["alice".into()]);
+    assert!(giving[0].replaced);
+    assert!(rig.harness.service.drop_placed_copy(&giving[0]).await);
+
+    assert!(Path::new(&placed.path).is_file());
+    assert!(Path::new(&placed.beside[0]).is_file());
+    assert!(record_keys(&rig).is_empty());
+}
+
+/// A copy Lidarr's import replaced comes back from its link where it was. Where the song's own
+/// landed file for its people lies now, it gives way; where another file lies, it waits for a
+/// later try and is never put beside it.
+#[tokio::test]
+async fn a_replaced_placed_copy_comes_back_where_it_was_or_waits() {
+    let rig = Rig::new();
+    let (placed, link) = placed_teardrop(&rig, "Teardrop.flac").await;
+    std::fs::remove_file(&placed.path).expect("Lidarr deleted it");
+    assert!(rig.pending.mark_replaced(&placed.path));
+    let copy = rig.pending.replaced_copies(None, None).remove(0);
+
+    std::fs::write(&placed.path, b"a file of the user's").expect("written");
+    assert_eq!(
+        rig.harness.service.restore_placed_copy(&copy).await,
+        Restored::Later
+    );
+    let folder = Path::new(&placed.path).parent().expect("its folder");
+    assert_eq!(
+        std::fs::read_dir(folder)
+            .expect("read")
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == "flac"))
+            .count(),
+        1,
+        "never put beside it"
+    );
+
+    rig.library
+        .by_tags
+        .lock()
+        .push(teardrop_record(&placed.path, false));
+    assert_eq!(
+        rig.harness.service.restore_placed_copy(&copy).await,
+        Restored::GaveWay
+    );
+
+    std::fs::remove_file(&placed.path).expect("gone");
+    assert_eq!(
+        rig.harness.service.restore_placed_copy(&copy).await,
+        Restored::Back
+    );
+    assert_eq!(
+        std::fs::read(&placed.path).expect("back"),
+        std::fs::read(&link).expect("its link")
+    );
+}
+
 /// A kept copy that waits for a follow gives way to a proven copy of its song only when that copy
 /// passed the gate of everyone it was kept for: its file, what was written beside it and its
 /// library record go. A copy kept for someone else too stays as it is.
@@ -415,4 +661,45 @@ async fn a_kept_copy_is_dropped_for_a_proven_copy_only_for_everyone_it_was_kept_
     assert!(!Path::new(&placement.path).exists());
     assert!(!lyrics.exists());
     assert!(rig.library.by_tags.lock().is_empty(), "its record went");
+}
+
+/// Alice stopped waiting with a library of her own, so a copy of the kept file landed there for
+/// her, and the original waits for Bob alone though its record still names her: a proven copy
+/// that passed Bob's gate makes it give way.
+#[tokio::test]
+async fn a_kept_copy_someone_took_a_copy_of_gives_way_for_the_rest() {
+    let rig = Rig::new();
+    rig.follow("rg-mezzanine", "Massive Attack", "Mezzanine", false);
+    let placement = rig
+        .place(&kept_teardrop(), &teardrop_request(), DownloadSource::YouTube)
+        .await;
+    let held = HeldPlacement {
+        users: vec!["bob".into()],
+        own_copies: vec!["alice".into()],
+        ..rig.pending.held().remove(0)
+    };
+    rig.library.by_tags.lock().push((
+        "Massive Attack".into(),
+        "Teardrop".into(),
+        Some("Mezzanine".into()),
+        crate::services::local::LocalSongMapping {
+            external_provider: "soulseek".into(),
+            external_id: "teardrop".into(),
+            local_path: placement.path.clone(),
+            heart: Some(crate::services::local::KeptHeart {
+                users: vec!["alice".into(), "bob".into()],
+                as_heard: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ));
+
+    assert!(
+        rig.harness
+            .service
+            .drop_held_copy(&held, &["bob".to_string()])
+            .await
+    );
+    assert!(!Path::new(&placement.path).exists());
 }

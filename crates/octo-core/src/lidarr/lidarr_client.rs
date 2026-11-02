@@ -23,6 +23,11 @@ pub enum LidarrError {
     /// Lidarr answered with an error status, or could not be reached.
     #[error("{0}")]
     Http(String),
+    /// The request went out and no answer of Lidarr's says what came of it: the connection
+    /// dropped after it was sent, or a proxy in front of Lidarr answered 502, 503 or 504. Lidarr
+    /// may have done it, as after a timeout.
+    #[error("{0}")]
+    MaybeSent(String),
     /// The client's timeout, or the caller's cancellation.
     #[error("{0}")]
     Canceled(String),

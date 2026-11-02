@@ -734,6 +734,19 @@ impl ILocalLibraryService for LocalLibraryService {
         Ok(stale.into_iter().map(|(_, mapping)| mapping).collect())
     }
 
+    async fn forget_mapping_keyed(&self, key: &str) -> anyhow::Result<bool> {
+        if dotnet::is_blank(key) {
+            return Ok(false);
+        }
+        let mut cached = self.mappings.lock();
+        let mappings = self.loaded(&mut cached)?;
+        if mappings.remove(key).is_none() {
+            return Ok(false);
+        }
+        self.save(mappings)?;
+        Ok(true)
+    }
+
     async fn restore_mappings(&self, mappings: &[LocalSongMapping], local_path: &str) -> anyhow::Result<()> {
         if mappings.is_empty() || dotnet::is_blank(local_path) {
             return Ok(());

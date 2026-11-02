@@ -242,18 +242,25 @@ impl LidarrClient {
     /// refused by its guid; the album's releases are then listed once more and the same
     /// release, by its indexer, title and size, is grabbed under its new guid.
     pub async fn grab_picked(&self, album_id: i32, pick: &LidarrReleasePick) -> Result<String, LidarrError> {
-        self.grab_picked_saving(album_id, pick, |_| {}).await
+        self.grab_picked_saving(album_id, pick, |_| async { Ok(()) })
+            .await
     }
 
     /// The same, telling `before` each guid right before the grab under it is sent, so the caller
-    /// can save it first.
-    pub async fn grab_picked_saving(
+    /// can save it first: a grab is sent only once `before` answered Ok. A grab Lidarr may have
+    /// taken with no answer back (a timeout, a dropped connection) fails as it is; only one
+    /// Lidarr refused is looked for again.
+    pub async fn grab_picked_saving<F, Saved>(
         &self,
         album_id: i32,
         pick: &LidarrReleasePick,
-        before: impl Fn(&str),
-    ) -> Result<String, LidarrError> {
-        before(&pick.guid);
+        before: F,
+    ) -> Result<String, LidarrError>
+    where
+        F: Fn(String) -> Saved,
+        Saved: Future<Output = Result<(), LidarrError>>,
+    {
+        before(pick.guid.clone()).await?;
         match self.grab_release(pick).await {
             Ok(()) => return Ok(pick.guid.clone()),
             // Most likely forgotten; found again below, or refused in plain words.
@@ -272,7 +279,7 @@ impl LidarrClient {
             title: Some(again.title),
             size: again.size,
         };
-        before(&fresh.guid);
+        before(fresh.guid.clone()).await?;
         match self.grab_release(&fresh).await {
             Ok(()) => Ok(fresh.guid),
             Err(LidarrError::Http(_)) => Err(LidarrError::InvalidOperation(PICK_REFUSED_TEXT.into())),
@@ -1038,11 +1045,19 @@ impl LidarrClient {
         Ok(response)
     }
 
-    /// What an error status is told as: the status and the start of the body.
+    /// What an error status is told as: the status and the start of the body. A 502, 503 or 504
+    /// is a proxy's in front of Lidarr, which may have passed the request on.
     async fn status_error(response: reqwest::Response, timeout: Duration) -> LidarrError {
         let status = response.status().as_u16();
         match response.text().await {
-            Ok(body) => LidarrError::Http(format!("Lidarr returned HTTP {status}: {}", truncate(&body, 300))),
+            Ok(body) => {
+                let message = format!("Lidarr returned HTTP {status}: {}", truncate(&body, 300));
+                if matches!(status, 502..=504) {
+                    LidarrError::MaybeSent(message)
+                } else {
+                    LidarrError::Http(message)
+                }
+            }
             Err(error) => transport_error(error, timeout),
         }
     }
@@ -1202,12 +1217,16 @@ fn artist_id_of(album: &JsonObject) -> Result<i32, LidarrError> {
     }
 }
 
-/// What a request that got no answer fails with: its timeout, or the connection.
+/// What a request that got no answer fails with: its timeout; a connection never made (nothing
+/// was sent); or a connection that dropped once the request was on its way, which Lidarr may have
+/// taken.
 fn transport_error(error: reqwest::Error, timeout: Duration) -> LidarrError {
     if error.is_timeout() {
         LidarrError::Canceled(http_client_factory::timeout_message(timeout))
-    } else {
+    } else if error.is_connect() {
         LidarrError::Http(http_client_factory::connect_failure_message(&error))
+    } else {
+        LidarrError::MaybeSent(http_client_factory::connect_failure_message(&error))
     }
 }
 

@@ -2861,12 +2861,26 @@ impl IDownloadService for BaseDownloadService {
             .any(|info| info.status == DownloadStatus::InProgress)
     }
 
-    async fn place_held(&self, held: &crate::services::lidarr::HeldPlacement) -> Option<String> {
+    async fn place_held(
+        &self,
+        held: &crate::services::lidarr::HeldPlacement,
+    ) -> Option<crate::services::i_download_service::PlacedHeld> {
         self.place_held_file(held).await
     }
 
     async fn drop_held(&self, held: &crate::services::lidarr::HeldPlacement, users: &[String]) -> bool {
         self.drop_held_copy(held, users).await
+    }
+
+    async fn drop_placed(&self, copy: &crate::services::lidarr::GivingWay) -> bool {
+        self.drop_placed_copy(copy).await
+    }
+
+    async fn restore_placed(
+        &self,
+        copy: &crate::services::lidarr::ReplacedCopy,
+    ) -> crate::services::i_download_service::Restored {
+        self.restore_placed_copy(copy).await
     }
 
     async fn get_local_path_if_exists(&self, external_provider: &str, external_id: &str) -> Option<String> {

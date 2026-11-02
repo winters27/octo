@@ -17,10 +17,11 @@ use tracing::{debug, error, info, warn};
 use super::{BaseDownloadService, FileNotFoundException, RequestedIdentity, file_exists, get_extension};
 use crate::services::common::acquisition_tracker::{acquisition_event_kinds, key_of};
 use crate::services::common::soulseek_hold_store::held_root;
+use crate::services::i_download_service::{PlacedHeld, Restored};
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::replacement_handoff::ArrivedTags;
 use crate::services::library::{ReplacementHandoff, ReplacementRejectedException};
-use crate::services::lidarr::{FollowEnd, HELD_FOR_LIDARR, HeldPlacement};
+use crate::services::lidarr::{FollowEnd, GivingWay, HELD_FOR_LIDARR, HeldPlacement, ReplacedCopy};
 use crate::services::lyrics::lyrics_sidecar_writer::LyricsJob;
 use crate::services::soulseek::soulseek_download_service::INCOMING_FOLDER_NAME;
 
@@ -248,6 +249,7 @@ impl BaseDownloadService {
             kept: matches!(proof, RecordingProof::AsHeard { .. } | RecordingProof::KeptByYou),
             follows: follows.clone(),
             users: users.to_vec(),
+            own_copies: Vec::new(),
         });
         if proven {
             info!("{held_path} is proven: Octo stops following Lidarr for its artist and places it");
@@ -266,8 +268,9 @@ impl BaseDownloadService {
     /// Places a file a Lidarr follow held back, now that no follow holds it: moved where the
     /// layout gave it (beside a different file already there, never over it), with whatever was
     /// written beside it, the library's record moved along, and a scan asked for. Never while a
-    /// library job or a download is placing files. None when it could not be placed.
-    pub async fn place_held_file(&self, held: &HeldPlacement) -> Option<String> {
+    /// library job or a download is placing files. None when it could not be placed; else where
+    /// it landed and the files moved beside it.
+    pub async fn place_held_file(&self, held: &HeldPlacement) -> Option<PlacedHeld> {
         let _share = match &self.services.write_gate {
             Some(gate) => Some(gate.write().await),
             None => None,
@@ -290,7 +293,7 @@ impl BaseDownloadService {
             warn!("Could not place the held {}: {e}", held.held_path);
             return None;
         }
-        move_beside(&held.held_path, &target);
+        let beside = move_beside(&held.held_path, &target);
         // The hold folder goes with its last file.
         if let Some(folder) = Path::new(&held.held_path).parent() {
             let _ = std::fs::remove_dir(folder);
@@ -310,7 +313,172 @@ impl BaseDownloadService {
             "Placed the held {} where the layout files it: {target}",
             held.song
         );
-        Some(target)
+        Some(PlacedHeld { path: target, beside })
+    }
+
+    /// A copy Octo placed during a Lidarr follow gives way to its song's proven Lidarr file (see
+    /// [`crate::services::i_download_service::IDownloadService::drop_placed`]): never a file Octo
+    /// did not place, never a file beside it that another file of that name shares, and never a
+    /// record but the kept version's. Never while a library job or a download is placing files.
+    pub async fn drop_placed_copy(&self, copy: &GivingWay) -> bool {
+        let _share = match &self.services.write_gate {
+            Some(gate) => Some(gate.write().await),
+            None => None,
+        };
+        let Ok(_permit) = self.download_lock.acquire().await else {
+            return false;
+        };
+        if !self.forget_kept_record(copy).await {
+            return false;
+        }
+        if copy.replaced {
+            info!(
+                "The copy Octo placed of {} was replaced by Lidarr's import; its record goes",
+                copy.song
+            );
+            return true;
+        }
+        if !still_placed(&copy.path, copy.backup.as_deref(), copy.linked) {
+            info!(
+                "{} is no longer the copy Octo placed of {}; it stays",
+                copy.path, copy.song
+            );
+            return true;
+        }
+        if let Err(e) = std::fs::remove_file(&copy.path)
+            && Path::new(&copy.path).exists()
+        {
+            warn!("Could not delete the copy Octo placed at {}: {e}", copy.path);
+            return false;
+        }
+        for file in &copy.beside {
+            if !shares_its_name(file) {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+        Self::try_remove_empty_parents(get_directory_name(&copy.path).as_deref(), &self.download_path());
+        self.local_library.trigger_library_scan(false).await;
+        info!(
+            "Dropped the copy Octo placed of {} for its proven Lidarr file: {}",
+            copy.song, copy.path
+        );
+        true
+    }
+
+    /// The library's record of the kept version a placed copy was, at its path: that one record
+    /// goes, and a record of any other file there (the proven file, landed where the copy was)
+    /// stays. False when the records could not be written.
+    async fn forget_kept_record(&self, copy: &GivingWay) -> bool {
+        let Some((provider, external_id)) = copy.song.split_once(':') else {
+            return true;
+        };
+        let full = get_full_path(&copy.path);
+        let kept_for_them = |users: &[String]| {
+            !users.is_empty()
+                && users.iter().all(|user| {
+                    copy.users
+                        .iter()
+                        .any(|known| dotnet::eq_ignore_case(known.trim(), user.trim()))
+                })
+        };
+        let kept: Vec<String> = self
+            .local_library
+            .get_mappings()
+            .await
+            .into_iter()
+            .filter(|mapping| {
+                mapping.external_provider == provider
+                    && mapping.external_id == external_id
+                    && dotnet::eq_ignore_case(&get_full_path(&mapping.local_path), &full)
+                    && mapping.kept_unproven()
+                    && mapping
+                        .heart
+                        .as_ref()
+                        .is_some_and(|heart| kept_for_them(&heart.users))
+            })
+            .map(|mapping| mapping.key())
+            .collect();
+        for key in kept {
+            if let Err(e) = self.local_library.forget_mapping_keyed(&key).await {
+                warn!("Could not forget the library's record of {key}: {e}");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Puts back a copy Octo placed during a Lidarr follow that Lidarr's import replaced (see
+    /// [`crate::services::i_download_service::IDownloadService::restore_placed`]). Never while a
+    /// library job or a download is placing files.
+    pub async fn restore_placed_copy(&self, copy: &ReplacedCopy) -> Restored {
+        let _share = match &self.services.write_gate {
+            Some(gate) => Some(gate.write().await),
+            None => None,
+        };
+        let Ok(_permit) = self.download_lock.acquire().await else {
+            return Restored::Later;
+        };
+        if !Path::new(&copy.backup).is_file() {
+            warn!(
+                "The copy Octo placed at {} was replaced, and its link is gone",
+                copy.path
+            );
+            return Restored::Lost;
+        }
+        if Path::new(&copy.path).exists() {
+            if self.landed_for(copy).await {
+                info!(
+                    "{} holds the song's own file for its people now; the copy Octo placed there gives way",
+                    copy.path
+                );
+                return Restored::GaveWay;
+            }
+            info!(
+                "Another file lies where the copy Octo placed was ({}); it is put back later",
+                copy.path
+            );
+            return Restored::Later;
+        }
+        if let Some(folder) = Path::new(&copy.path).parent()
+            && let Err(e) = std::fs::create_dir_all(folder)
+        {
+            warn!("Could not make {} for a copy Octo placed: {e}", folder.display());
+            return Restored::Later;
+        }
+        let back = std::fs::hard_link(&copy.backup, &copy.path).is_ok()
+            || std::fs::copy(&copy.backup, &copy.path).is_ok();
+        if !back {
+            warn!(
+                "Lidarr's import replaced the copy Octo placed at {}, and Octo could not put it back yet",
+                copy.path
+            );
+            return Restored::Later;
+        }
+        self.local_library.trigger_library_scan(false).await;
+        info!(
+            "Lidarr's file for {} did not land; the copy Octo placed is back at {}",
+            copy.song, copy.path
+        );
+        Restored::Back
+    }
+
+    /// Whether the file at a replaced copy's path is its song's own landed file for one of its
+    /// people: the library records the song there, proven, for one of them.
+    async fn landed_for(&self, copy: &ReplacedCopy) -> bool {
+        let Some((provider, external_id)) = copy.song.split_once(':') else {
+            return false;
+        };
+        let full = get_full_path(&copy.path);
+        self.local_library.get_mappings().await.iter().any(|mapping| {
+            mapping.external_provider == provider
+                && mapping.external_id == external_id
+                && dotnet::eq_ignore_case(&get_full_path(&mapping.local_path), &full)
+                && !mapping.kept_unproven()
+                && mapping
+                    .heart
+                    .as_ref()
+                    .is_some_and(|heart| copy.users.iter().any(|user| heart.is_for(user)))
+        })
     }
 
     /// Drops a kept copy a Lidarr follow held back, once a proven copy of its song passed the gate
@@ -332,6 +500,8 @@ impl BaseDownloadService {
             .await
             .into_iter()
             .find(|mapping| mapping.local_path == held.held_path);
+        // Someone it was kept for who has a copy of their own in their library now no longer needs
+        // this one.
         let only_theirs = mapping
             .as_ref()
             .and_then(|mapping| mapping.heart.as_ref())
@@ -340,6 +510,7 @@ impl BaseDownloadService {
                     && heart.users.iter().all(|kept_for| {
                         users
                             .iter()
+                            .chain(held.own_copies.iter())
                             .any(|user| dotnet::eq_ignore_case(user.trim(), kept_for.trim()))
                     })
             });
@@ -831,17 +1002,19 @@ pub(super) fn move_file(from: &str, to: &str) -> std::io::Result<()> {
 }
 
 /// Moves the files written beside `from` (its name with another extension, such as its lyrics)
-/// to beside `to`, named after it. Best effort; one already there stays.
-fn move_beside(from: &str, to: &str) {
+/// to beside `to`, named after it. Best effort; one already there stays. The files it moved, by
+/// their new paths.
+fn move_beside(from: &str, to: &str) -> Vec<String> {
+    let mut moved = Vec::new();
     let (from, to) = (Path::new(from), Path::new(to));
     let (Some(from_dir), Some(to_dir)) = (from.parent(), to.parent()) else {
-        return;
+        return moved;
     };
     let (Some(from_stem), Some(to_stem)) = (from.file_stem(), to.file_stem()) else {
-        return;
+        return moved;
     };
     let Ok(entries) = std::fs::read_dir(from_dir) else {
-        return;
+        return moved;
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -856,10 +1029,80 @@ fn move_beside(from: &str, to: &str) {
             to_stem.to_string_lossy(),
             extension.to_string_lossy()
         ));
-        if !beside.exists() {
-            let _ = std::fs::rename(&path, &beside);
+        if !beside.exists() && std::fs::rename(&path, &beside).is_ok() {
+            moved.push(beside.to_string_lossy().into_owned());
         }
     }
+    moved
+}
+
+/// Whether the file at `path` is still the very file Octo placed, as the link it kept of it
+/// (`backup`) proves: the same file on disk when the link is a hard link (on Linux; elsewhere by
+/// its bytes), else the same size and the same bytes. Never without a link.
+fn still_placed(path: &str, backup: Option<&str>, linked: bool) -> bool {
+    let Some(backup) = backup else {
+        return false;
+    };
+    let (Ok(placed), Ok(kept)) = (std::fs::metadata(path), std::fs::metadata(backup)) else {
+        return false;
+    };
+    if !placed.is_file() || !kept.is_file() {
+        return false;
+    }
+    if linked && let Some(same) = same_file(&placed, &kept) {
+        return same;
+    }
+    placed.len() == kept.len()
+        && file_hash(Path::new(path)).is_some_and(|hash| file_hash(Path::new(backup)) == Some(hash))
+}
+
+/// Whether two files are one file on disk, by device and inode.
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Some(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+/// Not known here: the bytes decide.
+#[cfg(not(unix))]
+fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> Option<bool> {
+    None
+}
+
+/// The SHA-256 of a file's bytes, or None when it cannot be read.
+fn file_hash(path: &Path) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(hasher.finalize().into())
+}
+
+/// Whether a file written beside an audio file (its lyrics) is shared by another audio file of
+/// the same name in its folder, so it is that file's too.
+fn shares_its_name(beside: &str) -> bool {
+    let beside = Path::new(beside);
+    let (Some(folder), Some(stem)) = (beside.parent(), beside.file_stem()) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path != beside
+            && path.file_stem() == Some(stem)
+            && path.is_file()
+            && is_audio_file(&path.to_string_lossy())
+    })
 }
 
 /// The folder of a path: everything before the last separator, `"/"` for a file in the root,

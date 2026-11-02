@@ -95,6 +95,13 @@ impl ILocalLibraryService for FakeLocalLibrary {
         Ok(forgotten)
     }
 
+    async fn forget_mapping_keyed(&self, key: &str) -> anyhow::Result<bool> {
+        let mut by_tags = self.by_tags.lock();
+        let before = by_tags.len();
+        by_tags.retain(|(.., mapping)| mapping.key() != key);
+        Ok(by_tags.len() != before)
+    }
+
     async fn trigger_library_scan(&self, _force: bool) -> bool {
         self.scans.fetch_add(1, Ordering::SeqCst);
         true

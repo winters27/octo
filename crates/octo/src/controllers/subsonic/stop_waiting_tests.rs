@@ -114,11 +114,17 @@ impl IDownloadService for Placer {
         None
     }
 
-    async fn place_held(&self, held: &HeldPlacement) -> Option<String> {
+    async fn place_held(
+        &self,
+        held: &HeldPlacement,
+    ) -> Option<crate::services::i_download_service::PlacedHeld> {
         std::fs::create_dir_all(Path::new(&held.target).parent()?).ok()?;
         std::fs::rename(&held.held_path, &held.target).ok()?;
         self.placed.lock().push(held.target.clone());
-        Some(held.target.clone())
+        Some(crate::services::i_download_service::PlacedHeld {
+            path: held.target.clone(),
+            beside: Vec::new(),
+        })
     }
 
     async fn get_local_path_if_exists(&self, _: &str, _: &str) -> Option<String> {
@@ -217,6 +223,7 @@ impl WaitApp {
             kept: true,
             follows: vec![album.into()],
             users: vec!["alice".into()],
+            own_copies: Vec::new(),
         };
         self.pending.hold_placement(held.clone());
         for user in ["alice", "bob"] {
@@ -444,6 +451,7 @@ async fn one_persons_stop_waiting_ends_only_their_wait_on_a_shared_follow() {
             kept: true,
             follows: vec!["rg-mezzanine".into()],
             users: vec![user.into()],
+            own_copies: Vec::new(),
         };
         t.pending.hold_placement(held.clone());
         t.state.acquisition_tracker.begin(

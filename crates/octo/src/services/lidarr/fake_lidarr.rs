@@ -332,6 +332,8 @@ struct PendingRelease {
     title: String,
     reason: String,
     added: DateTime<Utc>,
+    /// The release source of the search that held it back, which its grab carries.
+    release_source: String,
 }
 
 #[derive(Clone)]
@@ -424,6 +426,10 @@ struct State {
     failing_requests: Vec<(String, String, u32)>,
     /// The next request of a method and path under `/api/v1/` is answered this late.
     slow_requests: Vec<(String, String, std::time::Duration)>,
+    /// The next request of a method and path under `/api/v1/` is done and its answer lost.
+    lost_answers: Vec<(String, String)>,
+    /// The next command of each name posted is run and its answer lost.
+    lost_commands: Vec<String>,
 }
 
 impl FakeLidarr {
@@ -492,6 +498,8 @@ impl FakeLidarr {
                 down: false,
                 failing_requests: Vec::new(),
                 slow_requests: Vec::new(),
+                lost_answers: Vec::new(),
+                lost_commands: Vec::new(),
             })),
         };
         let server = MockServer::builder().start().await;
@@ -719,6 +727,22 @@ impl FakeLidarr {
         });
     }
 
+    /// The next request of `method` whose path under `/api/v1/` starts with `prefix` is done, and
+    /// its answer lost on the way back: a proxy in front of Lidarr answers 502 instead.
+    pub fn lose_next_answer(&self, method: &str, prefix: &str) {
+        self.with(|state| {
+            state
+                .lost_answers
+                .push((method.to_string(), prefix.to_ascii_lowercase()));
+        });
+    }
+
+    /// The next command named `name` posted is queued and run, and its answer lost on the way
+    /// back: a proxy in front of Lidarr answers 502 instead.
+    pub fn lose_next_command_answer(&self, name: &str) {
+        self.with(|state| state.lost_commands.push(name.to_string()));
+    }
+
     /// The next request of `method` whose path under `/api/v1/` starts with `prefix` is answered
     /// `delay` late.
     pub fn slow_next(&self, method: &str, prefix: &str, delay: std::time::Duration) {
@@ -785,6 +809,7 @@ impl FakeLidarr {
                 title: format!("Pending release {queue_id}"),
                 reason: reason.to_string(),
                 added,
+                release_source: "Search".to_string(),
             });
             queue_id
         })
@@ -802,9 +827,18 @@ impl FakeLidarr {
     }
 
     /// A pending release is grabbed after all: it leaves the queue's pending list and becomes
-    /// this download, with its `grabbed` row naming the search it came from.
+    /// this download, with its `grabbed` row naming the search it came from (the release source of
+    /// the search that held it back).
     pub fn grab_pending(&self, queue_id: i32, grab: Grab) {
-        self.take_pending(queue_id, grab, "Search");
+        let source = self.with(|state| {
+            state
+                .pending
+                .iter()
+                .find(|p| p.queue_id == queue_id)
+                .map(|p| p.release_source.clone())
+                .expect("a pending release")
+        });
+        self.take_pending(queue_id, grab, &source);
     }
 
     /// The pending release leaves the queue for a grab of the album made with `release_source`,
@@ -1419,6 +1453,7 @@ impl State {
                     title: format!("Pending release {queue_id}"),
                     reason,
                     added,
+                    release_source: release_source.to_string(),
                 });
                 continue;
             }
@@ -2946,7 +2981,22 @@ impl Respond for FakeLidarr {
             .iter()
             .position(|(m, prefix, _)| hit(m, prefix))
             .map(|index| state.slow_requests.remove(index).2);
+        let named = body
+            .as_ref()
+            .and_then(|body| body["name"].as_str())
+            .filter(|_| method == "POST" && path == "/api/v1/command")
+            .and_then(|name| state.lost_commands.iter().position(|lost| lost == name));
+        let lost = state
+            .lost_answers
+            .iter()
+            .position(|(m, prefix)| hit(m, prefix))
+            .map(|index| state.lost_answers.remove(index))
+            .is_some()
+            || named.map(|index| state.lost_commands.remove(index)).is_some();
         let response = state.handle(request.method.as_str(), request.url.path(), &query, body.as_ref());
+        if lost {
+            return answer(502, json!({ "message": "Bad gateway" }));
+        }
         match delay {
             Some(delay) => response.set_delay(delay),
             None => response,
