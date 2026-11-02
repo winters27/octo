@@ -1077,7 +1077,11 @@ async fn a_copy_octo_placed_during_an_open_follow_is_not_the_artists_music() {
         .queue_command("RescanFolders", serde_json::json!({}), "manual");
     f.pending
         .placed_copy(&copy.to_string_lossy(), &[ALBUM_ID.to_string()], None);
-    let artist = service.artist_music().read(ARTIST_ID).await.expect("Lidarr answers");
+    let artist = service
+        .artist_music()
+        .read(ARTIST_ID)
+        .await
+        .expect("Lidarr answers");
     let artist_id = artist.artist.as_ref().expect("Lidarr has the artist").id;
     assert_eq!(
         f.client()
