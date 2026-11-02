@@ -254,9 +254,12 @@ async fn the_first_answer_after_a_call_deezer_did_not_answer_wakes_what_waits_fo
     h.service.on_answered_again(Arc::new(move || {
         count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }));
+    assert_eq!(h.service.answering(), Some(0));
     assert_eq!(h.service.get_album_detail("711108").await, None);
+    assert_eq!(h.service.answering(), None, "its last call went unanswered");
     assert!(h.service.get_album_detail("711108").await.is_some());
     assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(h.service.answering(), Some(1), "answered again once");
     h.service.clear_caches();
     assert!(h.service.get_album_detail("711108").await.is_some());
     assert_eq!(
@@ -264,6 +267,7 @@ async fn the_first_answer_after_a_call_deezer_did_not_answer_wakes_what_waits_fo
         1,
         "no call failed between"
     );
+    assert_eq!(h.service.answering(), Some(1));
 }
 
 /// The other poisoning branch: the album call itself is throttled.

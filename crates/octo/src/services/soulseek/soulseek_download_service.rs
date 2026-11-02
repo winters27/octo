@@ -3904,6 +3904,7 @@ mod spotiflac_download;
 #[path = "soulseek_gate.rs"]
 mod soulseek_gate;
 
+pub(crate) use soulseek_gate::record_joiner;
 use soulseek_gate::{FileJudged, gated, move_to_hold, not_proven, only_heard_or_master};
 pub use spotiflac_download::SPOTIFLAC_SOURCE;
 

@@ -60,8 +60,6 @@ impl SoulseekHoldResumer {
     /// album tracks) are then checked again once each, oldest first, one at a time, at the AcoustID
     /// lane's lowest place; files kept as heard are never checked at start.
     pub async fn run(self: Arc<Self>, _stopping: CancellationToken) -> anyhow::Result<()> {
-        // Held files no hold names go before anything runs again.
-        self.hearts.sweep_held_files();
         // Every live hold holds its heard copies again, and saved copy holds no hold names go;
         // a hold that waits on the shim joins the round queue instead of running now.
         if let Some(heard) = &self.heard {

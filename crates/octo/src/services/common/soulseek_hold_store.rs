@@ -311,6 +311,9 @@ impl HeldAcquisition {
 /// The folder under the download path's incoming folder that every held file waits in.
 pub const HELD_FOLDER_NAME: &str = "held";
 
+/// How the folder of one person's keep copies, beside a hold's files, begins.
+pub const KEPT_FOR_PREFIX: &str = "kept-for-";
+
 /// Where every held file waits: `<download path>/<incoming folder>/held`.
 pub fn held_root(download_path: &Path) -> PathBuf {
     download_path.join(INCOMING_FOLDER_NAME).join(HELD_FOLDER_NAME)
@@ -436,8 +439,10 @@ impl SoulseekHoldStore {
     /// Records a hold, its holders seeded from its requester when it lists none, in one write. A
     /// hold already there under the same key keeps its first start time and takes in what the new
     /// record brings: a person not listed yet joins it (a listed person's entry is replaced only by
-    /// one heard later, and takes in their routes), and its held files, their Lidarr labels, the
-    /// keeps asked for and its line join the hold's own. Answers the hold as kept.
+    /// one heard later), each joining person in it by the new record's route as well as by any
+    /// they had; a song's hold that a hearted album's track joins becomes that album's held track,
+    /// the people already in it kept there by their song; and its held files, their Lidarr labels,
+    /// the keeps asked for and its line join the hold's own. Answers the hold as kept.
     pub fn hold(&self, mut held: HeldAcquisition) -> HeldAcquisition {
         held.seed_holders();
         held.tidy_lidarr_files();
@@ -445,8 +450,10 @@ impl SoulseekHoldStore {
         let key = held.key();
         if let Some(existing) = map.get(&key) {
             let mut kept = existing.clone();
+            let joining = HoldRoute::of(&held);
+            let mut changed = take_album_track(&mut kept, held.album_track.take());
             let own = HoldRoute::of(&kept);
-            let mut changed = merge_holders(&mut kept.holders, held.holders, own);
+            changed |= merge_holders(&mut kept.holders, held.holders, own, joining);
             for file in held.held_files {
                 if !kept.held_files.contains(&file) {
                     kept.held_files.push(file);
@@ -566,8 +573,10 @@ impl SoulseekHoldStore {
         let kept = match map.get(&new_key) {
             Some(existing) => {
                 let mut kept = existing.clone();
+                let joining = HoldRoute::of(&moved);
+                take_album_track(&mut kept, moved.album_track.take());
                 let own = HoldRoute::of(&kept);
-                merge_holders(&mut kept.holders, moved.holders, own);
+                merge_holders(&mut kept.holders, moved.holders, own, joining);
                 kept
             }
             None => moved,
@@ -596,9 +605,10 @@ impl SoulseekHoldStore {
     }
 
     /// Every file under `root` (the one hold path) that waits in a hold's own folder and that no
-    /// hold names: a hold that ended before its files went, or a crash between. Other folders
-    /// there (a Lidarr follow's) are not a hold's and are left alone; an emptied hold folder goes.
-    /// Answers how many files went.
+    /// hold names: a hold that ended before its files went, or a crash between. A keep's copies
+    /// beside a hold's files ([`KEPT_FOR_PREFIX`]) go too: at Octo's start no keep is under way.
+    /// Other folders there (a Lidarr follow's) are not a hold's and are left alone; an emptied hold
+    /// folder goes. Answers how many files went.
     pub fn sweep_unnamed(&self, root: &Path) -> usize {
         let named: std::collections::HashSet<PathBuf> = self
             .held
@@ -625,6 +635,17 @@ impl SoulseekHoldStore {
                 continue;
             };
             for file in files.flatten().map(|entry| entry.path()) {
+                let copies = file.is_dir()
+                    && file
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(KEPT_FOR_PREFIX));
+                if copies {
+                    swept += std::fs::read_dir(&file)
+                        .map(|left| left.flatten().filter(|entry| entry.path().is_file()).count())
+                        .unwrap_or_default();
+                    let _ = std::fs::remove_dir_all(&file);
+                    continue;
+                }
                 if file.is_file() && !named.contains(&file) && std::fs::remove_file(&file).is_ok() {
                     swept += 1;
                 }
@@ -654,21 +675,45 @@ fn delete_unnamed_files(ended: &HeldAcquisition, map: &DotnetDictionary<HeldAcqu
     }
 }
 
+/// A song's hold that a hearted album's track joins becomes that album's held track: it takes the
+/// track `joining` brings when it has none, and the people already in it, there by their song,
+/// keep saying so. True when it changed.
+fn take_album_track(kept: &mut HeldAcquisition, joining: Option<HeldAlbumTrack>) -> bool {
+    let Some(track) = joining.filter(|_| kept.album_track.is_none()) else {
+        return false;
+    };
+    for holder in &mut kept.holders {
+        if holder.routes.is_empty() {
+            holder.routes = vec![HoldRoute::Song];
+        }
+    }
+    kept.album_track = Some(track);
+    true
+}
+
 /// Takes `joining` into `holders` of a hold whose own route is `own`, one entry per person
-/// (ignoring case): a person not listed is added; a listed person's entry is replaced by one heard
-/// later (keeping the album context and the routes it had), otherwise takes the album context it
-/// lacked, and either way takes in the routes the joining entry lists beside those it had. True
-/// when anything changed.
-fn merge_holders(holders: &mut Vec<Holder>, joining: Vec<Holder>, own: HoldRoute) -> bool {
+/// (ignoring case), each joining person in it by the route they list, else by `route`, the route
+/// of the record they came with: a person not listed is added; a listed person's entry is
+/// replaced by one heard later (keeping the album context it had), otherwise takes the album
+/// context it lacked, and either way is in it by every route they had and every route they join
+/// by. A person in it by its own route only lists none. True when anything changed.
+fn merge_holders(holders: &mut Vec<Holder>, joining: Vec<Holder>, own: HoldRoute, route: HoldRoute) -> bool {
+    let listed = |routes: Vec<HoldRoute>| if routes == [own] { Vec::new() } else { routes };
     let mut changed = false;
-    for holder in joining {
+    for mut holder in joining {
         if holder.user.trim().is_empty() {
             continue;
         }
+        let joins_by = if holder.routes.is_empty() {
+            vec![route]
+        } else {
+            std::mem::take(&mut holder.routes)
+        };
         let Some(known) = holders
             .iter_mut()
             .find(|known| dotnet::eq_ignore_case(known.user.trim(), holder.user.trim()))
         else {
+            holder.routes = listed(joins_by);
             holders.push(holder);
             changed = true;
             continue;
@@ -678,7 +723,6 @@ fn merge_holders(holders: &mut Vec<Holder>, joining: Vec<Holder>, own: HoldRoute
             (None, Some(_)) => true,
             (Some(was), Some(now)) => now.heard_at > was.heard_at,
         };
-        let routes: Vec<HoldRoute> = holder.routes.clone();
         if heard_later {
             let context = known.context.take();
             let had = std::mem::take(&mut known.routes);
@@ -692,15 +736,20 @@ fn merge_holders(holders: &mut Vec<Holder>, joining: Vec<Holder>, own: HoldRoute
             known.context = holder.context;
             changed = true;
         }
-        // A person kept in the hold by its own route only lists none; one more route lists both.
-        if known.routes.is_empty() && routes.iter().any(|route| *route != own) {
-            known.routes.push(own);
-        }
-        for route in routes {
-            if !known.routes.contains(&route) {
-                known.routes.push(route);
-                changed = true;
+        let mut routes = if known.routes.is_empty() {
+            vec![own]
+        } else {
+            known.routes.clone()
+        };
+        for joined in joins_by {
+            if !routes.contains(&joined) {
+                routes.push(joined);
             }
+        }
+        let routes = listed(routes);
+        if known.routes != routes {
+            known.routes = routes;
+            changed = true;
         }
     }
     changed
@@ -999,6 +1048,47 @@ mod tests {
         assert!(SoulseekHoldStore::new(Some(&path)).snapshot().is_empty());
     }
 
+    /// A song's own hold that a hearted album's held track of the same wait joins becomes that
+    /// album's held track: the person already in it by their song stays so, the same person joining
+    /// by the album is in it by both, and another joining by the album is in it by the album alone.
+    #[test]
+    fn a_songs_hold_joined_by_an_album_track_becomes_it_and_each_person_keeps_their_routes() {
+        let store = SoulseekHoldStore::new(None::<PathBuf>);
+        let song = store.hold(waiting("brandon", "v2009", 1));
+        assert_eq!(song.holders[0].routes_in(&song), [HoldRoute::Song]);
+        let track = HeldAlbumTrack {
+            album_key: "soulseek:album-1".into(),
+            song_ids: vec!["help".into()],
+            ..Default::default()
+        };
+        let album = |user: &str| {
+            let mut record = waiting(user, "v2009", 1);
+            record.album_track = Some(track.clone());
+            record.holders[0].heard = None;
+            record
+        };
+        let joined = store.hold(album("brandon"));
+        assert_eq!(joined.key(), song.key(), "one record");
+        assert_eq!(joined.album_track, Some(track.clone()));
+        assert_eq!(
+            joined.holders[0].routes_in(&joined),
+            [HoldRoute::Song, HoldRoute::Album]
+        );
+        let joined = store.hold(album("anna"));
+        assert_eq!(joined.holders[1].routes_in(&joined), [HoldRoute::Album]);
+        assert!(
+            joined.holders[1].routes.is_empty(),
+            "the hold's own route lists none"
+        );
+        // The song's heart joining again by its own route changes nothing of the album's.
+        let again = store.hold(waiting("brandon", "v2009", 1));
+        assert_eq!(again.album_track, Some(track));
+        assert_eq!(
+            again.holders[0].routes_in(&again),
+            [HoldRoute::Song, HoldRoute::Album]
+        );
+    }
+
     #[test]
     fn records_of_one_song_are_found_whatever_they_wait_for_and_move_between_waits() {
         let store = SoulseekHoldStore::new(None::<PathBuf>);
@@ -1204,6 +1294,23 @@ mod tests {
         assert!(!Path::new(&stray).exists());
         assert!(Path::new(&shared).exists());
         assert!(follow.join("kept.flac").exists());
+    }
+
+    /// At start, a keep's copies left beside a hold's files (a stop between the copy and its
+    /// landing) go with their folder, and a hold folder they leave empty goes too.
+    #[test]
+    fn a_keeps_copies_left_beside_a_holds_files_go_at_start() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().join("held");
+        let folder = root.join("Track_soulseek_x");
+        let copies = folder.join(format!("{KEPT_FOR_PREFIX}0123456789abcdef"));
+        std::fs::create_dir_all(&copies).expect("a folder");
+        std::fs::write(copies.join("a.flac"), b"x").expect("written");
+        std::fs::write(copies.join("b.flac"), b"x").expect("written");
+        let store = SoulseekHoldStore::new(None::<PathBuf>);
+        assert_eq!(store.sweep_unnamed(&root), 2);
+        assert!(!copies.exists());
+        assert!(!folder.exists(), "the emptied hold folder goes");
     }
 
     /// A person's entry replaced by one heard later keeps the album they listened from and the

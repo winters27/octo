@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use super::{HEARD_GONE, HeartAcquisitionCoordinator, track_base_key};
 use crate::services::common::acquisition_tracker::{AcquisitionSnapshot, key_of};
-use crate::services::common::soulseek_hold_store::Holder;
+use crate::services::common::soulseek_hold_store::{Holder, KEPT_FOR_PREFIX};
 use crate::services::common::{AcquisitionHeld, AcquisitionTarget, HeldAcquisition, HeldKind};
 
 /// The downloads line of a song whose keep waits for YouTube to answer for the heard video.
@@ -225,7 +225,9 @@ impl HeartAcquisitionCoordinator {
     }
 
     /// Carries out every keep saved in the hold `key` that `done` does not name, until none is
-    /// left. Nothing while the hold runs again: that pass carries them out when it ends.
+    /// left. Nothing while the hold runs again: that pass carries them out when it ends. A wake of
+    /// the hold that came while the keeps were carried out runs it now, and that run carries out
+    /// any keep still saved.
     pub(crate) async fn keeps_after(&self, key: &str, done: &[String]) {
         let Some(holds) = self.extras.holds.clone() else {
             return;
@@ -245,7 +247,14 @@ impl HeartAcquisitionCoordinator {
                 return;
             }
             self.carry_out(&record, &fresh).await;
-            self.resuming.lock().remove(key);
+            self.release_run(key);
+            if self.again.lock().contains(key) {
+                debug!("Held {key} was woken while a keep was carried out; it runs now");
+                if let Some(me) = self.me.upgrade() {
+                    me.resume_held(key);
+                }
+                return;
+            }
             done.extend(fresh);
         }
     }
@@ -281,33 +290,59 @@ impl HeartAcquisitionCoordinator {
             }
             return;
         }
-        // Its files are gone and the song is in the library: the keep landed before Octo stopped,
-        // and only its hold was left to end.
-        if !record.held_files.is_empty() && self.kept_before(record).await {
-            info!("The keep of {} landed before; its hold ends", record.key());
-            self.end_kept(record);
-            return;
-        }
         for user in users {
+            // Its files are gone and the library keeps a copy kept anyway for this person: their
+            // keep landed before Octo stopped, and only their place in the hold was left to end.
+            if !record.held_files.is_empty() && self.kept_before(record, user).await {
+                info!(
+                    "The keep of {} for {user} landed before; they leave its hold",
+                    record.key()
+                );
+                self.ended_as_kept(record, user);
+                continue;
+            }
             self.keep_heard_audio(record, user).await;
         }
     }
 
-    /// Whether the song of `record` is in the library where its keep lands it.
-    async fn kept_before(&self, record: &HeldAcquisition) -> bool {
-        let target = record
-            .requested_by
-            .clone()
-            .or_else(|| record.holders.first().map(|holder| holder.user.clone()))
-            .and_then(|user| self.import_target(&user).ok())
-            .unwrap_or(AcquisitionTarget::Shared);
-        let scope = match &target {
-            AcquisitionTarget::Shared => crate::services::family::LibraryScope::Shared,
-            AcquisitionTarget::Member(user) => crate::services::family::LibraryScope::Viewer(user.clone()),
+    /// Whether the library keeps a file of the song of `record` kept anyway, unproven, for `user`:
+    /// their own keep, never another copy of the song or anyone else's.
+    async fn kept_before(&self, record: &HeldAcquisition, user: &str) -> bool {
+        let Some(library) = &self.extras.library else {
+            return false;
         };
-        self.owned_copy(&record.provider, &record.external_id, &scope)
-            .await
-            .is_some()
+        library.get_mappings().await.iter().any(|mapping| {
+            eq_ignore_case(&mapping.external_provider, &record.provider)
+                && mapping.external_id == record.external_id
+                && mapping.kept_unproven()
+                && mapping.heart.as_ref().is_some_and(|heart| heart.is_for(user))
+        })
+    }
+
+    /// `user`'s keep of `record` landed before: they leave the hold as their keep's landing would
+    /// have left it, and a hold nobody is left in ends.
+    fn ended_as_kept(&self, record: &HeldAcquisition, user: &str) {
+        let current = self
+            .extras
+            .holds
+            .as_ref()
+            .and_then(|holds| holds.get(&record.key()))
+            .unwrap_or_else(|| record.clone());
+        match current
+            .holders
+            .iter()
+            .find(|holder| eq_ignore_case(holder.user.trim(), user.trim()))
+        {
+            Some(holder) => self.leave_after_keep(&current, holder, None),
+            None => {
+                if let Some(holds) = &self.extras.holds {
+                    holds.update(&record.key(), |kept| {
+                        kept.keep_requested
+                            .retain(|asker| !eq_ignore_case(asker.trim(), user.trim()))
+                    });
+                }
+            }
+        }
     }
 
     /// A hold's file lands as it is for `user` alone: into their own library, counted as theirs by
@@ -635,13 +670,19 @@ impl HeartAcquisitionCoordinator {
     }
 }
 
+/// The folder of `user`'s keep copies: named by a hash of who they are (ignoring case), so no two
+/// people share one and no name shows in it.
+fn kept_for_folder(user: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(octo_core::common::dotnet::to_lower_invariant(user.trim()).as_bytes());
+    let hex: String = digest.iter().take(8).map(|byte| format!("{byte:02x}")).collect();
+    format!("{KEPT_FOR_PREFIX}{hex}")
+}
+
 /// Copies of a hold's files for one person's keep, beside them in a folder of that person's own,
 /// each under its own name: the pipeline lands the copies, and the files stay held for the others.
 fn copies_for(files: &[String], user: &str) -> std::io::Result<Vec<String>> {
-    let folder_name: String = user
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
+    let folder_name = kept_for_folder(user);
     let mut copies = Vec::new();
     for file in files {
         let source = Path::new(file);
@@ -649,7 +690,7 @@ fn copies_for(files: &[String], user: &str) -> std::io::Result<Vec<String>> {
             remove_copies(&copies);
             return Err(std::io::Error::other(format!("{file} names no file")));
         };
-        let folder = parent.join(format!("kept-for-{folder_name}"));
+        let folder = parent.join(&folder_name);
         let copy = folder.join(name);
         let made = std::fs::create_dir_all(&folder).and_then(|()| std::fs::copy(source, &copy));
         if let Err(e) = made {

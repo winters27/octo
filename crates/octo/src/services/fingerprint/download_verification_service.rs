@@ -1638,7 +1638,7 @@ fn get_extension(path: &str) -> &str {
 mod heart;
 
 pub use heart::{
-    ANOTHER_SONG_OR_TAKE, ANOTHER_SONG_PLAYED, HEARD_LOOKUP_BUSY, NEVER_PLAYED, YOUTUBE_PEER,
+    ANOTHER_SONG_OR_TAKE, ANOTHER_SONG_PLAYED, HEARD_LOOKUP_BUSY, NEVER_PLAYED, SOUND_NOT_READ, YOUTUBE_PEER,
     became_with_duplicates,
 };
 pub(crate) use heart::{pick_contexts, song_in};

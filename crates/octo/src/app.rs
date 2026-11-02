@@ -1158,8 +1158,15 @@ impl Acquisition {
                 }),
                 album_gates: Some(album_gates.clone()),
                 metadata: Some(music_metadata.clone()),
+                library: Some(navidrome.local_library.clone()),
+                deezer_answering: Some({
+                    let deezer = clients.deezer_metadata.clone();
+                    Arc::new(move || deezer.answering())
+                }),
             },
         );
+        // Held files no hold names go before any worker runs.
+        heart_acquisition_coordinator.sweep_held_files();
         // The shim's rounds resume a held heart once the shim answers for it, and show a hold
         // they moved on its row.
         {
@@ -4211,6 +4218,26 @@ mod tests {
             state.deezer_client.limiter(),
             &state.deezer_rate_limiter
         ));
+    }
+
+    /// A held file no hold names (a hold that ended before its files went) is gone once the state
+    /// is built, before any worker runs.
+    #[tokio::test]
+    async fn held_files_no_hold_names_go_while_the_state_is_built() {
+        let config = tempfile::tempdir().expect("a temp dir");
+        let folder = crate::services::common::soulseek_hold_store::held_root(&config.path().join("music"))
+            .join("Track_soulseek_x");
+        std::fs::create_dir_all(&folder).expect("made");
+        let stray = folder.join("stray.flac");
+        std::fs::write(&stray, b"x").expect("written");
+        let _state = AppState::for_tests_with(
+            AppSettings::default(),
+            TestServices {
+                config_dir: Some(config.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        assert!(!stray.exists());
     }
 
     /// The sinks in send order, ntfy then Discord, and nothing from the notification, Last.fm or

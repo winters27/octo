@@ -695,6 +695,28 @@ async fn a_keep_that_cannot_land_leaves_the_track_held_and_offers_the_keep_again
     stop.cancel();
 }
 
+/// A keep's copies go in a folder named by a hash of the person, ignoring case: two people whose
+/// names differ only by a character a folder name cannot hold never share one, and no name shows.
+#[test]
+fn a_keeps_copies_go_in_a_folder_named_by_a_hash_of_the_person() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let held = held_file(&dir, "night");
+    let folder_of = |user: &str| {
+        let copies = copies_for(std::slice::from_ref(&held), user).expect("copied");
+        Path::new(&copies[0])
+            .parent()
+            .and_then(Path::file_name)
+            .expect("a folder")
+            .to_string_lossy()
+            .into_owned()
+    };
+    let (dotted, underscored) = (folder_of("a.b"), folder_of("a_b"));
+    assert_ne!(dotted, underscored);
+    assert!(dotted.starts_with(KEPT_FOR_PREFIX), "{dotted}");
+    assert!(!dotted.contains("a.b") && !underscored.contains("a_b"));
+    assert_eq!(folder_of(" A.B "), dotted, "the same person, whatever the case");
+}
+
 /// MusicBrainz gave up on the question a held heart waited on: the heart runs again, and once it
 /// ends with nothing (nothing landed, nothing of the song held), its row says MusicBrainz could not
 /// answer for this song.

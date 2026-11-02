@@ -1233,6 +1233,22 @@ impl HeartGates for DownloadVerificationService {
             .collect()
     }
 
+    async fn judge_landed(&self, path: &str, acquisition_key: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
+        let candidate = HeartCandidate {
+            labels: LabelSource::TheFile,
+            identity: None,
+            acquisition_key: acquisition_key.to_string(),
+        };
+        let mut verdicts = Vec::with_capacity(gates.len());
+        for gate in gates {
+            let check = self
+                .verify_for_heart(std::path::Path::new(path), &candidate, gate)
+                .await;
+            verdicts.push(check.verdict);
+        }
+        verdicts
+    }
+
     fn on_filed(&self, record: &HeldAcquisition, user: &str) {
         let Some(parts) = self.heart.get() else {
             return;

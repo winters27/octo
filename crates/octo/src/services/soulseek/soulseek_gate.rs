@@ -104,6 +104,24 @@ fn verdict_words(verdict: &GateVerdict) -> (&'static str, &'static str) {
     }
 }
 
+/// Records in `ledger` what the gate of someone who joined another acquisition said of its file:
+/// the outcome for their person, and which acceptance passed it when one did.
+pub(crate) fn record_joiner(
+    ledger: &crate::services::common::GateLedger,
+    gate: &HeartGate,
+    verdict: &GateVerdict,
+) {
+    let outcome = match verdict {
+        GateVerdict::Accept { .. } => GateOutcome::Accepted,
+        GateVerdict::Hold(waiting) => GateOutcome::Held(*waiting),
+        other => GateOutcome::NotAccepted(not_kept(verdict_words(other).1)),
+    };
+    ledger.record(&gate.user, gate.origin, outcome);
+    if let GateVerdict::Accept { by, .. } = verdict {
+        ledger.record_accepted(&gate.user, gate.origin, *by);
+    }
+}
+
 /// Why a gate did not keep a file, as the rest of a sentence about it ("the file is not kept:
 /// it does not sound like what played").
 fn not_kept(detail: &str) -> String {
@@ -254,15 +272,7 @@ impl SoulseekDownloadService {
                 download.acquisition_key,
                 check.verdict
             );
-            let outcome = match &check.verdict {
-                GateVerdict::Accept { .. } => GateOutcome::Accepted,
-                GateVerdict::Hold(waiting) => GateOutcome::Held(*waiting),
-                other => GateOutcome::NotAccepted(not_kept(verdict_words(other).1)),
-            };
-            ledger.record(&gate.user, gate.origin, outcome);
-            if let GateVerdict::Accept { by, .. } = check.verdict {
-                ledger.record_accepted(&gate.user, gate.origin, by);
-            }
+            record_joiner(ledger, gate, &check.verdict);
         }
     }
 
