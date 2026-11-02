@@ -98,7 +98,7 @@ pub mod trickle_states {
             YIELDING => "Waiting for other downloads",
             WAITING_FOR_SOULSEEK => "Waiting for Soulseek",
             WAITING_FOR_MORNYE_CHECK => "Waiting for Mornye's check",
-            WAITING_FOR_MORNYE => "Waiting for Mornye to answer",
+            WAITING_FOR_MORNYE => "Waiting for Mornye",
             WAITING_FOR_MUSIC_DATABASE => "Waiting for MusicBrainz",
             _ => "Working on it",
         }
@@ -173,8 +173,9 @@ pub(crate) async fn mornye_keeps_the_step(
         .is_some()
 }
 
-/// Mornye is the only source on a Soulseek step with nothing after it (slskd is not set up), and
-/// it is on but not answering or unable to download, so a song started now could only fail.
+/// Mornye is the only source on a Soulseek step with nothing after it (slskd is not in use, by
+/// the rule Better quality uses too), and it is on but not answering or unable to download, so a
+/// song started now could only fail.
 pub(crate) async fn mornye_down_with_no_slskd(
     settings: &SettingsStore,
     soulseek: &dyn ISoulseekLink,
@@ -183,7 +184,12 @@ pub(crate) async fn mornye_down_with_no_slskd(
     let Some(client) = mornye.filter(|client| client.is_on()) else {
         return false;
     };
-    soulseek_step_alone(settings) && soulseek.is_off() && !client.stands_in().await
+    soulseek_step_alone(settings)
+        && !crate::services::library::UpgradeSources::slskd_in_use_with(
+            &settings.current().soulseek,
+            Some(soulseek),
+        )
+        && !client.stands_in().await
 }
 
 /// A song the library already has: its id there, when Navidrome said.

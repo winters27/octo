@@ -678,12 +678,15 @@ impl PrefetchService {
     }
 
     /// What prefetch waits for while the Soulseek step is out: Mornye, when it is that step's only
-    /// source (slskd is not set up), else Soulseek.
+    /// source (slskd is not in use, by the rule Better quality and imports use), else Soulseek.
     fn step_out_words(&self) -> &'static str {
         let mornye_only = self.parts.spotiflac.as_ref().is_some_and(|client| client.is_on())
-            && self.parts.soulseek.as_ref().is_some_and(|link| link.is_off());
+            && !crate::services::library::UpgradeSources::slskd_in_use_with(
+                &self.parts.settings.current().soulseek,
+                self.parts.soulseek.as_deref(),
+            );
         if mornye_only {
-            "Waiting for Mornye to answer"
+            "Waiting for Mornye"
         } else {
             "Waiting for Soulseek to connect"
         }

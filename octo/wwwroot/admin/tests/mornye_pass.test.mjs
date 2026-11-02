@@ -140,8 +140,9 @@ test('the page draws the status cards, and syncs the switch on load and after a 
   assert.ok(
     slice("form.dataset.section?.startsWith('spotiflac')", 'setTimeout(loadMornyeNow').includes('syncMornyeNotifyRow()'),
   );
-  const imports = slice('function renderTrickle()', 'impEl(');
-  assert.ok(imports.includes("waitingForMornye: 'Waiting for Mornye to answer'"));
+  const imports = slice('function renderTrickle()', "if (t.state === 'off')");
+  assert.ok(imports.includes("waitingForMornye: 'Waiting for Mornye'"));
+  assert.ok(imports.includes("if (t.state === 'waitingForMornye') parts.push('Mornye is the only lossless source"));
 });
 
 test('an unreachable Mornye says so with its problem', () => {

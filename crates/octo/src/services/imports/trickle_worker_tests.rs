@@ -334,37 +334,138 @@ async fn it_waits_while_mornye_is_the_only_source_and_does_not_answer() {
     );
     assert_eq!(
         trickle_states::label(trickle_states::WAITING_FOR_MORNYE, false),
-        "Waiting for Mornye to answer"
+        "Waiting for Mornye"
     );
     rig.mornye_down.store(false, Ordering::SeqCst);
     assert!(rig.tick().await);
 }
 
 #[tokio::test]
-async fn mornye_is_down_for_the_step_only_when_it_is_on_slskd_is_not_set_up_and_it_cannot_stand_in() {
+async fn mornye_is_down_for_the_step_only_when_it_is_on_slskd_is_not_in_use_and_it_cannot_stand_in() {
     use crate::services::common::test_fakes::{OffLink, OfflineLink};
     let clear = mornye("active").await;
-    let down = |url: String, enabled: bool, link: Arc<dyn ISoulseekLink>| async move {
+    // Answers, but without its utilities extension it cannot download.
+    let no_utilities = wiremock::MockServer::builder().start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/api/get_signed_sessions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!(
+            {"result": {"sessions": [], "error": "The optional utilities extension is not installed; 'mornye.core.signed_session_status' requires 'utilities.sflx' to be available."}}
+        )))
+        .mount(&no_utilities)
+        .await;
+    struct Case {
+        url: String,
+        enabled: bool,
+        /// slskd's address and sign-in are set, and it is switched on or off.
+        slskd: Option<bool>,
+        lidarr_after: bool,
+        link: Arc<dyn ISoulseekLink>,
+    }
+    let down = |case: Case| async move {
         let mut all = AppSettings::default();
-        all.spotiflac.enabled = enabled;
-        all.spotiflac.url = url;
+        all.spotiflac.enabled = case.enabled;
+        all.spotiflac.url = case.url;
+        if let Some(on) = case.slskd {
+            all.soulseek.enabled = on;
+            all.soulseek.base_url = Some("http://slskd:5030".into());
+            all.soulseek.username = Some("u".into());
+            all.soulseek.password = Some("p".into());
+        }
+        if case.lidarr_after {
+            all.subsonic.heart_download_sources = vec![
+                octo_core::settings::HeartDownloadStep {
+                    source: HeartDownloadSource::Soulseek,
+                    song_enabled: Some(true),
+                    ..Default::default()
+                },
+                octo_core::settings::HeartDownloadStep {
+                    source: HeartDownloadSource::Lidarr,
+                    song_enabled: Some(true),
+                    ..Default::default()
+                },
+            ];
+        }
         let settings = Arc::new(SettingsStore::for_tests(all));
         let client = SpotiflacClient::new(Arc::clone(&settings));
-        mornye_down_with_no_slskd(&settings, link.as_ref(), Some(&client)).await
+        mornye_down_with_no_slskd(&settings, case.link.as_ref(), Some(&client)).await
     };
-    assert!(down("http://127.0.0.1:1".into(), true, Arc::new(OffLink)).await);
+    let refused = || "http://127.0.0.1:1".to_string();
+    let case = |url: String, link: Arc<dyn ISoulseekLink>| Case {
+        url,
+        enabled: true,
+        slskd: None,
+        lidarr_after: false,
+        link,
+    };
+
+    assert!(down(case(refused(), Arc::new(OffLink))).await);
     assert!(
-        !down(clear.uri(), true, Arc::new(OffLink)).await,
+        down(case(no_utilities.uri(), Arc::new(OffLink))).await,
+        "a Mornye that answers but cannot download holds the step too"
+    );
+    assert!(
+        down(Case {
+            slskd: Some(false),
+            ..case(refused(), Arc::new(OfflineLink))
+        })
+        .await,
+        "slskd switched off with its sign-in kept is not in use"
+    );
+    assert!(
+        !down(case(clear.uri(), Arc::new(OffLink))).await,
         "an answering Mornye carries the step"
     );
     assert!(
-        !down("http://127.0.0.1:1".into(), false, Arc::new(OffLink)).await,
+        !down(Case {
+            enabled: false,
+            ..case(refused(), Arc::new(OffLink))
+        })
+        .await,
         "with Mornye off, imports run as they did without it"
     );
     assert!(
-        !down("http://127.0.0.1:1".into(), true, Arc::new(OfflineLink)).await,
-        "a set-up slskd has its own wait"
+        !down(Case {
+            slskd: Some(true),
+            ..case(refused(), Arc::new(OfflineLink))
+        })
+        .await,
+        "a slskd in use has its own wait"
     );
+    assert!(
+        !down(Case {
+            lidarr_after: true,
+            ..case(refused(), Arc::new(OffLink))
+        })
+        .await,
+        "Lidarr after the Soulseek step still fetches"
+    );
+}
+
+/// The worker as Octo builds it: with no slskd and Mornye refusing, a queued song waits and is not
+/// handed to the downloads; with Mornye answering and its check paused, it waits for the check.
+#[tokio::test]
+async fn the_worker_octo_builds_waits_for_a_mornye_that_does_not_answer_or_whose_check_is_paused() {
+    let paused = mornye("unverified").await;
+    for (url, waiting) in [
+        (
+            "http://127.0.0.1:1".to_string(),
+            trickle_states::WAITING_FOR_MORNYE,
+        ),
+        (paused.uri(), trickle_states::WAITING_FOR_MORNYE_CHECK),
+    ] {
+        let mut all = settings(12);
+        all.spotiflac.enabled = true;
+        all.spotiflac.url = url;
+        let state = crate::app::AppState::for_tests(all);
+        let worker = state.imports.trickle();
+        worker.queue.add("alice", &[song("a")]);
+
+        assert!(!worker.tick().await, "{waiting}");
+        assert_eq!(worker.status_for("alice").state, waiting);
+        assert!(
+            state.track_acquisition_queue.is_idle(),
+            "{waiting}: nothing went to the downloads"
+        );
+    }
 }
 
 /// A Mornye whose one gateway session is in `state`.

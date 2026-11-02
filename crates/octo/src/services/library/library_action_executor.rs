@@ -189,8 +189,9 @@ impl LibraryActionCodes {
     }
 }
 
-/// The words of a request waiting for a Mornye that is not answering.
-const MORNYE_OUT_TEXT: &str = "Mornye is not answering, and no other source can look for this song now.";
+/// The words of a request waiting for a Mornye that is not answering or cannot download.
+const MORNYE_OUT_TEXT: &str =
+    "Mornye is not answering or cannot download, and no other source can look for this song now.";
 
 /// The words of a request waiting for Mornye's check.
 fn mornye_wait_text(pause: &octo_core::spotiflac::check::CheckPause) -> String {

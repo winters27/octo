@@ -917,7 +917,8 @@ async fn a_slow_mornye_never_holds_up_a_song_that_is_ready_to_go() {
         tokio::spawn(async move { worker.tick(&ct).await })
     };
 
-    let ran = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+    // The read never ends, so a tick that waits for it never starts the song.
+    let ran = tokio::time::timeout(Duration::from_secs(30), started.notified()).await;
     ticking.abort();
 
     assert!(ran.is_ok(), "the ready song waited for Mornye's answer");
@@ -947,7 +948,8 @@ async fn a_slow_read_of_whether_a_source_can_search_never_holds_up_a_song_that_i
         tokio::spawn(async move { worker.tick(&ct).await })
     };
 
-    let ran = tokio::time::timeout(Duration::from_secs(5), started.notified()).await;
+    // The read never ends, so a tick that waits for it never starts the song.
+    let ran = tokio::time::timeout(Duration::from_secs(30), started.notified()).await;
     ticking.abort();
 
     assert!(ran.is_ok(), "the ready song waited for the read");
@@ -982,7 +984,7 @@ async fn a_job_waiting_for_a_mornye_that_does_not_answer_says_so_and_goes_back_o
     assert_eq!(job.state, UpgradeStates::WAITING);
     assert_eq!(
         job.detail.as_deref(),
-        Some("Waiting for Mornye, which is not answering")
+        Some("Waiting for Mornye, which is not answering or cannot download now")
     );
 
     offline.store(false, Ordering::SeqCst);

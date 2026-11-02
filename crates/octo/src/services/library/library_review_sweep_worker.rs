@@ -1674,7 +1674,7 @@ impl LibraryReviewSweepWorker {
             }
             Ok(outcome) if outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_OUT) => {
                 info!(
-                    "Library review sweep: '{} - {}' waits, because Mornye is not answering and the replacement may come from nowhere else",
+                    "Library review sweep: '{} - {}' waits, because Mornye is not answering or cannot download and the replacement may come from nowhere else",
                     song.artist, song.title
                 );
                 Replacing::Waits

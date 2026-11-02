@@ -9092,7 +9092,7 @@ function renderTrickle() {
     off: 'Off',
     yielding: 'Waiting for other downloads',
     waitingForSoulseek: 'Waiting for Soulseek',
-    waitingForMornye: 'Waiting for Mornye to answer',
+    waitingForMornye: 'Waiting for Mornye',
     waitingForMornyeCheck: "Waiting for Mornye's check",
     waitingForMusicDatabase: 'Waiting for MusicBrainz',
   };
@@ -9100,7 +9100,7 @@ function renderTrickle() {
   const parts = [];
   if (t.state === 'yielding') parts.push('Someone\'s own downloads come first; it goes on once they finish.');
   if (t.state === 'waitingForSoulseek') parts.push('slskd is not logged in to Soulseek; it goes on once it is back.');
-  if (t.state === 'waitingForMornye') parts.push('Mornye is the only source and it is not answering; it goes on once it answers again.');
+  if (t.state === 'waitingForMornye') parts.push('Mornye is the only lossless source, and it is not answering or cannot download now (its card on the Mornye page says why); it goes on once it can.');
   if (t.state === 'waitingForMornyeCheck') parts.push("Mornye could not pass its check and Soulseek cannot be used; it goes on when Mornye may try its check again, or once you pass it on the Mornye page.");
   if (t.state === 'waitingForMusicDatabase') parts.push('MusicBrainz is not answering; songs it has to check go on once it is back.');
   if (t.state === 'off') parts.push('Songs an hour is 0, so nothing starts. Change it above.');

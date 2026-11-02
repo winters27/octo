@@ -478,13 +478,21 @@ pub async fn get_status(State(state): State<AppState>, caller: Caller) -> Respon
 }
 
 /// Mornye's row of the admin status, kept between answers so a slow Mornye never holds the
-/// status up: one probe at a time, each keeping its row for the address it asked.
+/// status up: one probe at a time, each keeping its row for the settings it was asked under.
 pub struct MornyeRowKeeper {
-    kept: parking_lot::Mutex<Option<(String, serde_json::Value)>>,
+    kept: parking_lot::Mutex<Option<KeptRow>>,
     asking: std::sync::atomic::AtomicBool,
     answered: tokio::sync::Notify,
     /// How long a status answer waits for a probe, in milliseconds.
     wait_ms: std::sync::atomic::AtomicU64,
+}
+
+/// A row a probe kept: the address it asked, the settings snapshot it was asked under, and the
+/// row.
+struct KeptRow {
+    url: String,
+    under: std::sync::Arc<octo_core::settings::AppSettings>,
+    row: serde_json::Value,
 }
 
 impl Default for MornyeRowKeeper {
@@ -513,20 +521,37 @@ impl MornyeRowKeeper {
             .store(wait.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The row the last probe of the Mornye at `url` kept.
-    pub(super) fn kept_for(&self, url: &str) -> Option<serde_json::Value> {
+    /// The row the last probe of the Mornye at `url` kept, while the settings are still the
+    /// snapshot it was asked under (`now`): any change since, a switch off and on again
+    /// included, wants a new probe.
+    pub(super) fn kept_for(
+        &self,
+        url: &str,
+        now: &std::sync::Arc<octo_core::settings::AppSettings>,
+    ) -> Option<serde_json::Value> {
         self.kept
             .lock()
             .as_ref()
-            .filter(|(asked, _)| asked == url)
-            .map(|(_, row)| row.clone())
+            .filter(|kept| kept.url == url && std::sync::Arc::ptr_eq(&kept.under, now))
+            .map(|kept| kept.row.clone())
     }
 
-    /// Keeps `row`, from a probe of the Mornye at `asked`, while Mornye is on at that address
-    /// (`live`); one switched off or moved while it was asked says nothing about the Mornye now.
-    pub(super) fn keep(&self, live: Option<&str>, asked: String, row: serde_json::Value) {
-        if live == Some(asked.as_str()) {
-            *self.kept.lock() = Some((asked, row));
+    /// Keeps `row`, from a probe of the Mornye at `asked` made under the settings `under`, only
+    /// while those are still the settings (`now`): a probe that outlived a change says nothing
+    /// about the Mornye now.
+    pub(super) fn keep(
+        &self,
+        under: std::sync::Arc<octo_core::settings::AppSettings>,
+        now: &std::sync::Arc<octo_core::settings::AppSettings>,
+        asked: String,
+        row: serde_json::Value,
+    ) {
+        if std::sync::Arc::ptr_eq(&under, now) {
+            *self.kept.lock() = Some(KeptRow {
+                url: asked,
+                under,
+                row,
+            });
         }
     }
 }
@@ -545,14 +570,12 @@ impl Drop for ProbeDone {
 
 /// Mornye's row for an admin: None while Mornye is switched off. Switched on with no address, a
 /// warning that says so. Otherwise the row of a probe that answers within the keeper's wait
-/// ([`MornyeRowKeeper::WAIT`]), else the row the last probe of this address kept, else a warning
-/// that Mornye has not answered yet; a probe still asking keeps its row for the next answer, as
-/// long as Mornye is still on at the address it asked. A row is forgotten while Mornye is off.
+/// ([`MornyeRowKeeper::WAIT`]), else the row the last probe kept under these same settings, else
+/// a warning that Mornye has not answered yet; a probe still asking keeps its row for the next
+/// answer unless the settings changed while it asked.
 async fn mornye_row(state: &AppState) -> Option<serde_json::Value> {
-    let settings = state.spotiflac.settings();
-    if !settings.is_on() {
-        *state.mornye_row.kept.lock() = None;
-    }
+    let snapshot = state.settings.current();
+    let settings = &snapshot.spotiflac;
     if !settings.enabled {
         return None;
     }
@@ -573,19 +596,20 @@ async fn mornye_row(state: &AppState) -> Option<serde_json::Value> {
     if !keeper.asking.swap(true, std::sync::atomic::Ordering::AcqRel) {
         let state = state.clone();
         let asked = url.clone();
+        let under = snapshot.clone();
         tokio::spawn(async move {
             let done = ProbeDone(state.clone());
             let row = probe_mornye(&state).await;
             state
                 .mornye_row
-                .keep(state.spotiflac.live_url().as_deref(), asked, row);
+                .keep(under, &state.settings.current(), asked, row);
             drop(done);
         });
     }
     let _ = tokio::time::timeout(keeper.wait(), answered).await;
     Some(
         keeper
-            .kept_for(&url)
+            .kept_for(&url, &state.settings.current())
             .unwrap_or_else(|| json!(ServiceProbe::new(true, "Mornye has not answered yet.").warning(true))),
     )
 }

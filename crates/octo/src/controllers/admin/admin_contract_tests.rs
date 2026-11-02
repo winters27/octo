@@ -436,6 +436,8 @@ fn change_mornye(state: &AppState, change: impl FnOnce(&mut octo_core::settings:
 async fn status_never_waits_for_a_slow_mornye_and_shows_its_last_answer() {
     let mornye = silent_mornye().await;
     let state = mornye_status_state(&mornye.uri());
+    // No wait at all, so the answer never races the probe.
+    state.mornye_row.set_wait(std::time::Duration::ZERO);
     let app = app(state.clone());
 
     assert_eq!(
@@ -446,7 +448,11 @@ async fn status_never_waits_for_a_slow_mornye_and_shows_its_last_answer() {
     // Once the probe has given up, the next status shows its row at once.
     let url = state.spotiflac.settings().effective_url();
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        while state.mornye_row.kept_for(&url).is_none() {
+        while state
+            .mornye_row
+            .kept_for(&url, &state.settings.current())
+            .is_none()
+        {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
@@ -476,7 +482,7 @@ async fn a_moved_mornye_never_shows_the_row_of_the_one_before() {
     assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
 
     let after = silent_mornye().await;
-    state.mornye_row.set_wait(super::system::MornyeRowKeeper::WAIT);
+    state.mornye_row.set_wait(std::time::Duration::ZERO);
     change_mornye(&state, |mornye| mornye.url = after.uri());
 
     assert_eq!(
@@ -496,14 +502,8 @@ async fn a_mornye_switched_off_and_on_again_never_shows_a_row_from_before() {
     change_mornye(&state, |mornye| mornye.enabled = false);
     assert_eq!(mornye_row_of(&app).await, Value::Null);
 
-    // On again at the same address, which now answers after a minute.
-    mornye.reset().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/info"))
-        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
-        .mount(&mornye)
-        .await;
-    state.mornye_row.set_wait(super::system::MornyeRowKeeper::WAIT);
+    // On again at the same address; no wait, so only a kept row could answer.
+    state.mornye_row.set_wait(std::time::Duration::ZERO);
     change_mornye(&state, |mornye| mornye.enabled = true);
 
     assert_eq!(
@@ -512,18 +512,46 @@ async fn a_mornye_switched_off_and_on_again_never_shows_a_row_from_before() {
     );
 }
 
+#[tokio::test]
+async fn a_mornye_switched_off_and_on_again_with_no_status_between_never_shows_a_row_from_before() {
+    let (mornye, _) = mornye_and_helper("active", false).await;
+    let state = mornye_status_state(&mornye.uri());
+    state.mornye_row.set_wait(std::time::Duration::from_secs(30));
+    let app = app(state.clone());
+    assert_eq!(mornye_row_of(&app).await["detail"], "Mornye 1.0.5");
+
+    change_mornye(&state, |mornye| mornye.enabled = false);
+    change_mornye(&state, |mornye| mornye.enabled = true);
+    state.mornye_row.set_wait(std::time::Duration::ZERO);
+
+    assert_eq!(
+        mornye_row_of(&app).await["detail"],
+        "Mornye has not answered yet."
+    );
+}
+
 #[test]
-fn a_probe_keeps_its_row_only_while_mornye_is_on_at_the_address_it_asked() {
+fn a_probe_keeps_its_row_only_under_the_settings_it_was_asked_under() {
     let keeper = super::system::MornyeRowKeeper::default();
     let row = serde_json::json!({"detail": "Mornye 1.0.5"});
     let asked = "http://spotiflac:8000";
+    let before = std::sync::Arc::new(AppSettings::default());
+    let after = std::sync::Arc::new(AppSettings::default());
 
-    keeper.keep(None, asked.into(), row.clone());
-    assert_eq!(keeper.kept_for(asked), None, "switched off while it asked");
-    keeper.keep(Some("http://mornye.lan:8000"), asked.into(), row.clone());
-    assert_eq!(keeper.kept_for(asked), None, "moved while it asked");
-    keeper.keep(Some(asked), asked.into(), row.clone());
-    assert_eq!(keeper.kept_for(asked), Some(row));
+    keeper.keep(before.clone(), &after, asked.into(), row.clone());
+    assert_eq!(
+        keeper.kept_for(asked, &after),
+        None,
+        "the settings changed while it asked"
+    );
+    keeper.keep(before.clone(), &before, asked.into(), row.clone());
+    assert_eq!(keeper.kept_for(asked, &before), Some(row));
+    assert_eq!(keeper.kept_for(asked, &after), None, "the settings changed since");
+    assert_eq!(
+        keeper.kept_for("http://mornye.lan:8000", &before),
+        None,
+        "another address"
+    );
 }
 
 /// With Prefetch at its defaults neither document lists it, so the settings answers stay as they

@@ -785,7 +785,7 @@ async fn with_no_slskd_a_mornye_that_does_not_answer_is_what_prefetch_waits_for(
     assert!(w.asked().is_empty());
     assert_eq!(
         w.service.status().await.paused.as_deref(),
-        Some("Waiting for Mornye to answer")
+        Some("Waiting for Mornye")
     );
 }
 

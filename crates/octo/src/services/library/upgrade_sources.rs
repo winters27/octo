@@ -71,9 +71,9 @@ impl UpgradeSources {
         }
     }
 
-    /// slskd can take a search: it is set up and not known to be logged out.
+    /// slskd can take a search: it is in use and not known to be logged out.
     async fn slskd_usable(&self) -> bool {
-        if !Self::soulseek_set_up(&self.settings.current().soulseek) {
+        if !self.slskd_in_use() {
             return false;
         }
         match self.soulseek_link.as_ref() {
@@ -84,9 +84,19 @@ impl UpgradeSources {
         }
     }
 
-    /// slskd's address and sign-in are set.
+    fn slskd_in_use(&self) -> bool {
+        Self::slskd_in_use_with(&self.settings.current().soulseek, self.soulseek_link.as_deref())
+    }
+
+    /// slskd is in use: set up ([`Self::soulseek_set_up`]) and its link not off. The one rule
+    /// Better quality and imports share, so a server never gets two answers.
+    pub fn slskd_in_use_with(settings: &SoulseekSettings, link: Option<&dyn ISoulseekLink>) -> bool {
+        Self::soulseek_set_up(settings) && !link.is_some_and(|link| link.is_off())
+    }
+
+    /// slskd is set up: switched on, with its address and sign-in set.
     pub fn soulseek_set_up(settings: &SoulseekSettings) -> bool {
-        !dotnet::is_null_or_white_space(settings.base_url.as_deref())
+        settings.is_on()
             && !dotnet::is_null_or_white_space(settings.username.as_deref())
             && !dotnet::is_null_or_white_space(settings.password.as_deref())
     }
@@ -140,11 +150,7 @@ impl UpgradeSources {
         if source != DownloadSource::Soulseek {
             return Self::word(source);
         }
-        let settings = self.settings.current();
-        match (
-            Self::soulseek_set_up(&settings.soulseek),
-            settings.spotiflac.is_on(),
-        ) {
+        match (self.slskd_in_use(), self.settings.current().spotiflac.is_on()) {
             (false, true) => "Mornye",
             (true, true) => "Soulseek or Mornye",
             _ => "Soulseek",
@@ -187,7 +193,7 @@ impl UpgradeSources {
         }
         Some(match self.mornye_pause().await {
             Some(pause) => SourcesOut::MornyeCheck(pause),
-            None if !Self::soulseek_set_up(&self.settings.current().soulseek) => SourcesOut::Mornye,
+            None if !self.slskd_in_use() => SourcesOut::Mornye,
             None => SourcesOut::Soulseek,
         })
     }
@@ -219,9 +225,7 @@ impl UpgradeSources {
     fn set_up(&self, source: DownloadSource) -> bool {
         let settings = self.settings.current();
         match source {
-            DownloadSource::Soulseek => {
-                Self::soulseek_set_up(&settings.soulseek) || settings.spotiflac.is_on()
-            }
+            DownloadSource::Soulseek => self.slskd_in_use() || settings.spotiflac.is_on(),
             DownloadSource::Lidarr => Self::lidarr_set_up(&settings.lidarr),
             _ => false,
         }
@@ -482,6 +486,35 @@ mod tests {
         );
         assert!(sources.available().await.is_empty());
         assert_eq!(sources.waiting_for().await, Some(SourcesOut::Soulseek));
+    }
+
+    /// slskd switched off, or its link off, with its address and sign-in still saved, is not in
+    /// use: the same server shape imports wait on.
+    #[tokio::test]
+    async fn a_switched_off_slskd_with_its_sign_in_kept_is_not_in_use() {
+        let switched_off = SoulseekSettings {
+            enabled: false,
+            ..slskd()
+        };
+        let link_off: Arc<dyn ISoulseekLink> = Arc::new(crate::services::common::test_fakes::OffLink);
+        let logged_in: Arc<dyn ISoulseekLink> = Arc::new(FixedLink(SoulseekLinkState::LoggedIn));
+        for (soulseek, link) in [(switched_off, logged_in), (slskd(), link_off)] {
+            let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+                soulseek: soulseek.clone(),
+                spotiflac: octo_core::settings::SpotiflacSettings {
+                    enabled: true,
+                    url: "http://127.0.0.1:1".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+            assert!(!UpgradeSources::slskd_in_use_with(&soulseek, Some(link.as_ref())));
+            let sources = UpgradeSources::new(Arc::clone(&settings), Some(link))
+                .with_spotiflac(Arc::new(SpotiflacClient::new(settings)));
+            assert_eq!(sources.step_word(DownloadSource::Soulseek), "Mornye");
+            assert!(sources.available().await.is_empty());
+            assert_eq!(sources.waiting_for().await, Some(SourcesOut::Mornye));
+        }
     }
 
     #[tokio::test]

@@ -1060,7 +1060,7 @@ impl UpgradeWorker {
         let detail = match state {
             UpgradeStates::WAITING if mornye_check => outcome.detail.clone(),
             UpgradeStates::WAITING if outcome.code.as_deref() == Some(LibraryActionCodes::MORNYE_OUT) => {
-                Some("Waiting for Mornye, which is not answering".to_string())
+                Some("Waiting for Mornye, which is not answering or cannot download now".to_string())
             }
             UpgradeStates::WAITING => Some("Waiting for Soulseek".to_string()),
             UpgradeStates::UPGRADED if result.as_ref().is_some_and(|r| r.after.is_some()) => {

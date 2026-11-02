@@ -202,6 +202,12 @@ impl ImportService {
         *self.clock.lock() = clock;
     }
 
+    /// The trickle this service hands songs to (tests).
+    #[cfg(test)]
+    pub(crate) fn trickle(&self) -> Arc<TrickleWorker> {
+        self.trickle.clone()
+    }
+
     fn now(&self) -> DateTime<Utc> {
         self.clock.lock().now()
     }

@@ -458,14 +458,17 @@ async fn a_hold_on_a_pause_that_names_no_check_ends_once_its_mornye_is_off() {
     assert!(store.snapshot().mornye_holds.is_empty());
 }
 
-#[tokio::test]
-async fn the_weekly_runs_own_wiring_lets_a_hold_go_once_its_mornye_is_off_without_asking_it() {
-    let mornye = wiremock::MockServer::builder().start().await;
-    wiremock::Mock::given(wiremock::matchers::any())
-        .respond_with(wiremock::ResponseTemplate::new(500))
-        .expect(0)
-        .mount(&mornye)
-        .await;
+/// The weekly run as Octo builds it, with Mornye on at `url` and song a held on check A of that
+/// Mornye for another month; Navidrome and the action are stood in for, so whether the hold is
+/// over is the worker's own. Answers the worker, its settings, its store and the songs it asked.
+fn weekly_run_as_octo_builds_it(
+    url: &str,
+) -> (
+    Arc<QualityUpgradeWorker>,
+    Arc<SettingsStore>,
+    Arc<QualityUpgradeStore>,
+    Arc<Mutex<Vec<String>>>,
+) {
     let settings = Arc::new(SettingsStore::for_tests(AppSettings {
         library_actions: LibraryActionSettings {
             enabled: true,
@@ -487,7 +490,7 @@ async fn the_weekly_runs_own_wiring_lets_a_hold_go_once_its_mornye_is_off_withou
         },
         spotiflac: octo_core::settings::SpotiflacSettings {
             enabled: true,
-            url: mornye.uri(),
+            url: url.into(),
             ..Default::default()
         },
         ..Default::default()
@@ -506,7 +509,7 @@ async fn the_weekly_runs_own_wiring_lets_a_hold_go_once_its_mornye_is_off_withou
             key.clone(),
             MornyeHold {
                 labels: vec!["A".into()],
-                url: mornye.uri(),
+                url: url.into(),
                 ..MornyeHold::until(chrono::Utc::now() + chrono::TimeDelta::days(30))
             },
         );
@@ -528,7 +531,6 @@ async fn the_weekly_runs_own_wiring_lets_a_hold_go_once_its_mornye_is_off_withou
     ));
     let asked: Arc<Mutex<Vec<String>>> = Arc::default();
     let seen = asked.clone();
-    // Navidrome and the action are stood in for; whether the hold is over is the worker's own.
     w.configure(|s| {
         s.has_admin_identity = Arc::new(|| true);
         s.list_songs = Arc::new(|| async { (vec![row("a", "A/a.mp3")], true) }.boxed());
@@ -543,6 +545,18 @@ async fn the_weekly_runs_own_wiring_lets_a_hold_go_once_its_mornye_is_off_withou
             .boxed()
         });
     });
+    (w, settings, store, asked)
+}
+
+#[tokio::test]
+async fn the_weekly_runs_own_wiring_lets_a_hold_go_once_its_mornye_is_off_without_asking_it() {
+    let mornye = wiremock::MockServer::builder().start().await;
+    wiremock::Mock::given(wiremock::matchers::any())
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mornye)
+        .await;
+    let (w, settings, store, asked) = weekly_run_as_octo_builds_it(&mornye.uri());
     let mut off = (*settings.current()).clone();
     off.spotiflac.enabled = false;
     settings.set(off);
@@ -552,6 +566,34 @@ async fn the_weekly_runs_own_wiring_lets_a_hold_go_once_its_mornye_is_off_withou
     assert_eq!(*asked.lock(), vec!["a".to_string()]);
     assert!(store.snapshot().mornye_holds.is_empty());
     mornye.verify().await;
+}
+
+#[tokio::test]
+async fn the_weekly_runs_own_wiring_keeps_a_hold_while_the_same_mornye_reports_its_check_paused() {
+    let mornye = wiremock::MockServer::builder().start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/api/get_signed_sessions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {"result": {"sessions": [{"key": "gateway-a-1", "kind": "gateway", "label": "A",
+                 "extensions": ["a-ext"], "state": "unverified", "auth_paused_s": 900.0}]}}
+            )),
+        )
+        .mount(&mornye)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::path("/api/get_download_services"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!(
+                {"result": {"services": [{"id": "ext:a-ext", "label": "A", "extensions": ["a-ext"]}]}}
+            )),
+        )
+        .mount(&mornye)
+        .await;
+    let (w, _, store, asked) = weekly_run_as_octo_builds_it(&mornye.uri());
+
+    w.tick().await;
+
+    assert!(asked.lock().is_empty(), "the held song is not tried");
+    assert_eq!(store.snapshot().mornye_holds.len(), 1);
 }
 
 #[test]
