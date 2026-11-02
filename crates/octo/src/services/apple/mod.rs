@@ -3,6 +3,8 @@
 
 pub mod apple_catalog;
 pub mod apple_pace;
+pub mod server_store;
 
 pub use apple_catalog::{AppleAsked, AppleCatalog, Entity, StoreSource};
 pub use apple_pace::{AppleClass, ApplePace, PaceConfig, Refused, Ticket};
+pub use server_store::ServerStore;

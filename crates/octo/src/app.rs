@@ -53,6 +53,7 @@ use crate::services::cover_art::{
 };
 use octo_media::cover::CoverArtService;
 
+use crate::services::apple::{AppleCatalog, ApplePace, ServerStore};
 use crate::services::charts::{AppleMusicPages, ChartCountryStore, ChartsWarmWorker, GenreNames};
 use crate::services::common::HeartGates;
 use crate::services::common::IAcquisitionActivity;
@@ -139,7 +140,7 @@ use crate::services::lyrics::{
 };
 use crate::services::metadata::{
     DeezerExplicitCatalog, DeezerMetadataService, DeezerPublishedTempo, DeezerRateLimitHandler,
-    DeezerRateLimiter,
+    DeezerRateLimiter, DeezerReach, DeezerStandIn, DoorInfos,
 };
 use crate::services::metadata::{GenreBackfillJournal, GenreBackfillStore, GenreBackfillWorker};
 use crate::services::notifications::{DiscordSink, INotificationSink, NotificationService, NtfySink};
@@ -281,6 +282,9 @@ pub struct AppInner {
     /// The "deezer" HTTP client with `DeezerRateLimitHandler` in its chain. Every Deezer
     /// caller goes through it.
     pub deezer_client: Arc<DeezerRateLimitHandler>,
+    /// Whether Deezer serves this server, and so which catalog answers its searches. None in test
+    /// builds, which wire no stand-in.
+    pub deezer_reach: Option<Arc<DeezerReach>>,
     /// `DeezerMetadataService`.
     pub deezer_metadata: Arc<DeezerMetadataService>,
     /// `MusicBrainzClient` with its own HTTP client.
@@ -1889,6 +1893,54 @@ impl MetadataClients {
     }
 }
 
+/// Apple's catalog standing in for Deezer's where Deezer does not serve this server, wired into
+/// the Deezer client before any worker or request uses it. Test builds wire none.
+struct CatalogStandIn {
+    reach: Arc<DeezerReach>,
+    apple: Arc<AppleCatalog>,
+}
+
+impl CatalogStandIn {
+    fn wire(clients: &MetadataClients, config_dir: &Path) -> Self {
+        let pace = ApplePace::shared();
+        let reach = Arc::new(DeezerReach::new(Arc::clone(&pace)));
+        let apple = Arc::new(AppleCatalog::new(pace, Some(config_dir.join("apple-store.json"))));
+        let stand_in = Arc::new(DeezerStandIn::new(Arc::clone(&reach), Arc::clone(&apple)));
+        stand_in.set_door(Arc::downgrade(&clients.deezer_client));
+        stand_in.set_hints(Arc::clone(&clients.artwork_hints));
+        clients.deezer_client.set_stand_in(stand_in);
+        reach.set_reader(Arc::new(DoorInfos::new(
+            Arc::downgrade(&clients.deezer_client),
+            DeezerMetadataService::BASE,
+        )));
+        Self { reach, apple }
+    }
+
+    /// Which Apple store to ask: the server's own country, once the charts can tell it.
+    fn use_store_of(&self, settings: &Arc<SettingsStore>, top_songs: &TopSongsService) {
+        let top_songs = top_songs.clone();
+        self.apple.set_store_source(Arc::new(ServerStore::new(
+            Arc::clone(settings),
+            Arc::new(move || top_songs.known_country()),
+            Arc::clone(&self.reach),
+        )));
+    }
+
+    /// At start: Deezer's `/infos` is read once, and the Deezer service's caches are cleared at
+    /// every catalog switch from then on.
+    fn register_workers(&self, workers: &WorkerSupervisor, deezer: &Arc<DeezerMetadataService>) {
+        let (reach, deezer) = (Arc::clone(&self.reach), Arc::clone(deezer));
+        workers.register("DeezerReach", move |_stopping| {
+            let (reach, deezer) = (Arc::clone(&reach), Arc::clone(&deezer));
+            async move {
+                deezer.follow_switches();
+                reach.read_at_start();
+                Ok(())
+            }
+        });
+    }
+}
+
 /// The lyrics services. `config_dir` None keeps the pins and the undo journal in memory (handler
 /// tests).
 struct Lyrics {
@@ -3228,11 +3280,13 @@ impl AppState {
         let stores = Stores::build(&settings, &config_dir);
         // Matches survive a restart, so a library is not sent back to Apple album by album.
         let clients = MetadataClients::build(&settings, Some(config_dir.join("itunes-masters.json")));
+        let catalog_stand_in = CatalogStandIn::wire(&clients, &config_dir);
         let tagging = Tagging::build(&settings, &clients);
         let lyrics = Lyrics::build(&settings, Some(&config_dir));
         let workers = Arc::new(WorkerSupervisor::new());
         stores.register_workers(&workers);
         lyrics.register_workers(&workers);
+        catalog_stand_in.register_workers(&workers, &clients.deezer_metadata);
 
         // The iTunes matches flush every 15 seconds, and once more on shutdown.
         let itunes = Arc::clone(&clients.itunes_cover_art);
@@ -3385,6 +3439,8 @@ impl AppState {
             &config_dir,
         );
         charts.register_workers(&workers);
+        catalog_stand_in.use_store_of(&settings, &charts.top_songs);
+        let deezer_reach = Some(Arc::clone(&catalog_stand_in.reach));
         let sync_catalog = Arc::new(SyncCatalogService::new(
             navidrome.subsonic_proxy.clone(),
             metadata_service.clone(),
@@ -3600,6 +3656,7 @@ impl AppState {
             startup_validation: navidrome.startup_validation,
             deezer_rate_limiter: clients.deezer_rate_limiter,
             deezer_client: clients.deezer_client,
+            deezer_reach,
             deezer_metadata: clients.deezer_metadata,
             music_brainz: clients.music_brainz,
             acoust_id_rate_limiter: clients.acoust_id_rate_limiter,
@@ -3755,6 +3812,8 @@ impl AppState {
         // The clients point at the real hosts but ask nothing until a test calls them, and
         // the iTunes matches stay in memory.
         let mut clients = MetadataClients::build_with(&settings, None, overrides.deezer_base_url.as_deref());
+        // Test builds wire no stand-in: a mock Deezer answers as Deezer, and no test asks Apple.
+        let deezer_reach: Option<Arc<DeezerReach>> = None;
         if let Some(base) = overrides.music_brainz_base_url.as_deref() {
             clients.music_brainz = Arc::new(test_music_brainz(base));
         }
@@ -4056,6 +4115,7 @@ impl AppState {
             startup_validation: navidrome.startup_validation,
             deezer_rate_limiter: clients.deezer_rate_limiter,
             deezer_client: clients.deezer_client,
+            deezer_reach,
             deezer_metadata: clients.deezer_metadata,
             music_brainz: clients.music_brainz,
             acoust_id_rate_limiter: clients.acoust_id_rate_limiter,
