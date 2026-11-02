@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use super::i_cover_art_source::ICoverArtSource;
+use crate::services::apple::{AppleClass, ApplePace};
 use crate::services::framework::HttpAnswer;
 use crate::services::framework::http::client_builder;
 
@@ -61,40 +62,27 @@ fn album_titles() -> SongMatchOptions {
     }
 }
 
-// Every search and lookup this class sends for a master waits its turn here, however many
-// albums are being worked on at once, and whichever instance sends it (the pacing is shared).
-// Apple documents about 20 a minute, but answered 30 searches at 2 a second on 2026-10-01,
-// and sacad asks up to 10 a second; so one a second, doubling (to 8 s at most) each time
-// Apple refuses, and halving again after 50 answers in a row.
-static APPLE_INTERVAL_NANOS: AtomicU64 = AtomicU64::new(1_000_000_000);
-const APPLE_INTERVAL_MAX: Duration = Duration::from_secs(8);
-static APPLE_GATE: LazyLock<tokio::sync::Mutex<Option<Instant>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(None));
-static APPLE_BACKOFF: Mutex<Duration> = Mutex::new(Duration::ZERO);
-static APPLE_ANSWERED: AtomicU32 = AtomicU32::new(0);
+// Every search and lookup this class sends for a master waits its turn on the process's Apple
+// pace (`ApplePace::shared`, class Cover), however many albums are being worked on at once and
+// whichever instance sends it. Apple documents about 20 a minute, but answered 30 searches at 2 a
+// second on 2026-10-01, and sacad asks up to 10 a second; so one a second, doubling (to 8 s at
+// most) each time Apple refuses, and halving again after 50 answers in a row. The pace also holds
+// Octo's catalog questions to Apple, and while those run (Deezer's searches answered from Apple)
+// the cover searches below take their turns too.
 
-/// `AppleInterval` (an `internal static` property the tests could set).
+/// The least time between two of this lookup's paced requests.
 pub fn apple_interval() -> Duration {
-    Duration::from_nanos(APPLE_INTERVAL_NANOS.load(Ordering::SeqCst))
+    ApplePace::shared().cover_spacing()
 }
 
+/// Sets [`apple_interval`] for every lookup in the process (a test sets it to zero).
 pub fn set_apple_interval(interval: Duration) {
-    APPLE_INTERVAL_NANOS.store(
-        u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
-        Ordering::SeqCst,
-    );
+    ApplePace::shared().set_cover_spacing(interval);
 }
 
 async fn wait_for_apple() {
-    let mut next = APPLE_GATE.lock().await;
-    if let Some(at) = *next
-        && at > Instant::now()
-    {
-        tokio::time::sleep_until(at).await;
-    }
-    let backoff = *APPLE_BACKOFF.lock();
-    let interval = backoff.max(apple_interval());
-    *next = Some(Instant::now() + interval);
+    // A Cover turn is never refused.
+    let _ = ApplePace::shared().turn(AppleClass::Cover).await;
 }
 
 /// One row of itunes-masters.json: a key, an optional URL and when it was found, with PascalCase
@@ -197,37 +185,24 @@ impl ITunesCoverArtLookup {
         for attempt in 0..2 {
             wait_for_apple().await;
             let response = self.get(url).await?;
+            let pace = ApplePace::shared();
             if matches!(
                 response.status,
                 StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
             ) {
-                // Slower from now on, for every album, not just this one.
-                let backoff = {
-                    let mut backoff = APPLE_BACKOFF.lock();
-                    *backoff = (apple_interval().max(*backoff) * 2).min(APPLE_INTERVAL_MAX);
-                    *backoff
-                };
-                APPLE_ANSWERED.store(0, Ordering::SeqCst);
+                // Slower from now on, for every album and every catalog question, not just this one.
+                pace.refused_by_apple();
                 if attempt > 0 {
                     return Ok(Some(response));
                 }
                 info!(
                     "Apple asked Octo to slow down; waiting a minute, then one every {} s",
-                    backoff.as_secs_f64()
+                    pace.backoff().as_secs_f64()
                 );
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 continue;
             }
-            let backing_off = !APPLE_BACKOFF.lock().is_zero();
-            if backing_off && APPLE_ANSWERED.fetch_add(1, Ordering::SeqCst) + 1 >= 50 {
-                APPLE_ANSWERED.store(0, Ordering::SeqCst);
-                let mut backoff = APPLE_BACKOFF.lock();
-                *backoff = if *backoff / 2 <= apple_interval() {
-                    Duration::ZERO
-                } else {
-                    *backoff / 2
-                };
-            }
+            pace.answered_by_apple();
             return Ok(Some(response));
         }
         Ok(None)
@@ -664,7 +639,21 @@ impl ITunesCoverArtLookup {
                 self.base,
                 dotnet::escape_data_string(term)
             );
+            // Unpaced while Deezer answers Octo's searches; while Apple answers them, this search
+            // takes its turn with them so the whole of Octo stays within Apple's rate.
+            let pace = ApplePace::shared();
+            let paced = pace.strict();
+            if paced {
+                let _ = pace.turn(AppleClass::Cover).await;
+            }
             let resp = self.get(&url).await?;
+            if paced {
+                if matches!(resp.status, StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS) {
+                    pace.refused_by_apple();
+                } else {
+                    pace.answered_by_apple();
+                }
+            }
             if !resp.is_success() {
                 return anyhow::Ok(None);
             }
