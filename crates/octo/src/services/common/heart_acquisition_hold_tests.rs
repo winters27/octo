@@ -447,7 +447,7 @@ async fn a_held_lidarr_files_labels_are_filed_with_it_handed_back_on_resume_and_
     let key = "Track:soulseek:imported:AcoustId";
     let record = rig.holds.get(key).expect("held for AcoustID");
     assert_eq!(record.held_files, [file]);
-    assert_eq!(record.lidarr_files, [brought.clone()]);
+    assert_eq!(record.lidarr_files, std::slice::from_ref(&brought));
 
     rig.coordinator.resume_held(key);
     let again = tokio::time::timeout(

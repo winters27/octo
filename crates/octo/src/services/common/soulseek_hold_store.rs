@@ -977,10 +977,13 @@ mod tests {
         ];
         let key = store.hold(record).key();
 
-        assert_eq!(store.get(&key).expect("held").lidarr_files, [brought.clone()]);
+        assert_eq!(
+            store.get(&key).expect("held").lidarr_files,
+            std::slice::from_ref(&brought)
+        );
         let reopened = SoulseekHoldStore::new(Some(&path));
         let read = reopened.get(&key).expect("held after a restart");
-        assert_eq!(read.lidarr_files, [brought.clone()]);
+        assert_eq!(read.lidarr_files, std::slice::from_ref(&brought));
         assert_eq!(
             read.lidarr_files[0].labels(),
             LabelSource::Delivered(PathBuf::from("/downloads/complete/a.flac"))
