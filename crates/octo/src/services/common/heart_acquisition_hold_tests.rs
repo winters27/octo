@@ -2660,7 +2660,7 @@ async fn a_song_heart_held_first_then_its_album_heart_each_keep_the_person_in_it
         both.holders[0].routes_in(&both),
         [HoldRoute::Song, HoldRoute::Album]
     );
-    assert_eq!(both.held_files, [file.clone()]);
+    assert_eq!(both.held_files, std::slice::from_ref(&file));
 
     assert_eq!(
         rig.coordinator
