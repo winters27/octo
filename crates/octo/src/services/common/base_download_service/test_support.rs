@@ -19,6 +19,9 @@ use crate::services::local::{DownloadHistoryService, ILocalLibraryService};
 use crate::services::notifications::NotificationService;
 use crate::services::subsonic::NavidromeIdentityService;
 
+/// How the test catalog's album ids start; the rest is the album's own id.
+pub(crate) const TEST_ALBUM: &str = "test-album:";
+
 /// What the transfer does with the song: correct it the way a backend would, and say where the
 /// file landed.
 pub(crate) type Landing = Arc<dyn Fn(&mut Song, &str) -> String + Send + Sync>;
@@ -70,8 +73,9 @@ impl DownloadBackend for TestBackend {
         }
     }
 
-    fn extract_external_id_from_album_id(&self, _: &str) -> Option<String> {
-        None
+    /// An album id the test catalog gives as `test-album:<id>`.
+    fn extract_external_id_from_album_id(&self, album_id: &str) -> Option<String> {
+        album_id.strip_prefix(TEST_ALBUM).map(str::to_string)
     }
 
     async fn judge_landed(

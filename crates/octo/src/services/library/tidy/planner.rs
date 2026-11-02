@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use octo_core::common::artist_credit::primary_credit;
 use octo_core::common::navidrome_artist_key::{navidrome_artist_parts, navidrome_artist_text};
+use octo_core::common::path_helper::fold_name;
 use octo_core::common::{PathHelper, SongIdentity};
 pub use octo_core::fingerprint::music_brainz_client::CreditPart;
 use regex::Regex;
@@ -84,6 +85,9 @@ pub struct TidyOptions {
     pub tick_all: bool,
     /// Folders under the root (relative, "/" separated) the person left out of the run.
     pub excluded: Vec<String>,
+    /// The file layout does not file songs in artist folders at the top, so artist folders are
+    /// left as they are: only tags change.
+    pub leave_folders: bool,
 }
 
 /// The kind of a preview row.
@@ -97,6 +101,8 @@ pub enum TidyKind {
     Rename,
     /// Guests added to a song's ARTISTS tag.
     Guest,
+    /// Songs of one folder moved or renamed into the file layout.
+    Layout,
     /// Left alone, with the reason.
     Skip,
 }
@@ -138,6 +144,30 @@ pub struct TidyMove {
     pub files: Vec<String>,
 }
 
+/// One file moved or renamed by the File layout task: a song, or a file beside it that takes its
+/// name (its lyrics), right after it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TidyFileMove {
+    pub from: String,
+    pub to: String,
+    pub row: String,
+    /// For a file beside a song, the song's own `from`.
+    #[serde(default)]
+    pub song: Option<String>,
+    /// The folder move this file's `from` lies in, which runs first: the file is held when that
+    /// move is.
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+/// A cover copied, never moved, into a folder an album moved into whole.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TidyCopy {
+    pub from: String,
+    pub to: String,
+    pub row: String,
+}
+
 /// The plan.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TidyPlan {
@@ -148,6 +178,15 @@ pub struct TidyPlan {
     pub wanted_artists: Vec<String>,
     /// Recording ids whose MusicBrainz credit is wanted.
     pub wanted_recordings: Vec<String>,
+    /// File layout: files moved or renamed, after the folder moves.
+    #[serde(default)]
+    pub file_moves: Vec<TidyFileMove>,
+    /// File layout: covers copied into folders an album moved into.
+    #[serde(default)]
+    pub copies: Vec<TidyCopy>,
+    /// File layout: family pool files moved, each with every member's link.
+    #[serde(default)]
+    pub pool_moves: Vec<TidyFileMove>,
 }
 
 impl TidyPlan {
@@ -175,6 +214,15 @@ impl TidyPlan {
                 movement.to,
                 movement.files.join("\u{1f}")
             ));
+        }
+        // Only a File layout plan has these, so an artist plan's fingerprint is as it was.
+        for (tag, list) in [("f", &self.file_moves), ("p", &self.pool_moves)] {
+            for movement in list {
+                text.push_str(&format!("{tag}|{}|{}\n", movement.from, movement.to));
+            }
+        }
+        for copy in &self.copies {
+            text.push_str(&format!("c|{}|{}\n", copy.from, copy.to));
         }
         hex::encode_upper(Sha256::digest(text.as_bytes()))[..16].to_string()
     }
@@ -216,7 +264,17 @@ pub fn plan(root: &str, files: &[TidyFile], answers: &TidyAnswers, options: &Tid
     let spelling = spellings(&files, answers, options, &mut out);
     let folders = folders(root, &files, answers, &spelling, &mut out);
     retags(root, &files, &spelling, &folders, &mut out);
-    moves(root, &files, &folders, options, &mut out);
+    if options.leave_folders {
+        // The layout's top folder is not the artist, so artist folders are not this task's.
+        out.rows.retain(|row| {
+            row.kind != TidyKind::Split
+                && !["split|", "folder|", "hidden|"]
+                    .iter()
+                    .any(|prefix| row.id.starts_with(prefix))
+        });
+    } else {
+        moves(root, &files, &folders, options, &mut out);
+    }
 
     let mut wanted_artists: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
@@ -232,6 +290,7 @@ pub fn plan(root: &str, files: &[TidyFile], answers: &TidyAnswers, options: &Tid
         moves: out.moves,
         wanted_artists,
         wanted_recordings,
+        ..TidyPlan::default()
     }
 }
 
@@ -401,7 +460,12 @@ fn spellings(
                     .collect();
                 return Some((
                     tied[0].clone(),
-                    format!("\"{}\" is on {most} track(s); {}.", tied[0], join_words(&others)),
+                    format!(
+                        "\"{}\" is on {}; {}.",
+                        tied[0],
+                        counted(most, "track", "tracks"),
+                        join_words(&others)
+                    ),
                 ));
             }
             None
@@ -428,19 +492,24 @@ fn spellings(
                     (
                         known[0].clone(),
                         format!(
-                            "{} tie on {most} track(s); MusicBrainz spells it \"{}\".",
+                            "{} tie on {}; MusicBrainz spells it \"{}\".",
                             quote_list(&tied),
+                            counted(most, "track", "tracks"),
                             known[0]
                         ),
                     )
                 } else {
                     let why = if unasked.is_empty() {
                         format!(
-                            "These spellings tie on {most} track(s) each, and MusicBrainz does not settle it."
+                            "These spellings tie on {} each, and MusicBrainz does not settle it.",
+                            counted(most, "track", "tracks")
                         )
                     } else {
                         out.wanted_artists.extend(unasked);
-                        format!("These spellings tie on {most} track(s) each. {NOT_ASKED}")
+                        format!(
+                            "These spellings tie on {} each. {NOT_ASKED}",
+                            counted(most, "track", "tracks")
+                        )
                     };
                     out.skip(format!("spelling|{key}"), "", quote_list(&tied), why);
                     continue;
@@ -599,19 +668,21 @@ fn folders(
             .filter(|value| !value.is_empty())
             .collect();
         let folder_key = SongIdentity::loose_key(&folder);
-        let credit =
-            most_common(credits.iter().filter(|value| {
-                PathHelper::sanitize_folder_name(value).to_lowercase() == folder.to_lowercase()
-            }))
-            .or_else(|| {
-                (!folder_key.is_empty())
-                    .then(|| {
-                        most_common(credits.iter().filter(|value| {
-                            SongIdentity::loose_key(&PathHelper::sanitize_folder_name(value)) == folder_key
-                        }))
-                    })
-                    .flatten()
-            });
+        let folded = fold_name(&folder, None);
+        let credit = most_common(
+            credits
+                .iter()
+                .filter(|value| fold_name(&PathHelper::sanitize_folder_name(value), None) == folded),
+        )
+        .or_else(|| {
+            (!folder_key.is_empty())
+                .then(|| {
+                    most_common(credits.iter().filter(|value| {
+                        SongIdentity::loose_key(&PathHelper::sanitize_folder_name(value)) == folder_key
+                    }))
+                })
+                .flatten()
+        });
         let Some(credit) = credit else {
             if any_in_scope && SongIdentity::parse_artists(&folder).names.len() > 1 {
                 out.skip(
@@ -678,7 +749,10 @@ fn folders(
                     &folder,
                     &primary,
                     &folder_row,
-                    format!("The songs' own artist credits ({count} file(s)) name \"{primary}\" first."),
+                    format!(
+                        "The songs' own artist credits ({}) name \"{primary}\" first.",
+                        counted(count, "file", "files")
+                    ),
                     spelling,
                 );
             } else {
@@ -782,7 +856,7 @@ fn read_list(credit: &str, names: &[String]) -> Said {
 /// Navidrome's scan, and an empty one is no name at all. None when the name is fine.
 fn hidden_target(folder: &str, target: &str) -> Option<String> {
     let sanitized = PathHelper::sanitize_folder_name(target);
-    if !target.trim().is_empty() && !sanitized.starts_with('.') {
+    if !target.trim().is_empty() && !PathHelper::is_hidden_name(&sanitized) {
         return None;
     }
     if nfc(&sanitized) == nfc(folder) {
@@ -1026,7 +1100,12 @@ fn moves(root: &str, files: &[TidyFile], folders: &FolderResult, options: &TidyO
             continue;
         }
         let target = PathHelper::sanitize_folder_name(&decision.target);
-        if nfc(&target) == nfc(&decision.name) {
+        // A folder that only differs from its target by what cleaning changes (a character
+        // Windows refuses) is the File layout task's to rename, never a respelling.
+        if nfc(&target) == nfc(&decision.name)
+            || PathHelper::safe_name(&target, None)
+                == PathHelper::safe_name(&PathHelper::sanitize_folder_name(&decision.name), None)
+        {
             continue;
         }
         let folder_files: Vec<&TidyFile> = files
@@ -1059,8 +1138,13 @@ fn moves(root: &str, files: &[TidyFile], folders: &FolderResult, options: &TidyO
                 decision.name.clone(),
                 decision.name.clone(),
                 format!(
-                    "{} song(s) sit directly in the artist folder rather than in an album folder, so they stay where they are.",
-                    loose.len()
+                    "{} directly in the artist folder rather than in an album folder, so {}.",
+                    counted(loose.len(), "song sits", "songs sit"),
+                    if loose.len() == 1 {
+                        "it stays where it is"
+                    } else {
+                        "they stay where they are"
+                    }
                 ),
             );
         }
@@ -1084,8 +1168,9 @@ fn moves(root: &str, files: &[TidyFile], folders: &FolderResult, options: &TidyO
                     from_rel.clone(),
                     from_rel,
                     format!(
-                        "{outside} of the {} song(s) in this album folder are not in this run, and a folder only moves whole.",
-                        album_files.len()
+                        "{outside} of the {} in this album folder {} not in this run, and a folder only moves whole.",
+                        counted(album_files.len(), "song", "songs"),
+                        if outside == 1 { "is" } else { "are" }
                     ),
                 );
                 continue;
@@ -1147,12 +1232,12 @@ pub fn relative(root: &str, path: &str) -> Option<Vec<String>> {
 }
 
 /// A dot folder or dot file (the trash, a NAS's metadata) is never tidied or counted; Navidrome
-/// does not read them either.
+/// does not read them either. A name of two dots or more (`...And Justice for All`) is listed.
 fn is_hidden(segments: &[String]) -> bool {
-    segments.iter().any(|segment| segment.starts_with('.'))
+    segments.iter().any(|segment| PathHelper::is_hidden_name(segment))
 }
 
-fn is_excluded(root: &str, path: &str, excluded: &[String]) -> bool {
+pub(crate) fn is_excluded(root: &str, path: &str, excluded: &[String]) -> bool {
     let Some(segments) = relative(root, path) else {
         return false;
     };
@@ -1203,6 +1288,11 @@ fn show(values: &[String]) -> String {
 fn quote_list(values: &[String]) -> String {
     let quoted: Vec<String> = values.iter().map(|v| format!("\"{v}\"")).collect();
     join_words(&quoted)
+}
+
+// "1 song" or "3 songs".
+pub(super) fn counted(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
 }
 
 fn join_words(values: &[String]) -> String {

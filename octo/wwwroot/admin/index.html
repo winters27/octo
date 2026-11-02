@@ -468,11 +468,12 @@
             <h3 class="set-title">File layout</h3>
             <p class="set-desc">How downloaded songs are named and filed on disk.</p>
           </div>
-          <form data-section="subsonic-storage" class="set-card">
+          <form data-section="subsonic-storage" class="set-card" id="file-layout-form">
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t">Folder structure</div>
-                <div class="set-info-d">Flat is <code>Artist - Title.flac</code>, By artist is <code>Artist/Title.flac</code>, Organized is <code>Artist/Album/01 - Title.flac</code>.</div>
+                <div class="set-info-d">New songs follow it and join the folders already there. Names are made safe for Windows and network shares.</div>
+                <div class="set-info-more">Songs already in your library stay where they are. To move them into this layout, use <a href="#library-tidy" data-tidy-task="FileLayout">Tidy the library, File layout</a>.</div>
               </div>
               <div class="set-ctrl">
                 <div class="seg" data-seg-for="f-folder-structure"><span class="seg-thumb"></span></div>
@@ -480,8 +481,51 @@
                   <option value="Flat">Flat</option>
                   <option value="ByArtist">By artist</option>
                   <option value="Organized">Organized</option>
+                  <option value="Custom">Custom</option>
                 </select>
               </div>
+            </div>
+            <div class="notice notice-warn" id="layout-fallback" role="status" hidden></div>
+            <div class="notice notice-warn" id="layout-caps-problem" role="status" hidden></div>
+            <div class="set-row stack" data-layout-custom hidden>
+              <div class="set-info">
+                <div class="set-info-t" id="f-folder-template-label">Albums</div>
+                <div class="set-info-d">Names in braces are filled in for each song, and a <code>/</code> starts a folder.</div>
+              </div>
+              <textarea class="set-input layout-template" id="f-folder-template" name="Subsonic.FolderTemplate" rows="1" enterkeyhint="done" placeholder="{Artist}/{Album}/{Track:00} - {Title}" aria-labelledby="f-folder-template-label" aria-describedby="f-folder-template-error" spellcheck="false" autocomplete="off"></textarea>
+              <div class="field-error" id="f-folder-template-error" role="alert" hidden></div>
+            </div>
+            <div class="set-row stack" data-layout-custom hidden>
+              <div class="set-info"><div class="set-info-t" id="f-folder-template-singles-label">Singles</div></div>
+              <textarea class="set-input layout-template" id="f-folder-template-singles" name="Subsonic.FolderTemplateSingles" rows="1" enterkeyhint="done" aria-labelledby="f-folder-template-singles-label" aria-describedby="f-folder-template-singles-error" placeholder="Same as albums" spellcheck="false" autocomplete="off"></textarea>
+              <div class="field-error" id="f-folder-template-singles-error" role="alert" hidden></div>
+            </div>
+            <div class="set-row stack" data-layout-custom hidden>
+              <div class="set-info"><div class="set-info-t" id="f-folder-template-compilations-label">Compilations</div></div>
+              <textarea class="set-input layout-template" id="f-folder-template-compilations" name="Subsonic.FolderTemplateCompilations" rows="1" enterkeyhint="done" aria-labelledby="f-folder-template-compilations-label" aria-describedby="f-folder-template-compilations-error" placeholder="Same as albums" spellcheck="false" autocomplete="off"></textarea>
+              <div class="field-error" id="f-folder-template-compilations-error" role="alert" hidden></div>
+            </div>
+            <div class="set-row stack" data-layout-custom hidden>
+              <div class="set-info">
+                <div class="set-info-t">Names</div>
+                <div class="set-info-d">Pick one to add it where you are typing. A name with no value takes the brackets around it, so write <code>({Year})</code> or <code>[{Album Type}]</code>.</div>
+                <div class="set-info-more">From Lidarr: paste its artist folder format, a <code>/</code>, then its track format.</div>
+              </div>
+              <div class="layout-names" id="layout-names" role="group" aria-label="Names to add">
+                <button type="button" class="layout-name" data-layout-name="{Artist}">{Artist}</button>
+                <button type="button" class="layout-name" data-layout-name="{Album Artist}">{Album Artist}</button>
+                <button type="button" class="layout-name" data-layout-name="{Track Artist}">{Track Artist}</button>
+                <button type="button" class="layout-name" data-layout-name="{Album}">{Album}</button>
+                <button type="button" class="layout-name" data-layout-name="{Title}">{Title}</button>
+                <button type="button" class="layout-name" data-layout-name="{Track:00}">{Track:00}</button>
+                <button type="button" class="layout-name" data-layout-name="{Disc}">{Disc}</button>
+                <button type="button" class="layout-name" data-layout-name="{Year}">{Year}</button>
+                <button type="button" class="layout-name" data-layout-name="{Album Type}">{Album Type}</button>
+              </div>
+            </div>
+            <div class="set-row stack layout-example-row" id="layout-example-row">
+              <div class="set-info"><div class="set-info-t">Example</div></div>
+              <div class="layout-examples" id="layout-examples" aria-live="polite"></div>
             </div>
             <div class="set-row">
               <div class="set-info">
@@ -1493,16 +1537,30 @@
           </div>
         </div>
 
-        <div class="set-section" id="library-tidy">
+        <div class="set-section" id="library-tidy" data-spot="library-tidy">
           <div class="set-head">
-            <h3 class="set-title">Tidy artists</h3>
-            <p class="set-desc">New downloads are filed under their first artist, with one spelling per artist and guests listed in their own tag. This brings music already in your library in line. Nothing is written until you have seen a preview.</p>
+            <h3 class="set-title">Tidy the library</h3>
+            <p class="set-desc" id="library-tidy-desc">New downloads are filed under their first artist, with one spelling per artist and guests listed in their own tag. This brings music already in your library in line. Nothing is written until you have seen a preview.</p>
           </div>
           <div class="set-card">
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t" id="library-tidy-task-title">What to tidy</div>
+                <div class="set-info-d" id="library-tidy-task-desc">Artists brings artist folders, spellings and guests in line. File layout moves and renames songs to match your File layout.</div>
+                <div class="set-info-d scope-hint" id="library-tidy-task-hint" role="status" hidden>You switched what to tidy. Preview again before applying.</div>
+              </div>
+              <div class="set-ctrl">
+                <div class="seg" data-seg-for="library-tidy-task"><span class="seg-thumb"></span></div>
+                <select id="library-tidy-task" class="seg-src" hidden aria-label="What to tidy">
+                  <option value="Artists">Artists</option>
+                  <option value="FileLayout">File layout</option>
+                </select>
+              </div>
+            </div>
             <div class="set-row stack">
               <div class="set-info">
                 <div class="set-info-t">Which files</div>
-                <div class="set-info-d">Every file is read either way, because the spelling most of your library uses is the one that wins. Only downloads Octo made are changed, or the whole library, your own rips and purchases included.</div>
+                <div class="set-info-d"><span id="library-tidy-scope-desc">Every file is read either way, because the spelling most of your library uses is the one that wins. Only downloads Octo made are changed, or the whole library, your own rips and purchases included.</span></div>
                 <div class="set-info-more">The whole library asks you to type the music path to confirm.</div>
               </div>
               <select class="set-input" id="library-tidy-scope">
@@ -1518,11 +1576,11 @@
               </div>
               <textarea class="set-input" id="library-tidy-excluded" rows="3" spellcheck="false"></textarea>
             </div>
-            <div class="notice notice-warn">
+            <div class="notice notice-warn" id="library-tidy-notice">
               <strong>Back up your music folder first.</strong> Apply rewrites artist tags, waits for Navidrome to finish a scan that saw them, and only then moves whole album folders, so each song keeps its stars, plays and playlist entries. That needs Navidrome 0.55 or newer. A rename marked with a warning changes which artist Navidrome files the songs under, and stars and ratings on the old artist are lost for every user, so those rows only run when you tick them. Undo moves folders back and restores the artist tags.
             </div>
             <div class="set-row">
-              <div class="set-info"><div class="set-info-t">Preview</div><div class="set-info-d">Reads every file and lists what would change and what is left alone, with the reason. Writes nothing. Folders whose songs say nothing are looked up on MusicBrainz, about one a second, so a large library may need a second preview to finish asking.</div></div>
+              <div class="set-info"><div class="set-info-t">Preview</div><div class="set-info-d" id="library-tidy-preview-note">Reads every file and lists what would change and what is left alone, with the reason. Writes nothing. Folders whose songs say nothing are looked up on MusicBrainz, about one a second, so a large library may need a second preview to finish asking.</div></div>
               <button class="btn btn-ghost" type="button" id="library-tidy-preview">Preview changes</button>
             </div>
             <div id="library-tidy-status" class="set-row stack"></div>
@@ -1530,10 +1588,11 @@
               <div class="set-info"><div class="set-info-t">Show</div></div>
               <select class="set-input" id="library-tidy-kind">
                 <option value="Changes">Every change</option>
-                <option value="Split">Folders split</option>
-                <option value="Respell">Spellings</option>
-                <option value="Rename">Renames that lose stars</option>
-                <option value="Guest">Guests</option>
+                <option value="Split" data-task="Artists">Folders split</option>
+                <option value="Respell" data-task="Artists">Spellings</option>
+                <option value="Rename" data-task="Artists">Renames that lose stars</option>
+                <option value="Guest" data-task="Artists">Guests</option>
+                <option value="Layout" data-task="FileLayout" hidden>Into the layout</option>
                 <option value="Skip">Left alone</option>
               </select>
             </div>
@@ -2169,7 +2228,7 @@
               <div class="set-info">
                 <div class="set-info-t">Write cover.jpg</div>
                 <div class="set-info-d">Also save the cover beside the file, full size, where Navidrome looks first.</div>
-                <div class="set-info-more">Only in the Organized layout, and only in a folder the download created. A cover.jpg Octo wrote gives way to a larger one later; one you put there never changes.</div>
+                <div class="set-info-more">Only in a folder the file layout gives each album alone (Organized, or a Custom layout with an album folder), and only in a folder the download created. A cover.jpg Octo wrote gives way to a larger one later; one you put there never changes.</div>
               </div>
               <label class="switch"><input type="checkbox" name="Metadata.WriteCoverFile" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>

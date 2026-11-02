@@ -26,6 +26,7 @@ pub mod health_versions;
 pub mod imports;
 pub mod json_body;
 pub mod lastfm;
+pub mod layout;
 pub mod library_actions;
 pub mod listening;
 pub mod lyrics_admin;
@@ -133,6 +134,7 @@ pub fn routes() -> RouteSet {
         .merge(library_and_job_routes())
         .merge(imports::routes())
         .merge(activity_routes())
+        .merge(layout::routes())
 }
 
 /// The library and job routes: the library actions, questions and checks, Recently removed,

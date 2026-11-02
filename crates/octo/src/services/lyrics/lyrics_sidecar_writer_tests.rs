@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use octo_core::lyrics::{
@@ -12,7 +13,8 @@ use octo_core::lyrics::{
 use octo_core::settings::{AppSettings, LyricsSaveTo, MetadataSettings, SettingsStore};
 use tokio_util::sync::CancellationToken;
 
-use super::{LyricsJob, LyricsSidecarWriter, LyricsWriteOutcome};
+use super::{LyricsJob, LyricsPathRemap, LyricsSidecarWriter, LyricsWriteOutcome};
+use crate::services::library::library_write_gate::LibraryWriteGate;
 use crate::services::lyrics::lyrics_service::LyricsService;
 use crate::services::lyrics::lyrics_undo_journal::{LyricsUndoEntry, LyricsUndoJournal};
 use crate::services::lyrics::song_lyrics;
@@ -542,6 +544,239 @@ fn a_full_queue_drops_the_job() {
         assert!(writer.try_enqueue(job(&song.root.join(format!("{n}.mp3")))));
     }
     assert!(!writer.try_enqueue(job(&song.root.join("one too many.mp3"))));
+}
+
+// ---- Jobs that wait while the library tidy moves their songs ------------------------------
+
+/// A song in its own folder under the root.
+fn in_folder(song: &Song, folder: &str, name: &str) -> PathBuf {
+    std::fs::create_dir_all(song.root.join(folder)).expect("a folder");
+    song.mp3(&format!("{folder}/{name}"), None)
+}
+
+/// Moves a folder under the root as the tidy does, answering the move as the tidy records it.
+fn move_folder(song: &Song, from: &str, to: &str) -> (String, String) {
+    let (from, to) = (song.root.join(from), song.root.join(to));
+    std::fs::rename(&from, &to).expect("moved");
+    (
+        from.to_string_lossy().into_owned(),
+        to.to_string_lossy().into_owned(),
+    )
+}
+
+/// Waits up to two seconds for `path` to be there.
+async fn appears(path: &Path) -> bool {
+    for _ in 0..100 {
+        if path.exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    path.exists()
+}
+
+fn pair(from: &str, to: &str) -> (String, String) {
+    (from.to_string(), to.to_string())
+}
+
+/// A job still in the queue when the tidy moves its song's folder writes the lyrics where the
+/// song is now, and lets go of the move once it is done.
+#[tokio::test]
+async fn queued_jobs_follow_a_move() {
+    let song = Song::new();
+    let audio = in_folder(&song, "Old", "Artist - Song.mp3");
+    let writer = Arc::new(song.lrclib_writer(|| found("lrclib", Some("[00:01.00]line"), None)));
+    let remap = writer.path_remap();
+    assert!(writer.try_enqueue(job(&audio)));
+
+    remap.record(&[move_folder(&song, "Old", "New")]);
+    assert_eq!(remap.kept(), 1, "the waiting job needs the move");
+    let stopping = CancellationToken::new();
+    let worker = tokio::spawn(writer.clone().run(stopping.clone()));
+
+    let lrc = song.root.join("New").join("Artist - Song.lrc");
+    assert!(
+        appears(&lrc).await,
+        "the lyrics are beside the song where it is now"
+    );
+    assert_eq!(read(&lrc), format!("{MARK}\n[00:01.00]line\n"));
+    for _ in 0..100 {
+        if remap.waiting() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        (remap.waiting(), remap.kept()),
+        (0, 0),
+        "nothing waits, so nothing is kept"
+    );
+    stopping.cancel();
+    worker.await.expect("joined").expect("stopped cleanly");
+}
+
+/// A job the worker took from the queue before the tidy started waits for its share of the gate,
+/// and once it has it, follows the move the tidy made meanwhile.
+#[tokio::test]
+async fn a_job_dequeued_before_a_move_lands_at_the_new_path() {
+    let song = Song::new();
+    let audio = in_folder(&song, "Old", "Artist - Song.mp3");
+    let writer = Arc::new(song.lrclib_writer(|| found("lrclib", Some("[00:01.00]line"), None)));
+    let gate = LibraryWriteGate::new();
+    writer.set_write_gate(gate.clone());
+    let tidy = gate.begin_job("The library tidy").await.expect("the gate");
+    let stopping = CancellationToken::new();
+    let worker = tokio::spawn(writer.clone().run(stopping.clone()));
+
+    assert!(writer.try_enqueue(job(&audio)));
+    for _ in 0..100 {
+        if writer.queued() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        writer.queued(),
+        0,
+        "the worker took the job and waits for its share"
+    );
+    writer.path_remap().record(&[move_folder(&song, "Old", "New")]);
+    drop(tidy);
+
+    let lrc = song.root.join("New").join("Artist - Song.lrc");
+    assert!(
+        appears(&lrc).await,
+        "the lyrics are beside the song where it is now"
+    );
+    assert!(!song.root.join("Old").exists());
+    stopping.cancel();
+    worker.await.expect("joined").expect("stopped cleanly");
+}
+
+/// A move is kept while a job older than it waits, and goes once none does: a job queued after
+/// a move never needs it.
+#[test]
+fn the_remap_is_dropped_once_no_older_job_waits() {
+    let remap = LyricsPathRemap::new();
+    remap.record(&[pair("/m/a", "/m/b")]);
+    assert_eq!(remap.kept(), 0, "no job waits, so the move is not kept");
+
+    let older = remap.hold_for_test();
+    remap.record(&[pair("/m/b", "/m/c")]);
+    let newer = remap.hold_for_test();
+    remap.record(&[pair("/m/c", "/m/d")]);
+    assert_eq!(remap.kept(), 2);
+    assert_eq!(remap.map("/m/b/x.mp3"), "/m/d/x.mp3", "every move, oldest first");
+    assert_eq!(remap.map("/m/other/x.mp3"), "/m/other/x.mp3");
+
+    remap.release_for_test(older);
+    assert_eq!(remap.kept(), 1, "only the newer job's move is left");
+    assert_eq!(remap.map("/m/b/x.mp3"), "/m/b/x.mp3");
+    assert_eq!(remap.map("/m/c/x.mp3"), "/m/d/x.mp3");
+    remap.release_for_test(newer);
+    assert_eq!((remap.kept(), remap.waiting()), (0, 0));
+}
+
+/// A job tried again follows each move made while it waited, in the order they were made: the
+/// folder moved, then moved on and back (a move and its undo), and the lyrics land where the
+/// song is.
+#[tokio::test(start_paused = true)]
+async fn a_retry_follows_a_move_then_its_undo() {
+    let song = Song::new();
+    let audio = in_folder(&song, "A", "Artist - Song.mp3");
+    let tries = Arc::new(AtomicUsize::new(0));
+    let source = FakeSource::new("lrclib", {
+        let tries = tries.clone();
+        move || {
+            if tries.fetch_add(1, Ordering::SeqCst) < 2 {
+                LyricsLookup::failed()
+            } else {
+                found("lrclib", Some("[00:01.00]line"), None)
+            }
+        }
+    });
+    let delay = Duration::from_secs(5);
+    let writer = Arc::new(
+        song.writer("lrclib", LyricsSaveTo::BESIDE, source.clone())
+            .with_retry_delay(delay),
+    );
+    let gate = LibraryWriteGate::new();
+    writer.set_write_gate(gate.clone());
+    let remap = writer.path_remap();
+    let stopping = CancellationToken::new();
+    let worker = tokio::spawn(writer.clone().run(stopping.clone()));
+
+    assert!(writer.try_enqueue(job(&audio)));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(source.calls(), 1, "the first try found no service answering");
+    {
+        let _tidy = gate.begin_job("The library tidy").await.expect("the gate");
+        remap.record(&[move_folder(&song, "A", "B")]);
+    }
+    tokio::time::sleep(delay).await;
+    assert_eq!(source.calls(), 2, "the second try found the song where it moved");
+    {
+        let _tidy = gate.begin_job("The library tidy").await.expect("the gate");
+        remap.record(&[move_folder(&song, "B", "C"), move_folder(&song, "C", "B")]);
+    }
+    tokio::time::sleep(delay).await;
+
+    let lrc = song.root.join("B").join("Artist - Song.lrc");
+    assert!(
+        appears(&lrc).await,
+        "the lyrics are beside the song where it is now"
+    );
+    assert_eq!(source.calls(), 3);
+    stopping.cancel();
+    worker.await.expect("joined").expect("stopped cleanly");
+}
+
+/// A try again that finds the queue full is dropped, counted, and lets go of its age, so the
+/// moves it waited on are not kept for it.
+#[tokio::test(start_paused = true)]
+async fn a_retry_the_full_queue_drops_is_counted_and_lets_go() {
+    let song = Song::new();
+    let audio = song.mp3("Artist - Song.mp3", None);
+    let busy = FakeSource::new("lrclib", LyricsLookup::failed);
+    let delay = Duration::from_secs(5);
+    let writer = Arc::new(
+        song.writer("lrclib", LyricsSaveTo::BESIDE, busy.clone())
+            .with_retry_delay(delay),
+    );
+    let gate = LibraryWriteGate::new();
+    writer.set_write_gate(gate.clone());
+    let remap = writer.path_remap();
+    let stopping = CancellationToken::new();
+    let worker = tokio::spawn(writer.clone().run(stopping.clone()));
+
+    assert!(writer.try_enqueue(job(&audio)));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(busy.calls(), 1);
+    // The tidy holds the gate, so the worker waits with the next job and the queue fills.
+    let tidy = gate.begin_job("The library tidy").await.expect("the gate");
+    assert!(writer.try_enqueue(job(&song.root.join("next.mp3"))));
+    for _ in 0..50 {
+        if writer.queued() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for n in 0..256 {
+        assert!(writer.try_enqueue(job(&song.root.join(format!("{n}.mp3")))));
+    }
+    assert_eq!(
+        remap.waiting(),
+        258,
+        "the try again, the job taken and 256 queued"
+    );
+
+    tokio::time::sleep(delay).await;
+    assert_eq!(writer.dropped_retries(), 1);
+    assert_eq!(remap.waiting(), 257, "the dropped try again let go of its age");
+
+    drop(tidy);
+    stopping.cancel();
+    worker.await.expect("joined").expect("stopped cleanly");
 }
 
 /// Counts the scans asked for.

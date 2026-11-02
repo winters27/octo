@@ -20,6 +20,10 @@ pub(crate) struct FakeLocalLibrary {
     pub moved: Mutex<Vec<(String, String)>>,
     /// The library file of an outside song, by its id.
     pub files: Mutex<Vec<(String, String)>>,
+    /// Every path a download was registered at, in order.
+    pub registered: Mutex<Vec<String>>,
+    /// Every path dropped mappings were put back at, in order.
+    pub restored: Mutex<Vec<String>>,
 }
 
 impl FakeLocalLibrary {
@@ -46,7 +50,8 @@ impl ILocalLibraryService for FakeLocalLibrary {
             .map(|(_, path)| path.clone())
     }
 
-    async fn register_downloaded_song(&self, _: &Song, _: &str) -> anyhow::Result<()> {
+    async fn register_downloaded_song(&self, _: &Song, local_path: &str) -> anyhow::Result<()> {
+        self.registered.lock().push(local_path.to_string());
         Ok(())
     }
 
@@ -100,6 +105,11 @@ impl ILocalLibraryService for FakeLocalLibrary {
         let before = by_tags.len();
         by_tags.retain(|(.., mapping)| mapping.key() != key);
         Ok(by_tags.len() != before)
+    }
+
+    async fn restore_mappings(&self, _: &[LocalSongMapping], local_path: &str) -> anyhow::Result<()> {
+        self.restored.lock().push(local_path.to_string());
+        Ok(())
     }
 
     async fn trigger_library_scan(&self, _force: bool) -> bool {

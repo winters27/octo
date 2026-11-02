@@ -30,7 +30,7 @@ use crate::services::cover_art::{CoverUpgradeMode, CoverUpgradeRun, CoverUpgrade
 use crate::services::health::HealthRun;
 use crate::services::imports::import_views::ImportOverview;
 use crate::services::library::duplicate_scan_worker::DuplicateScanResult;
-use crate::services::library::tidy::{TidyMode, TidyRun, TidyStatus};
+use crate::services::library::tidy::{TidyMode, TidyRun, TidyStatus, TidyTask};
 use crate::services::library::upgrade_queue::{UpgradeJob, UpgradeStates};
 use crate::services::metadata::genre_backfill_state::{GenreBackfillRun, GenreBackfillStatus};
 
@@ -316,16 +316,19 @@ pub fn genre(run: &GenreBackfillRun, pending: bool, now: DateTime<Utc>) -> Optio
     )
 }
 
-/// A "Tidy artists" run: a preview, an apply, or an undo.
+/// A library tidy run, its words from its task: a preview, an apply, or an undo.
 pub fn tidy(run: &TidyRun, pending: bool, now: DateTime<Utc>) -> Option<ActivityItem> {
-    let title = match run.mode {
-        TidyMode::Preview => "Previewing the artist tidy",
-        TidyMode::Apply => "Tidying artists",
-        TidyMode::Undo => "Undoing the artist tidy",
+    let title = match (run.task, run.mode) {
+        (TidyTask::Artists, TidyMode::Preview) => "Previewing the artist tidy",
+        (TidyTask::Artists, TidyMode::Apply) => "Tidying artists",
+        (TidyTask::Artists, TidyMode::Undo) => "Undoing the artist tidy",
+        (TidyTask::FileLayout, TidyMode::Preview) => "Previewing the File layout tidy",
+        (TidyTask::FileLayout, TidyMode::Apply) => "Moving songs into the File layout",
+        (TidyTask::FileLayout, TidyMode::Undo) => "Undoing the File layout tidy",
     };
     if pending && run.status != TidyStatus::Running {
         return Some(
-            ActivityItem::new("tidy:pending", "tidy", "tags", "Tidy artists", "running")
+            ActivityItem::new("tidy:pending", "tidy", "tags", "The library tidy", "running")
                 .detail(Some("Starting".to_string())),
         );
     }

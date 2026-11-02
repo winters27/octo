@@ -58,7 +58,7 @@ pub use personal_library::{LibraryDestination, LibraryError, PersonalLibrary};
 pub use player_caps::PlayerCaps;
 pub use pool::{
     FamilyPlacement, FamilyPool, LinkMode, LinkStatus, MemberCopies, MemberStars, NavidromeMemberStars,
-    PoolParts,
+    PoolParts, RelayoutOutcome,
 };
 pub use request_service::{FamilyEvent, FamilyEvents, RequestError, RequestService};
 pub use request_store::RequestStore;

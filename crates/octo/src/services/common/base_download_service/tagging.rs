@@ -13,7 +13,7 @@ use octo_core::last_fm::last_fm_radio_recommendation_service::canonical_tag;
 use octo_core::metadata::deezer_metadata_service::FullTrackMeta;
 use octo_core::metadata::genre_normalizer::{GenreNormalizer, GenreTagAction};
 use octo_core::models::domain::Song;
-use octo_core::settings::{FolderStructure, GenreFallbackSource, GenreSettings, MetadataSettings};
+use octo_core::settings::{GenreFallbackSource, GenreSettings, MetadataSettings};
 use octo_core::tagging::tag_guard;
 use octo_core::tagging::{
     AlbumGrouping, AlbumTagContext, CatalogBlankFiller, FileFacts, MeasuredLoudness, PreviewLoudnessMeter,
@@ -29,9 +29,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::placement::{get_directory_name, get_file_name, is_audio_file};
+use super::placement::{self, get_file_name};
 use super::{BaseDownloadService, RequestedIdentity, get_extension};
 use crate::services::common::acquisition_tracker::acquisition_event_kinds;
+use crate::services::common::album_identity::{LayoutTags, read_layout_tags};
 use crate::services::cover_art::CoversOnHand;
 use crate::services::fingerprint::music_brainz_client::{HeartQuestions, Lane};
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
@@ -180,13 +181,12 @@ impl BaseDownloadService {
             self.log_song_step(song, acquisition_event_kinds::TAGS, text, Some(why));
         }
 
-        let sibling = if self.settings.current().subsonic.folder_structure == FolderStructure::Organized {
-            self.album_sibling(song, requested, file_path)
-        } else {
-            None
-        };
+        let sibling = self.album_sibling(song, requested, file_path);
         if let Some(sibling) = &sibling {
             join_album(song, sibling);
+            // The album's disc count, when nothing said it: the song then shows its disc as the
+            // album's files do.
+            take_disc_count(song, sibling);
         }
 
         if planned && !settings.tag_rehearsal {
@@ -315,8 +315,11 @@ impl BaseDownloadService {
         }
     }
 
-    /// One file of the album folder this song will join, when the folder is already there and
-    /// the file agrees on the album and its artist; its facts as read, with its path.
+    /// One file of the album folder this song will join, when the folder is already there (found
+    /// by the layout's settle and the album search, whatever it is called) and holds this song's
+    /// album by the album identity; its facts as read, with its path. The file is the one
+    /// placement takes the album's facts from too ([`placement::folder_fact_file`]), never the
+    /// landed file itself.
     fn album_sibling(
         &self,
         song: &Song,
@@ -326,38 +329,28 @@ impl BaseDownloadService {
         if dotnet::is_blank(&song.album) || self.download_path().is_empty() {
             return None;
         }
-        let target = self.organized_target(song, requested, get_extension(current_path));
-        let dir = get_directory_name(&target).filter(|d| !d.is_empty() && Path::new(d).is_dir())?;
-        let current = get_full_path(current_path);
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                debug!("could not read the album folder's sibling for {current_path}: {e}");
-                return None;
-            }
+        // Only a layout that gives the album a folder of its own has a folder to look in: the
+        // album's folder, its songs directly in it or in its disc folders.
+        let (dir, values) = self
+            .album_folder_target(song, requested, get_extension(current_path))
+            .filter(|(dir, _)| !dir.is_empty() && Path::new(dir).is_dir())?;
+        let Some(sibling) = placement::folder_fact_file(&dir, &values, current_path) else {
+            debug!("{dir} holds no other file of {}'s album", song.title);
+            return None;
         };
-        let sibling = entries
-            .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-            .map(|e| e.path().to_string_lossy().into_owned())
-            .find(|file| is_audio_file(file) && !dotnet::eq_ignore_case(&get_full_path(file), &current))?;
+        Some(AlbumSiblingFile::read(&sibling))
+    }
 
-        let facts = tag_writer_extras::read_facts(&sibling, true);
-        if SongIdentity::key(facts.album.as_deref().unwrap_or("")) != SongIdentity::key(&song.album) {
-            return None;
+    /// The album-level facts of a file of the album folder placement filed the song in, taken
+    /// before its tags are written, as identify takes its album sibling's: the grouping values
+    /// and a disc count the song lacks always, and with a sure identification (not a rehearsal)
+    /// the year, label, catalog number, barcode, disc count, album artist and release group.
+    pub(super) fn pin_to_folder(&self, song: &mut Song, sibling: &AlbumSiblingFile) {
+        join_album(song, sibling);
+        take_disc_count(song, sibling);
+        if song.tag_plan.is_some() && !self.settings.current().metadata.tag_rehearsal {
+            pin_to_sibling(song, sibling);
         }
-        let album_artist = song
-            .album_artist
-            .clone()
-            .or_else(|| song.primary_artist.clone())
-            .unwrap_or_else(|| song.artist.clone());
-        if let Some(theirs) = facts.album_artist.as_deref().filter(|a| !a.is_empty())
-            && !album_artist.is_empty()
-            && !SongIdentity::same_artist_name(theirs, &album_artist)
-        {
-            return None;
-        }
-        Some(AlbumSiblingFile { path: sibling, facts })
     }
 
     /// Renames a landed file whose extension names another format than its bytes (a FLAC named
@@ -931,10 +924,32 @@ impl BaseDownloadService {
     }
 }
 
-/// One file of the album folder a song will join, and its facts as read.
-struct AlbumSiblingFile {
-    path: String,
+/// One file of the album folder a song will join, read once: its facts, the values the library
+/// server groups its album by, and its layout tags. Every fact a song takes from it comes from
+/// this one read, so a file renamed or retagged meanwhile never gives half of them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlbumSiblingFile {
+    pub path: String,
     facts: FileFacts,
+    grouping: Option<AlbumGrouping>,
+    layout: Option<LayoutTags>,
+}
+
+impl AlbumSiblingFile {
+    /// The file at `path`, read.
+    pub(super) fn read(path: &str) -> AlbumSiblingFile {
+        let grouping = KeptIdentityTags::read(Path::new(path), None)
+            .filter(|kept| {
+                kept.album_id.is_some() || kept.release_date.is_some() || kept.album_version.is_some()
+            })
+            .map(|kept| AlbumGrouping::new(kept.album_id, kept.release_date, kept.album_version));
+        AlbumSiblingFile {
+            path: path.to_string(),
+            facts: tag_writer_extras::read_facts(path, true),
+            grouping,
+            layout: read_layout_tags(Path::new(path)),
+        }
+    }
 }
 
 /// A single joining an album folder that is already there takes that album's release facts from
@@ -966,6 +981,37 @@ fn pin_to_sibling(song: &mut Song, sibling: &AlbumSiblingFile) {
     if let Some(barcode) = facts.barcode.clone().filter(|b| !b.is_empty()) {
         song.barcode = Some(barcode);
     }
+    // The album's own spelling of its artist, its disc count and its release group: the folder
+    // is one album, and its files say so alike.
+    if let Some(album_artist) = facts.album_artist.clone().filter(|a| !dotnet::is_blank(a)) {
+        song.album_artist = Some(album_artist);
+    }
+    if let Some(layout) = &sibling.layout {
+        // Never fewer discs than the song's own release says.
+        if let Some(count) = layout
+            .disc_count
+            .filter(|count| *count >= song.disc_number.unwrap_or(1))
+            .map(|count| count.max(song.total_discs.unwrap_or(0)))
+        {
+            song.total_discs = Some(count);
+        }
+        if song
+            .music_brainz_release_group_id
+            .as_deref()
+            .is_none_or(dotnet::is_blank)
+            && let Some(group) = layout.release_group.clone()
+        {
+            song.music_brainz_release_group_id = Some(group);
+            // Written only beside the album it names, which is this one.
+            if song
+                .music_brainz_album_title
+                .as_deref()
+                .is_none_or(dotnet::is_blank)
+            {
+                song.music_brainz_album_title = Some(song.album.clone());
+            }
+        }
+    }
     if let Some(plan) = song.tag_plan.as_deref_mut() {
         plan.notes.push(format!(
             "album facts taken from the album folder's own '{}'",
@@ -974,21 +1020,29 @@ fn pin_to_sibling(song: &mut Song, sibling: &AlbumSiblingFile) {
     }
 }
 
+/// The sibling's disc count, for a song whose own release did not say how many discs it has.
+fn take_disc_count(song: &mut Song, sibling: &AlbumSiblingFile) {
+    if song.total_discs.is_some_and(|count| count > 0) {
+        return;
+    }
+    if let Some(count) = sibling
+        .layout
+        .as_ref()
+        .and_then(|tags| tags.disc_count)
+        .filter(|count| *count >= song.disc_number.unwrap_or(1))
+    {
+        song.total_discs = Some(count);
+    }
+}
+
 /// The values the library server groups the folder's album by, read the way it reads them, so
 /// the new track carries exactly the same ones and lands in that album rather than one of its
 /// own. Not a matching decision, so a rehearsal keeps it too.
 fn join_album(song: &mut Song, sibling: &AlbumSiblingFile) {
-    let Some(kept) = KeptIdentityTags::read(Path::new(&sibling.path), None) else {
+    let Some(grouping) = sibling.grouping.clone() else {
         return;
     };
-    if kept.album_id.is_none() && kept.release_date.is_none() && kept.album_version.is_none() {
-        return;
-    }
-    song.joins_album = Some(AlbumGrouping::new(
-        kept.album_id,
-        kept.release_date,
-        kept.album_version,
-    ));
+    song.joins_album = Some(grouping);
     if let Some(plan) = song.tag_plan.as_deref_mut() {
         plan.notes.push(format!(
             "album grouping copied from the album folder's own '{}'",

@@ -64,6 +64,9 @@ services:
       Subsonic__DownloadOnPlay: ${DOWNLOAD_ON_PLAY:-false}
       Subsonic__LidarrAlbumOnPlay: ${LIDARR_ALBUM_ON_PLAY:-false}
       Subsonic__FolderStructure: ${FOLDER_STRUCTURE:-Flat}
+      Subsonic__FolderTemplate: ${FOLDER_TEMPLATE:-}
+      Subsonic__FolderTemplateSingles: ${FOLDER_TEMPLATE_SINGLES:-}
+      Subsonic__FolderTemplateCompilations: ${FOLDER_TEMPLATE_COMPILATIONS:-}
       Subsonic__DownloadSource: ${DOWNLOAD_SOURCE:-Soulseek}
       Subsonic__UseLocalStaging: ${USE_LOCAL_STAGING:-false}
       Subsonic__ExplicitFilter: ${EXPLICIT_FILTER:-All}

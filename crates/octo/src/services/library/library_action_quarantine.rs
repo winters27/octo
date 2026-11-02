@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use octo_core::common::PathHelper;
 use octo_core::json::datetime;
 use octo_core::settings::{LibraryAction, SettingsStore};
 use serde::{Deserialize, Serialize};
@@ -337,16 +338,24 @@ impl LibraryActionQuarantine {
                 ));
             }
 
+            if file_exists(&manifest.original_path) {
+                return Ok(QuarantineResult::refused(
+                    "something already exists at the original path",
+                ));
+            }
+            // On Windows and over SMB a name in other capitals (or with a character Windows
+            // refuses written another way) is the same name: putting the song back beside it
+            // would make two of one name.
+            if twin_on_the_way(&manifest.original_path) {
+                return Ok(QuarantineResult::refused(
+                    "something of the same name in other capitals is already at the original path",
+                ));
+            }
             if let Some(parent) = Path::new(&manifest.original_path)
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
             {
                 std::fs::create_dir_all(parent)?;
-            }
-            if file_exists(&manifest.original_path) {
-                return Ok(QuarantineResult::refused(
-                    "something already exists at the original path",
-                ));
             }
 
             rename_new(quarantine_path, &manifest.original_path)?;
@@ -502,7 +511,16 @@ impl LibraryActionQuarantine {
     /// own files) came from under `from` names its place under `to`, so Put back returns it
     /// there. Answers how many notes followed.
     pub fn move_paths(&self, music_root: &str, from: &str, to: &str) -> usize {
-        let moved_path = |path: &str| octo_core::common::PathHelper::moved_path(path, from, to);
+        self.move_paths_batch(music_root, &[(from.to_string(), to.to_string())])
+    }
+
+    /// [`Self::move_paths`] for each `(from, to)` in order, so `a` to `b` then `b` to `c` ends at
+    /// `c`, with the trash walked once and each note written once. Answers how many notes
+    /// followed, each move counted on its own.
+    pub fn move_paths_batch(&self, music_root: &str, moves: &[(String, String)]) -> usize {
+        if moves.is_empty() {
+            return 0;
+        }
         let mut folders = vec![std::path::PathBuf::from(self.root_for(music_root))];
         let mut moved = 0;
         while let Some(folder) = folders.pop() {
@@ -522,20 +540,27 @@ impl LibraryActionQuarantine {
                 let Some(mut manifest) = self.read_manifest(quarantine_path) else {
                     continue;
                 };
-                let mut changed = false;
-                if let Some(now) = moved_path(&manifest.original_path) {
-                    manifest.original_path = now;
-                    changed = true;
-                }
-                for sidecar in manifest.sidecars.iter_mut().flatten() {
-                    if let Some(now) = moved_path(&sidecar.original_path) {
-                        sidecar.original_path = now;
+                let mut written = false;
+                for (from, to) in moves {
+                    let moved_path = |path: &str| octo_core::common::PathHelper::moved_path(path, from, to);
+                    let mut changed = false;
+                    if let Some(now) = moved_path(&manifest.original_path) {
+                        manifest.original_path = now;
                         changed = true;
                     }
+                    for sidecar in manifest.sidecars.iter_mut().flatten() {
+                        if let Some(now) = moved_path(&sidecar.original_path) {
+                            sidecar.original_path = now;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        moved += 1;
+                        written = true;
+                    }
                 }
-                if changed {
+                if written {
                     self.write_manifest(quarantine_path, &manifest);
-                    moved += 1;
                 }
             }
         }
@@ -744,6 +769,37 @@ pub(crate) fn get_relative_path(relative_to: &str, path: &str) -> String {
         relative.push('/');
     }
     relative
+}
+
+/// Whether putting a file back at `path` would sit beside another spelling of a name on its way,
+/// as Windows and SMB compare names: the file's own name in its folder, or the first folder
+/// still to be made for it in the deepest folder that is there.
+fn twin_on_the_way(path: &str) -> bool {
+    let target = Path::new(path);
+    let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let mut first_missing = name;
+    let mut is_file = true;
+    let mut dir = target.parent();
+    while let Some(folder) = dir.filter(|folder| !folder.as_os_str().is_empty() && !folder.is_dir()) {
+        let Some(folder_name) = folder.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        first_missing = folder_name;
+        is_file = false;
+        dir = folder.parent();
+    }
+    let Some(there) = dir.filter(|dir| !dir.as_os_str().is_empty()) else {
+        return false;
+    };
+    std::fs::read_dir(there).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry.file_name().to_str().is_some_and(|entry| {
+                entry != first_missing && PathHelper::same_name(entry, first_missing, is_file)
+            })
+        })
+    })
 }
 
 fn file_exists(path: &str) -> bool {

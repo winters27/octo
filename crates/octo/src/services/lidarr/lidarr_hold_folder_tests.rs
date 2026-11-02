@@ -153,7 +153,7 @@ fn hold_kept_copy(f: &Fixture) -> HeldPlacement {
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
         users: vec!["alice".into()],
-        proven_for: Vec::new(),
+        ..Default::default()
     };
     f.pending.hold_placement(held.clone());
     held
@@ -588,7 +588,7 @@ fn hold_kept_copy_for(f: &Fixture, name: &str, users: &[&str]) -> HeldPlacement 
         kept: true,
         follows: vec![ALBUM_ID.to_string()],
         users: users.iter().map(|user| user.to_string()).collect(),
-        proven_for: Vec::new(),
+        ..Default::default()
     };
     f.pending.hold_placement(held.clone());
     held

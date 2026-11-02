@@ -134,8 +134,8 @@ use crate::services::listen_brainz::{ListenBrainzRadioClient, ListenBrainzServic
 use crate::services::local::DownloadHistoryService;
 use crate::services::local::{ILocalLibraryService, LocalLibraryService, LocalSongMapping};
 use crate::services::lyrics::{
-    LyricsChoiceService, LyricsChoiceStore, LyricsLibraryStore, LyricsLibraryWorker, LyricsService,
-    LyricsSidecarWriter, LyricsUndoJournal, lyrics_http,
+    LyricsChoiceService, LyricsChoiceStore, LyricsLibraryStore, LyricsLibraryWorker, LyricsPathRemap,
+    LyricsService, LyricsSidecarWriter, LyricsUndoJournal, lyrics_http,
 };
 use crate::services::metadata::{
     DeezerExplicitCatalog, DeezerMetadataService, DeezerPublishedTempo, DeezerRateLimitHandler,
@@ -1524,6 +1524,9 @@ impl NavidromeServices {
             )),
             shared_root: Box::new(move || shared_identity.effective_download_path(&configured_download_path)),
         });
+        // Promotions, shared copies and relayouts take the music folder gate's share, so none of
+        // them names a file while a library job moves folders.
+        family_pool_service.set_write_gate(stores.library_write_gate.clone());
         let personal_library = Arc::new(PersonalLibrary::new(
             Arc::clone(settings),
             Arc::clone(&stores.family_store),
@@ -2012,6 +2015,7 @@ fn build_tidy(
     stores: &Stores,
     jobs: &GenreAndCoverJobs,
     lyrics_undo: &Arc<LyricsUndoJournal>,
+    lyrics_remap: LyricsPathRemap,
 ) -> Arc<TidyWorker> {
     let (identity, http, list_settings) = (
         navidrome.navidrome_identity.clone(),
@@ -2022,9 +2026,10 @@ fn build_tidy(
         let (identity, http, settings) = (identity.clone(), http.clone(), list_settings.clone());
         Box::pin(async move {
             let base = settings.current().subsonic.url.clone();
-            let root = settings
+            let configured = settings
                 .raw("Library:DownloadPath")
                 .unwrap_or_else(|| "./downloads".to_string());
+            let root = identity.effective_download_path(&configured);
             navidrome_song_list::list(Some(&identity), Some(&http), base.as_deref(), &root).await
         })
     });
@@ -2051,6 +2056,13 @@ fn build_tidy(
                 lyrics_undo: Some(lyrics_undo.clone()),
                 explicit: Some(jobs.explicit_backfill_store.clone()),
                 quarantine: Some(Arc::new(LibraryActionQuarantine::new(settings.clone()))),
+                // Its own client: Lidarr's address and key are read from the settings at each
+                // request, as every client of Octo's reads them.
+                lidarr: Some(Arc::new(LidarrClient::new(settings.clone()))),
+                lidarr_pending: Some(stores.lidarr_pending.clone()),
+                identity: Some(Arc::new(navidrome.navidrome_identity.clone())),
+                family_pool: Some(navidrome.family_pool_service.clone()),
+                lyrics_remap: Some(lyrics_remap),
             },
         )
         .with_write_gate(stores.library_write_gate.clone()),
@@ -3290,6 +3302,7 @@ impl AppState {
             &stores,
             &genre_cover_jobs,
             &lyrics.undo_journal,
+            lyrics.sidecar_writer.path_remap(),
         );
         {
             let worker = tidy_worker.clone();
@@ -3813,6 +3826,7 @@ impl AppState {
             &stores,
             &genre_cover_jobs,
             &lyrics.undo_journal,
+            lyrics.sidecar_writer.path_remap(),
         );
         // No workers: the acquisition worker, the resumer and the cache cleanup are not run.
         let acquisition = Acquisition::build(

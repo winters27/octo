@@ -14,7 +14,7 @@ use futures::FutureExt;
 use octo_core::common::dotnet;
 use octo_core::common::live_version;
 use octo_core::common::song_identity::ArtistAgreement;
-use octo_core::common::{Clock, SongIdentity};
+use octo_core::common::{Clock, PathHelper, SongIdentity};
 use octo_core::fingerprint::verification::{
     InconclusiveReason, VerificationResult, VerificationVerdict, whole_percent,
 };
@@ -1848,9 +1848,12 @@ impl LibraryReviewSweepWorker {
                 full.strip_prefix(&prefix).map(str::to_string)
             })
             .filter(|relative| {
-                !relative
-                    .split('/')
-                    .any(|segment| segment.is_empty() || segment.starts_with('.'))
+                !relative.split('/').any(|segment| {
+                    segment.is_empty()
+                        || segment == "."
+                        || segment == ".."
+                        || PathHelper::is_hidden_name(segment)
+                })
             })
             .collect();
         found.sort_by(|a, b| compare_ordinal(a, b));
@@ -1997,11 +2000,12 @@ impl LibraryReviewSweepWorker {
         }
     }
 
-    /// Every audio file under `root`, library-relative with `/`, in ordinal order. A leading dot
-    /// is the quarantine and anything else kept out of Navidrome's scan; slskd's incomplete
+    /// Every audio file under `root`, library-relative with `/`, in ordinal order. A name with one
+    /// leading dot is the quarantine and anything else Navidrome leaves out of its scan; a name
+    /// with more (`...And Justice for All`) is listed as Navidrome lists it. slskd's incomplete
     /// folder holds half-written downloads when it sits in the library. A folder that cannot be
-    /// read is skipped, and hidden entries, whose names start with a dot, are not walked. The
-    /// trash folder is left out by its configured name too, which may have no dot.
+    /// read is skipped, and hidden entries are not walked. The trash folder is left out by its
+    /// configured name too, which may have no dot.
     pub fn enumerate(root: &str, trash: Option<&Path>) -> Vec<String> {
         let root = Path::new(root);
         let mut found: Vec<String> = Vec::new();
@@ -2012,7 +2016,7 @@ impl LibraryReviewSweepWorker {
             };
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
+                if PathHelper::is_hidden_name(&name) {
                     continue;
                 }
                 let path = entry.path();
@@ -2043,7 +2047,7 @@ impl LibraryReviewSweepWorker {
                 // slskd's default incomplete folder and Octo's own staging.
                 let incomplete_folders = excluded_folder_names(None);
                 let kept_out = relative.split('/').any(|segment| {
-                    segment.starts_with('.')
+                    PathHelper::is_hidden_name(segment)
                         || incomplete_folders
                             .iter()
                             .any(|folder| dotnet::eq_ignore_case(folder, segment))

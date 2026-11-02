@@ -34,12 +34,18 @@ fn song(id: &str) -> Song {
 }
 
 fn family(world: World) -> Family {
+    let songs = ["1", "2", "3", "4"].map(|id| (id, song(id)));
+    family_with(world, &songs, DownloadServices::default())
+}
+
+/// The download service over `world`'s pool, with a catalog of `songs` and these services.
+fn family_with(world: World, songs: &[(&str, Song)], mut services: DownloadServices) -> Family {
     let metadata = FakeMetadata::default();
-    for id in ["1", "2", "3", "4"] {
+    for (id, song) in songs {
         metadata
             .songs
             .lock()
-            .insert(("test".to_string(), id.to_string()), song(id));
+            .insert(("test".to_string(), id.to_string()), song.clone());
     }
     let core = DownloadCore {
         settings: world.settings.clone(),
@@ -50,10 +56,7 @@ fn family(world: World) -> Family {
         notifications: Arc::new(NotificationService::new(Vec::new(), world.settings.clone(), None)),
     };
     let backend = Arc::new(TestBackend::default());
-    let services = DownloadServices {
-        family: Some(world.pool.clone() as Arc<dyn FamilyPlacement>),
-        ..Default::default()
-    };
+    services.family = Some(world.pool.clone() as Arc<dyn FamilyPlacement>);
     let service = BaseDownloadService::new(core, services, Arc::clone(&backend) as Arc<dyn DownloadBackend>);
     Family {
         world,
@@ -627,4 +630,65 @@ async fn a_member_download_waits_while_the_pool_folder_has_no_marker() {
         .expect_err("refused");
     assert_eq!(refused.to_string(), crate::services::family::pool::POOL_NOT_READY);
     assert!(family.world.pool.store().list().is_empty(), "nothing placed");
+}
+
+// ---- a new disc beside a loose album --------------------------------------------------------
+
+/// A world filing every kind by `{Artist}/{Album}/Disc {Disc}/{Track:00} - {Title}`.
+fn disc_world() -> World {
+    let world = World::new(None);
+    let mut settings = world.settings.current().as_ref().clone();
+    settings.subsonic.folder_structure = octo_core::settings::FolderStructure::Custom;
+    settings.subsonic.folder_template = "{Artist}/{Album}/Disc {Disc}/{Track:00} - {Title}".into();
+    world.settings.set(settings);
+    world
+}
+
+/// An MP3 at `path`, tagged as the first track of `disc` of Pink Floyd's The Wall, of two.
+fn wall_track(path: &str, title: &str, disc: u32) {
+    std::fs::create_dir_all(Path::new(path).parent().expect("a folder")).expect("folders");
+    std::fs::write(path, crate::services::test_support::mp3()).expect("written");
+    let mut file = octo_media::tags::TagFile::open(Path::new(path)).expect("opens");
+    file.set_title(Some(title));
+    file.set_performers(&["Pink Floyd".to_string()]);
+    file.set_album(Some("The Wall"));
+    file.set_track(1);
+    file.set_disc(disc);
+    file.set_disc_count(2);
+    file.save().expect("saved");
+}
+
+/// A member's download of disc 2 of an album whose disc 1 lies loose in the pool lands loose
+/// beside it, so the pool album keeps one folder.
+#[tokio::test]
+async fn a_member_download_of_a_new_disc_lands_loose_beside_the_pools_album() {
+    let world = disc_world();
+    let pool = world.pool.pool_root_path();
+    wall_track(
+        &format!("{pool}/Pink Floyd/The Wall/01 - In the Flesh.mp3"),
+        "In the Flesh",
+        1,
+    );
+    let hey_you = Song {
+        title: "Hey You".into(),
+        artist: "Pink Floyd".into(),
+        album: "The Wall".into(),
+        track: Some(1),
+        disc_number: Some(2),
+        total_discs: Some(2),
+        external_provider: Some("test".into()),
+        external_id: Some("5".into()),
+        ..Default::default()
+    };
+    let family = family_with(world, &[("5", hey_you)], DownloadServices::default());
+    family.lands("mp3", false);
+
+    let path = family.get("5", for_members(&["alex"])).await.expect("landed");
+
+    assert_eq!(path, format!("{pool}/Pink Floyd/The Wall/01 - Hey You.mp3"));
+    assert!(Path::new(&format!("{pool}/Pink Floyd/The Wall/01 - In the Flesh.mp3")).is_file());
+    assert!(
+        !Path::new(&format!("{pool}/Pink Floyd/The Wall/Disc 2")).exists(),
+        "no disc folder"
+    );
 }

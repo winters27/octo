@@ -808,6 +808,60 @@ async fn update_local_path_the_mapping_follows_a_moved_folder() {
     assert!(on_disk.contains("Bizarrap/Album/Session.flac"), "{on_disk}");
 }
 
+/// A batch of moves writes the mappings once, and each move sees the ones before it: a song
+/// moved from `A` to `B` and then on to `C` is found in `C`.
+#[tokio::test]
+async fn update_local_paths_saves_once_and_follows_each_move_in_order() {
+    let f = Fixture::new().await;
+    let song = |id: &str| Song {
+        title: format!("Song {id}"),
+        artist: "Artist".into(),
+        external_provider: Some("deezer".into()),
+        external_id: Some(id.into()),
+        ..Song::default()
+    };
+    let (a, b, c) = (f.path("Artist/A"), f.path("Artist/B"), f.path("Artist/C"));
+    // The files are where the moves put them.
+    std::fs::create_dir_all(&c).expect("made");
+    std::fs::create_dir_all(f.path("Other")).expect("made");
+    std::fs::write(format!("{c}/1.flac"), "moved").expect("written");
+    std::fs::write(f.path("Other/Two.flac"), "moved").expect("written");
+    f.service
+        .register_downloaded_song(&song("1"), &format!("{a}/1.flac"))
+        .await
+        .expect("registered");
+    f.service
+        .register_downloaded_song(&song("2"), &f.path("Other/2.flac"))
+        .await
+        .expect("registered");
+    let before = f.service.saves();
+
+    let moved = f
+        .service
+        .update_local_paths(&[
+            (a.clone(), b.clone()),
+            (b.clone(), c.clone()),
+            (f.path("Other/2.flac"), f.path("Other/Two.flac")),
+        ])
+        .await
+        .expect("saved");
+
+    assert_eq!(moved, 3);
+    assert_eq!(f.service.saves(), before + 1, "one write for the whole batch");
+    assert_eq!(
+        f.service.get_local_path_for_external_song("deezer", "1").await,
+        Some(format!("{c}/1.flac"))
+    );
+    assert_eq!(
+        f.service.get_local_path_for_external_song("deezer", "2").await,
+        Some(f.path("Other/Two.flac"))
+    );
+    let on_disk = std::fs::read_to_string(f.mappings_file()).expect("written");
+    assert!(on_disk.contains("Artist/C/1.flac"), "{on_disk}");
+    assert_eq!(f.service.update_local_paths(&[]).await.expect("nothing"), 0);
+    assert_eq!(f.service.saves(), before + 1);
+}
+
 // ---- Scans of one library ----
 
 /// A Navidrome that signs the admin in and counts `startScan` calls per library.

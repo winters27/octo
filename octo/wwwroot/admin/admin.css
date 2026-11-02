@@ -879,7 +879,14 @@ input[type="number"].set-input { max-width: 160px; }
 .field-help { font-size: var(--t-meta); color: var(--text-muted); line-height: 1.6; }
 .field-help p { margin: 0 0 var(--s-s); }
 .field-help p:last-child { margin: 0; }
-.field-error { color: var(--bad); font-size: var(--t-meta); line-height: 1.5; }
+.field-error { color: #ff7b72; font-size: var(--t-meta); line-height: 1.5; max-width: 62ch; text-wrap: pretty; }
+/* An error sits close under its own field, not at the row's spacing. */
+.set-row.stack > .set-input + .field-error { margin-top: calc(var(--s-s) - var(--s-l)); }
+.set-input[aria-invalid="true"] { border-color: rgb(239 68 68 / 0.70); }
+.set-input[aria-invalid="true"]:focus {
+  border-color: rgb(239 68 68 / 0.85);
+  box-shadow: 0 0 0 1.5px rgb(239 68 68 / 0.30), inset 1px 1px 2px rgba(0, 0, 0, 0.35);
+}
 
 /* ── Save bar: the foot of a settings card ── */
 .form-actions {
@@ -1253,7 +1260,7 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .explicit-row { grid-template-columns: 2fr 1fr 2fr; gap: var(--s-l); }
 .explicit-row .found-explicit { color: var(--ink-1); font-weight: 600; }
 .explicit-row .value { word-break: normal; overflow-wrap: anywhere; }
-#explicit-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-xl) var(--s-xl); }
+#explicit-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-2xl) var(--s-xl); }
 #explicit-backfill-filter { display: flex; flex-wrap: wrap; gap: var(--s-s); padding: 0 var(--s-xl) var(--s-l); }
 #explicit-backfill-filter[hidden] { display: none; }
 #explicit-backfill-filter .btn[aria-pressed="true"] { color: var(--ink); box-shadow: inset 0 0 0 1px var(--accent); }
@@ -1264,10 +1271,30 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 
 /* Genre backfill preview: the config-sources shell with four columns instead of two. */
 .genre-change-row { grid-template-columns: 2fr 1fr 1fr 1fr; gap: var(--s-l); }
-#genre-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-xl) var(--s-xl); }
+#genre-backfill-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-2xl) var(--s-xl); }
 @container (max-width: 640px) {
   .genre-change-row { grid-template-columns: 1fr 1fr; }
   .genre-change-row > span:first-child { grid-column: 1 / -1; }
+}
+
+/* Tidy preview rows: what / before / after / why / leave out. Every row shares the table's
+ * columns, so a row without Leave out lines up with the rows that have it. */
+.tidy-table { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 2fr) auto; column-gap: var(--s-l); }
+.tidy-table.layout { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.8fr) auto; }
+.tidy-row { grid-column: 1 / -1; grid-template-columns: subgrid; gap: var(--s-l); }
+.tidy-row .key, .tidy-row .value { word-break: normal; overflow-wrap: break-word; }
+.tidy-row .why { font-family: var(--font); color: var(--text-secondary); line-height: 1.45; }
+.tidy-row .tidy-act .btn { font-family: var(--font); }
+#library-tidy-results .config-table { max-height: 420px; overflow-y: auto; margin: 0 var(--s-2xl) var(--s-xl); }
+.tidy-held-t { font-size: var(--t-label); font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-muted); margin-bottom: calc(var(--s-s) - var(--s-l)); }
+@container (max-width: 640px) {
+  .tidy-table { display: flex; }
+  .tidy-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); row-gap: var(--s-s); }
+  .tidy-row { align-items: start; }
+  .tidy-row > :first-child, .tidy-row > .why, .tidy-row > .tidy-act { grid-column: 1 / -1; }
+  .tidy-row.config-row-head { display: none; }
+  .tidy-row > .tidy-act:empty { display: none; }
+  .tidy-row > .value[data-label]::before { content: attr(data-label); display: block; margin-bottom: var(--s-2xs); font-family: var(--font); font-size: var(--t-label); font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-muted); }
 }
 
 /* ── Who the dashboard is signed in as, above Restart ── */
@@ -2864,3 +2891,58 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .test-check.warn .icon { color: var(--warn); }
 .test-check.fail { color: var(--ink); }
 .test-check.fail .icon { color: var(--bad); }
+
+/* File layout: the server's own example paths, the template fields and the names to add. A path
+ * wraps, at a folder break when it can, rather than being cut off. */
+.layout-examples {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: var(--s-xl);
+  row-gap: var(--s-m);
+  min-height: 19.5px;
+}
+/* Each example shares the list's two columns, so every path starts at one edge. */
+.layout-example {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: baseline;
+  font-size: var(--t-meta);
+  line-height: 1.5;
+}
+.layout-examples > .set-info-d { grid-column: 1 / -1; }
+.layout-example-k { color: var(--text-muted); }
+.layout-example-p { font-family: var(--mono); font-size: var(--t-meta); color: var(--ink-1); overflow-wrap: anywhere; background: none; padding: 0; }
+.layout-example-wait { color: var(--text-muted); }
+.layout-example-all { grid-column: 1 / -1; font-size: var(--t-meta); line-height: 1.5; }
+.set-input.layout-template { font-family: var(--mono); font-size: var(--t-meta); }
+/* A template is one line that grows to show all of itself instead of scrolling sideways. */
+textarea.set-input.layout-template {
+  min-height: var(--h-field);
+  resize: none;
+  overflow: hidden;
+  field-sizing: content;
+  overflow-wrap: anywhere;
+}
+.layout-names { display: flex; flex-wrap: wrap; gap: var(--s-s); }
+.layout-name {
+  font-family: var(--mono);
+  font-size: var(--t-label);
+  line-height: 1;
+  padding: 8px 12px;
+  border-radius: var(--r-pill);
+  border: 0;
+  box-shadow: var(--nest-rim);
+  background: var(--nest);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color var(--t-hover) var(--ease), color var(--t-hover) var(--ease), transform var(--t-press) var(--ease);
+}
+.layout-name:hover { color: var(--ink); background: var(--hover); }
+.layout-name:active { transform: scale(0.97); }
+.layout-name:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+@media (pointer: coarse) { .layout-name { min-height: var(--h-m); } }
+@container (max-width: 480px) {
+  .layout-examples { grid-template-columns: 1fr; row-gap: var(--s-l); }
+  .layout-example { grid-template-columns: 1fr; row-gap: 0; }
+}

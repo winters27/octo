@@ -44,6 +44,19 @@ struct PoolDocument {
     links: LinkState,
     #[serde(default)]
     files: Vec<PoolFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    copies: Vec<CopySource>,
+}
+
+/// A pool file that is a copy of a shared library's file, made for members who cannot see that
+/// library, so the next member who needs it gets the same copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CopySource {
+    /// The pool file.
+    pub path: String,
+    /// The shared library's file it was copied from.
+    pub source: String,
 }
 
 /// The file as it is read: the plain list of files it once was, or the document. The list is
@@ -104,6 +117,7 @@ impl PoolFile {
 pub struct FamilyPoolStore {
     files: Mutex<Vec<PoolFile>>,
     links: Mutex<LinkState>,
+    copies: Mutex<Vec<CopySource>>,
     path: Option<PathBuf>,
     save_lock: Mutex<()>,
     load_warning: Option<String>,
@@ -122,11 +136,13 @@ impl FamilyPoolStore {
             StoredPool::Files(files) => PoolDocument {
                 links: LinkState::default(),
                 files,
+                copies: Vec::new(),
             },
         };
         FamilyPoolStore {
             files: Mutex::new(document.files),
             links: Mutex::new(document.links),
+            copies: Mutex::new(document.copies),
             path,
             save_lock: Mutex::new(()),
             load_warning,
@@ -236,7 +252,7 @@ impl FamilyPoolStore {
         Some(left)
     }
 
-    /// Forgets a file. False when it was not recorded.
+    /// Forgets a file, and what it was copied from. False when it was not recorded.
     pub fn remove(&self, path: &str) -> bool {
         let removed = {
             let mut files = self.files.lock();
@@ -244,10 +260,99 @@ impl FamilyPoolStore {
             files.retain(|f| f.path != path);
             before != files.len()
         };
-        if removed {
+        let uncopied = {
+            let mut copies = self.copies.lock();
+            let before = copies.len();
+            copies.retain(|copy| copy.path != path);
+            before != copies.len()
+        };
+        if removed || uncopied {
             self.save();
         }
         removed
+    }
+
+    /// Records that the pool file at `path` is a copy of the shared file `source`.
+    pub fn set_source(&self, path: &str, source: &str) {
+        {
+            let mut copies = self.copies.lock();
+            if copies
+                .iter()
+                .any(|copy| copy.path == path && copy.source == source)
+            {
+                return;
+            }
+            copies.retain(|copy| copy.path != path);
+            copies.push(CopySource {
+                path: path.to_string(),
+                source: source.to_string(),
+            });
+        }
+        self.save();
+    }
+
+    /// The recorded pool file that is a copy of the shared file `source`.
+    pub fn find_by_source(&self, source: &str) -> Option<PoolFile> {
+        let path = self
+            .copies
+            .lock()
+            .iter()
+            .find(|copy| copy.source == source)
+            .map(|copy| copy.path.clone())?;
+        self.get(&path)
+    }
+
+    /// Follows shared files the library tidy moved: each copy names where its source is now, for
+    /// each `(from, to)` in order, saved once. Answers how many followed, each move counted on
+    /// its own.
+    pub fn move_paths_batch(&self, moves: &[(String, String)]) -> usize {
+        let mut moved = 0;
+        {
+            let mut copies = self.copies.lock();
+            for (from, to) in moves {
+                for copy in copies.iter_mut() {
+                    if let Some(now) = octo_core::common::PathHelper::moved_path(&copy.source, from, to) {
+                        copy.source = now;
+                        moved += 1;
+                    }
+                }
+            }
+        }
+        if moved > 0 {
+            self.save();
+        }
+        moved
+    }
+
+    /// Moves a file's record from `from` to `to`, its links and ids with it, in place of any
+    /// record already at `to`. False when `from` is not recorded.
+    pub fn move_file(&self, from: &str, to: &str) -> bool {
+        if from == to {
+            return self.get(from).is_some();
+        }
+        let moved = {
+            let mut files = self.files.lock();
+            if !files.iter().any(|f| f.path == from) {
+                false
+            } else {
+                files.retain(|f| f.path != to);
+                if let Some(file) = files.iter_mut().find(|f| f.path == from) {
+                    file.path = to.to_string();
+                }
+                true
+            }
+        };
+        if moved {
+            {
+                let mut copies = self.copies.lock();
+                copies.retain(|copy| copy.path != to);
+                for copy in copies.iter_mut().filter(|copy| copy.path == from) {
+                    copy.path = to.to_string();
+                }
+            }
+            self.save();
+        }
+        moved
     }
 
     /// The files `user` links.
@@ -269,6 +374,7 @@ impl FamilyPoolStore {
         store_file::save_with(self.path.as_deref(), &self.save_lock, || PoolDocument {
             links: self.links.lock().clone(),
             files: self.files.lock().clone(),
+            copies: self.copies.lock().clone(),
         });
     }
 }
@@ -338,6 +444,42 @@ mod tests {
         assert_eq!(got.refs, ["sam", "alex"]);
         assert_eq!(reloaded.refs_of("sam").len(), 1);
         assert!(reloaded.refs_of("kim").is_empty());
+    }
+
+    /// A record moves with its links and what it is a copy of; the copy's source follows the
+    /// shared file it was copied from; both survive a restart, and a removed file forgets it.
+    #[test]
+    fn a_moved_record_keeps_its_links_and_its_source() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("family-pool.json");
+        let store = FamilyPoolStore::new(Some(&path));
+        let moved = "/members/.pool/Artist/Album (2004)/01 - Song.flac";
+        store.upsert(file(POOL, &["sam", "alex"]));
+        store.set_source(POOL, "/music/Artist/Album/01 Song.flac");
+
+        assert!(store.move_file(POOL, moved));
+        assert!(!store.move_file(POOL, moved), "nothing is recorded there now");
+        assert!(store.get(POOL).is_none());
+        assert_eq!(store.get(moved).expect("moved").refs, ["sam", "alex"]);
+        assert_eq!(
+            store.move_paths_batch(&[
+                ("/music/Artist/Album".to_string(), "/music/Artist/B".to_string()),
+                ("/music/Artist/B".to_string(), "/music/Artist/C".to_string()),
+            ]),
+            2
+        );
+        assert!(store.find_by_source("/music/Artist/Album/01 Song.flac").is_none());
+
+        let reloaded = FamilyPoolStore::new(Some(&path));
+        assert_eq!(
+            reloaded
+                .find_by_source("/music/Artist/C/01 Song.flac")
+                .expect("the copy")
+                .path,
+            moved
+        );
+        assert!(reloaded.remove(moved));
+        assert!(reloaded.find_by_source("/music/Artist/C/01 Song.flac").is_none());
     }
 
     #[test]

@@ -418,9 +418,15 @@ impl NavidromeSongPathResolver {
 
         if raw_path.starts_with('/') {
             paths.push(raw_path.to_string()); // same mount point
-            // Different mount: keep the tail that still looks like Artist/Album/File.
-            let tail = &segments[segments.len().saturating_sub(3)..];
-            paths.push(combine(root, &tail.join("/")));
+            // Different mount: every tail of the path under the music root, longest first, so a
+            // file at any depth (a flat `Artist - Title`, an `Artist/Album/Disc 2/` one) is found
+            // whatever the other mount's own folders were.
+            for start in 1..segments.len() {
+                let tail = combine(root, &segments[start..].join("/"));
+                if !paths.contains(&tail) {
+                    paths.push(tail);
+                }
+            }
         }
         paths
     }

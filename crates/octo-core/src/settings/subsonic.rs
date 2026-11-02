@@ -53,11 +53,11 @@ pub enum StorageMode {
 pub enum FolderStructure {
     /// Organized folder structure: Artist/Album/XX - Track.flac
     /// Better for large libraries with album-based organization
-    #[default]
     Organized,
 
-    /// Flat file structure: Artist - Title.flac (all files in root)
+    /// Flat file structure: Artist - Title.flac (all files in root), the default
     /// Better for simple libraries without nested folders
+    #[default]
     Flat,
 
     /// One folder per artist, no album folder: Artist/Title.flac
@@ -65,6 +65,10 @@ pub enum FolderStructure {
     /// single and Flat makes one directory of thousands of files. The album is
     /// still in the tags, so a server that reads tags shows it either way.
     ByArtist,
+
+    /// The person's own templates: FolderTemplate for album tracks, and FolderTemplateSingles
+    /// and FolderTemplateCompilations when set (`common::layout`).
+    Custom,
 }
 
 /// Where a starred track's permanent copy comes from.
@@ -371,8 +375,28 @@ pub struct SubsonicSettings {
 
     /// Folder structure for downloaded tracks (default: Flat)
     /// Environment variable: FOLDER_STRUCTURE
-    /// Values: "Organized" (Artist/Album/Track.flac), "Flat" (Artist - Title.flac)
+    /// Values: "Flat" (Artist - Title.flac), "ByArtist" (Artist/Title.flac), "Organized"
+    /// (Artist/Album/01 - Title.flac), "Custom" (the templates below)
     pub folder_structure: FolderStructure,
+
+    /// The Custom layout for album tracks, such as `{Artist}/{Album}/{Track:00} - {Title}`.
+    /// Environment variable: FOLDER_TEMPLATE
+    pub folder_template: String,
+
+    /// The Custom layout for singles; blank files them as album tracks.
+    /// Environment variable: FOLDER_TEMPLATE_SINGLES
+    pub folder_template_singles: String,
+
+    /// The Custom layout for compilations; blank files them as album tracks.
+    /// Environment variable: FOLDER_TEMPLATE_COMPILATIONS
+    pub folder_template_compilations: String,
+
+    /// The folder caps of every template these settings have held, beside the built-in ones,
+    /// so a folder an older template cut keeps its name on disk after a switch or an edit
+    /// (`common::layout::Layout::cut_caps`). The settings store remembers them in
+    /// `layout-caps.json` beside settings.json. Never read from or written to the configuration.
+    #[serde(skip)]
+    pub layout_caps: Vec<usize>,
 
     /// Download source (default: Soulseek). Lidarr applies to hearts only.
     /// Environment variable: DOWNLOAD_SOURCE
@@ -428,6 +452,10 @@ impl Default for SubsonicSettings {
             download_on_play: false,
             lidarr_album_on_play: false,
             folder_structure: FolderStructure::Flat,
+            folder_template: crate::common::layout::ORGANIZED.to_string(),
+            folder_template_singles: String::new(),
+            folder_template_compilations: String::new(),
+            layout_caps: Vec::new(),
             download_source: DownloadSource::Soulseek,
             heart_download_sources: Vec::new(),
             use_local_staging: false,

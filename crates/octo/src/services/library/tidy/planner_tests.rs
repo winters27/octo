@@ -723,6 +723,36 @@ fn the_hash_follows_what_would_be_written_and_moved() {
     assert_ne!(plan_of(&files).hash(), plan_of(&other).hash());
 }
 
+// ---- the file layout --------------------------------------------------------------------------
+
+#[test]
+fn custom_layout_not_by_artist_leaves_folders() {
+    let files = [song("Beyonce/A/01 - S.flac", "Beyonc\u{e9}")];
+    assert_eq!(plan_of(&files).moves.len(), 1, "an artist-first layout moves it");
+    let options = TidyOptions {
+        leave_folders: true,
+        ..TidyOptions::default()
+    };
+    let plan = plan(ROOT, &files, &TidyAnswers::default(), &options);
+    assert!(plan.moves.is_empty());
+    assert!(plan.rows.iter().all(|row| row.kind != TidyKind::Split));
+}
+
+#[test]
+fn a_folder_differing_only_by_cleaning_stays() {
+    // The folder is what the tags say; only the file layout's cleaning would change it.
+    let plan = plan_of(&[song("Beyonce?/A/01 - S.flac", "Beyonce?")]);
+    assert!(plan.moves.is_empty(), "{:?}", plan.moves);
+}
+
+#[test]
+fn three_dot_artist_is_tidied() {
+    let plan = plan_of(&[
+        song("...And You Will Know Us/A/01 - S.flac", "...And You Will Know Us").title("S (feat. X)"),
+    ]);
+    assert!(row_of(&plan, TidyKind::Guest).is_some());
+}
+
 #[test]
 fn row_ids_stay_the_same_across_previews() {
     let files = [

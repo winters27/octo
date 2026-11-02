@@ -29,8 +29,8 @@ pub use lyrics_library_job::{LyricsLibraryStore, LyricsLibraryWorker};
 pub use lyrics_ovh_lyrics_source::LyricsOvhLyricsSource;
 pub use lyrics_service::LyricsService;
 pub use lyrics_sidecar_writer::{
-    LyricsJob, LyricsSidecarWriter, LyricsSongTags, LyricsTagAccess, LyricsWrite, LyricsWriteOutcome,
-    TagLibLyricsTags,
+    LyricsJob, LyricsPathRemap, LyricsSidecarWriter, LyricsSongTags, LyricsTagAccess, LyricsWrite,
+    LyricsWriteOutcome, TagLibLyricsTags,
 };
 pub use lyrics_undo_journal::{LyricsUndoEntry, LyricsUndoJournal};
 pub use netease_lyrics_source::NeteaseLyricsSource;

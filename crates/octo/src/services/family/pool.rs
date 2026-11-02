@@ -34,15 +34,18 @@ use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::common::dotnet::eq_ignore_case;
-use octo_core::common::{Clock, PathHelper, SongIdentity};
+use octo_core::common::path_helper::{PATH_BUDGET, POOL_BUDGET};
+use octo_core::common::{
+    AlbumHook, Clock, Layout, LayoutKind, LayoutValues, PathHelper, RenderedName, SettleHooks, SongIdentity,
+};
 use octo_core::models::domain::Song;
-use octo_core::settings::{LibraryAction, SettingsStore};
+use octo_core::settings::{FolderStructure, LibraryAction, SettingsStore};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -54,8 +57,15 @@ use super::family_store::{FamilyStore, Member, SharedLibraries};
 use super::library_index::{IndexedSong, LibraryIndex};
 use super::member_credentials::MemberCredentials;
 use crate::services::common::acquisition_tracker::key_of;
+use crate::services::common::album_identity::{self, AlbumIdentity, LayoutTags, Shown};
+use crate::services::common::base_download_service::{
+    Filed, PLACEMENT, choose_loose, file_values, mapping_at, values_from_tags,
+};
+use crate::services::library::library_write_gate::{LibraryWrite, LibraryWriteGate as MusicFolderGate};
+use crate::services::library::tidy::layout_pass::{LayoutMapping, kept_values};
 use crate::services::library::{LibraryActionQuarantine, PathSource, ResolvedSongFile};
 use crate::services::local::ILocalLibraryService;
+use crate::services::soulseek::soulseek_download_service::INCOMING_FOLDER_NAME;
 
 /// The pool's folder under the members folder. The dot keeps it out of every member's
 /// library and out of Navidrome's scans.
@@ -210,6 +220,19 @@ pub enum PoolError {
     #[error("{0}")]
     Io(#[from] io::Error),
 }
+
+/// What became of a pool file [`FamilyPool::relayout_held`] was asked to move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayoutOutcome {
+    /// The file, its lyrics files, its record and every member's link are at the new place.
+    Moved,
+    /// Nothing moved, for the reason these words give (the tidy's row shows them).
+    Held(String),
+}
+
+/// What the claim two changes copying one shared file into the pool take turns on starts with,
+/// before the shared file's path. No pool path starts with it.
+const COPY_OF: &str = "copy of:";
 
 /// What a change answers when it could not run because Octo is stopping.
 fn stopping() -> PoolError {
@@ -464,7 +487,27 @@ impl Drop for Claim<'_> {
     }
 }
 
+/// A change's hold while it makes names ([`FamilyPool::naming`]): the placement lock, then the
+/// gate's share, let go of in that order.
+struct Naming {
+    _placing: tokio::sync::MutexGuard<'static, ()>,
+    _share: Option<LibraryWrite>,
+}
+
 impl Claims {
+    /// Holds `paths` at once when none of them is held, without waiting; None when one is.
+    fn try_claim(&self, paths: &[&str]) -> Option<Claim<'_>> {
+        let mut paths: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
+        paths.sort();
+        paths.dedup();
+        let mut held = self.held.lock();
+        if paths.iter().any(|path| held.contains(path)) {
+            return None;
+        }
+        held.extend(paths.iter().cloned());
+        Some(Claim { claims: self, paths })
+    }
+
     /// Waits until none of `paths` is held, then holds them all at once (so two changes that
     /// each want two files never wait on each other).
     async fn claim(&self, paths: &[&str]) -> Claim<'_> {
@@ -488,11 +531,13 @@ impl Claims {
 }
 
 /// The members folder and the pool folder as one change reads them, for the file work it does
-/// on a blocking thread.
+/// on a blocking thread, and the music folder's staging folder, which keeps a record of each copy
+/// while it is under way.
 #[derive(Debug, Clone)]
 struct Places {
     members: String,
     pool: String,
+    staging: PathBuf,
 }
 
 impl Places {
@@ -549,6 +594,8 @@ pub struct FamilyPool {
     records: RecordsLock,
     /// The pool files changes are working on.
     claims: Claims,
+    /// The music folder's one-writer gate, which a change that makes names takes a share of.
+    write_gate: OnceLock<MusicFolderGate>,
     /// When the last sweep ran, by the steady clock.
     last_sweep: Mutex<Option<Duration>>,
     /// Pool files sweeps found missing, with when they were first found missing; a file goes
@@ -606,6 +653,7 @@ impl FamilyPool {
             mode: RwLock::new(mode),
             records: RecordsLock::default(),
             claims: Claims::default(),
+            write_gate: OnceLock::new(),
             last_sweep: Mutex::new(None),
             misses: Mutex::new(HashMap::new()),
             clock: RwLock::new(Clock::system()),
@@ -620,6 +668,30 @@ impl FamilyPool {
 
     fn arc(&self) -> Option<Arc<FamilyPool>> {
         self.me.upgrade()
+    }
+
+    /// The music folder's one-writer gate, shared with placements and the library jobs: a
+    /// promotion, a shared file's pool copy and a relayout each take a share of it. Only the first
+    /// call counts.
+    pub fn set_write_gate(&self, gate: MusicFolderGate) {
+        let _ = self.write_gate.set(gate);
+    }
+
+    /// What a change that makes names in the shared library or the pool holds while it settles
+    /// and moves, taken after its claims: the gate's share (no library job moves folders
+    /// meanwhile), then the placement lock (no other route makes a folder of the same name at
+    /// once), with every move into the library a stop left half done put right first. Nothing
+    /// awaits another lock while it is held.
+    async fn naming(&self) -> Naming {
+        let share = match self.write_gate.get() {
+            Some(gate) => Some(gate.write().await),
+            None => None,
+        };
+        let placing = PLACEMENT.placing(&self.staging()).await;
+        Naming {
+            _placing: placing,
+            _share: share,
+        }
     }
 
     /// Reads the wall clock time from `clock` from now on (tests move it along).
@@ -707,7 +779,17 @@ impl FamilyPool {
     fn places(&self) -> Places {
         let members = self.members_root();
         let pool = format!("{members}/{POOL_FOLDER}");
-        Places { members, pool }
+        Places {
+            members,
+            pool,
+            staging: self.staging(),
+        }
+    }
+
+    /// The music folder's staging folder, which holds the records of moves and copies under way.
+    /// The shared folder is the music folder.
+    fn staging(&self) -> PathBuf {
+        Path::new(&(self.shared_root)()).join(INCOMING_FOLDER_NAME)
     }
 
     /// A member's name as Octo keeps it (anyone else's as given).
@@ -856,13 +938,13 @@ impl FamilyPool {
             .pool_path_of_link(user, link)
             .unwrap_or_else(|| link.to_string());
         let _claim = self.claims.claim(&[&pool_path]).await;
-        let (path, pause) = (PathBuf::from(link), self.copy_pause());
+        let (path, pause, staging) = (PathBuf::from(link), self.copy_pause(), self.staging());
         let copied = on_disk(move || -> io::Result<Option<u64>> {
             if !is_symlink(&path) {
                 return Ok(None);
             }
             wait_before_copy(pause);
-            copy_staged(&path, &path)?;
+            copy_staged(&staging, &path, &path)?;
             Ok(Some(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)))
         })
         .await
@@ -977,14 +1059,14 @@ impl FamilyPool {
                 .filter_map(|user| self.link_path(&file.path, user))
                 .map(PathBuf::from)
                 .collect();
-            let pause = self.copy_pause();
+            let (pause, staging) = (self.copy_pause(), self.staging());
             replaced += on_disk(move || {
                 links
                     .iter()
                     .filter(|link| is_symlink(link))
                     .filter(|link| {
                         wait_before_copy(pause);
-                        match copy_staged(link, link) {
+                        match copy_staged(&staging, link, link) {
                             Ok(()) => true,
                             Err(e) => {
                                 warn!("FAMILY could not make a copy of {}: {e}", link.display());
@@ -1078,13 +1160,19 @@ impl FamilyPool {
                 if !Path::new(&path).is_file() {
                     return Err(PoolError::NotInPool(path));
                 }
-                make_link(mode, &path, &link, &relative)?;
+                make_link(&places.staging, mode, &path, &link, &relative)?;
                 for companion in companions(&path) {
                     let Some(companion_relative) = places.relative(&companion) else {
                         continue;
                     };
                     let companion_link = places.under(&name, &companion_relative);
-                    if let Err(e) = make_link(mode, &companion, &companion_link, &companion_relative) {
+                    if let Err(e) = make_link(
+                        &places.staging,
+                        mode,
+                        &companion,
+                        &companion_link,
+                        &companion_relative,
+                    ) {
                         warn!("FAMILY could not give {name} {companion}: {e}");
                     }
                 }
@@ -1550,29 +1638,38 @@ impl FamilyPool {
         let stays_pooled = !keepers.is_empty();
         let seer_names: Vec<String> = seers.iter().map(|user| self.member_name(user)).collect();
         let (path, pause) = (pool_path.to_string(), self.copy_pause());
-        let target = on_disk(move || -> io::Result<String> {
-            let mut target = format!("{shared_root}/{relative}");
-            if Path::new(&target).exists() {
-                target = PathHelper::resolve_unique_path(&target);
-            }
-            let companions = companions(&path);
-            wait_before_copy(pause);
-            if stays_pooled {
-                copy_staged(Path::new(&path), Path::new(&target))?;
-            } else {
-                move_file(Path::new(&path), Path::new(&target))?;
-            }
-            carry_companions(&companions, Path::new(&target), stays_pooled);
-            for name in &seer_names {
-                remove_member_link(&places, name, &path, &companions);
-            }
-            if !stays_pooled && let Some(folder) = Path::new(&path).parent() {
-                remove_lonely_covers(folder);
-                prune_empty(folder, Path::new(&places.pool));
-            }
-            Ok(target)
-        })
-        .await??;
+        let layout = Layout::from_settings(&self.settings.current().subsonic);
+        let naming = self.naming().await;
+        // Filed under the shared folder from its own tags as a new song is: the folders already
+        // there by those names or other spellings of them, the folder already holding its album,
+        // and its disc folders.
+        let target = self
+            .file_by_tags(pool_path, &shared_root, &relative, &layout, PATH_BUDGET)
+            .await?;
+        let moved = {
+            let target = target.clone();
+            on_disk(move || -> io::Result<()> {
+                let companions = companions(&path);
+                wait_before_copy(pause);
+                if stays_pooled {
+                    copy_staged(&places.staging, Path::new(&path), Path::new(&target))?;
+                } else {
+                    move_pool_file(&places.staging, Path::new(&path), Path::new(&target))?;
+                }
+                carry_companions(&places.staging, &companions, Path::new(&target), stays_pooled);
+                for name in &seer_names {
+                    remove_member_link(&places, name, &path, &companions);
+                }
+                if !stays_pooled && let Some(folder) = Path::new(&path).parent() {
+                    remove_lonely_covers(folder);
+                    prune_empty(folder, Path::new(&places.pool));
+                }
+                Ok(())
+            })
+            .await
+        };
+        drop(naming);
+        moved??;
         {
             let _records = self.records.lock();
             if stays_pooled {
@@ -1664,9 +1761,9 @@ impl FamilyPool {
             .is_none_or(|member| sees_shared_library(&member, self.shared_library_of(path)))
     }
 
-    /// A shared file's place in the pool: its path under the shared folder, or its last three
-    /// parts (`Artist/Album/file`) when it is somewhere else.
-    fn pool_place_of_shared(&self, shared_path: &str) -> Option<String> {
+    /// A shared file's path inside the pool, before it is settled there: its path under the
+    /// shared folder, or its last three parts (`Artist/Album/file`) when it is somewhere else.
+    fn pool_relative_of_shared(&self, shared_path: &str) -> Option<String> {
         let shared_root = (self.shared_root)();
         let shared_root = shared_root.trim_end_matches('/');
         let under_root = (!shared_root.is_empty())
@@ -1682,15 +1779,16 @@ impl FamilyPool {
             && relative
                 .split('/')
                 .all(|part| !part.is_empty() && part != "." && part != "..");
-        plain.then(|| format!("{}/{relative}", self.pool_root_path()))
+        plain.then_some(relative)
     }
 
     /// Gives `user`, who cannot see the shared library a shared file is in, a copy they can
     /// play through the pool: the file, with its lyrics and its folder's cover, is copied once
-    /// into the pool at its place in the shared layout, recorded as a copy of `song`, and
-    /// linked into their library like any pool song. Another member who needs it gets a link
-    /// to that same pool file. The copy is written on a blocking thread while only that pool
-    /// file is claimed, so other changes to the pool go on beside it. Answers their link.
+    /// into the pool at its place in the shared layout (each name cleaned and settled there as a
+    /// new song's is), recorded as a copy of that file and of `song`, and linked into their
+    /// library like any pool song. Another member who needs it gets a link to that same pool
+    /// file, found by its record (the copy of this file, or of this outside song), never by where
+    /// a copy would go. Two changes for one shared file take turns. Answers their link.
     pub async fn copy_shared_for(
         &self,
         shared_path: &str,
@@ -1699,8 +1797,8 @@ impl FamilyPool {
         song: Option<&Song>,
     ) -> Result<String, PoolError> {
         let member = self.member_named(user)?;
-        let target = self
-            .pool_place_of_shared(shared_path)
+        let relative = self
+            .pool_relative_of_shared(shared_path)
             .ok_or_else(|| PoolError::NotInPool(shared_path.to_string()))?;
         let (shared_path, outside_key, song) = (
             shared_path.to_string(),
@@ -1708,66 +1806,194 @@ impl FamilyPool {
             song.cloned(),
         );
         self.whole(Err(stopping()), move |pool| async move {
-            let _claim = pool.claims.claim(&[&target]).await;
-            let linked = pool
-                .copy_shared_claimed(
-                    &shared_path,
-                    &member,
-                    &target,
-                    outside_key.as_deref(),
-                    song.as_ref(),
-                )
-                .await;
-            // A copy nobody could be given is not kept.
-            if linked.is_err() && pool.store.get(&target).is_some_and(|file| file.refs.is_empty()) {
-                pool.gc_claimed(&target).await;
-            }
-            linked
+            let source = format!("{COPY_OF}{shared_path}");
+            let _source = pool.claims.claim(&[&source]).await;
+            pool.copy_shared_claimed(
+                &shared_path,
+                &member,
+                &relative,
+                outside_key.as_deref(),
+                song.as_ref(),
+            )
+            .await
         })
         .await
     }
 
-    /// [`Self::copy_shared_for`] for a change that holds the claim on `target`, the copy's
-    /// place in the pool.
+    /// The pool's copy of a shared file, found by its record: the copy made of this file, else a
+    /// pool file of this outside song. Only a file still on disk counts.
+    async fn recorded_copy(&self, shared_path: &str, outside_key: Option<&str>) -> Option<String> {
+        let mut candidates: Vec<String> = Vec::new();
+        candidates.extend(self.store.find_by_source(shared_path).map(|file| file.path));
+        candidates.extend(
+            outside_key
+                .and_then(|key| self.store.find_by_outside_id(key))
+                .map(|file| file.path),
+        );
+        if candidates.is_empty() {
+            return None;
+        }
+        on_disk(move || candidates.into_iter().find(|path| Path::new(path).is_file()))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// [`Self::copy_shared_for`] for a change that holds the claim on copies of `shared_path`.
+    /// `relative` is the copy's path in the pool before it is settled.
     async fn copy_shared_claimed(
         &self,
         shared_path: &str,
         member: &Member,
-        target: &str,
+        relative: &str,
         outside_key: Option<&str>,
         song: Option<&Song>,
     ) -> Result<String, PoolError> {
-        let (from, to, pause) = (
-            PathBuf::from(shared_path),
-            PathBuf::from(target),
-            self.copy_pause(),
-        );
-        let (copied, size) = on_disk(move || -> io::Result<(bool, u64)> {
-            if !from.is_file() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("{} is not there", from.display()),
-                ));
+        if let Some(existing) = self.recorded_copy(shared_path, outside_key).await {
+            let _claim = self.claims.claim(&[&existing]).await;
+            // Looked at again now that this change holds it: another change may have moved it.
+            if self.store.get(&existing).is_some() {
+                let size = {
+                    let path = existing.clone();
+                    on_disk(move || std::fs::metadata(&path).map(|m| m.len()).ok()).await?
+                };
+                if let Some(size) = size {
+                    return self
+                        .give_copy(shared_path, member, &existing, size, outside_key, song)
+                        .await;
+                }
             }
-            let copied = !to.is_file();
-            if copied {
+        }
+        let from = PathBuf::from(shared_path);
+        let layout = Layout::from_settings(&self.settings.current().subsonic);
+        let pool_root = self.pool_root_path();
+        loop {
+            let naming = self.naming().await;
+            // Filed in the pool from the file's own tags as a member's download is, with the
+            // album's folder by any name and its disc folders.
+            let target = self
+                .file_by_tags(shared_path, &pool_root, relative, &layout, POOL_BUDGET)
+                .await?;
+            let Some(_claim) = self.claims.try_claim(&[&target]) else {
+                // Another change holds that name: once it is done, the name is settled again.
+                drop(naming);
+                drop(self.claims.claim(&[&target]).await);
+                continue;
+            };
+            let (from, to, pause, staging) = (
+                from.clone(),
+                PathBuf::from(&target),
+                self.copy_pause(),
+                self.staging(),
+            );
+            let size = on_disk(move || -> io::Result<u64> {
                 wait_before_copy(pause);
-                copy_with_companions(&from, &to)?;
-            }
-            Ok((copied, std::fs::metadata(&to).map(|m| m.len()).unwrap_or(0)))
-        })
-        .await??;
-        if copied {
+                copy_with_companions(&staging, &from, &to)?;
+                Ok(std::fs::metadata(&to).map(|m| m.len()).unwrap_or(0))
+            })
+            .await;
+            drop(naming);
+            let size = size??;
             info!(
                 "FAMILY {shared_path} was copied into the pool as {target} for {}, who cannot see its shared library",
                 member.username
             );
+            return self
+                .give_copy(shared_path, member, &target, size, outside_key, song)
+                .await;
         }
+    }
+
+    /// Where the file at `path`, now at `relative`, goes under `root`: filed by the layout as a
+    /// download is (the album's folder by any name, its disc folders, and a new disc landing
+    /// loose beside an album's loose files). The names come from what the File layout task names
+    /// the file by: for a file Octo placed, the values its mapping saved, each field kept only
+    /// while its tag still says what was written; else the file's own tags. When neither can
+    /// name the song, its path's own names are cleaned and settled. A name already taken gives
+    /// the next free one. For a change that holds the naming locks.
+    async fn file_by_tags(
+        &self,
+        path: &str,
+        root: &str,
+        relative: &str,
+        layout: &Layout,
+        budget: usize,
+    ) -> io::Result<String> {
+        let name = relative.rsplit('/').next().unwrap_or(relative);
+        let extension = match name.rfind('.') {
+            Some(dot) if dot > 0 => name[dot..].to_string(),
+            _ => String::new(),
+        };
+        let mappings = self.library.get_mappings().await;
+        let placed = mapping_at(&mappings, path).map(|mapping| LayoutMapping {
+            title: mapping.title.clone(),
+            album: mapping.album.clone(),
+            artist: mapping.artist.clone(),
+            values: mapping.layout.clone(),
+        });
+        let first = {
+            let (path, root, relative, layout, extension) = (
+                path.to_string(),
+                root.to_string(),
+                relative.to_string(),
+                layout.clone(),
+                extension.clone(),
+            );
+            on_disk(move || -> io::Result<Filing> {
+                if !Path::new(&path).is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("{path} is not there"),
+                    ));
+                }
+                let tags = album_identity::read_layout_tags(Path::new(&path));
+                let values = tags.as_ref().and_then(|tags| {
+                    placed
+                        .as_ref()
+                        .and_then(|placed| kept_values(placed, tags))
+                        .or_else(|| values_from_tags(tags))
+                });
+                Ok(match values {
+                    Some(values) => Filing::Filed(file_values(&layout, &root, values, &extension, budget)?),
+                    None => Filing::Path(settle_relative(&root, &relative, tags.as_ref(), &layout, budget)?),
+                })
+            })
+            .await??
+        };
+        let filed = match first {
+            Filing::Filed(filed) => filed,
+            Filing::Path(target) => return Ok(target),
+        };
+        let (root, layout) = (root.to_string(), layout.clone());
+        let filed = on_disk(move || choose_loose(&layout, &root, filed, &extension, budget)).await??;
+        Ok(match filed.settled.taken {
+            Some(_) => PathHelper::resolve_unique_path(&filed.settled.path),
+            None => filed.settled.path,
+        })
+    }
+
+    /// Records the pool file at `target` as the copy of `shared_path` and of `song`, and links it
+    /// into `member`'s library, for a change that holds its claim. A copy nobody could be given
+    /// is not kept.
+    async fn give_copy(
+        &self,
+        shared_path: &str,
+        member: &Member,
+        target: &str,
+        size: u64,
+        outside_key: Option<&str>,
+        song: Option<&Song>,
+    ) -> Result<String, PoolError> {
         {
             let _records = self.records.lock();
             self.record_shared_copy(target, size, outside_key, song);
+            self.store.set_source(target, shared_path);
         }
-        self.link_claimed(target, &member.username).await
+        let linked = self.link_claimed(target, &member.username).await;
+        if linked.is_err() && self.store.get(target).is_some_and(|file| file.refs.is_empty()) {
+            self.gc_claimed(target).await;
+        }
+        linked
     }
 
     /// Records a pool copy of a shared file as a copy of `song`. A record it already has gains
@@ -1821,6 +2047,137 @@ impl FamilyPool {
             album: song.map(|s| s.album.clone()).unwrap_or_default(),
             refs: Vec::new(),
         });
+    }
+
+    /// Holds the pool files at `paths` for the library tidy's job, which holds the music folder's
+    /// gate whole while it moves them: until the hold is dropped no other change touches them.
+    /// It never waits: None when another change is working on one of them, which may itself be
+    /// waiting for the gate, so the job lets the gate go a moment and asks again.
+    pub fn try_hold(&self, paths: &[&str]) -> Option<PoolFilesHeld> {
+        let pool = self.arc()?;
+        let mut paths: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
+        paths.sort();
+        paths.dedup();
+        {
+            let mut held = self.claims.held.lock();
+            if paths.iter().any(|path| held.contains(path)) {
+                return None;
+            }
+            held.extend(paths.iter().cloned());
+        }
+        Some(PoolFilesHeld(Arc::new(HeldFiles { pool, paths })))
+    }
+
+    /// Moves a pool file from `old` to `new` (both in the pool, both in `held`) for the library
+    /// tidy's File layout task, while its job holds the music folder's gate whole: no download,
+    /// lyrics write or other placement runs until the job lets the gate go, so none of them sees
+    /// an album half moved. It takes no share of the gate (the job's hold covers it), only the
+    /// placement lock. Before anything moves, the new place is looked at in the pool and in the
+    /// library of every member who has the song: anything there by that name or another spelling
+    /// of it, or by another spelling of a folder on the way, holds the move, with the words its
+    /// row shows. Then the file and its own lyrics files move, its record follows, and each
+    /// member's link is made again at the new place, pointing at it (a member's real copy is
+    /// renamed instead). The covers of the folder it leaves are copied into a new folder that has
+    /// none. Each move is told to `remap`, so a lyrics job waiting for the gate writes where the
+    /// song is now. Stars are not carried over: Navidrome finds a moved file again by its tags.
+    /// `relayout_held(new, old)` puts it back. Answers [`RelayoutOutcome::Moved`] also when it
+    /// was already done.
+    pub async fn relayout_held(
+        &self,
+        held: &PoolFilesHeld,
+        old: &str,
+        new: &str,
+        remap: Option<crate::services::lyrics::LyricsPathRemap>,
+    ) -> anyhow::Result<RelayoutOutcome> {
+        if !held.covers(old) || !held.covers(new) {
+            anyhow::bail!("{old} and {new} are not both held for the move");
+        }
+        let (old, new, held) = (old.to_string(), new.to_string(), held.clone());
+        self.whole(Err(anyhow::anyhow!("Octo is stopping")), move |pool| async move {
+            let _placing = PLACEMENT.lock().await;
+            let moved = pool.relayout_claimed(&old, &new, remap.as_ref()).await;
+            drop(held);
+            moved
+        })
+        .await
+    }
+
+    /// [`Self::relayout_held`] for a test, holding both paths first.
+    #[cfg(test)]
+    pub(crate) async fn relayout(&self, old: &str, new: &str) -> anyhow::Result<RelayoutOutcome> {
+        let held = self.try_hold(&[old, new]).expect("no other change holds them");
+        self.relayout_held(&held, old, new, None).await
+    }
+
+    /// [`Self::relayout_held`] for a change that holds both paths and the placement lock, under
+    /// the job's hold on the gate.
+    async fn relayout_claimed(
+        &self,
+        old: &str,
+        new: &str,
+        remap: Option<&crate::services::lyrics::LyricsPathRemap>,
+    ) -> anyhow::Result<RelayoutOutcome> {
+        let places = self.places();
+        let (Some(old_relative), Some(new_relative)) = (places.relative(old), places.relative(new)) else {
+            anyhow::bail!("{old} and {new} are not both files in the family pool");
+        };
+        if old_relative == new_relative {
+            return Ok(RelayoutOutcome::Moved);
+        }
+        let holders: Vec<String> = self
+            .store
+            .get(old)
+            .or_else(|| self.store.get(new))
+            .map(|file| file.refs)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|user| self.family.member(user).map(|member| member.username))
+            .filter(|name| has_valid_folder(name))
+            .collect();
+        let move_ = PoolMove {
+            places,
+            old: old.to_string(),
+            new: new.to_string(),
+            old_relative,
+            new_relative,
+        };
+        let held = {
+            let (move_, holders) = (move_.clone(), holders.clone());
+            on_disk(move || move_.held_by(&holders)).await??
+        };
+        if let Some(words) = held {
+            info!("FAMILY {old} stays where it is: {words}");
+            return Ok(RelayoutOutcome::Held(words));
+        }
+        let sidecars = {
+            let move_ = move_.clone();
+            on_disk(move || move_.move_in_pool()).await??
+        };
+        // Told before anything is let go of, so no lyrics job takes the gate between the move
+        // and the record of it.
+        let mut moved = vec![(old.to_string(), new.to_string())];
+        moved.extend(holders.iter().map(|name| {
+            (
+                move_.places.under(name, &move_.old_relative),
+                move_.places.under(name, &move_.new_relative),
+            )
+        }));
+        if let Some(remap) = remap {
+            remap.record(&moved);
+        }
+        {
+            let _records = self.records.lock();
+            self.store.move_file(old, new);
+        }
+        let mode = self.mode();
+        on_disk(move || {
+            for name in &holders {
+                move_.relink(mode, name, &sidecars);
+            }
+        })
+        .await?;
+        info!("FAMILY {old} moved to {new} for the file layout");
+        Ok(RelayoutOutcome::Moved)
     }
 
     /// Lets go of everything a member who is leaving the family has: each of their links goes,
@@ -1936,8 +2293,8 @@ impl FamilyPool {
                 target
             };
             let companions = companions(&path);
-            move_file(Path::new(&path), Path::new(&target))?;
-            carry_companions(&companions, Path::new(&target), false);
+            move_pool_file(&places.staging, Path::new(&path), Path::new(&target))?;
+            carry_companions(&places.staging, &companions, Path::new(&target), false);
             remove_member_link(&places, &name, &path, &companions);
             if let Some(folder) = Path::new(&path).parent() {
                 remove_lonely_covers(folder);
@@ -2271,12 +2628,28 @@ impl MemberCopies for FamilyPool {
         {
             return self.link_path(&file.path, &member.username);
         }
-        // A shared song they cannot see: their copy goes where the pool keeps it.
+        // A shared song they cannot see: their copy, found by its record, else where the pool
+        // would put it now.
         let song = self.index.song(library_id)?;
         if !self.is_shared_file(&song.path) || sees_shared_library(&member, library) {
             return None;
         }
-        let place = self.pool_place_of_shared(&song.path)?;
+        if let Some(copy) = self.store.find_by_source(&song.path) {
+            return self.link_path(&copy.path, &member.username);
+        }
+        let relative = self.pool_relative_of_shared(&song.path)?;
+        let (pool_root, layout, shared) = (
+            self.pool_root_path(),
+            Layout::from_settings(&self.settings.current().subsonic),
+            song.path.clone(),
+        );
+        let place = on_disk(move || {
+            let tags = album_identity::read_layout_tags(Path::new(&shared));
+            settle_relative(&pool_root, &relative, tags.as_ref(), &layout, POOL_BUDGET).ok()
+        })
+        .await
+        .ok()
+        .flatten()?;
         self.link_path(&place, &member.username)
     }
 
@@ -2412,7 +2785,7 @@ fn trash_unless_linked(
 /// Makes `link` stand for `pool_path`: a relative link in link mode, or a copy (in copy mode,
 /// and when the disk refuses the link). Nothing changes when something is there already. A
 /// folder another change tidied away in the meantime is made again.
-fn make_link(mode: LinkMode, pool_path: &str, link: &str, relative: &str) -> io::Result<()> {
+fn make_link(staging: &Path, mode: LinkMode, pool_path: &str, link: &str, relative: &str) -> io::Result<()> {
     let link_path = Path::new(link);
     for _ in 0..3 {
         if std::fs::symlink_metadata(link_path).is_ok() {
@@ -2429,10 +2802,10 @@ fn make_link(mode: LinkMode, pool_path: &str, link: &str, relative: &str) -> io:
                 }
                 Err(e) => {
                     warn!("FAMILY could not link {link}: {e}; copying it instead");
-                    copy_staged(Path::new(pool_path), link_path)
+                    copy_staged(staging, Path::new(pool_path), link_path)
                 }
             },
-            LinkMode::Copy => copy_staged(Path::new(pool_path), link_path),
+            LinkMode::Copy => copy_staged(staging, Path::new(pool_path), link_path),
         };
         match made {
             Ok(()) => return Ok(()),
@@ -2478,22 +2851,18 @@ fn remove_member_link(places: &Places, name: &str, pool_path: &str, companions: 
 /// Takes a song's `companions` along to `target`'s folder where nothing is there yet: covers
 /// are always copied (the album folder keeps its own), lyrics files copied when `copy` and
 /// moved otherwise.
-fn carry_companions(companions: &[String], target: &Path, copy: bool) {
+fn carry_companions(staging: &Path, companions: &[String], target: &Path, copy: bool) {
     for companion in companions {
-        let Some(name) = Path::new(companion).file_name() else {
+        let Some((destination, is_cover)) = companion_place(companion, target) else {
             continue;
         };
-        let destination = target.with_file_name(name);
         if destination.exists() {
             continue;
         }
-        let is_cover = COVER_FILES
-            .iter()
-            .any(|cover| eq_ignore_case(cover, &name.to_string_lossy()));
         let result = if is_cover || copy {
             std::fs::copy(companion, &destination).map(|_| ())
         } else {
-            move_file(Path::new(companion), &destination)
+            move_file(staging, Path::new(companion), &destination)
         };
         if let Err(e) = result {
             warn!("FAMILY could not move {companion} with its song: {e}");
@@ -2502,29 +2871,97 @@ fn carry_companions(companions: &[String], target: &Path, copy: bool) {
 }
 
 /// Copies `from` to `to` (through a link at `from`, when it is one), written beside `to` first
-/// and then put in its place, so a half-written file never stands there. With `from` and `to`
+/// and then put in its place, so a half-written file never stands there; a record of it in
+/// `staging` while it is under way lets a recovery remove what a stop left. With `from` and `to`
 /// the same link, the link becomes a real copy of what it points to.
-fn copy_staged(from: &Path, to: &Path) -> io::Result<()> {
-    let mut name = to.as_os_str().to_owned();
-    name.push(".octo-copy");
-    let staged = PathBuf::from(name);
-    copy_file(from, &staged)?;
+fn copy_staged(staging: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    stage_copy(staging, from, to, Staged::Copy)
+}
+
+/// What a staged copy is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Staged {
+    /// A copy: the file it is made from stays.
+    Copy,
+    /// A move whose caller follows the copy whatever the answer (a member's own copy, a song's
+    /// lyrics): the file it is made from goes once the copy has its name, and one that cannot go
+    /// yet goes with the next recovery, the move answered as done.
+    Move,
+    /// A move whose caller takes an error as nothing moved (a pool file moved, kept aside or
+    /// promoted): one whose source cannot go, or whose name cannot be made to last, is taken back
+    /// and answered as an error, and one a stop cut short is taken back by the next recovery.
+    MoveOrNothing,
+}
+
+/// [`copy_staged`], and for a move, `from` goes once the copy's name lasts a power cut (its
+/// folder flushed), as `staged_for` says ([`Staged`]).
+fn stage_copy(staging: &Path, from: &Path, to: &Path, staged_for: Staged) -> io::Result<()> {
+    let moving = staged_for != Staged::Copy;
+    let (staged, mut record) = PLACEMENT.copy_under_way(
+        staging,
+        to,
+        moving.then_some(from),
+        staged_for == Staged::MoveOrNothing,
+    )?;
+    // Whole on the disk, and its record says so, before it takes the name.
+    let whole = copy_file(from, &staged)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&staged)
+                .and_then(|file| file.sync_all())
+        })
+        .and_then(|()| record.mark_whole());
+    if let Err(e) = whole {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e);
+    }
+    #[cfg(test)]
+    STAGED_COPIES.lock().push((
+        to.to_path_buf(),
+        to.exists(),
+        staged.is_file(),
+        marked_whole(&staging.join("replacing")),
+    ));
     if let Err(e) = std::fs::rename(&staged, to) {
         let _ = std::fs::remove_file(&staged);
         return Err(e);
     }
+    match staged_for {
+        Staged::Copy => {
+            let _ = record.settle(None, to);
+        }
+        Staged::Move => {
+            if record.settle(Some(from), to).is_err() {
+                let _ = record.keep_moved();
+            }
+        }
+        Staged::MoveOrNothing => return record.settle_or_undo(from, to),
+    }
     Ok(())
+}
+
+/// Whether the records folder `records` holds a record that marks its copy whole.
+#[cfg(test)]
+fn marked_whole(records: &Path) -> bool {
+    std::fs::read_dir(records).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            std::fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|record| record["whole"] == serde_json::json!(true))
+        })
+    })
 }
 
 /// Copies a song to `to` ([`copy_staged`]), then copies its lyrics files and its folder's cover
 /// beside it where nothing is there yet.
-fn copy_with_companions(from: &Path, to: &Path) -> io::Result<()> {
-    copy_staged(from, to)?;
+fn copy_with_companions(staging: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    copy_staged(staging, from, to)?;
     for companion in companions(&from.to_string_lossy()) {
-        let Some(file_name) = Path::new(&companion).file_name() else {
+        let Some((destination, _)) = companion_place(&companion, to) else {
             continue;
         };
-        let destination = to.with_file_name(file_name);
         if destination.exists() {
             continue;
         }
@@ -2563,6 +3000,460 @@ fn companions(song_path: &str) -> Vec<String> {
         }
     }
     found
+}
+
+/// Where a song's `companion` goes beside the song at `target`, and whether it is a cover: a
+/// cover keeps its name, and a lyrics file takes the song's name with its own extension, so the
+/// two still pair when the song's name changed on the way.
+fn companion_place(companion: &str, target: &Path) -> Option<(PathBuf, bool)> {
+    let name = Path::new(companion).file_name()?;
+    if COVER_FILES
+        .iter()
+        .any(|cover| eq_ignore_case(cover, &name.to_string_lossy()))
+    {
+        return Some((target.with_file_name(name), true));
+    }
+    let extension = Path::new(companion).extension()?;
+    Some((target.with_extension(extension), false))
+}
+
+/// The cover files directly in `folder`.
+fn covers_in(folder: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            COVER_FILES.iter().any(|cover| eq_ignore_case(cover, &name))
+        })
+        .map(|entry| entry.path().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    found
+}
+
+/// `relative`, a song's path, with the extension of `sidecar` in place of its own.
+fn with_extension_of(relative: &str, sidecar: &str) -> String {
+    let name_start = relative.rfind('/').map_or(0, |slash| slash + 1);
+    let stem = match relative.rfind('.') {
+        Some(dot) if dot > name_start => &relative[..dot],
+        _ => relative,
+    };
+    let extension = Path::new(sidecar)
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!("{stem}.{extension}")
+}
+
+/// The first entry in the way of a file at `root/relative`, which is at `root/own` now: a file
+/// where a folder must be, another spelling of a folder that would have to be made (other
+/// capitals, a character Windows refuses), or anything by the file's name or another spelling of
+/// it. The entries on `own`'s own way are never in the way. None when the way is clear.
+fn in_the_way(root: &str, relative: &str, own: &str) -> Option<String> {
+    let parts: Vec<&str> = relative.split('/').collect();
+    let own_parts: Vec<&str> = own.split('/').collect();
+    let mut dir = PathBuf::from(root);
+    for (at, part) in parts.iter().enumerate() {
+        let last = at + 1 == parts.len();
+        let own_here = (own_parts.len() > at && own_parts[..at] == parts[..at]).then(|| own_parts[at]);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return None;
+        };
+        let names: Vec<(String, bool)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_str()?.to_string();
+                (Some(name.as_str()) != own_here).then(|| {
+                    let is_dir = entry.path().is_dir();
+                    (name, is_dir)
+                })
+            })
+            .collect();
+        if last {
+            return names
+                .into_iter()
+                .find(|(name, _)| name == part || PathHelper::same_name(name, part, true))
+                .map(|(name, _)| name);
+        }
+        if own_here == Some(*part) || names.iter().any(|(name, is_dir)| name == part && *is_dir) {
+            dir.push(part);
+            continue;
+        }
+        // The folder is made new, so nothing below it can be in the way.
+        return names
+            .into_iter()
+            .find(|(name, _)| name == part || PathHelper::same_name(name, part, false))
+            .map(|(name, _)| name);
+    }
+    None
+}
+
+/// Puts a member's `old_link` at `new_link` for the pool file now at `target` (`relative` in
+/// the pool): a link is made again pointing at it, since its text named the old place; a real
+/// copy is renamed; a missing one is made.
+fn move_link(
+    staging: &Path,
+    mode: LinkMode,
+    (old_link, new_link): (&str, &str),
+    target: &str,
+    relative: &str,
+) -> io::Result<()> {
+    match std::fs::symlink_metadata(old_link) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if eq_ignore_case(old_link, new_link) {
+                // One entry on a disk that ignores capitals: made again in its own place.
+                std::fs::remove_file(old_link)?;
+                make_link(staging, LinkMode::Symlink, target, new_link, relative)
+            } else {
+                make_link(staging, LinkMode::Symlink, target, new_link, relative)?;
+                std::fs::remove_file(old_link)
+            }
+        }
+        Ok(_) => move_file(staging, Path::new(old_link), Path::new(new_link)),
+        Err(_) => make_link(staging, mode, target, new_link, relative),
+    }
+}
+
+/// The library tidy's hold on pool files ([`FamilyPool::try_hold`]), let go of when the last
+/// clone is dropped. Clones share it.
+#[derive(Clone)]
+pub struct PoolFilesHeld(Arc<HeldFiles>);
+
+impl PoolFilesHeld {
+    fn covers(&self, path: &str) -> bool {
+        self.0.paths.iter().any(|held| held == path)
+    }
+}
+
+struct HeldFiles {
+    pool: Arc<FamilyPool>,
+    paths: Vec<String>,
+}
+
+impl Drop for HeldFiles {
+    fn drop(&mut self) {
+        {
+            let mut held = self.pool.claims.held.lock();
+            for path in &self.paths {
+                held.remove(path);
+            }
+        }
+        self.pool.claims.freed.notify_waiters();
+    }
+}
+
+/// One pool file's move for the File layout task, as its file work on a blocking thread reads
+/// it. The relative paths are inside the pool, and the same inside each member's library.
+#[derive(Debug, Clone)]
+struct PoolMove {
+    places: Places,
+    old: String,
+    new: String,
+    old_relative: String,
+    new_relative: String,
+}
+
+impl PoolMove {
+    /// The file is at the new place and not at the old.
+    fn done(&self) -> bool {
+        !Path::new(&self.old).is_file() && Path::new(&self.new).is_file()
+    }
+
+    /// The song's own lyrics files that go with it, each as (where it is, where it goes), inside
+    /// the pool. Once the move is done, the ones beside the new place.
+    fn sidecars(&self) -> Vec<(String, String)> {
+        let (from, to, done) = if self.done() {
+            (&self.new, &self.old_relative, true)
+        } else {
+            (&self.old, &self.new_relative, false)
+        };
+        LibraryActionQuarantine::sidecars_of(from)
+            .into_iter()
+            .filter_map(|sidecar| {
+                let here = self.places.relative(&sidecar)?;
+                let there = with_extension_of(to, &sidecar);
+                Some(if done { (there, here) } else { (here, there) })
+            })
+            .collect()
+    }
+
+    /// Why the file may not move now, in the words its row shows; None when the way is clear in
+    /// the pool and in each of `holders`' libraries. A move already done is never held.
+    fn held_by(&self, holders: &[String]) -> io::Result<Option<String>> {
+        let done = self.done();
+        if !done && !Path::new(&self.old).is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} is not there", self.old),
+            ));
+        }
+        let mut moves = vec![(self.old_relative.clone(), self.new_relative.clone())];
+        moves.extend(self.sidecars());
+        if !done {
+            for (at, (from, to)) in moves.iter().enumerate() {
+                if let Some(name) = in_the_way(&self.places.pool, to, from) {
+                    return Ok(Some(if at == 0 {
+                        format!("{name} is already there, so this song stays.")
+                    } else {
+                        format!("{name} is already there, so this song and its lyrics stay.")
+                    }));
+                }
+            }
+        }
+        for holder in holders {
+            let root = self.places.member_root(holder);
+            for (from, to) in &moves {
+                let (old_link, new_link) = (self.places.under(holder, from), self.places.under(holder, to));
+                let moved = std::fs::symlink_metadata(&old_link).is_err()
+                    && std::fs::symlink_metadata(&new_link).is_ok();
+                if !moved && let Some(name) = in_the_way(&root, to, from) {
+                    return Ok(Some(format!(
+                        "{holder}'s library already has {name}, so this song stays."
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Moves the pool file and its lyrics files, then copies the covers of the folder it leaves
+    /// into a new folder that has none, and tidies that folder away once nothing else is in it.
+    /// Answers the lyrics files now at the new place, as (old, new) inside the pool.
+    fn move_in_pool(&self) -> io::Result<Vec<(String, String)>> {
+        let sidecars = self.sidecars();
+        if self.done() {
+            return Ok(sidecars);
+        }
+        let leaving = Path::new(&self.old).parent().map(covers_in).unwrap_or_default();
+        move_pool_file(&self.places.staging, Path::new(&self.old), Path::new(&self.new))?;
+        let mut moved = Vec::new();
+        for (from, to) in sidecars {
+            let (here, there) = (
+                format!("{}/{from}", self.places.pool),
+                format!("{}/{to}", self.places.pool),
+            );
+            if Path::new(&there).exists() {
+                continue;
+            }
+            match move_file(&self.places.staging, Path::new(&here), Path::new(&there)) {
+                Ok(()) => moved.push((from, to)),
+                Err(e) => warn!("FAMILY could not move {here} with its song: {e}"),
+            }
+        }
+        if let Some(folder) = Path::new(&self.new).parent()
+            && covers_in(folder).is_empty()
+        {
+            for cover in &leaving {
+                let Some(name) = Path::new(cover).file_name() else {
+                    continue;
+                };
+                if let Err(e) = std::fs::copy(cover, folder.join(name)) {
+                    warn!("FAMILY could not copy {cover} with its album: {e}");
+                }
+            }
+        }
+        if let Some(folder) = Path::new(&self.old).parent() {
+            remove_lonely_covers(folder);
+            prune_empty(folder, Path::new(&self.places.pool));
+        }
+        Ok(moved)
+    }
+
+    /// Makes `name`'s link at the new place, pointing at the moved file, with links to its moved
+    /// lyrics files (`sidecars`, inside the pool) and its new folder's covers, then tidies away
+    /// the folder the old link leaves once nothing else is in it.
+    fn relink(&self, mode: LinkMode, name: &str, sidecars: &[(String, String)]) {
+        let mut moves = vec![(self.old_relative.clone(), self.new_relative.clone())];
+        moves.extend(sidecars.iter().cloned());
+        for (from, to) in &moves {
+            let (old_link, new_link) = (self.places.under(name, from), self.places.under(name, to));
+            let target = format!("{}/{to}", self.places.pool);
+            let links = (old_link.as_str(), new_link.as_str());
+            if let Err(e) = move_link(&self.places.staging, mode, links, &target, to) {
+                warn!("FAMILY could not move {name}'s {old_link} to {new_link}: {e}");
+            }
+        }
+        if let Some(folder) = Path::new(&self.new).parent() {
+            for cover in covers_in(folder) {
+                let Some(relative) = self.places.relative(&cover) else {
+                    continue;
+                };
+                let link = self.places.under(name, &relative);
+                if let Err(e) = make_link(&self.places.staging, mode, &cover, &link, &relative) {
+                    warn!("FAMILY could not give {name} {cover}: {e}");
+                }
+            }
+        }
+        let old_link = self.places.under(name, &self.old_relative);
+        if let Some(folder) = Path::new(&old_link).parent() {
+            remove_lonely_covers(folder);
+            prune_empty(folder, Path::new(&self.places.member_root(name)));
+        }
+    }
+}
+
+/// What a song's own tags say its kind is, as placement decides it: a compilation by its flag,
+/// its type or a Various Artists album artist; a single by its type or having no album.
+fn kind_of(tags: &LayoutTags) -> LayoutKind {
+    let various = tags
+        .album_artist
+        .as_deref()
+        .is_some_and(|artist| album_identity::artist_key(artist) == album_identity::VARIOUS_ARTISTS);
+    LayoutKind::of(
+        tags.release_type.as_deref(),
+        tags.compilation || various,
+        tags.album.as_deref().is_none_or(|album| album.trim().is_empty()),
+    )
+}
+
+/// How a path a layout made reads: where its album folder is, which folders an artist alone
+/// names, and what the album folder's name shows.
+struct Shape {
+    album_at: Option<usize>,
+    artist_level: Vec<bool>,
+    shown: Shown,
+}
+
+/// The shape of a path `folders` deep: the template `layout` files a song of `kind` by when it
+/// is that deep, else the built-in layout of that depth. None when neither is.
+fn shape_of(layout: &Layout, kind: LayoutKind, folders: usize, extension: &str) -> Option<Shape> {
+    let presets = [
+        FolderStructure::Organized,
+        FolderStructure::ByArtist,
+        FolderStructure::Flat,
+    ]
+    .map(Layout::preset);
+    let template = std::iter::once(layout.template(kind))
+        .chain(presets.iter().map(|preset| preset.template(LayoutKind::Album)))
+        .find(|template| template.folder_count() == folders)?;
+    // Every name filled, so every folder of the template renders and says what names it.
+    let probe = LayoutValues {
+        artist: "a".into(),
+        track_artist: "a".into(),
+        album_artist: Some("a".into()),
+        album: "b".into(),
+        title: "c".into(),
+        track: Some(1),
+        disc: Some(1),
+        disc_count: Some(2),
+        multi_disc: true,
+        year: Some(2000),
+        album_type: Some("Album".into()),
+        ..LayoutValues::default()
+    };
+    let mut artist_level = vec![false; folders];
+    for name in template.render(&probe, extension, PATH_BUDGET) {
+        if let Some(level) = artist_level.get_mut(name.segment) {
+            *level = name.artist_level;
+        }
+    }
+    let (year, album_type) = template.album_folder_shows();
+    Some(Shape {
+        album_at: template.album_folder_segment(),
+        artist_level,
+        shown: Shown { year, album_type },
+    })
+}
+
+/// Where a file's own tags file it, before the choice a loose album leaves; or, for a file whose
+/// tags cannot name the song, the path its own names settle to.
+enum Filing {
+    Filed(Filed),
+    Path(String),
+}
+
+/// Where a song now at `relative` (a path the pool's layout made, or an older rule's) goes
+/// under `root`: each name cleaned as the layout cleans one, then settled as a new song is, so it
+/// joins the folder already there by that name or another spelling of it, and the folder that
+/// already holds its album or its disc, whatever that is called. `tags` are the song's own. A
+/// file already there by the same name or another spelling of it stays, and this one takes the
+/// next free name.
+fn settle_relative(
+    root: &str,
+    relative: &str,
+    tags: Option<&LayoutTags>,
+    layout: &Layout,
+    budget: usize,
+) -> io::Result<String> {
+    let parts: Vec<&str> = relative.split('/').filter(|part| !part.is_empty()).collect();
+    let Some((file, folders)) = parts.split_last() else {
+        return Err(io::Error::other(format!("{relative} has no file name")));
+    };
+    let (stem, extension) = match file.rfind('.') {
+        Some(dot) if dot > 0 => (&file[..dot], &file[dot..]),
+        _ => (*file, ""),
+    };
+    let shape = tags.and_then(|tags| shape_of(layout, kind_of(tags), folders.len(), extension));
+    let artist_level = |at: usize| {
+        shape
+            .as_ref()
+            .and_then(|shape| shape.artist_level.get(at).copied())
+            .unwrap_or(false)
+    };
+    let mut names: Vec<RenderedName> = folders
+        .iter()
+        .enumerate()
+        .map(|(at, folder)| {
+            let name = PathHelper::safe_name(&PathHelper::sanitize_folder_name(folder), None);
+            RenderedName {
+                uncut: name.clone(),
+                name,
+                segment: at,
+                artist_level: artist_level(at),
+                cap: budget,
+                cut_caps: layout.cut_caps().to_vec(),
+            }
+        })
+        .collect();
+    let stem = PathHelper::safe_name(&PathHelper::clean_name(stem), Some(extension));
+    names.push(RenderedName {
+        uncut: stem.clone(),
+        name: stem,
+        segment: folders.len(),
+        artist_level: false,
+        cap: budget,
+        cut_caps: layout.cut_caps().to_vec(),
+    });
+
+    let identity = tags.and_then(|tags| AlbumIdentity::of_files(std::slice::from_ref(tags)));
+    let album_at = shape.as_ref().and_then(|shape| shape.album_at);
+    let shown = shape.as_ref().map(|shape| shape.shown).unwrap_or_default();
+    // A folder of another name under a parent no artist names is the album's only on a positive
+    // sign.
+    let positive = album_at
+        .filter(|at| *at == 0 || !artist_level(at - 1))
+        .and(tags)
+        .map(LayoutTags::primary_credit);
+    let find_album = |parent: &str| -> Option<String> {
+        album_identity::find_album_folder(Path::new(parent), identity.as_ref()?, shown, positive.as_deref())
+    };
+    let disc = tags.and_then(|tags| tags.disc);
+    let find_disc = |album_dir: &str| -> Option<String> {
+        let disc = disc?;
+        album_identity::disc_folders(Path::new(album_dir))
+            .into_iter()
+            .find(|(_, found)| *found == disc)
+            .map(|(name, _)| name)
+    };
+    let hooks = SettleHooks {
+        album: album_at.filter(|_| identity.is_some()).map(|at| AlbumHook {
+            at,
+            find: &find_album,
+        }),
+        disc: album_at
+            .map(|at| at + 1)
+            .filter(|at| *at < folders.len() && disc.is_some())
+            .map(|at| AlbumHook { at, find: &find_disc }),
+        fit: None,
+    };
+    let settled = PathHelper::settle(root, &names, extension, budget, hooks)?;
+    Ok(match settled.taken {
+        Some(_) => PathHelper::resolve_unique_path(&settled.path),
+        None => settled.path,
+    })
 }
 
 /// Removes cover files (or links) from a folder that holds nothing else.
@@ -2631,17 +3522,48 @@ fn make_dirs(path: &Path) -> io::Result<()> {
     builder.create(path)
 }
 
-/// Moves a file, copying it across disks.
-fn move_file(from: &Path, to: &Path) -> io::Result<()> {
+/// Moves a file, copying it across disks, for a caller that follows it whatever the answer (a
+/// member's own copy, a song's lyrics): [`Staged::Move`].
+fn move_file(staging: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    move_with(staging, from, to, Staged::Move, |from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+/// Moves a pool file, copying it across disks, for a caller that takes an error as nothing
+/// moved (a pool file moved, kept aside or promoted): [`Staged::MoveOrNothing`].
+fn move_pool_file(staging: &Path, from: &Path, to: &Path) -> io::Result<()> {
+    move_with(staging, from, to, Staged::MoveOrNothing, |from, to| {
+        std::fs::rename(from, to)
+    })
+}
+
+/// A move by `rename`: a rename, else a copy that takes `to`'s name only once it is whole
+/// ([`stage_copy`] as `staged_for` says, with its record in `staging`), so a stop never leaves
+/// part of a file under the song's name; `from` goes last. For [`Staged::MoveOrNothing`], an
+/// error means the file is still at `from` alone.
+fn move_with(
+    staging: &Path,
+    from: &Path,
+    to: &Path,
+    staged_for: Staged,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     if let Some(parent) = to.parent() {
         make_dirs(parent)?;
     }
-    if std::fs::rename(from, to).is_ok() {
+    if rename(from, to).is_ok() {
         return Ok(());
     }
-    copy_file(from, to)?;
-    std::fs::remove_file(from)
+    stage_copy(staging, from, to, staged_for)
 }
+
+/// Each staged copy as it was about to take its name: the name, whether a file already stood
+/// there, whether the copy stood beside it, and whether a record in the staging folder marked a
+/// copy under way whole.
+#[cfg(test)]
+pub(crate) static STAGED_COPIES: std::sync::LazyLock<Mutex<Vec<(PathBuf, bool, bool, bool)>>> =
+    std::sync::LazyLock::new(Mutex::default);
 
 /// Copies a file (through a link at `from`, when it is one), checking the copy's size.
 fn copy_file(from: &Path, to: &Path) -> io::Result<()> {

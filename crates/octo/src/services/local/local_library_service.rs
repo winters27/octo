@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use indexmap::IndexMap;
 use octo_core::common::dotnet::{self, eq_ignore_case, escape_data_string};
-use octo_core::common::{PathHelper, SongIdentity};
+use octo_core::common::{LayoutValues, PathHelper, SongIdentity};
 use octo_core::fingerprint::heart_gate::{HeardRecord, HeardRecording, HeardSource};
 use octo_core::json::{self, datetime};
 use octo_core::models::domain::Song;
@@ -80,6 +80,11 @@ pub struct LocalSongMapping {
     /// when set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heart: Option<KeptHeart>,
+
+    /// What the file layout's names were filled from when Octo placed the file, so the Tidy's
+    /// File layout task files it again from the same names. Written only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<LayoutValues>,
 }
 
 /// The hearts and plays a file was kept for: who, the recording their gate judged it against, and
@@ -193,6 +198,7 @@ impl Default for LocalSongMapping {
             transcoded_from: None,
             proof_mark: None,
             heart: None,
+            layout: None,
         }
     }
 }
@@ -236,6 +242,9 @@ pub struct LocalLibraryService {
     scan_window: Duration,
     /// Told whenever Octo starts a scan, so the library index can be read again after it.
     scan_notice: Option<Arc<tokio::sync::Notify>>,
+    /// How many times the mappings file was written (tests count them).
+    #[cfg(test)]
+    saves: std::sync::atomic::AtomicUsize,
 }
 
 /// One library's scans.
@@ -282,7 +291,15 @@ impl LocalLibraryService {
                 .to_std()
                 .unwrap_or(Duration::from_secs(30)),
             scan_notice: None,
+            #[cfg(test)]
+            saves: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many times the mappings file was written (tests count them).
+    #[cfg(test)]
+    pub(crate) fn saves(&self) -> usize {
+        self.saves.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Notifies `notice` whenever this service starts a scan.
@@ -375,6 +392,8 @@ impl LocalLibraryService {
 
     /// Writes the mappings, indented and atomically.
     fn save(&self, mappings: &DotnetDictionary<LocalSongMapping>) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let text = json::to_string_indented(&MappingsFile(mappings));
         state_file::save_atomic(&self.mapping_file_path, &text)?;
         Ok(())
@@ -570,6 +589,7 @@ impl ILocalLibraryService for LocalLibraryService {
                 .and_then(|verification| verification.proof.row_mark())
                 .map(str::to_string),
             heart,
+            layout: song.layout_values.as_deref().cloned(),
         };
         let key = mapping.key();
         let version = mapping.version();
@@ -788,16 +808,27 @@ impl ILocalLibraryService for LocalLibraryService {
     }
 
     async fn update_local_path(&self, old_path: &str, new_path: &str) -> anyhow::Result<usize> {
-        if dotnet::is_blank(old_path) || dotnet::is_blank(new_path) {
+        self.update_local_paths(&[(old_path.to_string(), new_path.to_string())])
+            .await
+    }
+
+    async fn update_local_paths(&self, moves: &[(String, String)]) -> anyhow::Result<usize> {
+        let moves: Vec<&(String, String)> = moves
+            .iter()
+            .filter(|(old_path, new_path)| !dotnet::is_blank(old_path) && !dotnet::is_blank(new_path))
+            .collect();
+        if moves.is_empty() {
             return Ok(0);
         }
         let mut cached = self.mappings.lock();
         let mappings = self.loaded(&mut cached)?;
         let mut moved = 0;
-        for mapping in mappings.values_mut() {
-            if let Some(now) = PathHelper::moved_path(&mapping.local_path, old_path, new_path) {
-                mapping.local_path = now;
-                moved += 1;
+        for (old_path, new_path) in moves {
+            for mapping in mappings.values_mut() {
+                if let Some(now) = PathHelper::moved_path(&mapping.local_path, old_path, new_path) {
+                    mapping.local_path = now;
+                    moved += 1;
+                }
             }
         }
         if moved > 0 {

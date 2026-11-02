@@ -122,19 +122,27 @@ impl ExplicitBackfillStore {
     /// Follow a folder the library tidy moved: the run's songs name where their files are now.
     /// Answers how many followed.
     pub fn move_paths(&self, from: &str, to: &str) -> usize {
+        self.move_paths_batch(&[(from.to_string(), to.to_string())])
+    }
+
+    /// [`Self::move_paths`] for each `(from, to)` in order, so `a` to `b` then `b` to `c` ends at
+    /// `c`, written once. Answers how many followed, each move counted on its own.
+    pub fn move_paths_batch(&self, moves: &[(String, String)]) -> usize {
         let mut moved = 0;
         {
             let mut run = self.run.lock();
             let run = &mut *run;
-            let paths = run
-                .rows
-                .iter_mut()
-                .map(|row| &mut row.path)
-                .chain(run.queue.iter_mut().map(|song| &mut song.path));
-            for path in paths {
-                if let Some(now) = octo_core::common::PathHelper::moved_path(path, from, to) {
-                    *path = now;
-                    moved += 1;
+            for (from, to) in moves {
+                let paths = run
+                    .rows
+                    .iter_mut()
+                    .map(|row| &mut row.path)
+                    .chain(run.queue.iter_mut().map(|song| &mut song.path));
+                for path in paths {
+                    if let Some(now) = octo_core::common::PathHelper::moved_path(path, from, to) {
+                        *path = now;
+                        moved += 1;
+                    }
                 }
             }
         }

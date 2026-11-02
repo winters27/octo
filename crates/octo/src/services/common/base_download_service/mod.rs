@@ -22,6 +22,10 @@ mod test_support;
 mod placement_tests;
 
 #[cfg(test)]
+#[path = "placement_layout_tests.rs"]
+mod placement_layout_tests;
+
+#[cfg(test)]
 #[path = "tagging_tests.rs"]
 mod tagging_tests;
 
@@ -41,6 +45,10 @@ mod family_tests;
 #[path = "prefetch_tests.rs"]
 mod prefetch_tests;
 
+#[cfg(test)]
+#[path = "playlists_lock_tests.rs"]
+mod playlists_lock_tests;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -51,7 +59,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use octo_core::common::{PathHelper, SongIdentity, dotnet};
+use octo_core::common::layout::Field;
+use octo_core::common::{LayoutKind, PathHelper, SongIdentity, TagSnapshot, dotnet};
 use octo_core::fingerprint::VerificationResult;
 use octo_core::fingerprint::heart_gate::{AcquisitionOrigin, HeardSource, HeartGate};
 use octo_core::fingerprint::verification::RecordingProof;
@@ -94,7 +103,8 @@ use crate::services::notifications::NotificationService;
 use crate::services::prefetch::{AheadSidecar, PrefetchedFiles, write_sidecar};
 use crate::services::subsonic::NavidromeIdentityService;
 
-pub use placement::{LayoutChoice, Placement};
+pub(crate) use placement::{Filed, PLACEMENT, choose_loose, file_values, mapping_at, values_from_tags};
+pub use placement::{LayoutChoice, Placement, Placing};
 pub use tagging::{CatalogBlanks, MeterPreview};
 
 /// The name a download was asked for under, captured before anything corrects it.
@@ -107,6 +117,8 @@ pub struct RequestedIdentity {
     /// For a download asked for with no album: the release group's id and title its ISRC
     /// picked, set once the pick has finished.
     pub album_pick: Arc<OnceLock<(String, String)>>,
+    /// The download's layout and root, read once before identify.
+    pub placing: Arc<OnceLock<Placing>>,
 }
 
 impl RequestedIdentity {
@@ -117,6 +129,7 @@ impl RequestedIdentity {
             album: album.to_string(),
             track,
             album_pick: Arc::default(),
+            placing: Arc::default(),
         }
     }
 }
@@ -340,11 +353,20 @@ pub trait ReviewQueue: Send + Sync {
     fn add_review(&self, owner: &str, local_path: &str, song: &Song, verdict: &VerificationResult) -> bool;
 }
 
+/// Held by every change to playlist files: the library tidy's follows and its undo, and a
+/// download adding its song to a playlist, so neither writes over what the other just wrote.
+/// It is taken last, after the download lock or the music folder's gate, and nothing that holds
+/// it waits on either.
+pub(crate) static PLAYLISTS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// The two playlist sync calls a download makes.
 #[async_trait]
 pub trait PlaylistTrackSync: Send + Sync {
     fn get_playlist_id_for_track(&self, song_id: &str) -> Option<String>;
 
+    /// Adds the song to the playlist's file. Called holding [`PLAYLISTS`], so it never waits on
+    /// the download lock or the music folder's gate.
     async fn add_track_to_m3u(
         &self,
         playlist_id: &str,
@@ -585,15 +607,43 @@ pub struct BaseDownloadService {
 
     identifier: OnceLock<Arc<ReleaseIdentifier>>,
 
+    /// How long the catalog may take to list a song's album, when only that listing can say how
+    /// many discs the album has.
+    disc_count_wait: Mutex<Duration>,
+
     /// The cover lines written to the downloads log, for tests.
     #[cfg(test)]
     pub(crate) cover_steps: Mutex<Vec<(String, Option<String>)>>,
+    /// Run by a placement once its target is settled, before anything is made or moved, for tests.
+    #[cfg(test)]
+    pub(crate) settle_pause: Mutex<Option<SettlePause>>,
 }
+
+/// What a test runs once a placement has settled its target (the path it would move to).
+#[cfg(test)]
+pub(crate) type SettlePause = Arc<dyn Fn(String) -> BoxFuture<'static, ()> + Send + Sync>;
 
 impl BaseDownloadService {
     /// The finalize phase runs under the download lock, so past this it is logged with its stage
     /// timings. Nothing is cut short beyond the per-stage caps.
     const FINALIZE_BUDGET: Duration = Duration::from_secs(20);
+
+    /// How long the catalog may take to list an album for its disc count.
+    const DISC_COUNT_WAIT: Duration = Duration::from_secs(10);
+
+    /// Sets how long the catalog may take to list an album for its disc count.
+    pub fn set_disc_count_wait(&self, wait: Duration) {
+        *self.disc_count_wait.lock() = wait;
+    }
+
+    /// The test's pause after a placement settles its target, when one is set.
+    #[cfg(test)]
+    pub(crate) async fn after_settle(&self, target: &str) {
+        let pause = self.settle_pause.lock().clone();
+        if let Some(pause) = pause {
+            pause(target.to_string()).await;
+        }
+    }
 
     pub fn new(
         core: DownloadCore,
@@ -634,8 +684,11 @@ impl BaseDownloadService {
             album_walks: Mutex::new(HashMap::new()),
             download_lock: Semaphore::new(1),
             identifier: OnceLock::new(),
+            disc_count_wait: Mutex::new(Self::DISC_COUNT_WAIT),
             #[cfg(test)]
             cover_steps: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            settle_pause: Mutex::new(None),
         });
 
         for dir in [service.download_path(), service.cache_path.clone()] {
@@ -648,7 +701,36 @@ impl BaseDownloadService {
                 error!("Failed to create directory: {dir}: {e}");
             }
         }
+        service.recover_replacements_at_start();
         service
+    }
+
+    /// Puts right, once Octo starts, every replace of a library file a stop left half done, under
+    /// the gate's share and the placement lock as a placement holds them. Every placement does it
+    /// too before it moves a file, for a music folder found only later.
+    fn recover_replacements_at_start(&self) {
+        let staging = self.staging_folder();
+        if !placement::replacements_pending(&staging) {
+            return;
+        }
+        let gate = self.services.write_gate.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _share = match &gate {
+                        Some(gate) => Some(gate.write().await),
+                        None => None,
+                    };
+                    let _placing = PLACEMENT.lock().await;
+                    placement::recover_replacements(&staging);
+                });
+            }
+            Err(_) => {
+                if let Ok(_placing) = PLACEMENT.try_lock() {
+                    placement::recover_replacements(&staging);
+                }
+            }
+        }
     }
 
     // ---- what a backend reaches ----------------------------------------------------------
@@ -1073,6 +1155,8 @@ impl BaseDownloadService {
 
         // In Album mode, fetch the full album first to ensure AlbumArtist is correctly set.
         let mut song: Option<Song> = None;
+        // The album Album mode fetched, kept for the disc count a disc folder needs.
+        let mut listed: Option<Album> = None;
         if self.settings.current().subsonic.download_mode == DownloadMode::Album
             && let Some(temp) = self.metadata.get_song(external_provider, external_id).await
             && let Some(album_id) = temp.album_id.as_deref().filter(|id| !id.is_empty())
@@ -1088,8 +1172,10 @@ impl BaseDownloadService {
             // Find the track in the album.
             song = album
                 .songs
-                .into_iter()
-                .find(|s| s.external_id.as_deref() == Some(external_id));
+                .iter()
+                .find(|s| s.external_id.as_deref() == Some(external_id))
+                .cloned();
+            listed = Some(album);
         }
 
         // Fallback to individual song fetch if not in Album mode or album fetch failed.
@@ -1495,6 +1581,17 @@ impl BaseDownloadService {
         // since nothing may read a file while it moves.
         let loudness = self.start_loudness(&landed_path);
 
+        // One layout and one root for the whole download, so the album folder identify looks in
+        // for a sibling is the one placement files into, whatever the settings say meanwhile.
+        let placing_root = pool_members
+            .as_ref()
+            .and(family)
+            .and_then(|family| family.pool_root());
+        let _ = requested.placing.set(Placing {
+            walk: options.album_context.is_some(),
+            ..self.placing_for(placing_root.as_deref())
+        });
+
         // Identify before the file is placed: the album the chooser settles on names the folder
         // (#50) and its main artist names the artist folder (#49). Reads only; nothing is written
         // to the file until it sits where it will stay.
@@ -1512,6 +1609,14 @@ impl BaseDownloadService {
             ));
         }
         self.apply_loudness(&mut song, loudness, &landed_path).await;
+        self.learn_disc_count(
+            &mut song,
+            &requested,
+            external_provider,
+            external_id,
+            listed.as_ref(),
+        )
+        .await;
         let identified = [
             (!dotnet::is_blank(&song.album)).then(|| match song.year.filter(|y| *y > 0) {
                 Some(year) => format!("on {} ({year})", song.album),
@@ -1600,8 +1705,22 @@ impl BaseDownloadService {
             }
             (Some(_), _, None) => self.stage_replacement(&landed_path)?,
         };
+        if let Some(why) = placement.failed.as_deref() {
+            // Kept where it landed, the file would sit where no scan looks and be swept a day
+            // later, recorded as in the library: the download fails instead, and the next source
+            // runs.
+            anyhow::bail!("The song could not be filed in the library: {why}");
+        }
         let mut local_path = placement.path.clone();
         song.local_path = Some(local_path.clone());
+        song.layout_values = placement.values.clone().map(Box::new);
+        // The album's facts from the file of the folder the song joined that placement read
+        // under its lock (a tidy rename or a family pool promotion can have made that folder
+        // since identify looked); the values it was named from already carry them. A walk's
+        // placement takes none: the walk keeps the facts it settled on itself.
+        if let Some(sibling) = placement.pinned.as_ref() {
+            self.pin_to_folder(&mut song, sibling);
+        }
         // Again after placement: identification takes seconds, and placement hands back the old
         // path when the file is missing rather than failing.
         Self::ensure_on_disk(Some(&local_path))?;
@@ -1621,6 +1740,21 @@ impl BaseDownloadService {
         let cover = self
             .write_metadata_replacing(&local_path, &mut song, replacing.as_deref())
             .await;
+        // The tags the names came from, as written, so the File layout task sees a later edit:
+        // read back from the file the way the task reads it, since the writer leaves some of
+        // them otherwise than the song says (an album artist it fills in, a release type in
+        // several values, a disc count only beside a disc number).
+        if let Some(mut values) = song.layout_values.take() {
+            let written = octo_media::tags::TagFile::open(&local_path)
+                .ok()
+                .map(|file| crate::services::common::album_identity::LayoutTags::read(&file));
+            values.tags = Some(
+                written
+                    .map(|tags| tags.snapshot())
+                    .unwrap_or_else(|| TagSnapshot::of_song(&song)),
+            );
+            song.layout_values = Some(values);
+        }
         if ahead_folder.is_some() {
             return Ok(self.keep_ahead(
                 external_provider,
@@ -1701,6 +1835,8 @@ impl BaseDownloadService {
             && let Some(playlist_id) = playlists.get_playlist_id_for_track(song_id)
         {
             info!("Track {song_id} belongs to playlist {playlist_id}, adding to M3U");
+            // A tidy rewriting playlist files finishes first, so neither change is lost.
+            let _playlists = PLAYLISTS.lock().await;
             if let Err(e) = playlists
                 .add_track_to_m3u(&playlist_id, &song, &local_path, false)
                 .await
@@ -1811,6 +1947,88 @@ impl BaseDownloadService {
 
         info!("Download completed: {local_path}");
         Ok(local_path)
+    }
+
+    /// How many discs the song's album has, for a layout that names `{Disc}`, when identification
+    /// left it unknown: the most discs the album Album mode fetched lists, else the most one
+    /// listing of the song's catalog album lists, waited for at most [`Self::DISC_COUNT_WAIT`].
+    /// Taken only from a listing of the album the song is filed under (its title's key is the
+    /// album's), and written to the song, so DISCTOTAL carries it. A listing that does not come
+    /// leaves the count unknown.
+    async fn learn_disc_count(
+        &self,
+        song: &mut Song,
+        requested: &RequestedIdentity,
+        provider: &str,
+        external_id: &str,
+        listed: Option<&Album>,
+    ) {
+        if song.total_discs.is_some_and(|count| count > 0) || dotnet::is_blank(&song.album) {
+            return;
+        }
+        let layout = self.layout_of(requested);
+        if ![LayoutKind::Album, LayoutKind::Single, LayoutKind::Compilation]
+            .into_iter()
+            .any(|kind| layout.template(kind).uses(Field::Disc))
+        {
+            return;
+        }
+        let fetched;
+        let album = match listed {
+            Some(album) => Some(album),
+            None => {
+                let Some(album_id) = song
+                    .album_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| self.backend.extract_external_id_from_album_id(id))
+                    .filter(|id| !id.is_empty())
+                else {
+                    return;
+                };
+                let wait = *self.disc_count_wait.lock();
+                fetched = match tokio::time::timeout(wait, self.metadata.get_album(provider, &album_id)).await
+                {
+                    Ok(album) => album,
+                    Err(_) => {
+                        info!(
+                            "The catalog did not list '{}' within {}s, so its disc count stays unknown",
+                            song.album,
+                            wait.as_secs()
+                        );
+                        None
+                    }
+                };
+                fetched.as_ref()
+            }
+        };
+        let Some(album) =
+            album.filter(|album| SongIdentity::key(&album.title) == SongIdentity::key(&song.album))
+        else {
+            return;
+        };
+        let Some(count) = album
+            .songs
+            .iter()
+            .filter_map(|listed| listed.disc_number)
+            .filter(|disc| *disc > 0)
+            .max()
+        else {
+            return;
+        };
+        song.total_discs = Some(count);
+        if song.disc_number.is_none() {
+            song.disc_number = album
+                .songs
+                .iter()
+                .find(|listed| listed.external_id.as_deref() == Some(external_id))
+                .and_then(|listed| listed.disc_number)
+                .filter(|disc| *disc > 0);
+        }
+        debug!(
+            "'{}' has {count} disc(s), as its catalog listing says",
+            song.album
+        );
     }
 
     /// Takes a song fetched ahead into a staging folder of its own under the incoming folder (a

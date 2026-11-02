@@ -12,7 +12,7 @@ use super::*;
 use crate::http::pipeline::build;
 use crate::http::static_files::StaticAssets;
 use crate::services::library::tidy::planner::{TidyKind, TidyPlan, TidyRow};
-use crate::services::library::tidy::store::{TidyPlanFile, TidyRun};
+use crate::services::library::tidy::store::{TidyLayout, TidyPlanFile, TidyRun};
 
 struct Reply {
     status: StatusCode,
@@ -58,18 +58,29 @@ async fn post(state: &AppState, token: &str, uri: &str, body: Value) -> Reply {
 }
 
 fn previewed(state: &AppState, scope: TidyScope) {
+    previewed_task(state, scope, TidyTask::Artists, None);
+}
+
+/// A finished preview of `task`, made with `layout` (a File layout preview's).
+fn previewed_task(state: &AppState, scope: TidyScope, task: TidyTask, layout: Option<TidyLayout>) {
     let store = state.tidy_worker.store();
+    let kind = match task {
+        TidyTask::Artists => TidyKind::Guest,
+        TidyTask::FileLayout => TidyKind::Layout,
+    };
     store
         .save_plan(TidyPlanFile {
             root: state.tidy_worker.music_root(),
             scope,
+            task,
+            layout,
             plan: TidyPlan {
                 rows: ["a", "b", "c"]
                     .iter()
                     .enumerate()
                     .map(|(at, id)| TidyRow {
                         id: id.to_string(),
-                        kind: if at == 2 { TidyKind::Skip } else { TidyKind::Guest },
+                        kind: if at == 2 { TidyKind::Skip } else { kind },
                         path: format!("A/{id}.flac"),
                         before: String::new(),
                         after: String::new(),
@@ -89,9 +100,245 @@ fn previewed(state: &AppState, scope: TidyScope) {
         status: TidyStatus::Completed,
         mode: TidyMode::Preview,
         scope,
+        task,
+        planned_file_moves: 2,
         plan_hash: Some("ABCDEF0123456789".into()),
         ..TidyRun::default()
     });
+}
+
+/// The layout as a File layout preview made now keeps it.
+fn layout_now(state: &AppState) -> TidyLayout {
+    let settings = state.settings.current();
+    TidyLayout {
+        structure: format!("{:?}", settings.subsonic.folder_structure),
+        templates: octo_core::common::Layout::from_settings(&settings.subsonic)
+            .texts()
+            .to_vec(),
+    }
+}
+
+#[tokio::test]
+async fn a_file_layout_preview_is_asked_for_by_its_task() {
+    let state = AppState::for_tests(AppSettings::default());
+    let token = state.browse_sessions.create("admin");
+
+    let reply = post(
+        &state,
+        &token,
+        "/api/admin/tidy/preview",
+        json!({ "scope": "OctoDownloads", "task": "FileLayout" }),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::ACCEPTED, "{}", reply.body);
+    let body: Value = serde_json::from_str(&reply.body).expect("json");
+    assert_eq!(body["task"], json!("FileLayout"));
+}
+
+#[tokio::test]
+async fn apply_is_refused_for_the_other_task() {
+    let state = AppState::for_tests(AppSettings::default());
+    let token = state.browse_sessions.create("admin");
+    previewed(&state, TidyScope::OctoDownloads);
+
+    let reply = post(
+        &state,
+        &token,
+        "/api/admin/tidy/apply",
+        json!({ "scope": "OctoDownloads", "task": "FileLayout" }),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.body.contains("Preview first"), "{}", reply.body);
+}
+
+#[tokio::test]
+async fn apply_is_refused_for_a_layout_changed_since_the_preview() {
+    let state = AppState::for_tests(AppSettings::default());
+    let token = state.browse_sessions.create("admin");
+    let mut then = layout_now(&state);
+    then.structure = "Organized".into();
+    then.templates = vec![octo_core::common::layout::ORGANIZED.to_string(); 3];
+    previewed_task(&state, TidyScope::OctoDownloads, TidyTask::FileLayout, Some(then));
+
+    let reply = post(
+        &state,
+        &token,
+        "/api/admin/tidy/apply",
+        json!({ "scope": "OctoDownloads", "task": "FileLayout" }),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(
+        reply
+            .body
+            .contains("The File layout changed since the preview. Preview again."),
+        "{}",
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn a_layout_with_a_problem_is_refused_for_preview_and_apply() {
+    let mut settings = AppSettings::default();
+    settings.subsonic.folder_structure = octo_core::settings::FolderStructure::Custom;
+    settings.subsonic.folder_template = "{Artst}/{Title}".into();
+    let state = AppState::for_tests(settings);
+    let token = state.browse_sessions.create("admin");
+
+    let preview = post(
+        &state,
+        &token,
+        "/api/admin/tidy/preview",
+        json!({ "scope": "OctoDownloads", "task": "FileLayout" }),
+    )
+    .await;
+    previewed_task(
+        &state,
+        TidyScope::OctoDownloads,
+        TidyTask::FileLayout,
+        Some(layout_now(&state)),
+    );
+    let apply = post(
+        &state,
+        &token,
+        "/api/admin/tidy/apply",
+        json!({ "scope": "OctoDownloads", "task": "FileLayout" }),
+    )
+    .await;
+
+    for reply in [preview, apply] {
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+        assert!(
+            reply.body.contains("The Albums layout has a problem"),
+            "{}",
+            reply.body
+        );
+    }
+    assert!(!state.tidy_worker.is_pending());
+}
+
+#[tokio::test]
+async fn the_status_carries_the_task_and_counts_layout_rows() {
+    let state = AppState::for_tests(AppSettings::default());
+    let token = state.browse_sessions.create("admin");
+    previewed_task(
+        &state,
+        TidyScope::OctoDownloads,
+        TidyTask::FileLayout,
+        Some(layout_now(&state)),
+    );
+
+    let reply = send(
+        &state,
+        request(Method::GET, "/api/admin/tidy", Some(&token), false, None),
+    )
+    .await;
+
+    let status: Value = serde_json::from_str(&reply.body).expect("json");
+    assert_eq!(status["task"], json!("FileLayout"));
+    assert_eq!(status["rows"]["Layout"], json!(2));
+    assert_eq!(status["plannedFileMoves"], json!(2));
+    assert_eq!(status["movedFiles"], json!(0));
+    assert_eq!(status["layoutRefusal"], Value::Null);
+    let page = send(
+        &state,
+        request(
+            Method::GET,
+            "/api/admin/tidy/rows?kind=Layout",
+            Some(&token),
+            false,
+            None,
+        ),
+    )
+    .await;
+    let page: Value = serde_json::from_str(&page.body).expect("json");
+    assert_eq!(page["total"], json!(2));
+    assert_eq!(page["rows"][0]["kind"], json!("Layout"));
+}
+
+async fn tidy_status(state: &AppState, token: &str) -> Value {
+    let reply = send(
+        state,
+        request(Method::GET, "/api/admin/tidy", Some(token), false, None),
+    )
+    .await;
+    serde_json::from_str(&reply.body).expect("json")
+}
+
+/// The status says which run Undo puts back, the newest in the journal, with its task, and an
+/// Undo sends that run back.
+#[tokio::test]
+async fn the_status_says_which_run_an_undo_puts_back() {
+    use crate::services::library::tidy::TidyJournalEntry;
+
+    let state = AppState::for_tests(AppSettings::default());
+    let token = state.browse_sessions.create("admin");
+    let journal = state.tidy_worker.journal();
+    let begin = |run: &str, task| TidyJournalEntry::Begin {
+        run: run.into(),
+        task,
+        at: chrono::Utc::now(),
+    };
+    journal
+        .append(&begin("r1", TidyTask::Artists))
+        .expect("journaled");
+
+    let first = tidy_status(&state, &token).await;
+    assert_eq!(first["undoRun"], json!("r1"));
+    assert_eq!(first["undoTask"], json!("Artists"));
+    assert!(first.get("undoAlbum").is_none());
+
+    journal
+        .append(&begin("r2", TidyTask::FileLayout))
+        .expect("journaled");
+    let second = tidy_status(&state, &token).await;
+    assert_eq!(second["undoRun"], json!("r2"));
+    assert_eq!(second["undoTask"], json!("FileLayout"));
+
+    let undo = post(&state, &token, "/api/admin/tidy/undo", json!({ "run": "r2" })).await;
+    assert_eq!(undo.status, StatusCode::ACCEPTED, "{}", undo.body);
+}
+
+#[test]
+fn the_job_and_activity_words_follow_the_task() {
+    assert_eq!(TidyWorker::JOB_NAME, "The library tidy");
+    let now = chrono::Utc::now();
+    let run = |task, mode, status| TidyRun {
+        run_id: "r1".into(),
+        status,
+        mode,
+        task,
+        started_utc: Some(now),
+        finished_utc: Some(now),
+        ..TidyRun::default()
+    };
+    let title = |run: TidyRun| {
+        super::super::activity::tidy(&run, false, now)
+            .expect("an item")
+            .title
+    };
+    assert_eq!(
+        title(run(TidyTask::FileLayout, TidyMode::Apply, TidyStatus::Running)),
+        "Moving songs into the File layout"
+    );
+    assert_eq!(
+        title(run(
+            TidyTask::FileLayout,
+            TidyMode::Preview,
+            TidyStatus::Completed
+        )),
+        "Previewing the File layout tidy"
+    );
+    assert_eq!(
+        title(run(TidyTask::FileLayout, TidyMode::Undo, TidyStatus::Running)),
+        "Undoing the File layout tidy"
+    );
+    let waiting = super::super::activity::tidy(&TidyRun::default(), true, now).expect("an item");
+    assert_eq!(waiting.title, "The library tidy");
 }
 
 #[tokio::test]
