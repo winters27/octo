@@ -765,7 +765,7 @@ stations, and Your Radio once `LASTFM_MINIMUM_PLAYS` plays have taught it, come 
 there is something to build them from. When Last.fm gives no answer for one of a listener's
 stations during a refresh (no connection, a rate limit, its time running out), that station keeps
 its songs instead of dropping off the list, and Octo tries it again every 15 minutes until it can
-be made or is no longer wanted; the dashboard's Radio page names the stations kept this way. A
+be made or is no longer wanted; the dashboard's Radio page says when stations were kept this way. A
 station Last.fm answered with too few songs goes as before. State is bounded and versioned in
 `/app/config/lastfm-radio-state.json`; do not share that file across Octo instances
 because cross-process locking is not supported.

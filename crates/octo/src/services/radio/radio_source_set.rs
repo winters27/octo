@@ -489,4 +489,36 @@ mod tests {
         assert_eq!(providers, [YOU_TUBE_MUSIC]);
         assert_eq!(last_fm.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
+
+    /// A station build's lookup is not answered when no source answered cleanly, a resting one
+    /// included; one clean answer, even an empty one, is an answer.
+    #[tokio::test]
+    async fn no_clean_answer_from_any_source_is_no_answer() {
+        let failing = FakeSource::new(LISTEN_BRAINZ, Behavior::Fail);
+        let alone = set(RadioSourceSettings::default(), vec![failing.clone()]);
+        alone.set_rest(TimeDelta::minutes(5));
+        let (_, trouble) = lookup_trouble::watch(ask(&alone)).await;
+        assert!(trouble.sources && !trouble.core);
+        for _ in 1..FAILURES_BEFORE_REST {
+            ask(&alone).await;
+        }
+        assert!(alone.available().is_empty());
+        let (answers, trouble) = lookup_trouble::watch(ask(&alone)).await;
+        assert!(answers.is_empty());
+        assert!(trouble.sources, "a resting source is no answer either");
+
+        let both = set(
+            RadioSourceSettings::default(),
+            vec![
+                FakeSource::new(LISTEN_BRAINZ, Behavior::Fail),
+                FakeSource::new(YOU_TUBE_MUSIC, Behavior::Nothing),
+            ],
+        );
+        let (_, trouble) = lookup_trouble::watch(ask(&both)).await;
+        assert!(!trouble.any());
+
+        let none = set(RadioSourceSettings::default(), Vec::new());
+        let (_, trouble) = lookup_trouble::watch(ask(&none)).await;
+        assert!(!trouble.any(), "no source to ask is a setting, not trouble");
+    }
 }

@@ -625,5 +625,29 @@ fn a_different_reserve_is_a_changed_station() {
     assert!(fixture.store.get_user("alice").stations[0].changed_utc >= before);
 }
 
+/// A station a one-star rating or an unplayable song leaves with no song goes from the list.
+#[test]
+fn a_station_emptied_by_a_rating_or_a_song_that_would_not_play_goes() {
+    let fixture = StateFixture::new(None, None);
+    fixture.store.replace_stations(
+        "alice",
+        &[
+            day_old("one", vec![song("A", "Only")], Vec::new()),
+            day_old("two", vec![song("B", "Last")], Vec::new()),
+            day_old("three", vec![song("C", "Stays")], Vec::new()),
+        ],
+    );
+    assert!(fixture.store.set_radio_ban("alice", "", "A", "Only", true));
+    assert_eq!(fixture.store.reject_track("alice", &song("B", "Last"), None), 1);
+    let keys: Vec<String> = fixture
+        .store
+        .get_user("alice")
+        .stations
+        .into_iter()
+        .map(|station| station.key)
+        .collect();
+    assert_eq!(keys, ["three"]);
+}
+
 #[path = "last_fm_radio_carry_over_tests.rs"]
 mod carry_over;

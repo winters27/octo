@@ -163,4 +163,19 @@ mod tests {
         cancelled.cancel();
         assert!(queue.dequeue(&cancelled).await.is_none());
     }
+
+    #[tokio::test]
+    async fn a_try_at_kept_stations_waits_beside_a_whole_refresh_and_only_once() {
+        let queue = LastFmRadioRefreshQueue::new();
+        let none = CancellationToken::new();
+        assert!(queue.enqueue("alice", None));
+        assert!(queue.enqueue_carried("alice"));
+        assert!(!queue.enqueue_carried("ALICE"));
+        assert!(!queue.enqueue("alice", None));
+        let first = queue.dequeue(&none).await.unwrap();
+        assert!(!first.carried_only);
+        let second = queue.dequeue(&none).await.unwrap();
+        assert!(second.carried_only && second.station_definition_id.is_none());
+        assert!(queue.enqueue_carried("alice"), "queued again once taken");
+    }
 }

@@ -537,8 +537,11 @@ impl LastFmService {
             return tracks;
         }
         match self.top_tracks_from_similar_artists_inner(&name, limit).await {
-            Ok(tracks) => {
-                self.keep(key, tracks.clone().wrap());
+            Ok((tracks, complete)) => {
+                // A list missing an artist Last.fm did not answer for is used, never kept.
+                if complete {
+                    self.keep(key, tracks.clone().wrap());
+                }
                 tracks
             }
             Err(e) => {
@@ -568,7 +571,7 @@ impl LastFmService {
 
     async fn top_tracks_from_similar_artists(&self, artist: &str, limit: i32) -> Vec<SimilarTrack> {
         match self.top_tracks_from_similar_artists_inner(artist, limit).await {
-            Ok(tracks) => tracks,
+            Ok((tracks, _)) => tracks,
             Err(e) => {
                 error!(error = %e, "Error fetching top tracks from similar artists for {artist}");
                 Vec::new()
@@ -576,11 +579,13 @@ impl LastFmService {
         }
     }
 
+    /// Top songs of the artists like `artist`, and whether Last.fm answered for every one of
+    /// them.
     async fn top_tracks_from_similar_artists_inner(
         &self,
         artist: &str,
         limit: i32,
-    ) -> anyhow::Result<Vec<SimilarTrack>> {
+    ) -> anyhow::Result<(Vec<SimilarTrack>, bool)> {
         // Get similar artists
         let artist_url = format!(
             "{}?method=artist.getsimilar&artist={}&api_key={}&format=json&limit=10",
@@ -605,6 +610,7 @@ impl LastFmService {
 
         // Get top tracks from each similar artist
         let mut tracks = Vec::new();
+        let mut complete = true;
         for similar_artist in &similar_artists {
             let top_tracks_url = format!(
                 "{}?method=artist.gettoptracks&artist={}&api_key={}&format=json&limit=10",
@@ -613,9 +619,9 @@ impl LastFmService {
                 self.last_fm().api_key
             );
             let top = self.get(&top_tracks_url).await?;
-            // A list missing an artist Last.fm did not answer for is never kept as the answer.
             if did_not_answer(&top) {
-                anyhow::bail!("Last.fm did not answer artist.gettoptracks for {similar_artist}");
+                complete = false;
+                continue;
             }
             if !top.is_success() {
                 continue;
@@ -635,7 +641,7 @@ impl LastFmService {
 
         info!("Found {} top tracks from similar artists", tracks.len());
 
-        Ok(take(tracks, limit))
+        Ok((take(tracks, limit), complete))
     }
 
     /// Last.fm can answer at all. Search discovery needs only this: an API key.
@@ -997,9 +1003,10 @@ impl LastFmService {
 /// offline, it is temporarily unavailable, or the rate limit was exceeded.
 const TRY_AGAIN_ERRORS: [i64; 4] = [8, 11, 16, 29];
 
-/// The `error` code in a Last.fm JSON body, when there is one.
+/// The `error` code in a Last.fm JSON body, when there is one, sent as a number or as text.
 fn error_code(doc: &Value) -> Option<i64> {
-    doc.get("error")?.as_i64()
+    let error = doc.get("error")?;
+    error.as_i64().or_else(|| error.as_str()?.trim().parse().ok())
 }
 
 /// Whether a Last.fm JSON body is one of its try-again errors.

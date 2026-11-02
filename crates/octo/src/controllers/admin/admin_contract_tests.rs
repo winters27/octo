@@ -913,6 +913,42 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     assert!(body["configFile"].as_str().unwrap().ends_with("settings.json"));
 }
 
+/// The Radio status says which stations the last refresh kept as they were, while something
+/// tries them again: the dashboard as its own line, the apps through `lastRefreshError`.
+#[tokio::test]
+async fn the_radio_status_names_the_stations_kept_from_the_last_refresh() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("lastfm-radio-state.json"),
+        r#"{"Version":1,"Users":{"alice":{"Username":"alice","Stations":[
+            {"Id":"or-your","Key":"your-mix","Name":"Your Radio","Owner":"alice","Kind":1,"Tracks":[{"Artist":"A","Title":"One"}]},
+            {"Id":"or-discovery","Key":"discovery","Name":"Discovery Radio","Owner":"alice","Kind":2,"Tracks":[{"Artist":"B","Title":"Two"}]}
+        ],"CarriedStationKeys":["discovery"]}}}"#,
+    )
+    .unwrap();
+    let state = AppState::for_tests_with(
+        factory_settings(),
+        crate::app::TestServices {
+            config_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let app = app(state.clone());
+    let radio = get(&app, "/api/admin/lastfm/radio?user=alice").await.json();
+    let note = "Couldn't update Discovery Radio, so it kept its songs";
+    assert_eq!(radio["learning"]["carriedNote"], note);
+    assert_eq!(radio["learning"]["lastRefreshError"], note);
+    assert_eq!(radio["learning"]["carriedRetryMinutes"], 15);
+
+    // Radio switched off tries nothing again, so nothing says it will.
+    let mut off = factory_settings();
+    off.last_fm.enable_radio = false;
+    state.settings.set(off);
+    let radio = get(&app, "/api/admin/lastfm/radio?user=alice").await.json();
+    assert!(radio["learning"]["carriedNote"].is_null());
+    assert!(radio["learning"]["lastRefreshError"].is_null());
+}
+
 #[tokio::test]
 async fn last_fm_and_listen_brainz_reads_have_the_recorded_shapes() {
     // The recorded stack's radio switches (compose turns them off).

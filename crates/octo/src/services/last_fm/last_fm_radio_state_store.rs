@@ -700,3 +700,74 @@ fn first_utf16_units(message: &str, units: usize) -> String {
 #[cfg(test)]
 #[path = "last_fm_radio_state_store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod carried_saves {
+    use octo_core::settings::AppSettings;
+
+    use super::*;
+
+    fn store(dir: &tempfile::TempDir) -> LastFmRadioStateStore {
+        LastFmRadioStateStore::new(
+            dir.path().join("state.json"),
+            Arc::new(SettingsStore::for_tests(AppSettings::default())),
+            Arc::new(ExternalIdRegistry::in_memory()),
+        )
+    }
+
+    fn station(key: &str) -> LastFmRadioStation {
+        LastFmRadioStation {
+            id: key.into(),
+            key: key.into(),
+            tracks: vec![LastFmRadioTrack {
+                artist: "A".into(),
+                title: key.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A retry of carried stations begun before a history reset saves nothing.
+    #[test]
+    fn a_retry_begun_before_a_reset_saves_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store(&dir);
+        store.replace_stations_carrying("alice", &[station("discovery")], &["discovery".into()]);
+        store.mark_refreshing("alice");
+        assert!(store.reset("alice"));
+        store.replace_carried("alice", &[station("discovery")], &["discovery".into()]);
+        let user = store.get_user("alice");
+        assert!(user.stations.is_empty());
+        assert!(user.carried_station_keys.is_empty());
+    }
+
+    /// The carried keys are those of saved stations, and a retry leaves the success stamp alone.
+    #[test]
+    fn carried_keys_follow_the_saved_stations_and_a_retry_keeps_the_schedule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = store(&dir);
+        store.replace_stations_carrying(
+            "alice",
+            &[station("discovery"), station("rock")],
+            &["discovery".into(), "gone".into()],
+        );
+        let user = store.get_user("alice");
+        assert_eq!(user.carried_station_keys, ["discovery"]);
+        let succeeded = user.last_refresh_success_utc;
+        assert!(succeeded.is_some());
+
+        store.mark_refreshing("alice");
+        store.replace_carried("alice", &[station("discovery"), station("rock")], &[]);
+        let user = store.get_user("alice");
+        assert!(user.carried_station_keys.is_empty());
+        assert_eq!(user.last_refresh_success_utc, succeeded);
+        assert!(!user.refreshing);
+
+        store.replace_stations_carrying("alice", &[station("discovery")], &["discovery".into()]);
+        assert!(store.set_radio_ban("alice", "", "A", "discovery", true));
+        let user = store.get_user("alice");
+        assert!(user.stations.is_empty(), "the only song was rated one star");
+        assert!(user.carried_station_keys.is_empty());
+    }
+}

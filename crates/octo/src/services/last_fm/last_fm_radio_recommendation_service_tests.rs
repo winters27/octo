@@ -1573,3 +1573,70 @@ async fn served_ids_renew_when_served_again_and_are_kept_per_listener() {
     );
     assert!(fixture.service.served_track("bob", "bob-1").is_some());
 }
+
+/// Only similar songs answer; every other method fails.
+#[derive(Clone)]
+struct OnlySimilarSongs;
+
+impl Respond for OnlySimilarSongs {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if query(request).get("method").map(String::as_str) == Some("track.getsimilar") {
+            RecommendationHandler.respond(request)
+        } else {
+            ResponseTemplate::new(500)
+        }
+    }
+}
+
+/// A station carried over keeps the songs it walked on to, but not one rated one star since.
+#[tokio::test]
+async fn a_carried_station_drops_a_walked_on_song_rated_one_star() {
+    let fixture = fixture(learned(), OnlySimilarSongs).await;
+    record_twelve(&fixture.state);
+    let old: Vec<LastFmRadioTrack> = (0..12)
+        .map(|index| LastFmRadioTrack {
+            artist: "Old".into(),
+            title: format!("Old {index}"),
+            ..Default::default()
+        })
+        .collect();
+    let station = create(
+        "alice",
+        "discovery",
+        "Discovery Radio",
+        LastFmRadioStationKind::Discovery,
+        true,
+        &["rock"],
+        old,
+        1,
+        Utc::now() - TimeDelta::hours(13),
+    );
+    fixture
+        .state
+        .replace_stations("alice", std::slice::from_ref(&station));
+    let saved = fixture.state.get_user("alice").stations[0].clone();
+    let key = continuation_key("alice", &saved);
+    let walked = |title: &str| LastFmRadioTrack {
+        artist: "Walked".into(),
+        title: title.into(),
+        ..Default::default()
+    };
+    fixture
+        .service
+        .continuations
+        .lock()
+        .insert(key.clone(), vec![walked("Rated"), walked("Kept")]);
+    assert!(fixture.state.set_radio_ban("alice", "", "Walked", "Rated", true));
+
+    let stations = build(&fixture.service).await;
+
+    assert!(
+        stations.iter().any(|station| station.key == "discovery"),
+        "Discovery Radio got no answer, so it is carried over"
+    );
+    let left: Vec<String> = fixture.service.continuations.lock()[&key]
+        .iter()
+        .map(|track| track.title.clone())
+        .collect();
+    assert_eq!(left, ["Kept"]);
+}

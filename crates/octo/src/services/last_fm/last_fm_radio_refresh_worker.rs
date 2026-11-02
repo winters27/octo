@@ -24,6 +24,9 @@ use super::last_fm_radio_state_store::LastFmRadioStateStore;
 use super::last_fm_radio_warmup_service::LastFmRadioWarmupService;
 
 const STALE_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Why a refresh that made no station at all failed.
+const NOTHING_MADE: &str = "Provider returned no usable replacement stations";
 const REFRESH_DEADLINE: Duration = Duration::from_secs(35);
 
 /// What the settings looked like at the last change.
@@ -285,11 +288,14 @@ impl LastFmRadioRefreshWorker {
             self.queue_warmup(&job.username);
             return Ok(true);
         }
-        // A build that made nothing because its lookups got no answer keeps the stations the
-        // listener has (they are tried again soon); one that was asked for nothing leaves none.
+        // A build that made nothing because its lookups got no answer is a failure. The stations
+        // it kept are saved all the same, so the ones switched off or no longer wanted go and
+        // the kept ones are tried again soon; one that was asked for nothing leaves none.
         let made = built.stations.len() - built.carried.len();
         if made == 0 && built.unanswered && !self.state.get_user(&job.username).stations.is_empty() {
-            anyhow::bail!("Provider returned no usable replacement stations");
+            self.state
+                .replace_carried(&job.username, &built.stations, &built.carried);
+            anyhow::bail!(NOTHING_MADE);
         }
         self.state
             .replace_stations_carrying(&job.username, &built.stations, &built.carried);
@@ -311,6 +317,8 @@ impl LastFmRadioRefreshWorker {
         if !should_retry_carried(&before, &self.settings.current().last_fm, self.clock.now()) {
             return Ok(false);
         }
+        // A failure this retry does not settle keeps showing after it.
+        let failure = before.last_refresh_error.clone();
         self.state.mark_refreshing(&job.username);
         let built = self
             .recommendations
@@ -357,6 +365,11 @@ impl LastFmRadioRefreshWorker {
         }
         let changed = stations != saved.stations;
         self.state.replace_carried(&job.username, &stations, &still);
+        // A refresh that made nothing is settled once nothing is kept any more; any other
+        // failure is about something this retry did not touch.
+        if let Some(failure) = failure.filter(|failure| !(still.is_empty() && failure == NOTHING_MADE)) {
+            self.state.mark_refresh_failed(&job.username, &failure);
+        }
         if changed {
             self.queue_warmup(&job.username);
         }
@@ -504,26 +517,31 @@ mod tests {
     }
 
     /// A refresh that made nothing because Last.fm gave no answer keeps the stations the
-    /// listener has, and records the failure.
+    /// listener has that it still wants, and records the failure.
     #[tokio::test]
     async fn worker_retains_stale_snapshot_and_records_failed_replacement() {
+        let definition = pinned("rock", "Rock", "rock");
         let fixture = fixture_answering(
             LastFmSettings {
                 api_key: "key".into(),
                 enable_radio: true,
                 enable_personalized_stations: false,
                 enable_discovery_stations: true,
-                discovery_stations: vec![pinned("rock", "Rock", "rock")],
+                discovery_stations: vec![definition.clone()],
                 ..Default::default()
             },
             ResponseTemplate::new(500),
         )
         .await;
         let prior = LastFmRadioStation {
-            id: station_id("alice", "old"),
-            key: "old".into(),
+            id: station_id("alice", "pinned-rock"),
+            key: "pinned-rock".into(),
             name: "Last Good".into(),
             owner: "alice".into(),
+            kind: LastFmRadioStationKind::Pinned,
+            definition_version: octo_core::last_fm::last_fm_radio_recommendation_service::definition_version(
+                &definition,
+            ),
             tracks: vec![LastFmRadioTrack {
                 artist: "A".into(),
                 title: "T".into(),
@@ -531,7 +549,15 @@ mod tests {
             }],
             ..Default::default()
         };
-        fixture.state.replace_stations("alice", &[prior]);
+        let unwanted = LastFmRadioStation {
+            id: station_id("alice", "old"),
+            key: "old".into(),
+            name: "No longer asked for".into(),
+            owner: "alice".into(),
+            tracks: prior.tracks.clone(),
+            ..Default::default()
+        };
+        fixture.state.replace_stations("alice", &[prior, unwanted]);
         let error = fixture
             .worker
             .process(&LastFmRadioRefreshJob::new("alice"))

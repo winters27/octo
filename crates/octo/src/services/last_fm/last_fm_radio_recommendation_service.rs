@@ -564,6 +564,11 @@ impl LastFmRadioRecommendationService {
                     }
                 }
 
+                // The genres this build asked about: their answers stand, however short.
+                let asked_genres: Vec<String> = genre_candidates
+                    .iter()
+                    .map(|(tag, _, _)| format!("genre-{}", key(tag)))
+                    .collect();
                 for (tag, candidates, troubled) in genre_candidates {
                     let station_key = format!("genre-{}", key(&tag));
                     let artists: IgnoreCaseKeys =
@@ -604,7 +609,8 @@ impl LastFmRadioRecommendationService {
                 }
 
                 // A ranking that got no answer may have left out the listener's genres, so the
-                // genre stations they have fill the places it could not.
+                // genre stations they have fill the places it could not; never one of the genres
+                // it did ask about.
                 if ranking_trouble.core {
                     let wanted = settings.effective_genre_station_count().max(0) as usize;
                     while stations
@@ -615,6 +621,9 @@ impl LastFmRadioRecommendationService {
                     {
                         if !carry(previous_stations, &mut stations, &mut carried, |station| {
                             station.kind == LastFmRadioStationKind::Genre
+                                && !asked_genres
+                                    .iter()
+                                    .any(|asked| dotnet::eq_ignore_case(asked, &station.key))
                         }) {
                             break;
                         }

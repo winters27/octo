@@ -561,7 +561,22 @@ async fn a_rate_limit_in_a_success_is_never_kept_as_an_answer() {
 }
 
 #[tokio::test]
-async fn a_refresh_that_could_make_nothing_keeps_everything() {
+async fn a_rate_limit_given_as_text_is_still_no_answer() {
+    let fixture = Fixture::new(
+        learned(),
+        only_similar_songs(status(200, r#"{"error":"29","message":"Rate Limit Exceeded"}"#)),
+    )
+    .await;
+    record_listening(&fixture.state);
+    fixture.state.replace_stations("alice", &everything_saved());
+    assert!(fixture.refresh().await.unwrap());
+    assert!(all_by(&fixture.station("discovery"), "Old Discovery"));
+    fixture.later(16);
+    assert_eq!(fixture.worker.queue_due(), 1, "kept, so tried again");
+}
+
+#[tokio::test]
+async fn a_refresh_that_could_make_nothing_fails_and_keeps_what_is_still_wanted() {
     let fixture = Fixture::new(learned(), last_fm(|_| Some(status(500, "")))).await;
     record_listening(&fixture.state);
     fixture.state.replace_stations("alice", &everything_saved());
@@ -570,8 +585,137 @@ async fn a_refresh_that_could_make_nothing_keeps_everything() {
         error.to_string(),
         "Provider returned no usable replacement stations"
     );
-    assert_eq!(fixture.keys().len(), 6);
+    assert_eq!(
+        fixture.keys(),
+        [
+            "your-mix".to_string(),
+            "discovery".to_string(),
+            artist_station("Artist A"),
+            genre_station("rock"),
+            genre_station("jazz"),
+        ],
+        "Artist C left the top artists, so its radio goes even now"
+    );
+    assert!(all_by(&fixture.station("your-mix"), "Old Mix"));
     assert!(all_by(&fixture.station("discovery"), "Old Discovery"));
+    fixture.later(16);
+    assert_eq!(
+        fixture.worker.queue_due(),
+        1,
+        "the kept stations are tried again soon"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_station_removed_during_an_outage_goes() {
+    let fixture = Fixture::new(learned(), last_fm(|_| Some(status(500, "")))).await;
+    record_listening(&fixture.state);
+    let mut rock = saved(
+        "pinned-rock",
+        "Rock",
+        LastFmRadioStationKind::Pinned,
+        "Old Pinned",
+    );
+    rock.definition_version = definition_version(&rock_definition("Rock"));
+    fixture.state.replace_stations("alice", &[your_radio(), rock]);
+    // The definition is gone from the settings, so nothing asks for the station.
+    assert!(fixture.refresh().await.is_err());
+    assert_eq!(fixture.keys(), ["your-mix"]);
+}
+
+#[tokio::test]
+async fn kept_starter_radio_becomes_your_radio_once_last_fm_answers() {
+    let fixture = Fixture::new(learned(), last_fm(|_| Some(status(500, "")))).await;
+    record_listening(&fixture.state);
+    fixture.state.replace_stations(
+        "alice",
+        &[
+            saved(
+                "starter",
+                "Starter Radio",
+                LastFmRadioStationKind::Starter,
+                "Old Starter",
+            ),
+            discovery(),
+        ],
+    );
+    assert!(fixture.refresh().await.is_err());
+    assert_eq!(fixture.keys(), ["starter", "discovery"]);
+    fixture.answer(last_fm(|_| None)).await;
+    fixture.later(16);
+    assert_eq!(fixture.worker.queue_due(), 1);
+    assert!(fixture.run_queued().await.unwrap());
+    assert_eq!(fixture.keys(), ["your-mix", "discovery"]);
+    assert!(none_by(&fixture.station("your-mix"), "Old Starter"));
+    assert!(
+        fixture.state.get_user("alice").last_refresh_error.is_none(),
+        "nothing is kept any more"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_chart_that_answered_is_made_though_another_tag_did_not() {
+    let fixture = Fixture::new(
+        LastFmSettings {
+            api_key: "key".into(),
+            enable_personalized_stations: false,
+            discovery_stations: vec![DiscoveryStationSettings {
+                id: "rock".into(),
+                name: "Rock".into(),
+                tags: vec!["rock".into(), "pop".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        last_fm(|query| {
+            (method(query) == "tag.gettoptracks" && query.get("tag").map(String::as_str) == Some("pop"))
+                .then(|| status(500, ""))
+        }),
+    )
+    .await;
+    record_listening(&fixture.state);
+    fixture.state.replace_stations(
+        "alice",
+        &[saved(
+            "pinned-rock",
+            "Rock",
+            LastFmRadioStationKind::Pinned,
+            "Old Pinned",
+        )],
+    );
+    assert!(fixture.refresh().await.unwrap());
+    assert!(none_by(&fixture.station("pinned-rock"), "Old Pinned"));
+}
+
+#[tokio::test]
+async fn a_genre_last_fm_answered_with_too_little_is_not_put_back_by_the_fill() {
+    let fixture = Fixture::new(
+        learned(),
+        last_fm(|query| match method(query) {
+            // One artist's tags do not answer, so the ranking is not whole.
+            "artist.gettoptags" if query.get("artist").map(String::as_str) == Some("Artist C") => {
+                Some(status(500, ""))
+            }
+            "artist.gettoptags" => Some(status(200, r#"{"toptags":{"tag":[{"name":"rock"}]}}"#)),
+            // Rock answers with three artists: too few for a station.
+            "tag.gettoptracks" => Some(status(
+                200,
+                &json!({"tracks": {"track": (0..3).map(|index| json!({
+                    "name": format!("rock-{index}"), "duration": 180000,
+                    "artist": {"name": format!("Rock Artist {index}")}
+                })).collect::<Vec<_>>()}})
+                .to_string(),
+            )),
+            _ => None,
+        }),
+    )
+    .await;
+    record_listening(&fixture.state);
+    fixture.state.replace_stations("alice", &everything_saved());
+    assert!(fixture.refresh().await.unwrap());
+    let keys = fixture.keys();
+    assert!(!keys.contains(&genre_station("rock")), "{keys:?}");
+    assert!(keys.contains(&genre_station("jazz")), "{keys:?}");
 }
 
 #[tokio::test]
