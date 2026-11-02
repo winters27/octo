@@ -1053,6 +1053,55 @@ async fn a_rescan_linking_a_copy_octo_placed_never_makes_the_follow_step_aside()
     );
 }
 
+/// The only music of an artist in Lidarr is a copy Octo placed while a follow of the artist is
+/// open, linked by a rescan and lying in the artist's folder: the artist has no music of the
+/// user's, so a pick may still use Lidarr for it. Once that follow is over, the copy is music of
+/// the library like any other, and Lidarr is left alone.
+#[tokio::test]
+async fn a_copy_octo_placed_during_an_open_follow_is_not_the_artists_music() {
+    let f = Fixture::new().await;
+    f.lidarr.user_album(ALBUM_ID, false);
+    let service = f.service(None, 1);
+    f.pending.remember(PendingAlbum {
+        foreign_album_id: ALBUM_ID.into(),
+        artist: "Massive Attack".into(),
+        title: "Mezzanine".into(),
+        search_command: 3,
+        ..Default::default()
+    });
+    let copy = f.lidarr.place_file(
+        "/data/music/Massive Attack/Mezzanine/03 - Teardrop.m4a",
+        b"the version alice heard",
+    );
+    f.lidarr
+        .queue_command("RescanFolders", serde_json::json!({}), "manual");
+    f.pending
+        .placed_copy(&copy.to_string_lossy(), &[ALBUM_ID.to_string()], None);
+    let artist = service.artist_music().read(ARTIST_ID).await.expect("Lidarr answers");
+    let artist_id = artist.artist.as_ref().expect("Lidarr has the artist").id;
+    assert_eq!(
+        f.client()
+            .artist_track_files(artist_id)
+            .await
+            .expect("Lidarr answers")
+            .len(),
+        1,
+        "the rescan linked the copy"
+    );
+    assert!(!artist.has_music, "Octo's own copy is not the user's music");
+
+    f.pending.forget(ALBUM_ID);
+    assert!(
+        service
+            .artist_music()
+            .read(ARTIST_ID)
+            .await
+            .expect("Lidarr answers")
+            .has_music,
+        "once the follow is over it is music of the library"
+    );
+}
+
 /// Octo's download was its client's only item and is gone from the client: Lidarr gives no proof
 /// it is gone, so the follow keeps reading, nothing is put back or deleted, and the Lidarr card
 /// lists it as a follow Octo cannot settle. The admin's "Put Lidarr back" counts the download
