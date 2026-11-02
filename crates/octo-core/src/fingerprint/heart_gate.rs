@@ -75,8 +75,8 @@ pub enum WaitingFor {
     LidarrIndexers,
     /// AcoustID has not answered for the heard sample or for a held file.
     AcoustId,
-    /// AcoustID is off and the catalog's clip could not settle what played; the person may keep
-    /// the heard audio anyway.
+    /// AcoustID is off (or could not settle what played) and the catalog's clip could not settle
+    /// it either; the person may keep the heard audio anyway.
     AcoustIdOff,
     /// Deezer has not answered for the catalog's clip.
     Deezer,
@@ -273,6 +273,17 @@ pub enum ClipReading {
     NoClip,
     /// Deezer or the shim did not answer; the heart holds for it.
     Busy(WaitingFor),
+    /// `fpcalc` could not print the clip or the heard audio, so nothing is known of what played:
+    /// the heart holds under [`ClipReading::UNPRINTED_WAITS_FOR`], whose wake-ups (Octo's next
+    /// start, the song's next play) run the check again.
+    Unprinted,
+}
+
+impl ClipReading {
+    /// What a heart holds under when `fpcalc` could not print for its clip check: Deezer's wait,
+    /// whose holds run again at Octo's next start, at the song's next play, and when Deezer
+    /// answers again after a call it did not answer.
+    pub const UNPRINTED_WAITS_FOR: WaitingFor = WaitingFor::Deezer;
 }
 
 /// The heard-master check's verdict on one file: whether it is the very master that played.
@@ -812,6 +823,7 @@ impl HeartGate {
         match &self.reading {
             HeardReading::Busy => return hold(WaitingFor::AcoustId),
             HeardReading::Clip(ClipReading::Busy(wait)) => return hold(*wait),
+            HeardReading::Clip(ClipReading::Unprinted) => return hold(ClipReading::UNPRINTED_WAITS_FOR),
             HeardReading::Clip(
                 ClipReading::AnotherSongOrTake | ClipReading::Unclear | ClipReading::NoClip,
             ) => {

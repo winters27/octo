@@ -41,6 +41,12 @@ pub const ANOTHER_SONG_PLAYED: &str =
 pub const ANOTHER_SONG_OR_TAKE: &str = "Octo played another song or another take for this one";
 /// The downloads line of a heart nobody played.
 pub const NEVER_PLAYED: &str = "Play it once so Octo can keep the version you hear";
+/// The downloads line of a heart whose clip check `fpcalc` could not print for: the check runs
+/// again at the song's next play (and Octo's next start).
+pub const SOUND_NOT_READ: &str = "Octo could not read the sound to check it; it tries again at the next play";
+/// The downloads line of a heart that AcoustID, switched on, could not settle, and the catalog's
+/// clip could not either: what played is not known, and the person may keep it anyway.
+pub const COULD_NOT_TELL: &str = "Octo could not tell what played from its sound";
 
 /// The most facts one file's judgement asks for before it settles: a bound, never reached by a
 /// gate that asks each fact once.
@@ -289,13 +295,20 @@ impl DownloadVerificationService {
                         }
                         hold(gate, WaitingFor::AcoustIdOff, ANOTHER_SONG_OR_TAKE, None)
                     }
-                    ClipReading::Unclear | ClipReading::NoClip => hold(
-                        gate,
-                        WaitingFor::AcoustIdOff,
-                        waiting_line(WaitingFor::AcoustIdOff),
-                        None,
-                    ),
+                    // Keep anyway is offered either way; the line says AcoustID is off only when
+                    // it is.
+                    ClipReading::Unclear | ClipReading::NoClip => {
+                        let line = if matches!(outcome, AcoustIdOutcome::Off) {
+                            waiting_line(WaitingFor::AcoustIdOff)
+                        } else {
+                            COULD_NOT_TELL
+                        };
+                        hold(gate, WaitingFor::AcoustIdOff, line, None)
+                    }
                     ClipReading::Busy(waiting) => hold(gate, waiting, waiting_line(waiting), None),
+                    ClipReading::Unprinted => {
+                        hold(gate, ClipReading::UNPRINTED_WAITS_FOR, SOUND_NOT_READ, None)
+                    }
                 }
             }
             HeardAnswerReading::AnotherSong => {

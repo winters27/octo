@@ -372,8 +372,9 @@ async fn the_recording_that_played_becomes_r() {
 }
 
 /// A heard sample AcoustID answers with code 3 cannot be read by its sound: the catalog's clip
-/// decides instead, and with no clip the heart holds for AcoustID being off, with Keep anyway's
-/// line. The same request is never sent again.
+/// decides instead, and with no clip the heart holds as AcoustID being off does, offering Keep
+/// anyway, but saying what is true with AcoustID on: Octo could not tell what played. The same
+/// request is never sent again.
 #[tokio::test]
 async fn a_heard_sample_answered_with_code_3_runs_the_clip_check() {
     let heart = heart(Duration::from_millis(10), None).await;
@@ -392,13 +393,37 @@ async fn a_heard_sample_answered_with_code_3_runs_the_clip_check() {
     .await;
     assert_eq!(
         waits(&built),
-        Some((
-            WaitingFor::AcoustIdOff,
-            "AcoustID is off, so Octo cannot check what played".to_string()
-        ))
+        Some((WaitingFor::AcoustIdOff, COULD_NOT_TELL.to_string()))
     );
     assert_eq!(gate_of(built).reading, HeardReading::Clip(ClipReading::NoClip));
     assert_eq!(lookups(&heart).await, 1);
+}
+
+/// AcoustID on, and its heard answer names another song too faintly to believe (one submission):
+/// the catalog's clip decides, and with no clip the heart holds with Keep anyway, saying Octo
+/// could not tell what played, never that AcoustID is off.
+#[tokio::test]
+async fn a_faint_other_song_the_clip_cannot_settle_holds_saying_octo_could_not_tell() {
+    let heart = heart(Duration::from_millis(10), None).await;
+    acoust_id_answers(
+        &heart,
+        ok(r#"{"status":"ok","results":[{"id":"fp","score":0.97,"recordings":[
+            {"id":"wonderwall","title":"Wonderwall","artists":[{"id":"oasis","name":"Oasis"}],"duration":258,"sources":1}]}]}"#),
+    )
+    .await;
+    let id = heart.rig.registry.register(help(Some(139)));
+    let built = build(
+        &heart,
+        &id,
+        AcquisitionOrigin::Heart,
+        Some(heard_help(&heart, false)),
+    )
+    .await;
+    assert_eq!(
+        waits(&built),
+        Some((WaitingFor::AcoustIdOff, COULD_NOT_TELL.to_string()))
+    );
+    assert_eq!(gate_of(built).reading, HeardReading::Clip(ClipReading::NoClip));
 }
 
 /// A heard lookup is never sent with a guessed or zero length: with no length known and a stored

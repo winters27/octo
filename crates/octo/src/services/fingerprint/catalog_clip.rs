@@ -167,10 +167,9 @@ impl CatalogClip {
             // The clip's audio goes as soon as it is printed.
             drop(file);
             // fpcalc failing here says nothing of the clip: the heart holds, and the check runs
-            // again on Octo's next start, the next play or heart of the song, or Deezer's next
-            // answer.
+            // again on Octo's next start or the next play or heart of the song.
             let Some(items) = printed else {
-                return ClipReading::Busy(WaitingFor::Deezer);
+                return ClipReading::Unprinted;
             };
             prints.clip = Some(items);
         }
@@ -331,7 +330,7 @@ impl CatalogClip {
             }
             WholePrint::Busy => Err(ClipReading::Busy(WaitingFor::Shim)),
             // fpcalc could not print the heard audio: the check runs again later, as for a clip.
-            WholePrint::NotPrinted => Err(ClipReading::Busy(WaitingFor::Deezer)),
+            WholePrint::NotPrinted => Err(ClipReading::Unprinted),
             // The heard audio is gone: what is stored is all there is, and it cannot say
             // another song.
             WholePrint::Gone => match stored {

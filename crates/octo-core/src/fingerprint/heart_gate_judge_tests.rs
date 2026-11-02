@@ -660,6 +660,12 @@ fn with_acoustid_off_the_clip_decides_whether_a0_and_a2_run() {
             GateVerdict::Hold(wait)
         );
     }
+    // A clip check fpcalc could not print for knows nothing of what played: the file waits with
+    // the heart, never kept and never refused.
+    let unprinted = gate(HeardReading::Clip(ClipReading::Unprinted));
+    let (verdict, asked) = settle(&unprinted, identical.clone(), None);
+    assert_eq!(verdict, GateVerdict::Hold(ClipReading::UNPRINTED_WAITS_FOR));
+    assert!(asked.is_empty());
 }
 
 /// Once the heard answer is read, a file whose own lookup is busy is kept when it is the heard

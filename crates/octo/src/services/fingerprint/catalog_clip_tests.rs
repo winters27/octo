@@ -471,8 +471,9 @@ async fn an_old_shim_holds_for_the_shim_and_a_gone_video_reads_unclear() {
     );
 }
 
-/// A clip fpcalc could not print says nothing of the song: the heart holds, and runs the check
-/// again later, never reading "no clip" (which holds with Keep anyway for good).
+/// A clip fpcalc could not print says nothing of the song: it reads as unprinted, so the heart
+/// holds and runs the check again later, never reading "no clip" (which holds with Keep anyway for
+/// good) nor waiting for a Deezer that answered.
 #[tokio::test]
 async fn a_clip_fpcalc_could_not_print_holds_rather_than_reading_no_clip() {
     let s = setup().await;
@@ -484,7 +485,7 @@ async fn a_clip_fpcalc_could_not_print_holds_rather_than_reading_no_clip() {
     let mut prints = ClipPrints::default();
     assert_eq!(
         s.clip.read(&help(), &heard, &mut prints).await,
-        ClipReading::Busy(WaitingFor::Deezer)
+        ClipReading::Unprinted
     );
     assert_eq!(prints.clip, None, "nothing is kept of a clip never printed");
 }

@@ -792,6 +792,41 @@ async fn with_acoust_id_off_walrus_2023_on_another_channel_holds() {
     assert_eq!(gate_of(built).reading, HeardReading::Clip(ClipReading::Unclear));
 }
 
+/// With AcoustID off, a catalog clip fpcalc cannot print says nothing of what played: the heart
+/// holds under the wait whose wake-ups run the check again (Octo's next start, the song's next
+/// play), saying Octo could not read the sound, never that it waits for a Deezer that answered.
+#[tokio::test]
+async fn with_acoust_id_off_a_clip_fpcalc_cannot_print_holds_saying_the_sound_was_not_read() {
+    let rig = gate_rig(GateSetup {
+        acoust_id_off: true,
+        music_brainz: false,
+        ..Default::default()
+    })
+    .await;
+    let id = rig.rig.registry.register(help(Some(139), Some(HELP_CODE)));
+    let preview = format!("{}/clip/unprintable.mp3?hdnea=exp=1~hmac=x", rig.shim.uri());
+    Mock::given(path(format!("/track/isrc:{HELP_CODE}")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            format!(
+                r#"{{"id":116,"title":"Help! (Remastered 2009)","duration":139,"isrc":"{HELP_CODE}","preview":"{preview}","artist":{{"id":1,"name":"The Beatles"}},"album":{{"id":9,"title":"x"}}}}"#
+            ),
+            "application/json",
+        ))
+        .mount(&rig.shim)
+        .await;
+    Mock::given(path("/clip/unprintable.mp3"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(b"ab".to_vec(), "audio/mpeg"))
+        .mount(&rig.shim)
+        .await;
+    let record = heard_with(&rig, VIDEO, frozen_print("help-2009-240"), true, "heard");
+    let built = build(&rig, &id, Some(record)).await;
+    assert_eq!(
+        waits(&built),
+        Some((ClipReading::UNPRINTED_WAITS_FOR, SOUND_NOT_READ.to_string()))
+    );
+    assert_eq!(gate_of(built).reading, HeardReading::Clip(ClipReading::Unprinted));
+}
+
 /// With AcoustID off, a Mrs. Robinson stream for a Help! row reads "another song or another take":
 /// that video is refused for this heart only (a live take would read the same), never for every
 /// user, and the heart holds with its line.
