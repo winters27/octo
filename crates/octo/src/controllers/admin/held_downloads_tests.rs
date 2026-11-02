@@ -387,8 +387,21 @@ async fn the_rows_say_who_may_keep_and_the_dashboard_keeps_for_the_person_it_nam
     dash.record_who_asked(true);
     assert_eq!(labels(&dash.holders("soulseek:help").await["keepers"]), ["alice"]);
 
+    // A held track's download log offers what its holds offer now.
+    let log_row = || async {
+        dash.get("admin", "/api/admin/downloads/log?key=soulseek:night")
+            .await
+            .json()["row"]
+            .clone()
+    };
+    assert_eq!(log_row().await["keepAnyway"], true);
+
     let album = keep(json!({ "key": "soulseek:help-album", "user": "alice" })).await;
     assert_eq!(album.status, StatusCode::OK, "{}", album.text());
+    assert!(
+        log_row().await.get("keepAnyway").is_none(),
+        "the keep is asked, so the log's row offers it no more"
+    );
     assert_eq!(
         dash.state
             .soulseek_holds
