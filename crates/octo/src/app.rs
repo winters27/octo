@@ -1308,6 +1308,7 @@ impl Acquisition {
             pool: navidrome.family_pool_service.clone(),
             metadata: music_metadata.clone(),
         });
+        lidarr_hearts.use_keeper(heart_acquisition_coordinator.member_keeper());
         let song_finder = Arc::new(SongFinder::new(SongFinderServices {
             settings: Some(settings.clone()),
             upgrade_queue: Some(upgrade_queue.clone()),

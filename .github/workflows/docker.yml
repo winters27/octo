@@ -241,8 +241,11 @@ jobs:
       # own still checks downloads by their sound. A release tag reuses main's images, so every
       # octo image built here needs it: without the secret the build stops here (and the
       # Dockerfile's OCTO_REQUIRE_ACOUSTID_KEY stops it again), never publishing an image without
-      # it. The key itself is never printed.
+      # it. The key itself is never printed and never a build argument: it reaches the build only
+      # as the build secret acoustid_key. Its SHA-256 (not the key) is a build argument, so a
+      # rotated key builds the server again instead of reusing a cached build.
       - name: Octo's own AcoustID key is set
+        id: acoustid
         if: matrix.image.name == 'octo'
         env:
           OCTO_ACOUSTID_APPLICATION_KEY: ${{ secrets.OCTO_ACOUSTID_APPLICATION_KEY }}
@@ -251,6 +254,7 @@ jobs:
             echo "::error::The OCTO_ACOUSTID_APPLICATION_KEY secret is empty. The octo image carries Octo's own AcoustID key; set the secret (gh secret set OCTO_ACOUSTID_APPLICATION_KEY) and run this again."
             exit 1
           fi
+          echo "arg=OCTO_ACOUSTID_KEY_SHA256=$(printf '%s' "$OCTO_ACOUSTID_APPLICATION_KEY" | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -281,8 +285,14 @@ jobs:
           build-args: |
             ${{ matrix.image.build_args }}
             ${{ steps.ytdlp.outputs.arg }}
-            ${{ matrix.image.name == 'octo' && format('OCTO_ACOUSTID_APPLICATION_KEY={0}', secrets.OCTO_ACOUSTID_APPLICATION_KEY) || '' }}
+            ${{ steps.acoustid.outputs.arg }}
             ${{ matrix.image.name == 'octo' && 'OCTO_REQUIRE_ACOUSTID_KEY=1' || '' }}
+          # Octo's own AcoustID key, as a build secret only the server's build step mounts: never
+          # in a build argument, a layer, the image's history or its provenance.
+          secrets: |
+            ${{ matrix.image.name == 'octo' && format('acoustid_key={0}', secrets.OCTO_ACOUSTID_APPLICATION_KEY) || '' }}
+          # Build arguments stay out of the published provenance.
+          provenance: mode=min
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image.suffix }},push-by-digest=true,name-canonical=true,push=true
           # A scope per image and platform, so the builds running side by side never fight
           # over the same cache entries.

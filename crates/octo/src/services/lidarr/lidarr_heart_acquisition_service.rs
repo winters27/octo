@@ -31,7 +31,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use super::lidarr_pending_albums::{FollowEnd, HELD_FOR_LIDARR, SongGate, StopWaiting, UnsettledFollow};
+use super::lidarr_pending_albums::{
+    FollowEnd, HELD_FOR_LIDARR, OwnCopy, SongGate, StopWaiting, UnsettledFollow,
+};
 use super::lidarr_pick::{
     ALREADY_LOOKING, LidarrArtistMusic, delete_moved_record, put_back_unsearched,
     put_back_unsearched_after_restart, users_queue_item, wait_for_rescans,
@@ -171,6 +173,46 @@ pub trait ILidarrHeartAcquisitionService: Send + Sync {
     fn put_lidarr_back(&self, _follow: &str) -> bool {
         false
     }
+
+    /// Gives the service what lands a kept copy in a family member's own library, for their stop
+    /// waiting with Family on. Once only; a second call changes nothing.
+    fn use_keeper(&self, _keeper: Arc<dyn OwnLibraryKeeper>) {}
+}
+
+/// Lands a kept copy in one person's own family library.
+#[async_trait]
+pub trait OwnLibraryKeeper: Send + Sync {
+    /// Whether `user`'s downloads land in their own library: Family is on and they are a member.
+    fn own_library(&self, user: &str) -> bool;
+
+    /// Lands `file` as the song `provider:external_id` for `user` alone, in their own library;
+    /// whether it landed. The file is the keeper's from then on.
+    async fn keep_for(&self, provider: &str, external_id: &str, file: &str, user: &str) -> bool;
+}
+
+/// A copy of a held file beside it for one person, named apart from it.
+fn copy_beside(held_path: &str, user: &str) -> std::io::Result<String> {
+    let held = Path::new(held_path);
+    let folder = held.parent().unwrap_or_else(|| Path::new("."));
+    let stem = held
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let extension = held
+        .extension()
+        .map(|extension| format!(".{}", extension.to_string_lossy()))
+        .unwrap_or_default();
+    let mark: String = user
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let copy = folder.join(format!(
+        "{stem}-{mark}-{}{extension}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::copy(held, &copy)?;
+    Ok(copy.to_string_lossy().into_owned())
 }
 
 /// What Lidarr's webhook says it imported.
@@ -316,6 +358,8 @@ struct Inner {
     restart: Arc<tokio::sync::RwLock<()>>,
     /// The service itself, for work it starts on its own.
     me: OnceLock<std::sync::Weak<Inner>>,
+    /// Lands a kept copy in a family member's own library.
+    keeper: OnceLock<Arc<dyn OwnLibraryKeeper>>,
 
     /// By foreign album id, ignoring case.
     jobs: Mutex<HashMap<String, Arc<AlbumJob>>>,
@@ -984,6 +1028,7 @@ impl LidarrHeartAcquisitionService {
             put_backs: PutBacks::default(),
             restart: Arc::new(tokio::sync::RwLock::new(())),
             me: OnceLock::new(),
+            keeper: OnceLock::new(),
             jobs: Mutex::new(HashMap::new()),
             timing: Mutex::new(Timing {
                 poll_override: None,
@@ -1178,6 +1223,10 @@ impl ILidarrHeartAcquisitionService for LidarrHeartAcquisitionService {
         info!("The admin put Lidarr back for {follow}: the downloads Octo cannot see count as gone");
         self.inner.ensure_following(follow);
         true
+    }
+
+    fn use_keeper(&self, keeper: Arc<dyn OwnLibraryKeeper>) {
+        let _ = self.inner.keeper.set(keeper);
     }
 
     async fn try_acquire_album(
@@ -1979,12 +2028,20 @@ impl Inner {
                 let Some(entry) = self.pending.get(&key) else {
                     continue;
                 };
-                if follow::lidarr_moved(&entry, &settings) == follow::LidarrMoved::Swapped {
-                    info!(
-                        "Octo let go of Lidarr's album {key}: the Lidarr it was asked of is no longer Octo's"
-                    );
-                    self.pending.forget(&key);
-                    continue;
+                match self.lidarr_now(&entry, &settings).await {
+                    Ok(follow::LidarrMoved::Swapped) => {
+                        info!(
+                            "Octo let go of Lidarr's album {key}: the Lidarr it was asked of is no longer Octo's"
+                        );
+                        self.pending.forget(&key);
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Could not read Octo's Lidarr for the put back of {key} yet: {e}");
+                        self.put_backs.owed.lock().insert(key);
+                        continue;
+                    }
                 }
                 if !entry.searched() {
                     match put_back_unsearched(&self.client, Some(self.pending.as_ref()), &entry, poll).await {
@@ -2033,6 +2090,17 @@ impl Inner {
             self.owe_put_back(&key);
         }
         self.sweep_hold_folders();
+        self.sweep_placed_links();
+        // A stop's copy whose song's proven Lidarr file landed before a restart cut its placing
+        // short gives way; a copy Lidarr replaced that could not come back yet is tried again.
+        for held in self.pending.owed_drops() {
+            if let Some(downloads) = &self.downloads
+                && !downloads.drop_held(&held, &held.users).await
+            {
+                warn!("The kept copy {} could not give way", held.held_path);
+            }
+        }
+        self.restore_replaced(None, None).await;
         for held in self.pending.release_unfollowed() {
             self.place_held(held, FollowEnd::Done).await;
         }
@@ -2215,7 +2283,16 @@ impl Inner {
                 artists_before,
             });
         }
-        self.save(&entry);
+        // On disk before anything is sent: a save that fails sends nothing, and an entry this pick
+        // made goes again.
+        let listed_before = self.pending.get(&key).is_some();
+        if let Err(e) = self.pending.remember_now(entry.clone()).await {
+            warn!("{e}");
+            if !listed_before {
+                self.pending.forget(&key);
+            }
+            return Err(e);
+        }
 
         let prepared = self
             .prepare_saved(job, settings, &mut entry, existing, &music)
@@ -2226,10 +2303,13 @@ impl Inner {
             Err(_) => false,
         };
         let saved = self.pending.get(&key).unwrap_or(entry);
-        // The search or the grab may have reached Lidarr with no answer back in time: what it
-        // started is followed, never put back as unsearched under it. A refusal Lidarr answered
-        // started nothing.
-        let unanswered = matches!(prepared, Err(LidarrError::Canceled(_)));
+        // The search or the grab may have reached Lidarr with no answer back in time, or with
+        // its connection dropped once sent: what it started is followed, never put back as
+        // unsearched under it. A refusal Lidarr answered started nothing.
+        let unanswered = matches!(
+            prepared,
+            Err(LidarrError::Canceled(_) | LidarrError::MaybeSent(_))
+        );
         if unanswered && saved.search_pending.is_some() && saved.lidarr_album_id > 0 {
             warn!("Lidarr did not answer Octo's search of {key}; Octo follows whatever it started");
             return Ok(Prepared::Searched {
@@ -2301,7 +2381,7 @@ impl Inner {
             let before = album.release_choice();
             entry.release_choice = Some(before.clone());
             entry.pin = Some(pin.clone());
-            self.save(entry);
+            self.pending.remember_now(entry.clone()).await?;
             // Pinned only while the choice is still the one just read: a change the user made
             // meanwhile is never written over, and the pick steps out.
             let pinned = self
@@ -2320,9 +2400,10 @@ impl Inner {
             }
         }
 
-        // Lidarr's time is saved before the search or the grab goes out, so a restart before its
-        // answer is saved still follows what it started. A release picked in Find songs is grabbed
-        // as it is: its grab is Octo's by its guid, saved before each grab is sent.
+        // Lidarr's time is saved, on disk, before the search or the grab goes out, so a restart
+        // before its answer is saved still follows what it started. A release picked in Find
+        // songs is grabbed as it is: its grab is Octo's by its guid, every guid sent saved on disk
+        // before its grab is sent.
         let pending_at = self.client.now().await?;
         entry.search_pending = Some(pending_at);
         let key = entry.foreign_album_id.clone();
@@ -2330,12 +2411,18 @@ impl Inner {
         match release {
             Some(pick) => {
                 entry.picked_guid = Some(pick.guid.clone());
-                self.save(entry);
+                self.pending.remember_now(entry.clone()).await?;
+                let pending = self.pending.clone();
                 let guid = self
                     .client
                     .grab_picked_saving(album_id, &pick, |guid| {
-                        self.pending
-                            .update(&key, |saved| saved.picked_guid = Some(guid.to_string()));
+                        let (pending, key) = (pending.clone(), key.clone());
+                        async move {
+                            pending
+                                .update_now(&key, |saved| saved.pick_sent(&guid))
+                                .await
+                                .map(|_| ())
+                        }
                     })
                     .await?;
                 entry.picked_guid = Some(guid.clone());
@@ -2346,7 +2433,7 @@ impl Inner {
                 });
             }
             None => {
-                self.save(entry);
+                self.pending.remember_now(entry.clone()).await?;
                 let command = self.client.album_search(album_id).await?;
                 entry.search_command = command.id;
                 entry.searched_at = Some(command.queued.unwrap_or(pending_at));
@@ -2361,14 +2448,29 @@ impl Inner {
     }
 
     /// The artist and the album read again right before the pin and the search: any track
-    /// file of the artist (one a rescan linked included) leaves Lidarr alone; a monitored album is
+    /// file of the artist (one a rescan linked included) leaves Lidarr alone, except a copy Octo
+    /// placed during a follow still listed, which is never the user's music; a monitored album is
     /// the user's; a queue item of the user's keeps Octo out. The album as it stands otherwise.
     async fn read_again(
         &self,
         album_id: i32,
         artist_id: i32,
     ) -> Result<Result<LidarrAlbum, Option<&'static str>>, LidarrError> {
-        if !self.client.artist_track_files(artist_id).await?.is_empty() {
+        let root = self.settings.current().lidarr.root_folder_path.clone();
+        let octo_root = self.music.octo_root();
+        let users_file = |path: Option<&str>| {
+            !path.is_some_and(|path| {
+                translate_imported_path(path, root.as_deref(), &octo_root)
+                    .is_ok_and(|local| self.pending.is_octos_copy(&local))
+            })
+        };
+        if self
+            .client
+            .artist_track_files(artist_id)
+            .await?
+            .iter()
+            .any(|file| users_file(file.path.as_deref()))
+        {
             return Ok(Err(Some(LIDARR_LEFT_ALONE)));
         }
         let Some(album) = self.client.album(album_id).await? else {
@@ -2884,35 +2986,117 @@ impl Inner {
         );
     }
 
-    /// `user` stopped waiting for Lidarr on the song: their kept copy is placed now, and they leave
-    /// the waits of every follow it waited for. A follow anyone else's heart still waits on goes on;
-    /// one nobody's is on any more ends, its follow (running or started again for it) removing
-    /// Octo's downloads.
+    /// `user` stopped waiting for Lidarr on the song, and they leave the waits of every follow its
+    /// kept copy waited for. In the shared library the copy is placed now for everyone it was kept
+    /// for; with Family on and a library of their own, a copy of it lands there for them alone
+    /// (the file itself when nobody else waits on it) and the original stays held for the others.
+    /// A follow anyone else's heart still waits on goes on; one nobody's is on any more ends, its
+    /// follow (running or started again for it) removing Octo's downloads.
     async fn stop_waiting(self: &Arc<Self>, provider: &str, external_id: &str, user: &str) -> StopWaiting {
         let song = format!("{provider}:{external_id}");
-        let (copies, ending) = self.pending.stop_waiting(&song, user);
-        if copies.is_empty() {
+        let keeper = self.keeper.get().cloned();
+        let own_library = keeper.as_ref().is_some_and(|keeper| keeper.own_library(user));
+        let stopped = self.pending.stop_waiting(&song, user, own_library);
+        if stopped.is_empty() {
             return StopWaiting::NothingWaits;
         }
-        for follow in copies.iter().flat_map(|held| held.follows.iter()) {
+        for follow in stopped.follows() {
             let job = self
                 .jobs
                 .lock()
-                .get(&dotnet::ordinal_ignore_case_key(follow))
+                .get(&dotnet::ordinal_ignore_case_key(&follow))
                 .cloned();
             if let Some(job) = job {
                 job.stopped_waiting(&song, user);
             }
         }
-        for held in copies {
+        for held in stopped.place {
             info!("{user} stopped waiting for Lidarr: the kept copy of {song} is placed");
             self.place_held(held, FollowEnd::Stopped).await;
         }
-        for follow in ending {
+        for own in stopped.own {
+            self.keep_in_own_library(keeper.as_deref(), own, provider, external_id, user)
+                .await;
+        }
+        for follow in stopped.ending {
             info!("Nobody waits for Lidarr on {follow} any more; Octo stops following it");
             self.ensure_following(&follow);
         }
         StopWaiting::Stopped
+    }
+
+    /// One kept copy lands in `user`'s own library: a copy of the held file while it stays held
+    /// for others, else the file itself. One that cannot land waits for the follow again.
+    async fn keep_in_own_library(
+        &self,
+        keeper: Option<&dyn OwnLibraryKeeper>,
+        own: OwnCopy,
+        provider: &str,
+        external_id: &str,
+        user: &str,
+    ) {
+        let held = own.held;
+        let file = if own.copy {
+            match copy_beside(&held.held_path, user) {
+                Ok(copy) => Some(copy),
+                Err(e) => {
+                    warn!(
+                        "Could not copy the kept {} for {user}'s own library: {e}",
+                        held.held_path
+                    );
+                    None
+                }
+            }
+        } else {
+            Some(held.held_path.clone())
+        };
+        let landed = match (keeper, &file) {
+            (Some(keeper), Some(file)) => keeper.keep_for(provider, external_id, file, user).await,
+            _ => false,
+        };
+        if landed {
+            info!(
+                "{user} stopped waiting for Lidarr: the kept copy of {provider}:{external_id} lands in their own library"
+            );
+        } else {
+            warn!(
+                "The kept copy of {provider}:{external_id} could not land in {user}'s own library; it waits for Lidarr again"
+            );
+            if own.copy {
+                if let Some(copy) = &file {
+                    let _ = std::fs::remove_file(copy);
+                }
+                // They wait on the original with the others again.
+                if let Some(mut original) = self
+                    .pending
+                    .held()
+                    .into_iter()
+                    .find(|known| known.held_path == held.held_path)
+                {
+                    original
+                        .own_copies
+                        .retain(|known| !dotnet::eq_ignore_case(known.trim(), user.trim()));
+                    original.users.push(user.trim().to_string());
+                    self.pending.hold_placement(original);
+                }
+            } else {
+                self.pending.hold_placement(held.clone());
+            }
+        }
+        // The row says it waits while another copy of the song still waits, for those it waits
+        // for; else it says its own line again.
+        if let Some(tracker) = &self.tracker {
+            let waiting = self.pending.kept_copies_waiting(&held.song);
+            if waiting.is_empty() {
+                tracker.end_aside(provider, external_id, None);
+            } else {
+                let users: Vec<String> = waiting
+                    .iter()
+                    .flat_map(|copy| copy.users.iter().cloned())
+                    .collect();
+                tracker.wait_aside(provider, external_id, &users, HELD_FOR_LIDARR);
+            }
+        }
     }
 
     async fn try_acquire(

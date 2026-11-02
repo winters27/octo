@@ -418,6 +418,9 @@ pub struct HeartAcquisitionCoordinator {
     // The holds woken again while they ran (a joiner, a new heard source, an answer): each runs
     // once more when its run ends, so no wake is lost.
     again: Mutex<HashSet<String>>,
+    // The holds whose MusicBrainz question was given up on, each with its song's provider and id:
+    // the run that serves that wake says so on the song's row, by what its last pass came to.
+    gave_up: Mutex<std::collections::HashMap<String, (String, String)>>,
 
     // Told each time a hold's run lets go of it, so a recheck that found one going waits for it.
     run_ended: tokio::sync::Notify,
@@ -476,6 +479,7 @@ impl HeartAcquisitionCoordinator {
             resuming: Mutex::new(HashSet::new()),
             again: Mutex::new(HashSet::new()),
             run_ended: tokio::sync::Notify::new(),
+            gave_up: Mutex::new(std::collections::HashMap::new()),
             deezer_waits: Mutex::new(HashSet::new()),
             deezer_turn: Mutex::new(None),
             deezer_seen: Mutex::new(HashMap::new()),
@@ -1890,6 +1894,7 @@ impl HeartAcquisitionCoordinator {
                 self.again.lock().remove(key);
                 self.release_run(key);
                 self.deezer_turn_ended(key);
+                self.tell_gave_up(key);
                 return;
             };
             // This run serves every wake that came before it.
@@ -1913,6 +1918,7 @@ impl HeartAcquisitionCoordinator {
             };
             if !rerun {
                 self.deezer_turn_ended(key);
+                self.tell_gave_up(key);
                 return;
             }
             debug!("Held {key} was woken while it ran; it runs again");
@@ -3256,27 +3262,38 @@ impl HeartAcquisitionCoordinator {
         );
     }
 
-    /// MusicBrainz gave up on the question a hold waited on: the hold runs again, and when the
-    /// heart ends with nothing (nothing landed, and nothing of the song is held any more) its row
-    /// says MusicBrainz could not answer for it.
+    /// MusicBrainz gave up on the question a hold waited on: the hold runs again (or once more,
+    /// when it runs now), and the last pass of that run says on the song's row that MusicBrainz
+    /// could not answer for it when the heart ended with nothing.
     fn resume_after_gave_up(self: &Arc<Self>, key: &str) {
         let Some(record) = self.extras.holds.as_ref().and_then(|holds| holds.get(key)) else {
             return;
         };
-        let coordinator = Arc::clone(self);
-        let key = key.to_string();
-        tokio::spawn(async move {
-            coordinator.recheck_held(&key).await;
-            let song = track_base_key(&record.provider, &record.external_id);
-            let held = coordinator
-                .extras
-                .holds
-                .as_ref()
-                .is_some_and(|holds| !holds.records_for(&song).is_empty());
-            if !held && let Some(tracker) = coordinator.tracker() {
-                tracker.ended_with_nothing(&record.provider, &record.external_id, MUSIC_BRAINZ_GAVE_UP);
-            }
-        });
+        self.gave_up
+            .lock()
+            .insert(key.to_string(), (record.provider, record.external_id));
+        self.resume_held(key);
+    }
+
+    /// The claimed run of the hold `key` ended its last pass: when MusicBrainz gave up on the
+    /// question it waited on, its song's row says so if the heart ended with nothing (the hold is
+    /// over and nothing of the song is held any more; a row whose file landed keeps its line).
+    fn tell_gave_up(&self, key: &str) {
+        let Some((provider, external_id)) = self.gave_up.lock().remove(key) else {
+            return;
+        };
+        let holds = self.extras.holds.as_ref();
+        let waits = holds
+            .and_then(|holds| holds.get(key))
+            .is_some_and(|record| record.waiting_for.is_some());
+        let song = track_base_key(&provider, &external_id);
+        let held = holds.is_some_and(|holds| !holds.records_for(&song).is_empty());
+        if !waits
+            && !held
+            && let Some(tracker) = self.tracker()
+        {
+            tracker.ended_with_nothing(&provider, &external_id, MUSIC_BRAINZ_GAVE_UP);
+        }
     }
 
     /// The download held instead of landing: the holders it holds for are filed under its wait
@@ -4558,6 +4575,9 @@ fn to_direct_source(source: HeartDownloadSource) -> DownloadSource {
 
 #[path = "heart_keep_anyway.rs"]
 pub mod keep_anyway;
+
+#[path = "heart_member_keep.rs"]
+mod member_keep;
 
 pub use keep_anyway::{KEEP_WAITS_FOR_YOUTUBE, KeepAnyway, KeepMarks};
 
