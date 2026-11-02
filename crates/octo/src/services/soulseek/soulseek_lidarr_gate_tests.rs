@@ -216,12 +216,30 @@ async fn a_held_lidarr_replacement_refused_when_judged_again_does_not_search_lid
 /// A heart's Lidarr file that waits for AcoustID is judged again once AcoustID answers by the
 /// check every Lidarr file meets, with its download's labels: an ISRC Lidarr wrote from its own
 /// matching, naming another recording, does not refuse it, and it is kept by its sound for the
-/// person.
+/// person. Octo's own key's lane starts at test gaps, and the heart's pace the busy answer backed
+/// off is waited out before the file is judged again, so the second lookup is AcoustID's to
+/// answer however fast the test runs.
 #[tokio::test]
 async fn a_hearts_held_lidarr_file_is_judged_again_with_its_downloads_labels() {
+    use crate::services::fingerprint::acoust_id_rate_limiter::{KeyLane, LookupClass};
+
     let root = Root::new("octo-gate-lidarr-held-");
     let imports = Arc::new(LidarrImportHandoff::new());
-    let g = lidarr_gated(&root, &imports).await;
+    let limiter = Arc::new(
+        AcoustIdRateLimiter::with_gaps(Duration::from_millis(20), Duration::from_millis(10))
+            .with_jitter(|| 1.0),
+    );
+    let g = gated_with(
+        &root,
+        DownloadSource::Soulseek,
+        Vec::new(),
+        Options {
+            limiter: Some(limiter.clone()),
+            lidarr_imports: Some(imports.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
     let heard = g.heard_video(4_000_000, None, "started", "heard-master").await;
     let gate = gate_of("brandon", Some(heard), HeardReading::RStays { tag: None });
     g.answers.status("clear", 503);
@@ -239,8 +257,13 @@ async fn a_hearts_held_lidarr_file_is_judged_again_with_its_downloads_labels() {
     .await
     .expect_err("it waits for AcoustID");
     let waiting = held_lidarr_file_of(&waited);
+    assert!(
+        limiter.backing_off(KeyLane::BuiltIn, LookupClass::Heart),
+        "the busy answer backed the heart's pace off"
+    );
 
     g.answers.answer("clear", &started_clear());
+    tokio::time::sleep(limiter.gap(KeyLane::BuiltIn, LookupClass::Heart)).await;
     let ledger = GateLedger::default();
     let kept = acquire_as(
         &g,
