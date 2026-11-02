@@ -1381,8 +1381,21 @@ async fn a_song_held_on_a_pause_that_names_no_check_is_asked_again_once_mornye_i
             ..Default::default()
         },
     );
-    worker.tick().await;
+    for _ in 0..3 {
+        worker.tick().await;
+    }
     assert_eq!(replacer.requests().len(), 1);
+
+    // The next pass, while the pause holds: a is passed over.
+    *now.lock() += LibraryReviewSweepWorker::PASS_INTERVAL + TimeDelta::minutes(1);
+    for _ in 0..3 {
+        worker.tick().await;
+    }
+    assert_eq!(
+        replacer.requests().len(),
+        1,
+        "a is not asked for while its pause holds"
+    );
 
     // Mornye is switched off: the next pass asks for a again, long before its pause ends.
     *replacer.mornye_kept.lock() = false;
