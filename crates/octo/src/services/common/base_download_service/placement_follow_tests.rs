@@ -739,7 +739,7 @@ async fn a_family_copy_lands_only_for_the_members_whose_gate_did_not_pass_lidarr
         .await;
     assert_eq!(end, HeldEnd::GaveWay, "nobody is left it is for");
     assert!(!Path::new(&held.held_path).exists());
-    assert!(!Path::new(&held.target).exists());
+    assert_eq!(pool.placed.lock().len(), 1, "nothing more lands in the pool");
 }
 
 /// In the family pool a kept copy is dropped for Lidarr's proven file only once that file passed
