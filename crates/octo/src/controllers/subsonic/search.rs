@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use octo_core::common::dotnet;
-use octo_core::models::domain::{Album, Artist, Song};
+use octo_core::models::domain::{Album, Artist, Song, explicit_status};
 use octo_core::models::search::SearchResult;
 use octo_core::models::subsonic::ExternalPlaylist;
+use octo_core::settings::ExplicitFilter;
 use octo_subsonic::subsonic_model_mapper::{Row, SearchRows, SubsonicModelMapper};
 use octo_subsonic::subsonic_response_builder::{SUBSONIC_NAMESPACE, SUBSONIC_VERSION};
 use octo_subsonic::sync_catalog_response;
@@ -26,6 +27,7 @@ use super::caller_checks::listener_name_of;
 use super::media::draws_its_own_marks_in;
 use crate::app::AppState;
 use crate::http::error::AppError;
+use crate::services::family::kid_filter;
 use crate::services::library::Standing;
 use crate::services::subsonic::{
     SearchBudget, SearchSongOrder, SearchSongOrderCache, SearchSongPagePlanner, SyncCatalog, SyncCatalogKind,
@@ -46,6 +48,7 @@ const SYNC_CATALOG_WAIT: Duration = Duration::from_secs(15);
 /// broken; with a query, we hijack.
 pub async fn search3(State(state): State<AppState>, req: Request) -> Result<Response, AppError> {
     let scope = scope_of(crate::services::family::family_caller(req.extensions()));
+    let kid = crate::services::family::family_caller(req.extensions()).is_some_and(kid_filter::is_kid);
     let started = Instant::now();
     let call = match SubsonicCall::read(&state, req).await {
         Ok(call) => call,
@@ -239,9 +242,13 @@ pub async fn search3(State(state): State<AppState>, req: Request) -> Result<Resp
         external_share,
         local_parsed.0.len() as i32,
     );
+    // A Clean only caller never gets an outside song whose words are not known yet (its lookup
+    // got no answer): the kid filter reads the word clients see, and such a song has none.
+    let clean_only = kid || subsonic.explicit_filter == ExplicitFilter::CleanOnly;
     let external_songs: Vec<Song> = built
         .iter()
         .take(external_slice.max(0) as usize)
+        .filter(|song| !clean_only || song.explicit_content_lyrics != Some(explicit_status::UNANSWERED))
         .cloned()
         .collect();
 

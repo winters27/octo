@@ -168,18 +168,30 @@ async fn asked(server: &MockServer, prefix: &str) -> usize {
 }
 
 #[test]
-fn only_https_from_deezers_cdn_is_ever_fetched() {
+fn only_https_from_the_catalogs_clip_hosts_is_ever_fetched() {
     let allowed = |url: &str| clip_url_allowed(&Url::parse(url).unwrap());
     assert!(allowed(
         "https://cdnt-preview.dzcdn.net/api/1/1/a/b/c/0/abc.mp3?hdnea=x"
+    ));
+    assert!(allowed(
+        "https://audio-ssl.itunes.apple.com/itunes-assets/AudioPreview125/v4/a.m4a"
     ));
     assert!(
         !allowed("http://cdnt-preview.dzcdn.net/api/1/1/a.mp3"),
         "never over http"
     );
+    assert!(
+        !allowed("http://audio-ssl.itunes.apple.com/a.m4a"),
+        "never over http"
+    );
     assert!(!allowed("https://dzcdn.net.evil.com/a.mp3"));
     assert!(!allowed("https://evil-dzcdn.net/a.mp3"));
     assert!(!allowed("https://example.com/a.mp3"));
+    assert!(
+        !allowed("https://is1-ssl.mzstatic.com/a.m4a"),
+        "Apple's other hosts are not clip hosts"
+    );
+    assert!(!allowed("https://audio-ssl.itunes.apple.com.evil.com/a.m4a"));
 }
 
 #[tokio::test]
@@ -347,6 +359,118 @@ async fn an_isrc_whose_deezer_track_is_another_song_is_skipped_for_the_title_sea
         "another song's clip is never fetched"
     );
     assert_eq!(asked(&s.server, "/clip/help").await, 1);
+}
+
+#[tokio::test]
+async fn a_matching_track_with_no_clip_is_passed_over_for_the_next_match() {
+    let s = setup().await;
+    let preview = format!("{}/clip/help.mp3", s.server.uri());
+    // Where Deezer does not serve the server's country, a song's own record names no clip.
+    Mock::given(path(format!("/track/isrc:{ISRC}")))
+        .respond_with(track(116, "Help! (Remastered 2009)", "The Beatles", 139, ""))
+        .mount(&s.server)
+        .await;
+    Mock::given(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"data":[{"id":5,"title":"Help!","duration":139,"artist":{"id":1,"name":"The Beatles"},"album":{"id":9,"title":"Help!"}}]}"#,
+            "application/json",
+        ))
+        .mount(&s.server)
+        .await;
+    Mock::given(path("/track/5"))
+        .respond_with(track(5, "Help!", "The Beatles", 139, &preview))
+        .mount(&s.server)
+        .await;
+    Mock::given(path("/clip/help.mp3"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            std::fs::read(fixture("clip/help-2009-clip.json")).unwrap(),
+            "audio/mpeg",
+        ))
+        .mount(&s.server)
+        .await;
+    channel(&s.server, "The Beatles - Topic").await;
+    let heard = heard_video(&s.rig, &fixture("gate/prints/help-2009-240.json"));
+    assert_eq!(
+        s.clip.read(&help(), &heard, &mut ClipPrints::default()).await,
+        ClipReading::ThisSong
+    );
+    assert_eq!(asked(&s.server, "/track/5").await, 1, "the next match was asked");
+}
+
+/// A song with no ISRC on a server Deezer does not serve: the title search is answered from
+/// Apple's catalog, and Apple's clip of the song is the one read.
+#[tokio::test]
+async fn where_deezer_hides_its_catalog_apples_clip_is_read() {
+    use crate::services::apple::{AppleCatalog, ApplePace, PaceConfig};
+    use crate::services::metadata::{DeezerReach, DeezerStandIn, DoorInfos};
+
+    let s = setup().await;
+    let apple_server = MockServer::start().await;
+    let pace = Arc::new(ApplePace::new(PaceConfig::unpaced()));
+    let reach = Arc::new(DeezerReach::new(Arc::clone(&pace)));
+    let apple = Arc::new(AppleCatalog::with_bases(
+        pace,
+        &apple_server.uri(),
+        &apple_server.uri(),
+        None,
+    ));
+    let stand_in = Arc::new(DeezerStandIn::new(Arc::clone(&reach), apple));
+    let door = Arc::new(DeezerRateLimitHandler::with_api_host(
+        Arc::new(DeezerRateLimiter::new()),
+        "127.0.0.1",
+    ));
+    stand_in.set_door(Arc::downgrade(&door));
+    door.set_stand_in(Arc::clone(&stand_in));
+    reach.set_reader(Arc::new(DoorInfos::new(Arc::downgrade(&door), &s.server.uri())));
+    let deezer = Arc::new(DeezerMetadataService::with_base_url(
+        Arc::clone(&door),
+        Arc::new(SettingsStore::for_tests(AppSettings::default())),
+        s.server.uri(),
+    ));
+    let clip = CatalogClip::new(
+        deezer,
+        s.rig.samples.clone(),
+        Arc::new(YouTubeResolver::with_base_url(Some(&s.server.uri()))),
+    );
+    let cdn = Url::parse(&s.server.uri()).unwrap();
+    clip.use_clip_hosts(Arc::new(move |url: &Url| {
+        url.host_str() == cdn.host_str() && url.port() == cdn.port()
+    }));
+
+    Mock::given(path("/infos"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"country_iso":"IN","country":"India","open":false}"#,
+            "application/json",
+        ))
+        .mount(&s.server)
+        .await;
+    reach.read_infos().await;
+    let song = format!(
+        r#"{{"wrapperType":"track","kind":"song","trackId":1440833098,"trackName":"Help!","artistName":"The Beatles","artistId":136975,"collectionId":1441164426,"collectionName":"Help!","trackTimeMillis":139000,"trackNumber":1,"discNumber":1,"trackExplicitness":"notExplicit","previewUrl":"{}/clip/apple-help.mp3","artworkUrl100":"https://is1-ssl.mzstatic.com/image/thumb/a/100x100bb.jpg"}}"#,
+        s.server.uri()
+    );
+    let answer = format!(r#"{{"resultCount":1,"results":[{song}]}}"#);
+    for apple_path in ["/search", "/lookup"] {
+        Mock::given(path(apple_path))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(answer.clone(), "text/javascript"))
+            .mount(&apple_server)
+            .await;
+    }
+    Mock::given(path("/clip/apple-help.mp3"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            std::fs::read(fixture("clip/help-2009-clip.json")).unwrap(),
+            "audio/mpeg",
+        ))
+        .mount(&s.server)
+        .await;
+    channel(&s.server, "The Beatles - Topic").await;
+    let heard = heard_video(&s.rig, &fixture("gate/prints/help-2009-240.json"));
+    let routing = SoulseekRouting { isrc: None, ..help() };
+    assert_eq!(
+        clip.read(&routing, &heard, &mut ClipPrints::default()).await,
+        ClipReading::ThisSong
+    );
+    assert_eq!(asked(&s.server, "/clip/apple-help.mp3").await, 1, "Apple's clip");
 }
 
 #[tokio::test]

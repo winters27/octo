@@ -1,0 +1,19 @@
+
+
+
+{
+ "resultCount":10,
+ "results": [
+{"wrapperType":"artist", "artistType":"Artist", "artistName":"Hans Zimmer", "artistLinkUrl":"https://music.apple.com/in/artist/hans-zimmer/454295032?uo=4", "artistId":454295032, "amgArtistId":140996, "primaryGenreName":"Soundtrack", "primaryGenreId":16}, 
+{"wrapperType":"artist", "artistType":"Artist", "artistName":"Mlathonic", "artistLinkUrl":"https://music.apple.com/in/artist/mlathonic/1793037794?uo=4", "artistId":1793037794, "primaryGenreName":"Ambient", "primaryGenreId":1056}, 
+{"wrapperType":"artist", "artistType":"Artist", "artistName":"Zimmer", "artistLinkUrl":"https://music.apple.com/in/artist/zimmer/1163942271?uo=4", "artistId":1163942271, "primaryGenreName":"Electronic", "primaryGenreId":7}, 
+{"wrapperType":"artist", "artistType":"Artist", "artistName":"Ludwig Göransson", "artistLinkUrl":"https://music.apple.com/in/artist/ludwig-g%C3%B6ransson/391832320?uo=4", "artistId":391832320, "amgArtistId":1343775, "primaryGenreName":"Soundtrack", "primaryGenreId":16}, 
+{"wrapperType":"artist", "artistType":"Artist", "artistName":"Bryan Adams", "artistLinkUrl":"https://music.apple.com/in/artist/bryan-adams/85932?uo=4", "artistId":85932, "primaryGenreName":"Rock", "primaryGenreId":21}, 
+{"wrapperType":"artist", "artistType":"Artist", "artistName":"Bastille", "artistLinkUrl":"https://music.apple.com/in/artist/bastille/420203509?uo=4", "artistId":420203509, "amgArtistId":2528804, "primaryGenreName":"Alternative", "primaryGenreId":20}, 
+{"wrapperType":"artist", "artistType":"Artist", "artistName":"RAYE", "artistLinkUrl":"https://music.apple.com/in/artist/raye/261686?uo=4", "artistId":261686, "primaryGenreName":"Pop", "primaryGenreId":14}, 
+{"wrapperType":"artist", "artistType":"Artist", "artistName":"Ramin Djawadi", "artistLinkUrl":"https://music.apple.com/in/artist/ramin-djawadi/5581431?uo=4", "artistId":5581431, "amgArtistId":563627, "primaryGenreName":"Soundtrack", "primaryGenreId":16}, 
+{"wrapperType":"artist", "artistType":"Artist", "artistName":"Disciples", "artistLinkUrl":"https://music.apple.com/in/artist/disciples/215276022?uo=4", "artistId":215276022, "amgArtistId":2867661, "primaryGenreName":"Dance", "primaryGenreId":17}, 
+{"wrapperType":"artist", "artistType":"Artist", "artistName":"Alan Walker", "artistLinkUrl":"https://music.apple.com/in/artist/alan-walker/1062085272?uo=4", "artistId":1062085272, "primaryGenreName":"Dance", "primaryGenreId":17}]
+}
+
+

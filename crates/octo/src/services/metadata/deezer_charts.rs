@@ -46,6 +46,7 @@ impl DeezerMetadataService {
     }
 
     async fn chart_list(&self, key: String, url: String, ttl: Duration) -> Option<Arc<Vec<CatalogTrack>>> {
+        let generation = self.generation();
         if let Some(Cached::Chart(cached)) = self.get_cached(&key) {
             return Some(cached);
         }
@@ -53,7 +54,7 @@ impl DeezerMetadataService {
         let fetch_key = key.clone();
         self.inner
             .in_flight_charts
-            .run(&key, async move {
+            .run(&super::in_generation(generation, &key), async move {
                 let r = this.get_json(&url, false).await;
                 if r.transient {
                     return None;
@@ -67,7 +68,7 @@ impl DeezerMetadataService {
                     .unwrap_or_default();
                 let ttl = if tracks.is_empty() { NEGATIVE_TTL } else { ttl };
                 let tracks = Arc::new(tracks);
-                this.put(fetch_key, Cached::Chart(tracks.clone()), ttl);
+                this.put(generation, fetch_key, Cached::Chart(tracks.clone()), ttl);
                 Some(tracks)
             })
             .await

@@ -3,6 +3,7 @@
 //! building blocks they share.
 
 pub mod admin;
+pub mod apple;
 pub mod charts;
 pub mod common;
 pub mod cover_art;

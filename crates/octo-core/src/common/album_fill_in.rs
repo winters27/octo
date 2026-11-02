@@ -129,15 +129,55 @@ impl AlbumFillIn {
         shared > 0 && shared * 2 >= songs.len()
     }
 
-    /// Whether the library already has this catalog song, so it is not offered as missing: the
-    /// same ISRC, or the same title ("Song (feat. X)" and "Song" alike, never "Song (Live)").
-    /// Length is not asked here, as a second row of the same title reads as a duplicate.
-    pub fn owned(library: &[LibraryTrack], catalog: &Song) -> bool {
-        let key = SongIdentity::title_key(&catalog.title);
-        library.iter().any(|l| {
-            SongIdentity::shares_isrc(present(&l.isrcs), catalog_isrcs(catalog))
-                || (!key.is_empty() && SongIdentity::title_key(l.title.as_deref().unwrap_or("")) == key)
-        })
+    /// Which catalog rows the library already has, so they are not offered as missing. A library
+    /// song owns every row that is its recording ([`Self::same_recording`]), so a recording the
+    /// album lists twice stays out twice. A library song that is no row's recording owns the
+    /// first row not yet owned with its title ("Song (feat. X)" and "Song" alike, never "Song
+    /// (Live)"), so one file never hides another recording of its title on the album.
+    pub fn owned_rows(library: &[LibraryTrack], catalog: &[Song]) -> Vec<bool> {
+        let mut owned = vec![false; catalog.len()];
+        let mut by_title = Vec::new();
+        for track in library {
+            let mut any = false;
+            for (at, row) in catalog.iter().enumerate() {
+                if Self::same_recording(track, row) {
+                    owned[at] = true;
+                    any = true;
+                }
+            }
+            if !any {
+                by_title.push(track);
+            }
+        }
+        for track in by_title {
+            let key = SongIdentity::title_key(track.title.as_deref().unwrap_or(""));
+            if key.is_empty() {
+                continue;
+            }
+            if let Some(at) = (0..catalog.len())
+                .find(|&at| !owned[at] && SongIdentity::title_key(&catalog[at].title) == key)
+            {
+                owned[at] = true;
+            }
+        }
+        owned
+    }
+
+    /// Up to `max` of the library album's ISRCs, each once, in the album's order.
+    pub fn isrcs(library: &[LibraryTrack], max: usize) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for isrc in library.iter().flat_map(|track| present(&track.isrcs)) {
+            let Some(code) = SongIdentity::normalize_isrc(isrc) else {
+                continue;
+            };
+            if found.len() >= max {
+                break;
+            }
+            if !found.contains(&code) {
+                found.push(code);
+            }
+        }
+        found
     }
 
     /// One recording on both sides: the same ISRC, or the same title at nearly the same length.
@@ -360,12 +400,59 @@ mod tests {
             lib("Other", Some(100), &[]),
         ];
 
-        assert!(AlbumFillIn::owned(
+        let owned = AlbumFillIn::owned_rows(
             &library,
-            &cat("Song", Some(230), Some("GBAAA0000001"))
-        ));
-        assert!(AlbumFillIn::owned(&library, &cat("Other", Some(300), None)));
-        assert!(!AlbumFillIn::owned(&library, &cat("New Song", Some(200), None)));
+            &[
+                cat("Song", Some(230), Some("GBAAA0000001")),
+                cat("Other", Some(300), None),
+                cat("New Song", Some(200), None),
+            ],
+        );
+        assert_eq!(owned, [true, true, false]);
+    }
+
+    #[test]
+    fn owned_rows_a_file_owns_its_own_recording_and_never_hides_another_of_its_title() {
+        // The library's "Stay" is 382 s; the album lists it, and another "Stay" at 412 s.
+        let owned = AlbumFillIn::owned_rows(
+            &[lib("Stay", Some(382), &[])],
+            &[
+                cat("Stay", Some(382), None),
+                cat("Other", Some(200), None),
+                cat("Stay", Some(412), None),
+            ],
+        );
+        assert_eq!(owned, [true, false, false]);
+        // Only "Stay" 412 s on the album: the file owns it by its title, as before.
+        let owned = AlbumFillIn::owned_rows(
+            &[lib("Stay", Some(382), &[])],
+            &[cat("Stay", Some(412), None), cat("Other", Some(200), None)],
+        );
+        assert_eq!(owned, [true, false]);
+    }
+
+    #[test]
+    fn owned_rows_a_recording_the_album_lists_twice_stays_out_twice() {
+        let owned = AlbumFillIn::owned_rows(
+            &[lib("Theme", Some(200), &["GBAAA0000001"])],
+            &[
+                cat("Theme", Some(200), Some("GBAAA0000001")),
+                cat("Theme (Reprise)", Some(90), None),
+                cat("Theme", Some(200), Some("GBAAA0000001")),
+            ],
+        );
+        assert_eq!(owned, [true, false, true]);
+    }
+
+    #[test]
+    fn isrcs_are_the_albums_own_each_once_and_bounded() {
+        let library = [
+            lib("A", None, &["GB-AAA-00-00001", "GBAAA0000001"]),
+            lib("B", None, &["GBAAA0000002"]),
+            lib("C", None, &["GBAAA0000003"]),
+        ];
+        assert_eq!(AlbumFillIn::isrcs(&library, 2), ["GBAAA0000001", "GBAAA0000002"]);
+        assert!(AlbumFillIn::isrcs(&[lib("A", None, &[])], 3).is_empty());
     }
 
     #[test]

@@ -33,6 +33,7 @@ use crate::services::common::acquisition_tracker::key_of;
 use crate::services::common::heart_acquisition_coordinator::waiting_line;
 use crate::services::http_client_factory::{connect_failure_message, timeout_message};
 use crate::services::lidarr::{CANNOT_SEE, NO_INDEXER_SEARCHES};
+use crate::services::metadata::Reach;
 use crate::services::soulseek::soulseek_link::ISoulseekLink;
 use crate::services::subsonic::subsonic_response_builder::acquisition_json;
 use crate::services::you_tube::you_tube_resolver::FRESH_HEADER;
@@ -466,6 +467,36 @@ async fn probe_last_fm(state: &AppState) -> ServiceProbe {
     }
 }
 
+/// Where albums, artists and song details come from: Deezer, or Apple Music's catalog standing in
+/// where Deezer does not serve the server or cannot be reached. Read from the reach; asks nothing.
+fn probe_catalog(state: &AppState) -> ServiceProbe {
+    catalog_probe(state.deezer_reach.as_ref().map(|reach| reach.reach()))
+}
+
+fn catalog_probe(reach: Option<Reach>) -> ServiceProbe {
+    let Some(reach) = reach else {
+        return ServiceProbe::new(true, "Deezer answers.");
+    };
+    match reach {
+        Reach::Unknown => ServiceProbe::new(true, "Checking Deezer…"),
+        Reach::Open { .. } => ServiceProbe::new(true, "Deezer answers."),
+        Reach::Closed { country, .. } => ServiceProbe::new(
+            true,
+            format!(
+                "Deezer does not serve {}, so albums, artists and song details come from Apple Music's catalog.",
+                if country.is_empty() { "this server's country" } else { country.as_str() }
+            ),
+        ),
+        Reach::Unreachable { error } => ServiceProbe::new(
+            true,
+            format!(
+                "Octo cannot reach Deezer ({error}), so albums, artists and song details come from Apple Music's catalog."
+            ),
+        )
+        .warning(true),
+    }
+}
+
 /// `now` in the round-trip form with an offset: seven fraction digits and `+00:00`.
 fn round_trip_offset(now: chrono::DateTime<Utc>) -> String {
     format!(
@@ -766,6 +797,7 @@ async fn probe_all(state: &AppState) -> serde_json::Map<String, serde_json::Valu
         ("ytDlpShim", shim),
         ("sonic", sonic),
         ("lastfm", lastfm),
+        ("catalog", probe_catalog(state)),
     ]
     .into_iter()
     .map(|(name, probe)| (name.to_string(), json!(probe)))
@@ -967,6 +999,38 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 4, 8, 7, 57).unwrap()
             + chrono::TimeDelta::nanoseconds(635_173_300);
         assert_eq!(round_trip_offset(now), "2026-10-04T08:07:57.6351733+00:00");
+    }
+
+    #[test]
+    fn the_music_catalog_card_says_where_albums_come_from_in_each_state() {
+        let checking = catalog_probe(Some(Reach::Unknown));
+        assert!(checking.ok && !checking.warning);
+        assert_eq!(checking.detail, "Checking Deezer…");
+        assert_eq!(catalog_probe(None).detail, "Deezer answers.");
+        let open = catalog_probe(Some(Reach::Open {
+            country_iso: "US".into(),
+            country: "United States of America".into(),
+        }));
+        assert!(open.ok && !open.warning);
+        assert_eq!(open.detail, "Deezer answers.");
+        let closed = catalog_probe(Some(Reach::Closed {
+            country_iso: "IN".into(),
+            country: "India".into(),
+        }));
+        assert!(closed.ok && !closed.warning, "a closed country is no fault");
+        assert_eq!(
+            closed.detail,
+            "Deezer does not serve India, so albums, artists and song details come from Apple Music's catalog."
+        );
+        let unreachable = catalog_probe(Some(Reach::Unreachable {
+            error: "connection refused".into(),
+        }));
+        assert!(unreachable.ok && unreachable.warning);
+        assert!(
+            unreachable
+                .detail
+                .starts_with("Octo cannot reach Deezer (connection refused)")
+        );
     }
 }
 

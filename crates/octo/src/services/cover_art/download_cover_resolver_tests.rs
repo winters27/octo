@@ -5,7 +5,6 @@
 
 use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -21,7 +20,6 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use super::*;
 use crate::services::cover_art::ICoverArtSource;
-use crate::services::cover_art::itunes_cover_art_lookup::set_apple_interval;
 use crate::services::http_client_factory;
 
 fn jpeg_with(width: u32, height: u32, center: Option<[u8; 3]>, quality: u8) -> Vec<u8> {
@@ -178,8 +176,8 @@ impl Hosts {
     }
 
     fn itunes(&self, cache: Option<std::path::PathBuf>) -> ITunesCoverArtLookup {
-        // Apple's pacing is for the real service; these talk to a fake.
-        set_apple_interval(Duration::ZERO);
+        // Apple's pacing is for the real service; these talk to a fake (a test lookup's own pace
+        // never waits).
         ITunesCoverArtLookup::with_base_url(cache, &self.url("itunes.apple.com"), Clock::system())
     }
 

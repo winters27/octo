@@ -93,6 +93,15 @@ impl HeartGates for CodeGates {
     }
 }
 
+#[test]
+fn a_row_waiting_on_the_catalog_names_no_one_catalog() {
+    // Deezer or Apple Music answers the catalog's questions, depending on the server's country.
+    assert_eq!(
+        crate::services::common::heart_acquisition_coordinator::waiting_line(WaitingFor::Deezer),
+        "Waiting for the music catalog"
+    );
+}
+
 /// Gates answered from a list per person: a listed wait holds, anyone else is ready.
 #[derive(Default)]
 struct ListedGates {
@@ -2909,7 +2918,7 @@ async fn an_import_deezer_cannot_answer_for_goes_back_on_the_trickle() {
     let later = back
         .downcast_ref::<crate::services::imports::trickle_worker::TrickleCheckLater>()
         .expect("put back");
-    assert_eq!(later.detail, "Waiting for Deezer");
+    assert_eq!(later.detail, "Waiting for the music catalog");
     assert!(later.turn_back);
     assert!(rig.holds.snapshot().is_empty(), "nothing held");
 }

@@ -715,7 +715,8 @@ impl SyncCatalogService {
             if hit.id.is_empty() || !seen_ids.insert(hit.id.clone()) {
                 continue;
             }
-            if settings.explicit_filter == ExplicitFilter::CleanOnly && hit.explicit_content_lyrics == Some(1)
+            if settings.explicit_filter == ExplicitFilter::CleanOnly
+                && !octo_core::models::domain::explicit_status::clean_only_allows(hit.explicit_content_lyrics)
             {
                 continue;
             }

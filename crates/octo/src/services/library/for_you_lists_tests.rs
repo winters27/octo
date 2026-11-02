@@ -934,6 +934,13 @@ fn new_releases_covers_are_fetched_only_from_the_catalogs_image_host() {
         ),
         ("http://cdn-images.dzcdn.net/images/cover/abc.jpg", false),
         ("https://dzcdn.net.example.com/cover.jpg", false),
+        // Apple's catalog, standing in where Deezer does not serve the server.
+        (
+            "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/a/b/c/794043201943.jpg/1000x1000bb.jpg",
+            true,
+        ),
+        ("http://is1-ssl.mzstatic.com/image/thumb/a.jpg", false),
+        ("https://mzstatic.com.example.com/a.jpg", false),
         ("https://192.168.1.10/cover.jpg", false),
         ("not a url", false),
     ] {

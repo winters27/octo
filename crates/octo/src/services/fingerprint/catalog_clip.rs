@@ -81,12 +81,25 @@ impl ClipPrints {
     }
 }
 
-/// Whether a clip's URL may be fetched: https, from a host under Deezer's CDN, `dzcdn.net`.
+/// Apple's clip host, for a song Apple's catalog answers where Deezer does not serve the server.
+pub const APPLE_CLIP_HOST: &str = "audio-ssl.itunes.apple.com";
+
+/// Whether a clip's URL may be fetched: https, from a host under Deezer's CDN, `dzcdn.net`, or
+/// from Apple's clip host exactly.
 pub fn clip_url_allowed(url: &Url) -> bool {
     url.scheme() == "https"
-        && url
-            .host_str()
-            .is_some_and(|host| host.to_ascii_lowercase().ends_with(".dzcdn.net"))
+        && url.host_str().is_some_and(|host| {
+            let host = host.to_ascii_lowercase();
+            host.ends_with(".dzcdn.net") || host == APPLE_CLIP_HOST
+        })
+}
+
+/// Whether a track carries a clip: Deezer leaves it empty where it does not serve the server.
+fn has_clip(track: &DeezerTrack) -> bool {
+    track
+        .clip_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
 }
 
 /// Which hosts a clip may come from.
@@ -195,8 +208,9 @@ impl CatalogClip {
     }
 
     /// The Deezer track of this song: its album at its disc and track, then its ISRC, then the
-    /// track search, the first that is this song. Ok(None) when none is; Err when Deezer did not
-    /// answer.
+    /// track search, the first that is this song and carries a clip (Deezer's own track has none
+    /// where Deezer does not serve the server; the search is then answered from Apple, with
+    /// Apple's clip). Ok(None) when none is; Err when Deezer did not answer.
     async fn track(&self, routing: &SoulseekRouting) -> Result<Option<DeezerTrack>, ClipReading> {
         let busy = Err(ClipReading::Busy(WaitingFor::Deezer));
         if let Some((album, disc, position)) = album_place(routing) {
@@ -210,7 +224,9 @@ impl CatalogClip {
                     if let Some(listed) = at {
                         match self.deezer.clip_track(&listed.id).await {
                             DeezerAsked::Busy => return busy,
-                            DeezerAsked::Answer(track) if is_this_song(&track, routing) => {
+                            DeezerAsked::Answer(track)
+                                if is_this_song(&track, routing) && has_clip(&track) =>
+                            {
                                 return Ok(Some(track));
                             }
                             _ => {}
@@ -222,7 +238,12 @@ impl CatalogClip {
         if let Some(isrc) = routing.isrc.as_deref().filter(|isrc| !isrc.trim().is_empty()) {
             match self.deezer.clip_track_by_isrc(isrc).await {
                 DeezerAsked::Busy => return busy,
-                DeezerAsked::Answer(track) if is_this_song(&track, routing) => return Ok(Some(track)),
+                DeezerAsked::Answer(track) if is_this_song(&track, routing) && has_clip(&track) => {
+                    return Ok(Some(track));
+                }
+                DeezerAsked::Answer(track) if is_this_song(&track, routing) => {
+                    debug!("Deezer's track for {isrc} carries no clip here; the title search is asked")
+                }
                 DeezerAsked::Answer(track) => debug!(
                     "Deezer's track for {isrc} is '{} - {}', not this song; the title search is asked",
                     track.artist, track.title
@@ -251,7 +272,7 @@ impl CatalogClip {
         for _ in 0..=MAX_REDIRECTS {
             if !hosts(&url) {
                 info!(
-                    "A clip from {} is not taken: only https from Deezer's CDN is",
+                    "A clip from {} is not taken: only https from the music catalogs' clip hosts is",
                     url.host_str().unwrap_or("")
                 );
                 return Fetched::Unusable;

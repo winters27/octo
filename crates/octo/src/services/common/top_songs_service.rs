@@ -383,6 +383,11 @@ impl TopSongsService {
         self.server_country()
     }
 
+    /// The country Apple's chart pages were last seen to put the server in, without asking.
+    pub fn known_country(&self) -> Option<String> {
+        self.inner.apple.known_country()
+    }
+
     fn server_country(&self) -> Option<String> {
         match self.inner.settings.current().generated_playlists.chart_country() {
             ChartCountry::Fixed(code) => Some(code),
@@ -823,7 +828,17 @@ impl TopSongsService {
             None => server_own,
         };
         if by_address && let Some(catalog) = self.inner.deezer.get_chart(CHART_LIMIT).await {
-            let (rows, source) = merge(Some(catalog.as_slice()), None, false, max, DEEZER_SOURCE);
+            // Apple's catalog answers the chart on a server Deezer does not serve; its rows carry
+            // Apple's ids.
+            let named = if catalog
+                .first()
+                .is_some_and(|row| octo_core::metadata::apple_as_deezer::is_apple_id(&row.catalog_id))
+            {
+                octo_core::charts::top_songs::APPLE_SOURCE
+            } else {
+                DEEZER_SOURCE
+            };
+            let (rows, source) = merge(Some(catalog.as_slice()), None, false, max, named);
             let songs = self.build_songs(&rows).await;
             return Built {
                 list: TopList {

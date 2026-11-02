@@ -207,6 +207,15 @@ impl SignInFactory {
     }
 
     async fn with(sign_in: &str, admin_login_in_settings: bool) -> Self {
+        Self::with_catalog(sign_in, admin_login_in_settings, None).await
+    }
+
+    /// `catalog`: a mock Deezer and a mock Apple, with the catalog stand-in wired between them.
+    async fn with_catalog(
+        sign_in: &str,
+        admin_login_in_settings: bool,
+        catalog: Option<(String, String)>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("a temp dir");
         let navidrome = Arc::new(FakeNavidrome::default());
         let url = navidrome.serve().await;
@@ -240,6 +249,8 @@ impl SignInFactory {
                     ("Soulseek:BaseUrl".into(), closed),
                     ("Subsonic:Url".into(), url),
                 ],
+                deezer_base_url: catalog.as_ref().map(|(deezer, _)| deezer.clone()),
+                apple_catalog_base_url: catalog.map(|(_, apple)| apple),
                 ..Default::default()
             },
         );
@@ -445,6 +456,46 @@ async fn status_gives_a_signed_in_admin_the_details() {
     let token = factory.state.browse_sessions.create("admin");
     let services = factory.get_with_token("/api/admin/status", &token).await.json()["services"].clone();
     assert!(services["navidrome"].get("detail").is_some());
+}
+
+/// The music catalog's card on a server Deezer does not serve: up for anyone, and the reason for a
+/// signed-in admin.
+#[tokio::test]
+async fn the_music_catalog_says_apple_answers_where_deezer_does_not_serve() {
+    let deezer = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/infos"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(
+            r#"{"country_iso":"IN","country":"India","open":false}"#,
+            "application/json",
+        ))
+        .mount(&deezer)
+        .await;
+    let apple = wiremock::MockServer::start().await;
+    let factory = SignInFactory::with_catalog("required", false, Some((deezer.uri(), apple.uri()))).await;
+    factory
+        .state
+        .deezer_reach
+        .as_ref()
+        .expect("the stand-in is wired")
+        .read_infos()
+        .await;
+
+    let anyone = get(&factory.app, "/api/admin/status").await.json();
+    assert_eq!(anyone["services"]["catalog"]["ok"], json!(true));
+    assert!(
+        anyone["services"]["catalog"].get("detail").is_none(),
+        "anyone learns only that it is up"
+    );
+
+    let token = factory.state.browse_sessions.create("admin");
+    let admin = factory.get_with_token("/api/admin/status", &token).await.json();
+    let detail = admin["services"]["catalog"]["detail"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        detail.contains("Deezer does not serve India") && detail.contains("Apple Music"),
+        "{detail}"
+    );
 }
 
 /// octo-sonic turned off in .env reads as off on the status page, like the switch, not as a

@@ -35,6 +35,8 @@ pub(crate) mod playlist_names;
 mod test_app;
 
 #[cfg(test)]
+mod closed_catalog_tests;
+#[cfg(test)]
 mod cover_cache_tests;
 #[cfg(test)]
 mod extensions_tests;
