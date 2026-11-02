@@ -2,10 +2,12 @@
 //! [`ApplePace`] and asked in the server's store, good answers kept for a while.
 //!
 //! The store is chosen once a process, on first need: the Charts country when it is set, else the
-//! server's own country as its [`StoreSource`] learns it, else `us`. Every store the server has
-//! used is kept in `apple-store.json`, so an album listed in one store still opens after the store
-//! changes: an id lookup that finds nothing in the current store asks the others, then `us`. A
-//! store Apple does not have (HTTP 400 naming `[country]`) gives way to `us`.
+//! server's own country as its [`StoreSource`] learns it. While nothing is learned yet, a request
+//! asks the store this server chose last time, else `us`, and the next request learns again. Every
+//! store the server has used is kept in `apple-store.json`, so an album listed in one store still
+//! opens after the store changes: an id lookup that finds nothing in the current store asks the
+//! others, then `us`. A store Apple does not have (HTTP 400 naming `[country]`) gives way to `us`
+//! and is never asked again in this process.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -93,8 +95,13 @@ struct StoresFile {
 
 #[derive(Debug, Default)]
 struct Stores {
+    /// The store chosen in this process, pinned or learned.
     current: Option<String>,
+    /// The store chosen last, as `apple-store.json` keeps it.
+    saved: Option<String>,
     used: Vec<String>,
+    /// Stores Apple said it does not have, in this process.
+    refused: HashSet<String>,
 }
 
 /// One request's outcome, shared by everyone who asked the same address at once.
@@ -152,11 +159,10 @@ impl AppleCatalog {
 
     /// The catalog on other hosts: a test's mock servers.
     pub fn with_bases(pace: Arc<ApplePace>, base: &str, feed: &str, stores_path: Option<PathBuf>) -> Self {
-        let used = stores_path
+        let file = stores_path
             .as_deref()
             .and_then(|path| state_file::read_text(path).ok().flatten())
             .and_then(|text| serde_json::from_str::<StoresFile>(&text).ok())
-            .map(|file| file.used)
             .unwrap_or_default();
         Self {
             client: client_builder()
@@ -170,7 +176,12 @@ impl AppleCatalog {
             running: Arc::new(Mutex::new(HashMap::new())),
             gathering: Arc::new(Mutex::new(None)),
             batch_albums: BATCH_ALBUMS,
-            stores: Mutex::new(Stores { current: None, used }),
+            stores: Mutex::new(Stores {
+                current: None,
+                saved: file.store.and_then(normal_store),
+                used: file.used,
+                refused: HashSet::new(),
+            }),
             stores_path,
             source: OnceLock::new(),
             warned: Arc::new(Mutex::new(HashSet::new())),
@@ -189,18 +200,29 @@ impl AppleCatalog {
         self
     }
 
+    /// The same catalog giving each request to Apple at most `timeout` (a test's short one).
+    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.client = client_builder()
+            .timeout(timeout)
+            .build()
+            .expect("the Apple catalog client builds");
+        self
+    }
+
     /// Where the store comes from; set once, before the first request.
     pub fn set_store_source(&self, source: Arc<dyn StoreSource>) {
         let _ = self.source.set(source);
     }
 
-    /// The store this process asks in.
+    /// The store this request asks in: the pinned one, else the one chosen in this process, else
+    /// the learned one (then chosen), else the one chosen last time, else `us`.
     pub async fn store(&self) -> String {
         let pinned = self
             .source
             .get()
             .and_then(|source| source.pinned())
-            .and_then(normal_store);
+            .and_then(normal_store)
+            .filter(|store| !self.is_refused(store));
         if let Some(pinned) = pinned {
             self.choose(&pinned);
             return pinned;
@@ -211,17 +233,26 @@ impl AppleCatalog {
         let learned = match self.source.get() {
             Some(source) => source.learned().await.and_then(normal_store),
             None => None,
-        };
+        }
+        .filter(|store| !self.is_refused(store));
         // Another request may have chosen while this one learned: the first choice stands.
         if let Some(current) = self.stores.lock().current.clone() {
             return current;
         }
-        let chosen = learned.unwrap_or_else(|| FALLBACK_STORE.to_string());
-        self.choose(&chosen);
-        chosen
+        if let Some(learned) = learned {
+            self.choose(&learned);
+            return learned;
+        }
+        // Nothing learned yet: this request only, so a later one can still learn.
+        let stores = self.stores.lock();
+        stores
+            .saved
+            .clone()
+            .filter(|store| !stores.refused.contains(store))
+            .unwrap_or_else(|| FALLBACK_STORE.to_string())
     }
 
-    /// Every store this server has used, the current one first.
+    /// Every store this server has used and Apple has, the current one first.
     pub fn stores_used(&self) -> Vec<String> {
         let stores = self.stores.lock();
         let mut all: Vec<String> = stores.current.iter().cloned().collect();
@@ -229,10 +260,14 @@ impl AppleCatalog {
             stores
                 .used
                 .iter()
-                .filter(|s| Some(*s) != stores.current.as_ref())
+                .filter(|s| Some(*s) != stores.current.as_ref() && !stores.refused.contains(*s))
                 .cloned(),
         );
         all
+    }
+
+    fn is_refused(&self, store: &str) -> bool {
+        self.stores.lock().refused.contains(store)
     }
 
     fn choose(&self, store: &str) {
@@ -242,11 +277,33 @@ impl AppleCatalog {
         }
         info!("Apple's catalog is asked in the '{store}' store");
         stores.current = Some(store.to_string());
+        stores.saved = Some(store.to_string());
         if !stores.used.iter().any(|s| s == store) {
             stores.used.push(store.to_string());
         }
+        self.keep(stores);
+    }
+
+    /// A store Apple does not have: never asked again in this process, and no longer kept.
+    fn refuse(&self, store: &str) {
+        let mut stores = self.stores.lock();
+        if !stores.refused.insert(store.to_string()) {
+            return;
+        }
+        warn!("Apple has no '{store}' store; Octo asks the '{FALLBACK_STORE}' store instead");
+        if stores.current.as_deref() == Some(store) {
+            stores.current = None;
+        }
+        if stores.saved.as_deref() == Some(store) {
+            stores.saved = None;
+        }
+        stores.used.retain(|s| s != store);
+        self.keep(stores);
+    }
+
+    fn keep(&self, stores: parking_lot::MutexGuard<'_, Stores>) {
         let file = StoresFile {
-            store: stores.current.clone(),
+            store: stores.saved.clone(),
             used: stores.used.clone(),
         };
         drop(stores);
@@ -303,11 +360,10 @@ impl AppleCatalog {
             url.push_str(&format!("&limit={}&country={store}", limit.clamp(1, 300)));
             url
         };
-        let first = self.ask_in_store(&address, class, "lookup").await;
+        let (first, current) = self.ask_in_store_at(&address, class, "lookup").await;
         if !matches!(first, AppleAsked::NoData) {
             return first;
         }
-        let current = self.store().await;
         let mut others: Vec<String> = self.stores_used().into_iter().filter(|s| *s != current).collect();
         if current != FALLBACK_STORE && !others.iter().any(|s| s == FALLBACK_STORE) {
             others.push(FALLBACK_STORE.to_string());
@@ -318,6 +374,7 @@ impl AppleCatalog {
                     debug!("Apple found {joined} in the '{store}' store, not '{current}'");
                     return AppleAsked::Answer(answer);
                 }
+                Flight::NoSuchStore if store != FALLBACK_STORE => self.refuse(&store),
                 Flight::NoData | Flight::NoSuchStore => {}
                 Flight::Busy | Flight::Refused => return AppleAsked::Busy,
             }
@@ -353,18 +410,29 @@ impl AppleCatalog {
         class: AppleClass,
         kind: &'static str,
     ) -> AppleAsked<Arc<Value>> {
-        let store = self.store().await;
+        self.ask_in_store_at(address, class, kind).await.0
+    }
+
+    /// [`Self::ask_in_store`], with the store that answered.
+    async fn ask_in_store_at(
+        &self,
+        address: impl Fn(&str) -> String,
+        class: AppleClass,
+        kind: &'static str,
+    ) -> (AppleAsked<Arc<Value>>, String) {
+        let mut store = self.store().await;
         let mut flight = self.ask(&address(&store), class, kind, ANSWER_TTL).await;
         if matches!(flight, Flight::NoSuchStore) && store != FALLBACK_STORE {
-            warn!("Apple has no '{store}' store; Octo asks the '{FALLBACK_STORE}' store from now on");
-            self.choose(FALLBACK_STORE);
-            flight = self.ask(&address(FALLBACK_STORE), class, kind, ANSWER_TTL).await;
+            self.refuse(&store);
+            store = FALLBACK_STORE.to_string();
+            flight = self.ask(&address(&store), class, kind, ANSWER_TTL).await;
         }
-        match flight {
+        let asked = match flight {
             Flight::Answer(answer) => AppleAsked::Answer(answer),
             Flight::NoData => AppleAsked::NoData,
             Flight::Busy | Flight::Refused | Flight::NoSuchStore => AppleAsked::Busy,
-        }
+        };
+        (asked, store)
     }
 
     /// One address, from what is kept, else joined with a request already running for it (raising
@@ -441,10 +509,11 @@ impl AppleCatalog {
     /// Apple's next turn while it has room for another album ([`BATCH_ALBUMS`]), raising that turn
     /// to its class; otherwise it starts the next gathering. The answer holds every album of the
     /// lookup that Apple has in the store; one it lacks is asked alone ([`Self::lookup`], which
-    /// tries the other stores).
+    /// tries the other stores). A refused turn is never a joiner's answer: the joiner asks alone,
+    /// on its own class.
     pub async fn tracklists(&self, id: u64, class: AppleClass) -> AppleAsked<Arc<Value>> {
         let store = self.store().await;
-        let outcome = {
+        let (outcome, joined) = {
             let mut gathering = self.gathering.lock();
             let room = self.batch_albums;
             let joinable = gathering.as_ref().is_some_and(|open| {
@@ -459,7 +528,7 @@ impl AppleCatalog {
                     }
                     drop(ids);
                     open.ticket.raise(class);
-                    open.outcome.clone()
+                    (open.outcome.clone(), true)
                 }
                 _ => {
                     let ids = Arc::new(Mutex::new(vec![id]));
@@ -500,7 +569,7 @@ impl AppleCatalog {
                         ticket,
                         outcome: outcome.clone(),
                     });
-                    outcome
+                    (outcome, false)
                 }
             }
         };
@@ -508,6 +577,7 @@ impl AppleCatalog {
             Flight::Answer(answer) => AppleAsked::Answer(answer),
             // Nothing in this store (or no such store): asked alone, through every store used.
             Flight::NoData | Flight::NoSuchStore => self.lookup(&[id], Some(Entity::Song), 300, class).await,
+            Flight::Refused if joined => self.lookup(&[id], Some(Entity::Song), 300, class).await,
             // Apple did not answer: no one asks again on its own while it is busy.
             Flight::Busy | Flight::Refused => AppleAsked::Busy,
         }

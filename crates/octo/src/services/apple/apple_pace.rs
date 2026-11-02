@@ -74,6 +74,19 @@ pub struct PaceConfig {
     pub background_cap: usize,
 }
 
+impl PaceConfig {
+    /// A pace that never makes a turn wait (a test's own).
+    pub fn unpaced() -> Self {
+        Self {
+            spacing: Duration::ZERO,
+            cover_spacing: Duration::ZERO,
+            bucket_capacity: 1000,
+            refill_every: Duration::from_millis(1),
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for PaceConfig {
     fn default() -> Self {
         Self {

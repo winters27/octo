@@ -9,7 +9,6 @@ use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
-use crate::services::cover_art::itunes_cover_art_lookup::set_apple_interval;
 
 const SQUARE: &str = "/itunes-assets/HLSMusic1/v4/aa/P1_default.m3u8";
 const TALL: &str = "/itunes-assets/HLSMusic1/v4/bb/P2_default.m3u8";
@@ -67,7 +66,6 @@ struct Apple {
 
 impl Apple {
     async fn new() -> Self {
-        set_apple_interval(Duration::ZERO);
         Apple {
             itunes: MockServer::start().await,
             music: MockServer::start().await,

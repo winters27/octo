@@ -77,7 +77,6 @@ fn an_unreadable_file_is_an_empty_cache() {
 /// read back by the next process.
 #[tokio::test]
 async fn a_master_is_matched_strictly_remembered_and_kept_on_disk() {
-    set_apple_interval(Duration::ZERO);
     let server = MockServer::builder().start().await;
     let art = |name: &str| format!("{}/image/{name}/100x100bb.jpg", server.uri());
     let results = format!(
@@ -147,10 +146,102 @@ async fn a_master_is_matched_strictly_remembered_and_kept_on_disk() {
     assert_eq!(searches(&server.received_requests().await.unwrap_or_default()), 1);
 }
 
+/// Master searches take Cover turns on the lookup's pace; chain searches wait for none while Deezer
+/// answers Octo's searches, and take turns while Apple answers them.
+#[tokio::test]
+async fn master_searches_are_paced_and_chain_searches_only_while_apple_stands_in() {
+    let server = MockServer::start().await;
+    Mock::given(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"results":[]}"#))
+        .mount(&server)
+        .await;
+    let spaced = Arc::new(ApplePace::new(PaceConfig {
+        cover_spacing: Duration::from_millis(400),
+        ..PaceConfig::unpaced()
+    }));
+    let masters = ITunesCoverArtLookup::with_base_url(None, &server.uri(), Clock::fixed(at(10, 0, 0)))
+        .with_pace(Arc::clone(&spaced));
+    let started = Instant::now();
+    masters
+        .try_fetch_album_master(Some("Air"), Some("Moon Safari"), None)
+        .await;
+    masters
+        .try_fetch_album_master(Some("Air"), Some("Talkie Walkie"), None)
+        .await;
+    assert!(
+        started.elapsed() >= Duration::from_millis(400),
+        "two master searches are a Cover turn apart"
+    );
+
+    // The next Cover turn is half a minute away.
+    let slow = Arc::new(ApplePace::new(PaceConfig {
+        cover_spacing: Duration::from_secs(30),
+        ..PaceConfig::unpaced()
+    }));
+    let _ = slow.turn(AppleClass::Cover).await;
+    let chain = ITunesCoverArtLookup::with_base_url(None, &server.uri(), Clock::fixed(at(10, 0, 0)))
+        .with_pace(Arc::clone(&slow));
+    let song = |title: &str| SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("Kino".into()),
+        title: Some(title.into()),
+        ..Default::default()
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        chain.try_fetch(&song("Gruppa krovi"), false).await;
+        chain.try_fetch(&song("Kukushka"), false).await;
+    })
+    .await
+    .expect("chain searches wait for no turn while Deezer answers");
+    slow.set_strict(true);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            chain.try_fetch(&song("Zvezda"), false)
+        )
+        .await
+        .is_err(),
+        "while Apple answers Octo's searches, a chain search waits its turn"
+    );
+}
+
+/// A refused master search waits the lookup's retry wait, then asks once more.
+#[tokio::test]
+async fn a_refused_master_search_waits_the_retry_wait_then_asks_again() {
+    let server = MockServer::start().await;
+    Mock::given(path("/search"))
+        .respond_with(ResponseTemplate::new(403))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"results":[]}"#))
+        .mount(&server)
+        .await;
+    let pace = Arc::new(ApplePace::new(PaceConfig {
+        cover_spacing: Duration::from_millis(10),
+        ..PaceConfig::unpaced()
+    }));
+    let lookup = ITunesCoverArtLookup::with_base_url(None, &server.uri(), Clock::fixed(at(10, 0, 0)))
+        .with_pace(Arc::clone(&pace))
+        .with_retry_wait(Duration::from_millis(100));
+    let started = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        lookup.try_fetch_album_master(Some("Air"), Some("Moon Safari"), None),
+    )
+    .await
+    .expect("the retry wait is the lookup's, not a minute");
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    let searches = server.received_requests().await.unwrap_or_default().len();
+    assert!(searches >= 2, "asked again after the refusal");
+    assert!(pace.backoff() > Duration::ZERO, "the refusal slowed the pace");
+}
+
 /// One barcode lookup matches albums back by name and keeps them for both ways of asking.
 #[tokio::test]
 async fn priming_by_barcode_matches_albums_back_by_name() {
-    set_apple_interval(Duration::ZERO);
     let server = MockServer::builder().start().await;
     let results = format!(
         r#"{{"results":[
@@ -200,7 +291,6 @@ async fn priming_by_barcode_matches_albums_back_by_name() {
 /// beats a longer name that only starts with the same letters.
 #[tokio::test]
 async fn a_search_takes_the_hit_that_names_the_artist() {
-    set_apple_interval(Duration::ZERO);
     let server = MockServer::start().await;
     let results = format!(
         r#"{{"results":[

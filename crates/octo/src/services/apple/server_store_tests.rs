@@ -15,17 +15,66 @@ fn server_store(chart_country: &str, pages: Option<&str>) -> (ServerStore, Arc<D
     let store = ServerStore::new(
         Arc::new(SettingsStore::for_tests(settings)),
         Arc::new(move || pages.clone()),
+        // Apple Music has every country but "zz".
+        Arc::new(|code: &str| code != "zz"),
         Arc::clone(&reach),
     );
     (store, reach)
 }
 
 #[tokio::test]
-async fn the_charts_country_pins_the_store() {
+async fn the_charts_country_pins_the_store_when_apple_has_it() {
     let (pinned, _) = server_store("GB", Some("in"));
     assert_eq!(pinned.pinned().as_deref(), Some("gb"));
     let (automatic, _) = server_store("auto", Some("in"));
     assert_eq!(automatic.pinned(), None);
+    let (missing, _) = server_store("ZZ", Some("in"));
+    assert_eq!(missing.pinned(), None, "a country Apple Music lacks pins nothing");
+}
+
+/// Answers `/infos` once `hold` is notified; never, when nothing notifies it.
+struct Held(Arc<tokio::sync::Notify>);
+
+#[async_trait::async_trait]
+impl InfosReader for Held {
+    async fn read(&self, _background: bool) -> Infos {
+        self.0.notified().await;
+        Infos::Closed {
+            country_iso: "IN".into(),
+            country: "India".into(),
+        }
+    }
+}
+
+#[tokio::test]
+async fn learning_waits_for_infos_while_the_reach_is_unknown() {
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let (store, reach) = server_store("auto", Some("FR"));
+    reach.set_reader(Arc::new(Held(Arc::clone(&hold))));
+    let learned = tokio::spawn(async move { store.learned().await });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!learned.is_finished(), "the store waits for /infos");
+    hold.notify_waiters();
+    assert_eq!(learned.await.unwrap().as_deref(), Some("in"));
+}
+
+#[tokio::test]
+async fn a_silent_infos_is_waited_for_no_longer_than_the_wait() {
+    let (store, reach) = server_store("auto", Some("FR"));
+    let store = store.with_infos_wait(Duration::from_millis(50));
+    reach.set_reader(Arc::new(Held(Arc::new(tokio::sync::Notify::new()))));
+    let learned = tokio::time::timeout(Duration::from_secs(5), store.learned()).await;
+    assert_eq!(learned.expect("the wait ends").as_deref(), Some("fr"));
+}
+
+#[tokio::test]
+async fn a_country_apple_music_lacks_is_never_learned() {
+    let (store, reach) = server_store("auto", Some("ZZ"));
+    reach.set_reader(Arc::new(Held(Arc::new(tokio::sync::Notify::new()))));
+    let store = store.with_infos_wait(Duration::from_millis(10));
+    assert_eq!(store.learned().await, None);
 }
 
 struct India;

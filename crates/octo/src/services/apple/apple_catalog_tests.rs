@@ -99,8 +99,81 @@ async fn the_charts_country_pins_the_store_and_nothing_known_is_us() {
     assert_eq!(unknown.store().await, "us");
 }
 
+/// A source whose learned store the test sets as it goes.
+struct LearnsLater(Mutex<Option<&'static str>>);
+
+#[async_trait::async_trait]
+impl StoreSource for LearnsLater {
+    fn pinned(&self) -> Option<String> {
+        None
+    }
+
+    async fn learned(&self) -> Option<String> {
+        self.0.lock().map(str::to_string)
+    }
+}
+
 #[tokio::test]
-async fn a_store_apple_does_not_have_gives_way_to_us_and_is_kept() {
+async fn nothing_learned_asks_the_last_store_for_now_and_learns_again_later() {
+    let folder = tempfile::tempdir().unwrap();
+    let file = folder.path().join("apple-store.json");
+    std::fs::write(&file, r#"{"store":"in","used":["in"]}"#).unwrap();
+    let source = Arc::new(LearnsLater(Mutex::new(None)));
+    let apple = AppleCatalog::with_bases(
+        instant_pace(),
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:0",
+        Some(file),
+    );
+    apple.set_store_source(Arc::clone(&source) as Arc<dyn StoreSource>);
+    assert_eq!(apple.store().await, "in", "the store chosen last time");
+    *source.0.lock() = Some("fr");
+    assert_eq!(apple.store().await, "fr", "learned once known");
+    *source.0.lock() = Some("de");
+    assert_eq!(apple.store().await, "fr", "then chosen for the process");
+
+    let fresh = AppleCatalog::with_bases(instant_pace(), "http://127.0.0.1:0", "http://127.0.0.1:0", None);
+    let later = Arc::new(LearnsLater(Mutex::new(None)));
+    fresh.set_store_source(Arc::clone(&later) as Arc<dyn StoreSource>);
+    assert_eq!(fresh.store().await, "us");
+    *later.0.lock() = Some("in");
+    assert_eq!(fresh.store().await, "in", "us was never chosen");
+}
+
+#[tokio::test]
+async fn a_refused_pinned_store_is_asked_once_in_the_process() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(query_param("country", "zz"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_raw(recorded("search-bad-country-zz-400.json"), "text/javascript"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(query_param("country", "us"))
+        .respond_with(ok(recorded("search-album-interstellar-in.json")))
+        .mount(&server)
+        .await;
+    let apple = AppleCatalog::with_bases(instant_pace(), &server.uri(), &server.uri(), None);
+    apple.set_store_source(Arc::new(Learned(Some("zz"), None)));
+    for term in ["interstellar", "dune"] {
+        assert!(matches!(
+            apple.search(term, Entity::Album, 5, AppleClass::Page).await,
+            AppleAsked::Answer(_)
+        ));
+    }
+    let asked_zz = calls(&server)
+        .await
+        .iter()
+        .filter(|call| call.url.query().is_some_and(|q| q.contains("country=zz")))
+        .count();
+    assert_eq!(asked_zz, 1);
+}
+
+#[tokio::test]
+async fn a_store_apple_does_not_have_gives_way_to_us_and_is_not_kept() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(query_param("country", "zz"))
@@ -126,8 +199,8 @@ async fn a_store_apple_does_not_have_gives_way_to_us_and_is_kept() {
     ));
     assert_eq!(apple.store().await, "us");
     let kept: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    assert_eq!(kept["store"], "us");
-    assert_eq!(kept["used"], json!(["zz", "us"]));
+    assert_eq!(kept["store"], serde_json::Value::Null);
+    assert_eq!(kept["used"], json!([]));
 }
 
 #[tokio::test]
@@ -348,6 +421,58 @@ async fn a_refused_leader_does_not_refuse_its_joiner() {
         "the joiner asked again itself"
     );
     assert!(matches!(newer.await.unwrap(), AppleAsked::Answer(_)));
+}
+
+#[tokio::test]
+async fn a_refused_tracklist_lookup_does_not_refuse_the_page_that_joined_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ok(recorded("lookup-1533983552-songs-in.json")))
+        .mount(&server)
+        .await;
+    let pace = Arc::new(ApplePace::new(PaceConfig {
+        spacing: Duration::from_secs(1),
+        background_cap: 1,
+        ..PaceConfig::default()
+    }));
+    pace.turn(AppleClass::Page).await.unwrap();
+    let apple = Arc::new(AppleCatalog::with_bases(
+        Arc::clone(&pace),
+        &server.uri(),
+        &server.uri(),
+        None,
+    ));
+    apple.set_store_source(Arc::new(Learned(None, Some("in"))));
+    let settle = || async {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    };
+    let gathered = tokio::spawn({
+        let apple = Arc::clone(&apple);
+        async move { apple.tracklists(1_533_983_552, AppleClass::Background).await }
+    });
+    settle().await;
+    let page = tokio::spawn({
+        let apple = Arc::clone(&apple);
+        async move { apple.tracklists(1_710_154_596, AppleClass::Page).await }
+    });
+    settle().await;
+    // A newer background request fills the background queue: the lookup's own turn, taken as a
+    // background request, is refused.
+    let _newer = tokio::spawn({
+        let apple = Arc::clone(&apple);
+        async move {
+            apple
+                .search("newer", Entity::Album, 5, AppleClass::Background)
+                .await
+        }
+    });
+    assert_eq!(gathered.await.unwrap(), AppleAsked::Busy);
+    assert!(
+        matches!(page.await.unwrap(), AppleAsked::Answer(_)),
+        "the page asked alone"
+    );
 }
 
 #[tokio::test]

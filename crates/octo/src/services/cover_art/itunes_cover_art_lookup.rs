@@ -2,8 +2,8 @@
 //! `octo_core::tagging::release_distance::barcode_forms`.
 
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use super::i_cover_art_source::ICoverArtSource;
-use crate::services::apple::{AppleClass, ApplePace};
+use crate::services::apple::{AppleClass, ApplePace, PaceConfig};
 use crate::services::framework::HttpAnswer;
 use crate::services::framework::http::client_builder;
 
@@ -70,20 +70,8 @@ fn album_titles() -> SongMatchOptions {
 // Octo's catalog questions to Apple, and while those run (Deezer's searches answered from Apple)
 // the cover searches below take their turns too.
 
-/// The least time between two of this lookup's paced requests.
-pub fn apple_interval() -> Duration {
-    ApplePace::shared().cover_spacing()
-}
-
-/// Sets [`apple_interval`] for every lookup in the process (a test sets it to zero).
-pub fn set_apple_interval(interval: Duration) {
-    ApplePace::shared().set_cover_spacing(interval);
-}
-
-async fn wait_for_apple() {
-    // A Cover turn is never refused.
-    let _ = ApplePace::shared().turn(AppleClass::Cover).await;
-}
+/// How long a refused master search waits before it tries once more.
+const RETRY_WAIT: Duration = Duration::from_secs(60);
 
 /// One row of itunes-masters.json: a key, an optional URL and when it was found, with PascalCase
 /// names matched case-sensitively.
@@ -120,6 +108,8 @@ pub struct ITunesCoverArtLookup {
     client: reqwest::Client,
     base: String,
     clock: Clock,
+    pace: Arc<ApplePace>,
+    retry_wait: Duration,
     /// The matched master URLs (`None` is a remembered miss) and when each was found, in the
     /// order they were added.
     master_urls: Mutex<IndexMap<String, (Option<String>, DateTime<Utc>)>>,
@@ -137,9 +127,12 @@ impl ITunesCoverArtLookup {
     /// [`Self::run_flush_loop`] to keep the file written.
     pub fn new(cache_path: Option<PathBuf>) -> Self {
         Self::with_base_url(cache_path, Self::BASE, Clock::system())
+            .with_pace(ApplePace::shared())
+            .with_retry_wait(RETRY_WAIT)
     }
 
-    /// A lookup against another host (a test's mock server), on a given clock.
+    /// A lookup against another host (a test's mock server), on a given clock, with a pace of its
+    /// own that never waits and no wait before a retry.
     pub fn with_base_url(cache_path: Option<PathBuf>, base: &str, clock: Clock) -> Self {
         // A master at full size runs to a few megabytes; 8 s was cut close on a slow line.
         let client = client_builder()
@@ -150,12 +143,26 @@ impl ITunesCoverArtLookup {
             client,
             base: base.trim_end_matches('/').to_string(),
             clock,
+            pace: Arc::new(ApplePace::new(PaceConfig::unpaced())),
+            retry_wait: Duration::ZERO,
             master_urls: Mutex::new(IndexMap::new()),
             cache_path: cache_path.filter(|p| !dotnet::is_blank(&p.to_string_lossy())),
             dirty: AtomicBool::new(false),
         };
         lookup.load_cache();
         lookup
+    }
+
+    /// The same lookup taking its turns on `pace`.
+    pub fn with_pace(mut self, pace: Arc<ApplePace>) -> Self {
+        self.pace = pace;
+        self
+    }
+
+    /// The same lookup waiting `wait` before it retries a refused master search.
+    pub fn with_retry_wait(mut self, wait: Duration) -> Self {
+        self.retry_wait = wait;
+        self
     }
 
     /// Writes the matches every 15 seconds, and once more when the token is canceled.
@@ -182,10 +189,11 @@ impl ITunesCoverArtLookup {
     /// A search or lookup through the gate. A refusal (403 or 429) waits a minute and
     /// tries once more, rather than losing the album.
     async fn apple_get(&self, url: &str) -> anyhow::Result<Option<HttpAnswer>> {
+        let pace = &self.pace;
         for attempt in 0..2 {
-            wait_for_apple().await;
+            // A Cover turn is never refused.
+            let _ = pace.turn(AppleClass::Cover).await;
             let response = self.get(url).await?;
-            let pace = ApplePace::shared();
             if matches!(
                 response.status,
                 StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
@@ -196,10 +204,11 @@ impl ITunesCoverArtLookup {
                     return Ok(Some(response));
                 }
                 info!(
-                    "Apple asked Octo to slow down; waiting a minute, then one every {} s",
+                    "Apple asked Octo to slow down; waiting {} s, then one every {} s",
+                    self.retry_wait.as_secs(),
                     pace.backoff().as_secs_f64()
                 );
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(self.retry_wait).await;
                 continue;
             }
             pace.answered_by_apple();
@@ -641,7 +650,7 @@ impl ITunesCoverArtLookup {
             );
             // Unpaced while Deezer answers Octo's searches; while Apple answers them, this search
             // takes its turn with them so the whole of Octo stays within Apple's rate.
-            let pace = ApplePace::shared();
+            let pace = &self.pace;
             let paced = pace.strict();
             if paced {
                 let _ = pace.turn(AppleClass::Cover).await;

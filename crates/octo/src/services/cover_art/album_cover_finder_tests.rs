@@ -10,7 +10,6 @@ use wiremock::matchers::path;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
-use crate::services::cover_art::itunes_cover_art_lookup::set_apple_interval;
 use crate::services::metadata::{DeezerRateLimitHandler, DeezerRateLimiter};
 
 fn jpeg(width: u32, height: u32) -> Vec<u8> {
@@ -23,7 +22,6 @@ fn jpeg(width: u32, height: u32) -> Vec<u8> {
 }
 
 fn finder(server: &MockServer) -> AlbumCoverFinder {
-    set_apple_interval(Duration::ZERO);
     let settings = Arc::new(SettingsStore::for_tests(AppSettings::default()));
     let deezer = DeezerMetadataService::with_base_url(
         Arc::new(DeezerRateLimitHandler::new(Arc::new(DeezerRateLimiter::new()))),
