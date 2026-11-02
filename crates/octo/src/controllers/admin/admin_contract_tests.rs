@@ -390,6 +390,23 @@ async fn a_mornye_that_refuses_reads_as_unreachable() {
     );
 }
 
+/// Mornye's client as Octo builds it reads slskd by the running link, as the downloads do: switched
+/// off in settings since startup, slskd is still in use until a restart.
+#[tokio::test]
+async fn mornyes_client_as_octo_builds_it_reads_slskd_by_its_link() {
+    let mut settings = factory_settings();
+    settings.soulseek.enabled = true;
+    settings.soulseek.base_url = Some("http://slskd.test:5030".into());
+    let state = AppState::for_tests(settings);
+    assert!(state.spotiflac.slskd_in_use());
+
+    let mut next = (*state.settings.current()).clone();
+    next.soulseek.enabled = false;
+    state.settings.set(next);
+
+    assert!(state.spotiflac.slskd_in_use());
+}
+
 /// A Mornye whose info answers after a minute, so a probe of it ends only at its own bound.
 async fn silent_mornye() -> MockServer {
     let mornye = MockServer::builder().start().await;
