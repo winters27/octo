@@ -605,6 +605,62 @@ async fn a_guard_whose_cancel_mornye_refuses_keeps_the_job_for_a_later_read() {
     );
 }
 
+/// Mornye refuses to cancel job-1 because it no longer runs.
+async fn refuse_cancel_of_job_1(mornye: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/api/v1/downloads/job-1/cancel"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({"error": "not running"})))
+        .with_priority(1)
+        .mount(mornye)
+        .await;
+}
+
+#[tokio::test]
+async fn a_run_forgets_its_job_once_mornye_says_it_is_over_though_it_refuses_the_cancel() {
+    let w = world(
+        sessions("unverified", 900.0),
+        no_browser(),
+        json!({"id": "job-1", "status": "failed", "error": "download_failed"}),
+    )
+    .await;
+    refuse_cancel_of_job_1(&w.mornye).await;
+    let run = w
+        .client
+        .start_pass(&w.music.path().to_string_lossy(), &tab_a())
+        .await
+        .expect("starts");
+
+    assert_eq!(until_finished(&run).await, RunState::NoCheck);
+    assert_eq!(requests_to(&w.mornye, "/api/v1/downloads/job-1/cancel").await, 1);
+    assert!(
+        w.client.check.store.pass_jobs().is_empty(),
+        "{:?}",
+        w.client.check.store.pass_jobs()
+    );
+}
+
+#[tokio::test]
+async fn a_guard_forgets_a_job_mornye_already_ended_though_it_refuses_the_cancel() {
+    let w = world(
+        sessions("unverified", 900.0),
+        no_browser(),
+        json!({"id": "job-1", "status": "failed", "error": "download_failed"}),
+    )
+    .await;
+    refuse_cancel_of_job_1(&w.mornye).await;
+    w.client.assist.stop_after_queue.store(true, Ordering::SeqCst);
+    let folder = w.music.path().to_string_lossy().into_owned();
+    let run = w.client.start_pass(&folder, &tab_a()).await.expect("starts");
+
+    assert_eq!(until_finished(&run).await, RunState::Unavailable);
+    assert_eq!(requests_to(&w.mornye, "/api/v1/downloads/job-1/cancel").await, 1);
+    assert!(
+        w.client.check.store.pass_jobs().is_empty(),
+        "{:?}",
+        w.client.check.store.pass_jobs()
+    );
+}
+
 /// A Pass run's song folder name, as Octo makes them.
 fn check_folder_name() -> String {
     format!("octo-check-{}", uuid::Uuid::new_v4().simple())
