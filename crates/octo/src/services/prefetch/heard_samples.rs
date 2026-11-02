@@ -119,6 +119,33 @@ pub fn covers_whole(items: usize, read_seconds: i32, reaches_end: bool, song_sec
     items > 0 && covered + WHOLE_SLACK_SECONDS >= f64::from(target)
 }
 
+/// What one run of a heart chain or a play holds of what its people heard, for as long as it lives:
+/// each heard copy under an id of the run's own, so a hold that keeps the same copy under the
+/// person's id, or another run, never frees it, and each heard sample. Let go when dropped.
+pub struct RunHold {
+    heard: Arc<HeardSamples>,
+    /// Each heard source and the id this run holds it under.
+    copies: Vec<(HeardSource, String)>,
+    /// The id the heard samples are held under.
+    samples: String,
+}
+
+impl RunHold {
+    /// The ids this run holds its heard copies under.
+    pub fn copy_ids(&self) -> Vec<String> {
+        self.copies.iter().map(|(_, id)| id.clone()).collect()
+    }
+}
+
+impl Drop for RunHold {
+    fn drop(&mut self) {
+        self.heard.release_samples(&self.samples);
+        for (source, id) in &self.copies {
+            self.heard.release_heard(source, id);
+        }
+    }
+}
+
 /// The id a heard source's prints are stored under: the same for the same source (the same video
 /// at the same size, type and format, the same copy, the same file), whoever heard it.
 pub fn sample_id_of(source: &HeardSource) -> String {
@@ -1132,6 +1159,40 @@ impl HeardSamples {
             HeardSource::Copy { key, .. } => self.prefetch.release(key, holder),
             HeardSource::Library { .. } | HeardSource::Acquired { .. } => {}
         }
+    }
+
+    /// Holds what `heard` names (each person, what they heard) of the acquisition `base_key` for one
+    /// run of a heart chain, or of a play (`play`), for as long as the returned hold lives: each
+    /// heard copy under an id of this run's own, never a hold's, and each heard sample. None when
+    /// nobody heard anything.
+    pub fn hold_for_run(
+        self: &Arc<Self>,
+        base_key: &str,
+        heard: &[(&str, &HeardRecord)],
+        play: bool,
+    ) -> Option<RunHold> {
+        if heard.is_empty() {
+            return None;
+        }
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let samples = format!("running:{base_key}:{run}");
+        let kind = if play { "play" } else { "run" };
+        let mut copies = Vec::new();
+        for (user, record) in heard {
+            let id = format!("{kind}:{base_key}:{}:{run}", user.trim());
+            self.hold_heard(&record.source, &id);
+            let sample = record
+                .sample_id
+                .clone()
+                .unwrap_or_else(|| sample_id_of(&record.source));
+            self.hold_sample(&sample, &samples);
+            copies.push((record.source.clone(), id));
+        }
+        Some(RunHold {
+            heard: Arc::clone(self),
+            copies,
+            samples,
+        })
     }
 
     /// At start: every saved copy holder id no live hold names goes, and every live hold's

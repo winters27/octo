@@ -84,6 +84,12 @@ impl DownloadVerificationService {
         self.heart.get().is_some()
     }
 
+    /// What people heard, once the heart gate is built: a download holds a heard copy here while
+    /// its gate reads it.
+    pub fn heard_samples(&self) -> Option<std::sync::Arc<crate::services::prefetch::HeardSamples>> {
+        self.heart.get().map(|parts| parts.samples.clone())
+    }
+
     /// Resumes a hold by its key once what it waits for answers.
     pub fn on_resume(&self, resume: ResumeHold) {
         *self.resume.lock() = Some(resume);
@@ -1233,9 +1239,15 @@ impl HeartGates for DownloadVerificationService {
             .collect()
     }
 
-    async fn judge_landed(&self, path: &str, acquisition_key: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
+    async fn judge_landed(
+        &self,
+        path: &str,
+        labels: LabelSource,
+        acquisition_key: &str,
+        gates: &[HeartGate],
+    ) -> Vec<GateVerdict> {
         let candidate = HeartCandidate {
-            labels: LabelSource::TheFile,
+            labels,
             identity: None,
             acquisition_key: acquisition_key.to_string(),
         };

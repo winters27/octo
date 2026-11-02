@@ -2574,6 +2574,66 @@ impl SoulseekDownloadService {
 }
 
 impl SoulseekDownloadService {
+    /// A play judged inside its own acquisition (Wait for lossless) gets its own gate when the
+    /// download has none for its asker yet, whatever gates of others' joined it: built from what
+    /// they heard of the song, which is held under a run of its own from before the gate is built
+    /// (the returned hold, kept until the download returns) so no sweep or cap takes it meanwhile.
+    /// False when nothing at all can prove a copy for the download: no gate could be built for the
+    /// play and it carries no other.
+    pub(crate) async fn own_play_gate(
+        &self,
+        download: &mut TrackDownload,
+    ) -> (bool, Option<crate::services::prefetch::heard_samples::RunHold>) {
+        use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
+        if download.origin != Some(AcquisitionOrigin::Play) || !self.verification.heart_ready() {
+            return (true, None);
+        }
+        let user = download.requested_by.first().cloned().unwrap_or_default();
+        let has_own = download.gates.iter().any(|gate| {
+            gate.origin == AcquisitionOrigin::Play
+                && octo_core::common::dotnet::eq_ignore_case(gate.user.trim(), user.trim())
+        });
+        if has_own {
+            return (true, None);
+        }
+        let external_id = download.track_id.clone();
+        let heard = Some(user.trim())
+            .filter(|user| !user.is_empty())
+            .and_then(|user| self.id_registry.heard_by(&external_id, user));
+        let held = match (&heard, self.verification.heard_samples()) {
+            (Some(record), Some(samples)) => {
+                let song = crate::services::common::HeldAcquisition {
+                    kind: crate::services::common::HeldKind::Track,
+                    provider: self.provider_name().to_string(),
+                    external_id: external_id.clone(),
+                    ..Default::default()
+                };
+                samples.hold_for_run(&song.base_key(), &[(user.trim(), record)], true)
+            }
+            _ => None,
+        };
+        let built = self
+            .verification
+            .build_heart_gate(
+                self.provider_name(),
+                &external_id,
+                &user,
+                AcquisitionOrigin::Play,
+                heard,
+                &mut Default::default(),
+            )
+            .await;
+        match built {
+            crate::services::fingerprint::download_verification_service::GateBuild::Ready(gate)
+                if gate.r.as_ref().is_some_and(|r| !r.ids.is_empty()) =>
+            {
+                download.gates.push(gate);
+                (true, held)
+            }
+            _ => (!download.gates.is_empty(), held),
+        }
+    }
+
     /// The first of a resumed hold's files that is still there and passes the checks a fresh
     /// download's file meets (a heart's or a play's by its askers' own gates); each one that fails
     /// is thrown away. A file Lidarr brought meets the check every Lidarr file meets, its labels
@@ -2603,10 +2663,21 @@ impl SoulseekDownloadService {
         let length_known = routing.duration.is_some_and(|s| s > 0);
         let mut refused_by_lidarr = None;
         let mut left = held.into_iter().filter(|file| file_exists(file));
+        // Other people of the hold judge the same files on their own requests: a file this download
+        // does not take stays held for them.
+        let for_others = download.held_for_others;
+        let let_go = |rest: &mut dyn Iterator<Item = String>| {
+            if !for_others {
+                for other in rest {
+                    let _ = std::fs::remove_file(&other);
+                }
+            }
+        };
         while let Some(file) = left.next() {
             if let Some(brought) = lidarr.iter().find(|known| known.path == file) {
+                let refused_to = for_others.then_some(file.as_str());
                 match self
-                    .check_lidarr_file(base, routing, download, &file, brought.labels(), None)
+                    .check_lidarr_file(base, routing, download, &file, brought.labels(), refused_to)
                     .await
                 {
                     Ok(verdict) => {
@@ -2614,9 +2685,7 @@ impl SoulseekDownloadService {
                         download.fetched_from = Some("Lidarr".to_string());
                         verdict.apply_tags_to(&mut download.song);
                         download.song.verification = Some(Box::new(verdict));
-                        for other in left {
-                            let _ = std::fs::remove_file(&other);
-                        }
+                        let_go(&mut left);
                         return Ok(Some(file));
                     }
                     Err(e) => match e.downcast::<AcquisitionHeld>() {
@@ -2640,14 +2709,20 @@ impl SoulseekDownloadService {
                     info!("Resumed with its held file: {file}");
                     verdict.apply_tags_to(&mut download.song);
                     download.song.verification = Some(Box::new(verdict));
-                    for other in left {
-                        let _ = std::fs::remove_file(&other);
-                    }
+                    let_go(&mut left);
                     return Ok(Some(file));
                 }
                 FileJudged::Hold(again) => {
                     // Still waiting: the rest wait with it.
                     return Err(waiting_on(again, left.collect()).into());
+                }
+                // Other people of the hold judge the same file on their own requests: it stays
+                // held for them, and goes with the hold.
+                FileJudged::NotProven(_) | FileJudged::Refuse { .. } if download.held_for_others => {
+                    info!(
+                        "A held file of '{}' is not this download's; it stays held for the others: {file}",
+                        download.song.title
+                    );
                 }
                 FileJudged::NotProven(_) | FileJudged::Refuse { .. } => {
                     info!(
@@ -2929,6 +3004,15 @@ impl DownloadBackend for SoulseekDownloadService {
             && HeartGates::owned_passes(self.verification.as_ref(), path, gate).await
     }
 
+    async fn judge_landed(
+        &self,
+        base: &BaseDownloadService,
+        download: &mut TrackDownload,
+        path: &str,
+    ) -> Option<bool> {
+        self.judge_landed_file(base, download, path).await
+    }
+
     // =========================================================================
     // Permanent download path (a star, or a play while in Permanent mode)
     // =========================================================================
@@ -2972,35 +3056,13 @@ impl DownloadBackend for SoulseekDownloadService {
         if held_track {
             anyhow::bail!("The held copy of this album track is not its recording");
         }
-        // A play judged inside its own acquisition (Wait for lossless, queued with no gate) gets
-        // its gate now; one with no identity to prove anything by is not proven at once.
-        if download.origin == Some(octo_core::fingerprint::heart_gate::AcquisitionOrigin::Play)
-            && download.gates.is_empty()
-            && self.verification.heart_ready()
-        {
-            let user = download.requested_by.first().cloned().unwrap_or_default();
-            let built = self
-                .verification
-                .build_heart_gate(
-                    self.provider_name(),
-                    &external_id,
-                    &user,
-                    octo_core::fingerprint::heart_gate::AcquisitionOrigin::Play,
-                    None,
-                    &mut Default::default(),
-                )
-                .await;
-            match built {
-                crate::services::fingerprint::download_verification_service::GateBuild::Ready(gate)
-                    if gate.r.as_ref().is_some_and(|r| !r.ids.is_empty()) =>
-                {
-                    download.gates.push(gate);
-                }
-                _ => {
-                    info!("The play of {external_id} has nothing to prove its copy by; it keeps none");
-                    return Err(not_proven());
-                }
-            }
+        // A play judged inside its own acquisition (Wait for lossless, queued with no gate of its
+        // own) gets its gate now, what its asker heard held until the download returns; one with
+        // nothing to prove anything by, and no other gate, is not proven at once.
+        let (proven_somehow, _heard) = self.own_play_gate(download).await;
+        if !proven_somehow {
+            info!("The play of {external_id} has nothing to prove its copy by; it keeps none");
+            return Err(not_proven());
         }
         let profile = if download.upgrade_search {
             SearchProfile::upgrade(&self.settings)
@@ -3611,6 +3673,10 @@ fn discard_rejected_download(path: &str, attempt_started_utc: DateTime<Utc>) {
 /// A refused file moved back to `back` (where it waits as a track of its album), else removed;
 /// swept with the job folders when neither can be done now.
 fn give_back_or_remove(path: &str, back: Option<&str>) {
+    // Given back to where it already is: it stays as it is.
+    if back == Some(path) {
+        return;
+    }
     if let Some(back) = back.filter(|back| !back.is_empty()) {
         // Taking the file out may have left its folder empty, and so removed it.
         if let Some(folder) = Path::new(back).parent() {

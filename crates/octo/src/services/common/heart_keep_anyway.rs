@@ -283,10 +283,21 @@ impl HeartAcquisitionCoordinator {
                     .holds
                     .as_ref()
                     .and_then(|holds| holds.get(&record.key()));
-                match current {
-                    Some(current) => self.keep_held_files(&current, user).await,
-                    None => return,
+                let Some(current) = current else {
+                    return;
+                };
+                // The library keeps a copy kept anyway for this person: their keep landed before
+                // Octo stopped, while others still hold the files, and only their place in the
+                // hold was left to end.
+                if self.kept_before(&current, user).await {
+                    info!(
+                        "The keep of {} for {user} landed before; they leave its hold",
+                        record.key()
+                    );
+                    self.ended_as_kept(&current, user);
+                    continue;
                 }
+                self.keep_held_files(&current, user).await;
             }
             return;
         }
@@ -418,7 +429,9 @@ impl HeartAcquisitionCoordinator {
                 Some(user),
             );
             let landed = completion.wait().await;
-            if others && landed.is_err() {
+            // The copies the keep did not land go: a failed keep's, or every one of them when the
+            // person's own check passed a file that landed for someone else first.
+            if others {
                 remove_copies(&handed);
             }
             match landed {
@@ -447,11 +460,13 @@ impl HeartAcquisitionCoordinator {
         }
     }
 
-    /// A hold whose file was kept anyway ends, and an album track's album row is counted again. The
-    /// song's row lets go, or is held again for another hold of the song still waiting.
+    /// A hold with no file left to keep ends, and an album track's album row is counted again; a
+    /// held album track goes on as the song's own hold for anyone in it by their heart of the song.
+    /// The song's row lets go, or is held again for another hold of the song still waiting.
     fn end_kept(&self, record: &HeldAcquisition) {
         if record.album_track.is_some() {
-            self.end_album_track(record);
+            self.album_track_over(record, &[], true);
+            return;
         }
         let Some(holds) = self.extras.holds.clone() else {
             return;

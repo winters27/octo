@@ -1438,8 +1438,10 @@ impl LibraryActionExecutor {
                         None => octo_core::fingerprint::heart_gate::AcquisitionOrigin::Replacement,
                     }),
                     kept_gate.iter().cloned().collect(),
-                    std::mem::take(&mut waiting),
-                    std::mem::take(&mut waiting_lidarr),
+                    crate::services::common::HeldFiles::of(
+                        std::mem::take(&mut waiting),
+                        std::mem::take(&mut waiting_lidarr),
+                    ),
                     &crate::services::common::AcquisitionTarget::Shared,
                     false,
                     SoulseekMetadataService::PROVIDER_NAME,

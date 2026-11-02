@@ -135,12 +135,7 @@ fn members_share_one_download_in_flight() {
         None,
     );
     assert!(Arc::ptr_eq(&first.outcome, &second.outcome), "one job");
-    let request = queue
-        .in_flight
-        .lock()
-        .get("deezer:1")
-        .cloned()
-        .expect("in flight");
+    let request = queue.running("deezer:1").expect("in flight");
     assert_eq!(
         request.pool_destination(),
         Some(vec!["alex".to_string(), "sam".to_string()])
@@ -167,12 +162,7 @@ fn anyone_who_wants_it_shared_makes_it_shared() {
         None,
     );
     star(&queue, "1", "winters");
-    let request = queue
-        .in_flight
-        .lock()
-        .get("deezer:1")
-        .cloned()
-        .expect("in flight");
+    let request = queue.running("deezer:1").expect("in flight");
     assert!(request.wants_shared());
     assert_eq!(request.pool_destination(), None);
     assert_eq!(request.pool_members(), ["alex"]);
@@ -184,12 +174,7 @@ fn every_request_is_shared_unless_a_member_asks() {
     assert_eq!(request.place(), AcquisitionPlace::default());
     let queue = TrackAcquisitionQueue::new();
     star(&queue, "2", "winters");
-    let shared = queue
-        .in_flight
-        .lock()
-        .get("deezer:2")
-        .cloned()
-        .expect("in flight");
+    let shared = queue.running("deezer:2").expect("in flight");
     assert_eq!(shared.place().pool_members, None);
 }
 
@@ -213,12 +198,7 @@ fn a_real_flac_ask_is_its_own_job() {
         None,
     );
     assert!(!Arc::ptr_eq(&any.outcome, &flac.outcome));
-    let request = queue
-        .in_flight
-        .lock()
-        .get("deezer:1:flac")
-        .cloned()
-        .expect("in flight");
+    let request = queue.running("deezer:1:flac").expect("in flight");
     assert!(request.place().flac_only);
 }
 
@@ -312,56 +292,65 @@ fn heart_as(
     )
 }
 
-/// With Family on, a heart that joins a request in flight with its own gate gets its member's
-/// link only when its own gate passed the landed file: a refused joiner gets no link and no
-/// attribution, and one that passed gets both.
+/// The next request the worker would take, or None when none comes within a moment.
+async fn next_now(queue: &TrackAcquisitionQueue) -> Option<Arc<AcquisitionRequest>> {
+    tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        queue.dequeue(&CancellationToken::new()),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+/// A download that carries a sound check belongs to one person: two people's hearts for one song
+/// are two requests, each with its own gate and its own library, and the second waits behind the
+/// first. Once the first lands, the second runs, carrying the file that landed for its own gate to
+/// judge first.
 #[tokio::test]
-async fn a_joiner_its_own_gate_refused_gets_no_link_and_no_attribution() {
+async fn two_peoples_hearts_for_one_song_are_two_requests_the_second_behind_the_first() {
     let queue = TrackAcquisitionQueue::new();
-    let first = heart_as(
+    let alice = heart_as(
         &queue,
         "song",
         "alice",
         AcquisitionTarget::Member("alice".into()),
         vec![gate("alice", AcquisitionOrigin::Heart)],
     );
-    heart_as(
+    let bob = heart_as(
         &queue,
         "song",
         "bob",
         AcquisitionTarget::Member("bob".into()),
         vec![gate("bob", AcquisitionOrigin::Heart)],
     );
-    heart_as(
-        &queue,
-        "song",
-        "carol",
-        AcquisitionTarget::Member("carol".into()),
-        vec![gate("carol", AcquisitionOrigin::Heart)],
-    );
-    let request = queue.dequeue(&CancellationToken::new()).await.expect("a request");
-    assert_eq!(request.pool_members(), ["alice"], "joiners wait for their gates");
-    assert_eq!(request.requested_by(), ["alice"]);
-    assert_eq!(request.gates().len(), 3, "each joiner is judged on its own");
-    // The download's check point writes each gate's verdict.
-    let ledger = first.ledger();
-    ledger.record("alice", AcquisitionOrigin::Heart, GateOutcome::Accepted);
-    ledger.record(
-        "bob",
-        AcquisitionOrigin::Heart,
-        GateOutcome::NotAccepted("another mix".into()),
-    );
-    ledger.record("carol", AcquisitionOrigin::Heart, GateOutcome::Accepted);
-    request.settle_joiners();
-    assert_eq!(request.pool_members(), ["alice", "carol"]);
-    assert_eq!(request.requested_by(), ["alice", "carol"]);
+    let first = next_now(&queue).await.expect("alice's request");
+    let users = |request: &AcquisitionRequest| -> Vec<String> {
+        request.gates().into_iter().map(|gate| gate.user).collect()
+    };
+    assert_eq!(users(&first), ["alice"], "no one else's gate rides on it");
+    assert_eq!(first.pool_members(), ["alice"]);
+    assert_eq!(first.requested_by(), ["alice"]);
+    assert!(next_now(&queue).await.is_none(), "bob's waits behind alice's");
+    assert!(queue.is_in_flight("soulseek", "song"));
+
+    queue.release_landed(&first, Some("/pool/song.flac"));
+    first.completion.try_set_result("/pool/song.flac");
+    assert_eq!(alice.wait().await.expect("landed"), "/pool/song.flac");
+    let second = next_now(&queue).await.expect("bob's own request");
+    assert_eq!(users(&second), ["bob"]);
+    assert_eq!(second.pool_members(), ["bob"]);
+    assert_eq!(second.requested_by(), ["bob"]);
+    assert_eq!(second.place().landed, ["/pool/song.flac"], "its own gate judges it first");
+    assert!(!bob.is_completed());
+    queue.release(&second);
+    assert!(!queue.is_in_flight("soulseek", "song"));
 }
 
-/// A joiner without a gate (the shipped checks) is recorded at once, as it always was; a joiner
-/// with a gate its own check never judged the landed file by (it joined a download that ran the
-/// shipped checks) is never credited with it: no link and no attribution.
+/// A request with no gate (the shipped checks) shares the download in flight as it always did,
+/// recorded at once; a gated heart of someone else never rides on it, and waits as its own.
 #[tokio::test]
-async fn a_gated_joiner_no_check_judged_is_never_credited() {
+async fn requests_with_no_gate_share_and_a_gated_heart_waits_as_its_own() {
     let queue = TrackAcquisitionQueue::new();
     heart_as(
         &queue,
@@ -384,17 +373,22 @@ async fn a_gated_joiner_no_check_judged_is_never_credited() {
         AcquisitionTarget::Member("carol".into()),
         vec![gate("carol", AcquisitionOrigin::Heart)],
     );
-    let request = queue.dequeue(&CancellationToken::new()).await.expect("a request");
+    let request = next_now(&queue).await.expect("a request");
     assert_eq!(request.pool_members(), ["alice", "bob"]);
+    assert!(request.gates().is_empty(), "carol's gate is on her own request");
     request.settle_joiners();
-    assert_eq!(request.pool_members(), ["alice", "bob"]);
     assert_eq!(request.requested_by(), ["alice", "bob"]);
+    queue.release(&request);
+    let carols = next_now(&queue).await.expect("carol's own request");
+    assert_eq!(carols.pool_members(), ["carol"]);
+    assert_eq!(carols.place().landed, Vec::<String>::new(), "nothing landed");
 }
 
-/// A heart that joins a play's download claims its outcome at once, so a play whose download
-/// then fails leaves the row to the heart, whose own chain goes on.
+/// The same person's heart joins their own play's download and claims its outcome at once, so a
+/// play whose download then fails leaves the row to the heart, whose own chain goes on; someone
+/// else's heart never joins it.
 #[tokio::test]
-async fn a_heart_joining_a_play_claims_its_outcome_at_once() {
+async fn a_heart_joining_its_persons_play_claims_its_outcome_at_once() {
     let queue = TrackAcquisitionQueue::new();
     let play = queue
         .try_enqueue_play_for(
@@ -415,13 +409,21 @@ async fn a_heart_joining_a_play_claims_its_outcome_at_once() {
         AcquisitionTarget::Shared,
         vec![gate("bob", AcquisitionOrigin::Heart)],
     );
+    assert!(!play.heart_joined(), "bob's heart is his own request");
+    heart_as(
+        &queue,
+        "song",
+        "alice",
+        AcquisitionTarget::Shared,
+        vec![gate("alice", AcquisitionOrigin::Heart)],
+    );
     assert!(play.heart_joined(), "the heart owns the outcome from its join");
     assert!(play.notifies_on_failure());
-    assert_eq!(play.requested_by(), ["alice"], "its name waits for its own gate");
+    assert_eq!(play.gates().len(), 2, "her play's gate and her heart's");
 }
 
-/// The gates a download started with grow with everyone who joins the request while it runs: the
-/// place hands the download a shared view of them.
+/// The gates a download started with grow with the same person's hearts that join the request
+/// while it runs: the place hands the download a shared view of them.
 #[tokio::test]
 async fn a_download_sees_the_gates_of_hearts_that_join_after_it_started() {
     let queue = TrackAcquisitionQueue::new();
@@ -438,18 +440,91 @@ async fn a_download_sees_the_gates_of_hearts_that_join_after_it_started() {
     heart_as(
         &queue,
         "song",
-        "bob",
+        "alice",
         AcquisitionTarget::Shared,
-        vec![gate("bob", AcquisitionOrigin::Heart)],
+        vec![gate("alice", AcquisitionOrigin::Heart)],
     );
-    let users: Vec<String> = place
+    let origins: Vec<AcquisitionOrigin> = place
         .live_gates
         .current()
         .expect("a request's place")
         .into_iter()
-        .map(|gate| gate.user)
+        .map(|gate| gate.origin)
         .collect();
-    assert_eq!(users, ["alice", "bob"]);
+    assert_eq!(origins, [AcquisitionOrigin::Import, AcquisitionOrigin::Heart]);
+}
+
+/// A person's keep of a held file, as the hold queues it.
+fn keep_as(queue: &TrackAcquisitionQueue, user: &str) -> (Completion, bool) {
+    queue.enqueue_keeping(
+        AcquisitionOrigin::AlbumHeart,
+        vec![gate(user, AcquisitionOrigin::AlbumHeart)],
+        vec![format!("/held/{user}.flac")],
+        &AcquisitionTarget::Shared,
+        "soulseek",
+        "song",
+        Some(DownloadSource::Soulseek),
+        Some(user),
+    )
+}
+
+/// A keep never shares a download with a request that is not one: a keep for a song with another
+/// person's heart queued waits behind it as its own, and never turns that heart into a keep.
+#[tokio::test]
+async fn a_keep_for_a_song_with_anothers_queued_heart_never_turns_that_heart_into_a_keep() {
+    let queue = TrackAcquisitionQueue::new();
+    heart_as(
+        &queue,
+        "song",
+        "bob",
+        AcquisitionTarget::Shared,
+        vec![gate("bob", AcquisitionOrigin::Heart)],
+    );
+    let (_, joined) = keep_as(&queue, "alice");
+    assert!(!joined, "the keep is its own request");
+    let heart = next_now(&queue).await.expect("bob's heart");
+    let place = heart.place();
+    assert!(!place.keep_anyway, "bob's heart is no keep");
+    assert!(place.keep_for.is_empty());
+    assert!(place.held_files.is_empty(), "the keep's files are its own");
+    assert_eq!(place.gates.len(), 1);
+    queue.release(&heart);
+    let keep = next_now(&queue).await.expect("alice's keep");
+    let place = keep.place();
+    assert!(place.keep_anyway);
+    assert_eq!(place.keep_for, ["alice"]);
+    assert_eq!(place.held_files, ["/held/alice.flac"]);
+}
+
+/// A heart of another person for a song a keep is running for waits as its own: it never rides on
+/// the keep, whose file counts as kept only for its keeper. Another keep of the same person shares
+/// it.
+#[tokio::test]
+async fn a_heart_of_another_person_never_rides_on_a_running_keep() {
+    let queue = TrackAcquisitionQueue::new();
+    let (keep, _) = keep_as(&queue, "alice");
+    let running = next_now(&queue).await.expect("alice's keep");
+    let bob = heart_as(
+        &queue,
+        "song",
+        "bob",
+        AcquisitionTarget::Shared,
+        vec![gate("bob", AcquisitionOrigin::Heart)],
+    );
+    let users: Vec<String> = running.gates().into_iter().map(|gate| gate.user).collect();
+    assert_eq!(users, ["alice"], "bob's gate is not on the keep");
+    assert_eq!(running.place().keep_for, ["alice"]);
+    let (_, joined) = keep_as(&queue, "ALICE");
+    assert!(joined, "her own second keep shares it");
+    assert_eq!(running.place().keep_for, ["alice"]);
+
+    queue.release_landed(&running, Some("/music/kept.flac"));
+    running.completion.try_set_result("/music/kept.flac");
+    assert!(keep.wait().await.is_ok());
+    assert!(!bob.is_completed(), "bob's heart was never answered by the keep");
+    let theirs = next_now(&queue).await.expect("bob's own request");
+    assert!(!theirs.place().keep_anyway);
+    assert_eq!(theirs.place().landed, ["/music/kept.flac"]);
 }
 
 /// An AcoustID answer whose recordings are these (id, title, artist, submissions), every one at

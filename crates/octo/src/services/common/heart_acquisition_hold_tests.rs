@@ -1,5 +1,5 @@
 //! Holds, joiners and origins: a heart whose gate cannot be built yet holds, saved, its row held;
-//! an answer, a restart or a second heart runs it again as one acquisition with every holder's
+//! an answer, a restart or a second heart runs it again, one request per holder with their own
 //! gate; an un-heart takes one person off; an import's busy identity goes back on the trickle; a
 //! download that holds moves to the hold path.
 
@@ -504,7 +504,7 @@ async fn a_second_heart_joins_the_hold_and_one_unheart_leaves_the_others() {
         heart("brandon").await,
         TrackOutcome::Held(WaitingFor::NotYetProven)
     );
-    // A second person's heart joins the hold and asks again at once, as one acquisition.
+    // A second person's heart joins the hold and asks again at once, each person's own gate.
     assert_eq!(heart("anna").await, TrackOutcome::Held(WaitingFor::NotYetProven));
     let key = "Track:soulseek:help:NotYetProven";
     until(|| !rig.coordinator.resuming.lock().contains(key)).await;
@@ -536,7 +536,7 @@ async fn a_second_heart_joins_the_hold_and_one_unheart_leaves_the_others() {
 }
 
 #[tokio::test]
-async fn a_record_with_two_holders_resumes_as_one_acquisition_with_each_holders_gate() {
+async fn a_record_with_two_holders_resumes_as_one_request_per_holder_with_their_own_gate() {
     let gates = Arc::new(ListedGates::default());
     let holds = memory_holds();
     holds.hold(held(
@@ -556,10 +556,18 @@ async fn a_record_with_two_holders_resumes_as_one_acquisition_with_each_holders_
     until(|| rig.holds.snapshot().is_empty()).await;
 
     let taken = landed.lock().clone();
-    assert_eq!(taken.len(), 1, "one acquisition");
-    let gated: Vec<String> = taken[0].gates().into_iter().map(|gate| gate.user).collect();
-    assert_eq!(gated, ["brandon", "anna"], "each joined with their own gate");
-    assert_eq!(taken[0].origin, Some(AcquisitionOrigin::Heart));
+    assert_eq!(taken.len(), 2, "one request per person");
+    let mut gated: Vec<Vec<String>> = taken
+        .iter()
+        .map(|request| request.gates().into_iter().map(|gate| gate.user).collect())
+        .collect();
+    gated.sort();
+    assert_eq!(gated, [vec!["anna"], vec!["brandon"]], "each with their own gate");
+    assert!(
+        taken
+            .iter()
+            .all(|request| request.origin == Some(AcquisitionOrigin::Heart))
+    );
     stop.cancel();
 }
 
@@ -1022,9 +1030,9 @@ fn land_judged(
     (taken, stop)
 }
 
-/// A record with two holders who heard two mixes resumes as one acquisition: the file of the
-/// first's mix lands for the first, the second stays held, and the record ends only when the
-/// second's own file lands.
+/// A record with two holders who heard two mixes runs one request per person: the file of the
+/// first's mix lands for the first, the second's own requests land nothing that is their mix and
+/// they stay held, and the record ends only when the second's own file lands.
 #[tokio::test]
 async fn two_holders_who_heard_two_mixes_each_wait_for_their_own_file() {
     let gates = Arc::new(ListedGates::default());
@@ -1040,30 +1048,34 @@ async fn two_holders_who_heard_two_mixes_each_wait_for_their_own_file() {
     let (landed, stop) = land_judged(&rig.queue, 1, accepting.clone());
     let key = "Track:soulseek:help:NotYetProven";
     rig.coordinator.resume_held(key);
-    until(|| landed.lock().len() == 1).await;
+    until(|| !landed.lock().is_empty()).await;
     until(|| !rig.coordinator.resuming.lock().contains(key)).await;
-    assert_eq!(landed.lock()[0].gates().len(), 2, "one acquisition, both gates");
+    assert!(
+        landed.lock().iter().all(|request| request.gates().len() == 1),
+        "one person per request"
+    );
     let record = rig.holds.get(key).expect("anna stays held");
     assert_eq!(users(&record), ["anna"]);
     assert!(rig.tracker.is_held("soulseek", "help"));
 
     // Her own mix lands: the record ends.
+    let before = landed.lock().len();
     *accepting.lock() = vec!["anna".to_string()];
     rig.coordinator.resume_held(key);
     until(|| rig.holds.snapshot().is_empty()).await;
-    assert_eq!(landed.lock().len(), 2);
+    assert_eq!(landed.lock().len(), before + 1);
     until(|| !rig.tracker.is_held("soulseek", "help")).await;
     stop.cancel();
 }
 
-/// Two people with different R join one request: the file lands for the one whose gate passed
-/// it, and never counts as the other's, whose own heart goes on down its own chain: the step runs
-/// again as theirs, and with nothing proven for a heart never played it holds for a play.
+/// Two people with different R heart one song: two requests, each with their own gate. The file
+/// lands for the one whose gate passed it, and never counts as the other's, whose own heart goes
+/// on down its own chain, and with nothing proven for a heart never played it holds for a play.
 #[tokio::test]
-async fn two_hearts_joining_one_request_each_get_their_own() {
+async fn two_hearts_of_one_song_each_get_their_own() {
     let rig = rig(Arc::new(ListedGates::default()), None, memory_holds());
     let accepting: Accepting = Arc::new(Mutex::new(vec!["brandon".to_string()]));
-    let (landed, stop) = land_judged(&rig.queue, 2, accepting);
+    let (landed, stop) = land_judged(&rig.queue, 1, accepting);
     let heart = |user: &'static str| {
         let coordinator = rig.coordinator.clone();
         tokio::spawn(async move {
@@ -1093,9 +1105,12 @@ async fn two_hearts_joining_one_request_each_get_their_own() {
         "the 2009 file is not what anna heard, and her own copy proved nothing"
     );
     let landed = landed.lock().clone();
-    assert_eq!(landed.len(), 2, "one download for both, then anna's own");
-    let theirs: Vec<String> = landed[1].gates().into_iter().map(|gate| gate.user).collect();
-    assert_eq!(theirs, ["anna"]);
+    let gated: Vec<Vec<String>> = landed
+        .iter()
+        .map(|request| request.gates().into_iter().map(|gate| gate.user).collect())
+        .collect();
+    assert_eq!(gated[0], ["brandon"], "brandon's own request");
+    assert!(gated[1..].iter().all(|users| users == &["anna"]), "{gated:?}");
     let record = rig
         .holds
         .get("Track:soulseek:help:NotYetProven")
@@ -2113,16 +2128,16 @@ async fn the_persons_own_retry_checks_their_kept_file_and_their_held_heart_again
 
 // ---- Joiners, runs again, rows, routes and what a run holds -----------------------------------
 
-/// A heart that joins an import already running for its song is never credited with the file its
-/// own check never judged: its own step runs, and the file of that step is what lands for it.
+/// A heart for a song an import is already fetching never rides on the import, whose checks never
+/// judge her gate: it waits behind it as her own request, which carries the import's file for her
+/// own gate to judge first, and what lands for her is what her own request lands.
 #[tokio::test]
-async fn a_heart_joining_a_started_import_never_lands_unjudged_and_runs_its_own_step() {
+async fn a_heart_for_a_song_an_import_fetches_waits_behind_it_as_its_own() {
     let rig = rig(Arc::new(ListedGates::default()), None, memory_holds());
     let import = rig.queue.enqueue_holding(
         Some(AcquisitionOrigin::Import),
         Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        HeldFiles::default(),
         &AcquisitionTarget::Shared,
         false,
         "soulseek",
@@ -2140,23 +2155,19 @@ async fn a_heart_joining_a_started_import_never_lands_unjudged_and_runs_its_own_
     let stop = CancellationToken::new();
     let (queue, seen, token) = (rig.queue.clone(), taken.clone(), stop.clone());
     tokio::spawn(async move {
-        let mut n = 0;
         while let Some(request) = queue.dequeue(&token).await {
-            // The import's own checks run while the heart joins it; they judge no gate of its.
-            while n == 0 && request.gates().is_empty() {
+            // The import runs while the heart is queued behind it.
+            while request.gates().is_empty() && queue.waiting_behind("soulseek", "help") == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            if n > 0 {
-                for gate in request.gates() {
-                    request
-                        .completion
-                        .ledger()
-                        .record(&gate.user, gate.origin, GateOutcome::Accepted);
-                }
+            for gate in request.gates() {
+                request
+                    .completion
+                    .ledger()
+                    .record(&gate.user, gate.origin, GateOutcome::Accepted);
             }
-            n += 1;
             seen.lock().push(request.clone());
-            queue.release(&request);
+            queue.release_landed(&request, Some("/music/help.flac"));
             request.completion.try_set_result("/music/help.flac");
         }
     });
@@ -2175,9 +2186,11 @@ async fn a_heart_joining_a_started_import_never_lands_unjudged_and_runs_its_own_
     assert_eq!(outcome, TrackOutcome::Landed("/music/help.flac".into()));
     assert!(import.wait().await.is_ok());
     let taken = taken.lock().clone();
-    assert_eq!(taken.len(), 2, "her own step ran");
+    assert_eq!(taken.len(), 2, "her own request ran");
+    assert!(taken[0].gates().is_empty(), "her gate never rode on the import");
     let hers: Vec<String> = taken[1].gates().into_iter().map(|gate| gate.user).collect();
     assert_eq!(hers, ["anna"]);
+    assert_eq!(taken[1].place().landed, ["/music/help.flac"]);
     stop.cancel();
 }
 
@@ -2383,7 +2396,13 @@ impl HeartGates for PassingGates {
         GateStart::Ready(gate(holder, origin))
     }
 
-    async fn judge_landed(&self, path: &str, _: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
+    async fn judge_landed(
+        &self,
+        path: &str,
+        _: LabelSource,
+        _: &str,
+        gates: &[HeartGate],
+    ) -> Vec<GateVerdict> {
         self.judged.lock().push(path.to_string());
         gates
             .iter()
@@ -3505,6 +3524,68 @@ async fn a_keep_that_landed_before_a_restart_ends_its_hold_as_kept() {
     }
 }
 
+/// A keep that landed just before Octo stopped while someone else still holds the files: after the
+/// restart its person leaves the hold as kept, and nothing is kept again for them; the other holder
+/// keeps waiting with the files.
+#[tokio::test]
+async fn a_keep_that_landed_before_a_restart_is_not_kept_again_while_others_hold_the_files() {
+    use crate::services::local::test_support::FakeLocalLibrary;
+    use crate::services::local::{KeptHeart, LocalSongMapping};
+
+    let library = FakeLocalLibrary::default();
+    library.by_tags.lock().push((
+        "The Beatles".into(),
+        "Help!".into(),
+        None,
+        LocalSongMapping {
+            external_provider: "soulseek".into(),
+            external_id: "help".into(),
+            local_path: "/music/help-brandon.flac".into(),
+            proof_mark: Some("kept by you, version not proven".into()),
+            heart: Some(KeptHeart {
+                users: vec!["brandon".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ));
+    let (rig, dir, _) = owned_rig_with(Arc::new(ListedGates::default()), Some(Arc::new(library)));
+    let file = dir.path().join("held.flac");
+    std::fs::write(&file, b"x").expect("written");
+    let mut record = held(
+        "help",
+        AcquisitionOrigin::AlbumHeart,
+        WaitingFor::NotYetProven,
+        &["brandon", "anna"],
+    );
+    record.album_track = Some(crate::services::common::soulseek_hold_store::HeldAlbumTrack {
+        album_key: "soulseek:album-1".into(),
+        ..Default::default()
+    });
+    record.held_files = vec![file.to_string_lossy().into_owned()];
+    record.keep_requested = vec!["brandon".to_string()];
+    let record = rig.holds.hold(record);
+    let taken: Taken = Arc::default();
+    let (queue, seen, stop) = (rig.queue.clone(), taken.clone(), CancellationToken::new());
+    let token = stop.clone();
+    tokio::spawn(async move {
+        while let Some(request) = queue.dequeue(&token).await {
+            seen.lock().push(request.clone());
+            queue.release(&request);
+            request.completion.try_set_result("/music/help-again.flac");
+        }
+    });
+
+    rig.coordinator.finish_keeps(vec![record.key()]).await;
+
+    assert!(taken.lock().is_empty(), "nothing is kept again for brandon");
+    let left = rig.holds.get(&record.key()).expect("anna still waits");
+    assert_eq!(users(&left), ["anna"]);
+    assert!(left.keep_requested.is_empty());
+    assert!(file.is_file(), "the files stay held for anna");
+    stop.cancel();
+}
+
 /// A family request's gate is built as a request's: never holding, so a song fetched at one
 /// quality is judged by the reading's refusals too.
 #[tokio::test]
@@ -3517,4 +3598,512 @@ async fn a_family_requests_gate_is_built_and_never_holds() {
     assert_eq!(built[0].origin, AcquisitionOrigin::Request);
     assert_eq!(built[0].user, "kim");
     assert!(rig.holds.snapshot().is_empty());
+}
+
+// ---- Deezer's turns, runs that end, and what a run holds --------------------------------------
+
+/// A hold Deezer keeps failing for its own reason never starves the others: each hold waiting for
+/// Deezer has one turn per answer, the one served longest ago first, so after Deezer's next answer
+/// the others run and land while the first still waits.
+#[tokio::test]
+async fn a_hold_deezer_keeps_failing_for_never_starves_the_others() {
+    let (_open, opened) = tokio::sync::watch::channel(true);
+    let gates = Arc::new(DeezerGates {
+        open: opened,
+        built: Mutex::new(Vec::new()),
+        busy: vec!["anna"],
+    });
+    let holds = memory_holds();
+    let since = Utc::now();
+    for (minute, (id, user)) in [("a", "anna"), ("b", "ben"), ("c", "cleo")]
+        .into_iter()
+        .enumerate()
+    {
+        let mut record = held(id, AcquisitionOrigin::Heart, WaitingFor::Deezer, &[user]);
+        record.held_since_utc = since + chrono::TimeDelta::minutes(minute as i64);
+        holds.hold(record);
+    }
+    let answering = Arc::new(Mutex::new(Some(1)));
+    let rig = deezer_rig(gates.clone(), holds, Some(answering.clone()));
+    let (_landed, stop) = land_everything(&rig.queue);
+
+    rig.coordinator.resume_waiting(WaitingFor::Deezer);
+    until(|| !gates.built.lock().is_empty()).await;
+    until(|| rig.coordinator.resuming.lock().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        gates.built.lock().iter().all(|user| user == "anna"),
+        "{:?}",
+        gates.built.lock()
+    );
+    assert_eq!(users_of_holds(&rig.holds), ["anna", "ben", "cleo"]);
+
+    // Deezer answers another call: anna's failure was her own, and the others have their turn.
+    *answering.lock() = Some(2);
+    rig.coordinator.resume_waiting(WaitingFor::Deezer);
+    until(|| users_of_holds(&rig.holds) == ["anna"]).await;
+    let built = gates.built.lock().clone();
+    assert!(built.contains(&"ben".to_string()) && built.contains(&"cleo".to_string()));
+    stop.cancel();
+}
+
+/// The hold whose turn it is at Deezer, which stopped waiting before its run could claim it, gives
+/// the turn up: the next hold waiting for Deezer runs, and a give-up line owed to it is dropped.
+#[tokio::test]
+async fn a_deezer_turn_whose_hold_stopped_waiting_passes_to_the_next() {
+    let holds = memory_holds();
+    holds.hold(held("b", AcquisitionOrigin::Heart, WaitingFor::Deezer, &["ben"]));
+    let rig = deezer_rig(Arc::new(ListedGates::default()), holds, None);
+    let (_landed, stop) = land_everything(&rig.queue);
+    let gone = "Track:soulseek:gone:Deezer";
+    *rig.coordinator.deezer_turn.lock() = Some(gone.to_string());
+    rig.coordinator
+        .gave_up
+        .lock()
+        .insert(gone.to_string(), ("soulseek".into(), "gone".into()));
+
+    rig.coordinator.resume_held(gone);
+
+    assert!(rig.coordinator.gave_up.lock().is_empty(), "nothing is owed to it");
+    until(|| rig.holds.snapshot().is_empty()).await;
+    stop.cancel();
+}
+
+/// A run whose hold another run took after a wake leaves the wake, the turn at Deezer and the
+/// give-up line to that run, whose last pass settles them.
+#[tokio::test]
+async fn a_run_whose_hold_another_run_took_leaves_its_turn_and_line_to_that_run() {
+    let holds = memory_holds();
+    holds.hold(held("help", AcquisitionOrigin::Heart, WaitingFor::Deezer, &["brandon"]));
+    let rig = rig(Arc::new(ListedGates::default()), None, holds);
+    let key = "Track:soulseek:help:Deezer";
+    *rig.coordinator.deezer_turn.lock() = Some(key.to_string());
+    rig.coordinator
+        .gave_up
+        .lock()
+        .insert(key.to_string(), ("soulseek".into(), "help".into()));
+    // A wake came during the run, and another run took the hold before this one could again.
+    rig.coordinator.again.lock().insert(key.to_string());
+    rig.coordinator.resuming.lock().insert(key.to_string());
+
+    assert!(!rig.coordinator.run_again(key));
+
+    assert!(rig.coordinator.again.lock().contains(key), "the wake is that run's");
+    assert_eq!(rig.coordinator.deezer_turn.lock().as_deref(), Some(key));
+    assert!(rig.coordinator.gave_up.lock().contains_key(key));
+}
+
+/// Two chains of one person and song (a song heart's and an album walk's) each hold the copy of
+/// what they heard under a run of their own: the first to end leaves it held for the other, and it
+/// goes free once both have.
+#[tokio::test]
+async fn two_chains_of_one_person_and_song_each_hold_the_heard_copy_for_their_own_run() {
+    let rig = heard_copy_rig(youtube_only(), |_| Arc::new(ListedGates::default()));
+    let brandon = Holder {
+        user: "brandon".into(),
+        heard: Some(heard_help()),
+        ..Default::default()
+    };
+    let first = rig
+        .coordinator
+        .hold_while_running("soulseek", &rig.id, std::slice::from_ref(&brandon), false)
+        .expect("held");
+    let second = rig
+        .coordinator
+        .hold_while_running("soulseek", &rig.id, &[brandon], false)
+        .expect("held");
+    assert_ne!(first.copy_ids(), second.copy_ids());
+    drop(first);
+    assert!(
+        rig.heard.copies.is_held(HEARD_VIDEO),
+        "the other chain still holds it"
+    );
+    drop(second);
+    assert!(!rig.heard.copies.is_held(HEARD_VIDEO));
+}
+
+/// An import whose sound `fpcalc` could not read goes back on its trickle, as one waiting for
+/// MusicBrainz or Deezer does, rather than waiting in a hold.
+#[test]
+fn an_import_whose_sound_could_not_be_read_goes_back_on_its_trickle() {
+    assert!(trickle_waits(WaitingFor::SoundUnread));
+    assert!(!files_hold(AcquisitionOrigin::Import, WaitingFor::SoundUnread));
+    assert!(files_hold(AcquisitionOrigin::Heart, WaitingFor::SoundUnread));
+}
+
+// ---- One request per person, and a hold that serves two routes --------------------------------
+
+/// Gates that are ready, noting each build's person and origin, and judge a held album track's
+/// file by the album's rule (`judge_held`) or the song's (`judge_landed`), noting which, each
+/// accepting it only for the people listed in `accepting`.
+#[derive(Default)]
+struct RouteGates {
+    built: Mutex<Vec<(String, AcquisitionOrigin)>>,
+    judged: Mutex<Vec<(String, &'static str)>>,
+    accepting: Mutex<Vec<String>>,
+}
+
+impl RouteGates {
+    fn verdicts(&self, gates: &[HeartGate], rule: &'static str) -> Vec<GateVerdict> {
+        gates
+            .iter()
+            .map(|gate| {
+                self.judged.lock().push((gate.user.clone(), rule));
+                if self.accepting.lock().contains(&gate.user) {
+                    GateVerdict::Accept {
+                        by: Acceptance::Sound,
+                        tags: octo_core::fingerprint::heart_gate::TagClaim::AsHeard,
+                    }
+                } else {
+                    GateVerdict::Refuse(octo_core::fingerprint::heart_gate::Refusal::AnotherRecording)
+                }
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl HeartGates for RouteGates {
+    async fn build(&self, _: &str, _: &str, holder: &Holder, origin: AcquisitionOrigin) -> GateStart {
+        self.built.lock().push((holder.user.clone(), origin));
+        GateStart::Ready(gate(holder, origin))
+    }
+
+    async fn judge_held(&self, _: &str, _: LabelSource, _: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
+        self.verdicts(gates, "album")
+    }
+
+    async fn judge_landed(&self, _: &str, _: LabelSource, _: &str, gates: &[HeartGate]) -> Vec<GateVerdict> {
+        self.verdicts(gates, "song")
+    }
+}
+
+/// "Help!" alone, as the album "album-1".
+fn help_album() -> Album {
+    Album {
+        id: "album-1".into(),
+        title: "Help!".into(),
+        artist: "The Beatles".into(),
+        songs: vec![octo_core::models::domain::Song {
+            external_provider: Some("soulseek".into()),
+            external_id: Some("help".into()),
+            title: "Help!".into(),
+            artist: "The Beatles".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// brandon's song heart held "not yet proven" with a held file, which anna's album heart then
+/// joins: one hold, now the album's held track.
+async fn song_hold_joined_by_an_album_heart(
+    gates: Arc<RouteGates>,
+) -> (Rig, Arc<AlbumGates>, tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let file = dir.path().join("help.flac").to_string_lossy().into_owned();
+    std::fs::write(&file, b"x").expect("written");
+    let holds = memory_holds();
+    let mut record = held(
+        "help",
+        AcquisitionOrigin::Heart,
+        WaitingFor::NotYetProven,
+        &["brandon"],
+    );
+    record.held_files = vec![file];
+    let key = holds.hold(record).key();
+    let (rig, album_gates) = album_rig(gates, holds);
+    let _gate = rig
+        .coordinator
+        .album_gate_up(
+            "soulseek",
+            "album-1",
+            &help_album(),
+            "anna",
+            AcquisitionOrigin::AlbumHeart,
+        )
+        .await
+        .expect("ready")
+        .expect("a gate");
+    (rig, album_gates, dir, key)
+}
+
+/// A song's hold that an album heart turned into the album's held track is the album heart's, and
+/// each person in it is judged by the heart that keeps them there: the album's by the album's rule,
+/// the song's as a song heart, the song's own gate built as a heart's. When every gate refuses its
+/// file, the album heart is done with the track, and the song's person goes on with the song's own
+/// hold, whose chain runs again as a heart's.
+#[tokio::test]
+async fn a_merged_hold_every_gate_refuses_ends_the_album_heart_and_runs_the_song_heart_again() {
+    let gates = Arc::new(RouteGates::default());
+    let (rig, _album_gates, _dir, key) = song_hold_joined_by_an_album_heart(gates.clone()).await;
+    let merged = rig.holds.get(&key).expect("one hold");
+    assert_eq!(merged.origin, Some(AcquisitionOrigin::AlbumHeart), "the album's held track");
+    let (landed, stop) = land_everything(&rig.queue);
+
+    rig.coordinator.recheck_held(&key).await;
+
+    until(|| landed.lock().len() == 1).await;
+    until(|| rig.holds.snapshot().is_empty()).await;
+    let built = gates.built.lock().clone();
+    assert!(built.contains(&("anna".into(), AcquisitionOrigin::AlbumHeart)), "{built:?}");
+    assert!(built.contains(&("brandon".into(), AcquisitionOrigin::Heart)), "{built:?}");
+    let judged = gates.judged.lock().clone();
+    assert!(judged.contains(&("anna".into(), "album")), "{judged:?}");
+    assert!(judged.contains(&("brandon".into(), "song")), "{judged:?}");
+    let ran = landed.lock()[0].clone();
+    assert_eq!(ran.origin, Some(AcquisitionOrigin::Heart), "a song heart's chain");
+    let users: Vec<String> = ran.gates().into_iter().map(|gate| gate.user).collect();
+    assert_eq!(users, ["brandon"], "anna's album heart is done with the track");
+    stop.cancel();
+}
+
+/// When only the song's person accepts the held file, it lands for them alone, by their own gate
+/// into their own library, and the album heart's held track waits on without it.
+#[tokio::test]
+async fn a_merged_holds_file_only_the_song_heart_accepts_lands_for_it_alone() {
+    let gates = Arc::new(RouteGates::default());
+    gates.accepting.lock().push("brandon".into());
+    let (rig, _album_gates, _dir, key) = song_hold_joined_by_an_album_heart(gates.clone()).await;
+    let (landed, stop) = land_everything(&rig.queue);
+
+    rig.coordinator.recheck_held(&key).await;
+
+    until(|| !landed.lock().is_empty()).await;
+    let ran = landed.lock()[0].clone();
+    let users: Vec<String> = ran.gates().into_iter().map(|gate| gate.user).collect();
+    assert_eq!(users, ["brandon"], "the landing carries his gate alone");
+    assert_eq!(ran.requested_by(), ["brandon"]);
+    until(|| rig.holds.get(&key).is_none_or(|record| users_of(&record) == ["anna"])).await;
+    stop.cancel();
+}
+
+fn users_of(record: &HeldAcquisition) -> Vec<String> {
+    users(record)
+}
+
+/// A held album track the album is un-hearted from goes on as the song's own hold of a heart, and
+/// its next run runs the song's person's chain as a heart's.
+#[tokio::test]
+async fn an_album_track_left_to_its_song_heart_runs_as_a_hearts_hold() {
+    let gates = Arc::new(RouteGates::default());
+    let (rig, _album_gates, _dir, key) = song_hold_joined_by_an_album_heart(gates.clone()).await;
+    assert_eq!(
+        rig.coordinator
+            .leave_album_holds("soulseek", "album-1", "anna"),
+        1
+    );
+    let song = rig.holds.get(&key).expect("brandon's song heart keeps it");
+    assert!(song.album_track.is_none());
+    assert_eq!(song.origin, Some(AcquisitionOrigin::Heart));
+    // Its file is gone by the next run: brandon's chain fetches anew.
+    for file in &song.held_files {
+        let _ = std::fs::remove_file(file);
+    }
+    let (landed, stop) = land_everything(&rig.queue);
+    rig.coordinator.recheck_held(&key).await;
+    until(|| !landed.lock().is_empty()).await;
+    assert_eq!(landed.lock()[0].origin, Some(AcquisitionOrigin::Heart));
+    stop.cancel();
+}
+
+/// An album heart never turns an import's hold of one of its tracks into the album's held track.
+#[tokio::test]
+async fn an_album_heart_never_takes_an_imports_hold_of_its_track() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let file = dir.path().join("help.flac").to_string_lossy().into_owned();
+    std::fs::write(&file, b"x").expect("written");
+    let holds = memory_holds();
+    let mut record = held(
+        "help",
+        AcquisitionOrigin::Import,
+        WaitingFor::AcoustId,
+        &["brandon"],
+    );
+    record.held_files = vec![file];
+    let key = holds.hold(record).key();
+    let (rig, _album_gates) = album_rig(Arc::new(RouteGates::default()), holds);
+    let _gate = rig
+        .coordinator
+        .album_gate_up(
+            "soulseek",
+            "album-1",
+            &help_album(),
+            "anna",
+            AcquisitionOrigin::AlbumHeart,
+        )
+        .await
+        .expect("ready")
+        .expect("a gate");
+    let import = rig.holds.get(&key).expect("held");
+    assert!(import.album_track.is_none());
+    assert_eq!(users(&import), ["brandon"]);
+}
+
+/// An album heart that joins a song's hold holding no file (it waits for MusicBrainz) stays in it
+/// by the album, the album named, and the hold stays the song's: once MusicBrainz answers, each
+/// person's own chain runs, the album heart's as an album heart's. Taking the album heart back
+/// leaves it.
+#[tokio::test]
+async fn an_album_heart_joining_a_song_hold_with_no_file_runs_its_own_chain_once_it_answers() {
+    use crate::services::common::soulseek_hold_store::HoldRoute;
+
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("brandon", WaitingFor::MusicBrainz);
+    gates.hold("anna", WaitingFor::MusicBrainz);
+    let holds = memory_holds();
+    let key = holds
+        .hold(held(
+            "help",
+            AcquisitionOrigin::Heart,
+            WaitingFor::MusicBrainz,
+            &["brandon"],
+        ))
+        .key();
+    let (rig, album_gates) = album_rig(gates.clone(), holds);
+    let _album = album_gates.register(
+        "soulseek",
+        "album-1",
+        AlbumGate {
+            user: "anna".into(),
+            origin: AcquisitionOrigin::AlbumHeart,
+            tracks: vec![help_on_the_album()],
+        },
+        Vec::<String>::new(),
+    );
+    let outcome = rig
+        .coordinator
+        .acquire_track_outcome(
+            "soulseek",
+            "help",
+            Some("anna"),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::AlbumHeart,
+        )
+        .await
+        .expect("ran");
+    assert_eq!(outcome, TrackOutcome::Held(WaitingFor::MusicBrainz));
+    until(|| !rig.coordinator.resuming.lock().contains(&key)).await;
+    let joined = rig.holds.get(&key).expect("one hold");
+    assert!(joined.album_track.is_none(), "still the song's hold");
+    assert_eq!(users(&joined), ["brandon", "anna"]);
+    assert_eq!(joined.holders[1].routes_in(&joined), [HoldRoute::Album]);
+    assert_eq!(
+        joined.holders[1]
+            .context
+            .as_ref()
+            .map(|context| context.catalog_album_id.as_str()),
+        Some("album-1")
+    );
+
+    // MusicBrainz answers: each person's own chain runs.
+    let (landed, stop) = land_everything(&rig.queue);
+    gates.ready("brandon");
+    gates.ready("anna");
+    rig.coordinator.recheck_held(&key).await;
+    until(|| rig.holds.snapshot().is_empty()).await;
+    let ran: Vec<(Vec<String>, Option<AcquisitionOrigin>)> = landed
+        .lock()
+        .iter()
+        .map(|request| {
+            (
+                request.gates().into_iter().map(|gate| gate.user).collect(),
+                request.origin,
+            )
+        })
+        .collect();
+    assert!(
+        ran.contains(&(vec!["anna".to_string()], Some(AcquisitionOrigin::AlbumHeart))),
+        "{ran:?}"
+    );
+    assert!(
+        ran.contains(&(vec!["brandon".to_string()], Some(AcquisitionOrigin::Heart))),
+        "{ran:?}"
+    );
+    stop.cancel();
+}
+
+/// Taking back an album heart that joined a song's hold holding no file takes them off it.
+#[tokio::test]
+async fn taking_back_an_album_heart_leaves_the_song_hold_it_joined_with_no_file() {
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("brandon", WaitingFor::MusicBrainz);
+    gates.hold("anna", WaitingFor::MusicBrainz);
+    let holds = memory_holds();
+    let key = holds
+        .hold(held(
+            "help",
+            AcquisitionOrigin::Heart,
+            WaitingFor::MusicBrainz,
+            &["brandon"],
+        ))
+        .key();
+    let (rig, album_gates) = album_rig(gates, holds);
+    let _album = album_gates.register(
+        "soulseek",
+        "album-1",
+        AlbumGate {
+            user: "anna".into(),
+            origin: AcquisitionOrigin::AlbumHeart,
+            tracks: vec![help_on_the_album()],
+        },
+        Vec::<String>::new(),
+    );
+    rig.coordinator
+        .acquire_track_outcome(
+            "soulseek",
+            "help",
+            Some("anna"),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::AlbumHeart,
+        )
+        .await
+        .expect("ran");
+    until(|| !rig.coordinator.resuming.lock().contains(&key)).await;
+    assert_eq!(
+        rig.coordinator
+            .leave_album_holds("soulseek", "album-1", "anna"),
+        1
+    );
+    assert_eq!(users(&rig.holds.get(&key).expect("brandon's")), ["brandon"]);
+}
+
+/// A hold with two people runs one request per person, each carrying that person's gate alone and
+/// going into that person's own library: a download that carries a sound check is one person's.
+#[tokio::test]
+async fn a_hold_of_two_people_runs_one_request_per_person() {
+    let holds = memory_holds();
+    let key = holds
+        .hold(held(
+            "help",
+            AcquisitionOrigin::Heart,
+            WaitingFor::NotYetProven,
+            &["brandon", "anna"],
+        ))
+        .key();
+    let rig = rig(Arc::new(ListedGates::default()), None, holds);
+    let (landed, stop) = land_everything(&rig.queue);
+    rig.coordinator.recheck_held(&key).await;
+    until(|| rig.holds.snapshot().is_empty()).await;
+    let mut ran: Vec<(Vec<String>, Vec<String>)> = landed
+        .lock()
+        .iter()
+        .map(|request| {
+            (
+                request.gates().into_iter().map(|gate| gate.user).collect(),
+                request.requested_by(),
+            )
+        })
+        .collect();
+    ran.sort();
+    assert_eq!(
+        ran,
+        [
+            (vec!["anna".to_string()], vec!["anna".to_string()]),
+            (vec!["brandon".to_string()], vec!["brandon".to_string()]),
+        ]
+    );
+    stop.cancel();
 }

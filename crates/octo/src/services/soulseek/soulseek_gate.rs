@@ -276,6 +276,70 @@ impl SoulseekDownloadService {
         }
     }
 
+    /// A file of the song another person's request landed while this download waited behind it,
+    /// judged by this download's own gates as a fresh file is (a hearted album's track by the
+    /// album's rule, a Wait for lossless play by its own gate, built now), and never moved or
+    /// deleted: whether one passes it, each gate's verdict written in the ledger. None when no gate
+    /// of this download judges by sound.
+    pub(crate) async fn judge_landed_file(
+        &self,
+        base: &BaseDownloadService,
+        download: &mut TrackDownload,
+        path: &str,
+    ) -> Option<bool> {
+        download.refresh_gates();
+        let (proven_somehow, _heard) = self.own_play_gate(download).await;
+        if !proven_somehow {
+            return Some(false);
+        }
+        if !gated(download) {
+            return None;
+        }
+        let track_key = download.song.external_id.clone().unwrap_or_default();
+        let candidate = HeartCandidate {
+            labels: LabelSource::TheFile,
+            identity: None,
+            acquisition_key: download.acquisition_key.clone(),
+        };
+        let album_file = download
+            .gates
+            .iter()
+            .any(|gate| gate.origin == AcquisitionOrigin::AlbumHeart)
+            .then(|| album_gates::title_and_length(path));
+        let mut passed = false;
+        for gate in &download.gates {
+            let mut check = self
+                .verification
+                .verify_for_heart(Path::new(path), &candidate, gate)
+                .await;
+            if let (AcquisitionOrigin::AlbumHeart, Some((title, seconds))) = (gate.origin, &album_file) {
+                check.verdict = album_track_verdict(gate, &check, &download.song, title.as_deref(), *seconds);
+            }
+            let accepted = matches!(check.verdict, GateVerdict::Accept { .. });
+            let text = if accepted {
+                "The copy that landed for someone else is the version you heard"
+            } else {
+                "The copy that landed for someone else is not provably the version you heard"
+            };
+            base.log_step_heard(
+                &track_key,
+                acquisition_event_kinds::CHECK,
+                text,
+                Some(verdict_words(&check.verdict).1),
+                check.verification.heard(),
+            );
+            info!(
+                "The gate of {} ({}) for {track_key}, on the copy that landed for someone else at {path}: {:?}",
+                gate.user,
+                gate.origin.name(),
+                check.verdict
+            );
+            record_joiner(&download.ledger, gate, &check.verdict);
+            passed |= accepted;
+        }
+        Some(passed)
+    }
+
     /// A heart's or a play's file, judged by each asker's own gate. Kept when one gate accepts it
     /// (each gate's verdict written for its asker); held in the one hold path when none accepts and
     /// one holds (a play never holds: its file is thrown away); otherwise not kept.
@@ -822,8 +886,9 @@ impl SoulseekDownloadService {
 
     /// A person's keep of what their hold kept: the first held file still there lands as it is,
     /// nothing judged, marked "kept by you, version not proven", and printed once so a later check
-    /// can read its sound; every other held file goes. Each gate's person counts it as theirs, by
-    /// no proof. None when no held file is left.
+    /// can read its sound; every other held file goes. Only the people whose keep it is count it as
+    /// theirs, by no proof: any other gate on the download records nothing, so its own chain runs
+    /// its own step. None when no held file is left.
     pub(crate) async fn keep_held_file(
         &self,
         base: &BaseDownloadService,
@@ -859,7 +924,12 @@ impl SoulseekDownloadService {
         }));
         download.song.isrc = None;
         download.song.music_brainz_recording_id = None;
-        for gate in &download.gates {
+        for gate in download.gates.iter().filter(|gate| {
+            download
+                .keep_for
+                .iter()
+                .any(|keeper| octo_core::common::dotnet::eq_ignore_case(keeper.trim(), gate.user.trim()))
+        }) {
             download
                 .ledger
                 .record(&gate.user, gate.origin, GateOutcome::Accepted);

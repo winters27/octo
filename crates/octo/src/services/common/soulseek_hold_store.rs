@@ -606,9 +606,10 @@ impl SoulseekHoldStore {
 
     /// Every file under `root` (the one hold path) that waits in a hold's own folder and that no
     /// hold names: a hold that ended before its files went, or a crash between. A keep's copies
-    /// beside a hold's files ([`KEPT_FOR_PREFIX`]) go too: at Octo's start no keep is under way.
-    /// Other folders there (a Lidarr follow's) are not a hold's and are left alone; an emptied hold
-    /// folder goes. Answers how many files went.
+    /// beside a hold's files ([`KEPT_FOR_PREFIX`]) go too, at Octo's start no keep being under
+    /// way, except one a hold names (a joined keep's copy filed as held), and their folder once
+    /// empty. Other folders there (a Lidarr follow's) are not a hold's and are left alone; an
+    /// emptied hold folder goes. Answers how many files went.
     pub fn sweep_unnamed(&self, root: &Path) -> usize {
         let named: std::collections::HashSet<PathBuf> = self
             .held
@@ -640,10 +641,15 @@ impl SoulseekHoldStore {
                         .file_name()
                         .is_some_and(|name| name.to_string_lossy().starts_with(KEPT_FOR_PREFIX));
                 if copies {
-                    swept += std::fs::read_dir(&file)
-                        .map(|left| left.flatten().filter(|entry| entry.path().is_file()).count())
-                        .unwrap_or_default();
-                    let _ = std::fs::remove_dir_all(&file);
+                    if let Ok(left) = std::fs::read_dir(&file) {
+                        for copy in left.flatten().map(|entry| entry.path()) {
+                            if copy.is_file() && !named.contains(&copy) && std::fs::remove_file(&copy).is_ok() {
+                                swept += 1;
+                            }
+                        }
+                    }
+                    // Only an empty folder goes.
+                    let _ = std::fs::remove_dir(&file);
                     continue;
                 }
                 if file.is_file() && !named.contains(&file) && std::fs::remove_file(&file).is_ok() {
@@ -675,9 +681,9 @@ fn delete_unnamed_files(ended: &HeldAcquisition, map: &DotnetDictionary<HeldAcqu
     }
 }
 
-/// A song's hold that a hearted album's track joins becomes that album's held track: it takes the
-/// track `joining` brings when it has none, and the people already in it, there by their song,
-/// keep saying so. True when it changed.
+/// A song's hold that a hearted album's track joins becomes that album's held track, run as an
+/// album heart's: it takes the track `joining` brings when it has none, and the people already in
+/// it, there by their song, keep saying so. True when it changed.
 fn take_album_track(kept: &mut HeldAcquisition, joining: Option<HeldAlbumTrack>) -> bool {
     let Some(track) = joining.filter(|_| kept.album_track.is_none()) else {
         return false;
@@ -688,6 +694,7 @@ fn take_album_track(kept: &mut HeldAcquisition, joining: Option<HeldAlbumTrack>)
         }
     }
     kept.album_track = Some(track);
+    kept.origin = Some(AcquisitionOrigin::AlbumHeart);
     true
 }
 
@@ -1311,6 +1318,32 @@ mod tests {
         assert_eq!(store.sweep_unnamed(&root), 2);
         assert!(!copies.exists());
         assert!(!folder.exists(), "the emptied hold folder goes");
+    }
+
+    /// A keep's copy that a hold names (a joined keep's copy filed as held) stays at start, with its
+    /// folder; the other copies beside it go.
+    #[test]
+    fn a_keeps_copy_a_hold_names_stays_at_start() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path().join("held");
+        let folder = root.join("Track_soulseek_x");
+        let copies = folder.join(format!("{KEPT_FOR_PREFIX}0123456789abcdef"));
+        std::fs::create_dir_all(&copies).expect("a folder");
+        let named = copies.join("a.flac");
+        std::fs::write(&named, b"x").expect("written");
+        std::fs::write(copies.join("b.flac"), b"x").expect("written");
+        let store = SoulseekHoldStore::new(None::<PathBuf>);
+        store.hold(HeldAcquisition {
+            provider: "soulseek".into(),
+            external_id: "x".into(),
+            requested_by: Some("brandon".into()),
+            waiting_for: Some(WaitingFor::NotYetProven),
+            held_files: vec![named.to_string_lossy().into_owned()],
+            ..Default::default()
+        });
+        assert_eq!(store.sweep_unnamed(&root), 1);
+        assert!(named.is_file(), "the hold's own file stays");
+        assert!(!copies.join("b.flac").exists());
     }
 
     /// A person's entry replaced by one heard later keeps the album they listened from and the

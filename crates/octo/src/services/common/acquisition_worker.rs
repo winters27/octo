@@ -181,8 +181,9 @@ impl AcquisitionWorker {
         match attempt {
             Ok(path) => {
                 // Released first, as a failure is: a joiner whose own gate never judged the file
-                // runs its own step at once, and must never join this finished request again.
-                self.queue.release(&request);
+                // runs its own step at once, and must never join this finished request again. The
+                // next request of the song waiting behind this one judges this file first.
+                self.queue.release_landed(&request, Some(&path));
                 request.completion.try_set_result(path.clone());
                 info!(
                     "Acquisition finished for {}:{} -> {path}",
