@@ -1079,6 +1079,26 @@ fn a_merged_away_id_in_the_answer_passes_a1() {
     );
 }
 
+/// A file whose answer names only another recording of R's song, which MusicBrainz gave up on
+/// saying what it is now, is ambiguous, never refused: that recording may still be R's.
+#[test]
+fn a_recording_of_rs_song_musicbrainz_gave_up_on_reads_ambiguous() {
+    let file = || facts(answered(vec![help("never-answered", &[ISRC_2009], 50)]));
+    let mut gave_up = file();
+    gave_up
+        .current_recordings
+        .push(("never-answered".into(), MusicBrainzFact::GaveUp));
+    assert_eq!(
+        never_played().judge(&gave_up, MATCH_SCORE),
+        Judgement::Verdict(GateVerdict::Undecided(Undecided::NotYetProven))
+    );
+    assert_eq!(
+        r_stays().judge(&gave_up, MATCH_SCORE),
+        Judgement::Needs(Need::HeardMaster),
+        "something heard may still pass it as the heard master"
+    );
+}
+
 /// Proof 2 refuses a file over the line against the heard audio whatever else it is; it never
 /// applies when the stream stood in with another song, and for a heart never played only against
 /// a stand-in that is its reference.

@@ -84,11 +84,14 @@ pub enum WaitingFor {
     Shim,
     /// Nothing could be proven yet; a play of the song, a proof or un-hearting ends it.
     NotYetProven,
+    /// `fpcalc` could not print the sound the catalog's clip check reads; Octo's next start or the
+    /// holder's next play of the song runs the check again.
+    SoundUnread,
 }
 
 impl WaitingFor {
     /// Every wait, in declaration order.
-    pub const ALL: [WaitingFor; 7] = [
+    pub const ALL: [WaitingFor; 8] = [
         Self::MusicBrainz,
         Self::LidarrIndexers,
         Self::AcoustId,
@@ -96,6 +99,7 @@ impl WaitingFor {
         Self::Deezer,
         Self::Shim,
         Self::NotYetProven,
+        Self::SoundUnread,
     ];
 
     /// The wait's name, as a hold's key and the hold file carry it.
@@ -108,6 +112,7 @@ impl WaitingFor {
             Self::Deezer => "Deezer",
             Self::Shim => "Shim",
             Self::NotYetProven => "NotYetProven",
+            Self::SoundUnread => "SoundUnread",
         }
     }
 }
@@ -280,10 +285,10 @@ pub enum ClipReading {
 }
 
 impl ClipReading {
-    /// What a heart holds under when `fpcalc` could not print for its clip check: Deezer's wait,
-    /// whose holds run again at Octo's next start, at the song's next play, and when Deezer
-    /// answers again after a call it did not answer.
-    pub const UNPRINTED_WAITS_FOR: WaitingFor = WaitingFor::Deezer;
+    /// What a heart holds under when `fpcalc` could not print for its clip check: a wait of its
+    /// own, whose holds run again at Octo's next start and at the holder's next play of the song,
+    /// never because Deezer answered.
+    pub const UNPRINTED_WAITS_FOR: WaitingFor = WaitingFor::SoundUnread;
 }
 
 /// The heard-master check's verdict on one file: whether it is the very master that played.
@@ -938,8 +943,9 @@ impl HeartGate {
 }
 
 /// The file's own reading against R. When it names another recording because a recording of R's
-/// song outside R dominates, MusicBrainz is asked what that recording is now, and a merged-away id
-/// of one of R's recordings counts as R's (the R returned holds it).
+/// song outside R dominates, MusicBrainz is asked what that recording is now: a merged-away id of
+/// one of R's recordings counts as R's (the R returned holds it), and a question MusicBrainz gave
+/// up on leaves the reading ambiguous, since that recording may still be R's.
 fn file_reading(
     answer: &AcoustIdAnswer,
     r: &HeardRecording,
@@ -962,6 +968,13 @@ fn file_reading(
             merged.ids.push(dominant.id.clone());
             Ok((read_answer(answer, &merged, min_score), merged))
         }
+        Some(MusicBrainzFact::GaveUp) => Ok((
+            AnswerReading {
+                reading: Reading::Ambiguous,
+                ..reading
+            },
+            r.clone(),
+        )),
         Some(_) => Ok((reading, r.clone())),
     }
 }
