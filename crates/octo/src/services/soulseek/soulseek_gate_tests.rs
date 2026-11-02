@@ -76,6 +76,8 @@ struct Options {
     lidarr_fetcher: Option<Arc<dyn ILidarrTrackFetcher>>,
     /// MusicBrainz, which the shipped checks ask what a file's own recording tag names.
     music_brainz: Option<Arc<crate::services::fingerprint::MusicBrainzClient>>,
+    /// The ISRC the routing of "Started" carries, which a gate's identity asks MusicBrainz about.
+    started_isrc: Option<&'static str>,
 }
 
 /// A 180 s FLAC whose sound is named, with `isrc` as its own tag.
@@ -143,6 +145,10 @@ async fn gated_with(root: &Root, source: DownloadSource, peers: Vec<Peer>, optio
                 album: Some("Nothing Was the Same".into()),
                 duration: Some(*seconds),
                 track: Some(i as i32 + 1),
+                isrc: options
+                    .started_isrc
+                    .filter(|_| *title == "Started")
+                    .map(str::to_string),
                 ..Default::default()
             });
             Song {
@@ -1092,6 +1098,126 @@ async fn a_heart_joining_an_import_of_a_song_fetched_ahead_is_judged_by_its_own_
     );
     let heart = ledger.outcome_for("anna", AcquisitionOrigin::Heart);
     assert!(matches!(heart, Some(GateOutcome::NotAccepted(_))), "{heart:?}");
+}
+
+// ---- A Wait for lossless play ---------------------------------------------------------------------
+
+/// A Wait for lossless play is queued with no gate and builds its own inside its acquisition: the
+/// request's gates, none, never take its place, so the play's file is judged by it. The faster
+/// peer's file, another recording by its sound, is refused, and the next peer's, the song's own
+/// recording, lands as the play's.
+#[tokio::test]
+async fn a_wait_for_lossless_play_queued_with_no_gate_is_judged_by_the_gate_it_builds() {
+    use crate::services::common::{AcquisitionTarget, TrackAcquisitionQueue};
+    use crate::services::fingerprint::heart_test_support::MusicBrainzByQuestion;
+
+    const CODE: &str = "USCM51300001";
+    let music_brainz = MockServer::builder().start().await;
+    let questions = MusicBrainzByQuestion::default();
+    questions.code(
+        CODE,
+        &json!({"recordings": [{
+            "id": "rec-started", "title": "Started", "length": 180_000, "disambiguation": "",
+            "isrcs": [CODE], "artist-credit": [{"name": "Drake", "artist": {"id": "drake", "name": "Drake"}}],
+        }]})
+        .to_string(),
+    );
+    Mock::given(any())
+        .respond_with(questions)
+        .mount(&music_brainz)
+        .await;
+    let base = url::Url::parse(&format!("{}/ws/2/", music_brainz.uri())).expect("parses");
+    let quick = Duration::from_millis(5);
+    let client = Arc::new(
+        crate::services::fingerprint::MusicBrainzClient::with_base_url(base).with_pace(
+            quick,
+            Duration::from_millis(500),
+            quick,
+        ),
+    );
+    let root = Root::new("octo-gate-lossless-play-");
+    let g = gated_with(
+        &root,
+        DownloadSource::Soulseek,
+        vec![
+            peer(
+                "wrongpeer",
+                FIRST,
+                named_flac("other", "other-master", "another", None),
+                2_000_000,
+            ),
+            peer(
+                "rightpeer",
+                SECOND,
+                named_flac("started", "started-master", "started", None),
+                1_000_000,
+            ),
+        ],
+        Options {
+            key: "key",
+            music_brainz: Some(client),
+            started_isrc: Some(CODE),
+            ..Default::default()
+        },
+    )
+    .await;
+    g.answers.answer(
+        "another",
+        &json!({"status": "ok", "results": [{"id": "fp", "score": 0.97, "recordings": [{
+            "id": "rec-other", "title": "Another Song", "artists": [{"name": "Someone Else"}],
+            "duration": 180, "sources": 40,
+        }]}]})
+        .to_string(),
+    );
+    g.answers.answer("started", &started_clear());
+    // Queued as Wait for lossless queues it: a play, with no gate of its own yet.
+    let queue = TrackAcquisitionQueue::new();
+    let _play = queue.enqueue_as(
+        Some(AcquisitionOrigin::Play),
+        Vec::new(),
+        &AcquisitionTarget::Shared,
+        false,
+        "soulseek",
+        &g.started(),
+        false,
+        false,
+        true,
+        None,
+        true,
+        Some("brandon"),
+        false,
+        None,
+    );
+    let request = queue.dequeue(&CancellationToken::new()).await.expect("the play");
+    let place = request.place();
+    assert!(place.gates.is_empty());
+    let ledger = place.ledger.clone();
+
+    // Run as the acquisition worker runs it: for the play's own requester.
+    let landed = tokio::time::timeout(
+        Duration::from_secs(60),
+        g.walk.service.execute_acquisition_to(
+            "soulseek",
+            &g.started(),
+            false,
+            true,
+            Some(DownloadSource::Soulseek),
+            &CancellationToken::new(),
+            Some(request.requested_by()),
+            false,
+            None,
+            place,
+        ),
+    )
+    .await
+    .expect("within a minute")
+    .expect("the song's own recording lands");
+    assert!(std::path::Path::new(&landed).is_file(), "{landed}");
+    assert_eq!(g.batch_users(), names(&["wrongpeer", "rightpeer"]));
+    assert_eq!(
+        ledger.outcome_for("brandon", AcquisitionOrigin::Play),
+        Some(GateOutcome::Accepted)
+    );
 }
 
 /// What the file's ISRC tag reads back as, so a tagged peer file is known to carry its label.

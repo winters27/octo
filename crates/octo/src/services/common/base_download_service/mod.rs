@@ -187,16 +187,35 @@ pub struct TrackDownload {
 }
 
 impl TrackDownload {
-    /// Every gate of the request now, joiners' included: the gates it started with when it runs
-    /// without a request.
+    /// Every gate of the download now: its own (a play's built inside its acquisition among them)
+    /// with every gate of the request beside them, a request's newer gate for one person and origin
+    /// in place of the one it started with.
     pub fn current_gates(&self) -> Vec<HeartGate> {
-        self.live_gates.current().unwrap_or_else(|| self.gates.clone())
+        let mut gates = self.gates.clone();
+        if let Some(live) = self.live_gates.current() {
+            merge_gates(&mut gates, live);
+        }
+        gates
     }
 
-    /// Takes in the gates of everyone who joined the request since the download started.
+    /// Takes in the gates of everyone who joined the request since the download started, keeping
+    /// every gate the download has already.
     pub fn refresh_gates(&mut self) {
         if let Some(live) = self.live_gates.current() {
-            self.gates = live;
+            merge_gates(&mut self.gates, live);
+        }
+    }
+}
+
+/// Adds each of `live` to `gates`: a gate of a person and origin `gates` has already takes that
+/// one's place, any other joins, and a gate `live` does not list stays.
+fn merge_gates(gates: &mut Vec<HeartGate>, live: Vec<HeartGate>) {
+    for gate in live {
+        match gates.iter_mut().find(|known| {
+            known.origin == gate.origin && dotnet::eq_ignore_case(known.user.trim(), gate.user.trim())
+        }) {
+            Some(known) => *known = gate,
+            None => gates.push(gate),
         }
     }
 }
