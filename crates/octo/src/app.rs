@@ -1354,7 +1354,9 @@ impl Acquisition {
         settings: &Arc<SettingsStore>,
         stores: &Stores,
         notifications: &Arc<NotificationService>,
+        verification: &Arc<DownloadVerificationService>,
     ) {
+        let rounds = Arc::clone(verification);
         let worker = Arc::new(
             AcquisitionWorker::new(
                 self.track_acquisition_queue.clone(),
@@ -1363,7 +1365,8 @@ impl Acquisition {
                 notifications.clone(),
                 Some(stores.download_concurrency.clone()),
             )
-            .with_family(self.family_pool_service.clone() as Arc<dyn FamilyPlacement>),
+            .with_family(self.family_pool_service.clone() as Arc<dyn FamilyPlacement>)
+            .with_end_rounds(Arc::new(move |key: &str| rounds.pause_acquisition(key))),
         );
         workers.register("AcquisitionWorker", move |stopping| worker.clone().run(stopping));
         let resumer = Arc::new(
@@ -3294,7 +3297,13 @@ impl AppState {
             },
             None,
         );
-        acquisition.register_workers(&workers, &settings, &stores, &integrations.notifications);
+        acquisition.register_workers(
+            &workers,
+            &settings,
+            &stores,
+            &integrations.notifications,
+            &tagging.download_verification,
+        );
         let library_actions = LibraryActions::build(
             &settings,
             &stores,

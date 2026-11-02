@@ -490,9 +490,10 @@ fn started_clear() -> String {
 // ---- A2 at Soulseek ------------------------------------------------------------------------------
 
 /// With an empty heard answer only A0 or A2 can keep a file: the first peer's upload of the song,
-/// another master, is not kept and is refused for this heart only; the second peer's file, the very
-/// master that played, is kept as the heard master. Both are checked against one fetch of the heard
-/// video, the round this pass opened.
+/// another master, is not kept, and since nothing could decide which version it is it is
+/// remembered as refused by nobody (a later play may still prove it); the second peer's file, the
+/// very master that played, is kept as the heard master. Both are checked against one fetch of the
+/// heard video, the round this pass opened.
 #[tokio::test]
 async fn an_empty_heard_answer_keeps_the_soulseek_file_that_passes_a2_and_not_the_one_that_fails() {
     let root = Root::new("octo-gate-a2-");
@@ -546,15 +547,61 @@ async fn an_empty_heard_answer_keeps_the_soulseek_file_that_passes_a2_and_not_th
         "never for imports"
     );
     assert!(
-        g.walk
+        !g.walk
             .rejected
-            .is_denied_for_heart(&song, &r, Some("wrongpeer"), Some(FIRST))
+            .is_denied_for_heart(&song, &r, Some("wrongpeer"), Some(FIRST)),
+        "an undecided file is no refusal"
     );
     assert!(
         !g.walk
             .rejected
             .is_denied_for_heart(&song, &r, Some("rightpeer"), Some(SECOND))
     );
+}
+
+/// Three people who heard one video hearted the song: one download judges its file with each
+/// person's gate in turn, each needing the heard master, and the file lands for all three. Their
+/// rounds take turns at one heard-copy place, so the download never waits on itself.
+#[tokio::test]
+async fn three_heard_gates_needing_the_heard_master_in_one_download_finish() {
+    let root = Root::new("octo-gate-three-");
+    let g = gated(
+        &root,
+        DownloadSource::Soulseek,
+        "key",
+        vec![peer(
+            "rightpeer",
+            FIRST,
+            named_flac("started", "heard-master", "nothing", None),
+            1_000_000,
+        )],
+    )
+    .await;
+    let heard = g.heard_video(4_000_000, None, "started", "heard-master").await;
+    let people = ["anna", "ben", "cleo"];
+    let gates: Vec<HeartGate> = people
+        .iter()
+        .map(|user| gate_of(user, Some(heard.clone()), HeardReading::OnlyHeardOrMaster))
+        .collect();
+    let key = acquisition_key("soulseek", &g.started(), false);
+    let builder: &dyn crate::services::common::heart_acquisition_coordinator::HeartGates =
+        g.verification.as_ref();
+    let rounds = builder.open_rounds(&key, &gates);
+    let ledger = GateLedger::default();
+
+    let path = acquire_as(&g, DownloadSource::Soulseek, heart_place(gates, &ledger))
+        .await
+        .expect("the heard master lands");
+    drop(rounds);
+    assert!(std::path::Path::new(&path).is_file(), "{path}");
+    for user in people {
+        assert_eq!(
+            ledger.outcome_for(user, AcquisitionOrigin::Heart),
+            Some(GateOutcome::Accepted),
+            "{user}"
+        );
+    }
+    assert_eq!(g.rig.samples.scratch_use().0, 0, "no heard copy outlives the pass");
 }
 
 /// Another upload of the heard recording that AcoustID has no entry for, and that is not the master

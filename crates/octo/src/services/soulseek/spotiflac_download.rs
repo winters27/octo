@@ -439,6 +439,7 @@ impl SoulseekDownloadService {
                 reason,
                 shared,
                 verdict,
+                ..
             } => {
                 discard_rejected_download(path, started_utc);
                 if shared && verdict.verdict == VerificationVerdict::Mismatch {

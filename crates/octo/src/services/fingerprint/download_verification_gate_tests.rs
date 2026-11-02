@@ -101,13 +101,13 @@ fn waits(built: &GateBuild) -> Option<(WaitingFor, String)> {
         GateBuild::Hold {
             waiting_for, line, ..
         } => Some((*waiting_for, line.clone())),
-        GateBuild::Ready(_) => None,
+        GateBuild::Ready(_) | GateBuild::End { .. } => None,
     }
 }
 
 fn gate_of(built: GateBuild) -> HeartGate {
     match built {
-        GateBuild::Ready(gate) | GateBuild::Hold { gate, .. } => gate,
+        GateBuild::Ready(gate) | GateBuild::Hold { gate, .. } | GateBuild::End { gate, .. } => gate,
     }
 }
 
@@ -468,6 +468,52 @@ fn help_heard(rig: &GateRig) -> HeartGate {
         record,
         HeardReading::RStays { tag: None },
     )
+}
+
+/// Prints nothing, as an fpcalc that is missing or runs out of time.
+struct NoPrints;
+
+#[async_trait::async_trait]
+impl crate::services::prefetch::heard_samples::Printer for NoPrints {
+    async fn raw(&self, _: &std::path::Path, _: i32, _: i32) -> Option<octo_media::audio::RawFingerprint> {
+        None
+    }
+
+    async fn compressed(&self, _: &std::path::Path, _: i32, _: i32) -> Option<(String, i32)> {
+        None
+    }
+}
+
+/// A file fpcalc could not print here is never refused for it: AcoustID was never asked, so the
+/// file is judged as with AcoustID off. Another master is not kept and is no refusal; the master
+/// that played is kept as heard.
+#[tokio::test]
+async fn a_file_fpcalc_could_not_print_is_judged_without_acoust_id() {
+    let rig = gate_rig(GateSetup::default()).await;
+    rig.shim_streams(VIDEO, sound_bytes("-", "help-2009-master", "-"))
+        .await;
+    let gate = help_heard(&rig);
+    rig.rig.samples.use_printer(Arc::new(NoPrints));
+    let other = file(&rig, "other", "help-2009", "another-master", "help", None);
+    let check = rig.service.verify_for_heart(&other, &candidate("x"), &gate).await;
+    assert_eq!(
+        check.verdict,
+        GateVerdict::Undecided(octo_core::fingerprint::heart_gate::Undecided::KeepHeardCopy)
+    );
+    let master = file(&rig, "master", "help-2009", "help-2009-master", "help", None);
+    let check = rig.service.verify_for_heart(&master, &candidate("x"), &gate).await;
+    assert!(
+        matches!(
+            check.verdict,
+            GateVerdict::Accept {
+                by: Acceptance::HeardMaster,
+                ..
+            }
+        ),
+        "{:?}",
+        check.verdict
+    );
+    assert!(rig.answers.asked().is_empty(), "nothing was sent to AcoustID");
 }
 
 /// With AcoustID busy for the file itself, a file that is the very master that played (A2) lands

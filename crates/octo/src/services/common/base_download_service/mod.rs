@@ -152,6 +152,9 @@ pub struct TrackDownload {
     /// The source a backend fetched the song from, when the format alone does not say: a FLAC can
     /// be Lidarr's as well as Soulseek's.
     pub fetched_from: Option<String>,
+    /// The YouTube video the song's file was made from, when a backend fetched it from one: a
+    /// copy fetched ahead keeps it, so a check of what played can read that video's channel.
+    pub fetched_video: Option<String>,
     /// The backend asked for the song to land without a notice of its own (a Lidarr album's songs
     /// that nobody hearted, and the songs of an album heart, which gets one for the album).
     pub muted: bool,
@@ -1195,6 +1198,7 @@ impl BaseDownloadService {
             upgrade_search: options.upgrade_search,
             replacing_path: options.replacement.as_ref().map(|r| r.original_path.clone()),
             fetched_from: None,
+            fetched_video: None,
             muted: false,
             flac_only,
             ahead: options.prefetch,
@@ -1238,8 +1242,8 @@ impl BaseDownloadService {
             None => None,
         };
 
-        let (transferred, fetched_from, muted) = match promoted {
-            Some((landed, fetched_from)) => (Ok(landed), fetched_from, false),
+        let (transferred, fetched_from, fetched_video, muted) = match promoted {
+            Some((landed, fetched_from)) => (Ok(landed), fetched_from, None, false),
             None => {
                 // Parallel only once slskd has proven it files each download in its own folder;
                 // until then the lock is held through the transfer exactly as before. The
@@ -1266,11 +1270,12 @@ impl BaseDownloadService {
                 let TrackDownload {
                     song: downloaded,
                     fetched_from,
+                    fetched_video,
                     muted,
                     ..
                 } = download;
                 song = downloaded;
-                (transferred, fetched_from, muted)
+                (transferred, fetched_from, fetched_video, muted)
             }
         };
         // The transfer's check may have named another album holding the same recording; the
@@ -1459,7 +1464,7 @@ impl BaseDownloadService {
                 song_id,
                 &local_path,
                 song,
-                fetched_from.as_deref(),
+                (fetched_from.as_deref(), fetched_video.as_deref()),
             ));
         }
         if let Some(replacement) = &options.replacement {
@@ -1695,8 +1700,9 @@ impl BaseDownloadService {
         ))
     }
 
-    /// The end of a download ahead: its facts beside the file in the folder, the folder's index
-    /// told, and no record left behind, so a heart waiting on it takes the file from there.
+    /// The end of a download ahead: its facts beside the file in the folder (with the source it
+    /// came from and, for YouTube, its video), the folder's index told, and no record left behind,
+    /// so a heart waiting on it takes the file from there.
     fn keep_ahead(
         &self,
         external_provider: &str,
@@ -1704,7 +1710,7 @@ impl BaseDownloadService {
         song_id: &str,
         local_path: &str,
         song: Song,
-        fetched_from: Option<&str>,
+        (fetched_from, fetched_video): (Option<&str>, Option<&str>),
     ) -> String {
         let path = Path::new(local_path);
         if let Some(seconds) = octo_media::tags::TagFile::open(local_path)
@@ -1714,14 +1720,17 @@ impl BaseDownloadService {
         {
             self.metadata.remember_file_length(external_id, seconds);
         }
-        let sidecar = AheadSidecar::of(
-            external_provider,
-            external_id,
-            path,
-            &song,
-            fetched_from,
-            Utc::now(),
-        );
+        let sidecar = AheadSidecar {
+            video_id: fetched_video.map(str::to_string),
+            ..AheadSidecar::of(
+                external_provider,
+                external_id,
+                path,
+                &song,
+                fetched_from,
+                Utc::now(),
+            )
+        };
         if let Err(e) = write_sidecar(path, &sidecar) {
             warn!("Could not write what was learned beside {local_path}: {e}");
         }

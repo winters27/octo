@@ -89,6 +89,10 @@ pub enum GateBuild {
         line: String,
         question: Option<String>,
     },
+    /// The heart ends before any source runs, with its downloads line: it was never played, no
+    /// video can stand in for it, and the catalog names no recording, so nothing could ever prove
+    /// a copy.
+    End { gate: HeartGate, line: String },
 }
 
 /// What the heart gate reads besides AcoustID: the songs and what each person heard, the heard

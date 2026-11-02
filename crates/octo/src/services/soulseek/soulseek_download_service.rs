@@ -410,6 +410,7 @@ impl SoulseekDownloadService {
                 reason,
                 shared,
                 verdict,
+                ..
             } => {
                 give_back_or_remove(local, refused_to);
                 if shared && verdict.verdict == VerificationVerdict::Mismatch {
@@ -763,6 +764,7 @@ impl SoulseekDownloadService {
                     FileJudged::Keep(verdict) => {
                         verdict.apply_tags_to(&mut download.song);
                         download.song.verification = Some(Box::new(verdict));
+                        download.fetched_video = Some(video_id.clone());
                         return Ok(path);
                     }
                     FileJudged::Hold(held) => return Err(held.into()),
@@ -770,15 +772,22 @@ impl SoulseekDownloadService {
                         let _ = std::fs::remove_file(&path);
                         return Err(not_proven());
                     }
-                    FileJudged::Refuse { reason, verdict, .. } => {
+                    FileJudged::Refuse {
+                        reason,
+                        verdict,
+                        refused,
+                        ..
+                    } => {
                         let _ = std::fs::remove_file(&path);
-                        if names_another_recording(&verdict, &artist, &title, r.duration, &takes) {
+                        if !refused.is_empty()
+                            && names_another_recording(&verdict, &artist, &title, r.duration, &takes)
+                        {
                             // Another recording altogether: refused for the song, as for any download.
                             routing.lock().refuse_video(&video_id);
                             self.id_registry.refuse_video(&track_key, &video_id);
                             self.id_registry.refuse_song_video(&artist, &title, &video_id);
                         } else {
-                            self.deny_for_gates(download, YOUTUBE_PEER, &video_id, &reason);
+                            self.deny_for_gates(download, &refused, YOUTUBE_PEER, &video_id, &reason);
                         }
                         last_refusal = Some(format!("YouTube's video for '{artist} - {title}' {reason}"));
                         if ct.is_cancelled() {
@@ -922,6 +931,7 @@ impl SoulseekDownloadService {
                 verdict.apply_tags_to(song);
             }
             song.verification = Some(Box::new(verdict));
+            download.fetched_video = Some(video_id.clone());
             self.judge_joiners(download, &path, None, LabelSource::TheFile)
                 .await;
             return Ok(path);
@@ -2028,6 +2038,7 @@ impl SoulseekDownloadService {
                             reason,
                             shared,
                             verdict,
+                            refused,
                         } => {
                             if !file_exists(&local_path) {
                                 // Nothing was judged, so nothing is held against the peer: a
@@ -2050,7 +2061,13 @@ impl SoulseekDownloadService {
                             if shared {
                                 self.deny_candidate(hit, routing, &reason);
                             } else {
-                                self.deny_for_gates(download, &hit.username, &hit.filename, &reason);
+                                self.deny_for_gates(
+                                    download,
+                                    &refused,
+                                    &hit.username,
+                                    &hit.filename,
+                                    &reason,
+                                );
                             }
                             if shared && verdict.verdict == VerificationVerdict::Mismatch {
                                 warn!(

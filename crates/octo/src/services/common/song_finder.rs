@@ -1503,7 +1503,7 @@ async fn fetch(
                     ..
                 } => return PickOutcome::skipped(MUSIC_BRAINZ_BUSY),
                 // Nothing else of the catalog is needed to fetch it: the shipped checks decide.
-                GateStart::Hold { .. } => Vec::new(),
+                GateStart::Hold { .. } | GateStart::End { .. } => Vec::new(),
             }
         }
         None => Vec::new(),

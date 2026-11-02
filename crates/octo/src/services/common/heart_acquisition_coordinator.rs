@@ -57,6 +57,18 @@ pub enum GateStart {
         line: String,
         question: Option<String>,
     },
+    /// The heart ends before any source runs, with the line the downloads row shows: nothing
+    /// could ever prove a copy for it.
+    End { gate: HeartGate, line: String },
+}
+
+/// Why no gate of a chain is ready to run its sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateStop {
+    /// Every holder holds; the first wait.
+    Held(WaitingFor),
+    /// Every holder's heart ended, with this line.
+    Ended(String),
 }
 
 /// Builds each heart's, play's or import's gate before its sources run, one per person who
@@ -81,6 +93,10 @@ pub trait HeartGates: Send + Sync {
     fn open_rounds(&self, _acquisition_key: &str, _gates: &[HeartGate]) -> Box<dyn Send> {
         Box::new(())
     }
+
+    /// The open rounds of `acquisition_key` give their heard-copy places back before the chain
+    /// waits in the queue; the next check makes each copy again.
+    fn pause_rounds(&self, _acquisition_key: &str) {}
 
     /// Whether `gate` proves the person's library copy at `path` is the version they heard: its
     /// own clear reading against R, or the very master that played. Without a way to judge it,
@@ -666,6 +682,8 @@ impl HeartAcquisitionCoordinator {
             GateStart::Hold {
                 gate, waiting_for, ..
             } => Err(Box::new((gate, waiting_for))),
+            // A play is never ended this way; with nothing to prove, it fetches nothing.
+            GateStart::End { gate, .. } => Err(Box::new((gate, WaitingFor::NotYetProven))),
         }
     }
 
@@ -1203,7 +1221,8 @@ impl HeartAcquisitionCoordinator {
                 ..Default::default()
             };
             let r = match builder.build(track_provider, &track_id, &holder, origin).await {
-                GateStart::Ready(gate) => gate.r.unwrap_or_else(named),
+                // An album track's gate never ends: it goes on with what is known of it.
+                GateStart::Ready(gate) | GateStart::End { gate, .. } => gate.r.unwrap_or_else(named),
                 // A family request never holds: the track goes on with what is known of it.
                 GateStart::Hold { gate, .. } if origin == AcquisitionOrigin::Request => {
                     gate.r.unwrap_or_else(named)
@@ -1909,6 +1928,7 @@ impl HeartAcquisitionCoordinator {
                             waiting_for.name()
                         );
                     }
+                    GateStart::End { .. } => {}
                 }
             }
             if gates.is_empty() {
@@ -1930,6 +1950,8 @@ impl HeartAcquisitionCoordinator {
                     .iter()
                     .any(|verdict| matches!(verdict, GateVerdict::Accept { .. }))
                 {
+                    // The landing waits in the queue, which never keeps a heard-copy place.
+                    builder.pause_rounds(&acquisition);
                     self.land_album_track(record, target, &gates, &file).await;
                     return;
                 }
@@ -2390,7 +2412,8 @@ impl HeartAcquisitionCoordinator {
     }
 
     /// Each holder's gate, built before any source runs. A holder whose gate holds is filed under
-    /// that wait (`filed` says where); Err with the wait when nobody's gate is ready.
+    /// that wait (`filed` says where); one whose heart ends leaves. Err when nobody's gate is
+    /// ready: the first wait, else the line the hearts ended with.
     async fn gate_up(
         &self,
         provider: &str,
@@ -2399,12 +2422,13 @@ impl HeartAcquisitionCoordinator {
         origin: AcquisitionOrigin,
         holders: &[Holder],
         filed: &mut Vec<(String, String)>,
-    ) -> Result<Vec<HeartGate>, WaitingFor> {
+    ) -> Result<Vec<HeartGate>, GateStop> {
         let Some(builder) = self.extras.gates.clone() else {
             return Ok(Vec::new());
         };
         let mut gates = Vec::new();
         let mut held = None;
+        let mut ended = None;
         for holder in holders {
             // A hearted album's or a family album request's track carries the album's gate: its
             // track's own recording, what the holder heard of it read against that.
@@ -2447,11 +2471,22 @@ impl HeartAcquisitionCoordinator {
                         filed,
                     );
                 }
+                GateStart::End { line, .. } => {
+                    info!(
+                        "{provider}:{external_id} can never be proven for {}: {line}",
+                        holder.user
+                    );
+                    ended.get_or_insert(line);
+                }
             }
         }
-        match held {
-            Some(waiting) if gates.is_empty() => Err(waiting),
-            _ => Ok(gates),
+        if !gates.is_empty() {
+            return Ok(gates);
+        }
+        match (held, ended) {
+            (Some(waiting), _) => Err(GateStop::Held(waiting)),
+            (None, Some(line)) => Err(GateStop::Ended(line)),
+            (None, None) => Ok(gates),
         }
     }
 
@@ -2716,7 +2751,13 @@ impl HeartAcquisitionCoordinator {
             .await
         {
             Ok(gates) => gates,
-            Err(waiting) => return Ok(TrackOutcome::Held(waiting)),
+            Err(GateStop::Held(waiting)) => return Ok(TrackOutcome::Held(waiting)),
+            Err(GateStop::Ended(line)) => {
+                if let Some(tracker) = self.tracker() {
+                    tracker.fail(provider, external_id, Some(&line));
+                }
+                return Ok(TrackOutcome::Failed(line));
+            }
         };
         let mut beside_owned = false;
         if judged && let Some((song, copy)) = self.owned_copy(provider, external_id, &scope).await {

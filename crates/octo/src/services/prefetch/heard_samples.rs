@@ -397,9 +397,13 @@ pub enum TopUp {
 /// What printing the heard audio over the whole song came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WholePrint {
-    Ready(Vec<u32>),
+    /// The raw items, and the song's length in whole seconds when the heard audio was there to
+    /// its end (a held file, or a fetch under its cap).
+    Ready(Vec<u32>, Option<i32>),
     Busy,
     Gone,
+    /// The heard audio is here, and `fpcalc` could not print it.
+    NotPrinted,
 }
 
 /// A local file of the heard audio: one already there (a copy, a library file), or one fetched
@@ -1072,18 +1076,41 @@ impl HeardSamples {
     }
 
     /// The heard audio's raw print over the whole song (`fpcalc -length 0`), from the held file,
-    /// else one fresh fetch.
+    /// else one fresh fetch, with the song's length when that file reaches the song's end.
     pub async fn whole_song_print(&self, heard: &HeardRecord) -> WholePrint {
         let file = match self.heard_file(heard, WHOLE_SONG_CAP_BYTES).await {
             HeardFetch::Ready(file) => file,
             HeardFetch::Busy => return WholePrint::Busy,
             HeardFetch::Gone => return WholePrint::Gone,
         };
+        let whole = match &file {
+            HeardFile::Held(_) => true,
+            HeardFile::Fetched(scratch) => std::fs::metadata(scratch.path())
+                .is_ok_and(|meta| meta.len() < WHOLE_SONG_CAP_BYTES),
+        };
         let _slot = self.slot(FpcalcClass::Heart).await;
         match self.printer().raw(file.path(), 0, self.timeout_seconds()).await {
-            Some(raw) => WholePrint::Ready(raw.items),
-            None => WholePrint::Gone,
+            Some(raw) => {
+                let seconds = (raw.seconds.round() as i32).max(0);
+                WholePrint::Ready(raw.items, (whole && seconds > 0).then_some(seconds))
+            }
+            None => WholePrint::NotPrinted,
         }
+    }
+
+    /// The YouTube video a heard copy fetched ahead was made from, while it is still that copy;
+    /// None for any other source.
+    pub fn copy_video(&self, source: &HeardSource) -> Option<String> {
+        let HeardSource::Copy {
+            key,
+            ready_at,
+            source_file,
+        } = source
+        else {
+            return None;
+        };
+        self.prefetch
+            .copy_video(key, *ready_at, source_file.as_deref())
     }
 
     // ---- Copies a hold keeps --------------------------------------------------------------

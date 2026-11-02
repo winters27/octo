@@ -5,8 +5,8 @@
 //! whose lookup would have to wait for its bulk turn moves its file to the one hold path instead.
 
 use octo_core::fingerprint::heart_gate::{
-    AcquisitionOrigin, FileFacts, GateVerdict, HeardReading, HeardSource, HeartGate, ImportJudgement,
-    Refusal, TagClaim, Undecided, WaitingFor, import_judgement,
+    AcquisitionOrigin, FileFacts, GateVerdict, HeardReading, HeardRecording, HeardSource, HeartGate,
+    ImportJudgement, Refusal, TagClaim, Undecided, WaitingFor, import_judgement,
 };
 use octo_core::fingerprint::verification::{RecordingProof, read_answer};
 
@@ -24,12 +24,15 @@ pub(crate) enum FileJudged {
     /// Keep it, tagged by this verdict.
     Keep(VerificationResult),
     /// It is not kept. `shared` when the file is not the song at all, so the peer's file is
-    /// remembered for every download; otherwise only the gates that refused it remember it.
-    /// `verdict` is the shipped reading of its sound, for the words and the YouTube loop.
+    /// remembered for every download; otherwise only the R of each gate that refused it
+    /// (`refused`) remembers it, and none when no gate refused it (a file no gate could decide is
+    /// thrown away and remembered by nobody). `verdict` is the shipped reading of its sound, for
+    /// the words and the YouTube loop.
     Refuse {
         reason: String,
         shared: bool,
         verdict: VerificationResult,
+        refused: Vec<HeardRecording>,
     },
     /// It waits in the one hold path, where it was moved, and the acquisition holds.
     Hold(AcquisitionHeld),
@@ -327,11 +330,12 @@ impl SoulseekDownloadService {
                 }
             }
             let kept = DownloadVerificationService::kept_verification(check, gate);
+            // The file carries only a code the sound proved: the song's own when it is one of
+            // them, else the first of them, and none when none was proven.
             if let GateVerdict::Accept {
                 tags: TagClaim::Recording { isrcs, .. },
                 ..
             } = &check.verdict
-                && !isrcs.is_empty()
                 && !download
                     .song
                     .isrc
@@ -375,6 +379,7 @@ impl SoulseekDownloadService {
                     reason: "the file could not be moved aside to wait".to_string(),
                     shared: false,
                     verdict: first.verification.clone(),
+                    refused: Vec::new(),
                 };
             };
             for (gate, check) in &checks {
@@ -412,15 +417,22 @@ impl SoulseekDownloadService {
             }
         }
         // Not the song at all only when its audio cannot even be decoded; every other refusal is
-        // one person's version, remembered for them alone.
+        // one person's version, remembered for them alone. A gate that could not decide refuses
+        // nothing: the file is thrown away, and a later play may still prove it.
         let shared = checks.iter().all(|(_, check)| {
             check.verdict == GateVerdict::Refuse(Refusal::Unreadable)
                 && check.verification.verdict == VerificationVerdict::Mismatch
         });
+        let refused = checks
+            .iter()
+            .filter(|(_, check)| matches!(check.verdict, GateVerdict::Refuse(_)))
+            .map(|(gate, _)| gate.r.clone().unwrap_or_default())
+            .collect();
         FileJudged::Refuse {
             reason,
             shared,
             verdict: first.verification.clone(),
+            refused,
         }
     }
 
@@ -512,14 +524,23 @@ impl SoulseekDownloadService {
                 reason: verdict.deny_reason.clone(),
                 shared: true,
                 verdict,
+                refused: Vec::new(),
             };
         }
 
+        let gates_r = || {
+            download
+                .gates
+                .iter()
+                .map(|gate| gate.r.clone().unwrap_or_default())
+                .collect()
+        };
         if self.import_refuses(base, download, path, &mut verdict, labels) {
             return FileJudged::Refuse {
                 reason: "is another recording by AcoustID's reading".to_string(),
                 shared: false,
                 verdict,
+                refused: gates_r(),
             };
         }
         if let Some(why) = self.denied_by_sound(base, download, &verdict) {
@@ -527,6 +548,7 @@ impl SoulseekDownloadService {
                 reason: why.to_string(),
                 shared: false,
                 verdict,
+                refused: gates_r(),
             };
         }
 
@@ -542,6 +564,7 @@ impl SoulseekDownloadService {
                 },
                 reason,
                 shared: true,
+                refused: Vec::new(),
             },
         }
     }
@@ -666,23 +689,20 @@ impl SoulseekDownloadService {
             })
     }
 
-    /// Remembers a peer's file one heart's or play's gate refused, for that gate's song and R only.
+    /// Remembers a peer's file the gates of `refused` (their R) refused, for the song and each of
+    /// those R only. None remembers a file no gate refused.
     pub(crate) fn deny_for_gates(
         &self,
         download: &TrackDownload,
+        refused: &[HeardRecording],
         username: &str,
         filename: &str,
         reason: &str,
     ) {
         let song = download.song.external_id.clone().unwrap_or_default();
-        for gate in &download.gates {
-            self.rejected_peers.deny_for_heart(
-                &song,
-                &gate.r.clone().unwrap_or_default(),
-                Some(username),
-                Some(filename),
-                reason,
-            );
+        for r in refused {
+            self.rejected_peers
+                .deny_for_heart(&song, r, Some(username), Some(filename), reason);
         }
     }
 }
@@ -753,6 +773,7 @@ impl SoulseekDownloadService {
                 FileJudged::Keep(verdict) => {
                     info!("Kept the stream of video {id} that played, as it is: {remuxed}");
                     download.fetched_from = Some("YouTube".to_string());
+                    download.fetched_video = Some(id.clone());
                     verdict.apply_tags_to(&mut download.song);
                     download.song.verification = Some(Box::new(verdict));
                     return Some(Ok(remuxed));

@@ -252,6 +252,66 @@ fn the_heard_answer_reads_in_branch_order() {
     );
 }
 
+/// Another song AcoustID names too faintly to believe (one submission) is never let through as
+/// "nothing proves what played", where the heard audio itself could be kept: the catalog's clip
+/// decides first. Another recording of R's song as faint still reads as before.
+#[test]
+fn a_faint_other_song_in_the_heard_answer_sends_it_to_the_clip() {
+    let r = help_r();
+    let read = |outcome: AcoustIdOutcome| read_heard_answer(&outcome, &r, MATCH_SCORE);
+    assert_eq!(read(answered(vec![wonderwall(1)])), HeardAnswerReading::NeedsClip);
+    // Another song leads, under half the weight.
+    assert_eq!(
+        read(answered(vec![
+            wonderwall(2),
+            recording("y1", "Yesterday", BEATLES, &[], 2),
+            recording("j1", "Hey Jude", BEATLES, &[], 1),
+        ])),
+        HeardAnswerReading::NeedsClip
+    );
+    // Another mix of R's song leads as faintly: nothing proves what played, as before.
+    assert_eq!(
+        read(answered(vec![
+            help(HELP_2015, &[ISRC_2015], 1),
+            wonderwall(1),
+            recording("y1", "Yesterday", BEATLES, &[], 1),
+        ])),
+        HeardAnswerReading::OnlyHeardOrMaster
+    );
+}
+
+/// An R that names no recording (the catalog gave only the song's names) cannot tell one recording
+/// of its song from another: a file AcoustID names as the song reads ambiguous, never another
+/// recording, so the heard master still decides it; what played still becomes R.
+#[test]
+fn with_no_recording_ids_the_song_reads_ambiguous_and_the_master_decides() {
+    let named = HeardRecording {
+        ids: Vec::new(),
+        duplicates: Vec::new(),
+        ..help_r()
+    };
+    let reading = read_answer(&answer(clear()), &named, MATCH_SCORE);
+    assert_eq!(reading.reading, Reading::Ambiguous);
+    let another_song = read_answer(&answer(vec![wonderwall(40)]), &named, MATCH_SCORE);
+    assert_eq!(another_song.reading, Reading::Another);
+    let gate = HeartGate {
+        r: Some(named.clone()),
+        ..r_stays()
+    };
+    let (verdict, asked) = settle(&gate, facts(answered(clear())), Some(HeardMaster::Same));
+    assert_eq!(verdict, as_heard(Acceptance::HeardMaster));
+    assert_eq!(asked, [Need::HeardMaster]);
+    assert_eq!(
+        verdict_of(&gate, facts(answered(clear())), Some(HeardMaster::Differs)),
+        KEEP
+    );
+    let stood_in = read_heard_answer(&answered(clear()), &named, MATCH_SCORE);
+    assert!(
+        matches!(&stood_in, HeardAnswerReading::Becomes(recording) if recording.id == HELP_2009),
+        "{stood_in:?}"
+    );
+}
+
 fn frozen(name: &str) -> AcoustIdAnswer {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(format!("tests/fixtures/heart_album/gate/answers/{name}.json"));
@@ -816,6 +876,107 @@ fn an_isrc_label_with_no_answer_is_asked_of_musicbrainz() {
     assert_eq!(
         gate.judge(&busy, MATCH_SCORE),
         Judgement::Verdict(GateVerdict::Hold(WaitingFor::MusicBrainz))
+    );
+}
+
+/// A file kept as the heard audio or its master claims only the codes the heard answer proved are
+/// its recording's own: a code another recording of the answer carries too is never claimed (one
+/// code is filed under more than one mix), and with none left it claims no ISRC at all, never R's.
+#[test]
+fn a_file_kept_as_heard_claims_only_the_codes_its_sound_proved() {
+    let shared = "GBXYZ0000001";
+    let heard = answer(vec![
+        help(HELP_2009, &[ISRC_2009, shared], 50),
+        recording("y1", "Yesterday", BEATLES, &[shared], 1),
+    ]);
+    assert_eq!(heard_codes(&heard, HELP_2009), [ISRC_2009]);
+    let only_shared = answer(vec![
+        help(HELP_2009, &[shared], 50),
+        recording("y1", "Yesterday", BEATLES, &[shared], 1),
+    ]);
+    assert!(heard_codes(&only_shared, HELP_2009).is_empty());
+    let (became_r, tag) = became(
+        &heard,
+        &weighed(&heard, HELP_2009),
+        &[],
+        &help_r(),
+        MATCH_SCORE,
+    );
+    assert_eq!(tag.as_deref(), Some(HELP_2009));
+    assert_eq!(became_r.tag_isrcs, [ISRC_2009]);
+
+    let tagged = HeartGate {
+        r: Some(HeardRecording {
+            tag_isrcs: Vec::new(),
+            ..help_r()
+        }),
+        ..gate(HeardReading::RStays {
+            tag: Some(HELP_2009.into()),
+        })
+    };
+    assert_eq!(
+        verdict_of(&tagged, facts(answered(clustered())), Some(HeardMaster::Same)),
+        GateVerdict::Accept {
+            by: Acceptance::HeardMaster,
+            tags: TagClaim::Recording {
+                id: HELP_2009.into(),
+                isrcs: Vec::new(),
+            },
+        },
+        "R's own ISRC is never claimed for what the sound did not prove"
+    );
+}
+
+/// The recording of `answer` with `id`, weighed as the answer weighs it.
+fn weighed(answer: &AcoustIdAnswer, id: &str) -> WeighedRecording {
+    read_answer(answer, &HeardRecording::default(), MATCH_SCORE)
+        .recordings
+        .into_iter()
+        .find(|recording| recording.id == id)
+        .expect("the recording is in the answer")
+}
+
+/// A label whose question MusicBrainz gave up on (it failed while MusicBrainz answered others)
+/// says nothing of the file: a recording id or a code it never answered for refuses no clear file,
+/// where a label MusicBrainz knows nothing by still names another recording.
+#[test]
+fn a_label_musicbrainz_gave_up_on_refuses_nothing() {
+    let gate = r_stays();
+    let mut by_id = with_recording_id(answered(clear()), "never-answered");
+    by_id
+        .current_recordings
+        .push(("never-answered".into(), MusicBrainzFact::GaveUp));
+    let accepted = GateVerdict::Accept {
+        by: Acceptance::Sound,
+        tags: TagClaim::Recording {
+            id: HELP_2009.into(),
+            isrcs: vec![ISRC_2009.into()],
+        },
+    };
+    assert_eq!(verdict_of(&gate, by_id, Some(HeardMaster::Differs)), accepted);
+    let code = "GBUM72306558";
+    let mut by_code = with_isrc(AcoustIdOutcome::Busy, code);
+    by_code.isrc_recordings.push((code.into(), MusicBrainzFact::GaveUp));
+    assert_eq!(
+        verdict_of(&gate, by_code, Some(HeardMaster::Differs)),
+        GateVerdict::Hold(WaitingFor::AcoustId),
+        "the file waits for its own answer, never refused by a code nobody answered for"
+    );
+    let mut known_nothing = with_isrc(AcoustIdOutcome::Busy, code);
+    known_nothing
+        .isrc_recordings
+        .push((code.into(), MusicBrainzFact::NotKnown));
+    assert_eq!(
+        verdict_of(&gate, known_nothing, Some(HeardMaster::Differs)),
+        GateVerdict::Refuse(Refusal::Label)
+    );
+    let mut refused_by_id = with_recording_id(answered(clear()), "no-such-recording");
+    refused_by_id
+        .current_recordings
+        .push(("no-such-recording".into(), MusicBrainzFact::NotKnown));
+    assert_eq!(
+        verdict_of(&gate, refused_by_id, Some(HeardMaster::Differs)),
+        GateVerdict::Refuse(Refusal::Label)
     );
 }
 

@@ -12,7 +12,7 @@ use octo_core::settings::{AppSettings, SoulseekSettings};
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
 use parking_lot::Mutex;
 use url::Url;
-use wiremock::matchers::{any, path};
+use wiremock::matchers::{any, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
@@ -24,7 +24,7 @@ use crate::services::metadata::deezer_metadata_service::{DeezerAsked, DeezerMeta
 use crate::services::metadata::deezer_rate_limit_handler::DeezerRateLimitHandler;
 use crate::services::metadata::deezer_rate_limiter::DeezerRateLimiter;
 use crate::services::prefetch::heard_samples::HeardPrints;
-use crate::services::prefetch::heard_samples::tests::{Rig, rig_in};
+use crate::services::prefetch::heard_samples::tests::{Rig, rig_in, song_bytes};
 use crate::services::you_tube::YouTubeResolver;
 
 const OCTO_KEY: &str = "octo-key";
@@ -204,13 +204,13 @@ fn waits(built: &GateBuild) -> Option<(WaitingFor, String)> {
         GateBuild::Hold {
             waiting_for, line, ..
         } => Some((*waiting_for, line.clone())),
-        GateBuild::Ready(_) => None,
+        GateBuild::Ready(_) | GateBuild::End { .. } => None,
     }
 }
 
 fn gate_of(built: GateBuild) -> HeartGate {
     match built {
-        GateBuild::Ready(gate) | GateBuild::Hold { gate, .. } => gate,
+        GateBuild::Ready(gate) | GateBuild::Hold { gate, .. } | GateBuild::End { gate, .. } => gate,
     }
 }
 
@@ -401,22 +401,42 @@ async fn a_heard_sample_answered_with_code_3_runs_the_clip_check() {
     assert_eq!(lookups(&heart).await, 1);
 }
 
-/// A heard lookup is never sent with a guessed or zero length: with no length known and a print
-/// that did not reach the song's end, the catalog's clip reads the sample instead.
+/// A heard lookup is never sent with a guessed or zero length: with no length known and a stored
+/// print that did not reach the song's end, the heard audio itself is printed whole once, and the
+/// lookup is sent with that audio's own length (the whole print kept for the catalog's clip).
 #[tokio::test]
 async fn a_heard_lookup_is_never_sent_with_a_zero_length() {
     let heart = heart(Duration::from_millis(10), None).await;
     acoust_id_answers(&heart, ok(r#"{"status":"ok","results":[]}"#)).await;
+    Mock::given(path("/stream"))
+        .and(query_param("fresh", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("X-Octo-Fresh", "1")
+                .set_body_raw(song_bytes(300.0, 7), "audio/mp4"),
+        )
+        .mount(&heart._shim)
+        .await;
     let id = heart.rig.registry.register(help(None));
-    let built = build(
-        &heart,
-        &id,
-        AcquisitionOrigin::Heart,
-        Some(heard_help(&heart, false)),
-    )
-    .await;
-    assert_eq!(lookups(&heart).await, 0);
-    assert!(matches!(gate_of(built).reading, HeardReading::Clip(_)));
+    let mut prints = ClipPrints::default();
+    let built = heart
+        .service
+        .build_heart_gate(
+            "soulseek",
+            &id,
+            "brandon",
+            AcquisitionOrigin::Heart,
+            Some(heard_help(&heart, false)),
+            &mut prints,
+        )
+        .await;
+    let sent = heart.acoust_id.received_requests().await.unwrap_or_default();
+    assert_eq!(sent.len(), 1);
+    let body = String::from_utf8_lossy(&sent[0].body).to_string();
+    assert!(body.contains("duration=300"), "{body}");
+    assert!(!body.contains("duration=0"), "{body}");
+    assert!(prints.whole_heard.is_some(), "the whole print serves the clip too");
+    assert_eq!(gate_of(built).reading, HeardReading::OnlyHeardOrMaster);
 }
 
 /// A print that reached the song's end gives the length a lookup sends when the routing has none.
@@ -437,16 +457,28 @@ async fn a_print_that_reached_the_end_gives_the_length() {
     assert!(String::from_utf8_lossy(&sent[0].body).contains("duration=139"));
 }
 
-/// A heart never played whose song has nothing to prove a download by holds "not yet proven", with
-/// its line.
+/// A heart never played whose song names no recording and has no video to stand in can never be
+/// proven: it ends with the plain line instead of waiting. With a video whose stand-in names
+/// nothing it holds "not yet proven" for a play, with its line.
 #[tokio::test]
-async fn a_heart_never_played_with_nothing_to_prove_holds_until_a_play() {
+async fn a_heart_never_played_with_nothing_to_prove_ends_and_with_a_video_holds_until_a_play() {
     let heart = heart(Duration::from_millis(10), None).await;
     let id = heart.rig.registry.register(SoulseekRouting {
         you_tube_id: None,
         ..help(Some(139))
     });
     let built = build(&heart, &id, AcquisitionOrigin::Heart, None).await;
+    let GateBuild::End { gate, line } = built else {
+        panic!("it did not end: {built:?}");
+    };
+    assert_eq!(line, crate::services::common::heart_acquisition_coordinator::HEARD_GONE);
+    assert_eq!(gate.reading, HeardReading::NotHeard);
+
+    let with_video = heart.rig.registry.register(SoulseekRouting {
+        title: Some("Ticket to Ride".into()),
+        ..help(Some(190))
+    });
+    let built = build(&heart, &with_video, AcquisitionOrigin::Heart, None).await;
     assert_eq!(
         waits(&built),
         Some((WaitingFor::NotYetProven, NEVER_PLAYED.to_string()))
