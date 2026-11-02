@@ -2338,7 +2338,7 @@ mod tests {
             .into_iter()
             .map(|copy| copy.path)
             .collect();
-        assert_eq!(back, [angel.clone()], "the copy that gave way never comes back");
+        assert_eq!(back, [angel.as_str()], "the copy that gave way never comes back");
         assert!(!pending.kept_copy_for("soulseek:teardrop"));
         assert!(pending.kept_copy_for("soulseek:angel"));
 
