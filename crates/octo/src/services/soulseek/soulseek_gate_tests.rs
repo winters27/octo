@@ -315,8 +315,11 @@ async fn gated_with(root: &Root, source: DownloadSource, peers: Vec<Peer>, optio
     let dir = tempfile::tempdir().expect("the heard samples' folder");
     if let Some(video) = options.heard_copy {
         std::fs::create_dir_all(dir.path().join("copies")).expect("made");
-        std::fs::write(dir.path().join("copies").join(format!("{video}.preview")), vec![0u8; 10])
-            .expect("written");
+        std::fs::write(
+            dir.path().join("copies").join(format!("{video}.preview")),
+            vec![0u8; 10],
+        )
+        .expect("written");
     }
     let holds = Arc::new(SoulseekHoldStore::new(None::<PathBuf>));
     let rig = rig_in(dir.path(), &server.uri(), holds.clone(), 16, 64 << 20);
@@ -1305,7 +1308,9 @@ async fn a_wait_for_lossless_plays_heard_copy_is_held_while_its_gate_is_built() 
     g.answers.answer("started", &started_clear());
     g.answers.answer("heard", &started_clear());
     let heard = g.heard_video(10, None, "started", "started-master").await;
-    g.walk.registry.remember_heard(&g.started(), "brandon", heard, None);
+    g.walk
+        .registry
+        .remember_heard(&g.started(), "brandon", heard, None);
     assert!(g.rig.copies.is_ready(HEARD));
     let _ = copies.set(g.rig.copies.clone());
     let queue = TrackAcquisitionQueue::new();
@@ -1346,16 +1351,18 @@ async fn a_wait_for_lossless_plays_heard_copy_is_held_while_its_gate_is_built() 
     .expect("within a minute");
 
     let kept = kept.lock().clone();
-    assert!(!kept.is_empty(), "MusicBrainz was asked while the gate was built: {landed:?}");
+    assert!(
+        !kept.is_empty(),
+        "MusicBrainz was asked while the gate was built: {landed:?}"
+    );
     assert!(kept.iter().all(|kept| *kept), "the sweep left the heard copy");
     assert!(!g.rig.copies.is_held(HEARD), "free once the download is over");
 }
 
-/// A Wait for lossless play builds its own gate even when someone's gate joined its request before
-/// it started (its person's heart): its file is judged by the play's own gate too.
+/// A Wait for lossless play's download that carries another gate of its person (their heart's) still
+/// builds the play's own gate: its file is judged by the play's own gate too.
 #[tokio::test]
-async fn a_wait_for_lossless_play_a_heart_joined_still_builds_its_own_gate() {
-    use crate::services::common::{AcquisitionTarget, TrackAcquisitionQueue};
+async fn a_wait_for_lossless_play_carrying_another_gate_still_builds_its_own() {
     use crate::services::fingerprint::heart_test_support::MusicBrainzByQuestion;
 
     const CODE: &str = "USCM51300001";
@@ -1401,44 +1408,13 @@ async fn a_wait_for_lossless_play_a_heart_joined_still_builds_its_own_gate() {
     )
     .await;
     g.answers.answer("started", &started_clear());
-    let queue = TrackAcquisitionQueue::new();
-    let _play = queue.enqueue_as(
-        Some(AcquisitionOrigin::Play),
-        Vec::new(),
-        &AcquisitionTarget::Shared,
-        false,
-        "soulseek",
-        &g.started(),
-        false,
-        false,
-        true,
-        None,
-        true,
-        Some("brandon"),
-        false,
-        None,
-    );
-    // Their heart joins before the download starts.
-    let _heart = queue.enqueue_as(
-        Some(AcquisitionOrigin::Heart),
-        vec![gate_of("brandon", None, HeardReading::NotHeard)],
-        &AcquisitionTarget::Shared,
-        false,
-        "soulseek",
-        &g.started(),
-        true,
-        false,
-        true,
-        None,
-        true,
-        Some("brandon"),
-        false,
-        None,
-    );
-    let request = queue.dequeue(&CancellationToken::new()).await.expect("the play");
-    let place = request.place();
-    assert_eq!(place.gates.len(), 1, "the heart's gate rides on the play's request");
-    let ledger = place.ledger.clone();
+    let ledger = GateLedger::default();
+    let place = AcquisitionPlace {
+        origin: Some(AcquisitionOrigin::Play),
+        gates: vec![gate_of("brandon", None, HeardReading::NotHeard)],
+        ledger: ledger.clone(),
+        ..Default::default()
+    };
 
     tokio::time::timeout(
         Duration::from_secs(60),
@@ -1449,7 +1425,7 @@ async fn a_wait_for_lossless_play_a_heart_joined_still_builds_its_own_gate() {
             true,
             Some(DownloadSource::Soulseek),
             &CancellationToken::new(),
-            Some(request.requested_by()),
+            Some(vec!["brandon".to_string()]),
             false,
             None,
             place,

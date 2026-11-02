@@ -487,9 +487,9 @@ impl AcquisitionRequest {
         }
     }
 
-    /// The people this request's sound checks are for, in lower case: nobody for a request with no
-    /// gate (the shipped checks, which every asker shares), else the person of each of its gates,
-    /// and the asker of a play whose gate is built inside its own acquisition.
+    /// The people this request's sound checks are for, in lower case: nobody for a request that
+    /// carries no gate (the shipped checks, which every asker shares), else the person of each of
+    /// its gates.
     fn checked_for(&self) -> Vec<String> {
         let mut people: Vec<String> = self
             .gates
@@ -497,13 +497,6 @@ impl AcquisitionRequest {
             .iter()
             .map(|gate| dotnet::to_lower_invariant(gate.user.trim()))
             .collect();
-        if people.is_empty() && self.origin == Some(AcquisitionOrigin::Play) {
-            people.push(
-                self.first_requester()
-                    .map(|user| dotnet::to_lower_invariant(user.trim()))
-                    .unwrap_or_default(),
-            );
-        }
         people.sort();
         people.dedup();
         people
@@ -1406,13 +1399,15 @@ impl TrackAcquisitionQueue {
         // wait behind the song's running request as its own.
         let known = {
             let mut in_flight = self.in_flight.lock();
-            in_flight.get_mut(&request.key()).map(|song| match song.sharing(&request) {
-                Some(known) => Claimed::Joins(known),
-                None => {
-                    song.behind.push_back(request.clone());
-                    Claimed::Behind
-                }
-            })
+            in_flight
+                .get_mut(&request.key())
+                .map(|song| match song.sharing(&request) {
+                    Some(known) => Claimed::Joins(known),
+                    None => {
+                        song.behind.push_back(request.clone());
+                        Claimed::Behind
+                    }
+                })
         };
         match known {
             Some(Claimed::Joins(known)) => {
@@ -1423,7 +1418,9 @@ impl TrackAcquisitionQueue {
                 if let Some(on_queued) = on_queued {
                     on_queued();
                 }
-                info!("{provider}:{external_id} is being fetched for someone else; this play waits behind it");
+                info!(
+                    "{provider}:{external_id} is being fetched for someone else; this play waits behind it"
+                );
                 return Some(request);
             }
             None => {}

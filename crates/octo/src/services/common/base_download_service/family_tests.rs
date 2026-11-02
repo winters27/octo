@@ -345,7 +345,11 @@ fn worker_over_queue(
             Arc::clone(&queue),
             Arc::clone(&family.service) as Arc<dyn IDownloadService>,
             Arc::new(ExternalIdRegistry::in_memory()),
-            Arc::new(NotificationService::new(Vec::new(), family.world.settings.clone(), None)),
+            Arc::new(NotificationService::new(
+                Vec::new(),
+                family.world.settings.clone(),
+                None,
+            )),
             None,
         )
         .with_family(family.world.pool.clone() as Arc<dyn FamilyPlacement>),
@@ -404,7 +408,11 @@ async fn a_second_members_heart_takes_the_first_ones_file_its_own_gate_passes_wi
     let sams = sam.wait().await.expect("credited to sam");
     assert_eq!(sams, alexs, "one file");
     assert_eq!(family.backend.transfers(), 1, "nothing downloaded again");
-    assert_eq!(*family.backend.judged.lock(), [alexs.clone()], "sam's own gate judged it");
+    assert_eq!(
+        *family.backend.judged.lock(),
+        std::slice::from_ref(&alexs),
+        "sam's own gate judged it"
+    );
     assert!(sam.ledger().accepted("sam"));
     for user in ["alex", "sam"] {
         let link = family.world.pool.link_path(&alexs, user).expect("a link path");
@@ -427,7 +435,7 @@ async fn a_second_members_heart_whose_gate_refuses_the_first_ones_file_downloads
     let alexs = alex.wait().await.expect("landed for alex");
     let sams = sam.wait().await.expect("sam's own");
     assert_eq!(family.backend.transfers(), 2, "sam's own download");
-    assert_eq!(*family.backend.judged.lock(), [alexs.clone()]);
+    assert_eq!(*family.backend.judged.lock(), std::slice::from_ref(&alexs));
     assert_ne!(sams, alexs);
     assert!(Path::new(&sams).is_file());
     let sam_link = family.world.pool.link_path(&alexs, "sam").expect("a link path");

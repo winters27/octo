@@ -101,7 +101,9 @@ async fn a_keep_counts_as_kept_only_for_its_keeper() {
         )
     };
 
-    acquire_as(&g, DownloadSource::Soulseek, place).await.expect("kept");
+    acquire_as(&g, DownloadSource::Soulseek, place)
+        .await
+        .expect("kept");
 
     assert!(ledger.accepted(&keeper.user), "kept for its keeper");
     assert_eq!(

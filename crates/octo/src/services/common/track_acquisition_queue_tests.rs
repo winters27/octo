@@ -341,7 +341,11 @@ async fn two_peoples_hearts_for_one_song_are_two_requests_the_second_behind_the_
     assert_eq!(users(&second), ["bob"]);
     assert_eq!(second.pool_members(), ["bob"]);
     assert_eq!(second.requested_by(), ["bob"]);
-    assert_eq!(second.place().landed, ["/pool/song.flac"], "its own gate judges it first");
+    assert_eq!(
+        second.place().landed,
+        ["/pool/song.flac"],
+        "its own gate judges it first"
+    );
     assert!(!bob.is_completed());
     queue.release(&second);
     assert!(!queue.is_in_flight("soulseek", "song"));

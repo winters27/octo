@@ -1709,9 +1709,10 @@ impl HeartAcquisitionCoordinator {
                 && record.holders.iter().any(|holder| {
                     eq_ignore_case(holder.user.trim(), user.trim())
                         && by_album(holder, record)
-                        && holder.context.as_ref().is_some_and(|context| {
-                            key_of(provider, &context.catalog_album_id) == album_key
-                        })
+                        && holder
+                            .context
+                            .as_ref()
+                            .is_some_and(|context| key_of(provider, &context.catalog_album_id) == album_key)
                 })
         }) {
             if self.leave_by_route(&record, user, HoldRoute::Album) {
@@ -2009,10 +2010,7 @@ impl HeartAcquisitionCoordinator {
     fn deezer_count(&self) -> Option<u64> {
         match &self.extras.deezer_answering {
             Some(answering) => answering(),
-            None => Some(
-                self.deezer_events
-                    .load(std::sync::atomic::Ordering::SeqCst),
-            ),
+            None => Some(self.deezer_events.load(std::sync::atomic::Ordering::SeqCst)),
         }
     }
 
@@ -2089,7 +2087,9 @@ impl HeartAcquisitionCoordinator {
                 debug!("Held {key} still waits for Deezer; every hold waits for its next answer");
                 return;
             }
-            debug!("Held {key} still waits for Deezer, which answered since its turn began; the next hold runs");
+            debug!(
+                "Held {key} still waits for Deezer, which answered since its turn began; the next hold runs"
+            );
         } else {
             self.deezer_turns.lock().remove(key);
             self.deezer_seen.lock().remove(key);
@@ -2690,16 +2690,26 @@ impl HeartAcquisitionCoordinator {
             Ok(path) => {
                 info!("Held {} is proven; it lands at {path}", record.key());
                 for gate in accepting.iter().skip(1) {
-                    self.credit_landed(&record.provider, &record.external_id, &path, &target_of(&gate.user))
-                        .await;
+                    self.credit_landed(
+                        &record.provider,
+                        &record.external_id,
+                        &path,
+                        &target_of(&gate.user),
+                    )
+                    .await;
                 }
                 let proofs = super::GateLedger::default();
                 for (gate, verdict) in verdicts {
-                    crate::services::soulseek::soulseek_download_service::record_joiner(&proofs, gate, verdict);
+                    crate::services::soulseek::soulseek_download_service::record_joiner(
+                        &proofs, gate, verdict,
+                    );
                 }
                 self.after_proofs(AcquisitionOrigin::AlbumHeart, &record.holders, &proofs);
                 self.after_proofs(AcquisitionOrigin::Heart, &record.holders, &proofs);
-                let landed_for: Vec<String> = accepting.iter().map(|gate| gate.user.trim().to_string()).collect();
+                let landed_for: Vec<String> = accepting
+                    .iter()
+                    .map(|gate| gate.user.trim().to_string())
+                    .collect();
                 let album_done = accepting
                     .iter()
                     .any(|gate| gate.origin == AcquisitionOrigin::AlbumHeart);
@@ -2743,8 +2753,18 @@ impl HeartAcquisitionCoordinator {
                 .any(|user| eq_ignore_case(user.trim(), holder.user.trim()))
                 || (album_done && !by_song(holder, &current))
         };
-        let leaving: Vec<Holder> = current.holders.iter().filter(|holder| leaves(holder)).cloned().collect();
-        let staying: Vec<Holder> = current.holders.iter().filter(|holder| !leaves(holder)).cloned().collect();
+        let leaving: Vec<Holder> = current
+            .holders
+            .iter()
+            .filter(|holder| leaves(holder))
+            .cloned()
+            .collect();
+        let staying: Vec<Holder> = current
+            .holders
+            .iter()
+            .filter(|holder| !leaves(holder))
+            .cloned()
+            .collect();
         let album_left = staying.iter().any(|holder| by_album(holder, &current)) && !album_done;
         if staying.is_empty() {
             self.end_album_track(record);

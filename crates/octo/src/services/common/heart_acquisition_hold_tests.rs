@@ -676,7 +676,8 @@ async fn holds_of_every_origin_survive_a_restart_and_come_back_with_their_rows()
     assert!(rig.tracker.is_held("soulseek", "hearted") && rig.tracker.is_held("soulseek", "imported"));
     until(|| rig.coordinator.resuming.lock().is_empty()).await;
 
-    // Their answers come: each is fetched once with its own origin, and every hold ends.
+    // Their answers come: each is fetched with its own origin, the heart once per person in it,
+    // and every hold ends.
     let (landed, stop) = land_everything(&rig.queue);
     gates.ready("brandon");
     gates.ready("anna");
@@ -692,6 +693,7 @@ async fn holds_of_every_origin_survive_a_restart_and_come_back_with_their_rows()
     assert_eq!(
         origins,
         [
+            ("hearted".to_string(), Some(AcquisitionOrigin::Heart)),
             ("hearted".to_string(), Some(AcquisitionOrigin::Heart)),
             ("imported".to_string(), Some(AcquisitionOrigin::Import)),
         ]
@@ -1093,12 +1095,11 @@ async fn two_hearts_of_one_song_each_get_their_own() {
         })
     };
     let brandon = heart("brandon");
-    until(|| rig.queue.is_in_flight("soulseek", "help")).await;
-    let anna = heart("anna");
     assert_eq!(
-        brandon.await.expect("joined"),
+        brandon.await.expect("ran"),
         TrackOutcome::Landed("/music/help.flac".into())
     );
+    let anna = heart("anna");
     assert_eq!(
         anna.await.expect("joined"),
         TrackOutcome::Held(WaitingFor::NotYetProven),
@@ -2494,10 +2495,10 @@ async fn the_row_of_a_person_still_held_is_held_again_after_anothers_file_lands(
         .expect("a row");
     assert_ne!(row.state, AcquisitionState::Done, "{row:?}");
     assert!(rig.tracker.is_held("soulseek", "help"));
-    assert_eq!(
-        rig.tracker.note_of("soulseek", "help").as_deref(),
-        Some("Waiting for NotYetProven")
-    );
+    // Her own chain ran on to its end, and she waits with the line her hold says now.
+    let line = rig.holds.get(key).and_then(|record| record.line);
+    assert!(line.is_some());
+    assert_eq!(rig.tracker.note_of("soulseek", "help"), line);
     stop.cancel();
 }
 
@@ -3674,7 +3675,12 @@ async fn a_deezer_turn_whose_hold_stopped_waiting_passes_to_the_next() {
 #[tokio::test]
 async fn a_run_whose_hold_another_run_took_leaves_its_turn_and_line_to_that_run() {
     let holds = memory_holds();
-    holds.hold(held("help", AcquisitionOrigin::Heart, WaitingFor::Deezer, &["brandon"]));
+    holds.hold(held(
+        "help",
+        AcquisitionOrigin::Heart,
+        WaitingFor::Deezer,
+        &["brandon"],
+    ));
     let rig = rig(Arc::new(ListedGates::default()), None, holds);
     let key = "Track:soulseek:help:Deezer";
     *rig.coordinator.deezer_turn.lock() = Some(key.to_string());
@@ -3688,7 +3694,10 @@ async fn a_run_whose_hold_another_run_took_leaves_its_turn_and_line_to_that_run(
 
     assert!(!rig.coordinator.run_again(key));
 
-    assert!(rig.coordinator.again.lock().contains(key), "the wake is that run's");
+    assert!(
+        rig.coordinator.again.lock().contains(key),
+        "the wake is that run's"
+    );
     assert_eq!(rig.coordinator.deezer_turn.lock().as_deref(), Some(key));
     assert!(rig.coordinator.gave_up.lock().contains_key(key));
 }
@@ -3838,7 +3847,11 @@ async fn a_merged_hold_every_gate_refuses_ends_the_album_heart_and_runs_the_song
     let gates = Arc::new(RouteGates::default());
     let (rig, _album_gates, _dir, key) = song_hold_joined_by_an_album_heart(gates.clone()).await;
     let merged = rig.holds.get(&key).expect("one hold");
-    assert_eq!(merged.origin, Some(AcquisitionOrigin::AlbumHeart), "the album's held track");
+    assert_eq!(
+        merged.origin,
+        Some(AcquisitionOrigin::AlbumHeart),
+        "the album's held track"
+    );
     let (landed, stop) = land_everything(&rig.queue);
 
     rig.coordinator.recheck_held(&key).await;
@@ -3846,8 +3859,14 @@ async fn a_merged_hold_every_gate_refuses_ends_the_album_heart_and_runs_the_song
     until(|| landed.lock().len() == 1).await;
     until(|| rig.holds.snapshot().is_empty()).await;
     let built = gates.built.lock().clone();
-    assert!(built.contains(&("anna".into(), AcquisitionOrigin::AlbumHeart)), "{built:?}");
-    assert!(built.contains(&("brandon".into(), AcquisitionOrigin::Heart)), "{built:?}");
+    assert!(
+        built.contains(&("anna".into(), AcquisitionOrigin::AlbumHeart)),
+        "{built:?}"
+    );
+    assert!(
+        built.contains(&("brandon".into(), AcquisitionOrigin::Heart)),
+        "{built:?}"
+    );
     let judged = gates.judged.lock().clone();
     assert!(judged.contains(&("anna".into(), "album")), "{judged:?}");
     assert!(judged.contains(&("brandon".into(), "song")), "{judged:?}");
@@ -3874,7 +3893,12 @@ async fn a_merged_holds_file_only_the_song_heart_accepts_lands_for_it_alone() {
     let users: Vec<String> = ran.gates().into_iter().map(|gate| gate.user).collect();
     assert_eq!(users, ["brandon"], "the landing carries his gate alone");
     assert_eq!(ran.requested_by(), ["brandon"]);
-    until(|| rig.holds.get(&key).is_none_or(|record| users_of(&record) == ["anna"])).await;
+    until(|| {
+        rig.holds
+            .get(&key)
+            .is_none_or(|record| users_of(&record) == ["anna"])
+    })
+    .await;
     stop.cancel();
 }
 
@@ -3889,8 +3913,7 @@ async fn an_album_track_left_to_its_song_heart_runs_as_a_hearts_hold() {
     let gates = Arc::new(RouteGates::default());
     let (rig, _album_gates, _dir, key) = song_hold_joined_by_an_album_heart(gates.clone()).await;
     assert_eq!(
-        rig.coordinator
-            .leave_album_holds("soulseek", "album-1", "anna"),
+        rig.coordinator.leave_album_holds("soulseek", "album-1", "anna"),
         1
     );
     let song = rig.holds.get(&key).expect("brandon's song heart keeps it");
@@ -3940,17 +3963,9 @@ async fn an_album_heart_never_takes_an_imports_hold_of_its_track() {
     assert_eq!(users(&import), ["brandon"]);
 }
 
-/// An album heart that joins a song's hold holding no file (it waits for MusicBrainz) stays in it
-/// by the album, the album named, and the hold stays the song's: once MusicBrainz answers, each
-/// person's own chain runs, the album heart's as an album heart's. Taking the album heart back
-/// leaves it.
-#[tokio::test]
-async fn an_album_heart_joining_a_song_hold_with_no_file_runs_its_own_chain_once_it_answers() {
-    use crate::services::common::soulseek_hold_store::HoldRoute;
-
-    let gates = Arc::new(ListedGates::default());
-    gates.hold("brandon", WaitingFor::MusicBrainz);
-    gates.hold("anna", WaitingFor::MusicBrainz);
+/// brandon's song heart held for MusicBrainz with no file, which anna's album heart of "album-1"
+/// joins while a run of the hold is going (so it runs once that one ends).
+async fn album_heart_joins_a_song_hold_with_no_file(gates: Arc<ListedGates>) -> (Rig, AlbumGateHold, String) {
     let holds = memory_holds();
     let key = holds
         .hold(held(
@@ -3960,8 +3975,9 @@ async fn an_album_heart_joining_a_song_hold_with_no_file_runs_its_own_chain_once
             &["brandon"],
         ))
         .key();
-    let (rig, album_gates) = album_rig(gates.clone(), holds);
-    let _album = album_gates.register(
+    let (rig, album_gates) = album_rig(gates, holds);
+    // The album's gate stays registered while the test holds it, as its walk's chain does.
+    let album = album_gates.register(
         "soulseek",
         "album-1",
         AlbumGate {
@@ -3971,6 +3987,7 @@ async fn an_album_heart_joining_a_song_hold_with_no_file_runs_its_own_chain_once
         },
         Vec::<String>::new(),
     );
+    rig.coordinator.resuming.lock().insert(key.clone());
     let outcome = rig
         .coordinator
         .acquire_track_outcome(
@@ -3984,7 +4001,20 @@ async fn an_album_heart_joining_a_song_hold_with_no_file_runs_its_own_chain_once
         .await
         .expect("ran");
     assert_eq!(outcome, TrackOutcome::Held(WaitingFor::MusicBrainz));
-    until(|| !rig.coordinator.resuming.lock().contains(&key)).await;
+    (rig, album, key)
+}
+
+/// An album heart that joins a song's hold holding no file (it waits for MusicBrainz) stays in it
+/// by the album, the album named, and the hold stays the song's: when it runs, each person's own
+/// chain runs, the album heart's as an album heart's, and the song's person still waits for
+/// MusicBrainz until it answers.
+#[tokio::test]
+async fn an_album_heart_joining_a_song_hold_with_no_file_runs_its_own_chain() {
+    use crate::services::common::soulseek_hold_store::HoldRoute;
+
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("brandon", WaitingFor::MusicBrainz);
+    let (rig, _album, key) = album_heart_joins_a_song_hold_with_no_file(gates.clone()).await;
     let joined = rig.holds.get(&key).expect("one hold");
     assert!(joined.album_track.is_none(), "still the song's hold");
     assert_eq!(users(&joined), ["brandon", "anna"]);
@@ -3997,12 +4027,11 @@ async fn an_album_heart_joining_a_song_hold_with_no_file_runs_its_own_chain_once
         Some("album-1")
     );
 
-    // MusicBrainz answers: each person's own chain runs.
+    // The run that was going ends; the hold runs again for both.
+    rig.coordinator.resuming.lock().remove(&key);
     let (landed, stop) = land_everything(&rig.queue);
-    gates.ready("brandon");
-    gates.ready("anna");
     rig.coordinator.recheck_held(&key).await;
-    until(|| rig.holds.snapshot().is_empty()).await;
+    until(|| !landed.lock().is_empty()).await;
     let ran: Vec<(Vec<String>, Option<AcquisitionOrigin>)> = landed
         .lock()
         .iter()
@@ -4013,14 +4042,22 @@ async fn an_album_heart_joining_a_song_hold_with_no_file_runs_its_own_chain_once
             )
         })
         .collect();
-    assert!(
-        ran.contains(&(vec!["anna".to_string()], Some(AcquisitionOrigin::AlbumHeart))),
-        "{ran:?}"
+    assert_eq!(
+        ran,
+        [(vec!["anna".to_string()], Some(AcquisitionOrigin::AlbumHeart))]
     );
-    assert!(
-        ran.contains(&(vec!["brandon".to_string()], Some(AcquisitionOrigin::Heart))),
-        "{ran:?}"
-    );
+    until(|| {
+        rig.holds
+            .get(&key)
+            .is_some_and(|record| users(&record) == ["brandon"])
+    })
+    .await;
+
+    // MusicBrainz answers: brandon's own chain runs as a heart's.
+    gates.ready("brandon");
+    rig.coordinator.recheck_held(&key).await;
+    until(|| rig.holds.snapshot().is_empty()).await;
+    assert_eq!(landed.lock()[1].origin, Some(AcquisitionOrigin::Heart));
     stop.cancel();
 }
 
@@ -4029,42 +4066,9 @@ async fn an_album_heart_joining_a_song_hold_with_no_file_runs_its_own_chain_once
 async fn taking_back_an_album_heart_leaves_the_song_hold_it_joined_with_no_file() {
     let gates = Arc::new(ListedGates::default());
     gates.hold("brandon", WaitingFor::MusicBrainz);
-    gates.hold("anna", WaitingFor::MusicBrainz);
-    let holds = memory_holds();
-    let key = holds
-        .hold(held(
-            "help",
-            AcquisitionOrigin::Heart,
-            WaitingFor::MusicBrainz,
-            &["brandon"],
-        ))
-        .key();
-    let (rig, album_gates) = album_rig(gates, holds);
-    let _album = album_gates.register(
-        "soulseek",
-        "album-1",
-        AlbumGate {
-            user: "anna".into(),
-            origin: AcquisitionOrigin::AlbumHeart,
-            tracks: vec![help_on_the_album()],
-        },
-        Vec::<String>::new(),
-    );
-    rig.coordinator
-        .acquire_track_outcome(
-            "soulseek",
-            "help",
-            Some("anna"),
-            None,
-            &AcquisitionTarget::Shared,
-            AcquisitionOrigin::AlbumHeart,
-        )
-        .await
-        .expect("ran");
-    until(|| !rig.coordinator.resuming.lock().contains(&key)).await;
+    let (rig, _album, key) = album_heart_joins_a_song_hold_with_no_file(gates).await;
     assert_eq!(
-        rig.coordinator
-            .leave_album_holds("soulseek", "album-1", "anna"),
+        rig.coordinator.leave_album_holds("soulseek", "album-1", "anna"),
         1
     );
     assert_eq!(users(&rig.holds.get(&key).expect("brandon's")), ["brandon"]);

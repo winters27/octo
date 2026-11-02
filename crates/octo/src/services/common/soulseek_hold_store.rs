@@ -643,7 +643,8 @@ impl SoulseekHoldStore {
                 if copies {
                     if let Ok(left) = std::fs::read_dir(&file) {
                         for copy in left.flatten().map(|entry| entry.path()) {
-                            if copy.is_file() && !named.contains(&copy) && std::fs::remove_file(&copy).is_ok() {
+                            if copy.is_file() && !named.contains(&copy) && std::fs::remove_file(&copy).is_ok()
+                            {
                                 swept += 1;
                             }
                         }

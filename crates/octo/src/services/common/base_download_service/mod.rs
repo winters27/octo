@@ -989,7 +989,13 @@ impl BaseDownloadService {
                 .filter(|path| !(landed_first && options.place.landed.contains(path)));
             if let Some(path) = existing
                 && let Some(existing) = self
-                    .already_here(external_provider, external_id, path, &pool_members, options.prefetch)
+                    .already_here(
+                        external_provider,
+                        external_id,
+                        path,
+                        &pool_members,
+                        options.prefetch,
+                    )
                     .await
             {
                 return Ok(existing);
