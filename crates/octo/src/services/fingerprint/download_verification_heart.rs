@@ -30,9 +30,7 @@ use crate::services::fingerprint::heard_master_check::{HeardAudio, RoundGuard};
 use crate::services::fingerprint::music_brainz_client::{
     HeartBusy, HeartQuestions, Lane, code_question, heart_song, recording_question,
 };
-use crate::services::prefetch::heard_samples::{
-    FpcalcClass, Printer, TopUp, WholePrint, sample_id_of,
-};
+use crate::services::prefetch::heard_samples::{FpcalcClass, Printer, TopUp, WholePrint, sample_id_of};
 
 /// The downloads line of a heart whose heard lookup has not answered yet.
 pub const HEARD_LOOKUP_BUSY: &str = "Waiting for AcoustID to check what played";
@@ -317,7 +315,8 @@ impl DownloadVerificationService {
             HeardAnswerReading::RStays { tag } => {
                 // A file kept as heard claims only the codes the heard answer proves are this
                 // recording's own.
-                if let (Some(id), AcoustIdOutcome::Answered(answer), Some(r)) = (&tag, &outcome, gate.r.as_mut())
+                if let (Some(id), AcoustIdOutcome::Answered(answer), Some(r)) =
+                    (&tag, &outcome, gate.r.as_mut())
                 {
                     r.tag_isrcs = heard_codes(answer, id);
                 }
@@ -1230,33 +1229,53 @@ impl HeartGates for DownloadVerificationService {
         if let Some(prints) = self.clip_prints.lock().remove(&song) {
             prints.save_to(&parts.holds, &key, user);
         }
-        match record.waiting_for {
-            Some(WaitingFor::Shim) => {
-                let video = record
-                    .holders
-                    .iter()
-                    .find(|holder| holder.user.trim().eq_ignore_ascii_case(user.trim()))
-                    .and_then(|holder| holder.heard.as_ref())
-                    .and_then(|heard| heard.source.video_id())
-                    .map(str::to_string);
-                if let Some(video) = video {
-                    parts.samples.wait_for_shim(&key, user, &video);
+        let Some(waiting) = record.waiting_for else {
+            return;
+        };
+        let heard = record
+            .holders
+            .iter()
+            .find(|holder| holder.user.trim().eq_ignore_ascii_case(user.trim()))
+            .and_then(|holder| holder.heard.clone());
+        // A hold a file's label check left: its question is asked again until it answers, as a
+        // gate's own question is.
+        let question = (waiting == WaitingFor::MusicBrainz)
+            .then(|| {
+                let song = (
+                    format!("{}:{}", record.provider, record.external_id),
+                    user.trim().to_lowercase(),
+                );
+                self.file_questions.lock().remove(&song)
+            })
+            .flatten();
+        self.wake_for(&key, waiting, user, heard.as_ref(), question);
+    }
+
+    fn wake_for(
+        &self,
+        key: &str,
+        waiting_for: WaitingFor,
+        user: &str,
+        heard: Option<&HeardRecord>,
+        question: Option<String>,
+    ) {
+        let Some(parts) = self.heart.get() else {
+            return;
+        };
+        let key = key.to_string();
+        match waiting_for {
+            WaitingFor::Shim => {
+                if let Some(video) = heard.and_then(|heard| heard.source.video_id()) {
+                    parts.samples.wait_for_shim(&key, user, video);
                 }
             }
-            Some(WaitingFor::AcoustId) => {
+            WaitingFor::AcoustId => {
                 let resume = self.resume.lock().clone();
                 if let Some(resume) = resume {
                     self.client.hold_lookup(Box::new(move || resume(&key)));
                 }
             }
-            Some(WaitingFor::MusicBrainz) => {
-                // A hold a file's label check left: its question is asked again until it
-                // answers, as a gate's own question is.
-                let song = (
-                    format!("{}:{}", record.provider, record.external_id),
-                    user.trim().to_lowercase(),
-                );
-                let question = self.file_questions.lock().remove(&song);
+            WaitingFor::MusicBrainz => {
                 let resume = self.resume.lock().clone();
                 if let (Some(question), Some(resume), Some(music_brainz)) =
                     (question, resume, self.music_brainz.as_ref())
@@ -1264,7 +1283,7 @@ impl HeartGates for DownloadVerificationService {
                     music_brainz.re_ask(
                         &question,
                         Box::new(move |ended| {
-                            debug!("MusicBrainz {ended:?} the label question {key} waited on");
+                            debug!("MusicBrainz {ended:?} the question {key} waited on");
                             resume(&key);
                         }),
                     );

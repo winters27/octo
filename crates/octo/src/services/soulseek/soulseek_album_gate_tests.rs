@@ -231,6 +231,58 @@ async fn an_album_hearts_walk_refuses_another_recording_tries_the_next_peer_and_
     );
 }
 
+/// A hearted album's walk counts a library copy of a track as had only when the track's gate
+/// proves it is the track's own recording: a copy of another recording in the library is left as
+/// it is and the track is fetched.
+#[tokio::test]
+async fn an_album_hearts_walk_fetches_a_track_whose_library_copy_nothing_proves() {
+    let root = Root::new("octo-album-gate-owned-");
+    let gates = Arc::new(AlbumGates::new());
+    let library = Arc::new(crate::services::local::test_support::FakeLocalLibrary::default());
+    let g = gated_with(
+        &root,
+        DownloadSource::Soulseek,
+        vec![peer(
+            "rightpeer",
+            SECOND,
+            named_flac("started", "started-master", "started", None),
+            1_000_000,
+        )],
+        Options {
+            key: "key",
+            album_gates: Some(gates.clone()),
+            library: Some(library.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    g.answers.answer("started", &clear("rec-started", "Started", 180));
+    g.answers
+        .answer("owned-remix", &clear("rec-started-remix", "Started", 180));
+    // The library holds another recording of Started.
+    let owned = std::path::PathBuf::from(root.path()).join("owned.flac");
+    std::fs::write(
+        &owned,
+        named_flac("owned-remix", "remix-master", "owned-remix", None),
+    )
+    .expect("written");
+    library
+        .files
+        .lock()
+        .push((g.started(), owned.to_string_lossy().into_owned()));
+    let gate = album_gate(&g, "brandon", AcquisitionOrigin::AlbumHeart);
+    let _hold = gates.register("soulseek", "album-1", gate, Vec::new());
+
+    walk_album_for(&g, &["brandon"]).await;
+
+    assert!(
+        g.batch_users().iter().any(|user| user == "rightpeer"),
+        "the track was fetched: {:?}",
+        g.batch_users()
+    );
+    assert!(owned.is_file(), "the library's copy is left as it is");
+}
+
 /// The frozen 2009 Help! answer read against a track whose recording is the 2009 one is a version
 /// AcoustID cannot tell apart: the track is held, never refused.
 #[tokio::test]

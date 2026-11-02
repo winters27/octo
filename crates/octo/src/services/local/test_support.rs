@@ -18,6 +18,8 @@ pub(crate) struct FakeLocalLibrary {
     pub scans: AtomicUsize,
     /// Every move of the records at one path to another, in order.
     pub moved: Mutex<Vec<(String, String)>>,
+    /// The library file of an outside song, by its id.
+    pub files: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeLocalLibrary {
@@ -36,8 +38,12 @@ impl FakeLocalLibrary {
 
 #[async_trait]
 impl ILocalLibraryService for FakeLocalLibrary {
-    async fn get_local_path_for_external_song(&self, _: &str, _: &str) -> Option<String> {
-        None
+    async fn get_local_path_for_external_song(&self, _: &str, external_id: &str) -> Option<String> {
+        self.files
+            .lock()
+            .iter()
+            .find(|(id, _)| id == external_id)
+            .map(|(_, path)| path.clone())
     }
 
     async fn register_downloaded_song(&self, _: &Song, _: &str) -> anyhow::Result<()> {

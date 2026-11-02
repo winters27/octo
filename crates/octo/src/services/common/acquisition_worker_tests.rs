@@ -218,7 +218,9 @@ async fn a_finished_download_ends_its_rounds_before_it_completes() {
     );
     let stopping = CancellationToken::new();
     let running = tokio::spawn(worker.run(stopping.clone()));
-    let completion = queue.enqueue("soulseek", "song-1", true, false, true, None, true, None, false, None);
+    let completion = queue.enqueue(
+        "soulseek", "song-1", true, false, true, None, true, None, false, None,
+    );
     let outcome = tokio::time::timeout(Duration::from_secs(10), completion.wait())
         .await
         .expect("the request finishes");

@@ -162,6 +162,33 @@ impl std::fmt::Debug for GateLedger {
     }
 }
 
+/// The gates of a request as they stand now, shared with the download that runs it: a heart or a
+/// play that joins after the download started is judged by its own gate all the same. A handle is
+/// where gates are read from, never part of what a place asks for, so any two compare equal.
+#[derive(Clone, Default)]
+pub struct SharedGates(Option<Arc<Mutex<Vec<HeartGate>>>>);
+
+impl SharedGates {
+    /// Every gate of the request now, or None for a place built without a request.
+    pub fn current(&self) -> Option<Vec<HeartGate>> {
+        self.0.as_ref().map(|gates| gates.lock().clone())
+    }
+}
+
+impl PartialEq for SharedGates {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SharedGates {}
+
+impl std::fmt::Debug for SharedGates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SharedGates").field(&self.current()).finish()
+    }
+}
+
 /// What a Wrong song or Wrong version replacement refuses by sound, from its original's own
 /// AcoustID answer, read once before the download.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +329,8 @@ pub struct AcquisitionPlace {
     pub origin: Option<AcquisitionOrigin>,
     /// One gate per heart or play that asked, each judged on its own.
     pub gates: Vec<HeartGate>,
+    /// The request's gates as they stand when a file is judged, joiners' included.
+    pub live_gates: SharedGates,
     /// The files a resumed hold held in the one hold path, which the download checks first.
     pub held_files: Vec<String>,
     /// Those of `held_files` Lidarr brought, each with where its labels are read from.
@@ -355,8 +384,8 @@ pub struct AcquisitionRequest {
     /// the shipped checks.
     pub origin: Option<AcquisitionOrigin>,
     /// The gates of the hearts and plays that asked, one per person and origin, joiners'
-    /// included.
-    gates: Mutex<Vec<HeartGate>>,
+    /// included, shared with the download that runs the request.
+    gates: Arc<Mutex<Vec<HeartGate>>>,
     /// The files a resumed hold held, which the download checks before any source.
     held_files: Mutex<Vec<String>>,
     /// Those of the held files Lidarr brought, with where their labels are read from.
@@ -380,8 +409,6 @@ struct GatedJoiner {
     users: Vec<String>,
     requested_by: Option<String>,
     target: AcquisitionTarget,
-    /// A heart joining a play: it owns the outcome once its gate passes.
-    heart: Option<bool>,
 }
 
 impl AcquisitionRequest {
@@ -413,7 +440,7 @@ impl AcquisitionRequest {
             pool_members: Mutex::new(Vec::new()),
             flac_only: false,
             origin: None,
-            gates: Mutex::new(Vec::new()),
+            gates: Arc::new(Mutex::new(Vec::new())),
             held_files: Mutex::new(Vec::new()),
             held_lidarr: Mutex::new(Vec::new()),
             joiners: Mutex::new(Vec::new()),
@@ -423,8 +450,10 @@ impl AcquisitionRequest {
         }
     }
 
-    /// A heart or play joining with its own gates: its library, its name and (for a heart joining
-    /// a play) its claim on the outcome wait for its own gate's verdict on the landed file.
+    /// A heart or play joining with its own gates: its library and its name wait for its own
+    /// gate's verdict on the landed file. A heart joining a play claims the outcome at once: from
+    /// now on the play leaves the row alone, whether the download lands or fails, and the heart's
+    /// own chain goes on from it.
     fn join_gated(
         &self,
         gates: &[HeartGate],
@@ -435,23 +464,24 @@ impl AcquisitionRequest {
         for gate in gates {
             self.add_gate(gate.clone());
         }
+        if let Some(notify) = heart {
+            self.join_heart(notify);
+        }
         self.joiners.lock().push(GatedJoiner {
             users: gates.iter().map(|gate| gate.user.trim().to_string()).collect(),
             requested_by: requested_by.map(str::to_string),
             target: target.clone(),
-            heart,
         });
     }
 
     /// The file landed: every gated joiner whose own gate passed it is recorded now, with its
-    /// library, its name and its claim; one its gate did not pass gets none of them. When no gate
-    /// judged the file at all (the shipped checks ran), every joiner is recorded as before.
+    /// library and its name; one with no such verdict (its gate did not pass the file, or never
+    /// judged it) gets neither. A joiner that brought no gate is recorded as before.
     pub(crate) fn settle_joiners(&self) {
         let joiners = std::mem::take(&mut *self.joiners.lock());
         let ledger = self.completion.ledger();
-        let judged = !ledger.is_empty();
         for joiner in joiners {
-            if judged && !joiner.users.iter().any(|user| ledger.accepted(user)) {
+            if !joiner.users.is_empty() && !joiner.users.iter().any(|user| ledger.accepted(user)) {
                 debug!(
                     "{} joined {} and its own gate did not pass the file; no link and no attribution",
                     joiner.users.join(", "),
@@ -461,9 +491,6 @@ impl AcquisitionRequest {
             }
             self.add_requester(joiner.requested_by.as_deref());
             self.add_target(&joiner.target);
-            if let Some(notify) = joiner.heart {
-                self.join_heart(notify);
-            }
         }
     }
 
@@ -557,6 +584,7 @@ impl AcquisitionRequest {
             flac_only: self.flac_only,
             origin: self.origin,
             gates: self.gates(),
+            live_gates: SharedGates(Some(Arc::clone(&self.gates))),
             held_files: self.held_files.lock().clone(),
             held_lidarr: self.held_lidarr.lock().clone(),
             ledger: self.completion.ledger().clone(),

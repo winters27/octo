@@ -180,6 +180,9 @@ impl AcquisitionWorker {
 
         match attempt {
             Ok(path) => {
+                // Released first, as a failure is: a joiner whose own gate never judged the file
+                // runs its own step at once, and must never join this finished request again.
+                self.queue.release(&request);
                 request.completion.try_set_result(path.clone());
                 info!(
                     "Acquisition finished for {}:{} -> {path}",

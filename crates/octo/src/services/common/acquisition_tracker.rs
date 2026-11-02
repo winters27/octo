@@ -574,6 +574,27 @@ impl AcquisitionTracker {
         }
     }
 
+    /// `user` took back their heart of an acquisition nothing holds or fetches any more: they
+    /// leave its row, which goes once nobody is left on it. A row still held for someone, or one
+    /// that finished, stays as it is.
+    pub fn leave_row(&self, provider: &str, external_id: &str, user: &str) {
+        if blank(provider) || blank(external_id) || blank(user) {
+            return;
+        }
+        let key = key_of(provider, external_id);
+        let mut state = self.state.lock();
+        let Some(entry) = state.entries.get_mut(&key) else {
+            return;
+        };
+        if entry.held || entry.finished() {
+            return;
+        }
+        entry.owners.retain(|owner| !eq_ignore_case(owner, user.trim()));
+        if entry.owners.is_empty() {
+            state.entries.remove(&key);
+        }
+    }
+
     /// A held acquisition runs again: its row leaves the line it waited with at once and shows
     /// the search, while its record keeps the row from being pruned until the run ends.
     pub fn resume_row(&self, provider: &str, external_id: &str) {

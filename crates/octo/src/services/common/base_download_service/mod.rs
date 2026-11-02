@@ -170,6 +170,9 @@ pub struct TrackDownload {
     pub origin: Option<AcquisitionOrigin>,
     /// The gate of each heart or play that asked: a file is judged against each on its own.
     pub gates: Vec<HeartGate>,
+    /// The request's gates as they stand now, so a heart or a play that joins while the download
+    /// runs is judged by its own gate.
+    pub live_gates: crate::services::common::SharedGates,
     /// The acquisition's key, which finds each person's open heard-master round.
     pub acquisition_key: String,
     /// Where each gate's verdict on the file is written.
@@ -181,6 +184,21 @@ pub struct TrackDownload {
     /// A person's keep: a file the hold kept lands as it is, or the very audio they heard, and
     /// nothing is searched for.
     pub keep_anyway: bool,
+}
+
+impl TrackDownload {
+    /// Every gate of the request now, joiners' included: the gates it started with when it runs
+    /// without a request.
+    pub fn current_gates(&self) -> Vec<HeartGate> {
+        self.live_gates.current().unwrap_or_else(|| self.gates.clone())
+    }
+
+    /// Takes in the gates of everyone who joined the request since the download started.
+    pub fn refresh_gates(&mut self) {
+        if let Some(live) = self.live_gates.current() {
+            self.gates = live;
+        }
+    }
 }
 
 /// The source-specific parts of the download pipeline. Every call is handed the base, so a
@@ -260,6 +278,12 @@ pub trait DownloadBackend: Send + Sync + 'static {
     /// judged by its own gate, so it counts the copy as its own only when that gate passes it. The
     /// default judges nothing.
     async fn judge_ahead_joiners(&self, _download: &TrackDownload, _path: &str, _identity: HeardSource) {}
+
+    /// Whether `gate` proves the library copy at `path` is the version its person heard (an
+    /// album track's own recording, for a hearted album's walk). The default proves nothing.
+    async fn owned_passes(&self, _path: &str, _gate: &HeartGate) -> bool {
+        false
+    }
 }
 
 /// The notice queue's review: ask one person about a download they can settle by listening. False
@@ -1206,6 +1230,7 @@ impl BaseDownloadService {
             held_lidarr: options.place.held_lidarr.clone(),
             origin: options.place.origin,
             gates: options.place.gates.clone(),
+            live_gates: options.place.live_gates.clone(),
             acquisition_key: acquisition_key(external_provider, external_id, flac_only),
             ledger: options.place.ledger.clone(),
             requested_by: options.requested_by.clone().unwrap_or_default(),
@@ -2008,10 +2033,27 @@ impl BaseDownloadService {
                 .try_collect()
                 .await
                 .unwrap_or_default();
-            let owned: HashMap<String, OwnedCopy> = found
+            let mut owned: HashMap<String, OwnedCopy> = found
                 .into_iter()
                 .filter_map(|(id, copy)| copy.map(|copy| (id, copy)))
                 .collect();
+            // A hearted album's track counts a library copy as its own only when each person's
+            // track gate proves it is the recording that track must be; otherwise it is fetched.
+            if let Some(album_gates) = &self.services.album_gates {
+                let mut unproven = Vec::new();
+                for (id, copy) in &owned {
+                    let gates = album_gates.track_gates(&provider, album_external_id, &askers, id);
+                    for gate in &gates {
+                        if !self.backend.owned_passes(&copy.absolute_path, gate).await {
+                            unproven.push(id.clone());
+                            break;
+                        }
+                    }
+                }
+                for id in unproven {
+                    owned.remove(&id);
+                }
+            }
             let can_be_lossless = self.source_can_be_lossless(source_override);
             let may_upgrade = self.upgrade_allowed(requested_by.as_deref());
             for track in tracks_to_download.iter() {
@@ -2130,6 +2172,36 @@ impl BaseDownloadService {
         Ok(failed == 0)
     }
 
+    /// The library copy a walk's track counts as already had: any copy for a walk nobody gates;
+    /// for a hearted album's track, only when each gated person's own copy is proven by their
+    /// track's gate to be the recording it must be. None when the track is to be fetched.
+    async fn walk_owned_copy(&self, provider: &str, track_id: &str, gates: &[HeartGate]) -> Option<String> {
+        if gates.is_empty() {
+            return self
+                .local_library
+                .get_local_path_for_external_song(provider, track_id)
+                .await
+                .filter(|path| file_exists(path));
+        }
+        let mut first = None;
+        for gate in gates {
+            let theirs = self
+                .local_library
+                .get_local_path_for_external_song_as(Some(&gate.user), provider, track_id)
+                .await
+                .filter(|path| file_exists(path))?;
+            if !self.backend.owned_passes(&theirs, gate).await {
+                debug!(
+                    "Track {track_id} has a copy in the library ({theirs}) nothing proves is the recording {} hearted; it is fetched",
+                    gate.user
+                );
+                return None;
+            }
+            first.get_or_insert(theirs);
+        }
+        first
+    }
+
     /// One track of the walk. The counters are shared by both lanes, so they move atomically.
     async fn walk_track(&self, track: &Song, walk: &Walk<'_>) {
         let provider = self.provider_name();
@@ -2146,12 +2218,7 @@ impl BaseDownloadService {
         let attempt: anyhow::Result<()> = async {
             self.backend.ensure_routing_registered(track);
 
-            if let Some(existing) = self
-                .local_library
-                .get_local_path_for_external_song(provider, track_id)
-                .await
-                .filter(|path| file_exists(path))
-            {
+            if let Some(existing) = self.walk_owned_copy(provider, track_id, &gates).await {
                 debug!("Track {track_id} already downloaded, skipping");
                 self.track(|t| {
                     t.already_in_library(
@@ -2583,6 +2650,12 @@ pub(crate) fn get_extension(path: &str) -> &str {
 
 #[async_trait]
 impl IDownloadService for BaseDownloadService {
+    fn held_root(&self) -> Option<std::path::PathBuf> {
+        let download_path = self.download_path();
+        (!download_path.trim().is_empty())
+            .then(|| crate::services::common::soulseek_hold_store::held_root(Path::new(&download_path)))
+    }
+
     async fn download_song(
         &self,
         external_provider: &str,

@@ -2923,6 +2923,12 @@ impl DownloadBackend for SoulseekDownloadService {
             .await;
     }
 
+    async fn owned_passes(&self, path: &str, gate: &octo_core::fingerprint::heart_gate::HeartGate) -> bool {
+        use crate::services::common::heart_acquisition_coordinator::HeartGates;
+        self.verification.heart_ready()
+            && HeartGates::owned_passes(self.verification.as_ref(), path, gate).await
+    }
+
     // =========================================================================
     // Permanent download path (a star, or a play while in Permanent mode)
     // =========================================================================

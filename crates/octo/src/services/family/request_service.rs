@@ -1512,9 +1512,11 @@ impl RequestFetcher for LiveRequestFetcher {
             RequestQuality::Flac => DownloadSource::Soulseek,
             RequestQuality::Mp3 => DownloadSource::YouTube,
         };
+        // The request's own gate, so the reading's refusals apply at every quality.
+        let gates = self.coordinator.request_gates(provider, external_id, user).await;
         let completion = self.queue.enqueue_as(
             Some(AcquisitionOrigin::Request),
-            Vec::new(),
+            gates,
             &target,
             quality == RequestQuality::Flac,
             provider,

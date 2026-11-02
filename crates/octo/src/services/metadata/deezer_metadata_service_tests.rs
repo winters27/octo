@@ -239,6 +239,33 @@ async fn get_album_detail_async_tracklist_throttled_not_cached_and_recovers_on_r
     assert_eq!(h.calls("/album/711108/tracks"), 2);
 }
 
+/// The first call Deezer answers after one it did not (a quota envelope) runs the hook that wakes
+/// what waits for Deezer, once; answers in a row run nothing more.
+#[tokio::test]
+async fn the_first_answer_after_a_call_deezer_did_not_answer_wakes_what_waits_for_it() {
+    let tracks = tracks_json(10);
+    let h = Harness::sequenced(vec![
+        ("/album/711108/tracks", vec![QUOTA_ENVELOPE, tracks.as_str()]),
+        ("/album/711108", vec![ALBUM_DETAIL_JSON]),
+    ])
+    .await;
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&woken);
+    h.service.on_answered_again(Arc::new(move || {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    assert_eq!(h.service.get_album_detail("711108").await, None);
+    assert!(h.service.get_album_detail("711108").await.is_some());
+    assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), 1);
+    h.service.clear_caches();
+    assert!(h.service.get_album_detail("711108").await.is_some());
+    assert_eq!(
+        woken.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "no call failed between"
+    );
+}
+
 /// The other poisoning branch: the album call itself is throttled.
 #[tokio::test]
 async fn get_album_detail_async_album_call_throttled_not_cached_and_recovers_on_retry() {

@@ -357,10 +357,11 @@ async fn a_joiner_its_own_gate_refused_gets_no_link_and_no_attribution() {
     assert_eq!(request.requested_by(), ["alice", "carol"]);
 }
 
-/// A joiner without a gate (the shipped checks) is recorded at once, as it always was; and when
-/// no gate judged the landed file, every gated joiner is recorded too.
+/// A joiner without a gate (the shipped checks) is recorded at once, as it always was; a joiner
+/// with a gate its own check never judged the landed file by (it joined a download that ran the
+/// shipped checks) is never credited with it: no link and no attribution.
 #[tokio::test]
-async fn joiners_with_no_verdict_on_the_file_are_recorded_as_before() {
+async fn a_gated_joiner_no_check_judged_is_never_credited() {
     let queue = TrackAcquisitionQueue::new();
     heart_as(
         &queue,
@@ -386,7 +387,69 @@ async fn joiners_with_no_verdict_on_the_file_are_recorded_as_before() {
     let request = queue.dequeue(&CancellationToken::new()).await.expect("a request");
     assert_eq!(request.pool_members(), ["alice", "bob"]);
     request.settle_joiners();
-    assert_eq!(request.pool_members(), ["alice", "bob", "carol"]);
+    assert_eq!(request.pool_members(), ["alice", "bob"]);
+    assert_eq!(request.requested_by(), ["alice", "bob"]);
+}
+
+/// A heart that joins a play's download claims its outcome at once, so a play whose download
+/// then fails leaves the row to the heart, whose own chain goes on.
+#[tokio::test]
+async fn a_heart_joining_a_play_claims_its_outcome_at_once() {
+    let queue = TrackAcquisitionQueue::new();
+    let play = queue
+        .try_enqueue_play_for(
+            &AcquisitionTarget::Shared,
+            "soulseek",
+            "song",
+            DownloadSource::Soulseek,
+            Some("alice"),
+            None,
+            vec![gate("alice", AcquisitionOrigin::Play)],
+        )
+        .expect("queued");
+    assert!(!play.heart_joined());
+    heart_as(
+        &queue,
+        "song",
+        "bob",
+        AcquisitionTarget::Shared,
+        vec![gate("bob", AcquisitionOrigin::Heart)],
+    );
+    assert!(play.heart_joined(), "the heart owns the outcome from its join");
+    assert!(play.notifies_on_failure());
+    assert_eq!(play.requested_by(), ["alice"], "its name waits for its own gate");
+}
+
+/// The gates a download started with grow with everyone who joins the request while it runs: the
+/// place hands the download a shared view of them.
+#[tokio::test]
+async fn a_download_sees_the_gates_of_hearts_that_join_after_it_started() {
+    let queue = TrackAcquisitionQueue::new();
+    heart_as(
+        &queue,
+        "song",
+        "alice",
+        AcquisitionTarget::Shared,
+        vec![gate("alice", AcquisitionOrigin::Import)],
+    );
+    let request = queue.dequeue(&CancellationToken::new()).await.expect("a request");
+    let place = request.place();
+    assert_eq!(place.gates.len(), 1);
+    heart_as(
+        &queue,
+        "song",
+        "bob",
+        AcquisitionTarget::Shared,
+        vec![gate("bob", AcquisitionOrigin::Heart)],
+    );
+    let users: Vec<String> = place
+        .live_gates
+        .current()
+        .expect("a request's place")
+        .into_iter()
+        .map(|gate| gate.user)
+        .collect();
+    assert_eq!(users, ["alice", "bob"]);
 }
 
 /// An AcoustID answer whose recordings are these (id, title, artist, submissions), every one at

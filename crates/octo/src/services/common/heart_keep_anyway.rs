@@ -253,9 +253,33 @@ impl HeartAcquisitionCoordinator {
             self.keep_held_files(record).await;
             return;
         }
+        // Its files are gone and the song is in the library: the keep landed before Octo stopped,
+        // and only its hold was left to end.
+        if !record.held_files.is_empty() && self.kept_before(record).await {
+            info!("The keep of {} landed before; its hold ends", record.key());
+            self.end_kept(record);
+            return;
+        }
         for user in users {
             self.keep_heard_audio(record, user).await;
         }
+    }
+
+    /// Whether the song of `record` is in the library where its keep lands it.
+    async fn kept_before(&self, record: &HeldAcquisition) -> bool {
+        let target = record
+            .requested_by
+            .clone()
+            .or_else(|| record.holders.first().map(|holder| holder.user.clone()))
+            .and_then(|user| self.import_target(&user).ok())
+            .unwrap_or(AcquisitionTarget::Shared);
+        let scope = match &target {
+            AcquisitionTarget::Shared => crate::services::family::LibraryScope::Shared,
+            AcquisitionTarget::Member(user) => crate::services::family::LibraryScope::Viewer(user.clone()),
+        };
+        self.owned_copy(&record.provider, &record.external_id, &scope)
+            .await
+            .is_some()
     }
 
     /// A hold's file lands as it is, for everyone who holds it, and the hold ends. A keep that

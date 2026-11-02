@@ -642,6 +642,50 @@ async fn un_hearting_the_album_deletes_its_held_tracks() {
     assert!(std::path::Path::new(&elsewhere).is_file());
 }
 
+/// A second person's heart of an album whose track another person's heart holds joins that held
+/// track, so its proof or a keep lands it for them too, while the walk still leaves it alone; her
+/// taking the album heart back leaves the first person's hold as it was.
+#[tokio::test]
+async fn a_second_album_heart_joins_the_tracks_another_heart_holds() {
+    let rig = album_rig().await;
+    let help = rig.held_file("help", "help", "help-master");
+    let record = rig.hold_track("help", &help, &["brandon"], 1);
+    let album = Album {
+        id: "help-album".into(),
+        title: "Help!".into(),
+        artist: "The Beatles".into(),
+        ..Default::default()
+    };
+    let gate = rig
+        .coordinator
+        .album_gate_up(
+            "soulseek",
+            "help-album",
+            &album,
+            "anna",
+            AcquisitionOrigin::AlbumHeart,
+        )
+        .await
+        .expect("not held");
+    assert!(gate.is_some());
+    let joined = rig.gate.holds.get(&record.key()).expect("held");
+    let users: Vec<&str> = joined.holders.iter().map(|holder| holder.user.as_str()).collect();
+    assert_eq!(users, ["brandon", "anna"]);
+    assert!(
+        rig.album_gates
+            .settled("soulseek", "help-album", &["anna".to_string()], "help")
+    );
+    assert_eq!(
+        rig.coordinator
+            .leave_album_holds("soulseek", "help-album", "anna"),
+        1
+    );
+    let left = rig.gate.holds.get(&record.key()).expect("brandon still holds it");
+    assert_eq!(left.holders.len(), 1);
+    assert!(std::path::Path::new(&help).is_file());
+    drop(gate);
+}
+
 // ---- The re-check events -----------------------------------------------------------------------
 
 /// Another person's play of a held track checks it again with one AcoustID question and takes

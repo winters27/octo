@@ -172,7 +172,8 @@ fn memory_holds() -> Arc<SoulseekHoldStore> {
 
 type Taken = Arc<Mutex<Vec<Arc<AcquisitionRequest>>>>;
 
-/// Lands every request the queue hands out, keeping each one, until the token is canceled.
+/// Lands every request the queue hands out, keeping each one, until the token is canceled; each
+/// gate on it accepts the file, as the download's check point writes it.
 fn land_everything(queue: &Arc<TrackAcquisitionQueue>) -> (Taken, CancellationToken) {
     let taken: Taken = Arc::default();
     let stop = CancellationToken::new();
@@ -180,6 +181,12 @@ fn land_everything(queue: &Arc<TrackAcquisitionQueue>) -> (Taken, CancellationTo
     tokio::spawn(async move {
         while let Some(request) = queue.dequeue(&token).await {
             seen.lock().push(request.clone());
+            for gate in request.gates() {
+                request
+                    .completion
+                    .ledger()
+                    .record(&gate.user, gate.origin, GateOutcome::Accepted);
+            }
             queue.release(&request);
             request
                 .completion
@@ -753,6 +760,12 @@ async fn a_resumed_hold_brings_its_held_files_and_its_row_leaves_the_hold_line_a
     assert_eq!(rig.tracker.note_of("soulseek", "help"), None);
     assert!(rig.tracker.is_held("soulseek", "help"), "held until the run ends");
     assert_eq!(request.place().held_files, record.held_files);
+    for gate in request.gates() {
+        request
+            .completion
+            .ledger()
+            .record(&gate.user, gate.origin, GateOutcome::Accepted);
+    }
     rig.queue.release(&request);
     request.completion.try_set_result("/music/help.flac");
     until(|| holds.snapshot().is_empty()).await;
@@ -2087,4 +2100,589 @@ async fn the_persons_own_retry_checks_their_kept_file_and_their_held_heart_again
     assert_eq!(users(&record), ["brandon"]);
     assert!(taken.lock().is_empty(), "its gate holds again before any source");
     stop.cancel();
+}
+
+// ---- Joiners, runs again, rows, routes and what a run holds -----------------------------------
+
+/// A heart that joins an import already running for its song is never credited with the file its
+/// own check never judged: its own step runs, and the file of that step is what lands for it.
+#[tokio::test]
+async fn a_heart_joining_a_started_import_never_lands_unjudged_and_runs_its_own_step() {
+    let rig = rig(Arc::new(ListedGates::default()), None, memory_holds());
+    let import = rig.queue.enqueue_holding(
+        Some(AcquisitionOrigin::Import),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        &AcquisitionTarget::Shared,
+        false,
+        "soulseek",
+        "help",
+        true,
+        false,
+        true,
+        None,
+        true,
+        Some("brandon"),
+        false,
+        None,
+    );
+    let taken: Taken = Arc::default();
+    let stop = CancellationToken::new();
+    let (queue, seen, token) = (rig.queue.clone(), taken.clone(), stop.clone());
+    tokio::spawn(async move {
+        let mut n = 0;
+        while let Some(request) = queue.dequeue(&token).await {
+            // The import's own checks run while the heart joins it; they judge no gate of its.
+            while n == 0 && request.gates().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            if n > 0 {
+                for gate in request.gates() {
+                    request
+                        .completion
+                        .ledger()
+                        .record(&gate.user, gate.origin, GateOutcome::Accepted);
+                }
+            }
+            n += 1;
+            seen.lock().push(request.clone());
+            queue.release(&request);
+            request.completion.try_set_result("/music/help.flac");
+        }
+    });
+    let outcome = rig
+        .coordinator
+        .acquire_track_outcome(
+            "soulseek",
+            "help",
+            Some("anna"),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::Heart,
+        )
+        .await
+        .expect("ran");
+    assert_eq!(outcome, TrackOutcome::Landed("/music/help.flac".into()));
+    assert!(import.wait().await.is_ok());
+    let taken = taken.lock().clone();
+    assert_eq!(taken.len(), 2, "her own step ran");
+    let hers: Vec<String> = taken[1].gates().into_iter().map(|gate| gate.user).collect();
+    assert_eq!(hers, ["anna"]);
+    stop.cancel();
+}
+
+/// Gates that are ready once `open` says so: a build waits for it.
+struct WaitingGates {
+    open: tokio::sync::watch::Receiver<bool>,
+    built: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl HeartGates for WaitingGates {
+    async fn build(&self, _: &str, _: &str, holder: &Holder, origin: AcquisitionOrigin) -> GateStart {
+        self.built.lock().push(holder.user.clone());
+        let mut open = self.open.clone();
+        let _ = open.wait_for(|open| *open).await;
+        GateStart::Ready(gate(holder, origin))
+    }
+}
+
+/// A heart that joins a hold while the hold runs again is not lost: the run ends with the first
+/// person's file, then runs once more for the one who joined, whose own gate passes their file.
+#[tokio::test]
+async fn a_heart_joining_a_hold_while_it_runs_is_gated_and_settled_by_one_more_run() {
+    let (open, opened) = tokio::sync::watch::channel(false);
+    let gates = Arc::new(WaitingGates {
+        open: opened,
+        built: Mutex::new(Vec::new()),
+    });
+    let holds = memory_holds();
+    holds.hold(held(
+        "help",
+        AcquisitionOrigin::Heart,
+        WaitingFor::AcoustId,
+        &["brandon"],
+    ));
+    let rig = rig(gates.clone(), None, holds);
+    let (landed, stop) = land_everything(&rig.queue);
+    let key = "Track:soulseek:help:AcoustId";
+    rig.coordinator.resume_held(key);
+    until(|| gates.built.lock().len() == 1).await;
+    assert_eq!(
+        rig.coordinator
+            .acquire_track_outcome(
+                "soulseek",
+                "help",
+                Some("anna"),
+                None,
+                &AcquisitionTarget::Shared,
+                AcquisitionOrigin::Heart,
+            )
+            .await
+            .expect("ran"),
+        TrackOutcome::Held(WaitingFor::AcoustId)
+    );
+    open.send_replace(true);
+    until(|| rig.holds.snapshot().is_empty()).await;
+    assert_eq!(*gates.built.lock(), ["brandon", "anna"]);
+    assert_eq!(landed.lock().len(), 2);
+    stop.cancel();
+}
+
+/// After a file lands for one person of a hold, the row of the person still waiting in it is held
+/// again with the hold's line, though the landing closed it as done.
+#[tokio::test]
+async fn the_row_of_a_person_still_held_is_held_again_after_anothers_file_lands() {
+    let holds = memory_holds();
+    holds.hold(held(
+        "help",
+        AcquisitionOrigin::Heart,
+        WaitingFor::NotYetProven,
+        &["brandon", "anna"],
+    ));
+    let rig = rig(Arc::new(ListedGates::default()), None, holds);
+    let (queue, tracker, stop) = (rig.queue.clone(), rig.tracker.clone(), CancellationToken::new());
+    let token = stop.clone();
+    tokio::spawn(async move {
+        while let Some(request) = queue.dequeue(&token).await {
+            let ledger = request.completion.ledger().clone();
+            for gate in request.gates() {
+                let outcome = if gate.user == "brandon" {
+                    GateOutcome::Accepted
+                } else {
+                    GateOutcome::NotAccepted("another mix".into())
+                };
+                ledger.record(&gate.user, gate.origin, outcome);
+            }
+            // The download's placement closes the row as done.
+            tracker.complete(&request.provider, &request.external_id, None);
+            queue.release(&request);
+            request.completion.try_set_result("/music/help.flac");
+        }
+    });
+    let key = "Track:soulseek:help:NotYetProven";
+    // The row is held with its line, as Octo's start leaves it.
+    rig.coordinator.hold_row_for(&rig.holds.get(key).expect("held"));
+    rig.coordinator.recheck_held(key).await;
+    assert_eq!(users(&rig.holds.get(key).expect("anna stays held")), ["anna"]);
+    let row = rig
+        .tracker
+        .all()
+        .into_iter()
+        .find(|row| row.external_id == "help")
+        .expect("a row");
+    assert_ne!(row.state, AcquisitionState::Done, "{row:?}");
+    assert!(rig.tracker.is_held("soulseek", "help"));
+    assert_eq!(
+        rig.tracker.note_of("soulseek", "help").as_deref(),
+        Some("Waiting for NotYetProven")
+    );
+    stop.cancel();
+}
+
+/// A held album track keeps a person by each heart of theirs that holds them in it: taking back
+/// the song heart leaves them held by the album heart, and the other way round; the hold ends
+/// with the last.
+#[tokio::test]
+async fn a_song_heart_and_an_album_heart_of_one_held_track_each_keep_the_person_in_it() {
+    for song_first in [true, false] {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let file = dir.path().join("help.flac");
+        std::fs::write(&file, b"x").expect("written");
+        let holds = memory_holds();
+        let mut record = held(
+            "help",
+            AcquisitionOrigin::AlbumHeart,
+            WaitingFor::NotYetProven,
+            &["brandon"],
+        );
+        record.album_track = Some(crate::services::common::soulseek_hold_store::HeldAlbumTrack {
+            album_key: "soulseek:album-1".into(),
+            ..Default::default()
+        });
+        record.held_files = vec![file.to_string_lossy().into_owned()];
+        holds.hold(record);
+        let gates = Arc::new(ListedGates::default());
+        gates.hold("brandon", WaitingFor::NotYetProven);
+        let rig = rig(gates, None, holds);
+        // Their song heart joins the held track.
+        rig.coordinator
+            .acquire_track_outcome(
+                "soulseek",
+                "help",
+                Some("brandon"),
+                None,
+                &AcquisitionTarget::Shared,
+                AcquisitionOrigin::Heart,
+            )
+            .await
+            .expect("ran");
+        let key = "Track:soulseek:help:NotYetProven";
+        until(|| !rig.coordinator.resuming.lock().contains(key)).await;
+        if song_first {
+            assert_eq!(rig.coordinator.leave_holds("soulseek", "help", "brandon"), 1);
+            assert_eq!(
+                users(&rig.holds.get(key).expect("the album heart keeps it")),
+                ["brandon"]
+            );
+            assert_eq!(
+                rig.coordinator
+                    .leave_album_holds("soulseek", "album-1", "brandon"),
+                1
+            );
+        } else {
+            assert_eq!(
+                rig.coordinator
+                    .leave_album_holds("soulseek", "album-1", "brandon"),
+                1
+            );
+            assert_eq!(
+                users(&rig.holds.get(key).expect("the song heart keeps it")),
+                ["brandon"]
+            );
+            assert_eq!(rig.coordinator.leave_holds("soulseek", "help", "brandon"), 1);
+        }
+        assert!(rig.holds.snapshot().is_empty(), "song first: {song_first}");
+    }
+}
+
+/// Taking the last heart back of a song nothing else holds or fetches lets its row go, rather
+/// than leaving it searching until it is pruned.
+#[tokio::test]
+async fn taking_the_last_heart_back_lets_the_row_go() {
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("brandon", WaitingFor::NotYetProven);
+    let rig = rig(gates, None, memory_holds());
+    assert_eq!(
+        rig.coordinator
+            .acquire_track_outcome(
+                "soulseek",
+                "help",
+                Some("brandon"),
+                None,
+                &AcquisitionTarget::Shared,
+                AcquisitionOrigin::Heart,
+            )
+            .await
+            .expect("ran"),
+        TrackOutcome::Held(WaitingFor::NotYetProven)
+    );
+    assert!(rig.tracker.is_held("soulseek", "help"));
+    assert_eq!(rig.coordinator.leave_holds("soulseek", "help", "brandon"), 1);
+    assert!(
+        rig.tracker.all().iter().all(|row| row.external_id != "help"),
+        "{:?}",
+        rig.tracker.all()
+    );
+}
+
+/// An import whose identity Deezer cannot answer goes back on the trickle to be asked again on its
+/// next turn, as one MusicBrainz cannot answer does; it never holds.
+#[tokio::test]
+async fn an_import_deezer_cannot_answer_for_goes_back_on_the_trickle() {
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("brandon", WaitingFor::Deezer);
+    let rig = rig(gates, None, memory_holds());
+    let back = rig
+        .coordinator
+        .acquire_track_for(
+            "soulseek",
+            "help",
+            Some("brandon"),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::Import,
+        )
+        .await
+        .expect_err("put back");
+    let later = back
+        .downcast_ref::<crate::services::imports::trickle_worker::TrickleCheckLater>()
+        .expect("put back");
+    assert_eq!(later.detail, "Waiting for Deezer");
+    assert!(later.turn_back);
+    assert!(rig.holds.snapshot().is_empty(), "nothing held");
+}
+
+/// While a heart's chain runs, the copy of what its person heard is held: a sweep that drops
+/// copies meanwhile leaves it, and once the chain ends with nothing held for them it goes free.
+#[tokio::test]
+async fn a_running_heart_holds_its_heard_copy_until_its_chain_ends() {
+    use crate::services::prefetch::heard_samples::tests::rig_in;
+    use crate::services::soulseek::SharedRouting;
+    use octo_core::fingerprint::heart_gate::{HeardRecord, HeardSource};
+    use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
+
+    const VIDEO: &str = "AAAAAAAAAA1";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("copies")).unwrap();
+    std::fs::write(
+        dir.path().join("copies").join(format!("{VIDEO}.preview")),
+        vec![0u8; 10],
+    )
+    .unwrap();
+    let holds = memory_holds();
+    let heard = rig_in(dir.path(), "http://127.0.0.1:1", holds.clone(), 16, 1 << 20);
+    let id = heard.registry.register(SharedRouting::new(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("The Beatles".into()),
+        title: Some("Help!".into()),
+        ..Default::default()
+    }));
+    heard.registry.remember_heard(
+        &id,
+        "brandon",
+        HeardRecord {
+            heard_at: Utc::now(),
+            source: HeardSource::Video {
+                id: VIDEO.into(),
+                size: Some(10),
+                content_type: "audio/mp4".into(),
+                itag: None,
+            },
+            sample_id: None,
+        },
+        None,
+    );
+    let queue = Arc::new(TrackAcquisitionQueue::new());
+    let coordinator = HeartAcquisitionCoordinator::new(
+        youtube_only(),
+        queue.clone(),
+        Arc::new(FakeDownloads::default()),
+        Arc::new(FakeLidarr::default()),
+        HeartCoordinatorExtras {
+            tracker: Some(Arc::new(AcquisitionTracker::new(None, Clock::system()))),
+            id_registry: Some(heard.registry.clone()),
+            holds: Some(holds.clone()),
+            gates: Some(Arc::new(ListedGates::default())),
+            heard: Some(heard.samples.clone()),
+            ..Default::default()
+        },
+    );
+    let copies = heard.copies.clone();
+    let kept_mid_chain = Arc::new(Mutex::new(None));
+    let (seen, stop) = (kept_mid_chain.clone(), CancellationToken::new());
+    let token = stop.clone();
+    tokio::spawn(async move {
+        while let Some(request) = queue.dequeue(&token).await {
+            // A sweep runs while the download does.
+            copies.drop_copy(VIDEO);
+            *seen.lock() = Some(copies.is_ready(VIDEO));
+            for gate in request.gates() {
+                request
+                    .completion
+                    .ledger()
+                    .record(&gate.user, gate.origin, GateOutcome::Accepted);
+            }
+            queue.release(&request);
+            request.completion.try_set_result("/music/help.flac");
+        }
+    });
+    let outcome = coordinator
+        .acquire_track_outcome(
+            "soulseek",
+            &id,
+            Some("brandon"),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::Heart,
+        )
+        .await
+        .expect("ran");
+    assert_eq!(outcome, TrackOutcome::Landed("/music/help.flac".into()));
+    assert_eq!(
+        *kept_mid_chain.lock(),
+        Some(true),
+        "the sweep left the heard copy"
+    );
+    assert!(!heard.copies.is_held(VIDEO), "free once the chain ended");
+    stop.cancel();
+}
+
+/// Two people's hearts waiting out one Soulseek outage when Octo restarted: each runs again as
+/// their own, and the hold ends only once both have left it.
+#[tokio::test]
+async fn an_outage_hold_of_two_people_resumes_both_after_a_restart() {
+    let holds = memory_holds();
+    holds.hold(HeldAcquisition {
+        provider: "soulseek".into(),
+        external_id: "help".into(),
+        requested_by: Some("brandon".into()),
+        held_since_utc: Utc::now(),
+        holders: vec![holder("brandon"), holder("anna")],
+        ..Default::default()
+    });
+    let rig = rig(Arc::new(ListedGates::default()), None, holds);
+    let (landed, stop) = land_everything(&rig.queue);
+    let resumer = Arc::new(SoulseekHoldResumer::new(
+        rig.holds.clone(),
+        rig.coordinator.clone(),
+    ));
+    resumer.run(CancellationToken::new()).await.expect("ran");
+    until(|| rig.holds.snapshot().is_empty()).await;
+    let mut asked: Vec<String> = landed
+        .lock()
+        .iter()
+        .flat_map(|request| request.gates().into_iter().map(|gate| gate.user))
+        .collect();
+    asked.sort();
+    asked.dedup();
+    assert_eq!(asked, ["anna", "brandon"], "each person's heart ran again");
+    stop.cancel();
+}
+
+/// Gates that hold for AcoustID, noting each wake they are asked to set up.
+#[derive(Default)]
+struct BusyGates {
+    wakes: Mutex<Vec<(String, WaitingFor, String)>>,
+}
+
+#[async_trait]
+impl HeartGates for BusyGates {
+    async fn build(&self, _: &str, _: &str, holder: &Holder, origin: AcquisitionOrigin) -> GateStart {
+        GateStart::Hold {
+            gate: gate(holder, origin),
+            waiting_for: WaitingFor::AcoustId,
+            line: "Waiting for AcoustID".into(),
+            question: None,
+        }
+    }
+
+    fn wake_for(
+        &self,
+        key: &str,
+        waiting_for: WaitingFor,
+        user: &str,
+        _: Option<&HeardRecord>,
+        _: Option<String>,
+    ) {
+        self.wakes
+            .lock()
+            .push((key.to_string(), waiting_for, user.to_string()));
+    }
+}
+
+/// A held album track checked again after its person's play, whose heard lookup AcoustID does not
+/// answer, waits as it is and runs again once AcoustID answers: the play is not lost.
+#[tokio::test]
+async fn a_held_album_tracks_check_that_meets_a_busy_answer_runs_again_when_it_answers() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let file = dir.path().join("help.flac");
+    std::fs::write(&file, b"x").expect("written");
+    let holds = memory_holds();
+    let mut record = held(
+        "help",
+        AcquisitionOrigin::AlbumHeart,
+        WaitingFor::NotYetProven,
+        &["brandon"],
+    );
+    record.album_track = Some(crate::services::common::soulseek_hold_store::HeldAlbumTrack {
+        album_key: "soulseek:album-1".into(),
+        ..Default::default()
+    });
+    record.held_files = vec![file.to_string_lossy().into_owned()];
+    let key = holds.hold(record).key();
+    let gates = Arc::new(BusyGates::default());
+    let rig = rig(gates.clone(), None, holds);
+    rig.coordinator.recheck_held(&key).await;
+    assert_eq!(
+        *gates.wakes.lock(),
+        [(key.clone(), WaitingFor::AcoustId, "brandon".to_string())]
+    );
+    assert!(rig.holds.get(&key).is_some(), "it waits as it is");
+}
+
+/// A play of a held song neither opens its own row over the held one nor fails it when its
+/// download fails: the row keeps the line it waits with.
+#[tokio::test]
+async fn a_play_of_a_held_song_leaves_its_row_alone() {
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("brandon", WaitingFor::NotYetProven);
+    let rig = rig(gates, None, memory_holds());
+    rig.coordinator
+        .acquire_track_outcome(
+            "soulseek",
+            "help",
+            Some("brandon"),
+            None,
+            &AcquisitionTarget::Shared,
+            AcquisitionOrigin::Heart,
+        )
+        .await
+        .expect("ran");
+    let line = rig.tracker.note_of("soulseek", "help");
+    assert_eq!(line.as_deref(), Some("Waiting for NotYetProven"));
+    let (queue, stop) = (rig.queue.clone(), CancellationToken::new());
+    let token = stop.clone();
+    tokio::spawn(async move {
+        while let Some(request) = queue.dequeue(&token).await {
+            queue.release(&request);
+            request
+                .completion
+                .try_set_error(anyhow::anyhow!("no peer had it"));
+        }
+    });
+    rig.coordinator.queue_play_download(
+        "soulseek",
+        "help",
+        DownloadSource::Soulseek,
+        Some("anna"),
+        None,
+        None,
+        &AcquisitionTarget::Shared,
+        Vec::new(),
+    );
+    until(|| !rig.queue.is_in_flight("soulseek", "help")).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(rig.tracker.is_held("soulseek", "help"));
+    assert_eq!(rig.tracker.note_of("soulseek", "help"), line);
+    let row = rig
+        .tracker
+        .all()
+        .into_iter()
+        .find(|row| row.external_id == "help")
+        .expect("a row");
+    assert_ne!(row.state, AcquisitionState::Failed, "{row:?}");
+    stop.cancel();
+}
+
+/// A keep that landed its file just before Octo stopped, its hold not yet ended: after the restart
+/// the hold ends as kept, never as a copy that could not be found.
+#[tokio::test]
+async fn a_keep_that_landed_before_a_restart_ends_its_hold_as_kept() {
+    let (rig, dir, _) = owned_rig(Arc::new(ListedGates::default()));
+    let mut record = held(
+        "help",
+        AcquisitionOrigin::Heart,
+        WaitingFor::AcoustIdOff,
+        &["brandon"],
+    );
+    record.held_files = vec![dir.path().join("gone.flac").to_string_lossy().into_owned()];
+    record.keep_requested = vec!["brandon".into()];
+    let record = rig.holds.hold(record);
+    rig.coordinator.hold_row_for(&record);
+    rig.coordinator.finish_keeps(vec![record.key()]).await;
+    assert!(rig.holds.snapshot().is_empty(), "the hold ended");
+    let row = rig
+        .tracker
+        .all()
+        .into_iter()
+        .find(|row| row.external_id == "help")
+        .expect("a row");
+    assert_ne!(row.state, AcquisitionState::Failed, "{row:?}");
+    assert_ne!(row.note.as_deref(), Some(HEARD_GONE));
+}
+
+/// A family request's gate is built as a request's: never holding, so a song fetched at one
+/// quality is judged by the reading's refusals too.
+#[tokio::test]
+async fn a_family_requests_gate_is_built_and_never_holds() {
+    let gates = Arc::new(ListedGates::default());
+    gates.hold("kim", WaitingFor::MusicBrainz);
+    let rig = rig(gates, None, memory_holds());
+    let built = rig.coordinator.request_gates("soulseek", "help", "kim").await;
+    assert_eq!(built.len(), 1);
+    assert_eq!(built[0].origin, AcquisitionOrigin::Request);
+    assert_eq!(built[0].user, "kim");
+    assert!(rig.holds.snapshot().is_empty());
 }

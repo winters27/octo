@@ -48,7 +48,7 @@ pub use star_on_arrival::{StarNavidrome, StarOnArrival, WaitingStar};
 pub use top_songs_service::{ChartFetch, TopList, TopSong, TopSongsService};
 pub use track_acquisition_queue::{
     AcquisitionHeld, AcquisitionOutcome, AcquisitionPlace, AcquisitionRequest, AcquisitionTarget, Completion,
-    GateLedger, GateOutcome, PlayOutcome, SoundDeny, TrackAcquisitionQueue, acquisition_key,
+    GateLedger, GateOutcome, PlayOutcome, SharedGates, SoundDeny, TrackAcquisitionQueue, acquisition_key,
 };
 
 #[cfg(test)]

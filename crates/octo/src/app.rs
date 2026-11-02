@@ -1196,6 +1196,13 @@ impl Acquisition {
                     });
                 }
             }));
+            // Deezer answering again after a call it did not answer runs every hold waiting for it.
+            let coordinator = Arc::downgrade(&heart_acquisition_coordinator);
+            clients.deezer_metadata.on_answered_again(Arc::new(move || {
+                if let Some(coordinator) = coordinator.upgrade() {
+                    coordinator.resume_waiting(WaitingFor::Deezer);
+                }
+            }));
             // Lidarr's indexers searching again runs every heart waiting for them; their health is
             // read only while one waits.
             let coordinator = Arc::downgrade(&heart_acquisition_coordinator);

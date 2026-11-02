@@ -191,6 +191,8 @@ impl SoulseekDownloadService {
         length_known: bool,
         labels: LabelSource,
     ) -> FileJudged {
+        // Everyone who joined the request since the download started is judged too.
+        download.refresh_gates();
         if gated(download) {
             return self.judge_by_gates(base, download, path, identity, labels).await;
         }
@@ -216,14 +218,15 @@ impl SoulseekDownloadService {
         identity: Option<HeardSource>,
         labels: LabelSource,
     ) {
-        let joiners: Vec<&HeartGate> = download.gates.iter().filter(|gate| personal(gate)).collect();
+        // The request's gates now: a heart that joined after the download started is a joiner too.
+        let gates = download.current_gates();
+        let joiners: Vec<&HeartGate> = gates.iter().filter(|gate| personal(gate)).collect();
         if gated(download) || joiners.is_empty() {
             return;
         }
         let ledger = &download.ledger;
         if let Some(origin) = download.origin {
-            let own = download
-                .gates
+            let own = gates
                 .iter()
                 .filter(|gate| gate.origin == origin)
                 .map(|gate| gate.user.clone())
@@ -816,6 +819,7 @@ impl SoulseekDownloadService {
         base: &BaseDownloadService,
         download: &mut TrackDownload,
     ) -> Option<String> {
+        download.refresh_gates();
         let held = std::mem::take(&mut download.held_files);
         let mut left = held.into_iter().filter(|file| file_exists(file));
         let file = left.next()?;
@@ -872,6 +876,7 @@ impl SoulseekDownloadService {
         path: &str,
         identity: HeardSource,
     ) -> bool {
+        download.refresh_gates();
         let candidate = HeartCandidate {
             labels: LabelSource::TheFile,
             identity: Some(identity),

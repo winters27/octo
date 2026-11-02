@@ -601,7 +601,11 @@ async fn three_heard_gates_needing_the_heard_master_in_one_download_finish() {
             "{user}"
         );
     }
-    assert_eq!(g.rig.samples.scratch_use().0, 0, "no heard copy outlives the pass");
+    assert_eq!(
+        g.rig.samples.scratch_use().0,
+        0,
+        "no heard copy outlives the pass"
+    );
 }
 
 /// Another upload of the heard recording that AcoustID has no entry for, and that is not the master
