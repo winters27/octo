@@ -7,11 +7,14 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// One refresh: a listener's whole station list, or one pinned definition of it.
+/// One refresh: a listener's whole station list, one pinned definition of it, or another try
+/// at the stations the last refresh kept as they were.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastFmRadioRefreshJob {
     pub username: String,
     pub station_definition_id: Option<String>,
+    /// Only the stations the last refresh carried over, and nothing else.
+    pub carried_only: bool,
 }
 
 impl LastFmRadioRefreshJob {
@@ -19,20 +22,24 @@ impl LastFmRadioRefreshJob {
         LastFmRadioRefreshJob {
             username: username.into(),
             station_definition_id: None,
+            carried_only: false,
         }
     }
 
-    fn key(&self) -> String {
-        queued_key(&self.username, self.station_definition_id.as_deref())
+    fn key(&self) -> (bool, String) {
+        (
+            self.carried_only,
+            queued_key(&self.username, self.station_definition_id.as_deref()),
+        )
     }
 }
 
-/// A channel of 100 that drops a write when full, one reader, and the queued jobs' keys,
-/// compared ignoring case.
+/// A channel of 100 that drops a write when full, one reader, and the queued jobs' kinds and
+/// keys, the keys compared ignoring case.
 pub struct LastFmRadioRefreshQueue {
     sender: mpsc::Sender<LastFmRadioRefreshJob>,
     receiver: tokio::sync::Mutex<mpsc::Receiver<LastFmRadioRefreshJob>>,
-    queued: Mutex<HashSet<String>>,
+    queued: Mutex<HashSet<(bool, String)>>,
 }
 
 impl Default for LastFmRadioRefreshQueue {
@@ -55,15 +62,28 @@ impl LastFmRadioRefreshQueue {
 
     /// Queues a refresh unless the same one is already waiting or the queue is full.
     pub fn enqueue(&self, username: &str, station_definition_id: Option<&str>) -> bool {
-        let username = username.trim();
-        let key = queued_key(username, station_definition_id);
-        if username.is_empty() || !self.queued.lock().insert(key.clone()) {
+        self.push(LastFmRadioRefreshJob {
+            username: username.trim().to_string(),
+            station_definition_id: station_definition_id.map(str::to_string),
+            carried_only: false,
+        })
+    }
+
+    /// Queues another try at the listener's carried stations, unless one is already waiting or
+    /// the queue is full.
+    pub fn enqueue_carried(&self, username: &str) -> bool {
+        self.push(LastFmRadioRefreshJob {
+            username: username.trim().to_string(),
+            station_definition_id: None,
+            carried_only: true,
+        })
+    }
+
+    fn push(&self, job: LastFmRadioRefreshJob) -> bool {
+        let key = job.key();
+        if job.username.is_empty() || !self.queued.lock().insert(key.clone()) {
             return false;
         }
-        let job = LastFmRadioRefreshJob {
-            username: username.to_string(),
-            station_definition_id: station_definition_id.map(str::to_string),
-        };
         if self.sender.try_send(job).is_ok() {
             return true;
         }
@@ -142,5 +162,20 @@ mod tests {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(queue.dequeue(&cancelled).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_try_at_kept_stations_waits_beside_a_whole_refresh_and_only_once() {
+        let queue = LastFmRadioRefreshQueue::new();
+        let none = CancellationToken::new();
+        assert!(queue.enqueue("alice", None));
+        assert!(queue.enqueue_carried("alice"));
+        assert!(!queue.enqueue_carried("ALICE"));
+        assert!(!queue.enqueue("alice", None));
+        let first = queue.dequeue(&none).await.unwrap();
+        assert!(!first.carried_only);
+        let second = queue.dequeue(&none).await.unwrap();
+        assert!(second.carried_only && second.station_definition_id.is_none());
+        assert!(queue.enqueue_carried("alice"), "queued again once taken");
     }
 }

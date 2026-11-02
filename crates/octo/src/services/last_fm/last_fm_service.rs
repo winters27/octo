@@ -23,6 +23,7 @@ use std::sync::LazyLock;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
+use super::lookup_trouble;
 use super::net_parse::{parse_double, parse_long};
 use crate::services::framework::HttpAnswer;
 use crate::services::framework::http::client_builder;
@@ -252,15 +253,31 @@ impl LastFmService {
         Utc::now() + TimeDelta::hours(i64::from(self.last_fm().effective_radio_cache_duration_hours()))
     }
 
+    /// One request. A request that got no answer marks the radio build's lookup that made it
+    /// (see [`lookup_trouble`]), when a key is set.
     async fn get(&self, url: &str) -> anyhow::Result<HttpAnswer> {
-        Ok(HttpAnswer::read(self.http.get(url).send().await?).await?)
+        let answer: anyhow::Result<HttpAnswer> =
+            async { Ok(HttpAnswer::read(self.http.get(url).send().await?).await?) }.await;
+        let unanswered = match &answer {
+            Ok(answer) => did_not_answer(answer),
+            Err(_) => true,
+        };
+        if unanswered && self.has_api_key() {
+            lookup_trouble::note_core();
+        }
+        answer
     }
 
-    /// `EnsureSuccessStatusCode`, then the body as JSON.
+    /// `EnsureSuccessStatusCode`, then the body as JSON. A try-again error is an error, so
+    /// nothing keeps it.
     async fn get_json(&self, url: &str) -> anyhow::Result<Value> {
         let answer = self.get(url).await?;
         ensure_success(&answer)?;
-        Ok(answer.json()?)
+        let doc = answer.json()?;
+        if says_try_again(&doc) {
+            anyhow::bail!("Last.fm asked to try again later");
+        }
+        Ok(doc)
     }
 
     pub async fn get_similar_tracks(&self, artist: &str, title: &str, limit: i32) -> Vec<SimilarTrack> {
@@ -271,6 +288,14 @@ impl LastFmService {
     /// itself from a guess. A seed Last.fm has never heard of, a YouTube upload filed under its
     /// uploader for one, gets similar artists to that uploader's name, which can be anyone (#78).
     pub async fn find_similar_tracks(&self, artist: &str, title: &str, limit: i32) -> SimilarAnswer {
+        // Last.fm answers nothing without a key, so nothing is asked, or kept.
+        if !self.has_api_key() {
+            return SimilarAnswer {
+                tracks: Vec::new(),
+                source: SimilarSource::None,
+                artist_trusted: false,
+            };
+        }
         match self.find_similar_tracks_inner(artist, title, limit).await {
             Ok(answer) => answer,
             Err(e) => {
@@ -497,6 +522,9 @@ impl LastFmService {
     /// Top songs of the artists Last.fm counts as like one artist: a radio for an artist. An
     /// answer is kept as long as the radio cache keeps answers; a failed one is not kept.
     pub async fn get_similar_artist_tracks(&self, artist: &str, limit: i32) -> Vec<SimilarTrack> {
+        if !self.has_api_key() {
+            return Vec::new();
+        }
         let name = SongIdentity::known_name(artist).unwrap_or_else(|| artist.to_string());
         let key = dotnet::to_lower_invariant(&format!("similar-artist-tracks|{name}|{limit}"));
         let hit = self
@@ -509,8 +537,11 @@ impl LastFmService {
             return tracks;
         }
         match self.top_tracks_from_similar_artists_inner(&name, limit).await {
-            Ok(tracks) => {
-                self.keep(key, tracks.clone().wrap());
+            Ok((tracks, complete)) => {
+                // A list missing an artist Last.fm did not answer for is used, never kept.
+                if complete {
+                    self.keep(key, tracks.clone().wrap());
+                }
                 tracks
             }
             Err(e) => {
@@ -540,7 +571,7 @@ impl LastFmService {
 
     async fn top_tracks_from_similar_artists(&self, artist: &str, limit: i32) -> Vec<SimilarTrack> {
         match self.top_tracks_from_similar_artists_inner(artist, limit).await {
-            Ok(tracks) => tracks,
+            Ok((tracks, _)) => tracks,
             Err(e) => {
                 error!(error = %e, "Error fetching top tracks from similar artists for {artist}");
                 Vec::new()
@@ -548,11 +579,13 @@ impl LastFmService {
         }
     }
 
+    /// Top songs of the artists like `artist`, and whether Last.fm answered for every one of
+    /// them.
     async fn top_tracks_from_similar_artists_inner(
         &self,
         artist: &str,
         limit: i32,
-    ) -> anyhow::Result<Vec<SimilarTrack>> {
+    ) -> anyhow::Result<(Vec<SimilarTrack>, bool)> {
         // Get similar artists
         let artist_url = format!(
             "{}?method=artist.getsimilar&artist={}&api_key={}&format=json&limit=10",
@@ -577,6 +610,7 @@ impl LastFmService {
 
         // Get top tracks from each similar artist
         let mut tracks = Vec::new();
+        let mut complete = true;
         for similar_artist in &similar_artists {
             let top_tracks_url = format!(
                 "{}?method=artist.gettoptracks&artist={}&api_key={}&format=json&limit=10",
@@ -585,6 +619,10 @@ impl LastFmService {
                 self.last_fm().api_key
             );
             let top = self.get(&top_tracks_url).await?;
+            if did_not_answer(&top) {
+                complete = false;
+                continue;
+            }
             if !top.is_success() {
                 continue;
             }
@@ -603,7 +641,7 @@ impl LastFmService {
 
         info!("Found {} top tracks from similar artists", tracks.len());
 
-        Ok(take(tracks, limit))
+        Ok((take(tracks, limit), complete))
     }
 
     /// Last.fm can answer at all. Search discovery needs only this: an API key.
@@ -624,7 +662,7 @@ impl LastFmService {
     /// Last.fm's track.search is a fuzzy match: "drake" returns Drake tracks,
     /// "drake hotline" returns "Hotline Bling" first, etc.
     pub async fn search_tracks(&self, query: &str, limit: i32) -> Vec<SimilarTrack> {
-        if dotnet::is_blank(query) {
+        if dotnet::is_blank(query) || !self.has_api_key() {
             return Vec::new();
         }
         let url = format!(
@@ -665,7 +703,8 @@ impl LastFmService {
     }
 
     async fn artist_top_tracks(&self, artist: &str, limit: i32, gated: bool) -> Vec<SimilarTrack> {
-        if dotnet::is_blank(artist) {
+        // Without a key Last.fm answers nothing, so nothing is asked, or kept.
+        if dotnet::is_blank(artist) || !self.has_api_key() {
             return Vec::new();
         }
         let url = format!(
@@ -946,12 +985,50 @@ impl LastFmService {
             return None;
         }
         match answer.json() {
+            // Never kept: the next ask tries again.
+            Ok(doc) if says_try_again(&doc) => {
+                warn!("Last.fm asked to try {method} again later");
+                None
+            }
             Ok(doc) => Some(doc),
             Err(e) => {
                 warn!(error = %e, "Last.fm {method} failed");
                 None
             }
         }
+    }
+}
+
+/// Last.fm's error codes that mean "try again later": the operation failed, the service is
+/// offline, it is temporarily unavailable, or the rate limit was exceeded.
+const TRY_AGAIN_ERRORS: [i64; 4] = [8, 11, 16, 29];
+
+/// The `error` code in a Last.fm JSON body, when there is one, sent as a number or as text.
+fn error_code(doc: &Value) -> Option<i64> {
+    let error = doc.get("error")?;
+    error.as_i64().or_else(|| error.as_str()?.trim().parse().ok())
+}
+
+/// Whether a Last.fm JSON body is one of its try-again errors.
+fn says_try_again(doc: &Value) -> bool {
+    error_code(doc).is_some_and(|code| TRY_AGAIN_ERRORS.contains(&code))
+}
+
+/// Whether Last.fm gave no answer to the question: a 408, 429 or 5xx, one of its try-again error
+/// codes whatever the status, a success whose body is not JSON, or any other 4xx without one of
+/// Last.fm's error codes in it (a proxy's or firewall's page). A 4xx carrying another Last.fm
+/// code is an answer: an artist it does not know, a key it refuses.
+fn did_not_answer(answer: &HttpAnswer) -> bool {
+    let status = answer.status.as_u16();
+    if status == 408 || status == 429 || answer.status.is_server_error() {
+        return true;
+    }
+    match answer.json() {
+        Ok(doc) => match error_code(&doc) {
+            Some(code) => TRY_AGAIN_ERRORS.contains(&code),
+            None => !answer.is_success(),
+        },
+        Err(_) => true,
     }
 }
 

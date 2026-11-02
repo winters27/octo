@@ -1839,8 +1839,11 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
 .radio-discovery-fields { display: grid; grid-template-columns: minmax(150px, .7fr) minmax(220px, 1.3fr); gap: 10px; }
 .radio-discovery-fields label { display: grid; gap: 5px; color: var(--text-muted); font-size: var(--t-label); }
 .radio-row-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--s-m); }
-.radio-status { min-height: 92px; padding: var(--s-xl); border-top: 1px solid var(--hairline); }
+.radio-status { min-height: 92px; padding: var(--s-xl) var(--s-2xl); border-top: 1px solid var(--hairline); }
 .radio-state-copy { margin: 0 0 var(--s-l); color: var(--text-muted); line-height: 1.5; }
+/* The stations kept from the last refresh: a quieter line that belongs to the state above it. */
+.radio-state-copy:has(+ .radio-carried-note) { margin-bottom: var(--s-2xs); }
+.radio-carried-note { margin: 0 0 var(--s-l); color: var(--text-muted); font-size: var(--t-meta); line-height: 1.5; text-wrap: pretty; }
 .radio-station-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .radio-station-item { padding: var(--s-l); border-radius: var(--r-control); background: rgba(0, 0, 0, 0.14); box-shadow: inset 0 0 0 1px var(--hairline); }
 .radio-station-item div { display: flex; justify-content: space-between; gap: var(--s-l); }
@@ -1912,6 +1915,8 @@ form.set-card.unsaved { border-color: var(--warn-line); box-shadow: var(--glass-
   .radio-row-actions { grid-column: 1; grid-row: 2; justify-content: stretch; }
   .radio-row-actions .btn { flex: 1 1 calc(50% - 8px); }
   .radio-station-grid { grid-template-columns: 1fr; }
+  .radio-status { padding: var(--s-l) 14px; }
+  .radio-status-toolbar .set-ctrl:not(:has(> :not([hidden]))) { display: none; }
   .radio-status-toolbar, .radio-reset-row { align-items: stretch; flex-direction: column; }
   .radio-status-toolbar .set-ctrl { width: 100%; min-width: 0; flex-wrap: wrap; }
   .radio-status-toolbar select, .radio-status-toolbar .btn, .radio-reset-row .btn { width: 100%; min-height: 44px; }

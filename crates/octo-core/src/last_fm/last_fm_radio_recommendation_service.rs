@@ -22,7 +22,9 @@ use crate::last_fm::last_fm_radio_state_store::station_id;
 use crate::last_fm::radio_filler;
 use crate::last_fm::{SimilarArtist, SimilarTrack};
 use crate::metadata::genre_normalizer::to_title_case;
-use crate::models::radio::{LastFmRadioPlay, LastFmRadioStation, LastFmRadioStationKind, LastFmRadioTrack};
+use crate::models::radio::{
+    LastFmRadioPlay, LastFmRadioStation, LastFmRadioStationKind, LastFmRadioTrack, LastFmRadioUserState,
+};
 use crate::radio::radio_provider;
 use crate::settings::{DiscoveryStationSettings, LastFmSettings};
 
@@ -952,6 +954,104 @@ pub fn title(value: &str) -> String {
     to_title_case(&dotnet::to_lower_invariant(value))
 }
 
+/// Whether radio has learned enough from the listener: their learned plays, each weighted by
+/// where it came from ([`source_weight`]), add up to `LASTFM_MINIMUM_PLAYS`. Only then are
+/// Your Radio, Discovery Radio and the artist and genre stations built.
+pub fn is_learned(plays: &[LastFmRadioPlay], settings: &LastFmSettings) -> bool {
+    let learned: f64 = plays
+        .iter()
+        .filter(|play| play.learned_signal)
+        .map(source_weight)
+        .sum();
+    learned >= f64::from(settings.effective_minimum_plays())
+}
+
+/// The listener's songs that would not play and are still held out at `now`.
+pub fn still_unavailable(user: &LastFmRadioUserState, now: DateTime<Utc>) -> IgnoreCaseKeys {
+    user.unavailable_tracks
+        .iter()
+        .filter(|track| track.retry_after_utc > now)
+        .map(|track| track.key.as_str())
+        .collect()
+}
+
+/// The songs that must never be in or served from the listener's stations at `now`: the ones
+/// they rated one star and the ones still held out because they would not play.
+pub fn blocked_tracks(user: &LastFmRadioUserState, now: DateTime<Utc>) -> IgnoreCaseKeys {
+    user.radio_bans
+        .iter()
+        .map(|ban| ban.key.as_str())
+        .chain(
+            user.unavailable_tracks
+                .iter()
+                .filter(|track| track.retry_after_utc > now)
+                .map(|track| track.key.as_str()),
+        )
+        .collect()
+}
+
+/// Takes every song in `blocked` out of a station's tracks and its reserve. Answers whether the
+/// tracks changed and whether the reserve changed.
+pub fn strip_blocked(station: &mut LastFmRadioStation, blocked: &IgnoreCaseKeys) -> (bool, bool) {
+    let allowed = |track: &LastFmRadioTrack| {
+        !blocked.contains(&seed_normalizer::track_key(&track.artist, &track.title))
+    };
+    let tracks = station.tracks.len();
+    station.tracks.retain(|track| allowed(track));
+    let reserve = station.reserve.len();
+    station.reserve.retain(|track| allowed(track));
+    (station.tracks.len() != tracks, station.reserve.len() != reserve)
+}
+
+/// A station put back among stations it was not built with keeps only the songs none of them
+/// has, unless that would leave it fewer than ten (or all it had), as
+/// [`suppress_station_overlap`] does within a build. The others stay as they are.
+pub fn trim_against(station: &mut LastFmRadioStation, others: &[LastFmRadioStation]) {
+    let used: IgnoreCaseKeys = others
+        .iter()
+        .flat_map(|other| other.tracks.iter())
+        .map(|track| seed_normalizer::track_key(&track.artist, &track.title))
+        .collect();
+    let unique: Vec<LastFmRadioTrack> = station
+        .tracks
+        .iter()
+        .filter(|track| !used.contains(&seed_normalizer::track_key(&track.artist, &track.title)))
+        .cloned()
+        .collect();
+    if unique.len() >= 10.min(station.tracks.len()) {
+        station.tracks = unique;
+    }
+}
+
+/// The longest station name the admin screens show by name in [`carried_note`]: the phone apps
+/// print the note after their own words, in two lines at most.
+pub const CARRIED_NAME_MOST: usize = 30;
+
+/// What the admin screens say while a refresh kept stations as they were because their lookups
+/// did not answer: one station by name when the name is short and plain, otherwise a count.
+/// None for no station.
+pub fn carried_note<S: AsRef<str>>(names: &[S]) -> Option<String> {
+    match names {
+        [] => None,
+        [name] => {
+            let name = name.as_ref().trim();
+            let plain = !name.is_empty()
+                && name.chars().count() <= CARRIED_NAME_MOST
+                && !name.contains(['{', '[', '<', '\n', '\r'])
+                && !name.contains("Exception");
+            Some(if plain {
+                format!("Couldn't update {name}, so it kept its songs")
+            } else {
+                "Couldn't update a station, so it kept its songs".to_string()
+            })
+        }
+        _ => Some(format!(
+            "Couldn't update {} stations, so they kept their songs",
+            names.len()
+        )),
+    }
+}
+
 fn stable_order(artist: &str, title: &str) -> String {
     key(&format!("{artist}|{title}"))
 }
@@ -1391,6 +1491,149 @@ mod tests {
         .map(|artist| artist.name)
         .collect();
         assert_eq!(order, ["New One", "Known Band", "New Two"]);
+    }
+
+    #[test]
+    fn learned_counts_plays_by_where_they_came_from() {
+        let settings = LastFmSettings {
+            minimum_plays: 3,
+            ..Default::default()
+        };
+        let play = |source: &str| LastFmRadioPlay {
+            source: source.into(),
+            ..Default::default()
+        };
+        assert!(!is_learned(&[play("scrobble"), play("scrobble")], &settings));
+        assert!(is_learned(
+            &[play("scrobble"), play("scrobble"), play("scrobble")],
+            &settings
+        ));
+        // A song the radio played counts 0.4: seven make 2.8, eight make 3.2.
+        assert!(!is_learned(&vec![play("internet-radio"); 7], &settings));
+        assert!(is_learned(&vec![play("internet-radio"); 8], &settings));
+        let unlearned = LastFmRadioPlay {
+            learned_signal: false,
+            ..play("scrobble")
+        };
+        assert!(!is_learned(&vec![unlearned; 5], &settings));
+    }
+
+    #[test]
+    fn blocked_songs_are_the_one_star_ones_and_the_unplayable_ones_still_held_out() {
+        use crate::models::radio::{LastFmRadioBan, LastFmRadioUnavailableTrack};
+        let now = Utc::now();
+        let key = seed_normalizer::track_key;
+        let user = LastFmRadioUserState {
+            radio_bans: vec![LastFmRadioBan {
+                key: key("A", "Banned"),
+                ..Default::default()
+            }],
+            unavailable_tracks: vec![
+                LastFmRadioUnavailableTrack {
+                    key: key("B", "Held"),
+                    retry_after_utc: now + TimeDelta::minutes(5),
+                    ..Default::default()
+                },
+                LastFmRadioUnavailableTrack {
+                    key: key("C", "Free"),
+                    retry_after_utc: now - TimeDelta::minutes(5),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let blocked = blocked_tracks(&user, now);
+        assert!(blocked.contains(&key("A", "Banned")) && blocked.contains(&key("B", "Held")));
+        assert!(!blocked.contains(&key("C", "Free")));
+        let held = still_unavailable(&user, now);
+        assert!(held.contains(&key("B", "Held")));
+        assert!(!held.contains(&key("A", "Banned")) && !held.contains(&key("C", "Free")));
+    }
+
+    #[test]
+    fn strip_blocked_says_which_list_changed() {
+        let track = |title: &str| LastFmRadioTrack {
+            artist: "A".into(),
+            title: title.into(),
+            ..Default::default()
+        };
+        let mut station = LastFmRadioStation {
+            tracks: vec![track("One"), track("Two")],
+            reserve: vec![track("Three")],
+            ..Default::default()
+        };
+        let blocked: IgnoreCaseKeys = [seed_normalizer::track_key("A", "Three")].into_iter().collect();
+        assert_eq!(strip_blocked(&mut station, &blocked), (false, true));
+        assert!(station.reserve.is_empty());
+        let blocked: IgnoreCaseKeys = [seed_normalizer::track_key("a", "ONE")].into_iter().collect();
+        assert_eq!(strip_blocked(&mut station, &blocked), (true, false));
+        assert_eq!(station.tracks, vec![track("Two")]);
+        assert_eq!(strip_blocked(&mut station, &blocked), (false, false));
+    }
+
+    #[test]
+    fn a_station_put_back_keeps_only_songs_the_stations_beside_it_lack_unless_too_few_are_left() {
+        let tracks = |prefix: &str, count: usize| -> Vec<LastFmRadioTrack> {
+            (0..count)
+                .map(|index| LastFmRadioTrack {
+                    artist: "A".into(),
+                    title: format!("{prefix}{index}"),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let other = LastFmRadioStation {
+            tracks: tracks("shared", 3),
+            ..Default::default()
+        };
+        let mut station = LastFmRadioStation {
+            tracks: [tracks("shared", 3), tracks("own", 12)].concat(),
+            ..Default::default()
+        };
+        trim_against(&mut station, std::slice::from_ref(&other));
+        assert_eq!(station.tracks, tracks("own", 12));
+        assert_eq!(other.tracks.len(), 3, "the stations beside it stay as they are");
+        let mut short = LastFmRadioStation {
+            tracks: [tracks("shared", 3), tracks("own", 5)].concat(),
+            ..Default::default()
+        };
+        trim_against(&mut short, std::slice::from_ref(&other));
+        assert_eq!(
+            short.tracks.len(),
+            8,
+            "fewer than ten would be left, so it stays whole"
+        );
+    }
+
+    #[test]
+    fn the_kept_note_names_one_plain_station_and_counts_more() {
+        assert_eq!(carried_note::<&str>(&[]), None);
+        assert_eq!(
+            carried_note(&["Discovery Radio"]).as_deref(),
+            Some("Couldn't update Discovery Radio, so it kept its songs")
+        );
+        assert_eq!(
+            carried_note(&["Discovery Radio", "Rock Radio"]).as_deref(),
+            Some("Couldn't update 2 stations, so they kept their songs")
+        );
+        for odd in [
+            "A Name Longer Than Thirty Chars Radio",
+            "{weird} Radio",
+            "[x] Radio",
+            "<b> Radio",
+            "Exception Radio",
+            "Two\nLines",
+            "   ",
+        ] {
+            assert_eq!(
+                carried_note(&[odd]).as_deref(),
+                Some("Couldn't update a station, so it kept its songs"),
+                "{odd:?}"
+            );
+        }
+        let thirty = format!("{} Radio", "A".repeat(24));
+        assert_eq!(thirty.chars().count(), CARRIED_NAME_MOST);
+        assert!(carried_note(&[thirty.as_str()]).unwrap().contains(&thirty));
     }
 
     #[test]

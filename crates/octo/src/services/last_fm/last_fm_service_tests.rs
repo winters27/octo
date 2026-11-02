@@ -628,3 +628,53 @@ async fn top_track_calls_take_turns_at_the_provider_gate() {
         .count();
     assert_eq!(early, 4, "four at once, the rest after");
 }
+
+/// Two artists like the seed, the second one's top songs rate limited while `limited` is set.
+struct OneArtistLimited {
+    limited: Arc<Mutex<bool>>,
+}
+
+impl Respond for OneArtistLimited {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        match query(request, "method").as_str() {
+            "artist.getsimilar" => ResponseTemplate::new(200)
+                .set_body_string(r#"{"similarartists":{"artist":[{"name":"One"},{"name":"Two"}]}}"#),
+            "artist.gettoptracks" if query(request, "artist") == "Two" && *self.limited.lock() => {
+                ResponseTemplate::new(429)
+            }
+            "artist.gettoptracks" => ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"toptracks":{{"track":[{{"name":"{} song"}}]}}}}"#,
+                query(request, "artist")
+            )),
+            _ => ResponseTemplate::new(200).set_body_string("{}"),
+        }
+    }
+}
+
+/// Radio for an artist plays the songs of the similar artists Last.fm answered for, and keeps
+/// that list only once every one of them answered.
+#[tokio::test]
+async fn similar_artist_songs_skip_an_unanswered_artist_and_are_kept_only_when_whole() {
+    let limited = Arc::new(Mutex::new(true));
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(OneArtistLimited {
+            limited: Arc::clone(&limited),
+        })
+        .mount(&server)
+        .await;
+    let last_fm = service(&server);
+    let titles =
+        |tracks: Vec<SimilarTrack>| -> Vec<String> { tracks.into_iter().map(|track| track.title).collect() };
+
+    assert_eq!(
+        titles(last_fm.get_similar_artist_tracks("Seed", 10).await),
+        ["One song"]
+    );
+    *limited.lock() = false;
+    assert_eq!(
+        titles(last_fm.get_similar_artist_tracks("Seed", 10).await),
+        ["One song", "Two song"],
+        "the list missing Two was not kept"
+    );
+}

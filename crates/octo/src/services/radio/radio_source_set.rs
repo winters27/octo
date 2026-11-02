@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use super::radio_outcome_store::RadioOutcomeStore;
 use super::radio_source::IRadioSource;
+use crate::services::last_fm::lookup_trouble;
 
 /// Failures or timeouts in a row before a source is rested, and for how long. A source that
 /// hangs would otherwise cost every radio its full timeout, and a station build one timeout per
@@ -142,31 +143,57 @@ impl RadioSourceSet {
             .into_iter()
             .filter(|source| only.is_none_or(|only| only(source.as_ref())))
             .collect();
-        futures::future::join_all(
+        let resting = self.resting(only);
+        let answers = futures::future::join_all(
             asked
                 .iter()
                 .map(|source| self.ask(source.as_ref(), source.songs_like(seed, count, auth))),
         )
-        .await
+        .await;
+        note_unanswered(&answers, resting);
+        answers.into_iter().map(|(answer, _)| answer).collect()
     }
 
     pub async fn tag_all(&self, tag: &str, count: i32) -> Vec<RadioAnswer> {
         let asked = self.available();
-        futures::future::join_all(
+        let resting = self.resting(None);
+        let answers = futures::future::join_all(
             asked
                 .iter()
                 .map(|source| self.ask(source.as_ref(), source.tag(tag, count))),
         )
-        .await
+        .await;
+        note_unanswered(&answers, resting);
+        answers.into_iter().map(|(answer, _)| answer).collect()
     }
 
+    /// Whether a source that would otherwise be asked is resting now.
+    fn resting(&self, only: Option<&(dyn Fn(&dyn IRadioSource) -> bool + Sync)>) -> bool {
+        let now = Utc::now();
+        let health = self.health.lock();
+        self.sources.iter().any(|source| {
+            source.available()
+                && only.is_none_or(|only| only(source.as_ref()))
+                && health
+                    .get(source.provider())
+                    .is_some_and(|(_, rest_until)| *rest_until > now)
+        })
+    }
+
+    /// One source's answer, and whether it answered cleanly: in time, without an error, and with
+    /// every Last.fm lookup inside it answered. Last.fm trouble inside a source still counts for
+    /// the station build that asked.
     async fn ask(
         &self,
         source: &dyn IRadioSource,
         ask: impl Future<Output = anyhow::Result<RadioAnswer>>,
-    ) -> RadioAnswer {
+    ) -> (RadioAnswer, bool) {
         let timeout = *self.source_timeout.lock();
-        match tokio::time::timeout(timeout, ask).await {
+        let (outcome, inner) = lookup_trouble::watch(tokio::time::timeout(timeout, ask)).await;
+        if inner.core {
+            lookup_trouble::note_core();
+        }
+        match outcome {
             Ok(Ok(answer)) => {
                 // A success clears the count of failures in a row, but never cuts a rest short:
                 // an answer to a call made before the rest began says nothing about the source
@@ -176,7 +203,7 @@ impl RadioSourceSet {
                     .entry(source.provider().to_string())
                     .or_insert((0, datetime::min_value()));
                 entry.0 = 0;
-                answer
+                (answer, !inner.any())
             }
             Err(_) => {
                 info!(
@@ -185,12 +212,12 @@ impl RadioSourceSet {
                     timeout.as_secs_f64()
                 );
                 self.failed(source.provider());
-                RadioAnswer::nothing(source.provider())
+                (RadioAnswer::nothing(source.provider()), false)
             }
             Ok(Err(error)) => {
                 warn!("Radio source {} failed; left out: {error}", source.provider());
                 self.failed(source.provider());
-                RadioAnswer::nothing(source.provider())
+                (RadioAnswer::nothing(source.provider()), false)
             }
         }
     }
@@ -210,6 +237,15 @@ impl RadioSourceSet {
             "Radio source {provider} failed {FAILURES_BEFORE_REST} times in a row; resting it for {} minutes",
             rest.num_seconds() as f64 / 60.0
         );
+    }
+}
+
+/// Marks the station build's lookup as not answered by the radio sources when none of them
+/// answered cleanly: each one asked failed, timed out or met trouble, or the ones left are all
+/// resting. No source to ask at all is a setting, not trouble.
+fn note_unanswered(answers: &[(RadioAnswer, bool)], resting: bool) {
+    if (!answers.is_empty() || resting) && !answers.iter().any(|(_, clean)| *clean) {
+        lookup_trouble::note_sources();
     }
 }
 
@@ -452,5 +488,37 @@ mod tests {
         let providers: Vec<&str> = answers.iter().map(|a| a.provider.as_str()).collect();
         assert_eq!(providers, [YOU_TUBE_MUSIC]);
         assert_eq!(last_fm.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A station build's lookup is not answered when no source answered cleanly, a resting one
+    /// included; one clean answer, even an empty one, is an answer.
+    #[tokio::test]
+    async fn no_clean_answer_from_any_source_is_no_answer() {
+        let failing = FakeSource::new(LISTEN_BRAINZ, Behavior::Fail);
+        let alone = set(RadioSourceSettings::default(), vec![failing.clone()]);
+        alone.set_rest(TimeDelta::minutes(5));
+        let (_, trouble) = lookup_trouble::watch(ask(&alone)).await;
+        assert!(trouble.sources && !trouble.core);
+        for _ in 1..FAILURES_BEFORE_REST {
+            ask(&alone).await;
+        }
+        assert!(alone.available().is_empty());
+        let (answers, trouble) = lookup_trouble::watch(ask(&alone)).await;
+        assert!(answers.is_empty());
+        assert!(trouble.sources, "a resting source is no answer either");
+
+        let both = set(
+            RadioSourceSettings::default(),
+            vec![
+                FakeSource::new(LISTEN_BRAINZ, Behavior::Fail),
+                FakeSource::new(YOU_TUBE_MUSIC, Behavior::Nothing),
+            ],
+        );
+        let (_, trouble) = lookup_trouble::watch(ask(&both)).await;
+        assert!(!trouble.any());
+
+        let none = set(RadioSourceSettings::default(), Vec::new());
+        let (_, trouble) = lookup_trouble::watch(ask(&none)).await;
+        assert!(!trouble.any(), "no source to ask is a setting, not trouble");
     }
 }

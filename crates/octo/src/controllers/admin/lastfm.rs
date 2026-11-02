@@ -7,6 +7,8 @@ use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use octo_core::common::dotnet::is_blank;
+use octo_core::last_fm::last_fm_radio_recommendation_service::carried_note;
+use octo_core::last_fm::last_fm_radio_refresh_policy::FAILURE_RETRY_DELAY;
 use octo_core::last_fm::last_fm_scrobble_service::LastFmScrobbleException;
 use octo_core::settings::SettingsWriteError;
 use serde::Deserialize;
@@ -60,6 +62,20 @@ pub async fn get_last_fm_radio(
         } else {
             "waiting for completed scrobbles"
         };
+        // Stations the last refresh kept as they were, while something will try them again.
+        let trying = settings.enable_radio
+            && (settings.enable_personalized_stations || settings.enable_discovery_stations);
+        let carried: Vec<&str> = user
+            .stations
+            .iter()
+            .filter(|station| {
+                user.carried_station_keys
+                    .iter()
+                    .any(|key| octo_core::common::dotnet::eq_ignore_case(key, &station.key))
+            })
+            .map(|station| station.name.as_str())
+            .collect();
+        let note = if trying { carried_note(&carried) } else { None };
         json!({
             "plays": learned,
             "needed": (settings.effective_minimum_plays() - learned).max(0),
@@ -67,7 +83,10 @@ pub async fn get_last_fm_radio(
             "refreshing": user.refreshing,
             "lastRefreshAttemptUtc": user.last_refresh_attempt_utc.as_ref().map(octo_core::json::datetime::format_utc),
             "lastRefreshSuccessUtc": user.last_refresh_success_utc.as_ref().map(octo_core::json::datetime::format_utc),
-            "lastRefreshError": user.last_refresh_error,
+            // The apps show this line as it is, so a refresh that kept stations says so here too.
+            "lastRefreshError": user.last_refresh_error.clone().or_else(|| note.clone()),
+            "carriedNote": note,
+            "carriedRetryMinutes": FAILURE_RETRY_DELAY.num_minutes(),
         })
     });
     let stations: Vec<serde_json::Value> = user_state

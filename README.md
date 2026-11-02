@@ -782,7 +782,11 @@ last good version. Stations are drawn again every `LASTFM_REFRESH_INTERVAL_HOURS
 default), whether or not anyone is listening; plays never draw a station again early, so an app
 that holds a station as a playlist keeps the same songs between refreshes. A listener's first
 stations, and Your Radio once `LASTFM_MINIMUM_PLAYS` plays have taught it, come as soon as
-there is something to build them from. State is bounded and versioned in
+there is something to build them from. When Last.fm gives no answer for one of a listener's
+stations during a refresh (no connection, a rate limit, its time running out), that station keeps
+its songs instead of dropping off the list, and Octo tries it again every 15 minutes until it can
+be made or is no longer wanted; the dashboard's Radio page says when stations were kept this way. A
+station Last.fm answered with too few songs goes as before. State is bounded and versioned in
 `/app/config/lastfm-radio-state.json`; do not share that file across Octo instances
 because cross-process locking is not supported.
 
