@@ -408,7 +408,9 @@ impl BaseDownloadService {
             transcoded_from: record.as_ref().and_then(|r| r.transcoded_from.clone()),
             ..Default::default()
         };
-        family.placed(target, &song, provider, external_id, members).await;
+        family
+            .placed(target, &song, provider, external_id, members, true)
+            .await;
         let Some(mut record) = record.filter(|record| {
             record.heart.as_ref().is_some_and(|heart| {
                 heart.users.len() != members.len() || heart.users.iter().any(|user| !one_of(members, user))

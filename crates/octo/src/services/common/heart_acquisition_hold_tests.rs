@@ -2752,6 +2752,57 @@ async fn an_album_heart_joins_a_songs_own_hold_of_its_track_that_holds_a_file() 
     assert!(album_gates.settled("soulseek", "album-1", &["anna".to_string()], "help"));
 }
 
+/// An album heart's walk held a track for MusicBrainz before any file of it was fetched: once
+/// MusicBrainz answers, the resumed hold fetches the track for the album heart, and the album's row
+/// lets go of it.
+#[tokio::test]
+async fn an_album_track_held_before_any_file_was_fetched_is_fetched_when_it_resumes() {
+    let (rig, album_gates) = album_rig(Arc::new(ListedGates::default()), memory_holds());
+    let _album = album_gates.register(
+        "soulseek",
+        "album-1",
+        AlbumGate {
+            user: "anna".into(),
+            origin: AcquisitionOrigin::AlbumHeart,
+            tracks: vec![help_on_the_album()],
+        },
+        Vec::<String>::new(),
+    );
+    rig.coordinator.file_hold(
+        "soulseek",
+        "help",
+        Some("anna"),
+        AcquisitionOrigin::AlbumHeart,
+        WaitingFor::MusicBrainz,
+        vec![holder("anna")],
+        "Waiting for MusicBrainz",
+        None,
+        None,
+        &mut Vec::new(),
+    );
+    let held = rig.holds.snapshot().remove(0);
+    assert!(held.album_track.is_some(), "held as the album's track");
+    assert!(held.held_files.is_empty(), "nothing fetched yet");
+    assert!(rig.tracker.is_held("soulseek", "album-1"));
+    let (landed, stop) = land_everything(&rig.queue);
+
+    rig.coordinator.resume_held(&held.key());
+
+    until(|| rig.holds.snapshot().is_empty()).await;
+    let taken = landed.lock().clone();
+    assert_eq!(taken.len(), 1, "the track is fetched");
+    assert_eq!(taken[0].external_id, "help");
+    assert_eq!(taken[0].origin, Some(AcquisitionOrigin::AlbumHeart));
+    let gated: Vec<String> = taken[0].gates().into_iter().map(|gate| gate.user).collect();
+    assert_eq!(gated, ["anna"], "for anna's album heart");
+    until(|| !rig.coordinator.resuming.lock().contains(&held.key())).await;
+    assert!(
+        !rig.tracker.is_held("soulseek", "album-1"),
+        "the album's row lets go"
+    );
+    stop.cancel();
+}
+
 /// A hold whose sound `fpcalc` could not read for the clip check waits on its own: Deezer answering
 /// again leaves it alone, and its holder's next play runs it again with what they heard. With
 /// AcoustID on, a hold the clip check could not tell runs again on its holder's next play too;

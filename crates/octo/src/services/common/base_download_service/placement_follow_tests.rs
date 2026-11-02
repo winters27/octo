@@ -140,7 +140,15 @@ impl FamilyPlacement for Pool {
         Some(path.to_string())
     }
 
-    async fn placed(&self, path: &str, _: &Song, _: &str, _: &str, members: &[String]) -> Option<String> {
+    async fn placed(
+        &self,
+        path: &str,
+        _: &Song,
+        _: &str,
+        _: &str,
+        members: &[String],
+        _: bool,
+    ) -> Option<String> {
         self.placed.lock().push((path.to_string(), members.to_vec()));
         None
     }

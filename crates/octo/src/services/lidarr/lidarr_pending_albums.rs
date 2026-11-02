@@ -1389,6 +1389,26 @@ impl LidarrPendingAlbums {
     /// is taken off the list and answered, to be placed now.
     pub fn release(&self, foreign_album_id: &str) -> Vec<HeldPlacement> {
         let mut listed = self.listed.lock();
+        let free = Self::release_listed(&mut listed, foreign_album_id);
+        self.save(&listed);
+        free
+    }
+
+    /// The follow is over: it imports nothing more, so no new file waits for it, and what it held
+    /// is let go as [`Self::release`] lets it go, in the same step, so no file is held for it in
+    /// between.
+    pub fn let_go_of(&self, foreign_album_id: &str) -> Vec<HeldPlacement> {
+        let mut listed = self.listed.lock();
+        if let Some(entry) = listed.albums.get_mut(&key(foreign_album_id)) {
+            entry.released = true;
+        }
+        let free = Self::release_listed(&mut listed, foreign_album_id);
+        self.save(&listed);
+        free
+    }
+
+    /// [`Self::release`] on the list as it is now.
+    fn release_listed(listed: &mut Listed, foreign_album_id: &str) -> Vec<HeldPlacement> {
         let open = listed.importing();
         let mut free = Vec::new();
         let mut kept = Vec::new();
@@ -1411,7 +1431,6 @@ impl LidarrPendingAlbums {
             }
         }
         listed.held = kept;
-        self.save(&listed);
         free
     }
 

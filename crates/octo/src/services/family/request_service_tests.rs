@@ -166,6 +166,7 @@ impl RequestFetcher for Fetcher {
                 provider,
                 external_id,
                 &[user.to_string()],
+                false,
             )
             .await;
         Fetched::Landed(path)
@@ -305,7 +306,7 @@ async fn a_song_another_member_has_is_added_at_once() {
     setup
         .world
         .pool
-        .placed(&pooled, &song, "test", "7", &["sam".to_string()])
+        .placed(&pooled, &song, "test", "7", &["sam".to_string()], false)
         .await;
 
     let made = setup
@@ -782,7 +783,7 @@ async fn a_member_never_reads_a_path_inside_the_server() {
     setup
         .world
         .pool
-        .placed(&pooled, &song, "test", "36", &["sam".to_string()])
+        .placed(&pooled, &song, "test", "36", &["sam".to_string()], false)
         .await;
     // Alex's own folder cannot be made: a file is in the way.
     std::fs::write(format!("{}/alex", setup.world.members()), b"in the way").expect("a file");

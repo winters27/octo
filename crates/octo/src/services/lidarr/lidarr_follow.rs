@@ -1353,16 +1353,17 @@ impl Inner {
         });
     }
 
-    /// The follow lets go of the files it held: each one no other follow that may still import
-    /// holds is placed now (or gives way to its song's proven Lidarr file). A file an earlier end
-    /// could not place, and one whose follows are gone or over, is tried again with them.
+    /// The follow lets go of the files it held: it is over from this moment, so a file that lands
+    /// for its artist meanwhile never waits for it, and each one it held that no other follow that
+    /// may still import holds is placed now (or gives way to its song's proven Lidarr file). A
+    /// file an earlier end could not place, and one whose follows are gone or over, is tried again
+    /// with them.
     async fn let_go(&self, key: &str, why: FollowEnd) {
-        let mut free = self.pending.release(key);
+        let mut free = self.pending.let_go_of(key);
         free.extend(self.pending.release_unfollowed());
         for held in free {
             self.place_held(held, why).await;
         }
-        self.pending.update(key, |entry| entry.released = true);
     }
 
     /// Places a held file now, or has a kept copy whose song's Lidarr file passed the gate of

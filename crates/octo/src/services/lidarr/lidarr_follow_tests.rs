@@ -787,6 +787,57 @@ async fn a_kept_copy_held_while_a_follow_is_open_waits_and_is_placed_when_it_end
     over(&f).await;
 }
 
+/// A follow that is over takes no new file from the moment it lets go: a file of the artist that
+/// lands while its kept copy is still being placed (the placing waits on the library) waits for no
+/// follow and goes to its target, and nothing is left held once the follow is done.
+#[tokio::test]
+async fn a_file_landing_while_a_follow_lets_go_never_waits_for_it() {
+    let f = Fixture::new().await;
+    f.lidarr.plan_grab(7, Grab::of("dl-1", &[(1, "Angel", "FLAC")]));
+    let service = f.service(None, 1);
+    assert!(!f.heart_teardrop(&service).await);
+    followed(&f, "dl-1").await;
+    until(|| !entry(&f).roots.is_empty()).await;
+    let held = hold_kept_copy(&f);
+    let artists = ["Massive Attack".to_string()];
+    let late_target = f
+        .root
+        .path()
+        .join("Massive Attack/Protection/01 - Karmacoma.flac")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        f.pending.covering(&artists, "Protection", &late_target),
+        [ALBUM_ID],
+        "the open follow would hold it"
+    );
+
+    // The follow is over, and placing its kept copy waits.
+    let placing = f.place_gate.lock().await;
+    f.lidarr.complete("dl-1");
+    f.lidarr.refresh();
+    until(|| f.pending.held().is_empty()).await;
+
+    // Karmacoma lands now: the placement asks which follows it waits for, and none does, so it
+    // goes to its target as usual.
+    let waits_for = f.pending.covering(&artists, "Protection", &late_target);
+    assert!(
+        waits_for.is_empty(),
+        "a follow letting go holds no new file: {waits_for:?}"
+    );
+    std::fs::create_dir_all(Path::new(&late_target).parent().expect("its folder")).expect("made");
+    std::fs::write(&late_target, b"karmacoma").expect("placed");
+
+    drop(placing);
+    until(|| f.placed.lock().len() == 1).await;
+    over(&f).await;
+    assert!(Path::new(&held.target).is_file(), "the kept copy is placed");
+    assert!(
+        f.pending.held().is_empty(),
+        "nothing waits for a follow that is over"
+    );
+}
+
 /// The late import of the hearted song fails Octo's checks: it is deleted through Lidarr, the pick
 /// is put back, and the kept copy is placed in the library.
 #[tokio::test]

@@ -424,6 +424,28 @@ async fn local_file_shortcut_relays_the_library_copy_with_the_ceiling() {
     assert_eq!(value(&sent, "format"), Some("opus"));
 }
 
+/// `who`'s own Wait for lossless play of the song, landed already with `file`: the acquisition their
+/// play joins. A play's download is its own person's, so no one else's play joins it.
+fn landed_play_of(f: &Family, who: &str, file: &str) {
+    let landed = f.state.track_acquisition_queue.enqueue_as(
+        Some(octo_core::fingerprint::heart_gate::AcquisitionOrigin::Play),
+        Vec::new(),
+        &crate::services::common::AcquisitionTarget::Shared,
+        false,
+        "deezer",
+        "1",
+        false,
+        false,
+        true,
+        None,
+        true,
+        Some(who),
+        false,
+        None,
+    );
+    assert!(landed.try_set_result(file));
+}
+
 #[tokio::test]
 async fn serve_acquired_relays_the_library_copy_with_the_ceiling() {
     // Only a member who adds songs at once has a play keep a copy, so only their play joins
@@ -431,12 +453,7 @@ async fn serve_acquired_relays_the_library_copy_with_the_ceiling() {
     let direct = Alex::with(json!({ "addToLibrary": "Direct", "streamCap": 192 }));
     let f = family(true, direct, |s| s.subsonic.wait_for_lossless_on_play = true).await;
     let file = f.index_song(false).await;
-    // The acquisition this play joins has already landed the file.
-    let landed = f
-        .state
-        .track_acquisition_queue
-        .enqueue("deezer", "1", false, false, true, None, true, None, false, None);
-    assert!(landed.try_set_result(file));
+    landed_play_of(&f, "alex", &file);
     let r = get(&f, &format!("/rest/stream?{ALEX}&id=ext-deezer-song-1"), HOME).await;
     assert_eq!(r.body, LIBRARY_AUDIO, "the library copy, never the file");
     let sent = f.streamed().await;
@@ -475,11 +492,10 @@ async fn a_file_in_another_members_library_is_never_served() {
         .register_downloaded_song(&song, &file)
         .await
         .expect("mapped");
-    let landed = f
-        .state
-        .track_acquisition_queue
-        .enqueue("deezer", "1", false, false, true, None, true, None, false, None);
-    assert!(landed.try_set_result(file));
+    // Each player's own play of the song has landed the file already.
+    for who in ["winters", "alex"] {
+        landed_play_of(&f, who, &file);
+    }
     for who in [OWNER, ALEX] {
         let r = get(&f, &format!("/rest/stream?{who}&id=ext-deezer-song-1"), HOME).await;
         assert!(!r.body.contains("the-original-flac-file"), "{who}: {}", r.body);

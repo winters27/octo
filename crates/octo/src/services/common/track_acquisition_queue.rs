@@ -487,9 +487,9 @@ impl AcquisitionRequest {
         }
     }
 
-    /// The people this request's sound checks are for, in lower case: nobody for a request that
-    /// carries no gate (the shipped checks, which every asker shares), else the person of each of
-    /// its gates.
+    /// The people this request's sound checks are for, in lower case: the person of each of its
+    /// gates; for a play with none, its asker, whose gate its download builds inside; nobody for
+    /// any other request that carries no gate (the shipped checks, which every asker shares).
     fn checked_for(&self) -> Vec<String> {
         let mut people: Vec<String> = self
             .gates
@@ -497,6 +497,12 @@ impl AcquisitionRequest {
             .iter()
             .map(|gate| dotnet::to_lower_invariant(gate.user.trim()))
             .collect();
+        if people.is_empty() && self.origin == Some(AcquisitionOrigin::Play) {
+            people.extend(
+                self.first_requester()
+                    .map(|user| dotnet::to_lower_invariant(user.trim())),
+            );
+        }
         people.sort();
         people.dedup();
         people

@@ -1254,16 +1254,38 @@ impl BaseDownloadService {
         }
 
         // A song a family member already has on disk is never downloaded again: another member
-        // gets a link to the same file, and the shared library takes the file over.
-        if !is_cache
-            && options.replacement.is_none()
-            && !options.upgrade_search
-            && let Some(family) = family
-            && let Some(found) = family
+        // gets a link to the same file, and the shared library takes the file over. A download
+        // judged by its own people's gates takes that file only as it takes one that landed for
+        // someone else: their gates judge it first, and one they refuse is passed over.
+        let family_file = match family {
+            Some(family) if !is_cache && options.replacement.is_none() && !options.upgrade_search => family
                 .find_song(external_provider, external_id, &song)
                 .await
                 .filter(|found| !flac_only || found.is_real_flac())
-                .filter(|found| !passed_over.contains(&found.path))
+                .filter(|found| !passed_over.contains(&found.path)),
+            _ => None,
+        };
+        let family_file = match family_file {
+            Some(found) if landed_first => {
+                let passes = self
+                    .backend
+                    .judge_landed(self, &mut new_download(song.clone()), &found.path)
+                    .await;
+                if passes == Some(false) {
+                    info!(
+                        "'{} - {}' is on disk for the family at {}, and this download's own check does not pass it; it fetches its own",
+                        song.artist, song.title, found.path
+                    );
+                    passed_over.push(found.path.clone());
+                    None
+                } else {
+                    Some(found)
+                }
+            }
+            found => found,
+        };
+        if let Some(family) = family
+            && let Some(found) = family_file
             && let Some(path) = match &pool_members {
                 Some(_) => Some(found.path.clone()),
                 None if options.prefetch => Some(found.path.clone()),
@@ -1693,11 +1715,21 @@ impl BaseDownloadService {
                 .register_downloaded_song_as(&song, &local_path, kept_heart(&options.place, &song))
                 .await?;
             // A pool file is recorded and linked for every member who asked (their libraries
-            // are scanned one by one); Navidrome shows it at the first member's link.
+            // are scanned one by one); Navidrome shows it at the first member's link. One judged
+            // by its own people's checks, or kept by its person, is theirs alone: it never
+            // replaces anyone else's copy of the song.
+            let personal = judged_by_own(&options.place) || options.place.keep_anyway;
             let pooled = match (family, &pool_members, &pool_root) {
                 (Some(family), Some(members), Some(_)) => Some(
                     family
-                        .placed(&local_path, &song, external_provider, external_id, members)
+                        .placed(
+                            &local_path,
+                            &song,
+                            external_provider,
+                            external_id,
+                            members,
+                            personal,
+                        )
                         .await
                         .unwrap_or_else(|| local_path.clone()),
                 ),

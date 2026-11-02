@@ -2274,8 +2274,9 @@ impl HeartAcquisitionCoordinator {
             .as_deref()
             .and_then(|user| self.import_target(user).ok())
             .unwrap_or(AcquisitionTarget::Shared);
-        // A hearted album's held track is checked again by its own held files, nothing fetched.
-        if record.album_track.is_some() && record.kind == HeldKind::Track {
+        // A hearted album's held track is checked again by its own held files, nothing fetched. One
+        // held before any file was fetched runs its chain, each holder by the heart that keeps them.
+        if record.album_track.is_some() && record.kind == HeldKind::Track && !record.held_files.is_empty() {
             self.recheck_album_track(record).await;
             return;
         }
@@ -2439,6 +2440,14 @@ impl HeartAcquisitionCoordinator {
             // Someone still waits here (a file landed only for the others): the row says so, held
             // again with this hold's line, even when the landing closed it as done.
             Some(still) => self.hold_row_for(&still),
+        }
+        // A hearted album's track that ran its chain: the album's row counts what still waits.
+        if let Some((provider, album_id)) = record
+            .album_track
+            .as_ref()
+            .and_then(|track| track.album_key.split_once(':'))
+        {
+            self.album_row(provider, album_id);
         }
     }
 
