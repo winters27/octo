@@ -1837,7 +1837,9 @@ pub(crate) fn is_catalog_image(url: &str) -> bool {
     uri.scheme() == "https"
         && uri.host_str().is_some_and(|host| {
             let host = host.to_ascii_lowercase();
-            host == "dzcdn.net" || host.ends_with(".dzcdn.net")
+            ["dzcdn.net", "mzstatic.com"]
+                .iter()
+                .any(|catalog| host == *catalog || host.ends_with(&format!(".{catalog}")))
         })
 }
 

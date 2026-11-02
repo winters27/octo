@@ -29,7 +29,7 @@ use crate::services::cover_art::CoverArtAggregator;
 use crate::services::framework::InFlight;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::metadata::DeezerMetadataService;
-use crate::services::metadata::deezer_metadata_service::fold_editions;
+use crate::services::metadata::deezer_metadata_service::{DeezerAsked, TrackAnswer, fold_editions};
 use crate::services::you_tube::{YouTubeHit, YouTubeResolver};
 
 /// The two members of `LastFmService` the length lookup uses: whether it has an API key, and
@@ -431,6 +431,11 @@ impl Inner {
         }
         let hits = self.deezer.search_albums(query, limit, false).await;
         let hits = if fold { fold_editions(hits, true) } else { hits };
+        self.album_rows(hits)
+    }
+
+    /// Catalog albums as outside album rows, each registered so it opens, plays and stars.
+    fn album_rows(&self, hits: Vec<AlbumHit>) -> Vec<Album> {
         let mut albums = Vec::with_capacity(hits.len());
         let clean_copies = clean_copies(&hits);
 
@@ -1230,10 +1235,14 @@ impl IMusicMetadataService for SoulseekMetadataService {
             .for_each_concurrent(8, |song| {
                 let missed = &missed;
                 async move {
-                    let meta = inner
+                    let answer = inner
                         .deezer
-                        .enrich_track(&song.artist, &song.title, true, false)
+                        .enrich_track_answered(&song.artist, &song.title, true, false)
                         .await;
+                    if answer == TrackAnswer::NoAnswer && song.explicit_content_lyrics.is_none() {
+                        song.explicit_content_lyrics = Some(explicit_status::UNANSWERED);
+                    }
+                    let meta = answer.found();
                     if !meta.as_ref().and_then(|m| m.duration).is_some_and(|d| d > 0) {
                         missed.lock().insert(song.id.clone());
                     }
@@ -1261,6 +1270,34 @@ impl IMusicMetadataService for SoulseekMetadataService {
         self.inner.deezer.search_tracks(query, limit).await
     }
 
+    fn catalog_searches_stand_in(&self) -> bool {
+        self.inner.deezer.searches_stand_in()
+    }
+
+    async fn catalog_albums_by_isrc(&self, isrcs: &[String]) -> Vec<Album> {
+        let mut hits: Vec<AlbumHit> = Vec::new();
+        for isrc in isrcs {
+            if let DeezerAsked::Answer(hit) = self.inner.deezer.album_by_isrc(isrc).await
+                && !hits.iter().any(|known| known.deezer_id == hit.deezer_id)
+            {
+                hits.push(hit);
+            }
+        }
+        let mut albums = Vec::new();
+        for row in self.inner.album_rows(hits) {
+            if let Some(album) = self
+                .get_album(
+                    Self::PROVIDER_NAME,
+                    row.external_id.as_deref().unwrap_or_default(),
+                )
+                .await
+            {
+                albums.push(album);
+            }
+        }
+        albums
+    }
+
     async fn enrich_search_rows(&self, songs: &mut [Song]) {
         let inner = &self.inner;
         let mut external: Vec<&mut Song> = songs.iter_mut().filter(|s| !s.is_local).collect();
@@ -1273,7 +1310,14 @@ impl IMusicMetadataService for SoulseekMetadataService {
             .for_each_concurrent(8, |song| {
                 let finish = &finish;
                 async move {
-                    let meta = inner.deezer.enrich_track_quick(&song.artist, &song.title).await;
+                    let answer = inner
+                        .deezer
+                        .enrich_track_quick_answered(&song.artist, &song.title)
+                        .await;
+                    if answer == TrackAnswer::NoAnswer && song.explicit_content_lyrics.is_none() {
+                        song.explicit_content_lyrics = Some(explicit_status::UNANSWERED);
+                    }
+                    let meta = answer.found();
                     let (id, artist, title) = key_of(song);
                     let Some(meta) = meta else {
                         finish.lock().push(RowToFinish::Missed { id, artist, title });
@@ -1488,7 +1532,7 @@ impl IMusicMetadataService for SoulseekMetadataService {
             {
                 song.album = album.to_string();
             }
-            if song.explicit_content_lyrics.is_none() {
+            if explicit_status::is_missing(song.explicit_content_lyrics) && r.explicit_content.is_some() {
                 song.explicit_content_lyrics = r.explicit_content;
             }
             if song.year.is_none() {

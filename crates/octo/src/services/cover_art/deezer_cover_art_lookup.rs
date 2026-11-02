@@ -18,7 +18,7 @@ use tracing::debug;
 
 use super::i_cover_art_source::ICoverArtSource;
 use crate::services::framework::HttpAnswer;
-use crate::services::metadata::DeezerRateLimitHandler;
+use crate::services::metadata::{AskFor, DeezerRateLimitHandler, Reach};
 
 /// Cover art via Deezer's public search API. No key, no auth, very broad
 /// catalog including international/non-Western releases: fills the gaps
@@ -100,7 +100,9 @@ impl DeezerCoverArtLookup {
         title: &str,
         background: bool,
     ) -> anyhow::Result<Option<String>> {
-        if artist.is_empty() || title.is_empty() {
+        // While Apple answers Deezer's searches, the iTunes source next in the chain asks Apple
+        // this same question: asking it here too would ask twice.
+        if artist.is_empty() || title.is_empty() || self.http.searches_stand_in() {
             return Ok(None);
         }
         // A plain query: the catalog stopped answering field-qualified ones
@@ -127,7 +129,7 @@ impl DeezerCoverArtLookup {
         album: &str,
         background: bool,
     ) -> anyhow::Result<Option<String>> {
-        if artist.is_empty() || album.is_empty() {
+        if artist.is_empty() || album.is_empty() || self.http.searches_stand_in() {
             return Ok(None);
         }
         // Plain, for the same reason as a track's.
@@ -161,7 +163,12 @@ impl DeezerCoverArtLookup {
     }
 
     async fn resolve_artist_cover(&self, artist: &str, background: bool) -> anyhow::Result<Option<String>> {
-        if artist.is_empty() {
+        // Deezer's artist search answers wherever Deezer can be reached, its closed countries too.
+        let unreachable = self
+            .http
+            .reach()
+            .is_some_and(|reach| matches!(reach.reach(), Reach::Unreachable { .. }));
+        if artist.is_empty() || unreachable {
             return Ok(None);
         }
         let url = format!(
@@ -210,7 +217,7 @@ impl DeezerCoverArtLookup {
     /// done uniformly for simplicity.
     async fn send(&self, url: &str, background: bool) -> anyhow::Result<HttpAnswer> {
         self.http
-            .get(url, background, self.accept_language.as_deref())
+            .get_for(url, AskFor::cover(background), self.accept_language.as_deref())
             .await
     }
 }

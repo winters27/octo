@@ -9,6 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use octo_core::common::{SongIdentity, SongMatchOptions, dotnet};
+use octo_core::metadata::apple_as_deezer;
 use octo_core::metadata::deezer_metadata_service::AlbumHit;
 use octo_media::cover::cover_image;
 use parking_lot::Mutex;
@@ -21,7 +22,7 @@ use tracing::{debug, info};
 use super::cover_art_archive_lookup::CoverArtArchiveLookup;
 use super::itunes_cover_art_lookup::{self, ITunesCoverArtLookup};
 use crate::services::framework::HttpAnswer;
-use crate::services::metadata::DeezerMetadataService;
+use crate::services::metadata::{AskFor, DeezerMetadataService};
 
 /// What is known about an album from its files' tags.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -289,12 +290,16 @@ impl AlbumCoverFinder {
             }
         };
         let ((itunes, probed_side), archive, catalog) = tokio::join!(itunes, archive, catalog);
+        let (catalog, catalog_source) = match catalog {
+            Some((bytes, source)) => (Some(bytes), source),
+            None => (None, "Deezer"),
+        };
 
         let mut best: Option<FoundCover> = None;
         for (bytes, source) in [
             (itunes, "iTunes"),
             (archive, "Cover Art Archive"),
-            (catalog, "Deezer"),
+            (catalog, catalog_source),
         ] {
             let Some(bytes) = bytes else {
                 continue;
@@ -328,9 +333,10 @@ impl AlbumCoverFinder {
             length_tolerance_seconds: None,
             ..SongMatchOptions::default()
         };
+        // A cover's question: Apple, standing in, paces it as a cover rather than a page.
         let hits = self
             .deezer
-            .search_albums(&format!("{artist} {album}"), 10, true)
+            .search_albums_for(&format!("{artist} {album}"), 10, true, AskFor::cover(false))
             .await;
         // The album by its own artist, never another artist's record of a near name.
         let hit = hits.into_iter().find(|hit| {
@@ -345,18 +351,22 @@ impl AlbumCoverFinder {
         hit
     }
 
-    async fn catalog_cover(&self, artist: &str, album: &str) -> Option<Vec<u8>> {
-        let url = self
-            .catalog_hit(artist, album)
-            .await?
-            .cover_url
-            .filter(|url| !url.is_empty())?;
+    /// The catalog's cover of an album, with the name of the catalog that answered: an id above
+    /// Deezer's range is Apple's.
+    async fn catalog_cover(&self, artist: &str, album: &str) -> Option<(Vec<u8>, &'static str)> {
+        let hit = self.catalog_hit(artist, album).await?;
+        let source = if apple_as_deezer::is_apple_id(&hit.deezer_id) {
+            "Apple Music"
+        } else {
+            "Deezer"
+        };
+        let url = hit.cover_url.filter(|url| !url.is_empty())?;
         let attempt = async {
             let response = self.http.get(&url).timeout(Self::DOWNLOAD_TIMEOUT).send().await?;
             anyhow::Ok(HttpAnswer::read(response).await?)
         };
         match attempt.await {
-            Ok(answer) if answer.is_success() => Some(answer.body.to_vec()),
+            Ok(answer) if answer.is_success() => Some((answer.body.to_vec(), source)),
             Ok(_) => None,
             Err(failure) => {
                 debug!("catalog cover failed for {artist} - {album}: {failure}");

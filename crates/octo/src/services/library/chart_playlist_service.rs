@@ -781,12 +781,14 @@ pub fn assemble(
 }
 
 /// `ExplicitStatus.ForClients` against the filter: a clean-only list leaves out what is marked
-/// explicit (1, or 4 for a partly explicit album), an explicit-only one what is a clean edit (3).
+/// explicit (1, or 4 for a partly explicit album) and an outside song whose words are not known
+/// because its lookup got no answer; an explicit-only one what is a clean edit (3).
 pub fn passes(song: &Song, filter: ExplicitFilter) -> bool {
-    let explicit = matches!(song.explicit_content_lyrics, Some(1 | 4));
     let clean = song.explicit_content_lyrics == Some(3);
     match filter {
-        ExplicitFilter::CleanOnly => !explicit,
+        ExplicitFilter::CleanOnly => {
+            octo_core::models::domain::explicit_status::clean_only_allows(song.explicit_content_lyrics)
+        }
         ExplicitFilter::ExplicitOnly => !clean,
         _ => true,
     }

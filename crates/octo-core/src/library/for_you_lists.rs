@@ -498,7 +498,9 @@ fn is_starred(song: &Node) -> bool {
 /// Whether the server's explicit filter lets an outside song in, as search and radio apply it.
 pub fn explicit_allowed(explicit_content_lyrics: Option<i32>, filter: ExplicitFilter) -> bool {
     match filter {
-        ExplicitFilter::CleanOnly => explicit_content_lyrics != Some(1),
+        ExplicitFilter::CleanOnly => {
+            crate::models::domain::explicit_status::clean_only_allows(explicit_content_lyrics)
+        }
         ExplicitFilter::ExplicitOnly => explicit_content_lyrics != Some(3),
         _ => true,
     }

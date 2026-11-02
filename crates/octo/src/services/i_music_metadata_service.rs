@@ -45,6 +45,18 @@ pub trait IMusicMetadataService: Send + Sync {
         None
     }
 
+    /// Whether another catalog answers this catalog's searches now (Apple's, for a server Deezer
+    /// does not serve): one song search for a query then fills its rows cheaper than a lookup
+    /// per row.
+    fn catalog_searches_stand_in(&self) -> bool {
+        false
+    }
+
+    /// The catalog albums the recordings with these ISRCs are on, each once, with their songs.
+    async fn catalog_albums_by_isrc(&self, _isrcs: &[String]) -> Vec<Album> {
+        Vec::new()
+    }
+
     /// [`Self::enrich_external_songs`] for a search someone is waiting on: one track search
     /// per row, no year. The rest of each row (the other queries for a row that search missed,
     /// the year) is looked up after the answer, for the next answer that lists the row.

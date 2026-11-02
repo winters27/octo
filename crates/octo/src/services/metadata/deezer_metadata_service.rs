@@ -15,6 +15,7 @@ use octo_core::json::element::{
     try_get_property,
 };
 use octo_core::metadata::accept_language_header;
+use octo_core::metadata::apple_as_deezer;
 use octo_core::metadata::deezer_image::deezer_image;
 use octo_core::metadata::deezer_metadata_service::normalized_record_type;
 pub use octo_core::metadata::deezer_metadata_service::{
@@ -28,7 +29,7 @@ use regex::Regex;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-use super::deezer_rate_limit_handler::DeezerRateLimitHandler;
+use super::deezer_rate_limit_handler::{AskFor, DeezerRateLimitHandler};
 use crate::services::framework::{InFlight, MemoryCache};
 use crate::services::library::album_ownership::AlbumOwnership;
 
@@ -136,6 +137,30 @@ pub enum DeezerAsked<T> {
     NoData,
     /// `transient`, a 429, the limiter's wait running out, a network error or a 5xx.
     Busy,
+}
+
+/// How a track lookup ended: the catalog's record of the song, the catalog does not have it, or
+/// no answer this time (nothing remembered, asked again next time).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrackAnswer {
+    Found(TrackMeta),
+    Missing,
+    NoAnswer,
+}
+
+impl TrackAnswer {
+    pub fn found(self) -> Option<TrackMeta> {
+        match self {
+            Self::Found(meta) => Some(meta),
+            Self::Missing | Self::NoAnswer => None,
+        }
+    }
+}
+
+impl From<Option<TrackMeta>> for TrackAnswer {
+    fn from(meta: Option<TrackMeta>) -> Self {
+        meta.map_or(Self::Missing, Self::Found)
+    }
 }
 
 /// One Deezer track as the clip check reads it.
@@ -273,12 +298,21 @@ impl DeezerMetadataService {
         &self.inner.base
     }
 
-    fn get_cached(&self, key: &str) -> Option<Cached> {
-        self.inner.cache.get(key)
+    /// The catalog generation (see `DeezerReach`). Each public entry reads it once, when its
+    /// request starts, and keeps what it learned under it, so an answer from before a catalog
+    /// switch lands where no one reads it again.
+    fn generation(&self) -> u64 {
+        self.inner.http.generation()
     }
 
-    fn put(&self, key: impl Into<String>, value: Cached, ttl: Duration) {
-        self.inner.cache.set(key, value, 1, ttl);
+    fn get_cached(&self, key: &str) -> Option<Cached> {
+        self.inner.cache.get(&in_generation(self.generation(), key))
+    }
+
+    fn put(&self, generation: u64, key: impl AsRef<str>, value: Cached, ttl: Duration) {
+        self.inner
+            .cache
+            .set(in_generation(generation, key.as_ref()), value, 1, ttl);
     }
 
     /// Drop every cached answer. Exposed so a poisoned cache can be cleared
@@ -287,6 +321,28 @@ impl DeezerMetadataService {
         self.inner.cache.clear();
         self.inner.album_year_tasks.clear();
         info!("deezer metadata caches cleared");
+    }
+
+    /// Whether Apple's catalog answers Deezer's catalog searches now.
+    pub fn searches_stand_in(&self) -> bool {
+        self.inner.http.searches_stand_in()
+    }
+
+    /// Clears every cached answer at each catalog switch, for as long as the service lives.
+    pub fn follow_switches(&self) {
+        let Some(reach) = self.inner.http.reach() else {
+            return;
+        };
+        let mut switches = reach.switches();
+        let inner = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            while switches.changed().await.is_ok() {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                (DeezerMetadataService { inner }).clear_caches();
+            }
+        });
     }
 
     fn track_key(artist: &str, title: &str) -> String {
@@ -319,6 +375,7 @@ impl DeezerMetadataService {
     ) -> Option<TrackMeta> {
         self.look_up_track(artist, title, include_year, background, false)
             .await
+            .found()
     }
 
     /// [`Self::enrich_track`] for a search someone is waiting on: one track search (the first
@@ -327,6 +384,24 @@ impl DeezerMetadataService {
     /// remembered: the full lookup's other queries may still find the song, and are left to
     /// a caller that is not waiting ([`Self::enrich_track`] on the background lane).
     pub async fn enrich_track_quick(&self, artist: &str, title: &str) -> Option<TrackMeta> {
+        self.enrich_track_quick_answered(artist, title).await.found()
+    }
+
+    /// [`Self::enrich_track`], telling a song the catalog does not have apart from a lookup that
+    /// got no answer.
+    pub async fn enrich_track_answered(
+        &self,
+        artist: &str,
+        title: &str,
+        include_year: bool,
+        background: bool,
+    ) -> TrackAnswer {
+        self.look_up_track(artist, title, include_year, background, false)
+            .await
+    }
+
+    /// [`Self::enrich_track_quick`], telling a miss apart from a lookup that got no answer.
+    pub async fn enrich_track_quick_answered(&self, artist: &str, title: &str) -> TrackAnswer {
         self.look_up_track(artist, title, false, false, true).await
     }
 
@@ -337,13 +412,14 @@ impl DeezerMetadataService {
         include_year: bool,
         background: bool,
         first_query_only: bool,
-    ) -> Option<TrackMeta> {
+    ) -> TrackAnswer {
         if is_blank(artist) && is_blank(title) {
-            return None;
+            return TrackAnswer::Missing;
         }
+        let generation = self.generation();
         let key = Self::track_key(artist, title);
         if let Some(Cached::Track(cached)) = self.get_cached(&key) {
-            return cached;
+            return TrackAnswer::from(cached);
         }
 
         let mut meta = None;
@@ -358,10 +434,10 @@ impl DeezerMetadataService {
                 self.find_track(artist, title, background, false).await?
             };
             if transient {
-                return anyhow::Ok(Flow::Return(None));
+                return anyhow::Ok(Flow::Return(TrackAnswer::NoAnswer));
             }
             if first_query_only && found.is_none() {
-                return Ok(Flow::Return(None));
+                return Ok(Flow::Return(TrackAnswer::Missing));
             }
             if let Some((t, doc)) = found {
                 let (mut alb_title, mut cover, mut art_name, mut art_img) = (None, None, None, None);
@@ -411,7 +487,7 @@ impl DeezerMetadataService {
 
         // Usable now, refetched next time, so the year gets another chance.
         if year_unresolved {
-            return meta;
+            return TrackAnswer::from(meta);
         }
 
         let ttl = if meta.is_none() {
@@ -419,8 +495,8 @@ impl DeezerMetadataService {
         } else {
             POSITIVE_TTL
         };
-        self.put(key, Cached::Track(meta.clone()), ttl);
-        meta
+        self.put(generation, key, Cached::Track(meta.clone()), ttl);
+        TrackAnswer::from(meta)
     }
 
     /// Full track metadata for tagging a downloaded file: one track search (album,
@@ -430,6 +506,7 @@ impl DeezerMetadataService {
         if is_blank(artist) && is_blank(title) {
             return None;
         }
+        let generation = self.generation();
         let key = dotnet::to_lower_invariant(&format!("full|{artist}|{title}"));
         if let Some(Cached::Full(cached)) = self.get_cached(&key) {
             return cached;
@@ -446,7 +523,7 @@ impl DeezerMetadataService {
                 return anyhow::Ok(Flow::Return(None));
             }
             if let Some((t, _)) = found {
-                let (full, unresolved) = self.build_full_meta(&t).await?;
+                let (full, unresolved) = self.build_full_meta(&t, generation).await?;
                 meta = Some(full);
                 detail_unresolved = unresolved;
             }
@@ -468,7 +545,7 @@ impl DeezerMetadataService {
         } else {
             POSITIVE_TTL
         };
-        self.put(key, Cached::Full(meta.clone()), ttl);
+        self.put(generation, key, Cached::Full(meta.clone()), ttl);
         meta
     }
 
@@ -486,6 +563,7 @@ impl DeezerMetadataService {
             return Arc::new(CatalogCandidates::default());
         }
         let max = max.clamp(1, MATCH_CANDIDATES);
+        let generation = self.generation();
         let key = dotnet::to_lower_invariant(&format!("cands|{artist}|{title}|{max}"));
         if let Some(Cached::Candidates(cached)) = self.get_cached(&key) {
             return cached;
@@ -499,7 +577,7 @@ impl DeezerMetadataService {
                 return anyhow::Ok(Flow::Return(()));
             }
             for hit in found.iter().take(max as usize) {
-                let (meta, unresolved) = self.build_full_meta(hit).await?;
+                let (meta, unresolved) = self.build_full_meta(hit, generation).await?;
                 detail_unresolved |= unresolved;
                 hits.push(meta);
             }
@@ -523,7 +601,7 @@ impl DeezerMetadataService {
         });
         if !detail_unresolved {
             let ttl = if empty { NEGATIVE_TTL } else { POSITIVE_TTL };
-            self.put(key, Cached::Candidates(Arc::clone(&answer)), ttl);
+            self.put(generation, key, Cached::Candidates(Arc::clone(&answer)), ttl);
         }
         answer
     }
@@ -531,7 +609,7 @@ impl DeezerMetadataService {
     /// One search hit made whole: the album's detail (year, genre, label, barcode,
     /// album artist, kind) and the track's own record (position, contributors, code, words,
     /// loudness). The second value says a detail call did not answer, so nothing is cached.
-    async fn build_full_meta(&self, t: &Value) -> ElementResult<(FullTrackMeta, bool)> {
+    async fn build_full_meta(&self, t: &Value, generation: u64) -> ElementResult<(FullTrackMeta, bool)> {
         let mut detail_unresolved = false;
         let (mut alb_title, mut cover, mut art_name) = (None, None, None);
         let mut isrc = str_prop(t, "isrc")?.map(str::to_string);
@@ -609,7 +687,7 @@ impl DeezerMetadataService {
                 }
                 bpm = tempo_of(track)?;
                 if let Some(code) = isrc.as_deref().and_then(SongIdentity::normalize_isrc) {
-                    self.put(tempo_key(&code), Cached::Tempo(bpm), POSITIVE_TTL);
+                    self.put(generation, tempo_key(&code), Cached::Tempo(bpm), POSITIVE_TTL);
                 }
                 if let Some(people @ Value::Array(_)) = try_get_property(track, "contributors")? {
                     let mut names: Vec<String> = Vec::new();
@@ -662,6 +740,7 @@ impl DeezerMetadataService {
         if is_blank(artist) {
             return None;
         }
+        let generation = self.generation();
         let key = dotnet::to_lower_invariant(&format!("a|{artist}"));
         if let Some(Cached::Artist(cached)) = self.get_cached(&key) {
             return cached;
@@ -695,7 +774,7 @@ impl DeezerMetadataService {
         } else {
             POSITIVE_TTL
         };
-        self.put(key, Cached::Artist(meta.clone()), ttl);
+        self.put(generation, key, Cached::Artist(meta.clone()), ttl);
         meta
     }
 
@@ -711,6 +790,7 @@ impl DeezerMetadataService {
         if is_blank(query) || limit <= 0 {
             return Vec::new();
         }
+        let generation = self.generation();
         let key = dotnet::to_lower_invariant(&format!("ars|{query}|{limit}"));
         if let Some(Cached::ArtistHits(cached)) = self.get_cached(&key) {
             return cached;
@@ -722,8 +802,8 @@ impl DeezerMetadataService {
         let (query, fetch_key) = (query.to_string(), key.clone());
         self.inner
             .in_flight_artists
-            .run(&key, async move {
-                this.fetch_artist_search(&query, limit, fetch_key, background)
+            .run(&in_generation(generation, &key), async move {
+                this.fetch_artist_search(&query, limit, fetch_key, background, generation)
                     .await
             })
             .await
@@ -735,6 +815,7 @@ impl DeezerMetadataService {
         limit: i32,
         key: String,
         background: bool,
+        generation: u64,
     ) -> Vec<ArtistHit> {
         let mut hits = Vec::new();
         let attempt = async {
@@ -764,7 +845,7 @@ impl DeezerMetadataService {
         } else {
             POSITIVE_TTL
         };
-        self.put(key, Cached::ArtistHits(hits.clone()), ttl);
+        self.put(generation, key, Cached::ArtistHits(hits.clone()), ttl);
         hits
     }
 
@@ -774,6 +855,7 @@ impl DeezerMetadataService {
         if is_blank(deezer_artist_id) || limit <= 0 {
             return Vec::new();
         }
+        let generation = self.generation();
         let key = dotnet::to_lower_invariant(&format!("rel|{deezer_artist_id}|{limit}"));
         if let Some(Cached::ArtistHits(cached)) = self.get_cached(&key) {
             return cached;
@@ -801,16 +883,41 @@ impl DeezerMetadataService {
         } else {
             POSITIVE_TTL
         };
-        self.put(key, Cached::ArtistHits(hits.clone()), ttl);
+        self.put(generation, key, Cached::ArtistHits(hits.clone()), ttl);
         hits
     }
 
     /// Search the album catalog. Single-track "albums" are dropped: a plain
     /// artist query returns a lot of them and they crowd out real records.
     pub async fn search_albums(&self, query: &str, limit: i32, keep_singles: bool) -> Vec<AlbumHit> {
+        self.search_albums_on(query, limit, keep_singles, false).await
+    }
+
+    /// [`Self::search_albums`] on the catalog's background lane when `background`.
+    pub async fn search_albums_on(
+        &self,
+        query: &str,
+        limit: i32,
+        keep_singles: bool,
+        background: bool,
+    ) -> Vec<AlbumHit> {
+        self.search_albums_for(query, limit, keep_singles, AskFor::lane(background))
+            .await
+    }
+
+    /// [`Self::search_albums`] for a caller that says who the answer is for (a cover finder's
+    /// search is a cover's, not a page's).
+    pub async fn search_albums_for(
+        &self,
+        query: &str,
+        limit: i32,
+        keep_singles: bool,
+        purpose: AskFor,
+    ) -> Vec<AlbumHit> {
         if is_blank(query) || limit <= 0 {
             return Vec::new();
         }
+        let generation = self.generation();
         let key = dotnet::to_lower_invariant(&format!(
             "as|{query}|{limit}|{}",
             if keep_singles { "True" } else { "False" }
@@ -820,12 +927,13 @@ impl DeezerMetadataService {
         }
 
         let mut hits = Vec::new();
+        let mut partial = false;
         let attempt = async {
             let q = escape_data_string(query);
             let r = self
-                .get_json(
+                .get_json_for(
                     &format!("{}/search/album?q={q}&limit={limit}", self.base()),
-                    false,
+                    purpose,
                 )
                 .await;
             // Caching an empty list here is what would make external albums silently
@@ -833,6 +941,7 @@ impl DeezerMetadataService {
             if r.transient {
                 return anyhow::Ok(Flow::Return(()));
             }
+            partial = is_partial(r.doc.as_ref());
             if let Some(data) = data_array(r.doc.as_ref())? {
                 for a in enumerate_array(data)? {
                     let id = match try_get_property(a, "id")? {
@@ -880,12 +989,14 @@ impl DeezerMetadataService {
             Err(e) => debug!("deezer album search '{query}' failed: {e}"),
         }
 
-        let ttl = if hits.is_empty() {
+        let ttl = if partial {
+            PARTIAL_TTL
+        } else if hits.is_empty() {
             NEGATIVE_TTL
         } else {
             POSITIVE_TTL
         };
-        self.put(key, Cached::AlbumHits(hits.clone()), ttl);
+        self.put(generation, key, Cached::AlbumHits(hits.clone()), ttl);
         hits
     }
 
@@ -927,6 +1038,7 @@ impl DeezerMetadataService {
             return Vec::new();
         }
         let pages = pages.clamp(1, 5);
+        let generation = self.generation();
         // A server that plays clean songs only keeps the clean copy of a title that has one.
         let clean_only = self.inner.settings.current().subsonic.explicit_filter == ExplicitFilter::CleanOnly;
         let key = dotnet::to_lower_invariant(&format!(
@@ -1068,7 +1180,7 @@ impl DeezerMetadataService {
         } else {
             POSITIVE_TTL
         };
-        self.put(key, Cached::AlbumHits(hits.clone()), ttl);
+        self.put(generation, key, Cached::AlbumHits(hits.clone()), ttl);
         hits
     }
 
@@ -1087,6 +1199,7 @@ impl DeezerMetadataService {
     /// someone is looking at the page, and the background lane is kept full by cache warming,
     /// which turned every one of these away. The caller keeps the number asked small.
     pub async fn album_track_count(&self, deezer_id: &str) -> Option<i32> {
+        let generation = self.generation();
         let key = format!("tc|{deezer_id}");
         if let Some(Cached::Number(cached)) = self.get_cached(&key) {
             return cached;
@@ -1096,14 +1209,13 @@ impl DeezerMetadataService {
         let (id, fetch_key) = (deezer_id.to_string(), key.clone());
         self.inner
             .in_flight_counts
-            .run(
-                &key,
-                async move { this.fetch_album_track_count(&id, fetch_key).await },
-            )
+            .run(&in_generation(generation, &key), async move {
+                this.fetch_album_track_count(&id, fetch_key, generation).await
+            })
             .await
     }
 
-    async fn fetch_album_track_count(&self, deezer_id: &str, key: String) -> Option<i32> {
+    async fn fetch_album_track_count(&self, deezer_id: &str, key: String, generation: u64) -> Option<i32> {
         let attempt = async {
             let r = self
                 .get_json(
@@ -1123,7 +1235,7 @@ impl DeezerMetadataService {
             } else {
                 POSITIVE_TTL
             };
-            self.put(key, Cached::Number(count), ttl);
+            self.put(generation, key, Cached::Number(count), ttl);
             Ok(count)
         };
         match attempt.await {
@@ -1141,12 +1253,14 @@ impl DeezerMetadataService {
         if is_blank(album) {
             return None;
         }
+        let generation = self.generation();
         let key = dotnet::to_lower_invariant(&format!("ai|{artist}|{album}"));
         if let Some(Cached::Id(cached)) = self.get_cached(&key) {
             return cached;
         }
 
         let mut id = None;
+        let mut partial = false;
         let attempt = async {
             // The question a heart asks for its catalog album: one builder, so the two never part.
             let Some(path) = deezer_album_search_url(artist, album) else {
@@ -1156,6 +1270,7 @@ impl DeezerMetadataService {
             if r.transient {
                 return anyhow::Ok(Flow::Return(None));
             }
+            partial = is_partial(r.doc.as_ref());
             if let Some(a) = best_match(r.doc.as_ref(), artist, album)?
                 && let Some(aid @ Value::Number(_)) = try_get_property(&a, "id")?
             {
@@ -1169,8 +1284,14 @@ impl DeezerMetadataService {
             Err(e) => debug!("deezer album id lookup '{artist} - {album}' failed: {e}"),
         }
 
-        let ttl = if id.is_none() { NEGATIVE_TTL } else { POSITIVE_TTL };
-        self.put(key, Cached::Id(id.clone()), ttl);
+        let ttl = if partial {
+            PARTIAL_TTL
+        } else if id.is_none() {
+            NEGATIVE_TTL
+        } else {
+            POSITIVE_TTL
+        };
+        self.put(generation, key, Cached::Id(id.clone()), ttl);
         id
     }
 
@@ -1210,6 +1331,7 @@ impl DeezerMetadataService {
                 answer: AlbumAnswer::NoSuchAlbum,
             };
         }
+        let generation = self.generation();
         let cache_key = format!("ad|{deezer_id}");
         if let Some(Cached::Album(cached)) = self.get_cached(&cache_key) {
             return cached;
@@ -1218,14 +1340,19 @@ impl DeezerMetadataService {
         let id = deezer_id.to_string();
         self.inner
             .in_flight_albums
-            .run(&cache_key, async move {
-                this.look_up_album_detail_on(&id, background).await
+            .run(&in_generation(generation, &cache_key), async move {
+                this.album_detail_in(&id, background, generation).await
             })
             .await
     }
 
     /// [`Self::look_up_album_detail`] on the catalog's background lane when `background`.
     pub async fn look_up_album_detail_on(&self, deezer_id: &str, background: bool) -> AlbumLookup {
+        self.album_detail_in(deezer_id, background, self.generation())
+            .await
+    }
+
+    async fn album_detail_in(&self, deezer_id: &str, background: bool, generation: u64) -> AlbumLookup {
         if is_blank(deezer_id) {
             return AlbumLookup {
                 detail: None,
@@ -1274,6 +1401,8 @@ impl DeezerMetadataService {
                 if r.transient {
                     return anyhow::Ok(Flow::Return(unavailable.clone()));
                 }
+                // An answer that may change soon (a stand-in album whose twin was not asked).
+                partial |= is_partial(r.doc.as_ref()) || is_partial(tr.doc.as_ref());
                 if let Some(root) = &r.doc {
                     nb_tracks = int(root, "nb_tracks")?;
                     title = str_prop(root, "title")?.unwrap_or("").to_string();
@@ -1301,7 +1430,7 @@ impl DeezerMetadataService {
                     detail: None,
                     answer: AlbumAnswer::NoSuchAlbum,
                 };
-                self.put(cache_key.clone(), Cached::Album(none.clone()), NEGATIVE_TTL);
+                self.put(generation, &cache_key, Cached::Album(none.clone()), NEGATIVE_TTL);
                 return Ok(Flow::Return(none));
             }
 
@@ -1416,13 +1545,14 @@ impl DeezerMetadataService {
                 answer: AlbumAnswer::Found,
             },
         };
-        self.put(cache_key, Cached::Album(lookup.clone()), ttl);
+        self.put(generation, cache_key, Cached::Album(lookup.clone()), ttl);
         lookup
     }
 
     /// The album's release year, and whether it could not be told this time. Shared across
     /// concurrent callers for the same album id (single-flight).
     async fn album_year_on(&self, album_id: i64, background: bool) -> ElementResult<(Option<i32>, bool)> {
+        let generation = self.generation();
         if let Some(Cached::Number(year)) = self.get_cached(&format!("y|{album_id}")) {
             return Ok((year, false));
         }
@@ -1430,8 +1560,8 @@ impl DeezerMetadataService {
         let answer = self
             .inner
             .album_year_tasks
-            .run(&album_id.to_string(), async move {
-                this.fetch_album_year(album_id, background).await.ok()
+            .run(&in_generation(generation, &album_id.to_string()), async move {
+                this.fetch_album_year(album_id, background, generation).await.ok()
             })
             .await;
         // The fetch failed (an album record of the wrong shape): the awaiting caller gets the
@@ -1474,7 +1604,12 @@ impl DeezerMetadataService {
             .and_then(|(year, _)| year)
     }
 
-    async fn fetch_album_year(&self, album_id: i64, background: bool) -> ElementResult<(Option<i32>, bool)> {
+    async fn fetch_album_year(
+        &self,
+        album_id: i64,
+        background: bool,
+        generation: u64,
+    ) -> ElementResult<(Option<i32>, bool)> {
         let r = self
             .get_json(&format!("{}/album/{album_id}", self.base()), background)
             .await;
@@ -1495,8 +1630,53 @@ impl DeezerMetadataService {
         } else {
             POSITIVE_TTL
         };
-        self.put(format!("y|{album_id}"), Cached::Number(year), ttl);
+        self.put(generation, format!("y|{album_id}"), Cached::Number(year), ttl);
         Ok((year, false))
+    }
+
+    /// The catalog album a recording is on, by its ISRC (Deezer answers this from every country,
+    /// the ones it does not serve too), asked on the interactive lane. Never cached here: the
+    /// album's own lookup is.
+    pub async fn album_by_isrc(&self, isrc: &str) -> DeezerAsked<AlbumHit> {
+        let Some(code) = SongIdentity::normalize_isrc(isrc) else {
+            return DeezerAsked::NoData;
+        };
+        let url = format!("{}/track/isrc:{}", self.base(), escape_data_string(&code));
+        let doc = match self.get_json_for(&url, AskFor::page()).await.asked() {
+            DeezerAsked::Answer(doc) => doc,
+            DeezerAsked::NoData => return DeezerAsked::NoData,
+            DeezerAsked::Busy => return DeezerAsked::Busy,
+        };
+        let Some(album) = doc.get("album") else {
+            return DeezerAsked::NoData;
+        };
+        let id = album.get("id").and_then(Value::as_i64).filter(|id| *id > 0);
+        let title = album
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !is_blank(title));
+        let (Some(id), Some(title)) = (id, title) else {
+            return DeezerAsked::NoData;
+        };
+        let artist = doc
+            .pointer("/artist/name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        DeezerAsked::Answer(AlbumHit {
+            deezer_id: id.to_string(),
+            title: title.to_string(),
+            artist,
+            cover_url: deezer_image(album, &["cover_xl", "cover_medium"])
+                .ok()
+                .flatten()
+                .map(str::to_string),
+            year: None,
+            track_count: 0,
+            record_type: None,
+            release_date: None,
+            explicit_lyrics: None,
+        })
     }
 
     /// An album's barcode (UPC), which names one exact release in every store, so the cover
@@ -1505,6 +1685,7 @@ impl DeezerMetadataService {
         if is_blank(deezer_id) {
             return None;
         }
+        let generation = self.generation();
         let key = format!("upc|{deezer_id}");
         if let Some(Cached::Text(cached)) = self.get_cached(&key) {
             return (!cached.is_empty()).then_some(cached);
@@ -1525,7 +1706,12 @@ impl DeezerMetadataService {
             };
             let upc = upc.filter(|u| !u.is_empty());
             let ttl = if upc.is_none() { NEGATIVE_TTL } else { POSITIVE_TTL };
-            self.put(key.clone(), Cached::Text(upc.clone().unwrap_or_default()), ttl);
+            self.put(
+                generation,
+                &key,
+                Cached::Text(upc.clone().unwrap_or_default()),
+                ttl,
+            );
             Ok(upc)
         };
         match attempt.await {
@@ -1651,39 +1837,47 @@ impl DeezerMetadataService {
     }
 
     async fn get_json(&self, url: &str, background: bool) -> DeezerResponse {
-        self.call_json(url, background, false).await
+        self.call_json(url, AskFor::lane(background), false).await
+    }
+
+    /// [`Self::get_json`] for a caller that says who the answer is for.
+    async fn get_json_for(&self, url: &str, purpose: AskFor) -> DeezerResponse {
+        self.call_json(url, purpose, false).await
     }
 
     /// [`Self::get_json`] with the permit taken before the request's timer starts, so a busy
     /// queue is waited out, never read as a call that did not answer.
     async fn get_json_after_permit(&self, url: &str, background: bool) -> DeezerResponse {
-        self.call_json(url, background, true).await
+        self.call_json(url, AskFor::lane(background), true).await
     }
 
-    async fn call_json(&self, url: &str, background: bool, after_permit: bool) -> DeezerResponse {
+    async fn call_json(&self, url: &str, purpose: AskFor, after_permit: bool) -> DeezerResponse {
         let this = self.clone();
         let address = url.to_string();
-        // A call that waits out the queue never joins one that may give up inside it.
-        let key = if after_permit {
-            format!("{background}|after-permit|{url}")
-        } else {
-            format!("{background}|{url}")
-        };
+        // A call that waits out the queue never joins one that may give up inside it, a page
+        // never joins a lookup Apple serves later, and nothing joins a call from before a
+        // catalog switch.
+        let key = format!(
+            "{:?}|{}|{after_permit}|{}|{url}",
+            purpose.class,
+            purpose.background,
+            self.generation()
+        );
         self.inner
             .in_flight_calls
             .run(&key, async move {
-                this.fetch_json(&address, background, after_permit).await
+                this.fetch_json(&address, purpose, after_permit).await
             })
             .await
     }
 
-    async fn fetch_json(&self, url: &str, background: bool, after_permit: bool) -> DeezerResponse {
-        let response = self.fetch_json_once(url, background, after_permit).await;
+    async fn fetch_json(&self, url: &str, purpose: AskFor, after_permit: bool) -> DeezerResponse {
+        let response = self.fetch_json_once(url, purpose, after_permit).await;
         self.note_answer(response.transient);
         response
     }
 
-    async fn fetch_json_once(&self, url: &str, background: bool, after_permit: bool) -> DeezerResponse {
+    async fn fetch_json_once(&self, url: &str, purpose: AskFor, after_permit: bool) -> DeezerResponse {
         // Genre names in album payloads localize to the caller's IP country
         // unless this header pins them. Read per request, so a settings
         // change reaches the next lookup without a restart.
@@ -1691,10 +1885,10 @@ impl DeezerMetadataService {
         let asked = if after_permit {
             self.inner
                 .http
-                .get_after_permit(url, background, language.as_deref())
+                .get_after_permit_for(url, purpose, language.as_deref())
                 .await
         } else {
-            self.inner.http.get(url, background, language.as_deref()).await
+            self.inner.http.get_for(url, purpose, language.as_deref()).await
         };
         let answer = match asked {
             Ok(answer) => answer,
@@ -1736,13 +1930,18 @@ impl DeezerMetadataService {
                 }
             };
             let definitive = code == Some(DEFINITIVE_ERROR_CODE);
-            warn!(
-                "deezer refused {url}: {} \"{}\" (code {}, treated as {})",
-                kind.unwrap_or("(null)"),
-                message.unwrap_or("(null)"),
-                code.map_or_else(|| "(null)".to_string(), |c| c.to_string()),
-                if definitive { "definitive" } else { "transient" }
-            );
+            if apple_as_deezer::is_marked(&doc) {
+                // Apple's catalog, standing in, has no such thing: an everyday answer.
+                debug!("the music catalog has nothing for {url}");
+            } else {
+                warn!(
+                    "deezer refused {url}: {} \"{}\" (code {}, treated as {})",
+                    kind.unwrap_or("(null)"),
+                    message.unwrap_or("(null)"),
+                    code.map_or_else(|| "(null)".to_string(), |c| c.to_string()),
+                    if definitive { "definitive" } else { "transient" }
+                );
+            }
             return DeezerResponse {
                 doc: None,
                 transient: !definitive,
@@ -1779,7 +1978,7 @@ impl DeezerMetadataService {
             self.base(),
             escape_data_string(&variant.text())
         );
-        let r = self.get_json(&url, false).await;
+        let r = self.get_json_for(&url, AskFor::row()).await;
         if r.transient {
             return Ok((true, None));
         }
@@ -1797,12 +1996,13 @@ impl DeezerMetadataService {
         if is_blank(query) || limit <= 0 {
             return Some(Vec::new());
         }
+        let generation = self.generation();
         let url = format!(
             "{}/search?q={}&limit={limit}",
             self.base(),
             escape_data_string(query.trim())
         );
-        let r = self.get_json(&url, false).await;
+        let r = self.get_json_for(&url, AskFor::page()).await;
         if r.transient {
             return None;
         }
@@ -1872,7 +2072,7 @@ impl DeezerMetadataService {
                             catalog_explicit(hit)?
                         },
                     };
-                    self.put(key, Cached::Track(Some(meta)), POSITIVE_TTL);
+                    self.put(generation, key, Cached::Track(Some(meta)), POSITIVE_TTL);
                 }
                 found.push((artist.to_string(), title.to_string()));
             }
@@ -1905,7 +2105,9 @@ impl DeezerMetadataService {
                 self.base(),
                 escape_data_string(&variant.text())
             );
-            let r = self.call_json(&url, background, after_permit).await;
+            let r = self
+                .call_json(&url, track_purpose(background), after_permit)
+                .await;
             if r.transient {
                 return Ok((true, None));
             }
@@ -1915,6 +2117,12 @@ impl DeezerMetadataService {
             if artist_id.is_none() {
                 artist_id = named_artist_id(r.doc.as_ref(), artist)?;
             }
+        }
+
+        // While Apple answers the catalog's searches, the album and top-songs steps would ask
+        // Apple the same question again in other words: the searches' miss stands.
+        if self.inner.http.searches_stand_in() {
+            return Ok((false, None));
         }
 
         let (transient, on_album, album_artist_id) = self
@@ -1935,7 +2143,9 @@ impl DeezerMetadataService {
             self.base(),
             escape_data_string(&artist_id)
         );
-        let r = self.call_json(&url, background, after_permit).await;
+        let r = self
+            .call_json(&url, track_purpose(background), after_permit)
+            .await;
         if r.transient {
             return Ok((true, None));
         }
@@ -1967,7 +2177,7 @@ impl DeezerMetadataService {
                     self.base(),
                     escape_data_string(&query)
                 ),
-                background,
+                track_purpose(background),
                 after_permit,
             )
             .await;
@@ -1989,7 +2199,7 @@ impl DeezerMetadataService {
                     "{}/album/{album_id}/tracks?limit={ALBUM_TRACKS_LIMIT}",
                     self.base()
                 ),
-                background,
+                track_purpose(background),
                 after_permit,
             )
             .await;
@@ -2007,7 +2217,7 @@ impl DeezerMetadataService {
         let detail = self
             .call_json(
                 &format!("{}/track/{track_id}", self.base()),
-                background,
+                track_purpose(background),
                 after_permit,
             )
             .await;
@@ -2425,6 +2635,28 @@ fn artist_hits(doc: Option<&Value>) -> ElementResult<Vec<ArtistHit>> {
         }
     }
     Ok(hits)
+}
+
+/// A cache or join key under a catalog generation.
+fn in_generation(generation: u64, key: &str) -> String {
+    format!("g{generation}|{key}")
+}
+
+/// Whether an answer says it may change soon (the stand-in could not ask everything it
+/// wanted): kept for [`PARTIAL_TTL`] only.
+fn is_partial(doc: Option<&Value>) -> bool {
+    doc.and_then(|doc| doc.get("octo_partial"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Who a song lookup's request is for: a row someone is looking at, or background work.
+fn track_purpose(background: bool) -> AskFor {
+    if background {
+        AskFor::background()
+    } else {
+        AskFor::row()
+    }
 }
 
 fn data_array(doc: Option<&Value>) -> ElementResult<Option<&Value>> {

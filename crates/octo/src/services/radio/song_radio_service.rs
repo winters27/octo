@@ -209,7 +209,9 @@ impl SongRadioService {
             .into_iter()
             .map(|(song, _)| song)
             .filter(|song| match filter {
-                ExplicitFilter::CleanOnly => song.explicit_content_lyrics != Some(1),
+                ExplicitFilter::CleanOnly => octo_core::models::domain::explicit_status::clean_only_allows(
+                    song.explicit_content_lyrics,
+                ),
                 ExplicitFilter::ExplicitOnly => song.explicit_content_lyrics != Some(3),
                 ExplicitFilter::All => true,
             })

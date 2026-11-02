@@ -385,6 +385,13 @@ async fn build(
     rows_done: RowsDone,
 ) -> (Vec<Song>, SongSource) {
     let started = Instant::now();
+    // While another catalog answers the catalog's searches, one song search for the query (the
+    // one `song_rows` asks when Last.fm is late, so the two share it) fills the rows' album and
+    // explicit word before each row looks itself up.
+    let catalog_rows = metadata.catalog_searches_stand_in().then(|| {
+        let (metadata, query) = (Arc::clone(&metadata), query.clone());
+        tokio::spawn(async move { metadata.search_catalog_tracks(&query, BUILD_SIZE).await })
+    });
     let (collected, source) = song_rows(&query, &last_fm, &metadata, last_fm_wait, &shared).await;
     let searched = started.elapsed();
 
@@ -409,6 +416,9 @@ async fn build(
     // The video lookups start now, so they run while Deezer answers; the pick still waits
     // for Deezer's length.
     metadata.prefetch_top_videos(&songs);
+    if let Some(catalog_rows) = catalog_rows {
+        let _ = catalog_rows.await;
+    }
     metadata.enrich_search_rows(&mut songs).await;
     let enriched = started.elapsed();
     // Album ownership reads tracklists from the same Deezer budget; they start now.

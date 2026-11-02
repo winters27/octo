@@ -541,6 +541,13 @@ pub async fn get_top_songs(State(state): State<AppState>, req: Request) -> AppRe
         .await
     };
 
+    // A Clean only listener never gets an outside song whose words are not known yet (its lookup
+    // got no answer): the kid filter reads the word clients see, and such a song has none.
+    let clean_only = crate::services::family::kid_filter::explicit_filter_for(
+        &settings,
+        Some(&state.family_store),
+        Some(&username),
+    ) == octo_core::settings::ExplicitFilter::CleanOnly;
     let mut rows: Vec<TopSongRow> = Vec::new();
     for (i, top) in candidates.iter().enumerate() {
         if rows.len() >= count {
@@ -549,7 +556,14 @@ pub async fn get_top_songs(State(state): State<AppState>, req: Request) -> AppRe
         match library.get(i).cloned().flatten() {
             Some(owned) => rows.push(TopSongRow::Library(owned)),
             None if outside && !skipped_takes::hides_song(&top.song, skip_covers_and_instrumentals) => {
-                rows.push(TopSongRow::Outside(synced_song(&state, &username, &top.song)));
+                let song = synced_song(&state, &username, &top.song);
+                if clean_only
+                    && song.explicit_content_lyrics
+                        == Some(octo_core::models::domain::explicit_status::UNANSWERED)
+                {
+                    continue;
+                }
+                rows.push(TopSongRow::Outside(song));
             }
             None => {}
         }

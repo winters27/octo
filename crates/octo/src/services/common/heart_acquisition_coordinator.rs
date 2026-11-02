@@ -326,7 +326,7 @@ pub(crate) fn waiting_line(waiting_for: WaitingFor) -> &'static str {
         WaitingFor::LidarrIndexers => "Waiting for Lidarr's indexers",
         WaitingFor::AcoustId => "Waiting for AcoustID",
         WaitingFor::AcoustIdOff => "AcoustID is off, so Octo cannot check what played",
-        WaitingFor::Deezer => "Waiting for Deezer",
+        WaitingFor::Deezer => "Waiting for the music catalog",
         WaitingFor::Shim => "Waiting for YouTube",
         WaitingFor::NotYetProven => "Play it once so Octo can keep the version you hear",
         WaitingFor::SoundUnread => {

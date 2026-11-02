@@ -43,6 +43,7 @@ impl DeezerMetadataService {
         let Some(code) = SongIdentity::normalize_isrc(isrc) else {
             return TempoLookup::Known(None);
         };
+        let generation = self.generation();
         let key = tempo_key(&code);
         if let Some(Cached::Tempo(bpm)) = self.get_cached(&key) {
             return TempoLookup::Known(bpm);
@@ -61,7 +62,7 @@ impl DeezerMetadataService {
             _ => None,
         };
         let ttl = if bpm.is_some() { POSITIVE_TTL } else { NEGATIVE_TTL };
-        self.put(key, Cached::Tempo(bpm), ttl);
+        self.put(generation, key, Cached::Tempo(bpm), ttl);
         TempoLookup::Known(bpm)
     }
 }
