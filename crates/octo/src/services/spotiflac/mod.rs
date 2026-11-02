@@ -109,6 +109,8 @@ pub struct SpotiflacClient {
     assist: assist::Assist,
     /// How often a run looks at Mornye (tests look quickly).
     assist_look_every: Option<Duration>,
+    /// slskd's link, which says whether Soulseek is asked while Mornye's check is paused.
+    slskd: Option<Arc<dyn crate::services::soulseek::ISoulseekLink>>,
 }
 
 /// A place among the songs asked for at once, given back when dropped.
@@ -146,6 +148,7 @@ impl SpotiflacClient {
             started_jobs: AtomicU64::new(0),
             assist: assist::Assist::default(),
             assist_look_every: None,
+            slskd: None,
         }
     }
 
@@ -163,6 +166,21 @@ impl SpotiflacClient {
     pub fn with_check(mut self, check: MornyeCheck) -> SpotiflacClient {
         self.check = check;
         self
+    }
+
+    /// The same, knowing slskd's link.
+    pub fn with_slskd(mut self, link: Arc<dyn crate::services::soulseek::ISoulseekLink>) -> SpotiflacClient {
+        self.slskd = Some(link);
+        self
+    }
+
+    /// slskd is in use, by the rule the downloads follow
+    /// ([`crate::services::library::UpgradeSources::slskd_in_use_with`]).
+    pub fn slskd_in_use(&self) -> bool {
+        crate::services::library::UpgradeSources::slskd_in_use_with(
+            &self.settings.current().soulseek,
+            self.slskd.as_deref(),
+        )
     }
 
     /// How many songs are being asked of Mornye now, and how many jobs were asked since start.
@@ -209,7 +227,7 @@ impl SpotiflacClient {
         let view = Arc::new(view);
         if Connection::of(&self.settings()) == connection && self.check.keep(&view) {
             let all = self.settings.current();
-            let meanwhile = Meanwhile::of(&all);
+            let meanwhile = Meanwhile::of(&all, self.slskd_in_use());
             let public_url = all.server.public_url.clone();
             self.check.note(&view, |labels, view| {
                 let now = chrono::Utc::now();

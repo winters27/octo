@@ -925,16 +925,18 @@ impl Acquisition {
         // Mornye: its check is kept in mornye-check.json and pushes once per stretch of failing.
         let check_notifications = integrations.notifications.clone();
         let spotiflac = Arc::new(
-            SpotiflacClient::new(settings.clone()).with_check(MornyeCheck::new(
-                stores.mornye_check.clone(),
-                CheckTimes::default(),
-                Some(Arc::new(move |words: String| {
-                    check_notifications.notify(NotificationEvent {
-                        detail: Some(words),
-                        ..NotificationEvent::new(NotificationEventType::MornyeCheck)
-                    });
-                })),
-            )),
+            SpotiflacClient::new(settings.clone())
+                .with_slskd(soulseek_link.clone())
+                .with_check(MornyeCheck::new(
+                    stores.mornye_check.clone(),
+                    CheckTimes::default(),
+                    Some(Arc::new(move |words: String| {
+                        check_notifications.notify(NotificationEvent {
+                            detail: Some(words),
+                            ..NotificationEvent::new(NotificationEventType::MornyeCheck)
+                        });
+                    })),
+                )),
         );
         let upgrade_sources = Arc::new(
             UpgradeSources::new(settings.clone(), Some(soulseek_link.clone()))

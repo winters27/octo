@@ -212,8 +212,8 @@ impl SettingsStore {
     /// Replaces the snapshot and tells subscribers. The merged configuration is left as it was.
     pub fn set(&self, settings: AppSettings) {
         let settings = Arc::new(settings);
-        Inner::note_spotiflac(&self.inner, &settings);
-        self.inner.current.store(settings.clone());
+        let previous = self.inner.current.swap(settings.clone());
+        Inner::note_spotiflac(&self.inner, &previous, &settings);
         self.inner.tx.send_replace(settings);
     }
 
@@ -323,16 +323,17 @@ impl Inner {
         tree.merge(&file_layer);
         let settings = Arc::new(bind_logged(&tree));
         inner.tree.store(Arc::new(tree));
-        Inner::note_spotiflac(inner, &settings);
-        inner.current.store(settings.clone());
+        let previous = inner.current.swap(settings.clone());
+        Inner::note_spotiflac(inner, &previous, &settings);
         inner.tx.send_replace(settings);
         Ok(())
     }
 
-    /// Counts `next` as a change of the Spotiflac section when it differs from the snapshot it
-    /// replaces.
-    fn note_spotiflac(inner: &Inner, next: &AppSettings) {
-        if inner.current.load().spotiflac != next.spotiflac {
+    /// Counts `next` as a change of the Spotiflac section when it differs from `previous`, the
+    /// snapshot it replaced. Called once `next` is published, so a reader that sees the new count
+    /// also sees the new section.
+    fn note_spotiflac(inner: &Inner, previous: &AppSettings, next: &AppSettings) {
+        if previous.spotiflac != next.spotiflac {
             inner
                 .spotiflac_changes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

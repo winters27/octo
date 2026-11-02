@@ -426,9 +426,11 @@ pub struct Meanwhile {
 }
 
 impl Meanwhile {
-    pub fn of(all: &octo_core::settings::AppSettings) -> Meanwhile {
+    /// With `slskd_in_use` the answer of the rule the downloads follow
+    /// (`UpgradeSources::slskd_in_use_with`), not the live switch.
+    pub fn of(all: &octo_core::settings::AppSettings, slskd_in_use: bool) -> Meanwhile {
         Meanwhile {
-            soulseek_on: all.soulseek.is_on(),
+            soulseek_on: slskd_in_use,
             then_mp3: all.subsonic.download_source
                 == octo_core::settings::DownloadSource::SoulseekThenYouTube,
         }

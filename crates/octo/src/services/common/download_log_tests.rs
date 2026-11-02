@@ -824,10 +824,11 @@ async fn find_songs_counts_slskd_by_its_link_as_better_quality_does() {
             .start("id", "alice", &CancellationToken::new())
             .await
             .expect("a look");
+        // The Soulseek row, and its text.
         look.sources
             .into_iter()
             .find(|source| source.name == "Soulseek")
-            .and_then(|source| source.text)
+            .map(|source| source.text)
     };
     let not_set_up = Some("Soulseek is not set up on this server".to_string());
     let signed_in = SoulseekSettings {
@@ -837,19 +838,31 @@ async fn find_songs_counts_slskd_by_its_link_as_better_quality_does() {
         ..Default::default()
     };
     assert_eq!(
-        soulseek_text(Arc::new(OffLink), signed_in).await,
-        not_set_up,
+        soulseek_text(Arc::new(OffLink), signed_in.clone()).await,
+        Some(not_set_up.clone()),
         "off at startup, its sign-in kept"
     );
     let no_sign_in = SoulseekSettings {
         base_url: Some("http://slskd:5030".into()),
         ..Default::default()
     };
+    let row = soulseek_text(Arc::new(LoggedInLink), no_sign_in)
+        .await
+        .expect("a Soulseek row");
     assert_ne!(
-        soulseek_text(Arc::new(LoggedInLink), no_sign_in).await,
-        not_set_up,
+        row, not_set_up,
         "on with no sign-in, as an slskd without one runs"
     );
+    // Switched off since startup while the running slskd is on: the link wins, as it does for
+    // the downloads.
+    let since_off = SoulseekSettings {
+        enabled: false,
+        ..signed_in
+    };
+    let row = soulseek_text(Arc::new(LoggedInLink), since_off)
+        .await
+        .expect("a Soulseek row");
+    assert_ne!(row, not_set_up, "switched off since startup, still running");
 }
 
 fn fetching(fetched: Arc<Mutex<Option<FoundCopy>>>) -> super::song_finder::FetchFn {

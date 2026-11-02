@@ -1955,6 +1955,11 @@ impl LibraryActionExecutor {
         }
     }
 
+    /// slskd is in use, by [`UpgradeSources::slskd_in_use_with`] on this executor's link.
+    pub fn slskd_in_use(&self, soulseek: &octo_core::settings::SoulseekSettings) -> bool {
+        UpgradeSources::slskd_in_use_with(soulseek, self.soulseek_link.as_deref())
+    }
+
     async fn soulseek_out(&self) -> bool {
         match &self.soulseek_link {
             Some(link) => link

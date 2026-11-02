@@ -255,19 +255,39 @@ fn the_meanwhile_follows_the_download_source() {
         all
     };
     assert_eq!(
-        Meanwhile::of(&all(DownloadSource::SoulseekThenYouTube, false)),
+        Meanwhile::of(&all(DownloadSource::SoulseekThenYouTube, false), false),
         Meanwhile {
             soulseek_on: false,
             then_mp3: true
         }
     );
     assert_eq!(
-        Meanwhile::of(&all(DownloadSource::Soulseek, true)),
+        Meanwhile::of(&all(DownloadSource::Soulseek, true), true),
         Meanwhile {
             soulseek_on: true,
             then_mp3: false
         }
     );
+    // Whether Soulseek is asked is the downloads' rule, not the live switch.
+    assert!(Meanwhile::of(&all(DownloadSource::Soulseek, false), true).soulseek_on);
+    assert!(!Meanwhile::of(&all(DownloadSource::Soulseek, true), false).soulseek_on);
+}
+
+#[test]
+fn mornye_s_client_reads_slskd_by_its_link() {
+    use std::sync::Arc;
+
+    use crate::services::common::test_fakes::LoggedInLink;
+    use crate::services::spotiflac::SpotiflacClient;
+    let settings = Arc::new(octo_core::settings::SettingsStore::for_tests(
+        octo_core::settings::AppSettings::default(),
+    ));
+    let client = SpotiflacClient::new(settings);
+    // No link: the live settings decide.
+    assert!(!client.slskd_in_use());
+    // Switched off in settings, but the running slskd link is on.
+    let client = client.with_slskd(Arc::new(LoggedInLink));
+    assert!(client.slskd_in_use());
 }
 
 #[test]

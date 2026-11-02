@@ -438,6 +438,24 @@ async fn mornye_is_down_for_the_step_only_when_it_is_on_slskd_is_not_in_use_and_
         .await,
         "a slskd in use has its own wait"
     );
+    // The settings and the running link disagree until a restart; the link wins, as it does for
+    // the downloads.
+    assert!(
+        !down(Case {
+            slskd: Some(false),
+            ..case(refused(), Arc::new(LoggedInLink))
+        })
+        .await,
+        "switched off since startup, the running slskd is still in use"
+    );
+    assert!(
+        down(Case {
+            slskd: Some(true),
+            ..case(refused(), Arc::new(OffLink))
+        })
+        .await,
+        "switched on since startup, slskd is not in use until a restart"
+    );
     assert!(
         !down(Case {
             lidarr_after: true,

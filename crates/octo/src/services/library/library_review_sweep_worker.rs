@@ -193,6 +193,12 @@ pub trait SweepReplacer: Send + Sync {
         let _ = hold;
         false
     }
+
+    /// Whether slskd is in use, by the rule the downloads follow
+    /// ([`crate::services::library::UpgradeSources::slskd_in_use_with`]).
+    fn slskd_in_use(&self, soulseek: &octo_core::settings::SoulseekSettings) -> bool {
+        soulseek.is_on()
+    }
 }
 
 /// The people besides the admin who can star or rate songs, whose marks the admin's own sign-in
@@ -338,6 +344,10 @@ impl SweepReplacer for ExecutorSweepReplacer {
 
     async fn mornye_wait_over(&self, hold: &MornyeHold) -> bool {
         self.executor.mornye_wait_over(hold).await
+    }
+
+    fn slskd_in_use(&self, soulseek: &octo_core::settings::SoulseekSettings) -> bool {
+        self.executor.slskd_in_use(soulseek)
     }
 
     async fn wrong_version_asked(&self, song_id: &str) -> bool {
@@ -1449,6 +1459,7 @@ impl LibraryReviewSweepWorker {
 
         self.lookup_failures.store(0, Ordering::SeqCst);
         self.unfingerprinted.store(0, Ordering::SeqCst);
+        let settings_now = self.settings.current();
         let mut pick_in_find_songs = false;
         let replaced = if outcome == Outcome::Ask
             // A file someone was asked about while this check looked at it stays theirs to answer.
@@ -1456,7 +1467,11 @@ impl LibraryReviewSweepWorker {
             && Self::decide(
                 &question,
                 &file,
-                &self.settings.current(),
+                &settings_now,
+                self.replacer.as_ref().map_or_else(
+                    || settings_now.soulseek.is_on(),
+                    |replacer| replacer.slskd_in_use(&settings_now.soulseek),
+                ),
                 step.keeper,
                 self.store.read(|s| s.today(self.clock.now())),
                 witness,
@@ -1736,12 +1751,14 @@ impl LibraryReviewSweepWorker {
     /// and either `ReviewSweepAutoReplace` on with AcoustID clearly hearing another song, or
     /// `ReviewSweepAutoReplacePreview` on with the song's YouTube preview clearly not matching (at least [`Self::PREVIEW_REPLACE_FROM`] of its bits differ).
     /// Either needs `KeepReplacedOriginals` on. The preview's replacing also needs a download
-    /// source other than YouTube alone, and Soulseek or SpotiFLAC switched on to fetch from. It
-    /// also needs the preview to be a YouTube Music row from the file's own album.
+    /// source other than YouTube alone, and slskd in use (`slskd_in_use`, the downloads' rule) or
+    /// Mornye switched on to fetch from. It also needs the preview to be a YouTube Music row from
+    /// the file's own album.
     pub fn decide(
         question: &VerificationResult,
         file: &SweptFile,
         settings: &AppSettings,
+        slskd_in_use: bool,
         keeper: &str,
         today: Today,
         witness: Option<PreviewWitness>,
@@ -1771,7 +1788,7 @@ impl LibraryReviewSweepWorker {
             })
             && actions.keep_replaced_originals
             && settings.subsonic.download_source != DownloadSource::YouTube
-            && (settings.soulseek.is_on() || settings.spotiflac.is_on());
+            && (slskd_in_use || settings.spotiflac.is_on());
         if may && (by_acoustid || by_preview) {
             AutoReplace::Replace
         } else {

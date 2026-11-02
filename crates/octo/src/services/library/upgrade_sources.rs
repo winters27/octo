@@ -555,6 +555,33 @@ mod tests {
         assert_eq!(sources.step_word(DownloadSource::Soulseek), "Soulseek or Mornye");
         assert_eq!(sources.available().await, [DownloadSource::Soulseek]);
 
+        // The settings and the running link disagree until a restart; the link wins, as it does
+        // for the downloads. With no Mornye, switched off since startup is still offered...
+        let only_slskd = |soulseek: SoulseekSettings| {
+            Arc::new(SettingsStore::for_tests(AppSettings {
+                soulseek,
+                ..Default::default()
+            }))
+        };
+        let since_off = SoulseekSettings {
+            enabled: false,
+            ..slskd()
+        };
+        let running = link_for(&slskd(), SoulseekLinkState::LoggedIn);
+        assert!(UpgradeSources::slskd_in_use_with(
+            &since_off,
+            Some(running.as_ref())
+        ));
+        let sources = UpgradeSources::new(only_slskd(since_off), Some(running));
+        assert_eq!(sources.plan(), [DownloadSource::Soulseek]);
+        assert_eq!(sources.step_word(DownloadSource::Soulseek), "Soulseek");
+        assert_eq!(sources.available().await, [DownloadSource::Soulseek]);
+        // ...and switched on since startup is not, since nothing would download it.
+        let not_running: Arc<dyn ISoulseekLink> = Arc::new(crate::services::common::test_fakes::OffLink);
+        let sources = UpgradeSources::new(only_slskd(slskd()), Some(not_running));
+        assert!(sources.plan().is_empty());
+        assert!(!sources.ready());
+
         // No link: switched on with an address is in use, switched off is not.
         assert!(UpgradeSources::slskd_in_use_with(&slskd(), None));
         let switched_off = SoulseekSettings {

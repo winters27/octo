@@ -985,6 +985,8 @@ struct FakeReplacer {
     mornye_kept: Mutex<bool>,
     /// The checks a kept outcome's pause watches.
     pause_labels: Vec<&'static str>,
+    /// What slskd's link says about slskd being in use; None leaves it to the settings.
+    slskd_in_use: Option<bool>,
 }
 
 impl FakeReplacer {
@@ -998,6 +1000,7 @@ impl FakeReplacer {
             code: None,
             mornye_kept: Mutex::new(false),
             pause_labels: vec!["Example"],
+            slskd_in_use: None,
         })
     }
 
@@ -1017,6 +1020,7 @@ impl FakeReplacer {
             code: Some(code),
             mornye_kept: Mutex::new(false),
             pause_labels: vec!["Example"],
+            slskd_in_use: None,
         })
     }
 
@@ -1031,6 +1035,7 @@ impl FakeReplacer {
             code: Some(LibraryActionCodes::MORNYE_KEPT),
             mornye_kept: Mutex::new(true),
             pause_labels: vec!["Example"],
+            slskd_in_use: None,
         })
     }
 
@@ -1045,6 +1050,7 @@ impl FakeReplacer {
             code: None,
             mornye_kept: Mutex::new(false),
             pause_labels: vec!["Example"],
+            slskd_in_use: None,
         })
     }
 
@@ -1092,6 +1098,10 @@ impl SweepReplacer for FakeReplacer {
 
     async fn mornye_wait_over(&self, _: &MornyeHold) -> bool {
         !*self.mornye_kept.lock()
+    }
+
+    fn slskd_in_use(&self, soulseek: &SoulseekSettings) -> bool {
+        self.slskd_in_use.unwrap_or_else(|| soulseek.is_on())
     }
 }
 
@@ -1173,6 +1183,7 @@ fn classify_then_decide_replaces_only_a_confident_other_song() {
             &question,
             &file_titled(title),
             &settings,
+            settings.soulseek.is_on(),
             "bob",
             Today::default(),
             None,
@@ -1210,6 +1221,12 @@ fn classify_then_decide_replaces_only_a_confident_other_song() {
 /// A file the preview says is another song, replaced with the preview's replacing on and every
 /// other gate open, unless `change` closes one.
 fn decide_by_preview(change: impl FnOnce(&mut AppSettings)) -> AutoReplace {
+    decide_by_preview_with(None, change)
+}
+
+/// [`decide_by_preview`], with slskd in use as its link says (`Some`) instead of as the settings
+/// say.
+fn decide_by_preview_with(slskd_in_use: Option<bool>, change: impl FnOnce(&mut AppSettings)) -> AutoReplace {
     let mut settings = app_settings(replacing_by_preview(60));
     settings.soulseek = SoulseekSettings {
         enabled: true,
@@ -1226,6 +1243,7 @@ fn decide_by_preview(change: impl FnOnce(&mut AppSettings)) -> AutoReplace {
         &question,
         &file_titled("Teardrop"),
         &settings,
+        slskd_in_use.unwrap_or_else(|| settings.soulseek.is_on()),
         "bob",
         Today::default(),
         Some(PreviewWitness {
@@ -1271,6 +1289,34 @@ fn the_preview_replaces_nothing_without_a_lossless_source_switched_on() {
         s.spotiflac.url = "http://spotiflac:8000".into();
     };
     assert_eq!(decide_by_preview(spotiflac), AutoReplace::Replace);
+}
+
+/// The gate reads slskd as the downloads do, by its link: switched off in settings while the
+/// running slskd is on still replaces, and on in settings while its link is off asks.
+#[test]
+fn the_preview_gate_reads_slskd_by_its_link_not_the_switch() {
+    let off = |s: &mut AppSettings| s.soulseek.enabled = false;
+    assert_eq!(decide_by_preview_with(Some(true), off), AutoReplace::Replace);
+    assert_eq!(decide_by_preview_with(Some(false), |_| {}), AutoReplace::Ask);
+}
+
+/// The sweep asks its replacer whether slskd is in use: with the link off and Mornye off, a file
+/// the preview says is another song is asked about, never sent to a replacement that could only
+/// wait.
+#[tokio::test]
+async fn the_sweep_reads_slskd_through_its_replacer() {
+    let replacer = Arc::new(FakeReplacer {
+        slskd_in_use: Some(false),
+        ..Arc::into_inner(FakeReplacer::ending(LibraryActionState::Applied)).expect("the only one")
+    });
+
+    let (_sweep, _, queue) =
+        preview_says_wrong(&["a.flac"], replacing_by_preview(60), replacer.clone(), None, 0.5).await;
+
+    assert!(replacer.requests().is_empty());
+    let entries = queue.for_user("bob", NoticeKind::Review);
+    assert_eq!(entries.len(), 1);
+    assert_ne!(entries[0].state, NoticeState::Acted);
 }
 
 /// The sweep builds the request for a replacement it holds to the preview: Soulseek alone under
@@ -1467,7 +1513,15 @@ fn decide_keeps_to_the_switch_dry_run_allowlist_and_the_day() {
     let (_, question) = LibraryReviewSweepWorker::classify(heard_as("Roads", 0.97));
     let file = file_titled("Teardrop");
     let decide = |actions: LibraryActionSettings, keeper: &str, today: Today| {
-        LibraryReviewSweepWorker::decide(&question, &file, &app_settings(actions), keeper, today, None)
+        LibraryReviewSweepWorker::decide(
+            &question,
+            &file,
+            &app_settings(actions),
+            false,
+            keeper,
+            today,
+            None,
+        )
     };
     assert_eq!(
         decide(replacing(60), "bob", Today::default()),
@@ -1950,6 +2004,7 @@ async fn a_file_navidrome_does_not_show_is_asked_about() {
         code: None,
         mornye_kept: Mutex::new(false),
         pause_labels: vec!["Example"],
+        slskd_in_use: None,
     });
     sweep
         .worker(
@@ -2526,13 +2581,24 @@ mod other_listeners {
             },
             ..Default::default()
         });
-        let http = crate::services::http_client_factory::default_client();
-        let identity = NavidromeIdentityService::new(settings.clone(), http.clone());
         let sources = Arc::new(
             crate::services::library::UpgradeSources::new(settings.clone(), None).with_spotiflac(Arc::new(
                 crate::services::spotiflac::SpotiflacClient::new(settings.clone()),
             )),
         );
+        replacer_over(
+            settings,
+            Extras {
+                sources: Some(sources),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The real replacer over an executor built from `extras`.
+    fn replacer_over(settings: Arc<SettingsStore>, extras: Extras) -> ExecutorSweepReplacer {
+        let http = crate::services::http_client_factory::default_client();
+        let identity = NavidromeIdentityService::new(settings.clone(), http.clone());
         ExecutorSweepReplacer::new(
             Arc::new(NavidromeSongPathResolver::new(
                 identity.clone(),
@@ -2540,13 +2606,7 @@ mod other_listeners {
                 http.clone(),
                 settings.clone(),
             )),
-            executor(
-                &settings,
-                Extras {
-                    sources: Some(sources),
-                    ..Default::default()
-                },
-            ),
+            executor(&settings, extras),
             Arc::new(NavidromePlaylistApi::new(
                 http.clone(),
                 identity.clone(),
@@ -2609,6 +2669,25 @@ mod other_listeners {
             "the same Mornye with its check still paused"
         );
         untouched.verify().await;
+    }
+
+    /// The sweep's own replacer reads slskd by the executor's link, as the downloads do: switched
+    /// off in settings while the running slskd is on, it is in use.
+    #[tokio::test]
+    async fn the_real_replacer_reads_slskd_by_its_link() {
+        let settings = store(AppSettings::default());
+        let soulseek = settings.current().soulseek.clone();
+        assert!(!soulseek.is_on());
+        let linked = replacer_over(
+            settings.clone(),
+            Extras {
+                soulseek_link: Some(Arc::new(crate::services::common::test_fakes::LoggedInLink)),
+                ..Default::default()
+            },
+        );
+        assert!(linked.slskd_in_use(&soulseek));
+        let unlinked = replacer_over(settings, Extras::default());
+        assert!(!unlinked.slskd_in_use(&soulseek));
     }
 }
 
@@ -3320,6 +3399,7 @@ fn a_song_one_submission_names_is_never_clearly_another() {
             question,
             &file_titled("Teardrop"),
             &settings,
+            settings.soulseek.is_on(),
             "bob",
             Today::default(),
             None,
@@ -3346,6 +3426,7 @@ fn acoust_id_replaces_only_with_the_original_kept() {
             &question,
             &file_titled("Teardrop"),
             &app_settings(actions),
+            false,
             "bob",
             Today::default(),
             None,
