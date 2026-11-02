@@ -671,11 +671,7 @@ impl Fixture {
         self.lidarr
             .changes()
             .iter()
-            .filter(|r| {
-                r.body
-                    .as_ref()
-                    .is_none_or(|body| body["name"] != "CheckHealth")
-            })
+            .filter(|r| r.body.as_ref().is_none_or(|body| body["name"] != "CheckHealth"))
             .map(|r| format!("{} {}", r.method, r.path))
             .collect()
     }
