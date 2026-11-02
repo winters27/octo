@@ -916,15 +916,15 @@ fn resolve(
     options: &LayoutOptions,
     out: &mut Out,
 ) {
-    for at in 0..songs.len() {
-        if songs[at].held.is_some() {
+    for song in songs.iter_mut() {
+        if song.held.is_some() {
             continue;
         }
-        if let Err(folder) = place(root, &mut songs[at], disk) {
+        if let Err(folder) = place(root, song, disk) {
             let rel = rel_of(root, &folder);
-            let shown = rel_of(root, &songs[at].file.path);
+            let shown = rel_of(root, &song.file.path);
             out.skip(format!("folder-there|{shown}"), &shown, folder_there(&rel));
-            songs[at].held = Some(folder_there(&rel));
+            song.held = Some(folder_there(&rel));
         }
     }
     // An album whose folder would be new joins the folder another group of the same album goes

@@ -805,8 +805,8 @@ fn a_cap_one_settle_carries_never_reaches_another() {
             .expect("settled")
             .folders
     };
-    assert_eq!(settle(names(vec![83])), [older.clone()]);
-    assert_ne!(settle(names(Vec::new())), [older.clone()]);
+    assert_eq!(settle(names(vec![83])), std::slice::from_ref(&older));
+    assert_ne!(settle(names(Vec::new())), std::slice::from_ref(&older));
     assert_eq!(settle(names(vec![83])), [older]);
 }
 
