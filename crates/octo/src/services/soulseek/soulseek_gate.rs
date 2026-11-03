@@ -108,6 +108,21 @@ fn verdict_words(verdict: &GateVerdict) -> (&'static str, &'static str) {
     }
 }
 
+/// The words a gate's verdict leaves in the downloads log for its own file: a heart never played
+/// heard nothing, so its same take is told by the song it hearted.
+fn gate_words(gate: &HeartGate, verdict: &GateVerdict) -> (&'static str, &'static str) {
+    match verdict {
+        GateVerdict::Accept {
+            by: octo_core::fingerprint::heart_gate::Acceptance::SameTake,
+            ..
+        } if gate.reading == HeardReading::NotHeard => (
+            "The same take as the song you hearted",
+            "AcoustID hears this song, it runs as long, and it names no other version",
+        ),
+        other => verdict_words(other),
+    }
+}
+
 /// Records in `ledger` what the gate of someone who joined another acquisition said of its file:
 /// the outcome for their person, and which acceptance passed it when one did.
 pub(crate) fn record_joiner(
@@ -329,7 +344,7 @@ impl SoulseekDownloadService {
                 &track_key,
                 acquisition_event_kinds::CHECK,
                 text,
-                Some(verdict_words(&check.verdict).1),
+                Some(gate_words(gate, &check.verdict).1),
                 check.verification.heard(),
             );
             info!(
@@ -377,7 +392,7 @@ impl SoulseekDownloadService {
             if let (AcquisitionOrigin::AlbumHeart, Some((title, seconds))) = (gate.origin, &album_file) {
                 check.verdict = album_track_verdict(gate, &check, &download.song, title.as_deref(), *seconds);
             }
-            let (text, detail) = verdict_words(&check.verdict);
+            let (text, detail) = gate_words(gate, &check.verdict);
             base.log_step_heard(
                 &track_key,
                 acquisition_event_kinds::CHECK,

@@ -854,7 +854,8 @@ impl HeartGate {
     ///    AcoustID off the file is undecided.
     /// 8. The same take: a file steps 5 to 7 would keep the heard copy for, or refuse as another
     ///    recording of R's song, no entry or an unlinked fingerprint, is accepted when it is the
-    ///    take that played ([`HeartGate::same_take`]).
+    ///    take that played; and a file of a heart never played they leave "not yet proven" when
+    ///    it is the take of the catalog's track ([`HeartGate::same_take`]).
     ///
     /// Before the file's reading names another recording, a dominant recording of R's song
     /// outside R is asked of MusicBrainz, since AcoustID never follows MusicBrainz's merges.
@@ -892,7 +893,7 @@ impl HeartGate {
         };
         let findings = label_findings(reading.as_ref(), facts, &r);
         let exact = self.exact_verdict(facts, reading.as_ref(), &r, &findings);
-        if same_take_may_replace(&exact) && self.same_take(facts, reading.as_ref(), &r, &findings) {
+        if self.same_take(&exact, facts, reading.as_ref(), &r, &findings) {
             return accept(Acceptance::SameTake, self.heard_tag(&r));
         }
         exact
@@ -965,10 +966,21 @@ impl HeartGate {
         }
     }
 
-    /// Whether a file is the take that played, all of these holding:
+    /// Whether a file is the same take, in place of the exact rule's verdict `exact`. What it
+    /// sounds like is judged first:
     ///
-    /// - something was heard and the file's distance from it can refuse it (proof 2), and the
-    ///   file's distance is at most [`SAME_TAKE_AT_MOST`];
+    /// - where the exact rule keeps the heard copy or refuses the file as another recording of
+    ///   R's song, no entry or an unlinked fingerprint ([`same_take_may_replace`]), something was
+    ///   heard: the file's distance from it can refuse it (proof 2) and is at most
+    ///   [`SAME_TAKE_AT_MOST`];
+    /// - where the exact rule leaves a heart never played "not yet proven", the catalog's track
+    ///   is what the person chose: with a stand-in that is the reference, the file's distance from
+    ///   its print is at most [`SAME_TAKE_AT_MOST`]; with none, the file's own reading is
+    ///   ambiguous with R's recordings among it carrying at least [`MIN_SOURCES_TO_CONFIRM`]
+    ///   submissions, or clear against an R built on a reading that was not clear.
+    ///
+    /// Then all of these hold:
+    ///
     /// - AcoustID read the file: with AcoustID off, busy or unable to read it, nothing changes;
     /// - the file's length is within the larger of [`SAME_TAKE_LENGTH_SECONDS`] and
     ///   [`SAME_TAKE_LENGTH_SHARE`] of the song's ([`HeartGate::heard_seconds`]);
@@ -979,6 +991,7 @@ impl HeartGate {
     ///   ([`names_another_version`]).
     fn same_take(
         &self,
+        exact: &Judgement,
         facts: &FileFacts,
         reading: Option<&AnswerReading>,
         r: &HeardRecording,
@@ -987,11 +1000,43 @@ impl HeartGate {
         let Some(reading) = reading else {
             return false;
         };
-        self.heard_usable()
-            && self.proof_two_applies()
-            && facts
-                .heard_distance
-                .is_some_and(|distance| distance <= SAME_TAKE_AT_MOST)
+        let near_reference = || {
+            self.proof_two_applies()
+                && facts
+                    .heard_distance
+                    .is_some_and(|distance| distance <= SAME_TAKE_AT_MOST)
+        };
+        let sounds_like = if same_take_may_replace(exact) {
+            self.heard_usable() && near_reference()
+        } else if *exact == Judgement::Verdict(GateVerdict::Undecided(Undecided::NotYetProven))
+            && self.reading == HeardReading::NotHeard
+            && matches!(
+                self.origin,
+                AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart
+            )
+        {
+            match &self.stand_in {
+                Some(stand_in) if stand_in.is_reference => near_reference(),
+                // R's recordings among the candidates carry at least two submissions: a lone
+                // submission is one person's word, and proves nothing.
+                _ => match reading.reading {
+                    Reading::Ambiguous => {
+                        reading
+                            .recordings
+                            .iter()
+                            .filter(|found| r.holds(&found.id))
+                            .map(|found| found.weight)
+                            .sum::<i64>()
+                            >= i64::from(MIN_SOURCES_TO_CONFIRM)
+                    }
+                    Reading::Clear => r.from_unclear,
+                    _ => false,
+                },
+            }
+        } else {
+            false
+        };
+        sounds_like
             && self.same_length(facts.seconds)
             && !matches!(
                 r.explicit,
@@ -1054,9 +1099,10 @@ impl HeartGate {
     }
 }
 
-/// Whether the exact rule's verdict is one a same-take file is accepted in place of: the heard
-/// copy kept, or a refusal for another recording (by AcoustID or a label), no entry or an
-/// unlinked fingerprint. Another song is left to [`HeartGate::same_take`], which refuses it.
+/// Whether the exact rule's verdict is one a same-take file of something heard is accepted in
+/// place of: the heard copy kept, or a refusal for another recording (by AcoustID or a label), no
+/// entry or an unlinked fingerprint. Another song is left to [`HeartGate::same_take`], which
+/// refuses it.
 fn same_take_may_replace(judgement: &Judgement) -> bool {
     matches!(
         judgement,

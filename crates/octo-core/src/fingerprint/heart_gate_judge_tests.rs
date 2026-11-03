@@ -1641,7 +1641,6 @@ fn the_exact_acceptances_and_acoustid_off_are_unchanged() {
         ..never_played()
     };
     assert_eq!(verdict_of(&stood_in, off(), None), NOT_YET);
-    assert_eq!(verdict_of(&never_played(), another_master(), None), NOT_YET);
     assert_eq!(verdict_of(&heard, off(), Some(HeardMaster::Differs)), KEEP);
     assert_eq!(
         verdict_of(
@@ -1667,6 +1666,174 @@ fn the_exact_acceptances_and_acoustid_off_are_unchanged() {
         verdict_of(&heard, unreadable, Some(HeardMaster::Differs)),
         GateVerdict::Refuse(Refusal::Unreadable)
     );
+}
+
+// ---- The same take of a heart never played ----------------------------------------------------
+
+fn stood_in(is_reference: bool) -> HeartGate {
+    HeartGate {
+        stand_in: Some(StandIn {
+            video_id: "pinned".into(),
+            sample_id: Some("pinned-sample".into()),
+            is_reference,
+        }),
+        ..never_played()
+    }
+}
+
+/// Another master of the song for a heart never played, its print `distance` from the stand-in's,
+/// as long as the catalog's track, with no version named.
+fn near_the_stand_in(distance: f64) -> FileFacts {
+    FileFacts {
+        heard_distance: Some(distance),
+        ..another_master()
+    }
+}
+
+/// A heart never played whose pinned video is the reference: a file within the same-take line of
+/// the stand-in's print, AcoustID unable to tell the masters apart, is the same take; over the
+/// match line (0.27) proof 2 refuses it as before, and between the two lines, or with no
+/// distance, it is still not yet proven. The stand-in decides alone.
+#[test]
+fn a_never_played_hearts_file_near_its_reference_stand_in_is_the_same_take() {
+    let (verdict, asked) = settle(&stood_in(true), near_the_stand_in(0.15), None);
+    assert_eq!(verdict, same_take());
+    assert!(asked.is_empty(), "nothing heard, so no heard master: {asked:?}");
+    assert_eq!(
+        verdict_of(&stood_in(true), near_the_stand_in(0.27), None),
+        GateVerdict::Refuse(Refusal::DiffersFromHeard)
+    );
+    assert_eq!(
+        verdict_of(&stood_in(true), near_the_stand_in(0.23), None),
+        NOT_YET
+    );
+    let no_distance = FileFacts {
+        heard_distance: None,
+        ..another_master()
+    };
+    assert_eq!(verdict_of(&stood_in(true), no_distance, None), NOT_YET);
+    // A stand-in that is not the reference leaves it to the file's own reading.
+    assert_eq!(
+        verdict_of(&stood_in(false), near_the_stand_in(0.30), None),
+        same_take()
+    );
+}
+
+/// A heart never played with no reference stand-in: a file AcoustID reads ambiguous with one of
+/// R's recordings among it, or clear against an R built on a reading that was not clear, is the
+/// same take when it is as long as the catalog's track; an album heart's track too. A play with
+/// nothing heard is left as it was.
+#[test]
+fn a_never_played_hearts_ambiguous_reading_holding_r_is_the_same_take() {
+    let listed = || FileFacts {
+        heard_distance: None,
+        ..another_master()
+    };
+    let (verdict, asked) = settle(&never_played(), listed(), None);
+    assert_eq!(verdict, same_take());
+    assert!(asked.is_empty());
+    let unclear = HeartGate {
+        r: Some(HeardRecording {
+            from_unclear: true,
+            ..help_r()
+        }),
+        ..never_played()
+    };
+    let clear_file = FileFacts {
+        answer: answered(clear()),
+        ..listed()
+    };
+    assert_eq!(verdict_of(&unclear, clear_file, None), same_take());
+    let album = HeartGate {
+        origin: AcquisitionOrigin::AlbumHeart,
+        ..never_played()
+    };
+    assert_eq!(verdict_of(&album, listed(), None), same_take());
+    let play = HeartGate {
+        origin: AcquisitionOrigin::Play,
+        ..never_played()
+    };
+    assert_eq!(verdict_of(&play, listed(), None), NOT_YET);
+}
+
+/// A heart never played keeps "not yet proven" for a reading that holds none of R's recordings, a
+/// song marked explicit, a version word or a length 30 s off; another song is refused as before,
+/// and with AcoustID off nothing changes.
+#[test]
+fn a_never_played_heart_is_not_yet_proven_without_the_same_take() {
+    let listed = || FileFacts {
+        heard_distance: None,
+        ..another_master()
+    };
+    assert_eq!(verdict_of(&never_played(), listed(), None), same_take());
+    let nothing_named = HeartGate {
+        r: Some(HeardRecording {
+            ids: Vec::new(),
+            duplicates: Vec::new(),
+            ..help_r()
+        }),
+        ..never_played()
+    };
+    let r = nothing_named.r.clone().unwrap();
+    assert_eq!(
+        read_answer(&answer(clustered()), &r, MATCH_SCORE).reading,
+        Reading::Ambiguous
+    );
+    assert_eq!(verdict_of(&nothing_named, listed(), None), NOT_YET);
+    let explicit = HeartGate {
+        r: Some(HeardRecording {
+            explicit: Some(explicit_status::EXPLICIT),
+            ..help_r()
+        }),
+        ..never_played()
+    };
+    assert_eq!(verdict_of(&explicit, listed(), None), NOT_YET);
+    let live = FileFacts {
+        heard_distance: None,
+        ..named("Help! (Live)", "Help!")
+    };
+    assert_eq!(verdict_of(&never_played(), live, None), NOT_YET);
+    let long = FileFacts {
+        seconds: Some(SONG_SECONDS + 30.0),
+        ..listed()
+    };
+    assert_eq!(verdict_of(&never_played(), long, None), NOT_YET);
+    let another_song = FileFacts {
+        answer: answered(vec![wonderwall(900), help(HELP_2009, &[ISRC_2009], 5)]),
+        ..listed()
+    };
+    assert_eq!(
+        verdict_of(&never_played(), another_song, None),
+        GateVerdict::Refuse(Refusal::AnotherRecording)
+    );
+    let off = FileFacts {
+        answer: AcoustIdOutcome::Off,
+        ..listed()
+    };
+    assert_eq!(verdict_of(&never_played(), off.clone(), None), NOT_YET);
+    assert_eq!(verdict_of(&stood_in(true), off, None), NOT_YET);
+}
+
+/// The never-played fallback keeps the lone-submission rule: R's recording among the file's
+/// candidates backed by two submissions is the same take, by one it is still not yet proven.
+#[test]
+fn a_never_played_hearts_fallback_needs_two_submissions_for_r() {
+    let at = |sources: i64| FileFacts {
+        heard_distance: None,
+        answer: answered(vec![
+            help(HELP_2009, &[ISRC_2009], sources),
+            help(HELP_2015, &[ISRC_2015], 1),
+        ]),
+        ..another_master()
+    };
+    assert_eq!(verdict_of(&never_played(), at(2), None), same_take());
+    assert_eq!(verdict_of(&never_played(), at(1), None), NOT_YET);
+    let lone = FileFacts {
+        heard_distance: None,
+        answer: answered(vec![help(HELP_2009, &[ISRC_2009], 1)]),
+        ..another_master()
+    };
+    assert_eq!(verdict_of(&never_played(), lone, None), NOT_YET);
 }
 
 /// R carries the song's explicit mark, and keeps it when it becomes the recording that played.
