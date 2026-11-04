@@ -855,7 +855,9 @@ impl HeartGate {
     /// 8. The same take: a file steps 5 to 7 would keep the heard copy for, or refuse as another
     ///    recording of R's song, no entry or an unlinked fingerprint, is accepted when it is the
     ///    take that played; and a file of a heart never played they leave "not yet proven" when
-    ///    it is the take of the catalog's track ([`HeartGate::same_take`]).
+    ///    it is the take of the catalog's track ([`HeartGate::same_take`]). Ahead of it, a heart
+    ///    never played whose stand-in is the reference checks the file against the stand-in's
+    ///    master ([`HeartGate::stand_in_master`]).
     ///
     /// Before the file's reading names another recording, a dominant recording of R's song
     /// outside R is asked of MusicBrainz, since AcoustID never follows MusicBrainz's merges.
@@ -893,10 +895,67 @@ impl HeartGate {
         };
         let findings = label_findings(reading.as_ref(), facts, &r);
         let exact = self.exact_verdict(facts, reading.as_ref(), &r, &findings);
+        if let Some(judgement) = self.stand_in_master(&exact, facts, reading.as_ref(), &r, &findings) {
+            return judgement;
+        }
         if self.same_take(&exact, facts, reading.as_ref(), &r, &findings) {
             return accept(Acceptance::SameTake, self.heard_tag(&r));
         }
         exact
+    }
+
+    /// A heart never played whose stand-in is the reference: where the exact rule leaves its
+    /// file not yet proven, or refuses it for no entry or an unlinked fingerprint, the heard
+    /// master's check runs against the stand-in's audio, as a played heart's does against the
+    /// heard audio, and the same master accepts the file, explicit song or not. Only a file
+    /// AcoustID read, whose labels name nothing else, as long as the song, and whose own names
+    /// add no version is checked; another song never is. The stand-in's busy shim holds, and any
+    /// other answer leaves the file to the same take and the exact rule. None when the check does
+    /// not apply or did not accept.
+    fn stand_in_master(
+        &self,
+        exact: &Judgement,
+        facts: &FileFacts,
+        reading: Option<&AnswerReading>,
+        r: &HeardRecording,
+        findings: &[LabelCheck],
+    ) -> Option<Judgement> {
+        let reading = reading?;
+        let checked = matches!(
+            exact,
+            Judgement::Verdict(
+                GateVerdict::Undecided(Undecided::NotYetProven)
+                    | GateVerdict::Refuse(Refusal::NoEntry | Refusal::Unknown)
+            )
+        ) && self.never_played_heart()
+            && self
+                .stand_in
+                .as_ref()
+                .is_some_and(|stand_in| stand_in.is_reference)
+            && findings.iter().all(|finding| *finding == LabelCheck::Clean)
+            && reading
+                .dominant()
+                .is_none_or(|dominant| same_song(reading, r, dominant))
+            && self.same_length(facts.seconds)
+            && !names_another_version(&facts.names, r);
+        if !checked {
+            return None;
+        }
+        match facts.heard_master {
+            None => Some(Judgement::Needs(Need::HeardMaster)),
+            Some(HeardMaster::Same) => Some(accept(Acceptance::HeardMaster, self.heard_tag(r))),
+            Some(HeardMaster::Busy) => Some(hold(WaitingFor::Shim)),
+            Some(HeardMaster::Differs | HeardMaster::Undecided | HeardMaster::HeardGone) => None,
+        }
+    }
+
+    /// A heart (or a hearted album's track) nobody played: nothing was heard of it.
+    fn never_played_heart(&self) -> bool {
+        self.reading == HeardReading::NotHeard
+            && matches!(
+                self.origin,
+                AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart
+            )
     }
 
     /// Steps 4 to 7 of [`HeartGate::judge`], once the file's reading and its labels' findings are
@@ -1009,11 +1068,7 @@ impl HeartGate {
         let sounds_like = if same_take_may_replace(exact) {
             self.heard_usable() && near_reference()
         } else if *exact == Judgement::Verdict(GateVerdict::Undecided(Undecided::NotYetProven))
-            && self.reading == HeardReading::NotHeard
-            && matches!(
-                self.origin,
-                AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart
-            )
+            && self.never_played_heart()
         {
             match &self.stand_in {
                 Some(stand_in) if stand_in.is_reference => near_reference(),
