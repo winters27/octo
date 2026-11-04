@@ -511,21 +511,39 @@ impl LibraryActionJournal {
     /// once more. Every removal of the same song is lifted, since any one of them would still
     /// refuse it. Answers how many were; 0 when the entry blocks nothing.
     pub fn allow_downloads(&self, key: &str) -> usize {
-        let lifted: Vec<LibraryActionEntry> = {
+        let song = {
             let entries = self.entries.lock();
             let Some(chosen) = entries.by_key.get(key).filter(|entry| entry.blocks_downloads()) else {
                 return 0;
             };
-            let song = SongIdentity::match_key(&chosen.artist, &chosen.title);
-            entries
-                .by_key
-                .values()
-                .filter(|entry| {
-                    entry.blocks_downloads() && SongIdentity::match_key(&entry.artist, &entry.title) == song
-                })
-                .cloned()
-                .collect()
+            SongIdentity::match_key(&chosen.artist, &chosen.title)
         };
+        self.lift(&song)
+    }
+
+    /// A heart on a song a Delete keeps from downloading: the person asks for it again, so every
+    /// removal of it is lifted, as Allow downloading again does. Answers how many were; 0 for a
+    /// blank artist or title.
+    pub fn allow_song(&self, artist: &str, title: &str) -> usize {
+        if dotnet::is_blank(artist) || dotnet::is_blank(title) {
+            return 0;
+        }
+        self.lift(&SongIdentity::match_key(artist, title))
+    }
+
+    /// Lifts every removal of `song`, a [`SongIdentity::match_key`], that keeps it from
+    /// downloading. Answers how many were.
+    fn lift(&self, song: &str) -> usize {
+        let lifted: Vec<LibraryActionEntry> = self
+            .entries
+            .lock()
+            .by_key
+            .values()
+            .filter(|entry| {
+                entry.blocks_downloads() && SongIdentity::match_key(&entry.artist, &entry.title) == song
+            })
+            .cloned()
+            .collect();
         let count = lifted.len();
         for entry in lifted {
             self.record(LibraryActionEntry {

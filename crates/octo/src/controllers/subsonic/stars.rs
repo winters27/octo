@@ -551,6 +551,14 @@ async fn star_outside_song(
         .external_id_registry
         .resolve_song(&external_id, true)
         .map(|r| r.snapshot());
+    // A heart asks for the song again, so a Delete that kept it from downloading no longer does.
+    if let Some((artist, title)) = routing
+        .as_ref()
+        .and_then(|r| r.artist.as_deref().zip(r.title.as_deref()))
+        && state.library_action_journal.allow_song(artist, title) > 0
+    {
+        info!("A heart on '{artist} - {title}' lifts its Delete from disk, so it downloads again");
+    }
     state.acquisition_tracker.begin(
         &provider,
         &external_id,

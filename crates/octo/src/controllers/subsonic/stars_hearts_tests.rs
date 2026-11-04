@@ -1,7 +1,8 @@
 //! Hearts sent several at once, outside artists, and the outside songs a caller hearted that
 //! are still downloading, which their starred lists show until the file lands.
 
-use octo_core::settings::{AppSettings, SoulseekSettings};
+use chrono::Utc;
+use octo_core::settings::{AppSettings, LibraryAction, SoulseekSettings};
 use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
 use serde_json::Value;
 use wiremock::matchers::any;
@@ -11,6 +12,7 @@ use super::ARTIST_NOT_IN_LIBRARY;
 use crate::app::AppState;
 use crate::controllers::subsonic::test_app::*;
 use crate::http::pipeline::App;
+use crate::services::library::{LibraryActionEntry, LibraryActionJournal, LibraryActionState, PathSource};
 
 /// Navidrome's getStarred2 answer in JSON: one library song.
 const STARRED2_JSON: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","starred2":{"song":[{"id":"nd-7","title":"Library song","starred":"2026-01-01T00:00:00Z"}]}}}"#;
@@ -153,6 +155,52 @@ impl HeartApp {
 
 fn alice() -> String {
     auth("alice", "good", "Symfonium")
+}
+
+/// A song removed with Delete from disk by alice, which keeps it from downloading again.
+fn removed(id: &str, title: &str) -> LibraryActionEntry {
+    LibraryActionEntry {
+        key: LibraryActionJournal::make_key(LibraryAction::Delete, id, "1:2"),
+        action: LibraryAction::Delete,
+        navidrome_id: id.into(),
+        username: "alice".into(),
+        title: title.into(),
+        artist: "Massive Attack".into(),
+        album: "Mezzanine".into(),
+        source_path: Some(format!("/music/{id}.flac")),
+        quarantine_path: Some(format!("/music/.octo-trash/{id}.flac")),
+        resolution: Some(PathSource::NativeApi),
+        state: LibraryActionState::Applied,
+        detail: Some("Removed.".into()),
+        dry_run: false,
+        at_utc: Utc::now(),
+        history_kept: None,
+        revealed_path: None,
+        copy: false,
+        download_allowed: false,
+        denied_source: None,
+    }
+}
+
+/// A heart asks for the song again: the Delete from disk that kept it from downloading is lifted,
+/// and only for that song.
+#[tokio::test]
+async fn a_heart_lifts_the_delete_that_kept_its_song_from_downloading() {
+    let t = HeartApp::new().await;
+    let teardrop = t.register(RoutingKind::Song, "Teardrop");
+    let journal = &t.state.library_action_journal;
+    journal.record(removed("nd-1", "Teardrop"));
+    journal.record(removed("nd-2", "Angel"));
+
+    let reply = get(
+        &t.app,
+        &format!("/rest/star.view?{}&f=json&id={teardrop}", alice()),
+    )
+    .await;
+
+    assert_eq!(reply.envelope()["status"], "ok", "{}", reply.text());
+    assert!(!journal.is_never_requested(Some("Massive Attack"), Some("Teardrop")));
+    assert!(journal.is_never_requested(Some("Massive Attack"), Some("Angel")));
 }
 
 /// Library ids sent together reach Navidrome together, outside songs among them are each queued

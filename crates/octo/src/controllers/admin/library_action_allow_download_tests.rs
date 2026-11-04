@@ -50,6 +50,21 @@ fn allowing_a_song_lifts_every_removal_of_it_and_only_it() {
     assert_eq!(journal.allow_downloads(&first.key), 0);
 }
 
+#[test]
+fn a_heart_lifts_every_removal_of_its_song_and_only_it() {
+    let journal = LibraryActionJournal::new();
+    journal.record(removed("nd-1", "Daft Punk", "Digital Love", false));
+    journal.record(removed("nd-2", "Daft Punk", "Digital Love", false));
+    journal.record(removed("nd-3", "Daft Punk", "Aerodynamic", false));
+
+    assert_eq!(journal.allow_song("Daft Punk", " "), 0);
+    assert_eq!(journal.allow_song("Daft Punk", "Digital Love"), 2);
+
+    assert!(!journal.is_never_requested(Some("Daft Punk"), Some("Digital Love")));
+    assert!(journal.is_never_requested(Some("Daft Punk"), Some("Aerodynamic")));
+    assert_eq!(journal.allow_song("Daft Punk", "Digital Love"), 0);
+}
+
 #[tokio::test]
 async fn the_history_offers_allow_downloading_again_and_it_works_only_when_signed_in() {
     let state = AppState::for_tests(AppSettings::default());
