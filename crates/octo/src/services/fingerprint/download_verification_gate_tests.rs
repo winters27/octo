@@ -141,6 +141,7 @@ fn candidate(id: &str) -> HeartCandidate {
 /// with, so a file AcoustID reads clear for R is kept only when it sounds like it.
 #[tokio::test]
 async fn a_search_heart_never_played_takes_r_from_its_pinned_videos_stand_in() {
+    let (logs, _guard) = crate::services::test_support::LogCapture::start();
     let rig = gate_rig(GateSetup {
         music_brainz: false,
         ..Default::default()
@@ -155,6 +156,9 @@ async fn a_search_heart_never_played_takes_r_from_its_pinned_videos_stand_in() {
     let GateBuild::Ready(gate) = build(&rig, &id, None).await else {
         panic!("the stand-in gave R");
     };
+    let read = format!("Stand-in {VIDEO} for {id}: reference");
+    let infos = logs.at(tracing::Level::INFO);
+    assert!(infos.contains(&read), "{infos:?}");
     assert_eq!(
         rig.streams_of(VIDEO).await,
         1,
@@ -203,6 +207,7 @@ async fn a_search_hearts_stand_in_with_nothing_that_fits_holds_until_a_play() {
         ),
         (r#"{"status":"ok","results":[]}"#.to_string(), "no entry"),
     ] {
+        let (logs, _guard) = crate::services::test_support::LogCapture::start();
         let rig = gate_rig(GateSetup {
             music_brainz: false,
             ..Default::default()
@@ -218,6 +223,12 @@ async fn a_search_hearts_stand_in_with_nothing_that_fits_holds_until_a_play() {
             Some((WaitingFor::NotYetProven, NEVER_PLAYED.to_string())),
             "{why}"
         );
+        let not_read = format!(
+            "Stand-in {VIDEO} for {id}: not the reference (no one recording of the song in its \
+             answer fits the song's length)"
+        );
+        let infos = logs.at(tracing::Level::INFO);
+        assert!(infos.contains(&not_read), "{why}: {infos:?}");
         assert_eq!(rig.streams_of(VIDEO).await, 1, "{why}: the stand-in was fetched");
         assert_eq!(rig.answers.asked(), ["stand-in"], "{why}");
     }
@@ -580,6 +591,7 @@ async fn another_master_as_long_as_the_song_is_kept_as_the_same_take() {
 /// fetched through the shim; another master of the song is not kept.
 #[tokio::test]
 async fn an_explicit_never_played_hearts_flac_of_the_stand_ins_master_is_kept() {
+    let (logs, _guard) = crate::services::test_support::LogCapture::start();
     let rig = gate_rig(GateSetup::default()).await;
     rig.shim_streams(VIDEO, sound_bytes("-", "help-2009-master", "-"))
         .await;
@@ -638,6 +650,21 @@ async fn an_explicit_never_played_hearts_flac_of_the_stand_ins_master_is_kept() 
         check.verdict,
         GateVerdict::Undecided(octo_core::fingerprint::heart_gate::Undecided::NotYetProven)
     );
+    // Each check against the stand-in leaves its verdict and its numbers in the log.
+    let infos = logs.at(tracing::Level::INFO);
+    let same = format!(
+        "Stand-in master for help against {}: Same (1 s median ",
+        master.display()
+    );
+    assert!(
+        infos.iter().any(|line| line.starts_with(&same)
+            && line.contains(" dB, 1 s worst ")
+            && line.contains(" dB, 0.25 s worst ")
+            && line.ends_with(" dB: the heard master)")),
+        "{infos:?}"
+    );
+    let differs = format!("Stand-in master for help against {}: Differs (", other.display());
+    assert!(infos.iter().any(|line| line.starts_with(&differs)), "{infos:?}");
 }
 
 /// With AcoustID busy for the file itself, a file that is the very master that played (A2) lands

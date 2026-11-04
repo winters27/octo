@@ -25,7 +25,7 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use octo_core::fingerprint::heard_master::{
-    BlockSums, F32leFrames, FirstPass, RefinePlan, Side, StretchPass, verdict,
+    BlockSums, F32leFrames, FirstPass, HeardMasterVerdict, RefinePlan, Side, StretchPass, verdict,
 };
 use octo_core::fingerprint::heart_gate::{HeardMaster, HeardRecord};
 use parking_lot::Mutex;
@@ -200,9 +200,14 @@ fn decode_into(
     decode.finish()
 }
 
-/// The three passes over `heard` and `file`: the verdict, or None when a decode failed or ran out
-/// of time.
-pub fn run_check(decoder: &dyn Decoder, heard: &Path, file: &Path, timeout: Duration) -> Option<bool> {
+/// The three passes over `heard` and `file`: the verdict, with each window's residual and why it
+/// passed or failed, or None when a decode failed or ran out of time.
+pub fn run_measured(
+    decoder: &dyn Decoder,
+    heard: &Path,
+    file: &Path,
+    timeout: Duration,
+) -> Option<HeardMasterVerdict> {
     let mut first_heard = FirstPass::new();
     if !decode_into(decoder, heard, timeout, |frames| {
         first_heard.push(frames);
@@ -219,7 +224,7 @@ pub fn run_check(decoder: &dyn Decoder, heard: &Path, file: &Path, timeout: Dura
     }
     let plan = RefinePlan::new(&first_heard, &first_file);
     if plan.is_empty() {
-        return Some(false);
+        return Some(HeardMasterVerdict::no_shift());
     }
     let mut heard_stretches = StretchPass::new(&plan.heard_ranges());
     if !decode_into(decoder, heard, timeout, |frames| {
@@ -270,7 +275,7 @@ pub fn run_check(decoder: &dyn Decoder, heard: &Path, file: &Path, timeout: Dura
         reading.long_worst(),
         reading.short_worst()
     );
-    Some(reading.passed())
+    Some(reading)
 }
 
 /// The open rounds, by acquisition and person.
@@ -347,9 +352,14 @@ impl HeardRound {
     /// Whether `file` is the master the person heard. The round's heard copy is made at its first
     /// call and serves every later one.
     pub async fn check(&self, file: &Path) -> HeardMaster {
+        self.check_measured(file).await.0
+    }
+
+    /// [`Self::check`] with what the check measured, when both files were decoded.
+    pub async fn check_measured(&self, file: &Path) -> (HeardMaster, Option<HeardMasterVerdict>) {
         let copy = match self.copy().await {
             Ok(copy) => copy,
-            Err(answer) => return answer,
+            Err(answer) => return (answer, None),
         };
         let parts = &self.0.parts;
         let _slot = parts.samples.slot(FpcalcClass::Heart).await;
@@ -358,12 +368,12 @@ impl HeardRound {
         let heard = copy.file.path().to_path_buf();
         let file = file.to_path_buf();
         let reading =
-            tokio::task::spawn_blocking(move || run_check(decoder.as_ref(), &heard, &file, timeout)).await;
+            tokio::task::spawn_blocking(move || run_measured(decoder.as_ref(), &heard, &file, timeout)).await;
         drop(copy);
         match reading {
-            Ok(Some(true)) => HeardMaster::Same,
-            Ok(Some(false)) => HeardMaster::Differs,
-            Ok(None) | Err(_) => HeardMaster::Undecided,
+            Ok(Some(measured)) if measured.passed() => (HeardMaster::Same, Some(measured)),
+            Ok(Some(measured)) => (HeardMaster::Differs, Some(measured)),
+            Ok(None) | Err(_) => (HeardMaster::Undecided, None),
         }
     }
 
@@ -521,12 +531,22 @@ impl HeardMasterCheck {
         heard: HeardAudio,
         file: &Path,
     ) -> HeardMaster {
+        self.check_once_measured(acquisition_key, heard, file).await.0
+    }
+
+    /// [`Self::check_once_in`] with what the check measured, when both files were decoded.
+    pub async fn check_once_measured(
+        &self,
+        acquisition_key: Option<&str>,
+        heard: HeardAudio,
+        file: &Path,
+    ) -> (HeardMaster, Option<HeardMasterVerdict>) {
         let round = HeardRound::new(
             Arc::clone(&self.parts),
             heard,
             acquisition_key.map(str::to_string),
         );
-        let answer = round.check(file).await;
+        let answer = round.check_measured(file).await;
         round.pause();
         answer
     }

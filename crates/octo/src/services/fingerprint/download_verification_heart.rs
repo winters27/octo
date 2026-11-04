@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 use chrono::Utc;
 use octo_core::fingerprint::acoust_id_client::{AcoustIdAnswer, AcoustIdOutcome};
+use octo_core::fingerprint::heard_master::HeardMasterVerdict;
 use octo_core::fingerprint::heart_gate::{
     AcquisitionOrigin, AlbumContext, ClipReading, FileFacts, FileLabels, FileNames, HeardAnswerReading,
     HeardMaster, HeardReading, HeardRecord, HeardRecording, Judgement, MusicBrainzFact, Need, StandIn,
@@ -536,13 +537,35 @@ impl DownloadVerificationService {
             },
             sample_id: None,
         };
-        let HeardLookup::Read(AcoustIdOutcome::Answered(answer), _) = self
+        let answer = match self
             .heard_lookup(parts, &record, routing, &mut ClipPrints::default())
             .await
-        else {
-            return;
+        {
+            HeardLookup::Read(AcoustIdOutcome::Answered(answer), _) => answer,
+            other => {
+                let why = match other {
+                    HeardLookup::ShimBusy => "the shim did not answer".to_string(),
+                    HeardLookup::Gone => "its audio is gone".to_string(),
+                    HeardLookup::Read(outcome, _) => format!("AcoustID did not read it: {outcome:?}"),
+                };
+                info!("Stand-in {video} for {external_id}: not the reference ({why})");
+                return;
+            }
         };
         let reading = read_stand_in(&answer, catalog, gate.heard_seconds, min);
+        if reading.is_reference {
+            info!("Stand-in {video} for {external_id}: reference");
+        } else {
+            let why = if catalog.ids.is_empty() {
+                "no one recording of the song in its answer fits the song's length".to_string()
+            } else {
+                format!(
+                    "its answer reads {:?} against the catalog's recording",
+                    read_answer(&answer, catalog, min).reading
+                )
+            };
+            info!("Stand-in {video} for {external_id}: not the reference ({why})");
+        }
         if let Some(recording) = &reading.recording {
             if catalog.ids.is_empty() {
                 if let Ok((r, _)) = self.became_r(parts, &answer, recording, catalog, min).await {
@@ -758,7 +781,14 @@ impl DownloadVerificationService {
             match gate.judge(facts, min) {
                 Judgement::Verdict(verdict) => return verdict,
                 Judgement::Needs(Need::HeardMaster) => {
-                    facts.heard_master = Some(heard_master(parts, gate, candidate, path).await);
+                    let (master, measured) = heard_master(parts, gate, candidate, path).await;
+                    if gate.heard.is_none() {
+                        info!(
+                            "{}",
+                            stand_in_master_line(candidate, path, master, measured.as_ref())
+                        );
+                    }
+                    facts.heard_master = Some(master);
                 }
                 Judgement::Needs(Need::CurrentRecording(id)) => {
                     let fact = match &self.music_brainz {
@@ -929,20 +959,50 @@ async fn heard_master(
     gate: &HeartGate,
     candidate: &HeartCandidate,
     path: &Path,
-) -> HeardMaster {
+) -> (HeardMaster, Option<HeardMasterVerdict>) {
     let (Some(parts), Some(heard)) = (parts, master_audio(gate)) else {
-        return HeardMaster::Undecided;
+        return (HeardMaster::Undecided, None);
     };
     match parts.master.round(&candidate.acquisition_key, &gate.user) {
-        Some(round) => round.check(path).await,
+        Some(round) => round.check_measured(path).await,
         None => {
             let acquisition = Some(candidate.acquisition_key.as_str()).filter(|key| !key.is_empty());
             parts
                 .master
-                .check_once_in(acquisition, HeardAudio::Heard(heard), path)
+                .check_once_measured(acquisition, HeardAudio::Heard(heard), path)
                 .await
         }
     }
+}
+
+/// The log line of one file checked against a never-played heart's stand-in: the song, the file,
+/// the verdict and, when both were decoded, the 1 s windows' median and worst residual and the
+/// 0.25 s windows' worst, in dB, with why it passed or failed.
+fn stand_in_master_line(
+    candidate: &HeartCandidate,
+    path: &Path,
+    master: HeardMaster,
+    measured: Option<&HeardMasterVerdict>,
+) -> String {
+    let song = candidate
+        .acquisition_key
+        .strip_suffix(":flac")
+        .unwrap_or(&candidate.acquisition_key);
+    let song = song.split_once(':').map_or(song, |(_, id)| id);
+    let db = |value: Option<f64>| value.map_or_else(|| "none".to_string(), |db| format!("{db:.1} dB"));
+    let numbers = measured.map_or_else(String::new, |measured| {
+        format!(
+            " (1 s median {}, 1 s worst {}, 0.25 s worst {}: {})",
+            db(measured.long_median()),
+            db(measured.long_worst()),
+            db(measured.short_worst()),
+            measured.reason.as_str()
+        )
+    });
+    format!(
+        "Stand-in master for {song} against {}: {master:?}{numbers}",
+        path.display()
+    )
 }
 
 /// The audio a gate's heard-master check compares a file with: what the person heard, else, for
