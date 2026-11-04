@@ -1410,8 +1410,8 @@ fn another_recording_of_the_same_song_is_the_same_take() {
     assert_eq!(verdict_of(&gate, empty, Some(HeardMaster::Differs)), same_take());
 }
 
-/// Over the match line a re-recording (0.27) and a live take (0.41) are refused as before; between
-/// it and the same-take line the heard copy is kept.
+/// Over the match line a re-recording (0.27) and a live take (0.41) are refused as before; up to
+/// it a file is the same take, the same-take line being the match line itself.
 #[test]
 fn a_rerecording_or_a_live_take_is_not_the_same_take() {
     let gate = r_stays();
@@ -1430,11 +1430,17 @@ fn a_rerecording_or_a_live_take_is_not_the_same_take() {
             "{distance}"
         );
     }
+    for distance in [0.23, 0.24, clip_check::MATCH_AT_MOST] {
+        assert_eq!(
+            verdict_of(&gate, at(distance), Some(HeardMaster::Differs)),
+            same_take(),
+            "{distance}"
+        );
+    }
     assert_eq!(
-        verdict_of(&gate, at(SAME_TAKE_AT_MOST), Some(HeardMaster::Differs)),
-        same_take()
+        verdict_of(&gate, at(0.26), Some(HeardMaster::Differs)),
+        GateVerdict::Refuse(Refusal::DiffersFromHeard)
     );
-    assert_eq!(verdict_of(&gate, at(0.23), Some(HeardMaster::Differs)), KEEP);
     let no_distance = FileFacts {
         heard_distance: None,
         ..another_master()
@@ -1482,28 +1488,52 @@ fn an_edit_is_not_the_same_take() {
     );
 }
 
-/// A song marked explicit, or the clean edit, keeps the exact rule: the two sound alike. A file
-/// whose own names say explicit is not the same take of a song not marked so either.
-#[test]
-fn an_explicit_song_keeps_the_exact_rule() {
-    let marked = |explicit: i32| HeartGate {
+fn marked(explicit: i32) -> HeartGate {
+    HeartGate {
         r: Some(HeardRecording {
             explicit: Some(explicit),
             ..help_r()
         }),
         ..r_stays()
-    };
-    assert_eq!(
-        verdict_of(&r_stays(), another_master(), Some(HeardMaster::Differs)),
-        same_take()
-    );
+    }
+}
+
+fn advised(advisory: i32) -> FileFacts {
+    FileFacts {
+        advisory: Some(advisory),
+        ..another_master()
+    }
+}
+
+/// A song marked explicit, or the clean edit, takes the same take as any other: an album FLAC
+/// at 0.15, as long as the song and with no clean marks, is kept, its own words in its names
+/// included. A file whose own names say explicit is still not the same take of a song marked
+/// neither.
+#[test]
+fn an_explicit_or_clean_song_takes_the_same_take() {
     for explicit in [explicit_status::EXPLICIT, explicit_status::CLEAN] {
         assert_eq!(
             verdict_of(&marked(explicit), another_master(), Some(HeardMaster::Differs)),
-            KEEP,
+            same_take(),
             "{explicit}"
         );
     }
+    assert_eq!(
+        verdict_of(
+            &marked(explicit_status::EXPLICIT),
+            named("Help! (Explicit)", "Help! (Explicit)"),
+            Some(HeardMaster::Differs)
+        ),
+        same_take()
+    );
+    assert_eq!(
+        verdict_of(
+            &marked(explicit_status::CLEAN),
+            named("Help! (Clean)", "Help! (Clean)"),
+            Some(HeardMaster::Differs)
+        ),
+        same_take()
+    );
     assert_eq!(
         verdict_of(
             &r_stays(),
@@ -1512,6 +1542,73 @@ fn an_explicit_song_keeps_the_exact_rule() {
         ),
         KEEP
     );
+}
+
+/// An explicit song's clean copy stays out by its names (a "(Clean)" title, a "(Clean)" album, a
+/// "(Radio Edit)" file name) and by its advisory tag; the clean edit refuses a file tagged
+/// explicit. A file with no advisory tag, or tagged as the song is, says nothing.
+#[test]
+fn a_clean_copy_of_an_explicit_song_is_not_the_same_take() {
+    let explicit = marked(explicit_status::EXPLICIT);
+    let radio_edit = FileFacts {
+        names: FileNames {
+            title: None,
+            album: None,
+            file: Some("07 - The Beatles - Help! (Radio Edit)".into()),
+        },
+        ..another_master()
+    };
+    for (facts, why) in [
+        (named("Help! (Clean)", "Help!"), "a (Clean) title"),
+        (named("Help!", "Help! (Clean)"), "a (Clean) album"),
+        (radio_edit, "a (Radio Edit) file name"),
+        (advised(ADVISORY_CLEAN), "tagged clean"),
+    ] {
+        assert_eq!(
+            verdict_of(&explicit, facts, Some(HeardMaster::Differs)),
+            KEEP,
+            "{why}"
+        );
+    }
+    let clean = marked(explicit_status::CLEAN);
+    assert_eq!(
+        verdict_of(&clean, advised(ADVISORY_EXPLICIT), Some(HeardMaster::Differs)),
+        KEEP
+    );
+    assert_eq!(
+        verdict_of(&explicit, advised(ADVISORY_EXPLICIT), Some(HeardMaster::Differs)),
+        same_take()
+    );
+    assert_eq!(
+        verdict_of(&clean, advised(ADVISORY_CLEAN), Some(HeardMaster::Differs)),
+        same_take()
+    );
+    assert_eq!(
+        verdict_of(&explicit, advised(0), Some(HeardMaster::Differs)),
+        same_take()
+    );
+    // A song marked neither reads no advisory.
+    assert_eq!(
+        verdict_of(&r_stays(), advised(ADVISORY_CLEAN), Some(HeardMaster::Differs)),
+        same_take()
+    );
+}
+
+/// The heard master never refuses on its own: an explicit song's file A2 calls another master, at
+/// 0.24 from what played, is the same take.
+#[test]
+fn a_differing_master_of_an_explicit_song_falls_to_the_same_take() {
+    let file = FileFacts {
+        heard_distance: Some(0.24),
+        ..another_master()
+    };
+    let (verdict, asked) = settle(
+        &marked(explicit_status::EXPLICIT),
+        file,
+        Some(HeardMaster::Differs),
+    );
+    assert_eq!(verdict, same_take());
+    assert_eq!(asked, [Need::HeardMaster]);
 }
 
 /// A file whose title, album or file name names a version the heard title does not is not the
@@ -1690,10 +1787,10 @@ fn near_the_stand_in(distance: f64) -> FileFacts {
     }
 }
 
-/// A heart never played whose pinned video is the reference: a file within the same-take line of
-/// the stand-in's print, AcoustID unable to tell the masters apart, is the same take; over the
-/// match line (0.27) proof 2 refuses it as before, and between the two lines, or with no
-/// distance, it is still not yet proven. The stand-in decides alone, once its master was asked.
+/// A heart never played whose pinned video is the reference: a file up to the match line from the
+/// stand-in's print, AcoustID unable to tell the masters apart, is the same take; over it (0.27)
+/// proof 2 refuses it as before, and with no distance it is still not yet proven. The stand-in
+/// decides alone, once its master was asked.
 #[test]
 fn a_never_played_hearts_file_near_its_reference_stand_in_is_the_same_take() {
     let differs = Some(HeardMaster::Differs);
@@ -1706,7 +1803,7 @@ fn a_never_played_hearts_file_near_its_reference_stand_in_is_the_same_take() {
     );
     assert_eq!(
         verdict_of(&stood_in(true), near_the_stand_in(0.23), differs),
-        NOT_YET
+        same_take()
     );
     let no_distance = FileFacts {
         heard_distance: None,
@@ -1758,8 +1855,8 @@ fn a_never_played_hearts_ambiguous_reading_holding_r_is_the_same_take() {
 }
 
 /// A heart never played keeps "not yet proven" for a reading that holds none of R's recordings, a
-/// song marked explicit, a version word or a length 30 s off; another song is refused as before,
-/// and with AcoustID off nothing changes.
+/// clean copy of an explicit song, a version word or a length 30 s off; another song is refused
+/// as before, and with AcoustID off nothing changes. An explicit song's own copy is the same take.
 #[test]
 fn a_never_played_heart_is_not_yet_proven_without_the_same_take() {
     let listed = || FileFacts {
@@ -1788,7 +1885,17 @@ fn a_never_played_heart_is_not_yet_proven_without_the_same_take() {
         }),
         ..never_played()
     };
-    assert_eq!(verdict_of(&explicit, listed(), None), NOT_YET);
+    assert_eq!(verdict_of(&explicit, listed(), None), same_take());
+    let tagged_clean = FileFacts {
+        advisory: Some(ADVISORY_CLEAN),
+        ..listed()
+    };
+    assert_eq!(verdict_of(&explicit, tagged_clean, None), NOT_YET);
+    let titled_clean = FileFacts {
+        heard_distance: None,
+        ..named("Help! (Clean)", "Help!")
+    };
+    assert_eq!(verdict_of(&explicit, titled_clean, None), NOT_YET);
     let live = FileFacts {
         heard_distance: None,
         ..named("Help! (Live)", "Help!")
@@ -1851,9 +1958,8 @@ fn explicit_stood_in() -> HeartGate {
 }
 
 /// An explicit song hearted without a play: its file that is the stand-in's master is kept as
-/// the same recording, asked once; the clean edit, which the master check's short windows tell
-/// apart, and another master of the song are not kept, since explicit songs never use the same
-/// take.
+/// the same recording, asked once; another master of the song near the stand-in is the same take;
+/// a clean copy, by its advisory tag or its names, is neither.
 #[test]
 fn an_explicit_never_played_hearts_file_that_is_the_stand_ins_master_is_kept() {
     let (verdict, asked) = settle(
@@ -1863,17 +1969,28 @@ fn an_explicit_never_played_hearts_file_that_is_the_stand_ins_master_is_kept() {
     );
     assert_eq!(verdict, as_heard(Acceptance::HeardMaster));
     assert_eq!(asked, [Need::HeardMaster]);
-    let clean_edit = near_the_stand_in(0.08);
-    assert_eq!(
-        verdict_of(&explicit_stood_in(), clean_edit, Some(HeardMaster::Differs)),
-        NOT_YET
-    );
     assert_eq!(
         verdict_of(
             &explicit_stood_in(),
             near_the_stand_in(0.15),
             Some(HeardMaster::Differs)
         ),
+        same_take()
+    );
+    let tagged_clean = FileFacts {
+        advisory: Some(ADVISORY_CLEAN),
+        ..near_the_stand_in(0.08)
+    };
+    assert_eq!(
+        verdict_of(&explicit_stood_in(), tagged_clean, Some(HeardMaster::Differs)),
+        NOT_YET
+    );
+    let folder_clean = FileFacts {
+        heard_distance: Some(0.08),
+        ..named("Help!", "Help! (Clean)")
+    };
+    assert_eq!(
+        verdict_of(&explicit_stood_in(), folder_clean, Some(HeardMaster::Differs)),
         NOT_YET
     );
     // The stand-in's master accepts what AcoustID has no entry for, as a played heart's does.
@@ -1944,7 +2061,10 @@ fn the_stand_ins_master_is_asked_only_where_it_could_keep_the_file() {
         stand_in: None,
         ..explicit_stood_in()
     };
-    assert_eq!(never_asked(&explicit_unstood, near_the_stand_in(0.05)), NOT_YET);
+    assert_eq!(
+        never_asked(&explicit_unstood, near_the_stand_in(0.05)),
+        same_take()
+    );
     let off = FileFacts {
         answer: AcoustIdOutcome::Off,
         ..near_the_stand_in(0.05)

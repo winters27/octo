@@ -23,9 +23,14 @@ use crate::models::domain::explicit_status;
 pub const NATIVE_CLIENT: &str = "navidrome-native";
 
 /// At or under this share of differing bits from the heard print, a file can be the take that
-/// played. Measured: the same recording 0.052 to 0.185, another mix or master of it 0.096 to
+/// played: the line proof 2 refuses above, so a file proof 2 does not call different can be the
+/// same take. Measured: the same recording 0.052 to 0.185, another mix or master of it 0.096 to
 /// 0.200, a re-recording 0.272 and up, a live take 0.40 and up, another song 0.425 and up.
-pub const SAME_TAKE_AT_MOST: f64 = 0.22;
+pub const SAME_TAKE_AT_MOST: f64 = clip_check::MATCH_AT_MOST;
+/// A file's advisory tag for explicit words, as iTunes numbers it.
+const ADVISORY_EXPLICIT: i32 = 1;
+/// A file's advisory tag for the clean edit, as iTunes numbers it.
+const ADVISORY_CLEAN: i32 = 2;
 /// A same-take file's length may be this many seconds from the song's, or
 /// [`SAME_TAKE_LENGTH_SHARE`] of the song's length when that is more.
 pub const SAME_TAKE_LENGTH_SECONDS: f64 = 3.0;
@@ -494,6 +499,9 @@ pub struct FileFacts {
     /// The file's length in seconds, when its container gives one.
     pub seconds: Option<f64>,
     pub names: FileNames,
+    /// The file's advisory tag: explicit (1), the clean edit (2) or neither (0), as iTunes
+    /// numbers it. None when the file carries none.
+    pub advisory: Option<i32>,
 }
 
 impl FileFacts {
@@ -509,6 +517,7 @@ impl FileFacts {
             isrc_recordings: Vec::new(),
             seconds: None,
             names: FileNames::default(),
+            advisory: None,
         }
     }
 }
@@ -1043,8 +1052,9 @@ impl HeartGate {
     /// - AcoustID read the file: with AcoustID off, busy or unable to read it, nothing changes;
     /// - the file's length is within the larger of [`SAME_TAKE_LENGTH_SECONDS`] and
     ///   [`SAME_TAKE_LENGTH_SHARE`] of the song's ([`HeartGate::heard_seconds`]);
-    /// - the song is not marked explicit or the clean edit: the two sound alike, so either keeps
-    ///   the exact rule;
+    /// - its advisory tag does not say the other words than the song's: a file tagged clean is
+    ///   not an explicit song's, nor a file tagged explicit the clean edit's
+    ///   ([`advisory_opposes`]); a file with no advisory tag says nothing;
     /// - no label and no reading of the file names another song;
     /// - the file's own names add no version the heard title does not carry
     ///   ([`names_another_version`]).
@@ -1093,10 +1103,7 @@ impl HeartGate {
         };
         sounds_like
             && self.same_length(facts.seconds)
-            && !matches!(
-                r.explicit,
-                Some(explicit_status::EXPLICIT | explicit_status::CLEAN)
-            )
+            && !advisory_opposes(r.explicit, facts.advisory)
             && !findings.contains(&LabelCheck::NamesAnother { other_song: true })
             && reading
                 .dominant()
@@ -1170,12 +1177,25 @@ fn same_take_may_replace(judgement: &Judgement) -> bool {
     )
 }
 
+/// Whether a file's advisory tag says the other words than the song's: clean for a song marked
+/// explicit, explicit for one marked the clean edit. A file with no advisory tag, or a song
+/// marked neither, says nothing.
+fn advisory_opposes(song: Option<i32>, advisory: Option<i32>) -> bool {
+    matches!(
+        (song, advisory),
+        (Some(explicit_status::EXPLICIT), Some(ADVISORY_CLEAN))
+            | (Some(explicit_status::CLEAN), Some(ADVISORY_EXPLICIT))
+    )
+}
+
 /// Whether a file's own names add a version the heard title (R's) does not carry: live,
 /// acoustic, demo, instrumental, karaoke, cover, sped up, slowed, nightcore, remix, edit,
-/// extended, or any other marker [`SongIdentity`] reads as a different recording, and the
-/// explicit word. Only another mix of the take and a bare "version" say nothing. The title and
-/// the file name are read as titles; the album is read whole, since a release's name says what
-/// kind it is anywhere in it ("Live at the BBC").
+/// extended, or any other marker [`SongIdentity`] reads as a different recording, clean and
+/// censored among them, and the explicit word. Only another mix of the take and a bare
+/// "version" say nothing, and the song's own words never do: explicit for a song marked
+/// explicit, clean for one marked the clean edit. The title and the file name are read as
+/// titles; the album is read whole, since a release's name says what kind it is anywhere in it
+/// ("Live at the BBC").
 fn names_another_version(names: &FileNames, r: &HeardRecording) -> bool {
     let options = SongMatchOptions {
         also_neutral: SAME_TAKE_NEUTRAL.iter().map(|word| word.to_string()).collect(),
@@ -1183,12 +1203,16 @@ fn names_another_version(names: &FileNames, r: &HeardRecording) -> bool {
     };
     let versions = |title: &SongTitle| -> BTreeSet<String> {
         let mut versions = SongIdentity::distinct_versions(title, Some(&options));
-        if title
-            .versions
-            .iter()
-            .any(|version| version == explicit_status::EXPLICIT_WORD)
+        if r.explicit != Some(explicit_status::EXPLICIT)
+            && title
+                .versions
+                .iter()
+                .any(|version| version == explicit_status::EXPLICIT_WORD)
         {
             versions.insert(explicit_status::EXPLICIT_WORD.to_string());
+        }
+        if r.explicit == Some(explicit_status::CLEAN) {
+            versions.remove(explicit_status::CLEAN_WORD);
         }
         versions
     };
