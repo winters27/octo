@@ -575,6 +575,71 @@ async fn another_master_as_long_as_the_song_is_kept_as_the_same_take() {
     assert_eq!(check.verdict, keep);
 }
 
+/// An explicit song hearted without a play, whose pinned video is the reference: a FLAC that is
+/// the pinned video's master is kept as the same recording, checked against the video's own audio
+/// fetched through the shim; another master of the song is not kept.
+#[tokio::test]
+async fn an_explicit_never_played_hearts_flac_of_the_stand_ins_master_is_kept() {
+    let rig = gate_rig(GateSetup::default()).await;
+    rig.shim_streams(VIDEO, sound_bytes("-", "help-2009-master", "-"))
+        .await;
+    rig.answers.answer(
+        "clustered",
+        &answer(&[
+            (HELP_2009, "Help!", "The Beatles", 139, 700, HELP_CODE),
+            (HELP_2015, "Help!", "The Beatles", 139, 300, "GBUM71505900"),
+        ]),
+    );
+    let stored = heard_with(&rig, VIDEO, print_items("help-2009", 240.0), true, "stand-in");
+    let gate = HeartGate {
+        user: "brandon".into(),
+        origin: AcquisitionOrigin::Heart,
+        r: Some(HeardRecording {
+            explicit: Some(1),
+            ..r_of(HELP_2009, HELP_CODE, "Help!", "The Beatles")
+        }),
+        heard: None,
+        heard_seconds: Some(200),
+        reading: HeardReading::NotHeard,
+        stand_in: Some(StandIn {
+            video_id: VIDEO.into(),
+            sample_id: stored.sample_id.clone(),
+            is_reference: true,
+        }),
+    };
+    // Audio after the header, so the file's container gives its 200 s.
+    let flac = |name: &str, master: &str| {
+        let path = rig.dir.path().join(format!("{name}.flac"));
+        let mut bytes = flac_header(200);
+        bytes.extend_from_slice(&sound_bytes("help-2009", master, "clustered"));
+        bytes.extend(std::iter::repeat_n(0u8, 256 * 1024));
+        std::fs::write(&path, bytes).expect("the file is written");
+        path
+    };
+
+    let master = flac("master", "help-2009-master");
+    let check = rig
+        .service
+        .verify_for_heart(&master, &candidate("help"), &gate)
+        .await;
+    assert_eq!(
+        check.verdict,
+        GateVerdict::Accept {
+            by: Acceptance::HeardMaster,
+            tags: TagClaim::AsHeard,
+        }
+    );
+    let other = flac("other", "another-master");
+    let check = rig
+        .service
+        .verify_for_heart(&other, &candidate("help"), &gate)
+        .await;
+    assert_eq!(
+        check.verdict,
+        GateVerdict::Undecided(octo_core::fingerprint::heart_gate::Undecided::NotYetProven)
+    );
+}
+
 /// With AcoustID busy for the file itself, a file that is the very master that played (A2) lands
 /// when its own ISRC is one MusicBrainz lists on another release of the same song, and is refused
 /// when its ISRC names another song.

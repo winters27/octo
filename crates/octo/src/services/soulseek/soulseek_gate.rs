@@ -109,7 +109,7 @@ fn verdict_words(verdict: &GateVerdict) -> (&'static str, &'static str) {
 }
 
 /// The words a gate's verdict leaves in the downloads log for its own file: a heart never played
-/// heard nothing, so its same take is told by the song it hearted.
+/// heard nothing, so its same take and its stand-in's master are told by the song it hearted.
 fn gate_words(gate: &HeartGate, verdict: &GateVerdict) -> (&'static str, &'static str) {
     match verdict {
         GateVerdict::Accept {
@@ -118,6 +118,13 @@ fn gate_words(gate: &HeartGate, verdict: &GateVerdict) -> (&'static str, &'stati
         } if gate.reading == HeardReading::NotHeard => (
             "The same take as the song you hearted",
             "AcoustID hears this song, it runs as long, and it names no other version",
+        ),
+        GateVerdict::Accept {
+            by: octo_core::fingerprint::heart_gate::Acceptance::HeardMaster,
+            ..
+        } if gate.reading == HeardReading::NotHeard => (
+            "The same recording as the song you hearted",
+            "It matches the song's own audio, window by window",
         ),
         other => verdict_words(other),
     }

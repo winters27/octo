@@ -930,7 +930,7 @@ async fn heard_master(
     candidate: &HeartCandidate,
     path: &Path,
 ) -> HeardMaster {
-    let (Some(parts), Some(heard)) = (parts, &gate.heard) else {
+    let (Some(parts), Some(heard)) = (parts, master_audio(gate)) else {
         return HeardMaster::Undecided;
     };
     match parts.master.round(&candidate.acquisition_key, &gate.user) {
@@ -939,10 +939,30 @@ async fn heard_master(
             let acquisition = Some(candidate.acquisition_key.as_str()).filter(|key| !key.is_empty());
             parts
                 .master
-                .check_once_in(acquisition, HeardAudio::Heard(heard.clone()), path)
+                .check_once_in(acquisition, HeardAudio::Heard(heard), path)
                 .await
         }
     }
+}
+
+/// The audio a gate's heard-master check compares a file with: what the person heard, else, for
+/// a heart never played, its stand-in's audio when the stand-in is the reference, fetched through
+/// the shim as heard audio is.
+fn master_audio(gate: &HeartGate) -> Option<HeardRecord> {
+    if let Some(heard) = &gate.heard {
+        return Some(heard.clone());
+    }
+    let stand_in = gate.stand_in.as_ref().filter(|stand_in| stand_in.is_reference)?;
+    Some(HeardRecord {
+        heard_at: Utc::now(),
+        source: HeardSource::Video {
+            id: stand_in.video_id.clone(),
+            size: None,
+            content_type: "audio/mp4".to_string(),
+            itag: None,
+        },
+        sample_id: stand_in.sample_id.clone(),
+    })
 }
 
 /// A file's own ISRC tags and `MUSICBRAINZ_TRACKID`, as read from it, and the title and album its
@@ -1375,15 +1395,20 @@ impl HeartGates for DownloadVerificationService {
         let Some(parts) = self.heart.get() else {
             return Box::new(());
         };
+        // A heart never played checks its files against its stand-in's audio, kept for the round
+        // as heard audio is.
         let rounds: Vec<RoundGuard> = gates
             .iter()
-            .filter(|gate| !matches!(gate.reading, HeardReading::NotHeard | HeardReading::AnotherSong))
             .filter_map(|gate| {
-                let heard = gate.heard.clone()?;
+                let audio = match gate.reading {
+                    HeardReading::AnotherSong => None,
+                    HeardReading::NotHeard if gate.heard.is_some() => None,
+                    _ => master_audio(gate),
+                }?;
                 Some(
                     parts
                         .master
-                        .open_round(acquisition_key, &gate.user, HeardAudio::Heard(heard)),
+                        .open_round(acquisition_key, &gate.user, HeardAudio::Heard(audio)),
                 )
             })
             .collect();

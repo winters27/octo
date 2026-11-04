@@ -1693,25 +1693,26 @@ fn near_the_stand_in(distance: f64) -> FileFacts {
 /// A heart never played whose pinned video is the reference: a file within the same-take line of
 /// the stand-in's print, AcoustID unable to tell the masters apart, is the same take; over the
 /// match line (0.27) proof 2 refuses it as before, and between the two lines, or with no
-/// distance, it is still not yet proven. The stand-in decides alone.
+/// distance, it is still not yet proven. The stand-in decides alone, once its master was asked.
 #[test]
 fn a_never_played_hearts_file_near_its_reference_stand_in_is_the_same_take() {
-    let (verdict, asked) = settle(&stood_in(true), near_the_stand_in(0.15), None);
+    let differs = Some(HeardMaster::Differs);
+    let (verdict, asked) = settle(&stood_in(true), near_the_stand_in(0.15), differs);
     assert_eq!(verdict, same_take());
-    assert!(asked.is_empty(), "nothing heard, so no heard master: {asked:?}");
+    assert_eq!(asked, [Need::HeardMaster]);
     assert_eq!(
         verdict_of(&stood_in(true), near_the_stand_in(0.27), None),
         GateVerdict::Refuse(Refusal::DiffersFromHeard)
     );
     assert_eq!(
-        verdict_of(&stood_in(true), near_the_stand_in(0.23), None),
+        verdict_of(&stood_in(true), near_the_stand_in(0.23), differs),
         NOT_YET
     );
     let no_distance = FileFacts {
         heard_distance: None,
         ..another_master()
     };
-    assert_eq!(verdict_of(&stood_in(true), no_distance, None), NOT_YET);
+    assert_eq!(verdict_of(&stood_in(true), no_distance, differs), NOT_YET);
     // A stand-in that is not the reference leaves it to the file's own reading.
     assert_eq!(
         verdict_of(&stood_in(false), near_the_stand_in(0.30), None),
@@ -1834,6 +1835,150 @@ fn a_never_played_hearts_fallback_needs_two_submissions_for_r() {
         ..another_master()
     };
     assert_eq!(verdict_of(&never_played(), lone, None), NOT_YET);
+}
+
+// ---- The stand-in's master for a heart never played -------------------------------------------
+
+/// A never-played heart of an explicit song with a reference stand-in.
+fn explicit_stood_in() -> HeartGate {
+    HeartGate {
+        r: Some(HeardRecording {
+            explicit: Some(explicit_status::EXPLICIT),
+            ..help_r()
+        }),
+        ..stood_in(true)
+    }
+}
+
+/// An explicit song hearted without a play: its file that is the stand-in's master is kept as
+/// the same recording, asked once; the clean edit, which the master check's short windows tell
+/// apart, and another master of the song are not kept, since explicit songs never use the same
+/// take.
+#[test]
+fn an_explicit_never_played_hearts_file_that_is_the_stand_ins_master_is_kept() {
+    let (verdict, asked) = settle(
+        &explicit_stood_in(),
+        near_the_stand_in(0.05),
+        Some(HeardMaster::Same),
+    );
+    assert_eq!(verdict, as_heard(Acceptance::HeardMaster));
+    assert_eq!(asked, [Need::HeardMaster]);
+    let clean_edit = near_the_stand_in(0.08);
+    assert_eq!(
+        verdict_of(&explicit_stood_in(), clean_edit, Some(HeardMaster::Differs)),
+        NOT_YET
+    );
+    assert_eq!(
+        verdict_of(
+            &explicit_stood_in(),
+            near_the_stand_in(0.15),
+            Some(HeardMaster::Differs)
+        ),
+        NOT_YET
+    );
+    // The stand-in's master accepts what AcoustID has no entry for, as a played heart's does.
+    let empty = FileFacts {
+        answer: AcoustIdOutcome::Answered(AcoustIdAnswer::default()),
+        ..near_the_stand_in(0.05)
+    };
+    assert_eq!(
+        verdict_of(&explicit_stood_in(), empty.clone(), Some(HeardMaster::Same)),
+        as_heard(Acceptance::HeardMaster)
+    );
+    assert_eq!(
+        verdict_of(&explicit_stood_in(), empty, Some(HeardMaster::Differs)),
+        GateVerdict::Refuse(Refusal::NoEntry)
+    );
+    // A shim that did not answer for the stand-in's audio holds for it.
+    assert_eq!(
+        verdict_of(
+            &explicit_stood_in(),
+            near_the_stand_in(0.05),
+            Some(HeardMaster::Busy)
+        ),
+        GateVerdict::Hold(WaitingFor::Shim)
+    );
+}
+
+/// A song not marked explicit: the stand-in's master accepts ahead of the same take, and when it
+/// is another master the same take still keeps a file near the stand-in.
+#[test]
+fn the_stand_ins_master_runs_ahead_of_the_same_take() {
+    assert_eq!(
+        verdict_of(&stood_in(true), near_the_stand_in(0.15), Some(HeardMaster::Same)),
+        as_heard(Acceptance::HeardMaster)
+    );
+    assert_eq!(
+        verdict_of(
+            &stood_in(true),
+            near_the_stand_in(0.15),
+            Some(HeardMaster::Differs)
+        ),
+        same_take()
+    );
+    for gone in [HeardMaster::Undecided, HeardMaster::HeardGone] {
+        assert_eq!(
+            verdict_of(&stood_in(true), near_the_stand_in(0.15), Some(gone)),
+            same_take(),
+            "{gone:?}"
+        );
+    }
+}
+
+/// The stand-in's master is never asked for without a reference stand-in, for a file AcoustID did
+/// not read, for another song, a label naming another recording, a length off the song's or a
+/// version word: each is judged as before.
+#[test]
+fn the_stand_ins_master_is_asked_only_where_it_could_keep_the_file() {
+    let never_asked = |gate: &HeartGate, facts: FileFacts| {
+        let (verdict, asked) = settle(gate, facts, None);
+        assert!(!asked.contains(&Need::HeardMaster), "{asked:?}");
+        verdict
+    };
+    assert_eq!(never_asked(&never_played(), near_the_stand_in(0.15)), same_take());
+    assert_eq!(
+        never_asked(&stood_in(false), near_the_stand_in(0.15)),
+        same_take()
+    );
+    let explicit_unstood = HeartGate {
+        stand_in: None,
+        ..explicit_stood_in()
+    };
+    assert_eq!(never_asked(&explicit_unstood, near_the_stand_in(0.05)), NOT_YET);
+    let off = FileFacts {
+        answer: AcoustIdOutcome::Off,
+        ..near_the_stand_in(0.05)
+    };
+    assert_eq!(never_asked(&explicit_stood_in(), off), NOT_YET);
+    let another_song = FileFacts {
+        answer: answered(vec![wonderwall(900), help(HELP_2009, &[ISRC_2009], 5)]),
+        ..near_the_stand_in(0.05)
+    };
+    assert_eq!(
+        never_asked(&explicit_stood_in(), another_song),
+        GateVerdict::Refuse(Refusal::AnotherRecording)
+    );
+    let labeled = FileFacts {
+        labels: FileLabels {
+            isrcs: vec![ISRC_2015.into()],
+            recording_id: None,
+        },
+        ..near_the_stand_in(0.05)
+    };
+    assert_eq!(
+        never_asked(&explicit_stood_in(), labeled),
+        GateVerdict::Refuse(Refusal::Label)
+    );
+    let long = FileFacts {
+        seconds: Some(SONG_SECONDS + 30.0),
+        ..near_the_stand_in(0.05)
+    };
+    assert_eq!(never_asked(&explicit_stood_in(), long), NOT_YET);
+    let live = FileFacts {
+        heard_distance: Some(0.05),
+        ..named("Help! (Live)", "Help!")
+    };
+    assert_eq!(never_asked(&explicit_stood_in(), live), NOT_YET);
 }
 
 /// R carries the song's explicit mark, and keeps it when it becomes the recording that played.
