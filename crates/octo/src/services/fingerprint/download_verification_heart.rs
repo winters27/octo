@@ -710,10 +710,10 @@ impl DownloadVerificationService {
             lookup,
         } = sound.clone();
 
-        let (labels, names) = match &candidate.labels {
+        let (labels, names, advisory) = match &candidate.labels {
             LabelSource::TheFile => labels_of(&file),
             LabelSource::Delivered(delivered) => labels_of(&delivered.to_string_lossy()),
-            LabelSource::None => (FileLabels::default(), FileNames::default()),
+            LabelSource::None => (FileLabels::default(), FileNames::default(), None),
         };
         let reading = match &outcome {
             AcoustIdOutcome::Answered(answer) => Some(read_answer(answer, &r, self.min_score())),
@@ -721,6 +721,7 @@ impl DownloadVerificationService {
         };
         let mut facts = FileFacts::new(outcome, labels);
         facts.seconds = file_ms.map(|ms| ms as f64 / 1000.0);
+        facts.advisory = advisory;
         facts.names = FileNames {
             file: path.file_stem().map(|stem| stem.to_string_lossy().into_owned()),
             ..names
@@ -1025,9 +1026,9 @@ fn master_audio(gate: &HeartGate) -> Option<HeardRecord> {
     })
 }
 
-/// A file's own ISRC tags and `MUSICBRAINZ_TRACKID`, as read from it, and the title and album its
-/// tags give.
-fn labels_of(path: &str) -> (FileLabels, FileNames) {
+/// A file's own ISRC tags and `MUSICBRAINZ_TRACKID`, as read from it, the title and album its
+/// tags give, and its advisory tag.
+fn labels_of(path: &str) -> (FileLabels, FileNames, Option<i32>) {
     let facts = tag_writer_extras::read_facts(path, true);
     let labels = FileLabels {
         isrcs: facts.isrcs,
@@ -1038,7 +1039,23 @@ fn labels_of(path: &str) -> (FileLabels, FileNames) {
         album: facts.album,
         file: None,
     };
-    (labels, names)
+    (labels, names, advisory_of(path))
+}
+
+/// The advisory a tagger may write as `RATING` where no `ITUNESADVISORY` or `rtng` is set.
+const RATING: tag_writer_extras::TagField = tag_writer_extras::TagField {
+    id3_frame: None,
+    id3_description: Some("RATING"),
+    vorbis: "RATING",
+    mp4: "RATING",
+};
+
+/// A file's advisory tag: `ITUNESADVISORY` (ID3 and Vorbis), the M4A `rtng` atom, else
+/// `RATING`. None when it carries none, or cannot be read.
+fn advisory_of(path: &str) -> Option<i32> {
+    let file = octo_media::tags::TagFile::open(path).ok()?;
+    tag_writer_extras::read_advisory(&file)
+        .or_else(|| tag_writer_extras::read_text(&file, RATING).and_then(|text| text.trim().parse().ok()))
 }
 
 fn hold(gate: HeartGate, waiting_for: WaitingFor, line: &str, question: Option<String>) -> GateBuild {

@@ -588,7 +588,8 @@ async fn another_master_as_long_as_the_song_is_kept_as_the_same_take() {
 
 /// An explicit song hearted without a play, whose pinned video is the reference: a FLAC that is
 /// the pinned video's master is kept as the same recording, checked against the video's own audio
-/// fetched through the shim; another master of the song is not kept.
+/// fetched through the shim; another master of the song is kept as the same take, unless its own
+/// advisory tag says it is the clean edit.
 #[tokio::test]
 async fn an_explicit_never_played_hearts_flac_of_the_stand_ins_master_is_kept() {
     let (logs, _guard) = crate::services::test_support::LogCapture::start();
@@ -645,6 +646,23 @@ async fn an_explicit_never_played_hearts_flac_of_the_stand_ins_master_is_kept() 
     let check = rig
         .service
         .verify_for_heart(&other, &candidate("help"), &gate)
+        .await;
+    assert_eq!(
+        check.verdict,
+        GateVerdict::Accept {
+            by: Acceptance::SameTake,
+            tags: TagClaim::AsHeard,
+        }
+    );
+    let clean = flac("clean", "clean-master");
+    {
+        let mut tagged = octo_media::tags::TagFile::open(&clean).expect("the FLAC opens");
+        octo_media::tags::tag_writer_extras::set_advisory(&mut tagged, Some(2));
+        tagged.save().expect("the advisory is saved");
+    }
+    let check = rig
+        .service
+        .verify_for_heart(&clean, &candidate("help"), &gate)
         .await;
     assert_eq!(
         check.verdict,
