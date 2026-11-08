@@ -176,18 +176,39 @@ impl LastFmRadioTrackResolver {
     }
 
     /// Navidrome's search for the artist and title, as the listener; the first hit that is the
-    /// same recording.
+    /// same recording. A library that files the artist under another name ("Ye" for "Kanye
+    /// West") finds nothing under the name asked, so when that search has no match the title
+    /// alone is searched once more, and the same rule judges its hits.
     pub async fn try_find_local_match(
         &self,
         artist: &str,
         title: &str,
         authenticated_parameters: &IndexMap<String, String>,
     ) -> Option<Song> {
-        let mut parameters = authenticated_parameters.clone();
         // Navidrome wants every word it is given, so a joined credit ("Kordhell, Scarlxrd") or a
         // video title ("... (Official Video)") would find nothing: the main artist and the core
         // title find the candidates, and is_same_recording still decides the version.
-        parameters.insert("query".into(), library_query(artist, title));
+        let first = library_query(artist, title);
+        if let Some(song) = self
+            .local_match_for_query(&first, artist, title, authenticated_parameters)
+            .await
+        {
+            return Some(song);
+        }
+        let by_title = library_title_query(artist, title)?;
+        self.local_match_for_query(&by_title, artist, title, authenticated_parameters)
+            .await
+    }
+
+    async fn local_match_for_query(
+        &self,
+        query: &str,
+        artist: &str,
+        title: &str,
+        authenticated_parameters: &IndexMap<String, String>,
+    ) -> Option<Song> {
+        let mut parameters = authenticated_parameters.clone();
+        parameters.insert("query".into(), query.to_string());
         parameters.insert("songCount".into(), "5".into());
         parameters.insert("albumCount".into(), "0".into());
         parameters.insert("artistCount".into(), "0".into());
@@ -426,7 +447,7 @@ fn shuffle<T>(items: &mut [T]) {
 }
 
 /// What the library is searched with for a song: the one the charts search with too.
-pub use octo_core::charts::top_songs::library_query;
+pub use octo_core::charts::top_songs::{library_query, library_title_query};
 
 /// The songs of an album or a random-songs answer that have an id.
 fn songs(parent: &Value) -> ElementResult<Vec<Song>> {

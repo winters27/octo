@@ -1068,8 +1068,10 @@ async fn match_library_finds_the_same_recording_only_and_gives_a_library_song_to
         top(4, "Daft Punk", "Around the World"),
     ];
     let asked = AtomicUsize::new(0);
+    let queries = std::sync::Mutex::new(Vec::<String>::new());
     let found = TopSongsService::match_library(&rows, |query| {
         asked.fetch_add(1, Ordering::SeqCst);
+        queries.lock().unwrap().push(query.clone());
         async move {
             match query.as_str() {
                 "Air Sexy Boy" => Some(vec![
@@ -1089,7 +1091,111 @@ async fn match_library_finds_the_same_recording_only_and_gives_a_library_song_to
     assert_eq!(found[1].as_ref().unwrap()["id"], "nd-lucky");
     assert!(found[2].is_none());
     assert!(found[3].is_none());
-    assert_eq!(asked.load(Ordering::SeqCst), 4);
+    // Row 1 found nothing that is its recording, so it asked once more by title alone. Rows 2 and
+    // 3 matched the same library song (row 3 loses it to the higher ranked row 2 afterwards), so
+    // neither retried; row 4's library did not answer, which is not asked again.
+    assert_eq!(asked.load(Ordering::SeqCst), 5, "{:?}", queries.lock().unwrap());
+}
+
+/// Navidrome's full-text search as it behaves: every word asked must be in the song's own indexed
+/// text (its title and the artist credit the file carries, nothing else).
+fn fake_navidrome(songs: &'static [(&'static str, &'static str, &'static str)], query: &str) -> Vec<Value> {
+    let words: Vec<String> = query.to_lowercase().split_whitespace().map(str::to_string).collect();
+    songs
+        .iter()
+        .filter(|(_, artist, title)| {
+            let indexed = format!("{artist} {title}").to_lowercase();
+            let have: Vec<&str> = indexed.split_whitespace().collect();
+            words.iter().all(|w| have.contains(&w.as_str()))
+        })
+        .take(5)
+        .map(|(id, artist, title)| json!({"id": id, "artist": artist, "title": title}))
+        .collect()
+}
+
+static FILED_UNDER_YE: &[(&str, &str, &str)] = &[
+    ("nd-wire", "Ye", "Through the Wire"),
+    ("nd-wire-cover", "Some Band", "Through the Wire"),
+    ("nd-jesus", "Ye", "Jesus Walks"),
+];
+
+#[tokio::test]
+async fn match_library_finds_a_song_filed_under_the_artists_other_name() {
+    let rows = vec![
+        top(1, "Kanye West", "Through the Wire"),
+        top(2, "Kanye West", "Jesus Walks (Explicit)"),
+    ];
+    let asked = std::sync::Mutex::new(Vec::<String>::new());
+    let found = TopSongsService::match_library(&rows, |query| {
+        asked.lock().unwrap().push(query.clone());
+        let hits = fake_navidrome(FILED_UNDER_YE, &query);
+        async move { Some(hits) }
+    })
+    .await;
+    // The first query ("Kanye West Through the Wire") finds nothing in this index.
+    assert!(fake_navidrome(FILED_UNDER_YE, "Kanye West Through the Wire").is_empty());
+    assert_eq!(found[0].as_ref().unwrap()["id"], "nd-wire");
+    assert_eq!(found[1].as_ref().unwrap()["id"], "nd-jesus");
+    assert_eq!(asked.lock().unwrap().len(), 4, "one retry per row, no more");
+}
+
+#[tokio::test]
+async fn match_library_title_retry_never_matches_another_artists_song() {
+    // The library only has another artist's song of that title: the retry finds it, the rule
+    // refuses it.
+    static OTHER_ARTIST: &[(&str, &str, &str)] = &[("nd-cover", "Some Band", "Through the Wire")];
+    let rows = vec![top(1, "Kanye West", "Through the Wire")];
+    let found = TopSongsService::match_library(&rows, |query| {
+        let hits = fake_navidrome(OTHER_ARTIST, &query);
+        async move { Some(hits) }
+    })
+    .await;
+    assert!(found[0].is_none());
+
+    // The right artist but another version of the song is no match either.
+    static LIVE: &[(&str, &str, &str)] = &[("nd-live", "Ye", "Through the Wire (Live)")];
+    let found = TopSongsService::match_library(&rows, |query| {
+        let hits = fake_navidrome(LIVE, &query);
+        async move { Some(hits) }
+    })
+    .await;
+    assert!(found[0].is_none());
+}
+
+#[tokio::test]
+async fn match_library_title_retry_is_cached_as_one_miss_and_a_failed_retry_is_not() {
+    let rows = vec![top(1, "Kanye West", "Heartless")];
+    let cache = crate::services::library::LibraryMatchCache::default();
+    let session = cache.session_for_tests("alice", "k");
+    let asked = AtomicUsize::new(0);
+    for _ in 0..3 {
+        let found = TopSongsService::match_library_with(
+            &rows,
+            |_| {
+                asked.fetch_add(1, Ordering::SeqCst);
+                async { Some(Vec::new()) }
+            },
+            &session,
+        )
+        .await;
+        assert!(found[0].is_none());
+    }
+    assert_eq!(asked.load(Ordering::SeqCst), 2, "searched once by name and once by title, then skipped");
+
+    // A retry that gets no answer is not remembered as a miss.
+    let cache = crate::services::library::LibraryMatchCache::default();
+    let session = cache.session_for_tests("alice", "k");
+    let asked = AtomicUsize::new(0);
+    TopSongsService::match_library_with(
+        &rows,
+        |query| {
+            asked.fetch_add(1, Ordering::SeqCst);
+            async move { (query == "Kanye West Heartless").then(Vec::new) }
+        },
+        &session,
+    )
+    .await;
+    assert!(!session.skips("Kanye West Heartless"));
 }
 
 #[test]

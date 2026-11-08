@@ -26,7 +26,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::charts::apple_pages::ChartGenre;
 use octo_core::charts::chart_settings::{self, ChartKind, OVERALL, list_id, list_key, split_list};
-use octo_core::charts::top_songs::{APPLE_SOURCE, library_hit, library_query, one_row_per_library_song};
+use octo_core::charts::top_songs::{APPLE_SOURCE, library_hit, library_query, library_title_query, one_row_per_library_song};
 use octo_core::common::{Clock, skipped_takes};
 use octo_core::library::generated_playlist_service::{period_index, playlist_id, user_key};
 use octo_core::models::domain::Song;
@@ -648,6 +648,59 @@ impl ChartPlaylistService {
             });
             let answers: Vec<(String, Option<Vec<Value>>)> = futures::future::join_all(asks).await;
             searched.extend(answers);
+
+            // A copy filed under another name of the artist ("Ye" for "Kanye West") is not found
+            // by the artist's name asked: where the library answered but has no such song, ask
+            // once more with the title alone, as one search per song, four at a time. What it
+            // finds is added to that row's hits, so the same rule judges them and the other
+            // lists reuse them; a miss stays recorded as one miss below.
+            let mut retries: Vec<(String, String)> = Vec::new();
+            for (row, query) in rows.iter().zip(&queries) {
+                let Some(Some(hits)) = searched.get(query) else {
+                    continue;
+                };
+                if session.skips(query)
+                    || library_hit(&row.song.artist, &row.song.title, hits).is_some()
+                    || retries.iter().any(|(q, _)| q == query)
+                {
+                    continue;
+                }
+                if let Some(by_title) = library_title_query(&row.song.artist, &row.song.title) {
+                    retries.push((query.clone(), by_title));
+                }
+            }
+            let to_search: Vec<String> = {
+                let mut seen: Vec<String> = Vec::new();
+                for (_, by_title) in &retries {
+                    if !searched.contains_key(by_title) && !seen.contains(by_title) {
+                        seen.push(by_title.clone());
+                    }
+                }
+                seen
+            };
+            let gate = tokio::sync::Semaphore::new(LIBRARY_SEARCHES_AT_ONCE);
+            let asks = to_search.into_iter().map(|query| {
+                let (proxy, auth, gate) = (self.inner.proxy.clone(), auth.clone(), &gate);
+                async move {
+                    let _turn = gate.acquire().await.ok();
+                    let found = search_library(&proxy, &auth, &query).await;
+                    (query, found)
+                }
+            });
+            searched.extend(futures::future::join_all(asks).await);
+            for (query, by_title) in retries {
+                match searched.get(&by_title).cloned().flatten() {
+                    Some(more) => {
+                        if let Some(Some(hits)) = searched.get_mut(&query) {
+                            hits.extend(more);
+                        }
+                    }
+                    // The retry was not answered: the row is unanswered, not a recorded miss.
+                    None => {
+                        searched.insert(query, None);
+                    }
+                }
+            }
 
             let mut unanswered = 0;
             let mut library: Vec<Option<Value>> = rows
