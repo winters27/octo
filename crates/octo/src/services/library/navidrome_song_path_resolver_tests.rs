@@ -182,10 +182,69 @@ fn candidate_paths_prefers_library_path_then_the_music_root() {
         &f.root,
     );
 
-    assert_eq!(paths.len(), 2);
+    assert!(paths.len() >= 2, "{paths:?}");
     assert!(
-        paths.iter().all(|p| p.ends_with("Artist/Album/Song.flac")),
+        paths[..2].iter().all(|p| p.ends_with("Artist/Album/Song.flac")),
         "{paths:?}"
+    );
+}
+
+/// Navidrome's library root can sit above the music root, so the path it reports carries
+/// folders the file does not have under Octo's root (`trending/octo/Artist/x.flac` for a file at
+/// `<root>/Artist/x.flac`). That holds even when Navidrome's root also exists in Octo's
+/// container, as `/music` does in both.
+#[test]
+fn a_library_root_above_the_music_root_resolves() {
+    let f = Fixture::new();
+    f.write_file("Charli xcx/party 4 u.flac", 2048);
+
+    let resolved = resolver()
+        .verify(
+            &candidate(
+                Some("trending/octo/Charli xcx/party 4 u.flac"),
+                2048,
+                "flac",
+                Some(&f.root),
+            ),
+            &f.root,
+            false,
+        )
+        .expect("resolved");
+
+    assert!(
+        resolved.absolute_path.ends_with("/Charli xcx/party 4 u.flac"),
+        "{}",
+        resolved.absolute_path
+    );
+}
+
+/// The longest tail that exists wins, a same-named file of another size is refused, and with no
+/// size reported no shorter tail is tried at all.
+#[test]
+fn a_shorter_tail_needs_the_size_to_agree() {
+    let f = Fixture::new();
+    f.write_file("octo/Artist/Song.flac", 2048);
+    f.write_file("Artist/Song.flac", 2048);
+    let reported = "trending/octo/Artist/Song.flac";
+
+    let resolved = resolver()
+        .verify(&candidate(Some(reported), 2048, "flac", None), &f.root, false)
+        .expect("resolved");
+    assert!(
+        resolved.absolute_path.ends_with("/octo/Artist/Song.flac"),
+        "{}",
+        resolved.absolute_path
+    );
+
+    assert!(
+        resolver()
+            .verify(&candidate(Some(reported), 9999, "flac", None), &f.root, false)
+            .is_none()
+    );
+    assert!(
+        resolver()
+            .verify(&candidate(Some(reported), 0, "flac", None), &f.root, false)
+            .is_none()
     );
 }
 
