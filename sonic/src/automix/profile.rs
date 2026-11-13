@@ -14,9 +14,16 @@ use super::features::{
 /// profile of a version it does not know.
 pub const PROFILE_VERSION: u32 = 1;
 
+/// Which pass of the analysis, within one version, a profile comes from. A
+/// player reads every revision the same way; a server reads a song again
+/// when its profile's revision is lower than this. A profile that does not
+/// say comes from revision 1. Revision 2 measures the start against the
+/// whole song's level, over 45 s.
+pub const PROFILE_REVISION: u32 = 2;
+
 /// How much of the start and of the end of a song a profile covers, as
 /// much as a scout reads.
-pub const PROFILE_HEAD_MS: i64 = 30_000;
+pub const PROFILE_HEAD_MS: i64 = 45_000;
 pub const PROFILE_TAIL_MS: i64 = 60_000;
 
 /// A profile keeps one level per this many milliseconds: enough for where
@@ -75,11 +82,13 @@ impl SectionProfile {
 /// What a player needs to plan the transitions into and out of one song.
 /// `body_db` is the level of the whole song (`None` when it is silent) and
 /// `tempo` its beat over the whole song, the same as a live tap that heard
-/// all of it would give. The end of the song is measured against the whole
-/// song's level.
+/// all of it would give. Both ends of the song are measured against the
+/// whole song's level. `revision` is the analysis pass it comes from
+/// ([`PROFILE_REVISION`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransitionProfile {
     pub version: u32,
+    pub revision: u32,
     pub duration_ms: i64,
     pub body_db: Option<f64>,
     pub tempo: Option<Tempo>,
@@ -100,11 +109,12 @@ impl TransitionProfile {
         let duration_ms = song.end_ms();
         let whole = SectionAnalysis::of(song.clone(), None, None, HEAD_BODY_PERCENTILE);
         let body_db = Some(whole.features.body_db).filter(|&b| b > SILENT_DB as f64);
-        let head = analyze_head(song.slice(0.0, PROFILE_HEAD_MS.min(duration_ms) as f64), None);
+        let head = analyze_head(song.slice(0.0, PROFILE_HEAD_MS.min(duration_ms) as f64), None, body_db);
         let tail_from = (duration_ms - PROFILE_TAIL_MS).max(0);
         let tail = analyze_tail(song.slice(tail_from as f64, duration_ms as f64), None, body_db);
         TransitionProfile {
             version: PROFILE_VERSION,
+            revision: PROFILE_REVISION,
             duration_ms,
             body_db,
             tempo: whole.features.tempo,
@@ -113,7 +123,8 @@ impl TransitionProfile {
         }
     }
 
-    /// The start of the song as the planner takes it.
+    /// The start of the song as the planner takes it, measured against the
+    /// whole song's level from revision 2 on.
     pub fn head_analysis(&self) -> SectionAnalysis {
         self.head.analysis()
     }

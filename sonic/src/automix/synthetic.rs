@@ -122,8 +122,9 @@ impl SyntheticSong {
         analyze_tail(self.envelope((len - 60_000.0).max(0.0), len, 4_093), None, None)
     }
 
-    /// The first 30 s, as the player scouts it.
+    /// The first 45 s, as the player scouts it.
     pub fn head(&self) -> SectionAnalysis {
-        analyze_head(self.envelope(0.0, 30_000f64.min(self.length_ms as f64), 4_093), None)
+        let head_ms = super::HEAD_SECS * 1_000.0;
+        analyze_head(self.envelope(0.0, head_ms.min(self.length_ms as f64), 4_093), None, None)
     }
 }

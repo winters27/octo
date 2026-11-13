@@ -185,7 +185,8 @@ fn router(app: App) -> Router {
 
 /// Healthy only when the music folder is there and has something in it: a mount that failed
 /// leaves an empty folder, and every song would then look missing. `soundsAlike` says whether
-/// it reads how songs sound; transition profiles are made either way.
+/// it reads how songs sound; transition profiles are made either way. `transitionRevision` is
+/// the pass of the profile analysis: Octo reads songs with a lower one again.
 async fn health(State(app): State<App>) -> impl IntoResponse {
     let root = app.root.clone();
     let sees = tokio::task::spawn_blocking(move || {
@@ -196,12 +197,13 @@ async fn health(State(app): State<App>) -> impl IntoResponse {
     if sees {
         (StatusCode::OK, Json(json!({
             "ok": true, "featuresVersion": version(), "transitionVersion": transition::version(),
-            "soundsAlike": app.sounds_alike,
+            "transitionRevision": transition::revision(), "soundsAlike": app.sounds_alike,
         })))
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
             "ok": false, "featuresVersion": version(), "transitionVersion": transition::version(),
-            "soundsAlike": app.sounds_alike, "error": "cannot see the music folder",
+            "transitionRevision": transition::revision(), "soundsAlike": app.sounds_alike,
+            "error": "cannot see the music folder",
         })))
     }
 }
@@ -344,7 +346,14 @@ mod tests {
         let (status, value) = health(app(&root)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(value["featuresVersion"], json!(2));
+        // Profiles of the second pass: the version the apps read stays 1.
         assert_eq!(value["transitionVersion"], json!(1));
+        assert_eq!(value["transitionRevision"], json!(2));
+        let blind = std::env::temp_dir().join("octo-sonic-health-blind");
+        std::fs::create_dir_all(&blind).unwrap();
+        let (status, value) = health(app(&blind)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!((&value["transitionVersion"], &value["transitionRevision"]), (&json!(1), &json!(2)));
     }
 
     #[test]

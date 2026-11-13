@@ -2,29 +2,30 @@
   "bodyDb": -24.761,
   "durationMs": 75000,
   "head": {
-    "bodyDb": -24.561,
+    "bodyDb": -24.761,
     "boundariesMs": [
       3800
     ],
     "gateDb": -60.0,
     "hopMs": 100,
     "introEndMs": 3500,
-    "levels": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaWmJaWlpaYlpaWlq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaWmJaWlpaYlpaWlq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaWmJaWlpaYlpaWlq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaWmJaWlpaYlpaWlq6dl5aWmJaWlpaYlpaWlpiWlpaW",
-    "outroStartMs": 30000,
-    "soundEndMs": 30000,
+    "levels": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaWmJaWlpaYlpaWlq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaWmJaWlpaYlpaWlq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaWmJaWlpaYlpaWlq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaWmJaWlpaYlpaWlq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaWmJaWlpaYlpaWlq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaWmJaWlpaYlpaWlq6dl5aWmJaWlpaYlpaWlpiWlpaWrp2XlpaYlpaWlpiWlpaWmJaWlpaunZeWlpiWlpaW",
+    "outroStartMs": 45000,
+    "soundEndMs": 45000,
     "soundStartMs": 0,
     "startMs": 0,
     "tempo": {
-      "beatMs": 500.01664816870147,
-      "bpm": 119.99600457254475,
-      "confidence": 2.296619666915381,
-      "consistency": 0.8666666666666667,
-      "downbeatMs": 6.942286348499832,
-      "firstBeatMs": 6.942286348499832,
+      "beatMs": 500.00228556502435,
+      "bpm": 119.99945146690158,
+      "confidence": 2.3141063846746914,
+      "consistency": 0.9111111111111111,
+      "downbeatMs": 7.3281744865611165,
+      "firstBeatMs": 7.3281744865611165,
       "steady": true,
       "trusted": true
     }
   },
+  "revision": 2,
   "tail": {
     "bodyDb": -24.761,
     "boundariesMs": [

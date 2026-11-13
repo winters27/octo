@@ -295,6 +295,23 @@ impl SectionAnalysis {
         at as f64 / (to - from) as f64
     }
 
+    /// How long from `from_ms` to `to_ms` the 400 ms level is at or above
+    /// `threshold_db`, in milliseconds.
+    pub fn ms_at_least(&self, from_ms: f64, to_ms: f64, threshold_db: f64) -> f64 {
+        if to_ms <= from_ms {
+            0.0
+        } else {
+            self.share_at_least(from_ms, to_ms, threshold_db) * (to_ms - from_ms)
+        }
+    }
+
+    /// The 400 ms level at a moment in dBFS; [`SILENT_DB`] outside the
+    /// envelope.
+    pub fn level_at(&self, ms: f64) -> f64 {
+        let i = self.envelope.index_at(ms);
+        if i < 0 || i >= self.envelope.size() as i64 { SILENT_DB as f64 } else { self.body[i as usize] }
+    }
+
     /// The same section measured against a body level known from elsewhere,
     /// such as the whole song heard as it played: the gate, sound times,
     /// outro and intro move with it; the boundaries and tempo stay.
@@ -311,9 +328,22 @@ impl SectionAnalysis {
     }
 }
 
-/// The features of the start of a song.
-pub fn analyze_head(envelope: SectionEnvelope, tag_bpm: Option<f64>) -> SectionAnalysis {
-    SectionAnalysis::of(envelope, tag_bpm, None, HEAD_BODY_PERCENTILE)
+/// The features of the start of a song. `body_level_db`, the whole song's
+/// body level when it is known (a profile made from the whole song), stands
+/// in for the start's own; a scouted start measures its own. When the sound
+/// starts but never comes within `OUTRO_BELOW_BODY_DB` of the body inside
+/// the section, the quiet intro lasts at least that long, so it ends at the
+/// section's end.
+pub fn analyze_head(
+    envelope: SectionEnvelope,
+    tag_bpm: Option<f64>,
+    body_level_db: Option<f64>,
+) -> SectionAnalysis {
+    let mut head = SectionAnalysis::of(envelope, tag_bpm, body_level_db, HEAD_BODY_PERCENTILE);
+    if head.features.sound_start_ms.is_some() && head.features.intro_end_ms.is_none() {
+        head.features.intro_end_ms = Some(head.envelope.end_ms());
+    }
+    head
 }
 
 /// The features of the end of a song. Without a body level from the whole
