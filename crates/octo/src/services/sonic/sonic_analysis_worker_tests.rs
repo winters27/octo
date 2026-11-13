@@ -167,6 +167,8 @@ struct Library {
     rows: Mutex<Vec<LibrarySongRow>>,
     arrivals: Mutex<HashMap<String, LibrarySongRow>>,
     file_lookups: AtomicUsize,
+    /// Times the list was asked for from its start.
+    lists: AtomicUsize,
     listable: AtomicBool,
     /// A page that fails, by its start.
     failing_page: Mutex<Option<i32>>,
@@ -222,6 +224,9 @@ impl ISonicLibrary for Library {
     /// As Navidrome's native API answers: the count is the page's rows before missing songs were
     /// left out, not the library's.
     async fn list(&self, start: i32, count: i32) -> Option<(Vec<LibrarySongRow>, usize)> {
+        if start == 0 {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+        }
         if !self.listable.load(Ordering::SeqCst) || *self.failing_page.lock() == Some(start) {
             return None;
         }
@@ -342,6 +347,7 @@ fn make(settings: Option<RadioSourceSettings>) -> T {
         rows: Mutex::default(),
         arrivals: Mutex::default(),
         file_lookups: AtomicUsize::new(0),
+        lists: AtomicUsize::new(0),
         listable: AtomicBool::new(true),
         failing_page: Mutex::default(),
         missing_ids: Mutex::default(),
@@ -924,7 +930,8 @@ async fn a_profile_of_a_lower_revision_is_read_again_once_and_served_meanwhile()
     assert_eq!(t.sidecar.analysed(), ["a.flac", "b.flac", "a.flac"]);
     assert_eq!(t.sidecar.parts.lock().last(), Some(&profile_only()));
     assert_eq!(t.transitions.entry("a").map(|e| e.revision), Some(2));
-    // The song not read yet keeps its profile served, and Sounds alike stays done.
+    // The song not read yet keeps its profile served, and Sounds alike stays done, without
+    // saying every song is analyzed.
     assert_eq!(
         profile_of(&t, "b").map(|p| (p["file"].clone(), p.get("revision").cloned())),
         Some(("b.flac".into(), None))
@@ -932,7 +939,7 @@ async fn a_profile_of_a_lower_revision_is_read_again_once_and_served_meanwhile()
     let status = t.worker.status();
     assert_eq!(
         (status.state.as_str(), status.reason.as_deref()),
-        ("Done", Some(DONE))
+        ("Done", Some(UPDATING))
     );
     assert_eq!(
         serde_json::to_value(&status).unwrap()["updatingProfiles"],
@@ -1145,21 +1152,324 @@ async fn an_octo_sonic_that_says_no_revision_has_nothing_read_again() {
     assert_eq!(t.worker.status().updating_profiles, None);
 }
 
-/// The Radio page shows how far an update of the profiles is, from the status's field.
-#[test]
-fn the_dashboard_says_how_far_the_profiles_are_updated() {
+// ---- new songs while profiles are read again ---------------------------------------------
+
+/// A library of `ids`, each read once with a profile of revision 1; octo-sonic now says 2.
+async fn reread_pass(ids: &[&str]) -> T {
+    let t = make(None);
+    *t.sidecar.transition.lock() = Some(1);
+    for id in ids {
+        t.library.add(id, &format!("{id}.flac"), Some(200), true);
+    }
+    t.ticks_until_pass(1).await;
+    *t.sidecar.revision.lock() = Some(2);
+    t
+}
+
+/// A song's file grows, and Navidrome lists it at its new size.
+fn grows(t: &T, id: &str) {
+    let path = t.library.directory.join(format!("{id}.flac"));
+    std::fs::write(&path, vec![0u8; 5000]).expect("writes");
+    for row in t.library.rows.lock().iter_mut().filter(|row| row.id == id) {
+        row.size = 5000;
+    }
+}
+
+/// Guard: fails when a pass that reads songs again walks its list in order, so a new song or a
+/// changed file waits behind the songs read again before it.
+#[tokio::test]
+async fn new_and_changed_songs_in_the_list_go_before_any_song_read_again() {
+    let t = reread_pass(&["a", "b", "c"]).await;
+    grows(&t, "b");
+    t.library.add("d", "d.flac", Some(200), true);
+    t.ticks_until_pass(2).await;
+    assert_eq!(
+        t.sidecar.analysed()[3..],
+        ["b.flac", "d.flac", "a.flac", "c.flac"]
+    );
+    assert_eq!(
+        t.sidecar.parts.lock()[3..],
+        [
+            sound_and_profile(),
+            sound_and_profile(),
+            profile_only(),
+            profile_only()
+        ]
+    );
+    assert_eq!(t.transitions.revision(), 2);
+}
+
+/// Guard: fails when a pass that reads songs again lists the library only once: a song added
+/// through Navidrome alone (by Lidarr, or a copied file) and a file changed meanwhile wait for
+/// every song read again, days on a large library, while the dashboard says it is up to date.
+#[tokio::test]
+async fn a_song_added_during_a_pass_of_songs_read_again_is_read_before_the_rest() {
+    let t = reread_pass(&["a", "b", "c", "d"]).await;
+    t.tick().await;
+    assert_eq!(t.sidecar.analysed()[4..], ["a.flac"]);
+    assert_eq!(t.state(), ("Done".to_string(), Some(UPDATING.to_string())));
+    // No download says so: the song is added in Navidrome, and d's file changes.
+    t.library.add("new", "new.flac", Some(200), true);
+    grows(&t, "d");
+    t.advance(PASS_INTERVAL);
+    t.tick().await;
+    assert_eq!(t.sidecar.analysed()[4..], ["a.flac", "new.flac"]);
+    assert_eq!(t.sidecar.parts.lock().last(), Some(&sound_and_profile()));
+    assert_eq!(t.worker.status().total, 5);
+    t.ticks_until_pass(2).await;
+    assert_eq!(
+        t.sidecar.analysed()[4..],
+        ["a.flac", "new.flac", "d.flac", "b.flac", "c.flac"]
+    );
+    assert!(t.store.read(|s| s.songs.contains_key("new")));
+    assert!(profile_of(&t, "new").is_some());
+    assert_eq!(t.transitions.revision(), 2);
+}
+
+/// The second look at the library comes once the pass has run for PASS_INTERVAL, to the
+/// second, and again each PASS_INTERVAL after; one that cannot read the list tries again after
+/// RELIST_RETRY while the pass goes on.
+#[tokio::test]
+async fn a_long_pass_lists_the_library_again_each_pass_interval() {
+    let t = reread_pass(&["a", "b", "c", "d", "e"]).await;
+    let lists = || t.library.lists.load(Ordering::SeqCst);
+    let read = || t.sidecar.analysed()[5..].to_vec();
+    t.tick().await;
+    assert_eq!(lists(), 2);
+    t.library.add("new", "new.flac", Some(200), true);
+    t.advance(PASS_INTERVAL - TimeDelta::seconds(1));
+    t.tick().await;
+    assert_eq!(lists(), 2);
+    assert_eq!(read(), ["a.flac", "b.flac"]);
+    t.advance(TimeDelta::seconds(1));
+    t.tick().await;
+    assert_eq!(lists(), 3);
+    assert_eq!(read(), ["a.flac", "b.flac", "new.flac"]);
+
+    // Navidrome's list cannot be read at the next look: the pass goes on.
+    t.library.listable.store(false, Ordering::SeqCst);
+    t.library.add("newer", "newer.flac", Some(200), true);
+    t.advance(PASS_INTERVAL);
+    t.tick().await;
+    assert_eq!(lists(), 4);
+    assert_eq!(read(), ["a.flac", "b.flac", "new.flac", "c.flac"]);
+    assert_eq!(t.worker.status().state, "Running");
+    t.library.listable.store(true, Ordering::SeqCst);
+    t.advance(RELIST_RETRY - TimeDelta::seconds(1));
+    t.tick().await;
+    assert_eq!(lists(), 4);
+    t.advance(TimeDelta::seconds(1));
+    t.tick().await;
+    assert_eq!(lists(), 5);
+    t.ticks_until_pass(2).await;
+    assert_eq!(
+        read(),
+        [
+            "a.flac",
+            "b.flac",
+            "new.flac",
+            "c.flac",
+            "d.flac",
+            "newer.flac",
+            "e.flac"
+        ]
+    );
+}
+
+/// Guard: fails when the update's count takes in profiles the pass will never read again: a
+/// song gone from the library but not yet forgotten, one from outside whose file is gone, and
+/// one whose reading failed. Its N would never reach its M.
+#[tokio::test]
+async fn the_updates_count_is_of_the_songs_the_pass_can_still_read() {
+    let t = make(None);
+    *t.sidecar.transition.lock() = Some(1);
+    for id in ["a", "b", "c", "d"] {
+        t.library.add(id, &format!("{id}.flac"), Some(200), true);
+    }
+    t.lands("youtube:x", "landed.mp3");
+    t.ticks_until_pass(1).await;
+    // c leaves the library, the outside song's file is deleted, and b cannot be read again.
+    t.library.rows.lock().retain(|row| row.id != "c");
+    std::fs::remove_file(t.library.directory.join("landed.mp3")).expect("removes");
+    t.sidecar
+        .errors
+        .lock()
+        .insert("b.flac".into(), "the file is damaged".into());
+    *t.sidecar.revision.lock() = Some(2);
+    let updating = |t: &T| t.worker.status().updating_profiles.map(|u| (u.done, u.total));
+    t.tick().await;
+    assert_eq!(t.sidecar.analysed()[5..], ["a.flac"]);
+    assert_eq!(updating(&t), Some((1, 3)));
+    t.tick().await;
+    assert_eq!(updating(&t), Some((1, 2)));
+    t.tick().await;
+    assert_eq!(t.sidecar.analysed()[5..], ["a.flac", "b.flac", "d.flac"]);
+    // Every song it can read again is read, though the pass has not ended.
+    assert_eq!(t.store.read(|s| s.pass), 1);
+    assert_eq!(updating(&t), None);
+}
+
+/// Guard: fails when songs read again wait for the minute's save of the index: a crash in the
+/// update loses them, they are read once more, and the dashboard's count goes back.
+#[tokio::test]
+async fn a_crash_while_profiles_are_read_again_loses_at_most_a_few() {
+    let ids = ["a", "b", "c", "d", "e", "f", "g"];
+    let t = reread_pass(&ids).await;
+    for _ in 0..6 {
+        t.tick().await;
+    }
+    assert_eq!(t.sidecar.analysed().len(), 13);
+    // Octo stops without saving: a new start knows only what is on disk.
+    let on_disk = TransitionStore::new(t._dir.path().join("profiles"));
+    let kept = ids
+        .iter()
+        .filter(|id| on_disk.entry(id).is_some_and(|e| e.revision == 2))
+        .count();
+    assert_eq!(kept, 5);
+}
+
+/// Guard: fails when a song read again only for its profile counts among the songs Sounds
+/// alike could not read.
+#[tokio::test]
+async fn a_failed_reading_again_is_kept_on_the_songs_profile_not_with_sounds_alike() {
+    let t = reread_pass(&["a", "b"]).await;
+    t.sidecar
+        .errors
+        .lock()
+        .insert("a.flac".into(), "the file is damaged".into());
+    t.ticks_until_pass(2).await;
+    assert_eq!(t.sidecar.analysed()[2..], ["a.flac", "b.flac"]);
+    // Sounds alike read a's sound, and still has it.
+    let status = t.worker.status();
+    assert_eq!((status.failed, status.analysed), (0, 2));
+    assert!(t.store.read(|s| s.failed.is_empty()));
+    let entry = t.transitions.entry("a").expect("kept");
+    let failed = entry.failed.clone().expect("the failure is on its profile");
+    assert_eq!(
+        (entry.revision, failed.revision, failed.stamp == entry.stamp),
+        (1, 2, true)
+    );
+    assert!(profile_of(&t, "a").is_some());
+    // Not read again before a week has gone by, and then once.
+    t.advance(PASS_INTERVAL + TimeDelta::minutes(1));
+    t.ticks_until_pass(3).await;
+    assert_eq!(t.sidecar.analysed().len(), 4);
+    t.sidecar.errors.lock().clear();
+    t.advance(RETRY_FAILED_AFTER);
+    t.ticks_until_pass(4).await;
+    assert_eq!(t.sidecar.analysed()[4..], ["a.flac"]);
+    let entry = t.transitions.entry("a").expect("kept");
+    assert_eq!((entry.revision, entry.failed), (2, None));
+}
+
+/// Guard: fails when the Radio page stops saying how far the profiles are updated, whether
+/// `loadSonic` stops handing the status to `sonicStatusText` or the field that reads stops
+/// matching the one the status serializes. The status line is run from `admin.js` itself with
+/// Node.js where it is installed; the call and the field are checked either way.
+#[tokio::test]
+async fn the_dashboard_says_how_far_the_profiles_are_updated() {
+    let t = reread_pass(&["a", "b"]).await;
+    t.tick().await;
+    let status = serde_json::to_value(t.worker.status()).expect("serialized");
+
     let js = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../octo/wwwroot/admin/admin.js"
     ))
     .expect("the dashboard script");
-    for read in [
-        "s.updatingProfiles",
-        "`Updating song profiles, ${updating.done} of ${updating.total}.`",
-    ] {
-        assert!(js.contains(read), "admin.js reads {read}");
+    let start = js.find("const sonicStates = ").expect("the analysis's states");
+    let end = start
+        + js[start..]
+            .find("async function sonicPost(")
+            .expect("sonicPost after loadSonic");
+    let script = &js[start..end];
+    let (text, load) = script.split_at(script.find("async function loadSonic() {").expect("loadSonic"));
+    let mut wrong = Vec::new();
+    // The field the status line reads is the one the status has.
+    let field: String = text
+        .split("const updating = s.")
+        .nth(1)
+        .unwrap_or_default()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if !status
+        .get(&field)
+        .is_some_and(|updating| updating["done"].is_number() && updating["total"].is_number())
+    {
+        wrong.push(format!(
+            "sonicStatusText reads s.{field}, which the status lacks: {status}"
+        ));
     }
+    // loadSonic hands what the status endpoint answers to the status line.
+    for call in [
+        "await api('/api/admin/sonic')",
+        "const s = await response.json();",
+        "status.textContent = sonicStatusText(s);",
+    ] {
+        if !load.contains(call) {
+            wrong.push(format!("loadSonic lacks {call}"));
+        }
+    }
+    match status_line(script, &status) {
+        Some(line) => {
+            let says = "Up to date. 2 of 2 songs analyzed (pass 1). 2 have a transition profile. \
+                        Updating song profiles, 1 of 2. New or changed songs are read first.";
+            if line != says {
+                wrong.push(format!("the page says {line:?}"));
+            }
+        }
+        None => eprintln!("node is not installed; the status line's run is skipped"),
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// The Radio page's status line as `admin.js` writes it: `script`, its analysis section, run by
+/// Node.js with `status` as `/api/admin/sonic` answers. None where Node.js is not installed.
+fn status_line(script: &str, status: &serde_json::Value) -> Option<String> {
+    let node = std::process::Command::new("node").arg("--version").output();
+    if !node.is_ok_and(|out| out.status.success()) {
+        return None;
+    }
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let write = |name: &str, text: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, text).expect("written");
+        path
+    };
+    let harness = write("harness.js", STATUS_LINE_HARNESS);
+    let section = write("sonic.js", script);
+    let answer = write("status.json", &status.to_string());
+    let out = std::process::Command::new("node")
+        .arg(&harness)
+        .arg(&section)
+        .arg(&answer)
+        .output()
+        .expect("node ran");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    Some(String::from_utf8(out.stdout).expect("text"))
+}
+
+/// A stand-in page for the analysis section of `admin.js`: `api` answers the status, and the
+/// status line's text is printed once `loadSonic` has run.
+const STATUS_LINE_HARNESS: &str = r#"
+'use strict';
+const fs = require('fs');
+const vm = require('vm');
+const [section, answer] = process.argv.slice(2);
+const elements = {};
+const element = () => ({ textContent: '', dataset: {}, querySelector: () => element() });
+const context = vm.createContext({
+  api: async (path) => ({
+    ok: path === '/api/admin/sonic',
+    status: path === '/api/admin/sonic' ? 200 : 404,
+    json: async () => JSON.parse(fs.readFileSync(answer, 'utf8')),
+  }),
+  document: { getElementById: (id) => (elements[id] = elements[id] || element()) },
+});
+vm.runInContext(fs.readFileSync(section, 'utf8') + '\nloadSonic();', context, { filename: section })
+  .then(() => process.stdout.write(elements['sonic-status'].textContent));
+"#;
 
 // ---- profiles with Sounds alike off -----------------------------------------------------
 

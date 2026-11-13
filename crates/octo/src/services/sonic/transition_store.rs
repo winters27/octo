@@ -1,7 +1,8 @@
 //! Every song's transition profile from octo-sonic: one small file per song under
 //! `transition-profiles/`, and an index (`transition-profiles.json`) of which song has one,
 //! of which file stamp, analysis version and revision. The index is written at most once a
-//! minute, like `sonic-features.json`; a profile's own file is written as it comes.
+//! minute, like `sonic-features.json`, and every few songs read again for a newer revision; a
+//! profile's own file is written as it comes.
 //!
 //! Library songs are kept by their Navidrome id, songs from outside the library by their
 //! acquisition key (`provider:id`) with the path of their file.
@@ -46,7 +47,8 @@ pub struct TransitionEntry {
     pub revision: i32,
     /// For a song from outside the library: its file.
     pub path: Option<String>,
-    /// For a song from outside the library: the last reading of it that failed.
+    /// The last reading of it for its profile alone that failed: a song from outside the
+    /// library, or a library song read again for a newer revision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed: Option<TransitionFailure>,
 }
@@ -63,8 +65,8 @@ impl Default for TransitionEntry {
     }
 }
 
-/// A reading of a song from outside the library that failed: its file then, the revision it
-/// was read for, and when.
+/// A reading of a song for its profile alone that failed: its file then, the revision it was
+/// read for, and when.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct TransitionFailure {
@@ -109,8 +111,8 @@ impl Default for TransitionIndex {
     }
 }
 
-/// How far a re-reading of profiles has come: of the `total` profiles of the version served,
-/// `done` are at the revision octo-sonic writes now.
+/// How far a re-reading of profiles has come: of the `total` profiles of the version served
+/// that are read again or still can be, `done` are at the revision octo-sonic writes now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RevisionProgress {
     pub done: usize,
@@ -129,10 +131,26 @@ pub enum TransitionLookup {
 // The index of a whole library is a few megabytes; once a minute is plenty.
 const FLUSH_EVERY: TimeDelta = TimeDelta::minutes(1);
 
+/// Songs read again for a newer revision that may wait in memory before the index is saved,
+/// in an index of up to [`SONGS_PER_REREAD`] times as many songs.
+const REREADS_PER_SAVE: usize = 5;
+/// A save rewrites the whole index, some 100 bytes a song: in a larger index one song read
+/// again per this many songs may wait, so a song read again costs at most some 400 KB of
+/// writing, and the minute's save bounds the loss in time.
+const SONGS_PER_REREAD: usize = 4000;
+
+/// How many songs read again may wait before an index of `songs` songs is saved: as many as a
+/// crash would lose, and then read once more.
+fn rereads_per_save(songs: usize) -> usize {
+    (songs / SONGS_PER_REREAD).max(REREADS_PER_SAVE)
+}
+
 struct Inner {
     index: TransitionIndex,
     dirty: bool,
     last_flush: DateTime<Utc>,
+    /// Songs read again for a newer revision since the index was last saved.
+    rereads: usize,
 }
 
 pub struct TransitionStore {
@@ -156,6 +174,7 @@ impl TransitionStore {
                 index,
                 dirty: false,
                 last_flush: datetime::min_value(),
+                rereads: 0,
             }),
             file_lock: Mutex::new(()),
         }
@@ -195,15 +214,38 @@ impl TransitionStore {
         }
     }
 
-    /// Of the profiles of the version served, how many are at `revision` or above.
-    pub fn progress(&self, revision: i32) -> RevisionProgress {
+    /// Of the profiles of the version served, how many are at `revision` or above (`done`), out
+    /// of those and the ones below it that `still_read` says will be read again (`total`).
+    pub fn progress(
+        &self,
+        revision: i32,
+        still_read: impl Fn(&str, &TransitionEntry) -> bool,
+    ) -> RevisionProgress {
         let inner = self.inner.lock();
         let version = inner.index.version;
-        let served = inner.index.songs.values().filter(|e| e.version == version);
-        let (done, total) = served.fold((0, 0), |(done, total), e| {
-            (done + usize::from(e.revision >= revision), total + 1)
-        });
+        let (mut done, mut total) = (0, 0);
+        for (key, entry) in inner.index.songs.iter().filter(|(_, e)| e.version == version) {
+            if entry.revision >= revision {
+                done += 1;
+                total += 1;
+            } else if still_read(key, entry) {
+                total += 1;
+            }
+        }
         RevisionProgress { done, total }
+    }
+
+    /// A song read again for a newer revision was kept, its profile or its failure: once a few
+    /// wait, the index is saved, so a crash loses no more of them than that.
+    pub fn reread_kept(&self) {
+        let due = {
+            let mut inner = self.inner.lock();
+            inner.rereads += 1;
+            inner.rereads >= rereads_per_save(inner.index.songs.len())
+        };
+        if due {
+            self.flush();
+        }
     }
 
     /// The songs from outside the library, by key and file, whose profile comes from a revision
@@ -219,7 +261,7 @@ impl TransitionStore {
             .collect()
     }
 
-    /// A reading of a song from outside the library that has an entry failed: its file was at
+    /// A reading for its profile alone of a song that has an entry failed: its file was at
     /// `stamp`, it was read for `revision`. The profile it has is kept and served.
     pub fn record_failure(&self, key: &str, stamp: &str, revision: i32, at_utc: DateTime<Utc>) {
         if !self.inner.lock().index.songs.contains_key(key) {
@@ -359,6 +401,7 @@ impl TransitionStore {
             }
             inner.dirty = false;
             inner.last_flush = Utc::now();
+            inner.rereads = 0;
             inner.index.clone()
         };
         if let Err(e) = state_file::save_atomic(&self.index_path, &octo_core::json::to_string(&snapshot)) {
@@ -513,8 +556,9 @@ mod tests {
         assert_eq!(store.entry("nd-new").map(|e| e.revision), Some(2));
         // The version is what decides serving: revision 1 is read the same way.
         assert_eq!(store.lookup("nd-old"), TransitionLookup::Ready(profile(1)));
-        assert_eq!(store.progress(2), RevisionProgress { done: 1, total: 2 });
-        assert_eq!(store.progress(1), RevisionProgress { done: 2, total: 2 });
+        let all = |_: &str, _: &TransitionEntry| true;
+        assert_eq!(store.progress(2, all), RevisionProgress { done: 1, total: 2 });
+        assert_eq!(store.progress(1, all), RevisionProgress { done: 2, total: 2 });
 
         store.set_revision(2);
         store.flush();
@@ -524,7 +568,72 @@ mod tests {
         // A new version has had no pass at any revision.
         again.set_current_version(2);
         assert_eq!(again.revision(), 1);
-        assert_eq!(again.progress(2), RevisionProgress { done: 0, total: 0 });
+        assert_eq!(again.progress(2, all), RevisionProgress { done: 0, total: 0 });
+    }
+
+    #[test]
+    fn the_progress_counts_a_lower_profile_only_while_it_will_be_read_again() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = TransitionStore::new(dir.path());
+        store.set_current_version(1);
+        store.put("nd-done", "1:1", None, &profile_at(1, 2));
+        store.put("nd-left", "1:1", None, &profile(1));
+        store.put("nd-gone", "1:1", None, &profile(1));
+        store.put("youtube:gone", "1:1", Some("/nowhere/x.mp3"), &profile(1));
+        let left = |key: &str, _: &TransitionEntry| key == "nd-left";
+        assert_eq!(store.progress(2, left), RevisionProgress { done: 1, total: 2 });
+        let asked = std::cell::RefCell::new(Vec::new());
+        store.progress(2, |key, entry| {
+            asked.borrow_mut().push((key.to_string(), entry.revision));
+            true
+        });
+        // Asked only of the profiles below the revision.
+        let mut asked = asked.into_inner();
+        asked.sort();
+        assert_eq!(
+            asked,
+            [
+                ("nd-gone".to_string(), 1),
+                ("nd-left".to_string(), 1),
+                ("youtube:gone".to_string(), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn songs_read_again_are_saved_every_few() {
+        assert_eq!(rereads_per_save(0), 5);
+        assert_eq!(rereads_per_save(20_000), 5);
+        assert_eq!(rereads_per_save(40_000), 10);
+        assert_eq!(rereads_per_save(200_000), 50);
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let store = TransitionStore::new(dir.path());
+        store.set_current_version(1);
+        let ids: Vec<String> = (0..6).map(|i| format!("nd-{i}")).collect();
+        for id in &ids {
+            store.put(id, "1:1", None, &profile(1));
+        }
+        store.flush();
+        let saved = |revision: i32| {
+            let on_disk = TransitionStore::new(dir.path());
+            ids.iter()
+                .filter(|id| on_disk.entry(id).is_some_and(|e| e.revision == revision))
+                .count()
+        };
+        for id in &ids[..4] {
+            store.put(id, "1:1", None, &profile_at(1, 2));
+            store.reread_kept();
+        }
+        // Within the minute, four wait in memory.
+        assert_eq!(saved(2), 0);
+        store.put(&ids[4], "1:1", None, &profile_at(1, 2));
+        store.reread_kept();
+        assert_eq!(saved(2), 5);
+        // The count starts over at each save.
+        store.put(&ids[5], "1:1", None, &profile_at(1, 2));
+        store.reread_kept();
+        assert_eq!(saved(2), 5);
     }
 
     #[test]
