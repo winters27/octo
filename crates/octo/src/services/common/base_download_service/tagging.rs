@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use octo_core::common::{SongIdentity, dotnet};
+use octo_core::common::{SongIdentity, SongRef, dotnet};
 use octo_core::fingerprint::heart_release::HeartSong;
 use octo_core::fingerprint::recording_identity::Identity;
 use octo_core::last_fm::last_fm_radio_recommendation_service::canonical_tag;
@@ -158,6 +158,9 @@ impl BaseDownloadService {
         }
 
         fill_album_from_file(song, file_path);
+        if album.is_none() && song.album_artist.as_deref().is_none_or(str::is_empty) {
+            self.album_artist_from_catalog_album(song, requested).await;
+        }
         Self::apply_single_fallback(song, settings.album_from_title);
 
         // Explicit or clean, from what landed; the library server shows it on every song.
@@ -203,6 +206,59 @@ impl BaseDownloadService {
                     }
                 }
             }
+        }
+    }
+
+    /// The album artist of the album a song heart asked for, from the catalog's own listing of
+    /// that album, when nothing before it named one. A song heart's request keeps its album, so
+    /// the chosen release lends no album artist, and the catalog's best hit for the song is
+    /// often the performer's single. A track of a multi-artist album (a soundtrack) then fell
+    /// back to its own performer, and every performer became an album of its own on the library
+    /// server, while an album heart of the same album files them all under the album's artist.
+    /// Taken only from a catalog album of exactly that name whose tracklist holds this song, so
+    /// two albums that share a name stay apart.
+    async fn album_artist_from_catalog_album(&self, song: &mut Song, requested: &RequestedIdentity) {
+        /// Albums of that name asked about, and how many of them are opened for their tracklist.
+        const NAMESAKES: i32 = 10;
+        const OPENED: usize = 3;
+        let Some(deezer) = &self.services.deezer else {
+            return;
+        };
+        let album_key = SongIdentity::key(&song.album);
+        if dotnet::is_blank(&requested.album) || album_key != SongIdentity::key(&requested.album) {
+            return;
+        }
+        let wanted = SongRef::new(song.title.clone(), song.artist.clone());
+        let hits = deezer.search_albums(&song.album, NAMESAKES, true).await;
+        for hit in hits
+            .iter()
+            .filter(|hit| SongIdentity::key(&hit.title) == album_key)
+            .take(OPENED)
+        {
+            let Some(detail) = deezer.get_album_detail(&hit.deezer_id).await else {
+                continue;
+            };
+            let artist = detail.artist.trim();
+            let holds = detail.tracks.iter().any(|track| {
+                SongIdentity::same(
+                    &wanted,
+                    &SongRef::new(track.title.clone(), track.artist.clone()),
+                    None,
+                )
+                .is_same()
+            });
+            if !holds || artist.is_empty() {
+                continue;
+            }
+            info!(
+                "Album artist of '{}' is '{artist}', from the catalog's listing of '{}'",
+                song.title, detail.title
+            );
+            song.album_artist = Some(artist.to_string());
+            if Self::is_various_artists(Some(artist)) {
+                song.is_compilation = true;
+            }
+            return;
         }
     }
 
