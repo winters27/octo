@@ -26,6 +26,10 @@ pub struct SonicFeatures {
 pub struct SonicHealth {
     pub version: i32,
     pub transition_version: Option<i32>,
+    /// The pass of the profile analysis within its version; songs whose profile comes from a
+    /// lower one are read again. None from an octo-sonic that does not say, which reads nothing
+    /// again.
+    pub transition_revision: Option<i32>,
     pub problem: Option<String>,
     pub off: bool,
     pub profiles_only: bool,
@@ -170,6 +174,10 @@ impl ISonicClient for SonicClient {
         let version = int32(doc.get("featuresVersion"))?;
         // An octo-sonic from before profiles leaves it out.
         let transition_version = int32(doc.get("transitionVersion")).filter(|&v| v > 0);
+        // An octo-sonic from before revisions leaves it out; it means nothing without profiles.
+        let transition_revision = transition_version
+            .and(int32(doc.get("transitionRevision")))
+            .filter(|&r| r > 0);
         // Without how songs sound there is nothing but profiles; an octo-sonic that leaves the
         // field out reads both.
         let profiles_only =
@@ -178,6 +186,7 @@ impl ISonicClient for SonicClient {
             return Some(SonicHealth {
                 version,
                 transition_version,
+                transition_revision,
                 problem: None,
                 off: false,
                 profiles_only,
@@ -187,6 +196,7 @@ impl ISonicClient for SonicClient {
             return Some(SonicHealth {
                 version,
                 transition_version,
+                transition_revision,
                 problem: None,
                 off: true,
                 profiles_only: false,
@@ -195,6 +205,7 @@ impl ISonicClient for SonicClient {
         (status.as_u16() == 503).then(|| SonicHealth {
             version,
             transition_version,
+            transition_revision,
             problem: Some(text(&doc, "error").unwrap_or_else(|| "cannot see the music folder".to_string())),
             off: false,
             profiles_only,
@@ -347,6 +358,31 @@ mod tests {
             .map(|h| h.profiles_only),
             Some(false)
         );
+        // The pass of the profile analysis, said only beside a profile version.
+        assert_eq!(
+            health(
+                200,
+                r#"{"ok":true,"featuresVersion":2,"transitionVersion":1,"transitionRevision":2}"#
+            )
+            .await,
+            Some(SonicHealth {
+                version: 2,
+                transition_version: Some(1),
+                transition_revision: Some(2),
+                ..Default::default()
+            })
+        );
+        for odd in [
+            r#"{"ok":true,"featuresVersion":2,"transitionRevision":2}"#,
+            r#"{"ok":true,"featuresVersion":2,"transitionVersion":1,"transitionRevision":0}"#,
+            r#"{"ok":true,"featuresVersion":2,"transitionVersion":1,"transitionRevision":"2"}"#,
+        ] {
+            assert_eq!(
+                health(200, odd).await.and_then(|h| h.transition_revision),
+                None,
+                "{odd}"
+            );
+        }
         assert_eq!(
             health(503, r#"{"ok":false,"off":true,"featuresVersion":2}"#).await,
             Some(SonicHealth {

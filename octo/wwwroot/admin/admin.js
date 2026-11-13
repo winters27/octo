@@ -3583,6 +3583,21 @@ setInterval(() => { if (document.visibilityState === 'visible' && !gatePromise) 
 // octo-sonic's analysis of every song (how it sounds, and its transition profile), on the radio page.
 const sonicStates = { Off: 'Off', Paused: 'Paused', Waiting: 'Waiting', Running: 'Analyzing', Done: 'Up to date' };
 
+// The analysis's status line. While songs are read again for a newer revision of their transition
+// profiles, the state stays as Sounds alike has it and a line says how far the update is.
+function sonicStatusText(s) {
+  const parts = [`${sonicStates[s.state] || s.state}.`];
+  if (s.total > 0 && s.readsSound === false) parts.push(`${s.profiled} of ${s.total} songs have a transition profile (pass ${s.pass}).`);
+  else if (s.total > 0) parts.push(`${s.analysed} of ${s.total} songs analyzed (pass ${s.pass}).`);
+  if (s.readsSound !== false && s.profiled > 0) parts.push(`${s.profiled} have a transition profile.`);
+  const updating = s.updatingProfiles;
+  if (updating) parts.push(`Updating song profiles, ${updating.done} of ${updating.total}.`);
+  if (s.failed > 0) parts.push(`${s.failed} could not be read.`);
+  if (s.skipped > 0) parts.push(`${s.skipped} left out: Octo cannot find the file, or the song has no length or runs over 45 minutes.`);
+  if (s.reason) parts.push(s.reason);
+  return parts.join(' ');
+}
+
 async function loadSonic() {
   const status = document.getElementById('sonic-status');
   if (!status) return;
@@ -3590,14 +3605,7 @@ async function loadSonic() {
     const response = await api('/api/admin/sonic');
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const s = await response.json();
-    const parts = [`${sonicStates[s.state] || s.state}.`];
-    if (s.total > 0 && s.readsSound === false) parts.push(`${s.profiled} of ${s.total} songs have a transition profile (pass ${s.pass}).`);
-    else if (s.total > 0) parts.push(`${s.analysed} of ${s.total} songs analyzed (pass ${s.pass}).`);
-    if (s.readsSound !== false && s.profiled > 0) parts.push(`${s.profiled} have a transition profile.`);
-    if (s.failed > 0) parts.push(`${s.failed} could not be read.`);
-    if (s.skipped > 0) parts.push(`${s.skipped} left out: Octo cannot find the file, or the song has no length or runs over 45 minutes.`);
-    if (s.reason) parts.push(s.reason);
-    status.textContent = parts.join(' ');
+    status.textContent = sonicStatusText(s);
     const toggle = document.getElementById('sonic-toggle');
     toggle.dataset.paused = s.paused ? 'true' : 'false';
     toggle.querySelector('span').textContent = s.paused ? 'Start' : 'Pause';

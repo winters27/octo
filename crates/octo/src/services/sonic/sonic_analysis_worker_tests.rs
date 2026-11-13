@@ -26,6 +26,9 @@ struct Sidecar {
     version: Mutex<Option<i32>>,
     /// The transition profile version it writes; `None` for one from before profiles.
     transition: Mutex<Option<i32>>,
+    /// The profile revision it says and writes; `None` for one from before revisions, whose
+    /// profiles do not say theirs.
+    revision: Mutex<Option<i32>>,
     /// What each reading asked for.
     parts: Mutex<Vec<SonicParts>>,
     /// The published tempo each reading was handed.
@@ -51,6 +54,7 @@ impl Default for Sidecar {
         Sidecar {
             version: Mutex::new(Some(2)),
             transition: Mutex::new(None),
+            revision: Mutex::new(None),
             parts: Mutex::default(),
             bpms: Mutex::default(),
             blind: AtomicBool::new(false),
@@ -76,10 +80,12 @@ impl ISonicClient for Sidecar {
     async fn health(&self) -> Option<SonicHealth> {
         let version = (*self.version.lock())?;
         let transition_version = *self.transition.lock();
+        let transition_revision = *self.revision.lock();
         if self.off.load(Ordering::SeqCst) {
             return Some(SonicHealth {
                 version,
                 transition_version,
+                transition_revision,
                 problem: None,
                 off: true,
                 profiles_only: false,
@@ -88,6 +94,7 @@ impl ISonicClient for Sidecar {
         Some(SonicHealth {
             version,
             transition_version,
+            transition_revision,
             problem: self
                 .blind
                 .load(Ordering::SeqCst)
@@ -135,14 +142,20 @@ impl ISonicClient for Sidecar {
             panic!("asked octo-sonic for the sound of {name} with Sounds alike off in .env");
         }
         let transition = self.transition.lock().unwrap_or(1);
+        let revision = *self.revision.lock();
         Ok(SonicAnswer {
             features: parts.sound.then(|| SonicFeatures {
                 values: (0..23).map(|i| i as f32 / 100.0).collect(),
                 version: self.version.lock().unwrap_or(2),
             }),
-            transition: parts
-                .transition
-                .then(|| serde_json::json!({ "version": transition, "durationMs": 200_000, "file": name })),
+            transition: parts.transition.then(|| {
+                let mut profile =
+                    serde_json::json!({ "version": transition, "durationMs": 200_000, "file": name });
+                if let Some(revision) = revision {
+                    profile["revision"] = revision.into();
+                }
+                profile
+            }),
             error: None,
             status: 200,
         })
@@ -272,6 +285,50 @@ impl T {
             }
         }
         panic!("the pass never finished");
+    }
+
+    /// Ticks, without moving the clock, until `pass` passes have finished.
+    async fn ticks_until_pass(&self, pass: i32) {
+        for _ in 0..30 {
+            self.tick().await;
+            if self.store.read(|s| s.pass) >= pass {
+                return;
+            }
+        }
+        panic!("pass {pass} never finished");
+    }
+
+    /// Octo stopped and started again: a new worker reads back what was written, with the same
+    /// octo-sonic, library and clock.
+    fn restarted(self) -> T {
+        self.store.flush();
+        self.transitions.flush();
+        let store = Arc::new(SonicStore::new(self._dir.path().join("state.json")));
+        let transitions = Arc::new(TransitionStore::new(self._dir.path().join("profiles")));
+        let clock_now = self.now.clone();
+        let worker = SonicAnalysisWorker::new(
+            store.clone(),
+            transitions.clone(),
+            self.sidecar.clone(),
+            self.library.clone(),
+            self.activity.clone(),
+            self.worker.settings.clone(),
+            None,
+            Clock::new(move || *clock_now.lock()),
+        );
+        T {
+            worker,
+            store,
+            transitions,
+            ..self
+        }
+    }
+
+    /// A file from outside the library landing in the music folder.
+    fn lands(&self, key: &str, name: &str) {
+        let landed = self.library.directory.join(name);
+        std::fs::write(&landed, b"some sound").expect("writes");
+        self.worker.arrived_outside(key, &landed.to_string_lossy());
     }
 }
 
@@ -843,6 +900,265 @@ async fn at_the_pass_end_gone_songs_lose_their_profiles() {
     t.ticks_until_done().await;
     assert!(t.transitions.entry("gone").is_none());
     assert!(profile_of(&t, "a").is_some());
+}
+
+// ---- profile revisions -------------------------------------------------------------------
+
+fn read_count(t: &T, name: &str) -> usize {
+    t.sidecar.analysed().iter().filter(|read| *read == name).count()
+}
+
+#[tokio::test]
+async fn a_profile_of_a_lower_revision_is_read_again_once_and_served_meanwhile() {
+    let t = make(None);
+    *t.sidecar.transition.lock() = Some(1);
+    t.library.add("a", "a.flac", Some(200), true);
+    t.library.add("b", "b.flac", Some(200), true);
+    t.ticks_until_pass(1).await;
+    assert_eq!(t.transitions.entry("a").map(|e| e.revision), Some(1));
+
+    // octo-sonic now makes revision 2 of the same version.
+    *t.sidecar.revision.lock() = Some(2);
+    t.tick().await;
+    // Without waiting out the pass interval, for the profile alone.
+    assert_eq!(t.sidecar.analysed(), ["a.flac", "b.flac", "a.flac"]);
+    assert_eq!(t.sidecar.parts.lock().last(), Some(&profile_only()));
+    assert_eq!(t.transitions.entry("a").map(|e| e.revision), Some(2));
+    // The song not read yet keeps its profile served, and Sounds alike stays done.
+    assert_eq!(
+        profile_of(&t, "b").map(|p| (p["file"].clone(), p.get("revision").cloned())),
+        Some(("b.flac".into(), None))
+    );
+    let status = t.worker.status();
+    assert_eq!(
+        (status.state.as_str(), status.reason.as_deref()),
+        ("Done", Some(DONE))
+    );
+    assert_eq!(
+        serde_json::to_value(&status).unwrap()["updatingProfiles"],
+        serde_json::json!({ "done": 1, "total": 2 })
+    );
+
+    t.ticks_until_pass(2).await;
+    assert_eq!(t.sidecar.analysed(), ["a.flac", "b.flac", "a.flac", "b.flac"]);
+    assert_eq!(t.transitions.revision(), 2);
+    assert_eq!(t.worker.status().updating_profiles, None);
+    // Once: the passes after leave them be.
+    t.advance(PASS_INTERVAL + TimeDelta::minutes(1));
+    t.ticks_until_pass(3).await;
+    assert_eq!(t.sidecar.analysed().len(), 4);
+    assert!(t.store.read(|s| s.failed.is_empty()));
+}
+
+#[tokio::test]
+async fn a_revision_rise_starts_a_pass_at_every_start_until_one_completes() {
+    let t = make(None);
+    *t.sidecar.transition.lock() = Some(1);
+    for id in ["a", "b", "c"] {
+        t.library.add(id, &format!("{id}.flac"), Some(200), true);
+    }
+    t.ticks_until_pass(1).await;
+    let next = t
+        .store
+        .read(|s| s.next_pass_utc)
+        .expect("the next pass is hours away");
+
+    // The update replaces Octo and octo-sonic together.
+    *t.sidecar.revision.lock() = Some(2);
+    let t = t.restarted();
+    assert_eq!(t.transitions.revision(), 1);
+    t.tick().await;
+    // The first look starts the pass now, and keeps the revision for the pass's end.
+    assert_eq!(t.store.read(|s| s.next_pass_utc), None);
+    assert_eq!(t.sidecar.analysed()[3..], ["a.flac"]);
+    assert_eq!(t.transitions.revision(), 1);
+
+    // Octo stops in the middle of the pass, before the cleared wait reached the disk.
+    t.store.write(|s| s.next_pass_utc = Some(next));
+    let t = t.restarted();
+    t.tick().await;
+    assert_eq!(t.store.read(|s| s.next_pass_utc), None);
+    // The pass goes on with the songs still at the lower revision.
+    assert_eq!(t.sidecar.analysed()[3..], ["a.flac", "b.flac"]);
+    t.ticks_until_pass(2).await;
+    assert_eq!(t.sidecar.analysed()[3..], ["a.flac", "b.flac", "c.flac"]);
+    assert_eq!(t.transitions.revision(), 2);
+
+    // Started again with 2 kept and octo-sonic still at 2: the wait stands.
+    let t = t.restarted();
+    t.tick().await;
+    let now = *t.now.lock();
+    assert!(t.store.read(|s| s.next_pass_utc).is_some_and(|next| next > now));
+    assert_eq!(t.sidecar.analysed().len(), 6);
+    assert_eq!(t.worker.status().state, "Done");
+}
+
+#[tokio::test]
+async fn a_new_index_keeps_the_revision_its_first_pass_began_with() {
+    let t = make(None);
+    *t.sidecar.transition.lock() = Some(1);
+    *t.sidecar.revision.lock() = Some(2);
+    t.library.add("a", "a.flac", Some(200), true);
+    t.library.add("b", "b.flac", Some(200), true);
+    assert_eq!(t.transitions.revision(), 1);
+    t.tick().await;
+    // Songs read for the first time: nothing is being updated.
+    let status = t.worker.status();
+    assert_eq!(
+        (status.state.as_str(), status.updating_profiles),
+        ("Running", None)
+    );
+    t.ticks_until_pass(1).await;
+    assert_eq!(t.transitions.revision(), 2);
+    assert_eq!(t.transitions.entry("a").map(|e| e.revision), Some(2));
+    assert_eq!(t.sidecar.analysed().len(), 2);
+}
+
+#[tokio::test]
+async fn a_rise_in_the_middle_of_a_pass_is_kept_by_the_next_which_starts_at_once() {
+    let t = make(None);
+    *t.sidecar.transition.lock() = Some(1);
+    for id in ["a", "b", "c"] {
+        t.library.add(id, &format!("{id}.flac"), Some(200), true);
+    }
+    t.ticks_until_pass(1).await;
+    t.advance(PASS_INTERVAL + TimeDelta::minutes(1));
+    t.library.add("d", "d.flac", Some(200), true);
+    t.tick().await;
+    assert_eq!(t.sidecar.analysed().last().map(String::as_str), Some("d.flac"));
+
+    *t.sidecar.revision.lock() = Some(2);
+    t.ticks_until_pass(2).await;
+    // That pass began without a revision, so it keeps none.
+    assert_eq!(t.transitions.revision(), 1);
+    // The clock stands still: the next pass starts at once, and keeps 2 at its end.
+    t.ticks_until_pass(3).await;
+    assert_eq!(t.transitions.revision(), 2);
+    for id in ["a", "b", "c", "d"] {
+        assert_eq!(t.transitions.entry(id).map(|e| e.revision), Some(2), "{id}");
+        assert_eq!(read_count(&t, &format!("{id}.flac")), 2, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn outside_songs_of_a_lower_revision_are_read_again_once_a_pass() {
+    let t = make(None);
+    *t.sidecar.transition.lock() = Some(1);
+    t.library.add("a", "a.flac", Some(200), true);
+    t.lands("youtube:abc", "landed.mp3");
+    t.ticks_until_pass(1).await;
+    assert_eq!(t.sidecar.analysed(), ["landed.mp3", "a.flac"]);
+
+    *t.sidecar.revision.lock() = Some(2);
+    t.ticks_until_pass(2).await;
+    // Listed at the pass's start and read for its profile alone, as the library's song is.
+    assert_eq!(t.sidecar.analysed()[2..], ["landed.mp3", "a.flac"]);
+    assert_eq!(
+        *t.sidecar.parts.lock(),
+        [
+            profile_only(),
+            sound_and_profile(),
+            profile_only(),
+            profile_only()
+        ]
+    );
+    assert_eq!(t.transitions.entry("youtube:abc").map(|e| e.revision), Some(2));
+    t.advance(PASS_INTERVAL + TimeDelta::minutes(1));
+    t.ticks_until_pass(3).await;
+    assert_eq!(t.sidecar.analysed().len(), 4);
+}
+
+#[tokio::test]
+async fn a_failed_outside_reading_waits_a_week_and_outlasts_the_pass() {
+    let t = make(None);
+    *t.sidecar.transition.lock() = Some(1);
+    t.library.add("a", "a.flac", Some(200), true);
+    t.lands("youtube:abc", "landed.mp3");
+    t.ticks_until_pass(1).await;
+
+    *t.sidecar.revision.lock() = Some(2);
+    t.sidecar
+        .errors
+        .lock()
+        .insert("landed.mp3".into(), "the file is damaged".into());
+    t.ticks_until_pass(2).await;
+    // Tried once in the pass. The failure is kept on its entry, not with the library's songs.
+    assert_eq!(t.sidecar.analysed()[2..], ["landed.mp3", "a.flac"]);
+    let entry = t.transitions.entry("youtube:abc").expect("kept");
+    let failed = entry.failed.clone().expect("the failure is kept");
+    assert_eq!(
+        (failed.stamp.as_str(), failed.revision),
+        (entry.stamp.as_str(), 2)
+    );
+    assert_eq!((entry.revision, failed.at_utc), (1, *t.now.lock()));
+    assert!(t.store.read(|s| s.failed.is_empty()));
+    assert!(profile_of(&t, "youtube:abc").is_some());
+
+    // The next pass lists it again and leaves it, until a week has gone by.
+    t.advance(PASS_INTERVAL + TimeDelta::minutes(1));
+    t.ticks_until_pass(3).await;
+    assert_eq!(t.sidecar.analysed().len(), 4);
+    assert!(
+        t.transitions
+            .entry("youtube:abc")
+            .and_then(|e| e.failed)
+            .is_some()
+    );
+
+    t.sidecar.errors.lock().clear();
+    t.advance(RETRY_FAILED_AFTER);
+    t.ticks_until_pass(4).await;
+    assert_eq!(t.sidecar.analysed()[4..], ["landed.mp3"]);
+    let entry = t.transitions.entry("youtube:abc").expect("kept");
+    assert_eq!((entry.revision, entry.failed), (2, None));
+}
+
+/// Guard: fails when a missing `transitionRevision` stands for any revision, such as the one
+/// the store last kept (the `revision` of `tick`), or when a pass that began without one changes
+/// the stored revision.
+#[tokio::test]
+async fn an_octo_sonic_that_says_no_revision_has_nothing_read_again() {
+    let t = make(None);
+    *t.sidecar.transition.lock() = Some(1);
+    *t.sidecar.revision.lock() = Some(2);
+    t.library.add("a", "a.flac", Some(200), true);
+    t.ticks_until_pass(1).await;
+    assert_eq!(t.transitions.revision(), 2);
+
+    // An octo-sonic from before revisions takes its place: its profiles say none.
+    *t.sidecar.revision.lock() = None;
+    t.library.add("b", "b.flac", Some(200), true);
+    t.advance(PASS_INTERVAL + TimeDelta::minutes(1));
+    t.ticks_until_pass(2).await;
+    t.lands("youtube:abc", "landed.mp3");
+    t.tick().await;
+    assert_eq!(t.transitions.entry("b").map(|e| e.revision), Some(1));
+    assert_eq!(t.transitions.entry("youtube:abc").map(|e| e.revision), Some(1));
+
+    t.tick().await;
+    let now = *t.now.lock();
+    assert!(t.store.read(|s| s.next_pass_utc).is_some_and(|next| next > now));
+    t.advance(PASS_INTERVAL + TimeDelta::minutes(1));
+    t.ticks_until_pass(3).await;
+    assert_eq!(t.sidecar.analysed(), ["a.flac", "b.flac", "landed.mp3"]);
+    assert_eq!(t.transitions.revision(), 2);
+    assert_eq!(t.worker.status().updating_profiles, None);
+}
+
+/// The Radio page shows how far an update of the profiles is, from the status's field.
+#[test]
+fn the_dashboard_says_how_far_the_profiles_are_updated() {
+    let js = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../octo/wwwroot/admin/admin.js"
+    ))
+    .expect("the dashboard script");
+    for read in [
+        "s.updatingProfiles",
+        "`Updating song profiles, ${updating.done} of ${updating.total}.`",
+    ] {
+        assert!(js.contains(read), "admin.js reads {read}");
+    }
 }
 
 // ---- profiles with Sounds alike off -----------------------------------------------------

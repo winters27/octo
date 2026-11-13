@@ -9,9 +9,14 @@
 //! acquisition key, so the apps find it by the id they play it by. Profiles are made whether
 //! or not Sounds alike is on; with it off (on the Radio page or in .env) each song is read for
 //! its profile alone, and how it sounds is never read.
+//!
+//! When octo-sonic says a newer revision of its profiles than the last complete pass read, the
+//! next pass starts at once and reads every song with a lower one again, for its profile alone,
+//! one at a time like any other reading, while its profile is still served. Songs from outside
+//! the library with a lower one are listed once at the pass's start.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -29,7 +34,7 @@ use tracing::{error, info};
 
 use super::sonic_client::{ISonicClient, SonicAnswer, SonicParts};
 use super::sonic_store::{SonicFailure, SonicSong, SonicStore};
-use super::transition_store::TransitionStore;
+use super::transition_store::{FIRST_REVISION, TransitionEntry, TransitionStore};
 use crate::services::common::{AcquisitionTracker, DownloadArrivals, IAcquisitionActivity};
 use crate::services::library::navidrome_song_path_resolver::{Candidate, PathSource};
 use crate::services::library::quality_upgrade_worker::LibrarySongRow;
@@ -177,6 +182,15 @@ pub struct SonicStatus {
     pub profiled: i32,
     /// Whether songs are read for how they sound; false while only profiles are made.
     pub reads_sound: bool,
+    /// While a pass reads songs again for a newer revision of their profiles.
+    pub updating_profiles: Option<ProfilesUpdating>,
+}
+
+/// Of the `total` transition profiles served, `done` are of the revision octo-sonic makes now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ProfilesUpdating {
+    pub done: i32,
+    pub total: i32,
 }
 
 pub const IDLE_CHECK: Duration = Duration::from_secs(60);
@@ -214,16 +228,26 @@ struct Pass {
     /// Times octo-sonic dropped the connection on a song, by id. Twice means the file crashes
     /// it; it is then marked unreadable instead of being tried forever.
     dropped: HashMap<String, i32>,
+    /// The profile revision octo-sonic said when this pass's list was read: once the pass is
+    /// over, every song it walked has a profile of at least that revision.
+    revision: Option<i32>,
+    /// Songs from outside the library, by key and file, with a profile of a lower revision than
+    /// octo-sonic's when the pass began: each is looked at once in the pass.
+    outside: VecDeque<(String, String)>,
+    /// Whether this pass has read a song for more than a newer revision of its profile.
+    analyzing: bool,
 }
 
 /// The next song to read: its row, its file, the file's stamp, and what to read of it. A song
 /// from outside the library is read for its profile alone, kept under its acquisition key.
+/// `reread` when the song is read again only for a newer revision of the profile it has.
 struct Target {
     row: LibrarySongRow,
     file: String,
     stamp: String,
     parts: SonicParts,
     outside: bool,
+    reread: bool,
 }
 
 pub struct SonicAnalysisWorker {
@@ -245,6 +269,8 @@ pub struct SonicAnalysisWorker {
     status: Mutex<(String, Option<String>)>,
     /// Whether the last look read how songs sound, or made profiles only.
     reads_sound: AtomicBool,
+    /// The profile revision octo-sonic said at the last look; 0 when it said none.
+    revision: AtomicI32,
     /// Songs' published tempos, for their profiles.
     published: OnceLock<Arc<dyn IPublishedTempo>>,
 }
@@ -274,6 +300,7 @@ impl SonicAnalysisWorker {
             pass: Mutex::new(Pass::default()),
             generation: AtomicU64::new(0),
             reads_sound: AtomicBool::new(true),
+            revision: AtomicI32::new(0),
             published: OnceLock::new(),
             status: Mutex::new((
                 "Waiting".to_string(),
@@ -373,6 +400,15 @@ impl SonicAnalysisWorker {
         if let Some(version) = health.transition_version {
             self.transitions.set_current_version(version);
         }
+        // A profile revision newer than the last complete pass read: songs with a lower one are
+        // read again from the next pass, which starts now instead of hours later.
+        let revision = health.transition_version.and(health.transition_revision);
+        self.revision.store(revision.unwrap_or(0), Ordering::SeqCst);
+        if revision.is_some_and(|r| r > self.transitions.revision())
+            && self.store.read(|s| s.next_pass_utc.is_some())
+        {
+            self.store.write(|s| s.next_pass_utc = None);
+        }
         // How songs sound is read only while Sounds alike is on in both places; profiles are
         // made either way, when octo-sonic makes them.
         let profiles_only = if !settings.sounds_alike {
@@ -426,14 +462,28 @@ impl SonicAnalysisWorker {
             if generation != self.generation.load(Ordering::SeqCst) {
                 return Duration::ZERO;
             }
+            // Songs from outside the library reach the worker as their files land; those with a
+            // profile of a lower revision are listed here, once a pass.
+            let outside = revision
+                .map(|r| self.transitions.outside_below(r))
+                .unwrap_or_default();
             let mut pass = self.pass.lock();
             pass.rows = Some(rows);
             pass.complete = complete;
             pass.skipped.clear();
+            pass.revision = revision;
+            pass.outside = outside.into();
+            pass.analyzing = false;
         }
 
         let Some(target) = self
-            .next_target(sound_version, health.transition_version, now, arrivals_only)
+            .next_target(
+                sound_version,
+                health.transition_version,
+                revision,
+                now,
+                arrivals_only,
+            )
             .await
         else {
             if arrivals_only {
@@ -442,7 +492,7 @@ impl SonicAnalysisWorker {
             if generation != self.generation.load(Ordering::SeqCst) {
                 return Duration::ZERO;
             }
-            let (present, complete, count, skipped) = {
+            let (present, complete, count, skipped, began_at) = {
                 let pass = self.pass.lock();
                 let rows = pass.rows.as_deref().unwrap_or_default();
                 (
@@ -450,10 +500,16 @@ impl SonicAnalysisWorker {
                     pass.complete,
                     rows.len(),
                     pass.skipped.len(),
+                    pass.revision,
                 )
             };
             if complete {
                 self.transitions.keep_only(&present);
+            }
+            // Every song this pass walked has a profile of the revision it began with, or is
+            // left for later as one that failed; a pass that began without one changes nothing.
+            if let Some(revision) = began_at {
+                self.transitions.set_revision(revision);
             }
             self.transitions.flush();
             self.store.write(|s| {
@@ -477,6 +533,7 @@ impl SonicAnalysisWorker {
             stamp,
             parts,
             outside,
+            reread,
         } = target;
         let bpm = if parts.transition {
             self.published_tempo(&row, &file, outside).await
@@ -516,19 +573,39 @@ impl SonicAnalysisWorker {
             return Duration::ZERO;
         }
         let pause = Duration::from_secs(settings.effective_sonic_pause_seconds().max(0) as u64);
+        // A song read again only for a newer revision of its profile leaves Sounds alike done,
+        // unless this pass has read songs for more.
+        let analyzing = {
+            let mut pass = self.pass.lock();
+            pass.analyzing |= !reread;
+            pass.analyzing
+        };
+        let (state, reason) = if analyzing {
+            ("Running", profiles_only)
+        } else {
+            ("Done", Some(done))
+        };
         if outside {
             // A file outside octo-sonic's music folder (a cached copy) has no profile to make.
             match answer.transition {
                 Some(profile) => {
                     self.transitions.put(&row.id, &stamp, Some(&file), &profile);
                 }
-                None => info!(
-                    "No transition profile for {} ({file}): {}",
-                    row.id,
-                    answer.error.as_deref().unwrap_or("")
-                ),
+                None => {
+                    info!(
+                        "No transition profile for {} ({file}): {}",
+                        row.id,
+                        answer.error.as_deref().unwrap_or("")
+                    );
+                    // A profile it already has stays served; the file is not read again for this
+                    // revision before RETRY_FAILED_AFTER. One octo-sonic cannot see blames nothing.
+                    if answer.status != 403 && answer.status != 404 {
+                        let revision = revision.unwrap_or(FIRST_REVISION);
+                        self.transitions.record_failure(&row.id, &stamp, revision, now);
+                    }
+                }
             }
-            return self.hold("Running", profiles_only, pause);
+            return self.hold(state, reason, pause);
         }
         // Octo sees the file and octo-sonic does not: its music mount is not Octo's. That is no
         // fault of the song, so nothing is recorded and the song is asked again once it is fixed.
@@ -541,7 +618,7 @@ impl SonicAnalysisWorker {
         let (features, error) = (answer.features, answer.error);
         // A song read for its profile alone keeps the features it has.
         if features.is_none() && error.is_none() {
-            return self.hold("Running", profiles_only, pause);
+            return self.hold(state, reason, pause);
         }
         if features.is_none() {
             info!(
@@ -578,16 +655,19 @@ impl SonicAnalysisWorker {
                 );
             }
         });
-        self.hold("Running", profiles_only, pause)
+        self.hold(state, reason, pause)
     }
 
-    /// A song first in line, else a song from outside the library that just landed, else the next
-    /// one with no features or profile, a changed file, older features or an older profile, or a
-    /// failure old enough to try again. Features are looked at only when `version` is given.
+    /// A song first in line, else a song from outside the library that just landed, else one
+    /// from outside listed for this pass, else the next one with no features or profile, a
+    /// changed file, older features or an older profile, or a failure old enough to try again.
+    /// Features are looked at only when `version` is given; a profile is older when its version
+    /// is not `transition` or its revision is below `revision`.
     async fn next_target(
         &self,
         version: Option<i32>,
         transition: Option<i32>,
+        revision: Option<i32>,
         now: DateTime<Utc>,
         arrivals_only: bool,
     ) -> Option<Target> {
@@ -619,8 +699,14 @@ impl SonicAnalysisWorker {
                 },
             };
             if let Some(row) = row
-                && let Some(found) =
-                    self.candidate(&row, version, transition, now, &mut self.pass.lock().skipped)
+                && let Some(found) = self.candidate(
+                    &row,
+                    version,
+                    transition,
+                    revision,
+                    now,
+                    &mut self.pass.lock().skipped,
+                )
             {
                 return Some(found);
             }
@@ -630,13 +716,23 @@ impl SonicAnalysisWorker {
                 let Some((key, path)) = self.outside.lock().pop_front() else {
                     break;
                 };
-                if let Some(found) = self.outside_target(&key, &path, transition) {
+                if let Some(found) = self.outside_target(&key, &path, transition, revision, now) {
                     return Some(found);
                 }
             }
         }
         if arrivals_only {
             return None;
+        }
+        if let Some(transition) = transition {
+            loop {
+                let Some((key, path)) = self.pass.lock().outside.pop_front() else {
+                    break;
+                };
+                if let Some(found) = self.outside_target(&key, &path, transition, revision, now) {
+                    return Some(found);
+                }
+            }
         }
         // The rows are checked in place, under the pass's lock: the cheap checks first, and a
         // file's stat only for a song not already known.
@@ -646,7 +742,7 @@ impl SonicAnalysisWorker {
             if skipped.contains(&row.id) {
                 continue;
             }
-            if let Some(found) = self.candidate(row, version, transition, now, skipped) {
+            if let Some(found) = self.candidate(row, version, transition, revision, now, skipped) {
                 return Some(found);
             }
         }
@@ -680,15 +776,29 @@ impl SonicAnalysisWorker {
         let _ = self.published.set(published);
     }
 
-    /// A landed file from outside the library, unless it already has this profile.
-    fn outside_target(&self, key: &str, path: &str, transition: i32) -> Option<Target> {
+    /// A file from outside the library, unless it already has this profile at `revision` or
+    /// above, or its reading failed lately at this stamp for that revision.
+    fn outside_target(
+        &self,
+        key: &str,
+        path: &str,
+        transition: i32,
+        revision: Option<i32>,
+        now: DateTime<Utc>,
+    ) -> Option<Target> {
         let file = SonicFile::stat(path)?;
         let stamp = format!("{}:{}", file.length, file.last_write_ticks);
-        if self
-            .transitions
-            .entry(key)
-            .is_some_and(|e| e.version == transition && e.stamp == stamp)
-        {
+        let entry = self.transitions.entry(key);
+        let same = entry
+            .as_ref()
+            .is_some_and(|e| e.version == transition && e.stamp == stamp);
+        if same && !entry.as_ref().is_some_and(|e| behind(e, revision)) {
+            return None;
+        }
+        let wanted = revision.unwrap_or(FIRST_REVISION);
+        if entry.and_then(|e| e.failed).is_some_and(|failed| {
+            failed.stamp == stamp && failed.revision >= wanted && now - failed.at_utc < RETRY_FAILED_AFTER
+        }) {
             return None;
         }
         Some(Target {
@@ -705,6 +815,7 @@ impl SonicAnalysisWorker {
                 transition: true,
             },
             outside: true,
+            reread: same,
         })
     }
 
@@ -713,6 +824,7 @@ impl SonicAnalysisWorker {
         row: &LibrarySongRow,
         version: Option<i32>,
         transition: Option<i32>,
+        revision: Option<i32>,
         now: DateTime<Utc>,
         skipped: &mut HashSet<String>,
     ) -> Option<Target> {
@@ -734,9 +846,9 @@ impl SonicAnalysisWorker {
                 .is_some_and(|done| done.version == version && done.stamp.starts_with(&size_prefix))
         });
         let has_profile = transition.is_none_or(|transition| {
-            profiled
-                .as_ref()
-                .is_some_and(|p| p.version == transition && p.stamp.starts_with(&size_prefix))
+            profiled.as_ref().is_some_and(|p| {
+                p.version == transition && !behind(p, revision) && p.stamp.starts_with(&size_prefix)
+            })
         });
         if sounded && has_profile {
             return None;
@@ -751,13 +863,18 @@ impl SonicAnalysisWorker {
             return None;
         };
         let stamp = format!("{}:{}", file.length, file.last_write_ticks);
+        // A profile of this file and version: only a newer revision makes it worth reading again.
+        let same_profile = transition.is_some_and(|transition| {
+            profiled
+                .as_ref()
+                .is_some_and(|same| same.version == transition && same.stamp == stamp)
+        });
+        let current = same_profile && !profiled.as_ref().is_some_and(|p| behind(p, revision));
         let parts = SonicParts {
             sound: version.is_some_and(|version| {
                 !done.is_some_and(|same| same.version == version && same.stamp == stamp)
             }),
-            transition: transition.is_some_and(|transition| {
-                !profiled.is_some_and(|same| same.version == transition && same.stamp == stamp)
-            }),
+            transition: transition.is_some() && !current,
         };
         if !parts.sound && !parts.transition {
             return None;
@@ -769,6 +886,7 @@ impl SonicAnalysisWorker {
             row: row.clone(),
             file: file.full_name,
             stamp,
+            reread: !parts.sound && same_profile,
             parts,
             outside: false,
         })
@@ -821,6 +939,16 @@ impl SonicAnalysisWorker {
         };
         let (state, reason) = self.status.lock().clone();
         let profiled = self.transitions.ready_count() as i32;
+        // While a pass is on after octo-sonic's revision rose past the last complete one, and
+        // songs with a lower one are left.
+        let revision = self.revision.load(Ordering::SeqCst);
+        let updating_profiles = (rows.is_some() && revision > self.transitions.revision())
+            .then(|| self.transitions.progress(revision))
+            .filter(|progress| progress.done < progress.total)
+            .map(|progress| ProfilesUpdating {
+                done: progress.done as i32,
+                total: progress.total as i32,
+            });
         self.store.read(|s| SonicStatus {
             state,
             reason,
@@ -833,6 +961,7 @@ impl SonicAnalysisWorker {
             skipped: skipped as i32,
             profiled,
             reads_sound: self.reads_sound.load(Ordering::SeqCst),
+            updating_profiles,
         })
     }
 
@@ -840,6 +969,12 @@ impl SonicAnalysisWorker {
         *self.status.lock() = (state.to_string(), reason.map(str::to_string));
         wait
     }
+}
+
+/// Whether a profile comes from a lower revision than `revision`, the one octo-sonic writes
+/// now; never when it says none.
+fn behind(entry: &TransitionEntry, revision: Option<i32>) -> bool {
+    revision.is_some_and(|r| entry.revision < r)
 }
 
 /// One row per id (compared exactly), the first kept.
