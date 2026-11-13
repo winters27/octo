@@ -53,6 +53,14 @@ pub enum AddToLibrary {
     SaveOnly,
 }
 
+/// Where a member's songs go: their own library, or the shared library everyone in the family
+/// plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MusicTarget {
+    Own,
+    Shared,
+}
+
 /// The quality a request asks for, and the highest one a member may ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RequestQuality {
@@ -176,6 +184,9 @@ impl<'de> Deserialize<'de> for StreamCap {
 #[serde(rename_all = "camelCase")]
 pub struct Abilities {
     pub add_to_library: AddToLibrary,
+    /// Where what they add lands. `Shared` sends it to the shared library, where the storage
+    /// limit does not apply.
+    pub music_goes_to: MusicTarget,
     pub request_quality: RequestQuality,
     pub auto_approve: bool,
     /// Requests per 7 days; 0 means no limit.
@@ -215,6 +226,7 @@ impl Abilities {
         match preset {
             Preset::Owner => Abilities {
                 add_to_library: AddToLibrary::Direct,
+                music_goes_to: MusicTarget::Own,
                 request_quality: RequestQuality::Best,
                 // "n/a" in the table: the owner never waits on anyone.
                 auto_approve: true,
@@ -248,6 +260,7 @@ impl Abilities {
             },
             Preset::Listener => Abilities {
                 add_to_library: AddToLibrary::Request,
+                music_goes_to: MusicTarget::Own,
                 request_quality: RequestQuality::Best,
                 auto_approve: false,
                 weekly_request_limit: 10,
@@ -327,6 +340,7 @@ impl Abilities {
             "addtolibrary" => {
                 self.add_to_library = parsed(value, "expected Direct, Request or SaveOnly")?;
             }
+            "musicgoesto" => self.music_goes_to = parsed(value, "expected Own or Shared")?,
             "requestquality" => {
                 self.request_quality = value
                     .as_str()
@@ -361,8 +375,12 @@ impl Abilities {
         self.stream_cap.kbps().is_some() || self.away_cap > 0
     }
 
-    /// The storage limit in bytes, or None for no limit.
+    /// The storage limit in bytes, or None for no limit. Someone whose music goes to the shared
+    /// library has none: the limit measures their own folder, which such songs never reach.
     pub fn storage_limit_bytes(&self) -> Option<u64> {
+        if self.music_goes_to == MusicTarget::Shared {
+            return None;
+        }
         (self.storage_limit_gb > 0).then(|| u64::from(self.storage_limit_gb) * 1_000_000_000)
     }
 }
@@ -442,6 +460,10 @@ mod tests {
         for (a, on) in [(&o, true), (&c, false), (&m, false), (&l, false), (&k, false)] {
             assert_eq!(a.library_actions, on);
         }
+        // MusicGoesTo
+        for a in [&o, &c, &m, &l, &k] {
+            assert_eq!(a.music_goes_to, MusicTarget::Own);
+        }
         // StorageLimitGb
         for (a, gb) in [(&o, 0), (&c, 0), (&m, 50), (&l, 10), (&k, 5)] {
             assert_eq!(a.storage_limit_gb, gb);
@@ -503,6 +525,7 @@ mod tests {
             value,
             json!({
                 "addToLibrary": "Request",
+                "musicGoesTo": "Own",
                 "requestQuality": "Best",
                 "autoApprove": false,
                 "weeklyRequestLimit": 10,
@@ -526,6 +549,30 @@ mod tests {
         assert_eq!(owner["streamCap"], json!(0));
         let back: Abilities = serde_json::from_value(value).expect("reads back");
         assert_eq!(back, Abilities::preset(Preset::Listener));
+    }
+
+    #[test]
+    fn music_goes_to_is_editable_and_round_trips() {
+        let (a, warnings) =
+            Abilities::preset(Preset::Member).with_edits(&edits(json!({ "MusicGoesTo": "Shared" })));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(a.music_goes_to, MusicTarget::Shared);
+        // The storage limit stays stored, but does not apply to shared music.
+        assert_eq!(a.storage_limit_gb, 50);
+        assert_eq!(a.storage_limit_bytes(), None);
+        assert_eq!(
+            Abilities::preset(Preset::Member).storage_limit_bytes(),
+            Some(50_000_000_000)
+        );
+        let value = serde_json::to_value(&a).expect("serializes");
+        assert_eq!(value["musicGoesTo"], json!("Shared"));
+        let back: Abilities = serde_json::from_value(value).expect("reads back");
+        assert_eq!(back, a);
+
+        let (bad, warnings) =
+            Abilities::preset(Preset::Member).with_edits(&edits(json!({ "musicGoesTo": "Elsewhere" })));
+        assert_eq!(bad.music_goes_to, MusicTarget::Own);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]

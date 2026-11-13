@@ -188,14 +188,16 @@ pub async fn edit_member(
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct RemoveMemberBody {
     pub confirm: String,
     pub files: String,
+    /// Leave Family but keep their Navidrome account and password.
+    pub keep_account: bool,
 }
 
 /// `DELETE /api/family/members/{name}`: needs the username typed as `confirm`, and what to do
-/// with their files.
+/// with their files. With `keepAccount` their Navidrome account stays.
 pub async fn remove_member(
     State(state): State<AppState>,
     web: Web,
@@ -218,7 +220,14 @@ pub async fn remove_member(
     };
     match state
         .family
-        .remove_member(&state, &signed.actor, &name, &request.confirm, files)
+        .remove_member(
+            &state,
+            &signed.actor,
+            &name,
+            &request.confirm,
+            files,
+            request.keep_account,
+        )
         .await
     {
         Ok(()) => no_content(),

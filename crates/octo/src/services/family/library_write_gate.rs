@@ -4,14 +4,15 @@
 //! family are never stopped here, and with Family off nothing is.
 //!
 //! - `Direct` members add at once, into the family pool and linked into their own library,
-//!   until their library is full; past that their adds become requests.
+//!   until their library is full; past that their adds become requests. With `MusicGoesTo`
+//!   Shared they add into the shared library instead, with no storage limit.
 //! - `Request` members ask for a copy (one request per album, one per import list). A heart
-//!   still saves the song as a link.
+//!   still saves the song as a link. An approved copy goes where their music goes.
 //! - `SaveOnly` members save songs and albums; anything else that would add one is refused.
 
 use std::sync::Arc;
 
-use octo_core::family::abilities::AddToLibrary;
+use octo_core::family::abilities::{AddToLibrary, MusicTarget};
 use octo_core::family::policy::storage_full;
 use octo_core::settings::SettingsStore;
 
@@ -26,7 +27,8 @@ pub const SAVE_ONLY_MESSAGE: &str = "Adding songs to your library is off for thi
 /// What happens to one library write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteDecision {
-    /// Not a member (or Family is off): as always, into the shared library.
+    /// Into the shared library: a person outside the family (or Family is off), or a member
+    /// whose music goes there.
     Shared,
     /// Into the family pool, linked into this member's library.
     Member(String),
@@ -105,6 +107,7 @@ impl LibraryWriteGate {
         };
         let abilities = member.abilities();
         match abilities.add_to_library {
+            AddToLibrary::Direct if abilities.music_goes_to == MusicTarget::Shared => WriteDecision::Shared,
             AddToLibrary::Direct => {
                 match storage_full(&abilities, self.personal.storage_used(&member.username)) {
                     Some(full) => WriteDecision::Request {
@@ -137,6 +140,20 @@ impl LibraryWriteGate {
         let abilities = member.abilities();
         !(abilities.auto_approve
             && storage_full(&abilities, self.personal.storage_used(&member.username)).is_none())
+    }
+
+    /// Where an approved request for `user` downloads: their own library, or the shared one
+    /// when their music goes there.
+    pub fn request_target(&self, user: &str) -> AcquisitionTarget {
+        let shared = self
+            .family
+            .member(user.trim())
+            .is_some_and(|m| m.abilities().music_goes_to == MusicTarget::Shared);
+        if shared {
+            AcquisitionTarget::Shared
+        } else {
+            AcquisitionTarget::Member(user.to_string())
+        }
     }
 
     /// Who approves members' requests, as the family knows them: the owner.
@@ -258,6 +275,59 @@ mod tests {
             HeartOutcome::Save {
                 user: "alex".into(),
                 request: Some("Your library is full (1.2 of 1 GB)".into())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn music_that_goes_to_shared_skips_the_storage_limit() {
+        let world = World::new(None);
+        let mut direct = member("alex", Preset::Member, 3);
+        direct.edits.insert("MusicGoesTo".into(), json!("Shared"));
+        direct.edits.insert("StorageLimitGb".into(), json!(1));
+        world.family.upsert_member(direct);
+        let mut listener = member("sam", Preset::Listener, 4);
+        listener.edits.insert("MusicGoesTo".into(), json!("Shared"));
+        world.family.upsert_member(listener);
+        let mut save_only = member("pat", Preset::Listener, 6);
+        save_only.edits.insert("MusicGoesTo".into(), json!("Shared"));
+        save_only.edits.insert("AddToLibrary".into(), json!("SaveOnly"));
+        world.family.upsert_member(save_only);
+        let gate = gate(&world);
+        // Their own folder is over the limit, which does not stop shared music.
+        world.index.note_placed(
+            3,
+            &format!("{}/alex/A/B/big.flac", world.members()),
+            2_000_000_000,
+        );
+        assert_eq!(gate.decide(Some("alex")), WriteDecision::Shared);
+        assert_eq!(gate.play_target(Some("alex")), Some(AcquisitionTarget::Shared));
+        let caller = FamilyCaller::member(
+            "alex",
+            Preset::Member,
+            octo_core::family::abilities::Abilities::preset(Preset::Member),
+        );
+        assert_eq!(
+            gate.heart(Some(&caller)),
+            HeartOutcome::Download(AcquisitionTarget::Shared)
+        );
+        // A listener still asks, and an approved copy lands in the shared library.
+        assert_eq!(
+            gate.decide(Some("sam")),
+            WriteDecision::Request {
+                user: "sam".into(),
+                full: None
+            }
+        );
+        assert!(gate.waits_for_approval("sam"));
+        assert_eq!(gate.request_target("sam"), AcquisitionTarget::Shared);
+        assert_eq!(gate.request_target("alex"), AcquisitionTarget::Shared);
+        // Save-only is unchanged.
+        assert_eq!(
+            gate.decide(Some("pat")),
+            WriteDecision::Refuse {
+                user: "pat".into(),
+                message: SAVE_ONLY_MESSAGE.into()
             }
         );
     }

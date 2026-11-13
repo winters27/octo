@@ -33,7 +33,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use octo_core::common::dotnet::eq_ignore_case;
-use octo_core::family::abilities::{AddToLibrary, Preset, RequestQuality};
+use octo_core::family::abilities::{AddToLibrary, MusicTarget, Preset, RequestQuality};
 use octo_core::family::policy::{self, RequestDecision, storage_full};
 use octo_core::family::request::{FamilyRequest, RequestKind, RequestOutcome, RequestState};
 use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
@@ -51,9 +51,7 @@ use super::request_store::RequestStore;
 use crate::services::common::acquisition_tracker::key_of;
 use crate::services::common::base_download_service::NO_REAL_FLAC;
 use crate::services::common::heart_acquisition_coordinator::TrackOutcome;
-use crate::services::common::{
-    AcquisitionTarget, AcquisitionTracker, HeartAcquisitionCoordinator, TrackAcquisitionQueue,
-};
+use crate::services::common::{AcquisitionTracker, HeartAcquisitionCoordinator, TrackAcquisitionQueue};
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::imports::ImportService;
 use crate::services::library::{LibraryOwnership, OwnedCopy, UpgradeAsk, UpgradeQueue};
@@ -355,11 +353,20 @@ impl RequestService {
         Ok(member)
     }
 
+    /// Whether `user`'s songs go to their own library, where a link or a pool copy lands. A
+    /// member whose music goes to the shared library gets theirs there, when approved.
+    fn music_is_own(&self, user: &str) -> bool {
+        self.family
+            .member(user)
+            .is_none_or(|m| m.abilities().music_goes_to == MusicTarget::Own)
+    }
+
     /// Whether `user` may take a song another member already has, without asking.
     fn instant_allowed(&self, member: &Member) -> bool {
         let abilities = member.abilities();
         abilities.instant_from_family
             && member.preset != Preset::Kid
+            && abilities.music_goes_to == MusicTarget::Own
             && storage_full(&abilities, self.personal.storage_used(&member.username)).is_none()
     }
 
@@ -1080,9 +1087,11 @@ impl RequestService {
         };
         let user = request.username.clone();
         let song = self.catalog.song(&outside.provider, &outside.external_id).await;
-        // Someone may have got it since it was asked for.
+        // Someone may have got it since it was asked for. A shared member's copy is a download
+        // into the shared library instead, so it is not linked here.
         if let Some(file) = self.pooled(&outside, song.as_ref(), request.quality).await
             && self.still_approved(request)
+            && self.music_is_own(&user)
         {
             match self.pool().link(&file.path, &user).await {
                 Ok(link) => {
@@ -1493,12 +1502,12 @@ impl RequestFetcher for LiveRequestFetcher {
             song.map(|s| s.title.as_str()),
             song.map(|s| s.album.as_str()),
         );
-        let target = AcquisitionTarget::Member(user.to_string());
+        let target = self.coordinator.request_target(user);
         let source = match quality {
             RequestQuality::Best => {
                 return match self
                     .coordinator
-                    .acquire_track_outcome(
+                    .acquire_track_without_lidarr(
                         provider,
                         external_id,
                         Some(user),

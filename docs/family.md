@@ -31,6 +31,14 @@ there when you turn Family on, and that Navidrome can see it when you add the fi
 Once members have music of their own, the folder stays where it is: Octo never moves
 members' files.
 
+A member's **Music goes to** ability sets where their songs land. **Their own library** (the
+default) is the folder above. **Shared library** sends what they add, and their approved
+requests, to the library everyone plays, the same place a non-member's songs go. Their storage
+limit does not apply then, since their own folder is no longer where new songs land; their
+request limit and approvals still do. A member whose music goes to the shared library needs to
+see that library: when their shared-library choice leaves some of them out, the edit sheet warns,
+since songs they add may not show up for them.
+
 An install that already keeps members' music in `/members` goes on using it.
 
 ### Cloud and network storage
@@ -43,3 +51,14 @@ who wants the song, and the Family page says what to change.
   Family off and on so Octo checks again.
 - **SMB or CIFS network shares:** add the `mfsymlinks` mount option to the share.
 - **NFS:** links work, nothing to change.
+
+## Leaving Family
+
+Removing a member deletes their Navidrome account and their own library, unless you choose
+**Keep their account and password**. Then their Navidrome account stays with the password they
+chose, so their apps keep signing in; they lose their family settings and their requests are
+closed. They keep the shared libraries they saw, and Octo refuses if they see none, or if they
+have no password Octo can use (reset it first). Their own library is deleted in every case; what
+happens to their files is your choice: kept aside, added to the shared library, or deleted.
+Once they are out of the family, what they add goes to the shared library, as for anyone
+outside it.

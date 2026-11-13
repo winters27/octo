@@ -35,7 +35,7 @@
 
   // Every preset's abilities, as the server's presets set them.
   var BASE = {
-    addToLibrary: 'Direct', requestQuality: 'Best', autoApprove: true, weeklyRequestLimit: 0, streamCap: 0,
+    addToLibrary: 'Direct', musicGoesTo: 'Own', requestQuality: 'Best', autoApprove: true, weeklyRequestLimit: 0, streamCap: 0,
     awayCap: 0, away: true, devicesAtOnce: 0, downloadFiles: true, offlineCopies: true, share: true,
     importPlaylists: true, cleanOnly: false, familyPlaylistsEdit: true, manageFamily: true, approveRequests: true,
     storageLimitGb: 0, instantFromFamily: true
@@ -68,6 +68,8 @@
     { title: 'Adding music', fields: [
       { key: 'addToLibrary', title: 'A heart on a song from outside the library', help: 'What happens when they heart a song Octo found elsewhere.', kind: 'choice',
         options: [['Direct', 'Add it to their library'], ['Request', 'Save it; they can ask for a copy'], ['SaveOnly', 'Save it only']] },
+      { key: 'musicGoesTo', title: 'Music goes to', help: 'Their own library, or the shared library everyone in the family plays.', kind: 'choice',
+        options: [['Own', 'Their own library'], ['Shared', 'Shared library']] },
       { key: 'requestQuality', title: 'Best copy they can ask for', help: 'The highest quality their requests fetch.', kind: 'choice',
         options: [['Best', 'Best there is'], ['Flac', 'FLAC'], ['Mp3', 'MP3']] },
       { key: 'autoApprove', title: 'Approve their requests at once', help: 'Off means each request waits for you.', kind: 'switch' },
@@ -422,7 +424,8 @@
     var devices = replies[1].ok ? replies[1].data : [];
     var requests = replies[2].ok ? replies[2].data : [];
     var login = replies[3].ok ? replies[3].data : null;
-    var limit = a.storageLimitGb > 0 ? a.storageLimitGb * 1e9 : 0;
+    // Shared music never counts against a limit on their own folder.
+    var limit = a.musicGoesTo !== 'Shared' && a.storageLimitGb > 0 ? a.storageLimitGb * 1e9 : 0;
     var playing = devices.filter(function (d) { return d.playing; });
 
     // One next step, the most useful first.
@@ -1406,7 +1409,7 @@
       { sub: 'Octo adds devices as they sign in. To sign ' + m.displayName + ' out everywhere, reset their password.', foot: [el('span'), reset] });
   }
 
-  async function librariesPicker(current) {
+  async function librariesPicker(current, onChange) {
     var reply = await api('GET', '/libraries');
     var shared = reply.ok ? reply.data.filter(function (l) { return !l.personal; }) : [];
     var all = current === 'All' || current === undefined;
@@ -1417,9 +1420,10 @@
     shared.forEach(function (l) {
       var check = switchControl(chosen.indexOf(l.id) >= 0 || all, l.name);
       check.input.setAttribute('data-id', l.id);
+      check.input.addEventListener('change', function () { if (onChange) onChange(); });
       ids.appendChild(setRow(l.name, l.path, check.node));
     });
-    allSwitch.input.addEventListener('change', function () { ids.hidden = allSwitch.input.checked; });
+    allSwitch.input.addEventListener('change', function () { ids.hidden = allSwitch.input.checked; if (onChange) onChange(); });
     box.appendChild(setRow('Every shared library', 'Libraries you add later are shared too.', allSwitch.node));
     box.appendChild(ids);
     box.value = function () {
@@ -1482,10 +1486,27 @@
     var values = Object.assign({}, m.abilities);
     var display = el('input', { class: 'set-input', id: 'edit-name', value: m.displayName });
     var fields = el('div', { class: 'fam-stack' });
-    var libraries = await librariesPicker(m.sharedLibraries);
+    var libraries = await librariesPicker(m.sharedLibraries, function () { syncSharedWarning(); });
     var presetHelp = el('p', { class: 'fam-help' }, PRESETS[preset]);
+    // The storage limit measures the member's own folder, which shared music never reaches, so
+    // it is disabled, with a note, while their music goes to the shared library.
+    var storage = null;
+    var sharedWarning = el('p', { class: 'notice notice-warn', hidden: true },
+      'They don’t see every shared library, so songs they add may not show up for them.');
+    var syncSharedWarning = function () {
+      sharedWarning.hidden = !(values.musicGoesTo === 'Shared' && libraries.value() !== 'All');
+    };
+    var syncStorage = function () {
+      // The warning is not tied to the storage row, which some managers may not see.
+      syncSharedWarning();
+      if (!storage) return;
+      var shared = values.musicGoesTo === 'Shared';
+      storage.input.disabled = shared;
+      storage.row.querySelector('.set-info-d').textContent = shared ? 'Not used: their music goes to the shared library.' : storage.help;
+    };
     var drawFields = function () {
       F.clear(fields);
+      storage = null;
       ABILITY_GROUPS.forEach(function (group) {
         if (group.owner && session.role !== 'Owner') return;
         var rows = group.fields.map(function (f) {
@@ -1496,14 +1517,20 @@
           } else if (f.kind === 'number') {
             control = el('input', { class: 'set-input fam-number', type: 'number', min: 0, step: 1, value: values[f.key], inputmode: 'numeric', 'aria-label': f.title, oninput: function () { values[f.key] = Math.max(0, parseInt(control.value, 10) || 0); } });
           } else {
-            control = el('select', { class: 'set-input fam-select', 'aria-label': f.title, onchange: function () { values[f.key] = control.value; } },
+            control = el('select', { class: 'set-input fam-select', 'aria-label': f.title, onchange: function () {
+              values[f.key] = control.value;
+              if (f.key === 'musicGoesTo') syncStorage();
+            } },
               f.options.map(function (o) { return el('option', { value: o[0] }, o[1]); }));
             control.value = values[f.key];
           }
-          return setRow(f.title, f.help, control);
+          var row = setRow(f.title, f.help, control);
+          if (f.key === 'storageLimitGb') storage = { input: control, row: row, help: f.help };
+          return row;
         });
         fields.appendChild(el('div', { class: 'fam-group' }, el('h3', { class: 'fam-group-title' }, group.title), rowsCard(rows)));
       });
+      syncStorage();
     };
     drawFields();
     var presets = [['Listener', 'Listener'], ['Member', 'Member'], ['Kid', 'Kid']];
@@ -1538,7 +1565,7 @@
       drawFields();
     }, 'Plan'), presetHelp),
     fields,
-    el('div', { class: 'fam-group' }, el('h3', { class: 'fam-group-title' }, 'Shared music they see'), libraries),
+    el('div', { class: 'fam-group' }, el('h3', { class: 'fam-group-title' }, 'Shared music they see'), libraries, sharedWarning),
     el('p', { class: 'fam-help' }, 'Outside songs stream at about 128 to 160 kbps whatever the limits say.'),
     error);
     F.openSheet('Edit ' + m.displayName, form, { side: true, sub: 'Choose a plan, then change any ability. Each one says what it does.', foot: [el('button', { class: 'btn btn-ghost', type: 'button', onclick: F.closeSheet }, 'Cancel'), save] });
@@ -1546,6 +1573,8 @@
 
   function removeSheet(m) {
     var files = 'keep';
+    var keep = false;
+    var keepSwitch = switchControl(false, 'Keep their account and password', function () { keep = keepSwitch.input.checked; });
     var confirmInput = el('input', { class: 'set-input', id: 'confirm-name', autocapitalize: 'none', spellcheck: 'false', autocomplete: 'off' });
     var error = el('p', { class: 'field-error', role: 'alert' });
     var button = el('button', { class: 'btn btn-primary btn-destructive', type: 'submit', form: 'remove-member', disabled: true }, 'Remove ' + m.displayName);
@@ -1559,7 +1588,7 @@
     var form = el('form', { class: 'fam-form', id: 'remove-member', onsubmit: async function (e) {
       e.preventDefault();
       button.disabled = true;
-      var r = await api('DELETE', '/members/' + encodeURIComponent(m.username), { confirm: confirmInput.value.trim(), files: files });
+      var r = await api('DELETE', '/members/' + encodeURIComponent(m.username), { confirm: confirmInput.value.trim(), files: files, keepAccount: keep });
       button.disabled = false;
       if (!r.ok) { error.textContent = F.errorOf(r); return; }
       F.closeSheet();
@@ -1570,9 +1599,10 @@
       files = v;
       help.textContent = choices.filter(function (c) { return c[0] === v; })[0][2];
     }, 'Their songs'), help),
+    rowsCard([setRow('Keep their account and password', 'They can still sign in to Navidrome with the password they chose, but lose their family settings.', keepSwitch.node)]),
     el('label', { class: 'fam-label', for: 'confirm-name' }, 'Type ' + m.username + ' to confirm', confirmInput),
     error);
-    F.openSheet('Remove ' + m.displayName + '?', form, { sub: 'Their login, devices and own library are removed. Shared music is not touched.', foot: [el('button', { class: 'btn btn-ghost', type: 'button', onclick: F.closeSheet }, 'Cancel'), button] });
+    F.openSheet('Remove ' + m.displayName + '?', form, { sub: 'Shared music is not touched. Unless you keep their account, their sign-in goes too.', foot: [el('button', { class: 'btn btn-ghost', type: 'button', onclick: F.closeSheet }, 'Cancel'), button] });
     confirmInput.focus();
   }
 
