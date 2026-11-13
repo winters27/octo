@@ -486,7 +486,10 @@ transition profile, which the Octo apps use to blend one song into the next, so 
 whether or not Sounds alike is on. It reads each song once, one at a time
 with `RADIO_SONIC_PAUSE_SECONDS` between, only while nothing downloads, then keeps up with new
 and changed songs; a damaged file costs only that file. On a network mount the first pass takes
-a while, and the dashboard shows how far it is, with Pause and Start over. `SONIC_CPUS` (default
+a while, and the dashboard shows how far it is, with Pause and Start over. When an update changes
+how transition profiles are measured, it reads each song once more, in the same way; the apps
+keep the song's older profile until then, and the dashboard shows "Updating song profiles" with
+how many are done. `SONIC_CPUS` (default
 1) caps the CPUs it may use; never set it above the machine's count, or Docker will not start it.
 It starts with the rest of the stack, so an update brings it without any change to `.env`. It is
 pulled already built, like the yt-dlp shim; only without access to `ghcr.io` is it compiled
