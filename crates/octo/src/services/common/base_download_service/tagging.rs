@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use octo_core::common::{SongIdentity, dotnet};
+use octo_core::common::{SongIdentity, SongRef, dotnet};
 use octo_core::fingerprint::heart_release::HeartSong;
 use octo_core::fingerprint::recording_identity::Identity;
 use octo_core::last_fm::last_fm_radio_recommendation_service::canonical_tag;
@@ -36,6 +36,7 @@ use crate::services::common::album_identity::{LayoutTags, read_layout_tags};
 use crate::services::cover_art::CoversOnHand;
 use crate::services::fingerprint::music_brainz_client::{HeartQuestions, Lane};
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
+use crate::services::metadata::DeezerMetadataService;
 use crate::services::soulseek::soulseek_download_service::INCOMING_FOLDER_NAME;
 
 impl BaseDownloadService {
@@ -158,6 +159,9 @@ impl BaseDownloadService {
         }
 
         fill_album_from_file(song, file_path);
+        if album.is_none() && song.album_artist.as_deref().is_none_or(dotnet::is_blank) {
+            self.album_artist_from_catalog_album(song, requested).await;
+        }
         Self::apply_single_fallback(song, settings.album_from_title);
 
         // Explicit or clean, from what landed; the library server shows it on every song.
@@ -204,6 +208,104 @@ impl BaseDownloadService {
                 }
             }
         }
+    }
+
+    /// The album artist of the album a song download asked for, read from the catalog's own
+    /// tracklist of that album, when nothing before it named one. A song that keeps the album it
+    /// asked for takes no album artist from a release on another album, and the catalog's best
+    /// hit for one track of a multi-artist album (a soundtrack) is often its performer's single:
+    /// without this the track was filed under its performer, and each performer became an album
+    /// of its own on the library server. Taken only from a catalog album of exactly that name
+    /// whose tracklist holds this song, so two albums that share a name stay apart. The album the
+    /// song was listed from is opened first; otherwise up to three albums found by the name.
+    async fn album_artist_from_catalog_album(&self, song: &mut Song, requested: &RequestedIdentity) {
+        /// How many albums the name search asks for, and how many of its namesakes are opened.
+        const SEARCHED: i32 = 10;
+        const OPENED: usize = 3;
+        let Some(deezer) = &self.services.deezer else {
+            return;
+        };
+        let album_key = SongIdentity::key(&song.album);
+        if dotnet::is_blank(&requested.album) || album_key != SongIdentity::key(&requested.album) {
+            return;
+        }
+        let wanted = SongRef::new(song.title.clone(), song.artist.clone());
+        let listed = song
+            .external_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(|id| self.backend.listed_album_ids(id, &song.album))
+            .unwrap_or_default();
+        let mut opened: Vec<String> = Vec::new();
+        for id in listed.into_iter().take(1) {
+            opened.push(id.clone());
+            if self
+                .take_album_artist_of(deezer, &id, song, &album_key, &wanted)
+                .await
+            {
+                return;
+            }
+        }
+        let hits = deezer.search_albums_on(&song.album, SEARCHED, true, true).await;
+        let namesakes = hits
+            .iter()
+            .filter(|hit| SongIdentity::key(&hit.title) == album_key)
+            .filter(|hit| !opened.contains(&hit.deezer_id))
+            .take(OPENED);
+        for hit in namesakes {
+            if self
+                .take_album_artist_of(deezer, &hit.deezer_id, song, &album_key, &wanted)
+                .await
+            {
+                return;
+            }
+        }
+    }
+
+    /// Opens the catalog album `id` on the catalog's background lane and, when it is the album
+    /// `album_key` names and its tracklist holds `wanted`, gives the song that album's artist
+    /// (and the compilation flag for a Various Artists album). True when it did.
+    async fn take_album_artist_of(
+        &self,
+        deezer: &DeezerMetadataService,
+        id: &str,
+        song: &mut Song,
+        album_key: &str,
+        wanted: &SongRef,
+    ) -> bool {
+        let Some(detail) = deezer.shared_album_detail(id, true).await.detail else {
+            return false;
+        };
+        let artist = detail.artist.trim();
+        if artist.is_empty() || SongIdentity::key(&detail.title) != album_key {
+            return false;
+        }
+        let holds = detail.tracks.iter().any(|track| {
+            SongIdentity::same(
+                wanted,
+                &SongRef::new(track.title.clone(), track.artist.clone()),
+                None,
+            )
+            .is_same()
+        });
+        if !holds {
+            return false;
+        }
+        info!(
+            "'{}' is filed under '{artist}', the artist of the catalog's '{}'",
+            song.title, detail.title
+        );
+        song.album_artist = Some(artist.to_string());
+        if Self::is_various_artists(Some(artist)) {
+            song.is_compilation = true;
+        }
+        if let Some(plan) = song.tag_plan.as_deref_mut() {
+            plan.notes.push(format!(
+                "album artist '{artist}' from the catalog's tracklist of '{}'",
+                detail.title
+            ));
+        }
+        true
     }
 
     /// The old catalog enrichment, asked for on its own when identification itself failed.

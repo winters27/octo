@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::TryStreamExt;
 use octo_core::common::version_gap::{self, Against};
-use octo_core::common::{dotnet, romanize};
+use octo_core::common::{SongIdentity, dotnet, romanize};
 use octo_core::fingerprint::heart_gate::HeardSource;
 use octo_core::fingerprint::recording_identity::{RecordingKind, Takes};
 use octo_core::fingerprint::{InconclusiveReason, VerificationResult, VerificationVerdict};
@@ -2765,6 +2765,34 @@ fn accept(
     path
 }
 
+/// The catalog's ids of the albums named `album` the song was played or listed from, the most
+/// recent play first, then the most recent listing, then the album its routing was made from.
+fn listed_album_ids_of(routing: &SoulseekRouting, album: &str) -> Vec<String> {
+    let album_key = SongIdentity::key(album);
+    let mut contexts: Vec<_> = routing
+        .contexts
+        .iter()
+        .filter(|c| {
+            c.album
+                .as_deref()
+                .is_some_and(|name| SongIdentity::key(name) == album_key)
+        })
+        .collect();
+    contexts.sort_by_key(|c| std::cmp::Reverse((c.played_at, c.listed_at)));
+    let mut ids: Vec<String> = Vec::new();
+    for id in contexts
+        .iter()
+        .map(|c| c.catalog_album_id.as_str())
+        .chain(routing.external_album_id.as_deref())
+    {
+        let id = id.trim();
+        if !id.is_empty() && !ids.iter().any(|known| known == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
 #[async_trait]
 impl DownloadBackend for SoulseekDownloadService {
     fn provider_name(&self) -> &str {
@@ -2809,6 +2837,12 @@ impl DownloadBackend for SoulseekDownloadService {
             isrc: track.isrc.clone(),
             ..Default::default()
         });
+    }
+
+    fn listed_album_ids(&self, external_id: &str, album: &str) -> Vec<String> {
+        self.routing_for(external_id)
+            .map(|routing| listed_album_ids_of(&routing.snapshot(), album))
+            .unwrap_or_default()
     }
 
     // =========================================================================

@@ -281,6 +281,14 @@ pub trait DownloadBackend: Send + Sync + 'static {
     /// SAME fields restores the SAME id and is idempotent.
     fn ensure_routing_registered(&self, _track: &Song) {}
 
+    /// The catalog's ids of the albums the song `external_id` was played or listed from that
+    /// carry the name `album`, the most recent play first, then the most recent listing, then
+    /// the album its routing was made from (whose name is not known here). The default knows
+    /// none.
+    fn listed_album_ids(&self, _external_id: &str, _album: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Queue what an album walk can take from one place in one go, before the walk starts, and
     /// say which tracks that covers. Each of those tracks still goes through its own download,
     /// which takes the queued file first. The default takes nothing, so the walk is song by song.

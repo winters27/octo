@@ -323,6 +323,19 @@ impl TagPlan {
                 }
             }
             if same_album {
+                // A request that kept its album takes the album's own artist from the release
+                // when nothing named one, so one track of a multi-artist album is filed under
+                // the album's artist, not its performer.
+                if request_owns
+                    && song.album_artist.as_deref().is_none_or(is_blank)
+                    && let Some(album_artist) = c.album_artist.as_deref().filter(|a| !is_blank(a))
+                {
+                    song.album_artist = Some(album_artist.to_string());
+                    self.set("albumArtist", Some(album_artist), from);
+                    if c.is_compilation {
+                        song.is_compilation = true;
+                    }
+                }
                 self.apply_dates(song, c, from);
                 if let Some(label) = c.label.as_deref().filter(|v| !v.is_empty()) {
                     song.label = Some(label.to_string());

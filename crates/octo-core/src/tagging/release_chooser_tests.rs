@@ -460,6 +460,74 @@ fn c_request_album_is_never_overwritten_even_by_a_strong_other_album() {
     assert_eq!(song.track, Some(1));
     assert_eq!(song.catalog_number, None);
     assert_eq!(song.label, None);
+    assert_eq!(song.album_artist, None);
+}
+
+fn soundtrack_song(album_artist: Option<&str>) -> (TagRequest, TagPlan) {
+    let request = request(
+        "Performer A",
+        "Song One",
+        Some("A Film Soundtrack"),
+        Some(3),
+        None,
+        Some(200),
+    );
+    let file = FileFacts {
+        album: Some("A Film Soundtrack".into()),
+        ..peer(200, "Song One", "Performer A")
+    };
+    let evidence = evidence(request.clone(), file, &["rec-one"]);
+    let candidates = vec![ReleaseCandidate {
+        album_artist: album_artist.map(str::to_string),
+        is_compilation: album_artist == Some("Various Artists"),
+        ..Fp::new(
+            "rec-one",
+            "Song One",
+            "Performer A",
+            "A Film Soundtrack",
+            "g-ost",
+            "Album",
+            "2025-06-20",
+        )
+        .length(200)
+        .build()
+    }];
+    let plan = ReleaseChooser::choose(&evidence, &candidates, &MatchingSettings::default(), THIS_YEAR);
+    (request, plan)
+}
+
+#[test]
+fn c_a_song_that_kept_its_album_takes_that_albums_own_artist() {
+    let (request, mut plan) = soundtrack_song(Some("Film Cast"));
+    let mut song = song_for(&request);
+    plan.apply_to(&mut song);
+
+    assert_eq!(song.album, "A Film Soundtrack");
+    assert_eq!(song.artist, "Performer A");
+    assert_eq!(song.album_artist.as_deref(), Some("Film Cast"));
+    assert!(!song.is_compilation);
+    assert_eq!(
+        plan.fields.get("albumArtist").and_then(|f| f.value.as_deref()),
+        Some("Film Cast")
+    );
+
+    let (request, mut plan) = soundtrack_song(Some("Various Artists"));
+    let mut song = song_for(&request);
+    plan.apply_to(&mut song);
+    assert_eq!(song.album_artist.as_deref(), Some("Various Artists"));
+    assert!(song.is_compilation);
+}
+
+#[test]
+fn c_an_album_artist_the_song_already_has_is_kept() {
+    let (request, mut plan) = soundtrack_song(Some("Film Cast"));
+    let mut song = Song {
+        album_artist: Some("The Composer".into()),
+        ..song_for(&request)
+    };
+    plan.apply_to(&mut song);
+
+    assert_eq!(song.album_artist.as_deref(), Some("The Composer"));
 }
 
 // ---- D: the pressing the file came from, the year the album first came out ----------

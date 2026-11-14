@@ -98,6 +98,46 @@ fn candidate_allowed_no_registry_filters_nothing() {
     assert!(candidate_allowed(&hit("peer1", "a.flac"), None, true));
 }
 
+#[test]
+fn listed_albums_of_that_name_come_played_first_then_listed_then_the_routings_own() {
+    let at = |minutes: i64| Utc::now() - chrono::TimeDelta::minutes(minutes);
+    let context = |id: &str, album: &str, listed: i64, played: Option<i64>| {
+        octo_core::fingerprint::heart_gate::AlbumContext {
+            user: "ann".into(),
+            client: None,
+            catalog_album_id: id.into(),
+            album: Some(album.into()),
+            disc: None,
+            track: None,
+            total: None,
+            isrc: None,
+            explicit: None,
+            listed_at: at(listed),
+            played_at: played.map(at),
+        }
+    };
+    let routing = SoulseekRouting {
+        kind: RoutingKind::Song,
+        external_album_id: Some("70".into()),
+        contexts: vec![
+            context("10", "A Film Soundtrack", 50, None),
+            context("20", "Another Soundtrack", 1, Some(1)),
+            context("30", "a film soundtrack", 5, None),
+            context("40", "A Film Soundtrack", 60, Some(30)),
+            context("30", "A Film Soundtrack", 70, None),
+            context(" ", "A Film Soundtrack", 2, None),
+        ],
+        ..Default::default()
+    };
+
+    assert_eq!(
+        listed_album_ids_of(&routing, "A Film Soundtrack"),
+        vec!["40", "30", "10", "70"]
+    );
+    assert_eq!(listed_album_ids_of(&routing, "Another Album"), vec!["70"]);
+    assert!(listed_album_ids_of(&SoulseekRouting::default(), "A Film Soundtrack").is_empty());
+}
+
 // ---- The resolve retry ---------------------------------------------------------------------
 //
 // slskd marks a transfer Succeeded before moving the file out of its incomplete

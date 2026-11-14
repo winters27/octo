@@ -37,6 +37,8 @@ pub(crate) struct TestBackend {
     pub landed_verdict: Mutex<Option<bool>>,
     /// The files of the song the download's gates judged that way.
     pub judged: Mutex<Vec<String>>,
+    /// The catalog album ids every song was listed from, whatever its album's name.
+    pub listed_albums: Mutex<Vec<String>>,
 }
 
 impl TestBackend {
@@ -76,6 +78,10 @@ impl DownloadBackend for TestBackend {
     /// An album id the test catalog gives as `test-album:<id>`.
     fn extract_external_id_from_album_id(&self, album_id: &str) -> Option<String> {
         album_id.strip_prefix(TEST_ALBUM).map(str::to_string)
+    }
+
+    fn listed_album_ids(&self, _external_id: &str, _album: &str) -> Vec<String> {
+        self.listed_albums.lock().clone()
     }
 
     async fn judge_landed(

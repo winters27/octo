@@ -543,6 +543,132 @@ async fn catalog_only_medium_fills_blanks_only_no_release_facts_written() {
     assert!(!report.fields.contains_key("album"));
 }
 
+// ---- G2: one song of a multi-artist album ---------------------------------------------------
+
+/// The catalog for one song of a film soundtrack downloaded on its own: its best hit for the
+/// song is the performer's single (album 5), and a name search for the soundtrack finds album 7,
+/// listed under `album_artist` with `tracks`. Album 9 is the same soundtrack under "Listed Cast",
+/// holding the song too.
+fn soundtrack_routes(album_artist: &str, tracks: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "/search/album?q=",
+            r#"{"data":[{"id":7,"title":"A Film Soundtrack","record_type":"album","nb_tracks":2,"artist":{"name":"ALBUM_ARTIST"}}]}"#
+                .replace("ALBUM_ARTIST", album_artist),
+        ),
+        ("/album/7/tracks", format!(r#"{{"data":[{tracks}]}}"#)),
+        (
+            "/album/7",
+            r#"{"id":7,"title":"A Film Soundtrack","record_type":"album","nb_tracks":2,"release_date":"2025-06-20","artist":{"name":"ALBUM_ARTIST"}}"#
+                .replace("ALBUM_ARTIST", album_artist),
+        ),
+        (
+            "/album/9/tracks",
+            r#"{"data":[{"id":51,"title":"Song One","duration":200,"artist":{"name":"Performer A"}}]}"#
+                .to_string(),
+        ),
+        (
+            "/album/9",
+            r#"{"id":9,"title":"A Film Soundtrack","record_type":"album","nb_tracks":1,"release_date":"2025-06-20","artist":{"name":"Listed Cast"}}"#
+                .to_string(),
+        ),
+        (
+            "/album/5",
+            r#"{"id":5,"record_type":"single","release_date":"2025-06-01","nb_tracks":1,"artist":{"name":"Performer A"}}"#
+                .to_string(),
+        ),
+        ("/track/51", r#"{"id":51,"track_position":1,"disk_number":1}"#.to_string()),
+        (
+            "/search?q=",
+            r#"{"data":[{"id":51,"title":"Song One","duration":200,"album":{"id":5,"title":"Song One"},"artist":{"name":"Performer A"}}]}"#
+                .to_string(),
+        ),
+    ]
+}
+
+/// Song One of the soundtrack, downloaded on its own in `layout`, with these catalog album ids
+/// as the albums it was listed from. The temp folder lives as long as the returned `Tagging`.
+async fn soundtrack_song(
+    routes: Vec<(&'static str, String)>,
+    layout: FolderStructure,
+    listed: &[&str],
+) -> (Tagging, String) {
+    let song = Song {
+        artist: "Performer A".into(),
+        title: "Song One".into(),
+        album: "A Film Soundtrack".into(),
+        track: Some(1),
+        ..Default::default()
+    };
+    let options = Options {
+        layout,
+        ..Default::default()
+    };
+    let tagging = build_with(vec![("1", song)], serve(routes).await, options).await;
+    *tagging.harness.backend.listed_albums.lock() = listed.iter().map(|id| id.to_string()).collect();
+    let root = tagging.root().to_path_buf();
+    tagging.harness.backend.land(move |_, _| {
+        landed_flac(&root, "peer share", |file| {
+            file.set_title(Some("Song One"));
+            file.set_performers(&["Performer A".to_string()]);
+            file.set_album(Some("A Film Soundtrack"));
+        })
+    });
+    let path = tagging.download("1").await.expect("downloaded");
+    (tagging, path)
+}
+
+const SOUNDTRACK_TRACKS: &str = r#"{"id":51,"title":"Song One","duration":200,"artist":{"name":"Performer A"}},
+    {"id":52,"title":"Song Two","duration":180,"artist":{"name":"Performer B"}}"#;
+
+#[tokio::test]
+async fn one_song_of_a_soundtrack_is_filed_under_the_soundtracks_artist() {
+    let routes = soundtrack_routes("Film Cast", SOUNDTRACK_TRACKS);
+    let (_tagging, path) = soundtrack_song(routes, FolderStructure::Flat, &[]).await;
+
+    assert_eq!(vorbis(&path, "ALBUM").as_deref(), Some("A Film Soundtrack"));
+    assert_eq!(vorbis(&path, "ALBUMARTIST").as_deref(), Some("Film Cast"));
+    assert_eq!(vorbis(&path, "ARTIST").as_deref(), Some("Performer A"));
+}
+
+#[tokio::test]
+async fn an_album_of_the_same_name_that_does_not_list_the_song_lends_no_artist() {
+    let tracks = r#"{"id":81,"title":"Something Else","duration":210,"artist":{"name":"Someone Else"}}"#;
+    let routes = soundtrack_routes("Someone Else", tracks);
+    let (_tagging, path) = soundtrack_song(routes, FolderStructure::Flat, &[]).await;
+
+    assert_eq!(vorbis(&path, "ALBUM").as_deref(), Some("A Film Soundtrack"));
+    assert_eq!(vorbis(&path, "ALBUMARTIST").as_deref(), Some("Performer A"));
+}
+
+#[tokio::test]
+async fn the_album_a_song_was_listed_from_is_asked_before_any_namesake() {
+    // Album 7, the name search's namesake, lists the song too, under another artist.
+    let routes = soundtrack_routes("Namesake Cast", SOUNDTRACK_TRACKS);
+    let (_tagging, path) = soundtrack_song(routes, FolderStructure::Flat, &["9"]).await;
+
+    assert_eq!(vorbis(&path, "ALBUMARTIST").as_deref(), Some("Listed Cast"));
+}
+
+#[tokio::test]
+async fn one_song_of_a_soundtrack_lands_in_the_soundtracks_album_folder() {
+    let routes = soundtrack_routes("Film Cast", SOUNDTRACK_TRACKS);
+    let (_tagging, path) = soundtrack_song(routes, FolderStructure::Organized, &[]).await;
+
+    assert_eq!(vorbis(&path, "ALBUMARTIST").as_deref(), Some("Film Cast"));
+    let path = Path::new(&path);
+    let album_folder = path.parent().expect("an album folder");
+    let artist_folder = album_folder.parent().expect("an artist folder");
+    assert_eq!(
+        album_folder.file_name().and_then(|n| n.to_str()),
+        Some("A Film Soundtrack")
+    );
+    assert_eq!(
+        artist_folder.file_name().and_then(|n| n.to_str()),
+        Some("Film Cast")
+    );
+}
+
 // ---- H: the database down and the catalog throttled ---------------------------------------
 
 #[tokio::test]
