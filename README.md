@@ -1209,6 +1209,11 @@ Project layout:
 
 [GPL-3.0](LICENSE)
 
+Octo ships [Inter](https://github.com/rsms/inter) 4.1 under the SIL Open Font License: the
+dashboard and Family pages load it from Octo itself (`octo/wwwroot/fonts/`, license in
+`octo/wwwroot/fonts/OFL.txt`), and list covers are drawn with it (`licenses/Inter-OFL.txt` in
+the image).
+
 ## Acknowledgments
 
 - [**Navidrome**](https://www.navidrome.org/): the music server Octo proxies.

@@ -1,0 +1,36 @@
+/*
+ * Inter 4.1 (https://github.com/rsms/inter), served by Octo itself under the SIL Open Font
+ * License (OFL.txt beside this file), so the dashboard and the Family pages draw without
+ * reaching any other host.
+ *
+ * Both names the pages ask for come from the one variable font: 'Inter var' where the browser
+ * supports font variations (admin.css switches to it under @supports), 'Inter' otherwise.
+ */
+@font-face {
+  font-family: 'Inter var';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('InterVariable.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Inter var';
+  font-style: italic;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('InterVariable-Italic.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('InterVariable.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Inter';
+  font-style: italic;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('InterVariable-Italic.woff2') format('woff2');
+}

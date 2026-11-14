@@ -574,6 +574,10 @@ async fn the_real_admin_ui_is_served_with_content_hash_etags() {
         "/admin/admin.js",
         "/admin/icons.svg",
         "/Assets/octo_logo.png",
+        "/fonts/inter.css",
+        "/fonts/InterVariable.woff2",
+        "/fonts/InterVariable-Italic.woff2",
+        "/fonts/OFL.txt",
     ] {
         assert!(assets.get(url).is_some(), "{url} missing");
     }
@@ -603,6 +607,9 @@ async fn the_real_admin_ui_is_served_with_content_hash_etags() {
         ("/admin/admin.js", "text/javascript"),
         ("/admin/icons.svg", "image/svg+xml"),
         ("/Assets/octo_logo.png", "image/png"),
+        ("/fonts/inter.css", "text/css"),
+        ("/fonts/InterVariable.woff2", "font/woff2"),
+        ("/fonts/InterVariable-Italic.woff2", "font/woff2"),
     ] {
         let r = send_to(&app, Method::GET, url, &[]).await;
         assert_eq!(r.status, StatusCode::OK, "{url}");
@@ -616,6 +623,123 @@ async fn the_real_admin_ui_is_served_with_content_hash_etags() {
     )
     .await;
     assert_eq!(r.header("content-encoding"), Some("br"));
+}
+
+/// Every place in a web file that pulls in a stylesheet, a font or a script from another host:
+/// a `<link>` or `<script>` tag's `href` or `src`, a CSS `url(...)` or `@import` (in a
+/// stylesheet, a page's own style or a script that sets one), and a JavaScript `import`.
+fn outside_loads(text: &str, script: bool) -> Vec<String> {
+    let lower = text.to_ascii_lowercase();
+    let is_outside = |rest: &str| {
+        let rest = rest.trim_start().trim_start_matches(['"', '\'']).trim_start();
+        rest.starts_with("http://") || rest.starts_with("https://") || rest.starts_with("//")
+    };
+    let mut found = Vec::new();
+    for tag in ["<link", "<script"] {
+        let mut from = 0;
+        while let Some(at) = lower[from..].find(tag) {
+            let start = from + at;
+            let end = lower[start..].find('>').map_or(lower.len(), |e| start + e);
+            let element = &lower[start..end];
+            if ["href=", "src="].iter().any(|attr| {
+                element
+                    .find(attr)
+                    .is_some_and(|a| is_outside(&element[a + attr.len()..]))
+            }) {
+                found.push(text[start..end].to_string());
+            }
+            from = end;
+        }
+    }
+    let mut markers = vec!["url(", "@import"];
+    if script {
+        markers.extend(["from ", "import(", "importscripts("]);
+    }
+    for marker in markers {
+        for (at, _) in lower.match_indices(marker) {
+            let rest = &lower[at + marker.len()..];
+            if is_outside(rest) {
+                let end = rest.find(['\n', ';', ')']).unwrap_or(rest.len());
+                found.push(text[at..at + marker.len() + end].to_string());
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn the_web_pages_load_nothing_from_another_host() {
+    // The check itself finds each kind of outside load.
+    for (sample, script) in [
+        (
+            r#"<link rel="stylesheet" href="https://rsms.me/inter/inter.css" />"#,
+            false,
+        ),
+        (r#"<link rel="preconnect" href="//rsms.me" />"#, false),
+        (r#"<script defer src='http://cdn.example/x.js'></script>"#, false),
+        (
+            r#"@font-face { src: url( "https://x.example/a.woff2" ) format('woff2'); }"#,
+            false,
+        ),
+        (r#"@import "https://x.example/a.css";"#, false),
+        (r#"import { a } from "https://x.example/a.js";"#, true),
+        (r#"const m = await import('https://x.example/m.js');"#, true),
+    ] {
+        assert_eq!(outside_loads(sample, script).len(), 1, "{sample}");
+    }
+    for (sample, script) in [
+        (r#"<link rel="stylesheet" href="/fonts/inter.css" />"#, false),
+        (
+            r#"<a href="https://www.last.fm/api/account/create">key</a>"#,
+            false,
+        ),
+        (r#"<input placeholder="https://music.example.com" />"#, false),
+        (r#"src: url('InterVariable.woff2') format('woff2');"#, false),
+        (
+            r#"Free from <a href="https://acoustid.org/">acoustid.org</a>."#,
+            false,
+        ),
+        (r#"import test from 'node:test';"#, true),
+    ] {
+        assert!(outside_loads(sample, script).is_empty(), "{sample}");
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../octo/wwwroot");
+    let mut dirs = vec![root.clone()];
+    let mut checked = 0;
+    let mut found = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the web root reads") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !["html", "htm", "css", "js", "mjs"].contains(&ext.as_str()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("a web file reads as text");
+            checked += 1;
+            for load in outside_loads(&text, ext == "js" || ext == "mjs") {
+                found.push(format!("{}: {load}", path.display()));
+            }
+        }
+    }
+    assert!(
+        checked >= 10,
+        "only {checked} web files were found under {}",
+        root.display()
+    );
+    assert!(
+        found.is_empty(),
+        "loaded from another host:\n{}",
+        found.join("\n")
+    );
 }
 
 // ---- /admin, /, the catch-all ----

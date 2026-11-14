@@ -17,11 +17,14 @@ use super::admin_headers::is_dashboard_path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalPort(pub u16);
 
-fn is_assets_path(path: &str) -> bool {
-    let prefix = "/Assets";
-    path.len() >= prefix.len()
-        && path[..prefix.len()].eq_ignore_ascii_case(prefix)
-        && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
+/// Whether a path is the logo under `/Assets` or the pages' font under `/fonts`, which both
+/// ports serve: the dashboard and the Family pages draw with them.
+fn is_shared_path(path: &str) -> bool {
+    ["/Assets", "/fonts"].iter().any(|prefix| {
+        path.len() >= prefix.len()
+            && path[..prefix.len()].eq_ignore_ascii_case(prefix)
+            && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
+    })
 }
 
 /// The answer when the request is on the wrong port for its path: a redirect to the dashboard,
@@ -36,9 +39,8 @@ pub fn refuse(path: &str, local_port: Option<u16>, admin_port: u16) -> Option<Re
             .insert(header::LOCATION, HeaderValue::from_static("/admin/index.html"));
         return Some(res);
     }
-    // The logo under /Assets is shared by both.
     let allowed = if on_admin_port {
-        admin || is_assets_path(path)
+        admin || is_shared_path(path)
     } else {
         !admin
     };
@@ -110,7 +112,7 @@ mod tests {
 
     #[test]
     fn the_admin_port_serves_only_the_dashboard() {
-        let cases: [(u16, &str, u16); 8] = [
+        let cases: [(u16, &str, u16); 12] = [
             (8080, "/admin/index.html", 404),
             (8080, "/api/admin/status", 404),
             (8080, "/rest/ping", 0),
@@ -119,6 +121,10 @@ mod tests {
             (5275, "/api/admin/status", 0),
             (5275, "/admin/index.html", 0),
             (5275, "/Assets/octo_logo.png", 0),
+            (5275, "/fonts/inter.css", 0),
+            (8080, "/fonts/InterVariable.woff2", 0),
+            (5275, "/fontsx/inter.css", 404),
+            (5275, "/family/index.html", 404),
         ];
         for (local_port, path, answered) in cases {
             let refused = refuse(path, Some(local_port), 5275);
