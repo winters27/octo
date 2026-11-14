@@ -230,9 +230,9 @@ impl BaseDownloadService {
             return;
         }
         let wanted = SongRef::new(song.title.clone(), song.artist.clone());
-        let listed = song
-            .external_id
-            .as_deref()
+        let listed = Some(requested.track_id.as_str())
+            .filter(|id| !id.is_empty())
+            .or(song.external_id.as_deref())
             .filter(|id| !id.is_empty())
             .map(|id| self.backend.listed_album_ids(id, &song.album))
             .unwrap_or_default();

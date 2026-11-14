@@ -119,6 +119,8 @@ pub struct RequestedIdentity {
     pub album_pick: Arc<OnceLock<(String, String)>>,
     /// The download's layout and root, read once before identify.
     pub placing: Arc<OnceLock<Placing>>,
+    /// The id the download was asked for by (the backend's own track id); empty when unknown.
+    pub track_id: String,
 }
 
 impl RequestedIdentity {
@@ -130,6 +132,7 @@ impl RequestedIdentity {
             track,
             album_pick: Arc::default(),
             placing: Arc::default(),
+            track_id: String::new(),
         }
     }
 }
@@ -1454,7 +1457,10 @@ impl BaseDownloadService {
 
         // Snapshot before anything can correct it: with NameFromMatch off this is still what
         // names the file, which is how every existing library was built.
-        let requested = RequestedIdentity::new(&song.artist, &song.title, &song.album, song.track);
+        let requested = RequestedIdentity {
+            track_id: external_id.to_string(),
+            ..RequestedIdentity::new(&song.artist, &song.title, &song.album, song.track)
+        };
         self.start_album_pick(&song, &requested);
 
         // A song fetched ahead earlier is taken from its folder instead of downloaded again, with

@@ -653,9 +653,25 @@ async fn the_album_a_song_was_listed_from_is_asked_before_any_namesake() {
 #[tokio::test]
 async fn one_song_of_a_soundtrack_lands_in_the_soundtracks_album_folder() {
     let routes = soundtrack_routes("Film Cast", SOUNDTRACK_TRACKS);
-    let (_tagging, path) = soundtrack_song(routes, FolderStructure::Organized, &[]).await;
+    let (tagging, path) = soundtrack_song(routes, FolderStructure::Organized, &[]).await;
 
-    assert_eq!(vorbis(&path, "ALBUMARTIST").as_deref(), Some("Film Cast"));
+    let mut files = Vec::new();
+    let mut dirs = vec![tagging.root().to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("lists").flatten() {
+            let found = entry.path();
+            if found.is_dir() {
+                dirs.push(found);
+            } else {
+                files.push(found.display().to_string());
+            }
+        }
+    }
+    assert_eq!(
+        vorbis(&path, "ALBUMARTIST").as_deref(),
+        Some("Film Cast"),
+        "{path}, among {files:?}"
+    );
     let path = Path::new(&path);
     let album_folder = path.parent().expect("an album folder");
     let artist_folder = album_folder.parent().expect("an artist folder");
