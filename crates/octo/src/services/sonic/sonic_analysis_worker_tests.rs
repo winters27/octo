@@ -1309,6 +1309,35 @@ async fn the_updates_count_is_of_the_songs_the_pass_can_still_read() {
     assert_eq!(updating(&t), None);
 }
 
+/// Guard: fails when the update's count takes in a song whose reading failed lately at its
+/// size, which the pass leaves until RETRY_FAILED_AFTER: N would stay below M to the pass's end.
+#[tokio::test]
+async fn the_updates_count_leaves_out_a_song_whose_reading_failed_lately() {
+    let t = reread_pass(&["a", "b", "c"]).await;
+    // A reading of b's file kept its profile, and its sound could not be read.
+    let stamp = t.store.read(|s| s.songs["b"].stamp.clone());
+    let at_utc = *t.now.lock();
+    t.store.write(|s| {
+        s.songs.shift_remove("b");
+        s.failed.insert(
+            "b".into(),
+            SonicFailure {
+                stamp,
+                error: "the file is damaged".into(),
+                at_utc,
+            },
+        );
+    });
+    let updating = |t: &T| t.worker.status().updating_profiles.map(|u| (u.done, u.total));
+    t.tick().await;
+    assert_eq!(updating(&t), Some((1, 2)));
+    t.tick().await;
+    assert_eq!(t.sidecar.analysed()[3..], ["a.flac", "c.flac"]);
+    // N reaches M before the pass's end.
+    assert_eq!(t.store.read(|s| s.pass), 1);
+    assert_eq!(updating(&t), None);
+}
+
 /// Guard: fails when songs read again wait for the minute's save of the index: a crash in the
 /// update loses them, they are read once more, and the dashboard's count goes back.
 #[tokio::test]

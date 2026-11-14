@@ -1156,7 +1156,9 @@ impl SonicAnalysisWorker {
     /// How far this pass has come reading songs again for `revision`. A profile below it counts
     /// only while the pass can still read it: not a song no longer in the pass's list (forgotten
     /// at its end), nor one the pass left out, nor one from outside the library no longer in line
-    /// (its file was not found), nor one whose reading for `revision` failed lately.
+    /// (its file was not found), nor one whose reading for `revision` failed lately, nor a library
+    /// song whose reading failed lately at its profile's size, which the walk leaves as `wanted`
+    /// does.
     fn profiles_progress(&self, revision: i32, now: DateTime<Utc>) -> RevisionProgress {
         let pass = self.pass.lock();
         let listed: HashSet<&str> = pass.rows.iter().flatten().map(|row| row.id.as_str()).collect();
@@ -1167,18 +1169,28 @@ impl SonicAnalysisWorker {
             .chain(landed.iter())
             .map(|(key, _)| key.as_str())
             .collect();
-        self.transitions.progress(revision, |key, entry| {
-            let failed = entry.failed.as_ref().is_some_and(|failed| {
-                failed.stamp == entry.stamp
-                    && failed.revision >= revision
-                    && now - failed.at_utc < RETRY_FAILED_AFTER
-            });
-            let reachable = if entry.path.is_some() {
-                in_line.contains(key)
-            } else {
-                listed.contains(key) && !pass.skipped.contains(key)
-            };
-            !failed && reachable
+        // The size in a file's stamp, `size:ticks`.
+        fn size(stamp: &str) -> Option<&str> {
+            stamp.split_once(':').map(|(size, _)| size)
+        }
+        self.store.read(|s| {
+            self.transitions.progress(revision, |key, entry| {
+                let failed = entry.failed.as_ref().is_some_and(|failed| {
+                    failed.stamp == entry.stamp
+                        && failed.revision >= revision
+                        && now - failed.at_utc < RETRY_FAILED_AFTER
+                });
+                let reachable = if entry.path.is_some() {
+                    in_line.contains(key)
+                } else {
+                    let sound_failed = s.failed.get(key).is_some_and(|lately| {
+                        size(&lately.stamp).is_some_and(|at| size(&entry.stamp) == Some(at))
+                            && now - lately.at_utc < RETRY_FAILED_AFTER
+                    });
+                    listed.contains(key) && !pass.skipped.contains(key) && !sound_failed
+                };
+                !failed && reachable
+            })
         })
     }
 
