@@ -28,7 +28,7 @@ use octo_core::charts::chart_settings::{
 };
 use octo_core::charts::top_songs::{
     APPLE_SOURCE, CatalogTrack, CountedTrack, DEEZER_SOURCE, MAX_ROWS, PlannedRow, library_hit,
-    library_query, merge, one_row_per_library_song,
+    library_query, library_title_query, merge, one_row_per_library_song,
 };
 use octo_core::common::dotnet::is_blank;
 use octo_core::common::{SongIdentity, skipped_takes};
@@ -1101,6 +1101,7 @@ impl TopSongsService {
         // Plain futures behind a semaphore, not a stream combinator: a combinator's closures
         // make a handler's future fail rustc's Send check ("not general enough").
         let gate = tokio::sync::Semaphore::new(LIBRARY_SEARCHES_AT_ONCE);
+        let search_songs = &search_songs;
         let searches = rows.iter().map(|row| {
             let (artist, title) = (row.song.artist.clone(), row.song.title.clone());
             let query = library_query(&artist, &title);
@@ -1110,7 +1111,17 @@ impl TopSongsService {
                 let search = search?;
                 let _turn = gate.acquire().await.ok()?;
                 let hits = search.await?;
-                let hit = library_hit(&artist, &title, &hits).cloned();
+                let mut hit = library_hit(&artist, &title, &hits).cloned();
+                if hit.is_none()
+                    && let Some(by_title) = library_title_query(&artist, &title)
+                {
+                    // The file may be credited to another name of the artist ("Ye" for "Kanye
+                    // West"); the title alone finds it, and the same rule judges the hits. Held
+                    // inside this turn, so searches stay four at a time; the one miss recorded
+                    // below covers both, so the retry is not repeated.
+                    let by_title_hits = search_songs(by_title).await?;
+                    hit = library_hit(&artist, &title, &by_title_hits).cloned();
+                }
                 session.record(&query, hit.as_ref());
                 hit
             }

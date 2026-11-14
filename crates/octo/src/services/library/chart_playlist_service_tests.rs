@@ -1234,8 +1234,9 @@ async fn a_new_own_country_leaves_pinned_lists_be() {
 
     assert_eq!(
         lists.searches().await - searched,
-        5,
-        "only the five songs of her own list are searched again"
+        10,
+        "only the five songs of her own list are searched again, each by name and, the library \
+         having none, once more by title"
     );
     let ids = |songs: Vec<Song>| songs.into_iter().map(|s| s.id).collect::<Vec<_>>();
     assert_eq!(ids(lists.service.outside_songs("alice", "34@jp")), ids(japan));

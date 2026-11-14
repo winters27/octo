@@ -169,6 +169,32 @@ fn library_query_is_the_main_artist_and_the_bare_title() {
 }
 
 #[test]
+fn library_title_query_is_the_bare_title_and_never_repeats_the_first_query() {
+    assert_eq!(
+        library_title_query("Kanye West", "Through the Wire").as_deref(),
+        Some("Through the Wire")
+    );
+    assert_eq!(
+        library_title_query("Daft Punk", "Get Lucky (feat. Pharrell Williams)").as_deref(),
+        Some("Get Lucky")
+    );
+    // No artist: the first query already was the title alone.
+    assert_eq!(library_title_query("", "Heartless"), None);
+    assert_eq!(library_title_query("Kanye West", ""), None);
+}
+
+#[test]
+fn a_title_search_hit_by_another_artist_is_not_the_row() {
+    let hits = [
+        json!({"id": "a", "artist": "Some Band", "title": "Through the Wire"}),
+        json!({"id": "b", "artist": "Ye", "title": "Through the Wire"}),
+    ];
+    let hit = library_hit("Kanye West", "Through the Wire", &hits).unwrap();
+    assert_eq!(hit["id"], "b");
+    assert!(library_hit("Kanye West", "Through the Wire", &hits[..1]).is_none());
+}
+
+#[test]
 fn match_library_finds_the_same_recording_only_and_gives_a_library_song_to_one_row() {
     let rows = [
         ("Air", "Sexy Boy"),

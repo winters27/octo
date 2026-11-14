@@ -103,6 +103,18 @@ impl LibraryMatchCache {
         }
     }
 
+    /// A session for a listener under a given library state, without reading the library.
+    #[cfg(test)]
+    pub fn session_for_tests(&self, username: &str, key: &str) -> MatchSession<'_> {
+        MatchSession {
+            kept: Some(Kept {
+                cache: self,
+                user: username.to_string(),
+                key: key.to_string(),
+            }),
+        }
+    }
+
     /// The listener's decisions under `key`, those made under another state dropped first.
     fn with_user<R>(&self, user: &str, key: &str, f: impl FnOnce(&mut Decided, usize) -> R) -> R {
         let mut by_user = self.by_user.lock();

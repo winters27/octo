@@ -213,6 +213,26 @@ pub fn library_query(artist: &str, title: &str) -> String {
     format!("{main} {core}").trim().to_string()
 }
 
+/// The second thing the library is searched with when the first found no copy: the bare title.
+/// Navidrome indexes a song under the artist credit the file carries, and wants every word it is
+/// given, so a renamed artist ("Kanye West" asked for, the file credited to "Ye") finds nothing
+/// under the name asked. The title alone finds those; [`library_hit`] still decides, by the same
+/// rule as for the first search, so a different artist's song of that title never counts. None
+/// when it would repeat the first query (no artist to drop) or is too short to be worth a search.
+pub fn library_title_query(artist: &str, title: &str) -> Option<String> {
+    let mut core = SongIdentity::parse_title(title, Some(artist)).core;
+    if core.trim().is_empty() {
+        core = title.to_string();
+    }
+    let core = core.trim().to_string();
+    if core.chars().filter(|c| c.is_alphanumeric()).count() < 2
+        || core.eq_ignore_ascii_case(&library_query(artist, title))
+    {
+        return None;
+    }
+    Some(core)
+}
+
 /// The first of a library search's songs that is the row's own recording, by the rule radio
 /// uses to play a library copy in place of an outside one. Hits without an id never count.
 pub fn library_hit<'a>(artist: &str, title: &str, hits: &'a [Value]) -> Option<&'a Value> {
