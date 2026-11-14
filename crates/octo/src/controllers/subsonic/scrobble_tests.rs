@@ -29,6 +29,7 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 use super::test_app::*;
 use crate::app::AppState;
 use crate::http::pipeline::App;
+use crate::services::common::listening_plays::ListeningPlays;
 use crate::services::last_fm::{LastFmScrobbleService, ScrobbleTime, ScrobbleTuning};
 use crate::services::listen_brainz::ListenBrainzService;
 use crate::services::subsonic::{RecentScrobbles, RequestIdentity};
@@ -457,6 +458,35 @@ async fn outside_song_completed_play_is_scrobbled() {
     assert_eq!(call["duration[0]"], "154");
     assert_eq!(call["timestamp[0]"], played_at.to_string());
     assert!(fixture.last_fm.calls_to("track.updateNowPlaying").is_empty());
+}
+
+#[tokio::test]
+async fn a_scrobble_tells_listen_first_what_the_player_did() {
+    let fixture = Fixture::new(false, false).await;
+    let first = fixture.register_outside_song("Be Nice 2 Me", 154);
+    let second = fixture.register_outside_song("Obedient", 160);
+    let listening = fixture.state.heart_acquisition_coordinator.listening();
+    let player = ListeningPlays::player_key("bob", None, "Octo");
+    let scrobble = |c: &str, id: &str, submission: Option<bool>| {
+        let submission = submission.map(|s| format!("&submission={s}")).unwrap_or_default();
+        format!("/rest/scrobble?u=bob&t=token&s=salt&f=json&c={c}&id={id}{submission}")
+    };
+
+    let _wait = listening.hold(&player, &first, Duration::from_secs(600)).unwrap();
+    // Its own now-playing, another app's, and a scrobble that sends no submission change nothing.
+    fixture.get(&scrobble("Octo", &first, Some(false))).await;
+    fixture.get(&scrobble("DSub", &second, Some(false))).await;
+    fixture.get(&scrobble("Octo", &first, None)).await;
+    assert_eq!(listening.waiting_song(&player), Some(first.clone()));
+
+    // A finish at once is a skip.
+    fixture.get(&scrobble("Octo", &first, Some(true))).await;
+    assert!(listening.waiting_song(&player).is_none());
+
+    // Another song's now-playing on the same player drops the wait too.
+    let _wait = listening.hold(&player, &first, Duration::from_secs(600)).unwrap();
+    fixture.get(&scrobble("Octo", &second, Some(false))).await;
+    assert!(listening.waiting_song(&player).is_none());
 }
 
 #[tokio::test]

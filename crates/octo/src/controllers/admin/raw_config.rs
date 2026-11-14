@@ -125,6 +125,7 @@ const CONFIG_SOURCE_KEYS: &[&str] = &[
     "Subsonic:WaitForLosslessOnPlay",
     "Subsonic:LosslessWaitTimeoutSeconds",
     "Subsonic:DownloadOnPlay",
+    "Subsonic:DownloadOnPlayAfterSeconds",
     "Subsonic:LidarrAlbumOnPlay",
     "Subsonic:DownloadSource",
     "Subsonic:AutoDetectDownloadPath",

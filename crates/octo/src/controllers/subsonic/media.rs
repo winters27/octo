@@ -41,6 +41,7 @@ use crate::http::error::{AppError, AppResult, json_status, problem};
 use crate::http::routes::RouteSet;
 use crate::http::static_files::{RangeOutcome, parse_range};
 use crate::services::common::heart_acquisition_coordinator::track_base_key;
+use crate::services::common::listening_plays::ListeningPlays;
 use crate::services::common::track_acquisition_queue::{Completion, PlayOutcome};
 use crate::services::cover_art::local_cover_cache::{CoverPicture, Fetched, NotKept};
 use crate::services::family::{FamilyCaller, LibraryScope, audio_gate, family_caller};
@@ -77,6 +78,13 @@ pub fn routes() -> RouteSet {
 
 /// Downloads on-the-fly if needed, or streams directly in Stream mode.
 pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
+    serve_stream(state, req, true).await
+}
+
+/// `stream`'s answer. `player_stream`: the request is a player's stream, so one from the first
+/// byte is that player starting the song; `download` serves an outside song through here too,
+/// and a download starts nothing.
+async fn serve_stream(state: AppState, req: Request, player_stream: bool) -> AppResult {
     let caller = family_caller(req.extensions()).cloned();
     let address = req
         .extensions()
@@ -111,6 +119,9 @@ pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
         "STREAM-IN client={client_name} id={id} isExternal={} range={range_in} ua={ua_in}",
         if is_external { "True" } else { "False" }
     );
+    if player_stream {
+        note_listening(&state, &call, address, &id).await;
+    }
 
     if !is_external {
         let response = call.proxy.relay_stream(&call.parameters).await;
@@ -231,6 +242,7 @@ pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
         &state,
         &call,
         caller.as_ref(),
+        address,
         &provider,
         &external_id,
         &id,
@@ -247,6 +259,20 @@ pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
             ))
         }
     }
+}
+
+/// A player's stream from its first byte is that player starting the song, which drops the wait
+/// Download on play holds there for another song. Looked at only while some play waits.
+async fn note_listening(state: &AppState, call: &SubsonicCall, address: Option<IpAddr>, id: &str) {
+    let listening = state.heart_acquisition_coordinator.listening();
+    if listening.is_empty() || !is_first_byte_request(call.method().as_str(), call.header("Range").as_deref())
+    {
+        return;
+    }
+    let Ok(who) = signed_in_user(state, call).await else {
+        return;
+    };
+    listening.started(&ListeningPlays::player_key(&who, address, call.param("c")), id);
 }
 
 /// A play from the first byte tells the songs fetched ahead what is playing, in the background:
@@ -636,7 +662,8 @@ async fn start_play_acquisition(
     let who = signed_in_user(state, call).await.map_err(anyhow::Error::new)?;
     let proven_somehow = heard.is_some() || state.acoust_id.is_on();
     if first_byte {
-        state.heart_acquisition_coordinator.queue_play_heard(
+        state.heart_acquisition_coordinator.queue_play_from(
+            &ListeningPlays::player_key(&who, play.address, call.param("c")),
             play.provider,
             play.external_id,
             requester_for(state, Some(&who)).as_deref(),
@@ -722,7 +749,7 @@ pub async fn download(State(state): State<AppState>, req: Request) -> AppResult 
     let outside = state.local_library.parse_song_id(call.param("id")).0;
     let req = Request::from_parts(parts, Body::from(body));
     if outside {
-        stream(State(state), req).await
+        serve_stream(state, req, false).await
     } else {
         Ok(catch_all::catch_all(State(state), req).await)
     }
@@ -735,6 +762,7 @@ async fn play_external(
     state: &AppState,
     call: &SubsonicCall,
     caller: Option<&FamilyCaller>,
+    address: Option<IpAddr>,
     provider: &str,
     external_id: &str,
     id: &str,
@@ -756,7 +784,8 @@ async fn play_external(
             return Ok::<(), anyhow::Error>(());
         }
         let who = signed_in_user(state, call).await.map_err(anyhow::Error::new)?;
-        state.heart_acquisition_coordinator.queue_play_heard(
+        state.heart_acquisition_coordinator.queue_play_from(
+            &ListeningPlays::player_key(&who, address, call.param("c")),
             provider,
             external_id,
             requester_for(state, Some(&who)).as_deref(),

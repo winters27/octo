@@ -20,6 +20,7 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 use super::caller_checks::is_first_byte_request;
 use super::media::draws_its_own_marks_in;
 use super::test_app::*;
+use crate::services::common::listening_plays::ListeningPlays;
 use crate::services::fingerprint::music_brainz_client::MusicBrainzClient;
 
 /// Navidrome accepting every sign-in: these tests are about what plays, not who.
@@ -428,6 +429,77 @@ async fn streaming_an_outside_song_queues_its_download_only_from_the_first_byte(
             "{range:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn listen_first_holds_the_plays_download_until_the_player_starts_another_song() {
+    let navidrome = ping_ok().await;
+    let downloads = Arc::new(FakeStreams::streaming(
+        "soulseek",
+        "track-id",
+        &[1, 2, 3],
+        "audio/mp4",
+    ));
+    let library = Arc::new(FakeLibrary::with_external(
+        "external-track",
+        "soulseek",
+        "track-id",
+    ));
+    let mut settings = playback_settings(&navidrome.uri(), false, true);
+    settings.subsonic.download_on_play_after_seconds = 30;
+    let state = state_with(settings, |inner| {
+        inner.download_service = downloads.clone();
+        inner.local_library = library.clone();
+    });
+    let app = app(&state);
+    let listening = state.heart_acquisition_coordinator.listening();
+    let player = ListeningPlays::player_key("alice", None, "test");
+
+    let response = get(
+        &app,
+        "/rest/stream?id=external-track&f=json&u=alice&t=good&s=salt&v=1.16.1&c=test",
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(listening.waiting_song(&player).as_deref(), Some("external-track"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        state.track_acquisition_queue.waiting_plays(),
+        0,
+        "not before it is listened to"
+    );
+
+    // A later range of the same song, a download and another app's stream are not this player
+    // starting another song.
+    send(
+        &app,
+        Method::GET,
+        "/rest/stream?id=external-track&f=json&u=alice&t=good&s=salt&v=1.16.1&c=test",
+        &[("Range", "bytes=4096-")],
+        Body::empty(),
+    )
+    .await;
+    get(
+        &app,
+        "/rest/download?id=library-track&u=alice&t=good&s=salt&v=1.16.1&c=test",
+    )
+    .await;
+    get(
+        &app,
+        "/rest/stream?id=library-track&u=alice&t=good&s=salt&v=1.16.1&c=other",
+    )
+    .await;
+    assert_eq!(listening.waiting_song(&player).as_deref(), Some("external-track"));
+
+    get(
+        &app,
+        "/rest/stream?id=library-track&u=alice&t=good&s=salt&v=1.16.1&c=test",
+    )
+    .await;
+    assert!(
+        listening.waiting_song(&player).is_none(),
+        "another song started first"
+    );
 }
 
 #[test]

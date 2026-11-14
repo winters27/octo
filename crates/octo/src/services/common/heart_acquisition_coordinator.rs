@@ -22,6 +22,7 @@ use super::acquisition_tracker::key_of;
 use super::album_gates::{
     AlbumGate, AlbumGateHold, AlbumGateTrack, AlbumGates, TrackFiling, tracks_wait_line,
 };
+use super::listening_plays::ListeningPlays;
 use super::soulseek_hold_store::{HeldAlbumTrack, HeldLidarrFile, Holder};
 use super::{
     AcquisitionHeld, AcquisitionState, AcquisitionTarget, AcquisitionTracker, HeldAcquisition, HeldFiles,
@@ -414,6 +415,18 @@ pub struct HeartAcquisitionCoordinator {
     // For each hold filed while Deezer was answering, how many times Deezer had answered again
     // then: one that answered since runs it once more, and no more until it answers again.
     deezer_seen: Mutex<HashMap<String, u64>>,
+
+    // Plays whose download waits until they have played DownloadOnPlayAfterSeconds.
+    listening: Arc<ListeningPlays>,
+}
+
+/// Which of a play's acquisitions start now. A play waiting to be listened to hands its album to
+/// Lidarr at once and starts its download once the wait ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayParts {
+    Both,
+    LidarrOnly,
+    DownloadOnly,
 }
 
 /// How long the album walk that follows a song heart waits for the hearted song to show in the
@@ -464,7 +477,13 @@ impl HeartAcquisitionCoordinator {
             deezer_turns: Mutex::new(HashMap::new()),
             deezer_events: std::sync::atomic::AtomicU64::new(0),
             deezer_seen: Mutex::new(HashMap::new()),
+            listening: Arc::new(ListeningPlays::default()),
         })
+    }
+
+    /// The plays waiting to be listened to, which players' other songs and scrobbles end.
+    pub fn listening(&self) -> &Arc<ListeningPlays> {
+        &self.listening
     }
 
     /// Changes how long a song heart's album waits for the hearted song.
@@ -545,7 +564,16 @@ impl HeartAcquisitionCoordinator {
         client_id: Option<&str>,
         owner: Option<&str>,
     ) {
-        self.queue_play_as(provider, external_id, requested_by, client_id, owner, false, None);
+        self.queue_play_as(
+            provider,
+            external_id,
+            requested_by,
+            client_id,
+            owner,
+            false,
+            None,
+            PlayParts::Both,
+        );
     }
 
     /// [`Self::queue_play`] carrying what this play itself played, which its gate is built from.
@@ -566,12 +594,96 @@ impl HeartAcquisitionCoordinator {
             owner,
             false,
             heard,
+            PlayParts::Both,
         );
+    }
+
+    /// [`Self::queue_play_heard`] from `player` ([`ListeningPlays::player_key`]). The play is a
+    /// new song on that player, which ends the wait of the song it played before. With
+    /// DownloadOnPlayAfterSeconds set, its download waits until it has played that long (half
+    /// the song at most, when its length is known), and is dropped when the player starts
+    /// another song first or scrobbles a skip; its album goes to Lidarr at once, as always.
+    #[allow(clippy::too_many_arguments)] // the play's facts, who played it and what it played
+    pub fn queue_play_from(
+        self: &Arc<Self>,
+        player: &str,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        client_id: Option<&str>,
+        owner: Option<&str>,
+        heard: Option<HeardRecord>,
+    ) {
+        let song = client_id.unwrap_or(external_id).to_string();
+        self.listening.started(player, &song);
+        let settings = self.settings.current().subsonic.clone();
+        let wait = settings
+            .download_on_play_wait()
+            .filter(|_| !settings.wait_for_lossless_on_play && !player.trim().is_empty());
+        let Some(wait) = wait else {
+            self.queue_play_heard(provider, external_id, requested_by, client_id, owner, heard);
+            return;
+        };
+        let wait = self.listening_wait(external_id, wait);
+        self.queue_play_as(
+            provider,
+            external_id,
+            requested_by,
+            client_id,
+            owner,
+            false,
+            heard.clone(),
+            PlayParts::LidarrOnly,
+        );
+        let Some(ticket) = self.listening.hold(player, &song, wait) else {
+            return;
+        };
+        info!(
+            "Download on play: {provider}:{external_id} downloads once it has played {} s",
+            wait.as_secs()
+        );
+        let coordinator = Arc::clone(self);
+        let (provider, external_id, requested_by) = owned3(provider, external_id, requested_by);
+        let (client_id, owner) = (client_id.map(str::to_string), owner.map(str::to_string));
+        tokio::spawn(async move {
+            if !ticket.listened().await {
+                return;
+            }
+            info!("Download on play: {provider}:{external_id} was listened to; its download starts");
+            coordinator.queue_play_as(
+                &provider,
+                &external_id,
+                requested_by.as_deref(),
+                client_id.as_deref(),
+                owner.as_deref(),
+                false,
+                heard,
+                PlayParts::DownloadOnly,
+            );
+        });
+    }
+
+    /// How long a play waits to be listened to: `wait`, or half the song when that is shorter
+    /// (at least a second), so a short song played through counts before the player opens the
+    /// next one.
+    fn listening_wait(&self, external_id: &str, wait: Duration) -> Duration {
+        let length = self
+            .extras
+            .id_registry
+            .as_ref()
+            .and_then(|registry| registry.lookup(external_id))
+            .and_then(|routing| routing.snapshot().duration)
+            .filter(|seconds| *seconds > 0);
+        match length {
+            Some(seconds) => wait.min(Duration::from_secs((seconds as u64 / 2).max(1))),
+            None => wait,
+        }
     }
 
     /// A song coming up next, queued with DownloadOnPlay on as the play it will be, only
     /// earlier. Unlike a play under way, it is queued with Wait for lossless on play on too,
-    /// since that waits only for the song playing.
+    /// since that waits only for the song playing. Never while DownloadOnPlayAfterSeconds is set:
+    /// a song is downloaded only once it has been listened to.
     pub fn queue_play_ahead(
         self: &Arc<Self>,
         provider: &str,
@@ -580,7 +692,16 @@ impl HeartAcquisitionCoordinator {
         client_id: Option<&str>,
         owner: Option<&str>,
     ) {
-        self.queue_play_as(provider, external_id, requested_by, client_id, owner, true, None);
+        self.queue_play_as(
+            provider,
+            external_id,
+            requested_by,
+            client_id,
+            owner,
+            true,
+            None,
+            PlayParts::Both,
+        );
     }
 
     #[allow(clippy::too_many_arguments)] // the play's facts and what it played
@@ -593,6 +714,7 @@ impl HeartAcquisitionCoordinator {
         owner: Option<&str>,
         ahead: bool,
         heard: Option<HeardRecord>,
+        parts: PlayParts,
     ) {
         let settings = self.settings.current().subsonic.clone();
         // A family member's play keeps a copy only when they may add songs at once, and then where
@@ -612,18 +734,27 @@ impl HeartAcquisitionCoordinator {
             );
             return;
         }
-        // WaitForLosslessOnPlay acquires the track itself, from its own source.
-        let download = settings.download_on_play && (ahead || !settings.wait_for_lossless_on_play);
+        // WaitForLosslessOnPlay acquires the track itself, from its own source. A song coming up
+        // is never downloaded early while a play must be listened to first.
+        let download = parts != PlayParts::LidarrOnly
+            && if ahead {
+                settings.download_on_play_at_start()
+            } else {
+                settings.download_on_play && !settings.wait_for_lossless_on_play
+            };
         let source = self.play_source().filter(|_| download);
         // Lidarr adds whole albums to the shared library, never to a member's own, once per song.
         let lidarr_key = format!("{provider}:{external_id}");
-        let lidarr = settings.lidarr_album_on_play && target == AcquisitionTarget::Shared && {
-            let mut plays = self.lidarr_plays.lock();
-            if plays.len() >= Self::LIDARR_PLAY_MEMORY {
-                plays.clear();
-            }
-            plays.insert(lidarr_key.clone())
-        };
+        let lidarr = parts != PlayParts::DownloadOnly
+            && settings.lidarr_album_on_play
+            && target == AcquisitionTarget::Shared
+            && {
+                let mut plays = self.lidarr_plays.lock();
+                if plays.len() >= Self::LIDARR_PLAY_MEMORY {
+                    plays.clear();
+                }
+                plays.insert(lidarr_key.clone())
+            };
         let holds = self
             .extras
             .soulseek

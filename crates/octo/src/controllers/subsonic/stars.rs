@@ -1,7 +1,9 @@
 //! `star`, `unstar`, `getStarred`, `getStarred2`, `setRating`, `scrobble` and `reportPlayback`.
 
+use std::net::{IpAddr, SocketAddr};
+
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -28,6 +30,7 @@ use crate::app::AppState;
 use crate::http::error::{AppError, AppResult};
 use crate::http::routes::RouteSet;
 use crate::services::common::heart_acquisition_coordinator::track_base_key;
+use crate::services::common::listening_plays::ListeningPlays;
 use crate::services::common::star_on_arrival::WaitingStar;
 use crate::services::common::{AcquisitionTarget, StarOnArrival};
 use crate::services::family::list_rules::{Edit, edit};
@@ -1361,6 +1364,10 @@ fn try_parse_int(text: &str) -> Option<i32> {
 /// songs are not: Navidrome has no such media to record.
 pub async fn scrobble(State(state): State<AppState>, req: Request) -> AppResult {
     let caller = family_caller(req.extensions()).cloned();
+    let address = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(address)| address.ip());
     // The device the family gate found, read before the request is taken apart.
     let device_id = family_caller(req.extensions()).and_then(|caller| caller.device_id.clone());
     let call = match SubsonicCall::read(&state, req).await {
@@ -1442,6 +1449,7 @@ pub async fn scrobble(State(state): State<AppState>, req: Request) -> AppResult 
                 .await?;
             if is_successful_subsonic_response(&check.body, &format) {
                 prewarm_queue();
+                note_listening(&state, &call, address, &ids, &submissions).await;
                 note_now_playing(&state, &call, caller.as_ref(), &ids, &submissions);
                 learn_from_scrobbles(&state, &call, &ids, &submissions, &times, device_id.as_deref()).await?;
             }
@@ -1463,6 +1471,7 @@ pub async fn scrobble(State(state): State<AppState>, req: Request) -> AppResult 
             .await?;
         if is_successful_subsonic_response(&result.body, &format) {
             prewarm_queue();
+            note_listening(&state, &call, address, &ids, &submissions).await;
             note_now_playing(&state, &call, caller.as_ref(), &ids, &submissions);
             learn_from_scrobbles(&state, &call, &ids, &submissions, &times, device_id.as_deref()).await?;
         }
@@ -1482,6 +1491,37 @@ pub async fn scrobble(State(state): State<AppState>, req: Request) -> AppResult 
             .create_response(&format, "scrobble")
             .into_response()),
         Err(other) => Err(AppError::from(other)),
+    }
+}
+
+/// A scrobble tells the plays Download on play waits on what their player did: a now-playing
+/// scrobble (`submission=false`) of another song drops the wait, and a finished one
+/// (`submission=true`) is a skip soon after the start and ends the wait later. A scrobble that
+/// sends no submission says neither. Looked at only while some play waits.
+async fn note_listening(
+    state: &AppState,
+    call: &SubsonicCall,
+    address: Option<IpAddr>,
+    ids: &[String],
+    submissions: &[String],
+) {
+    let listening = state.heart_acquisition_coordinator.listening();
+    if listening.is_empty() || ids.is_empty() {
+        return;
+    }
+    let Ok(who) = signed_in_user(state, call).await else {
+        return;
+    };
+    let player = ListeningPlays::player_key(&who, address, call.param("c"));
+    for (index, id) in ids.iter().enumerate() {
+        let submission = if submissions.len() == 1 {
+            submissions.first()
+        } else {
+            submissions.get(index)
+        };
+        if let Some(submission) = submission {
+            listening.scrobbled(&player, id, is_true(submission));
+        }
     }
 }
 

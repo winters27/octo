@@ -379,8 +379,9 @@ impl PrefetchService {
         }
 
         // DownloadOnPlay keeps every played song in the library: the songs coming up are
-        // started early as the same downloads their plays would start.
-        let kind = if self.parts.settings.current().subsonic.download_on_play {
+        // started early as the same downloads their plays would start. Not while a play must be
+        // listened to first: those are fetched ahead like any other.
+        let kind = if self.parts.settings.current().subsonic.download_on_play_at_start() {
             Kind::AsPlay
         } else {
             Kind::Ahead
@@ -611,7 +612,7 @@ impl PrefetchService {
         if self.stopped(settings) {
             return Some("Waiting for someone to play something".to_string());
         }
-        if self.parts.settings.current().subsonic.download_on_play {
+        if self.parts.settings.current().subsonic.download_on_play_at_start() {
             return None;
         }
         if self.room(settings) == 0 {
@@ -924,7 +925,7 @@ impl PrefetchService {
             .map(|l| l.name.clone())
             .collect();
         let count = settings.effective_keep_ready_count();
-        let kind = if self.parts.settings.current().subsonic.download_on_play {
+        let kind = if self.parts.settings.current().subsonic.download_on_play_at_start() {
             Kind::AsPlay
         } else {
             Kind::Ahead

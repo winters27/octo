@@ -741,6 +741,7 @@ async function loadSettings() {
   syncMornyeNotifyRow();
   updateStreamSettings();
   updateRadioPublicationSettings();
+  updateDownloadOnPlaySettings();
   renderHeartSourceOrder(currentSettings?.Subsonic?.HeartDownloadSources);
   renderLyricsSources(currentSettings?.Metadata?.LyricsSources ?? '');
   renderRadioDiscovery(currentSettings?.LastFm?.DiscoveryStations);
@@ -889,6 +890,7 @@ function revertForm(form) {
   syncPlaybackSourceControl();
   updateStreamSettings();
   updateRadioPublicationSettings();
+  updateDownloadOnPlaySettings();
   syncGenreUnknownRow();
   updateDiscoveryBanner();
   syncSegments(false);
@@ -1282,6 +1284,15 @@ function updateRadioPublicationSettings() {
 }
 
 document.getElementById('f-radio-streams')?.addEventListener('change', updateRadioPublicationSettings);
+
+function updateDownloadOnPlaySettings() {
+  const enabled = Boolean(document.getElementById('f-download-on-play')?.checked);
+  const after = document.getElementById('f-download-on-play-after');
+  if (after) after.disabled = !enabled;
+  document.getElementById('download-on-play-after-row')?.classList.toggle('is-disabled', !enabled);
+}
+
+document.getElementById('f-download-on-play')?.addEventListener('change', updateDownloadOnPlaySettings);
 
 // Delegated, so buttons rendered later (the setup checklist) work the same way.
 document.addEventListener('click', event => {

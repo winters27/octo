@@ -617,6 +617,14 @@
               </div>
               <label class="switch"><input type="checkbox" id="f-download-on-play" name="Subsonic.DownloadOnPlay" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>
+            <div class="set-row" id="download-on-play-after-row" data-stream-source="YouTube">
+              <div class="set-info">
+                <div class="set-info-t">Listen first <span class="set-opt">seconds</span></div>
+                <div class="set-info-d">Keeps a played song only once it has played this long, so a song you skip early is never downloaded. 0 keeps it as soon as it starts.</div>
+                <div class="set-info-more">Starting another song first, or skipping it, keeps nothing. A short song is kept once half of it has played.</div>
+              </div>
+              <input class="set-input" id="f-download-on-play-after" name="Subsonic.DownloadOnPlayAfterSeconds" type="number" min="0" />
+            </div>
             <div class="set-row">
               <div class="set-info">
                 <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-lidarr"/></svg>Send played albums to Lidarr</div>

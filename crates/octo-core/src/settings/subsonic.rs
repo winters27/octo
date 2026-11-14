@@ -377,6 +377,17 @@ pub struct SubsonicSettings {
     /// again.
     pub download_on_play: bool,
 
+    /// With DownloadOnPlay on, download a played track only once it has played this many seconds
+    /// (default: 0, at once).
+    /// Environment variable: DOWNLOAD_ON_PLAY_AFTER_SECONDS
+    ///
+    /// The download waits on the player that started the play, and is dropped when that player
+    /// starts another song first or scrobbles a skip (a finished scrobble within 30 seconds of
+    /// the start). A finished scrobble later than that starts it at once. A track shorter than
+    /// twice the wait downloads once half of it has played. Bytes streamed never count, since
+    /// players buffer ahead. While it is set, songs fetched ahead are not kept as plays early.
+    pub download_on_play_after_seconds: i32,
+
     /// Hand the album of every played external track to Lidarr (default: false).
     /// Environment variable: LIDARR_ALBUM_ON_PLAY
     ///
@@ -463,6 +474,7 @@ impl Default for SubsonicSettings {
             wait_for_lossless_on_play: false,
             lossless_wait_timeout_seconds: 0,
             download_on_play: false,
+            download_on_play_after_seconds: 0,
             lidarr_album_on_play: false,
             folder_structure: FolderStructure::Flat,
             folder_template: crate::common::layout::ORGANIZED.to_string(),
@@ -479,6 +491,19 @@ impl Default for SubsonicSettings {
 impl SubsonicSettings {
     pub fn effective_sync_catalog_max_songs(&self) -> i32 {
         self.sync_catalog_max_songs.clamp(50, 5000)
+    }
+
+    /// How long a played track must play before DownloadOnPlay downloads it: None while
+    /// DownloadOnPlay is off or downloads at once (DownloadOnPlayAfterSeconds 0 or below).
+    pub fn download_on_play_wait(&self) -> Option<std::time::Duration> {
+        (self.download_on_play && self.download_on_play_after_seconds > 0)
+            .then(|| std::time::Duration::from_secs(self.download_on_play_after_seconds as u64))
+    }
+
+    /// Whether DownloadOnPlay downloads a track as soon as it starts, so a song coming up can be
+    /// started early as the play it will be.
+    pub fn download_on_play_at_start(&self) -> bool {
+        self.download_on_play && self.download_on_play_wait().is_none()
     }
 
     /// How long a search waits for the YouTube lengths of its top outside rows: none while
@@ -795,6 +820,26 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(s.effective_sync_catalog_max_songs(), expected, "{configured}");
+        }
+    }
+
+    #[test]
+    fn download_on_play_waits_only_while_on_and_set_above_zero() {
+        use std::time::Duration;
+        for (on, seconds, wait, at_start) in [
+            (false, 0, None, false),
+            (false, 30, None, false),
+            (true, 0, None, true),
+            (true, -5, None, true),
+            (true, 30, Some(Duration::from_secs(30)), false),
+        ] {
+            let s = SubsonicSettings {
+                download_on_play: on,
+                download_on_play_after_seconds: seconds,
+                ..Default::default()
+            };
+            assert_eq!(s.download_on_play_wait(), wait, "{on} {seconds}");
+            assert_eq!(s.download_on_play_at_start(), at_start, "{on} {seconds}");
         }
     }
 }

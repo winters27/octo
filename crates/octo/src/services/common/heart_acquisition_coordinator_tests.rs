@@ -403,6 +403,152 @@ async fn download_on_play_leaves_the_track_to_wait_for_lossless_on_play() {
     assert_eq!(queue.waiting_plays(), 0);
 }
 
+const PHONE: &str = "felix|10.0.0.5|octo";
+
+/// Download on play waiting `seconds` of listening, Lidarr album on play as asked, on a clock
+/// the test moves.
+fn listening(
+    seconds: i32,
+    lidarr_album_on_play: bool,
+    queue: Arc<TrackAcquisitionQueue>,
+    lidarr: Arc<FakeLidarr>,
+    registry: Option<Arc<ExternalIdRegistry>>,
+) -> (
+    Arc<HeartAcquisitionCoordinator>,
+    super::super::listening_plays::HandClock,
+) {
+    let mut settings = play_settings(true, lidarr_album_on_play, Vec::new());
+    settings.download_on_play_after_seconds = seconds;
+    let coordinator = HeartAcquisitionCoordinator::new(
+        store(settings),
+        queue,
+        Arc::new(FakeDownloads::default()),
+        lidarr,
+        HeartCoordinatorExtras {
+            id_registry: registry,
+            ..Default::default()
+        },
+    );
+    let clock = coordinator.listening().hand_clock();
+    (coordinator, clock)
+}
+
+fn play_from(coordinator: &Arc<HeartAcquisitionCoordinator>, external_id: &str, song: &str) {
+    coordinator.queue_play_from(
+        PHONE,
+        "soulseek",
+        external_id,
+        Some("felix"),
+        Some(song),
+        Some("felix"),
+        None,
+    );
+}
+
+#[tokio::test]
+async fn a_play_downloads_only_once_it_has_been_listened_to() {
+    let queue = new_queue();
+    let (coordinator, clock) = listening(30, false, queue.clone(), Arc::new(FakeLidarr::default()), None);
+
+    play_from(&coordinator, "track-id", "ext-1");
+    assert!(
+        next_queued(&queue).await.is_none(),
+        "nothing while it has played under 30 s"
+    );
+    clock.advance(29);
+    assert!(next_queued(&queue).await.is_none());
+    clock.advance(1);
+    let request = next_queued(&queue).await.expect("queued once listened to");
+    assert_eq!(request.external_id, "track-id");
+    assert!(request.force_permanent);
+    assert_eq!(request.requested_by(), ["felix"]);
+}
+
+#[tokio::test]
+async fn another_song_first_keeps_nothing_while_lidarr_gets_the_album_at_once() {
+    let queue = new_queue();
+    let lidarr = Arc::new(FakeLidarr::default().tracks(|_, id, _| Ok(id == "track-id")));
+    let (coordinator, clock) = listening(30, true, queue.clone(), lidarr.clone(), None);
+
+    play_from(&coordinator, "track-id", "ext-1");
+    let handed = lidarr.clone();
+    until(move || handed.track_calls_for("soulseek", "track-id", false) == 1).await;
+    clock.advance(10);
+    // A library song started on the same player.
+    coordinator.listening().started(PHONE, "nd-42");
+    clock.advance(60);
+    assert!(next_queued(&queue).await.is_none());
+
+    // The next outside song is a new wait of its own, which drops none but its own.
+    play_from(&coordinator, "track-id", "ext-1");
+    play_from(&coordinator, "track-2", "ext-2");
+    clock.advance(30);
+    assert_eq!(next_queued(&queue).await.expect("queued").external_id, "track-2");
+    assert!(next_queued(&queue).await.is_none());
+}
+
+#[tokio::test]
+async fn a_skip_keeps_nothing_and_a_later_finish_downloads_at_once() {
+    let queue = new_queue();
+    let (coordinator, clock) = listening(120, false, queue.clone(), Arc::new(FakeLidarr::default()), None);
+
+    play_from(&coordinator, "track-id", "ext-1");
+    clock.advance(10);
+    coordinator.listening().scrobbled(PHONE, "ext-1", true);
+    clock.advance(200);
+    assert!(next_queued(&queue).await.is_none(), "skipped");
+
+    play_from(&coordinator, "track-2", "ext-2");
+    clock.advance(45);
+    coordinator.listening().scrobbled(PHONE, "ext-2", true);
+    assert_eq!(next_queued(&queue).await.expect("queued").external_id, "track-2");
+}
+
+#[tokio::test]
+async fn a_short_song_downloads_once_half_of_it_has_played() {
+    let registry = Arc::new(ExternalIdRegistry::in_memory());
+    let id = registry.register(octo_core::soulseek::soulseek_metadata_service::SoulseekRouting {
+        artist: Some("A".into()),
+        title: Some("Interlude".into()),
+        duration: Some(40),
+        ..Default::default()
+    });
+    let queue = new_queue();
+    let (coordinator, clock) = listening(
+        60,
+        false,
+        queue.clone(),
+        Arc::new(FakeLidarr::default()),
+        Some(registry),
+    );
+
+    play_from(&coordinator, &id, "ext-1");
+    clock.advance(19);
+    assert!(next_queued(&queue).await.is_none());
+    clock.advance(1);
+    assert_eq!(next_queued(&queue).await.expect("queued").external_id, id);
+}
+
+#[tokio::test]
+async fn no_wait_downloads_at_once_and_a_wait_never_downloads_a_song_coming_up() {
+    let queue = new_queue();
+    let (coordinator, _clock) = listening(0, false, queue.clone(), Arc::new(FakeLidarr::default()), None);
+    play_from(&coordinator, "track-id", "ext-1");
+    assert_eq!(next_queued(&queue).await.expect("queued").external_id, "track-id");
+
+    let queue = new_queue();
+    let (coordinator, clock) = listening(30, false, queue.clone(), Arc::new(FakeLidarr::default()), None);
+    coordinator.queue_play_ahead(
+        "soulseek",
+        "track-id",
+        Some("felix"),
+        Some("ext-1"),
+        Some("felix"),
+    );
+    clock.advance(60);
+    assert!(next_queued(&queue).await.is_none());
+}
+
 #[tokio::test]
 async fn soulseek_first_plays_fall_back_to_you_tube_only_when_it_is_on() {
     for (you_tube, expected) in [
