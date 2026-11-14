@@ -710,6 +710,24 @@ input[type="number"].set-input { max-width: 160px; }
  * leaves a line at the top. */
 .set-card > :not([hidden]):not([type="hidden"]) ~ :not([type="hidden"]) { border-top: 1px solid var(--hairline); }
 .set-row.stack { flex-direction: column; align-items: stretch; gap: var(--s-l); }
+/* A setting that only applies under the one above it: joined to that row with no line between,
+ * set in under its title, with a short rule leading back up to it. */
+.set-card > .set-row.sub:not([hidden]):not([type="hidden"]) {
+  position: relative;
+  border-top-color: transparent;
+  padding-top: var(--s-xs);
+  padding-left: calc(var(--s-2xl) + var(--s-xl));
+}
+.set-row.sub::before {
+  content: '';
+  position: absolute;
+  left: var(--s-2xl);
+  top: 0;
+  bottom: var(--s-xl);
+  width: 2px;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.12);
+}
 
 .set-info { min-width: 0; }
 .set-info-t { display: block; font-size: var(--t-body); font-weight: 500; color: var(--ink); line-height: 1.35; }
