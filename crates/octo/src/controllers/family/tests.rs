@@ -1620,6 +1620,124 @@ async fn delete_member_needs_typed_name() {
 }
 
 #[tokio::test]
+async fn delete_member_can_keep_their_account_and_password() {
+    let f = fam().await;
+    let session = f.state.browse_sessions.create_family("alex", SessionKind::Member);
+    assert!(
+        f.state
+            .browse_sessions
+            .family_session_of(Some(&session))
+            .is_some()
+    );
+    let removed = f
+        .delete(
+            "/api/family/members/alex",
+            Some(&f.owner_cookie()),
+            Some(json!({ "confirm": "alex", "files": "promote", "keepAccount": true })),
+        )
+        .await;
+    assert_eq!(removed.status, StatusCode::NO_CONTENT, "{}", removed.body);
+    // The account stays, with the password alex chose and the shared library only; their own
+    // library goes whatever became of their files.
+    assert_eq!(
+        f.accounts.calls(),
+        [
+            "set_password u-alex",
+            "libraries u-alex [1]",
+            "delete_library 3",
+            "set_password u-alex"
+        ]
+    );
+    assert!(f.accounts.users.lock().iter().any(|u| u.id() == "u-alex"));
+    assert_eq!(
+        f.files.released.lock().clone(),
+        [("alex".to_string(), FilesChoice::Promote)]
+    );
+    assert!(f.state.family_store.member("alex").is_none());
+    assert!(
+        f.state
+            .browse_sessions
+            .family_session_of(Some(&session))
+            .is_none()
+    );
+    // Not a member now, so what they add goes to the shared library.
+    assert_eq!(
+        f.state.family_write_gate.decide(Some("alex")),
+        crate::services::family::WriteDecision::Shared
+    );
+}
+
+#[tokio::test]
+async fn keeping_an_account_deletes_their_library_for_every_files_choice() {
+    for files in ["keep", "promote", "delete"] {
+        let f = fam().await;
+        let removed = f
+            .delete(
+                "/api/family/members/alex",
+                Some(&f.owner_cookie()),
+                Some(json!({ "confirm": "alex", "files": files, "keepAccount": true })),
+            )
+            .await;
+        assert_eq!(
+            removed.status,
+            StatusCode::NO_CONTENT,
+            "{files}: {}",
+            removed.body
+        );
+        assert_eq!(
+            f.accounts.calls(),
+            [
+                "set_password u-alex",
+                "libraries u-alex [1]",
+                "delete_library 3",
+                "set_password u-alex"
+            ],
+            "{files}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn keeping_an_account_needs_a_shared_library_to_keep_it_in() {
+    let f = fam().await;
+    let mut alex = f.state.family_store.member("alex").expect("alex");
+    alex.shared_libraries = crate::services::family::SharedLibraries::Ids(Vec::new());
+    f.state.family_store.upsert_member(alex);
+    let refused = f
+        .delete(
+            "/api/family/members/alex",
+            Some(&f.owner_cookie()),
+            Some(json!({ "confirm": "alex", "files": "keep", "keepAccount": true })),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    assert!(refused.error().contains("Give them one first"));
+    // Refused before any change: no password set, nothing removed.
+    assert!(f.accounts.calls().is_empty());
+    assert!(f.files.released.lock().is_empty());
+    assert!(f.state.family_store.member("alex").is_some());
+}
+
+#[tokio::test]
+async fn keeping_an_account_needs_a_password_they_chose() {
+    let f = fam().await;
+    let kim = member(&f.state, "kim", Preset::Listener, None, Some(5));
+    f.state.family_store.upsert_member(kim);
+    let refused = f
+        .delete(
+            "/api/family/members/kim",
+            Some(&f.owner_cookie()),
+            Some(json!({ "confirm": "kim", "files": "keep", "keepAccount": true })),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    assert!(refused.error().contains("reset their password first"));
+    assert!(f.accounts.calls().is_empty());
+    assert!(f.files.released.lock().is_empty());
+    assert!(f.state.family_store.member("kim").is_some());
+}
+
+#[tokio::test]
 async fn invite_member_sends_a_new_sign_in_link() {
     let f = fam().await;
     let r = f

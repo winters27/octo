@@ -480,7 +480,7 @@ impl HeartAcquisitionCoordinator {
 
     /// Where an import list's song goes for `user`, or the words that say why it may not be
     /// fetched now. A member who must ask first has songs queued only for a list an approver
-    /// said yes to, so theirs go to their own library too.
+    /// said yes to, so theirs go where their approved requests do.
     pub fn import_target(&self, user: &str) -> Result<AcquisitionTarget, String> {
         let Some(family) = self.family.get() else {
             return Ok(AcquisitionTarget::Shared);
@@ -488,9 +488,18 @@ impl HeartAcquisitionCoordinator {
         match family.gate.decide(Some(user)) {
             WriteDecision::Shared => Ok(AcquisitionTarget::Shared),
             WriteDecision::Member(user) => Ok(AcquisitionTarget::Member(user)),
-            WriteDecision::Request { user, full: None } => Ok(AcquisitionTarget::Member(user)),
+            WriteDecision::Request { user, full: None } => Ok(family.gate.request_target(&user)),
             WriteDecision::Request { full: Some(full), .. } => Err(full),
             WriteDecision::Refuse { message, .. } => Err(message),
+        }
+    }
+
+    /// Where an approved request for `user` downloads: their own library, or the shared one when
+    /// their music goes there.
+    pub fn request_target(&self, user: &str) -> AcquisitionTarget {
+        match self.family.get() {
+            Some(family) => family.gate.request_target(user),
+            None => AcquisitionTarget::Member(user.to_string()),
         }
     }
 
@@ -586,8 +595,8 @@ impl HeartAcquisitionCoordinator {
         heard: Option<HeardRecord>,
     ) {
         let settings = self.settings.current().subsonic.clone();
-        // A family member's play keeps a copy only when they may add songs at once, and then in
-        // their own library; `owner` is who signed in. Everyone else plays as always.
+        // A family member's play keeps a copy only when they may add songs at once, and then
+        // where their music goes; `owner` is who signed in. Everyone else plays as always.
         let target = match self.family.get() {
             Some(family) => match family.gate.play_target(owner) {
                 Some(target) => target,
@@ -1242,9 +1251,10 @@ impl HeartAcquisitionCoordinator {
         }
     }
 
-    /// Every song of an outside album into `user`'s own library, one heart chain each (no
-    /// Lidarr, which fills the shared library), each run for `origin`. With `star`, each song is
-    /// starred for them once it shows in their library. Answers where each song that landed is.
+    /// Every song of an outside album into `user`'s own library, or the shared one when their
+    /// music goes there, one heart chain each (no Lidarr, which hands back no file), each run for
+    /// `origin`. With `star`, each song is starred for them once it shows in their library.
+    /// Answers where each song that landed is.
     pub async fn acquire_album_for_member(
         &self,
         provider: &str,
@@ -1286,12 +1296,16 @@ impl HeartAcquisitionCoordinator {
                 .collect();
             tracker.announce(provider, Some(album_external_id), None, &listed);
         }
+        let target = family.gate.request_target(user);
+        let destination = match target {
+            AcquisitionTarget::Shared => "the shared library",
+            AcquisitionTarget::Member(_) => "their own library",
+        };
         info!(
-            "Album '{}' for {user}: {} song(s) into their own library",
+            "Album '{}' for {user}: {} song(s) into {destination}",
             album.title,
             tracks.len()
         );
-        let target = AcquisitionTarget::Member(user.to_string());
         let mut landed = Vec::new();
         // Each song's chain carries the album's gate: its track's own recording, filed by sound.
         let _gate = match self
@@ -1307,7 +1321,7 @@ impl HeartAcquisitionCoordinator {
             let track_provider = song.external_provider.as_deref().unwrap_or(provider);
             let track_id = song.external_id.as_deref().unwrap_or_default();
             match self
-                .acquire_track_outcome(track_provider, track_id, requested_by, None, &target, origin)
+                .acquire_track_without_lidarr(track_provider, track_id, requested_by, None, &target, origin)
                 .await
             {
                 Ok(TrackOutcome::Landed(path) | TrackOutcome::KeptAsHeard(path)) => {
@@ -2348,6 +2362,7 @@ impl HeartAcquisitionCoordinator {
                                 &target,
                                 route_origin(holder, record),
                                 vec![holder.clone()],
+                                true,
                                 held,
                                 &mut filed,
                             )
@@ -2378,6 +2393,7 @@ impl HeartAcquisitionCoordinator {
                         &target,
                         origin,
                         record.holders.clone(),
+                        true,
                         HeldFiles::of(record.held_files.clone(), record.lidarr_files.clone()),
                         &mut filed,
                     )
@@ -3132,6 +3148,52 @@ impl HeartAcquisitionCoordinator {
         target: &AcquisitionTarget,
         origin: AcquisitionOrigin,
     ) -> anyhow::Result<TrackOutcome> {
+        self.acquire_track_via(
+            provider,
+            external_id,
+            requested_by,
+            held_since_utc,
+            target,
+            origin,
+            true,
+        )
+        .await
+    }
+
+    /// [`Self::acquire_track_outcome`] for a caller that waits for the file, as an approved
+    /// request does: Lidarr is skipped even into the shared library, since it hands back none.
+    pub async fn acquire_track_without_lidarr(
+        &self,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        held_since_utc: Option<DateTime<Utc>>,
+        target: &AcquisitionTarget,
+        origin: AcquisitionOrigin,
+    ) -> anyhow::Result<TrackOutcome> {
+        self.acquire_track_via(
+            provider,
+            external_id,
+            requested_by,
+            held_since_utc,
+            target,
+            origin,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // the chain's facts and whether Lidarr may take the song
+    async fn acquire_track_via(
+        &self,
+        provider: &str,
+        external_id: &str,
+        requested_by: Option<&str>,
+        held_since_utc: Option<DateTime<Utc>>,
+        target: &AcquisitionTarget,
+        origin: AcquisitionOrigin,
+        lidarr: bool,
+    ) -> anyhow::Result<TrackOutcome> {
         // A heart of a song is one of the events its kept-as-heard files are checked again on, and
         // a Lidarr follow of it reads whether its download moved.
         if matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart) {
@@ -3155,6 +3217,7 @@ impl HeartAcquisitionCoordinator {
             target,
             origin,
             holders,
+            lidarr,
             HeldFiles::default(),
             &mut Vec::new(),
         )
@@ -3765,6 +3828,7 @@ impl HeartAcquisitionCoordinator {
         target: &AcquisitionTarget,
         origin: AcquisitionOrigin,
         holders: Vec<Holder>,
+        lidarr: bool,
         mut held: HeldFiles,
         filed: &mut Vec<(String, String)>,
     ) -> anyhow::Result<TrackOutcome> {
@@ -3915,7 +3979,9 @@ impl HeartAcquisitionCoordinator {
         let steps: Vec<HeartDownloadSource> = self
             .enabled_steps(false)
             .into_iter()
-            .filter(|step| *target == AcquisitionTarget::Shared || *step != HeartDownloadSource::Lidarr)
+            .filter(|step| {
+                *step != HeartDownloadSource::Lidarr || (lidarr && *target == AcquisitionTarget::Shared)
+            })
             .collect();
         // A file one of these gates could not tell apart from another version was passed over.
         let mut undecided = false;

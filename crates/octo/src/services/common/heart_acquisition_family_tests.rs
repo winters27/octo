@@ -5,20 +5,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::FutureExt;
+use octo_core::common::Clock;
 use octo_core::family::abilities::Preset;
 use octo_core::models::domain::{Album, Song};
 use octo_core::settings::{HeartDownloadSource, HeartDownloadStep};
 use serde_json::json;
 
 use super::*;
+use crate::services::common::acquisition_tracker::AcquisitionTracker;
 use crate::services::common::test_fakes::{FakeDownloads, FakeLidarr, FakeMetadata};
 use crate::services::common::{AcquisitionPlace, AcquisitionRequest};
 use crate::services::family::library_index::ScopeResolver;
+use crate::services::family::request_service::{LiveRequestFetcher, RequestFetcher};
 use crate::services::family::test_support::{
     World, eventually, member, navidrome_with_songs, song_row, write_file,
 };
 use crate::services::family::{LibraryWriteGate, PersonalLibrary};
 use crate::services::library::LibraryOwnership;
+use crate::services::library::UpgradeQueue;
 use crate::services::library::library_ownership::{Candidate, search_from};
 
 fn step(source: HeartDownloadSource) -> HeartDownloadStep {
@@ -562,4 +566,97 @@ async fn a_members_late_judged_landed_file_is_linked_into_their_own_library() {
         std::fs::symlink_metadata(&link).is_ok(),
         "sam's own library has the file: {link}"
     );
+}
+
+#[tokio::test]
+async fn a_members_music_that_goes_to_shared_is_added_to_the_shared_library() {
+    let world = World::new(None);
+    configure(&world, &[HeartDownloadSource::YouTube], true);
+    let mut ben = member("ben", Preset::Member, 8);
+    ben.edits.insert("MusicGoesTo".into(), json!("Shared"));
+    world.family.upsert_member(ben);
+    let mut ria = member("ria", Preset::Listener, 9);
+    ria.edits.insert("MusicGoesTo".into(), json!("Shared"));
+    world.family.upsert_member(ria);
+    let chain = chain(world);
+    let coordinator = chain.coordinator.clone();
+    assert_eq!(coordinator.request_target("ben"), AcquisitionTarget::Shared);
+    assert_eq!(coordinator.request_target("ria"), AcquisitionTarget::Shared);
+    assert_eq!(
+        coordinator.request_target("alex"),
+        AcquisitionTarget::Member("alex".into())
+    );
+    assert_eq!(coordinator.import_target("ria"), Ok(AcquisitionTarget::Shared));
+    assert_eq!(
+        coordinator.import_target("alex"),
+        Ok(AcquisitionTarget::Member("alex".into()))
+    );
+
+    // An approved song of theirs is fetched into the shared library, not their own.
+    let fetcher = LiveRequestFetcher::new(
+        chain.queue.clone(),
+        coordinator.clone(),
+        Arc::new(AcquisitionTracker::new(None, Clock::system())),
+        Arc::new(UpgradeQueue::new()),
+    );
+    let asked = tokio::spawn(async move {
+        fetcher
+            .song(
+                "ben",
+                "test",
+                "7",
+                octo_core::family::abilities::RequestQuality::Flac,
+                None,
+            )
+            .await
+    });
+    let request = next_queued(&chain.queue).await.expect("queued");
+    assert_eq!(
+        request.pool_destination(),
+        None,
+        "the shared library, not Ben's folder"
+    );
+    asked.abort();
+
+    // Their play keeps its copy in the shared library too.
+    coordinator.queue_play("test", "6", Some("ben"), None, Some("ben"));
+    let played = next_queued(&chain.queue).await.expect("queued");
+    assert_eq!(played.pool_destination(), None);
+}
+
+#[tokio::test]
+async fn an_approved_song_for_the_shared_library_is_not_handed_to_lidarr() {
+    let world = World::new(None);
+    configure(
+        &world,
+        &[HeartDownloadSource::Lidarr, HeartDownloadSource::YouTube],
+        false,
+    );
+    let mut ben = member("ben", Preset::Member, 8);
+    ben.edits.insert("MusicGoesTo".into(), json!("Shared"));
+    world.family.upsert_member(ben);
+    let chain = chain(world);
+    let fetcher = LiveRequestFetcher::new(
+        chain.queue.clone(),
+        chain.coordinator.clone(),
+        Arc::new(AcquisitionTracker::new(None, Clock::system())),
+        Arc::new(UpgradeQueue::new()),
+    );
+    let asked = tokio::spawn(async move {
+        fetcher
+            .song(
+                "ben",
+                "test",
+                "7",
+                octo_core::family::abilities::RequestQuality::Best,
+                None,
+            )
+            .await
+    });
+    // The request waits for a file, which Lidarr never hands back.
+    let request = next_queued(&chain.queue).await.expect("queued");
+    assert_eq!(request.source_override, Some(DownloadSource::YouTube));
+    assert_eq!(request.pool_destination(), None);
+    assert_eq!(chain.lidarr.calls(), 0);
+    asked.abort();
 }
