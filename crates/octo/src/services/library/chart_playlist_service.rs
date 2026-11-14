@@ -17,8 +17,8 @@
 //! discovery is on (the warm worker fetches the charts at start, so an app's first look after a
 //! restart has them), and a list's change time moves only when its songs do.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +26,10 @@ use std::time::Duration;
 use chrono::{DateTime, TimeDelta, Utc};
 use octo_core::charts::apple_pages::ChartGenre;
 use octo_core::charts::chart_settings::{self, ChartKind, OVERALL, list_id, list_key, split_list};
-use octo_core::charts::top_songs::{APPLE_SOURCE, library_hit, library_query, one_row_per_library_song};
+use octo_core::charts::top_songs::{
+    APPLE_SOURCE, LIBRARY_SONGS, LIBRARY_TITLE_SONGS, library_hit, library_query, library_title_retry,
+    one_row_per_library_song,
+};
 use octo_core::common::{Clock, skipped_takes};
 use octo_core::library::generated_playlist_service::{period_index, playlist_id, user_key};
 use octo_core::models::domain::Song;
@@ -594,6 +597,9 @@ impl ChartPlaylistService {
         let skip_covers_and_instrumentals = settings.soulseek.skip_covers_and_instrumentals;
         let explicit_filter = self.explicit_filter_for(username);
         let mut searched: HashMap<String, Option<Vec<Value>>> = HashMap::new();
+        // The bare-title searches by their query, and the first queries whose row had one.
+        let mut by_title_found: HashMap<String, Option<Vec<Value>>> = HashMap::new();
+        let mut title_searched: HashSet<String> = HashSet::new();
         let session = match &self.inner.library_matches {
             Some(cache) => cache.session(&self.inner.proxy, &auth, username).await,
             None => MatchSession::none(),
@@ -642,12 +648,62 @@ impl ChartPlaylistService {
                 let (proxy, auth, gate) = (self.inner.proxy.clone(), auth.clone(), &gate);
                 async move {
                     let _turn = gate.acquire().await.ok();
-                    let found = search_library(&proxy, &auth, &query).await;
+                    let found = search_library(&proxy, &auth, &query, LIBRARY_SONGS).await;
                     (query, found)
                 }
             });
             let answers: Vec<(String, Option<Vec<Value>>)> = futures::future::join_all(asks).await;
             searched.extend(answers);
+
+            // A row the library answered without its copy is searched once more by the bare
+            // title where that can find one (a copy filed under another name of the artist). The
+            // songs found join the row's own answer, so the same rule judges them, later lists
+            // reuse them and the row stays one recorded answer; a second search that got no
+            // answer leaves the row unanswered.
+            let mut retries: Vec<(String, String)> = Vec::new();
+            for (row, query) in rows.iter().zip(&queries) {
+                if title_searched.contains(query) || retries.iter().any(|(first, _)| first == query) {
+                    continue;
+                }
+                let Some(Some(hits)) = searched.get(query) else {
+                    continue;
+                };
+                if session.skips(query) || library_hit(&row.song.artist, &row.song.title, hits).is_some() {
+                    continue;
+                }
+                if let Some(by_title) = library_title_retry(&row.song.artist, &row.song.title, hits) {
+                    retries.push((query.clone(), by_title));
+                }
+            }
+            let mut by_title_queries: Vec<String> = Vec::new();
+            for (_, by_title) in &retries {
+                if !by_title_found.contains_key(by_title) && !by_title_queries.contains(by_title) {
+                    by_title_queries.push(by_title.clone());
+                }
+            }
+            let gate = tokio::sync::Semaphore::new(LIBRARY_SEARCHES_AT_ONCE);
+            let asks = by_title_queries.into_iter().map(|query| {
+                let (proxy, auth, gate) = (self.inner.proxy.clone(), auth.clone(), &gate);
+                async move {
+                    let _turn = gate.acquire().await.ok();
+                    let found = search_library(&proxy, &auth, &query, LIBRARY_TITLE_SONGS).await;
+                    (query, found)
+                }
+            });
+            by_title_found.extend(futures::future::join_all(asks).await);
+            for (query, by_title) in retries {
+                title_searched.insert(query.clone());
+                match by_title_found.get(&by_title).cloned().flatten() {
+                    Some(more) => {
+                        if let Some(Some(hits)) = searched.get_mut(&query) {
+                            hits.extend(more);
+                        }
+                    }
+                    None => {
+                        searched.insert(query, None);
+                    }
+                }
+            }
 
             let mut unanswered = 0;
             let mut library: Vec<Option<Value>> = rows
@@ -812,10 +868,15 @@ fn period_start(period: i64) -> DateTime<Utc> {
 
 /// Navidrome's songs for a query, searched as the listener with only their sign-in: Some (maybe
 /// empty) when it answered, None when it did not. Library only.
-async fn search_library(proxy: &SubsonicProxyService, auth: &Parameters, query: &str) -> Option<Vec<Value>> {
+async fn search_library(
+    proxy: &SubsonicProxyService,
+    auth: &Parameters,
+    query: &str,
+    songs: usize,
+) -> Option<Vec<Value>> {
     let mut search = auth.clone();
     search.insert("query".into(), query.to_string());
-    search.insert("songCount".into(), "5".into());
+    search.insert("songCount".into(), songs.to_string());
     search.insert("albumCount".into(), "0".into());
     search.insert("artistCount".into(), "0".into());
     search.insert("f".into(), "json".into());

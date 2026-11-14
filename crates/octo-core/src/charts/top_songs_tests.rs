@@ -169,6 +169,63 @@ fn library_query_is_the_main_artist_and_the_bare_title() {
 }
 
 #[test]
+fn the_title_query_is_the_bare_title_and_never_the_first_query_again() {
+    assert_eq!(
+        library_title_query("Kanye West", "Through the Wire").as_deref(),
+        Some("Through the Wire")
+    );
+    assert_eq!(
+        library_title_query("Daft Punk", "Get Lucky (feat. Pharrell Williams)").as_deref(),
+        Some("Get Lucky")
+    );
+    // With no artist the first query already was the title alone.
+    assert_eq!(library_title_query("", "Heartless"), None);
+    assert_eq!(library_title_query("Kanye West", ""), None);
+    assert_eq!(library_title_query("Kanye West", "?"), None);
+}
+
+#[test]
+fn the_title_is_searched_again_only_where_it_can_find_a_copy() {
+    // An artist with other names: the library may file the song under one of them.
+    assert_eq!(
+        library_title_retry("Kanye West", "Heartless", &[]).as_deref(),
+        Some("Heartless")
+    );
+    assert_eq!(
+        library_title_retry("Ye", "Heartless", &[]).as_deref(),
+        Some("Heartless")
+    );
+    // An artist the alias table does not know, and nothing found: one search was enough.
+    assert_eq!(library_title_retry("Radiohead", "Creep", &[]), None);
+    let unrelated = [json!({"id": "a", "artist": "Radiohead", "title": "Karma Police"})];
+    assert_eq!(library_title_retry("Radiohead", "Creep", &unrelated), None);
+    // The title is there under another credit: the library may hold the row's copy under it.
+    let other_credit = [json!({"id": "a", "artist": "Scala", "title": "Creep"})];
+    assert_eq!(
+        library_title_retry("Radiohead", "Creep", &other_credit).as_deref(),
+        Some("Creep")
+    );
+    // Another take of the title is not the title, and a hit without an id is no hit.
+    let live = [json!({"id": "a", "artist": "Somebody", "title": "Creep (Live)"})];
+    assert_eq!(library_title_retry("Radiohead", "Creep", &live), None);
+    let no_id = [json!({"artist": "Somebody", "title": "Creep"})];
+    assert_eq!(library_title_retry("Radiohead", "Creep", &no_id), None);
+}
+
+#[test]
+fn a_title_search_hit_by_another_artist_is_never_the_row() {
+    let hits = [
+        json!({"id": "a", "artist": "Some Band", "title": "Through the Wire"}),
+        json!({"id": "b", "artist": "Ye", "title": "Through the Wire"}),
+    ];
+    assert_eq!(
+        library_hit("Kanye West", "Through the Wire", &hits).unwrap()["id"],
+        "b"
+    );
+    assert!(library_hit("Kanye West", "Through the Wire", &hits[..1]).is_none());
+}
+
+#[test]
 fn match_library_finds_the_same_recording_only_and_gives_a_library_song_to_one_row() {
     let rows = [
         ("Air", "Sexy Boy"),

@@ -176,19 +176,43 @@ impl LastFmRadioTrackResolver {
     }
 
     /// Navidrome's search for the artist and title, as the listener; the first hit that is the
-    /// same recording.
+    /// same recording. With none, the bare title is searched once more where that can find a copy
+    /// (`library_title_retry`: a library may file the artist under another name, "Ye" for "Kanye
+    /// West"), and the same rule judges its hits.
     pub async fn try_find_local_match(
         &self,
         artist: &str,
         title: &str,
         authenticated_parameters: &IndexMap<String, String>,
     ) -> Option<Song> {
-        let mut parameters = authenticated_parameters.clone();
         // Navidrome wants every word it is given, so a joined credit ("Kordhell, Scarlxrd") or a
         // video title ("... (Official Video)") would find nothing: the main artist and the core
         // title find the candidates, and is_same_recording still decides the version.
-        parameters.insert("query".into(), library_query(artist, title));
-        parameters.insert("songCount".into(), "5".into());
+        let query = library_query(artist, title);
+        let hits = self
+            .library_songs(&query, LIBRARY_SONGS, authenticated_parameters)
+            .await?;
+        if let Some(found) = self.local_copy(artist, title, &hits) {
+            return found;
+        }
+        let by_title = library_title_retry(artist, title, &hits)?;
+        let hits = self
+            .library_songs(&by_title, LIBRARY_TITLE_SONGS, authenticated_parameters)
+            .await?;
+        self.local_copy(artist, title, &hits).flatten()
+    }
+
+    /// Up to `songs` of Navidrome's songs for a query, as the listener; None when it gave no
+    /// readable answer.
+    async fn library_songs(
+        &self,
+        query: &str,
+        songs: usize,
+        authenticated_parameters: &IndexMap<String, String>,
+    ) -> Option<Vec<Value>> {
+        let mut parameters = authenticated_parameters.clone();
+        parameters.insert("query".into(), query.to_string());
+        parameters.insert("songCount".into(), songs.to_string());
         parameters.insert("albumCount".into(), "0".into());
         parameters.insert("artistCount".into(), "0".into());
         parameters.insert("f".into(), "json".into());
@@ -197,7 +221,7 @@ impl LastFmRadioTrackResolver {
         if result.body.is_empty() {
             return None;
         }
-        let read = || -> anyhow::Result<Option<Song>> {
+        let read = || -> anyhow::Result<Option<Vec<Value>>> {
             let document: Value = serde_json::from_slice(&result.body)?;
             let Some(response) = try_get_property(&document, "subsonic-response")? else {
                 return Ok(None);
@@ -208,23 +232,38 @@ impl LastFmRadioTrackResolver {
             let Some(songs @ Value::Array(_)) = try_get_property(search, "song")? else {
                 return Ok(None);
             };
-            for song in enumerate_array(songs)? {
+            Ok(Some(enumerate_array(songs)?.to_vec()))
+        };
+        match read() {
+            Ok(songs) => songs,
+            Err(error) => {
+                debug!("local radio match lookup failed for '{query}': {error}");
+                None
+            }
+        }
+    }
+
+    /// The first of the songs that is the recording: Some(song) for a match, Some(None) when the
+    /// match could not be read as a song (no copy, and nothing more to search), None for no match.
+    fn local_copy(&self, artist: &str, title: &str, hits: &[Value]) -> Option<Option<Song>> {
+        let read = || -> anyhow::Result<Option<Song>> {
+            for song in hits {
                 let hit_artist = string(song, "artist")?;
                 let hit_title = string(song, "title")?;
                 let id = string(song, "id")?;
                 if id.is_empty() || !is_same_recording(artist, title, &hit_artist, &hit_title) {
                     continue;
                 }
-
                 return Ok(Some(library_song(song)?));
             }
             Ok(None)
         };
         match read() {
-            Ok(song) => song,
+            Ok(Some(song)) => Some(Some(song)),
+            Ok(None) => None,
             Err(error) => {
                 debug!("local radio match lookup failed for {artist} - {title}: {error}");
-                None
+                Some(None)
             }
         }
     }
@@ -427,6 +466,7 @@ fn shuffle<T>(items: &mut [T]) {
 
 /// What the library is searched with for a song: the one the charts search with too.
 pub use octo_core::charts::top_songs::library_query;
+use octo_core::charts::top_songs::{LIBRARY_SONGS, LIBRARY_TITLE_SONGS, library_title_retry};
 
 /// The songs of an album or a random-songs answer that have an id.
 fn songs(parent: &Value) -> ElementResult<Vec<Song>> {

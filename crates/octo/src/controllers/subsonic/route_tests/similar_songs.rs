@@ -54,6 +54,14 @@ fn library_song(id: &str) -> Option<Value> {
         ),
         "wide" => song("wide", "Wide", "Wide Artist", "Wides", "al-wides", "Trip-Hop"),
         "hello" => song("hello", "Hello", "Adele", "25", "al-25", "Pop"),
+        "renamed" => song(
+            "renamed",
+            "Stronger",
+            "Kanye West",
+            "Graduation",
+            "al-graduation",
+            "Hip-Hop",
+        ),
         "quiet" => song("quiet", "Quiet", "Nobody Known", "Quiet", "al-quiet", "Ambient"),
         "hush" => song("hush", "Hush", "Nobody Known", "Hush", "al-hush", "Ambient"),
         "blend" => song(
@@ -189,6 +197,17 @@ fn last_fm(query: &HashMap<String, String>) -> Value {
                 {"name": "Make You Feel My Love (Acoustic Cover)", "artist": {"name": "Adele"}, "match": 0.72},
                 {"name": "Set Fire to the Rain", "artist": {"name": "Adele"}, "match": 0.7}
             ]}}),
+            // Two songs by an artist the library files under another name, among 23 it lacks.
+            ("Kanye West", "Stronger") => {
+                let mut tracks = vec![
+                    json!({"name": "Through the Wire", "artist": {"name": "Kanye West"}, "match": 0.9}),
+                    json!({"name": "Jesus Walks", "artist": {"name": "Kanye West"}, "match": 0.85}),
+                ];
+                tracks.extend((1..=23).map(|i| {
+                    json!({"name": format!("Far {i}"), "artist": {"name": format!("Crowd {i}")}, "match": 0.8 - f64::from(i) / 100.0})
+                }));
+                json!({"similartracks": {"track": tracks}})
+            }
             ("Alan Walker", "Faded") => json!({"similartracks": {"track": [
                 {"name": "Wake Me Up", "artist": {"name": "Avicii"}, "match": 0.9}
             ]}}),
@@ -320,6 +339,14 @@ impl Respond for Upstream {
             } else {
                 json!({"randomSongs": {"song": []}})
             })
+        } else if path.ends_with("/rest/search3")
+            && query.get("query").map(String::as_str) == Some("Through the Wire")
+        {
+            // Filed under "Ye": found by the title alone, never under "Kanye West".
+            Some(json!({"searchResult3": {"song": [
+                song("wire-cover", "Through the Wire", "Some Band", "Covers", "al-covers", "Pop"),
+                song("ye-wire", "Through the Wire", "Ye", "The College Dropout", "al-dropout", "Hip-Hop")
+            ]}}))
         } else if path.ends_with("/rest/search3") {
             Some(match query.get("query").and_then(|q| blend_library_song(q)) {
                 Some(found) => json!({"searchResult3": {"song": [found]}}),
@@ -820,6 +847,39 @@ async fn nightcore_upload_tries_the_artist_its_title_names_and_keeps_its_playlis
     );
     assert!(songs.contains(&"ext-Avicii-Wake Me Up".to_string()), "{songs:?}");
     assert!(songs[0].starts_with("pl-"), "{songs:?}");
+}
+
+#[tokio::test]
+async fn radio_finds_a_copy_filed_under_another_name_and_bounds_its_library_searches() {
+    let f = fixture(|_| {}).await;
+    let songs = radio_ids(&f, "renamed").await;
+    assert!(songs.contains(&"ye-wire".to_string()), "{songs:?}");
+    assert!(!songs.contains(&"wire-cover".to_string()), "{songs:?}");
+
+    let searches: Vec<String> = f
+        .calls()
+        .into_iter()
+        .filter(|call| call.contains("/rest/search3"))
+        .collect();
+    let by_name = searches
+        .iter()
+        .filter(|call| call.contains("songCount=5"))
+        .count();
+    let by_title: Vec<&String> = searches
+        .iter()
+        .filter(|call| call.contains("songCount=20"))
+        .collect();
+    // At most one search per Last.fm song by artist and title, and the bare title once more only
+    // for the two songs by an artist with other names: 25 songs, at most 27 searches.
+    assert!(by_name <= 25, "{searches:?}");
+    assert_eq!(by_title.len(), 2, "{by_title:?}");
+    assert!(
+        by_title
+            .iter()
+            .all(|call| call.contains("query=Through") || call.contains("query=Jesus")),
+        "{by_title:?}"
+    );
+    assert_eq!(searches.len(), by_name + by_title.len(), "{searches:?}");
 }
 
 #[tokio::test]

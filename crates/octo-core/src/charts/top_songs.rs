@@ -213,6 +213,52 @@ pub fn library_query(artist: &str, title: &str) -> String {
     format!("{main} {core}").trim().to_string()
 }
 
+/// How many songs a library search by artist and title asks for.
+pub const LIBRARY_SONGS: usize = 5;
+
+/// How many songs a library search by the bare title asks for: a title alone ("Intro",
+/// "Stronger") finds other artists' songs first, so the owned copy is often past the first five.
+pub const LIBRARY_TITLE_SONGS: usize = 20;
+
+/// The bare title, the second library search for a row: Navidrome indexes a song under the
+/// artist credit its file carries and wants every word it is given, so a copy credited to another
+/// name of the artist ("Ye" for "Kanye West") is not found under the name asked, but is under the
+/// title alone. [`library_hit`] still judges what it finds. None when it would repeat
+/// [`library_query`] (no artist to drop) or has fewer than two letters or digits.
+pub fn library_title_query(artist: &str, title: &str) -> Option<String> {
+    let mut core = SongIdentity::parse_title(title, Some(artist)).core;
+    if core.trim().is_empty() {
+        core = title.to_string();
+    }
+    let core = core.trim();
+    if core.chars().filter(|c| c.is_alphanumeric()).count() < 2
+        || core.eq_ignore_ascii_case(&library_query(artist, title))
+    {
+        return None;
+    }
+    Some(core.to_string())
+}
+
+/// The bare-title search to make when the search by artist and title found no copy, only where it
+/// can find one: the artist goes by other names (so the library may file the song under one), or
+/// the first search's songs hold the title under another credit. None otherwise, so a song the
+/// library simply lacks costs one search, not two.
+pub fn library_title_retry(artist: &str, title: &str, first_hits: &[Value]) -> Option<String> {
+    let query = library_title_query(artist, title)?;
+    (SongIdentity::has_other_names(artist) || title_under_another_credit(artist, title, first_hits))
+        .then_some(query)
+}
+
+/// Whether one of the songs is the title asked, by its own credit, but not the row's recording.
+fn title_under_another_credit(artist: &str, title: &str, hits: &[Value]) -> bool {
+    hits.iter().any(|hit| {
+        let (hit_artist, hit_title) = (text(hit, "artist"), text(hit, "title"));
+        !text(hit, "id").is_empty()
+            && is_same_recording(hit_artist, title, hit_artist, hit_title)
+            && !is_same_recording(artist, title, hit_artist, hit_title)
+    })
+}
+
 /// The first of a library search's songs that is the row's own recording, by the rule radio
 /// uses to play a library copy in place of an outside one. Hits without an id never count.
 pub fn library_hit<'a>(artist: &str, title: &str, hits: &'a [Value]) -> Option<&'a Value> {

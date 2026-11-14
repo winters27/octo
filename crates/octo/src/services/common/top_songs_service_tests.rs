@@ -1067,9 +1067,9 @@ async fn match_library_finds_the_same_recording_only_and_gives_a_library_song_to
         top(3, "Daft Punk", "Get Lucky (Radio Edit)"),
         top(4, "Daft Punk", "Around the World"),
     ];
-    let asked = AtomicUsize::new(0);
-    let found = TopSongsService::match_library(&rows, |query| {
-        asked.fetch_add(1, Ordering::SeqCst);
+    let asked = Mutex::new(Vec::<(String, usize)>::new());
+    let found = TopSongsService::match_library(&rows, |query, songs| {
+        asked.lock().push((query.clone(), songs));
         async move {
             match query.as_str() {
                 "Air Sexy Boy" => Some(vec![
@@ -1089,7 +1089,142 @@ async fn match_library_finds_the_same_recording_only_and_gives_a_library_song_to
     assert_eq!(found[1].as_ref().unwrap()["id"], "nd-lucky");
     assert!(found[2].is_none());
     assert!(found[3].is_none());
-    assert_eq!(asked.load(Ordering::SeqCst), 4);
+    // Row 1's answer held "Sexy Boy" under another credit, so the bare title was asked once, for
+    // twenty songs; rows 2 and 3 found their copy and row 4's library did not answer, so none of
+    // them asked again.
+    assert_eq!(
+        *asked.lock(),
+        [
+            ("Air Sexy Boy".to_string(), 5),
+            ("Daft Punk Get Lucky".to_string(), 5),
+            ("Daft Punk Get Lucky".to_string(), 5),
+            ("Daft Punk Around the World".to_string(), 5),
+            ("Sexy Boy".to_string(), 20),
+        ]
+    );
+}
+
+/// Navidrome's full-text search as it behaves: every word asked is in the song's own indexed text
+/// (its title and the artist credit its file carries), and at most `songs` come back.
+fn indexed_library(library: &[(&str, &str, &str)], query: &str, songs: usize) -> Vec<Value> {
+    let words: Vec<String> = query
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    library
+        .iter()
+        .filter(|(_, artist, title)| {
+            let indexed = format!("{artist} {title}").to_lowercase();
+            let have: Vec<&str> = indexed.split_whitespace().collect();
+            words.iter().all(|word| have.contains(&word.as_str()))
+        })
+        .take(songs)
+        .map(|(id, artist, title)| json!({"id": id, "artist": artist, "title": title}))
+        .collect()
+}
+
+const FILED_UNDER_YE: &[(&str, &str, &str)] = &[
+    ("nd-wire", "Ye", "Through the Wire"),
+    ("nd-wire-cover", "Some Band", "Through the Wire"),
+    ("nd-jesus", "Ye", "Jesus Walks"),
+];
+
+#[tokio::test]
+async fn match_library_finds_a_copy_filed_under_another_name_of_the_artist() {
+    let rows = vec![
+        top(1, "Kanye West", "Through the Wire"),
+        top(2, "Kanye West", "Jesus Walks (Explicit)"),
+    ];
+    assert!(indexed_library(FILED_UNDER_YE, "Kanye West Through the Wire", 5).is_empty());
+    let asked = Mutex::new(Vec::<(String, usize)>::new());
+    let found = TopSongsService::match_library(&rows, |query, songs| {
+        asked.lock().push((query.clone(), songs));
+        let hits = indexed_library(FILED_UNDER_YE, &query, songs);
+        async move { Some(hits) }
+    })
+    .await;
+    assert_eq!(found[0].as_ref().unwrap()["id"], "nd-wire");
+    assert_eq!(found[1].as_ref().unwrap()["id"], "nd-jesus");
+    let asked = asked.lock().clone();
+    assert_eq!(
+        asked.len(),
+        4,
+        "each row once by name and once by title: {asked:?}"
+    );
+    assert!(asked.contains(&("Through the Wire".to_string(), 20)));
+}
+
+#[tokio::test]
+async fn match_library_never_takes_another_artists_song_or_take_found_by_title() {
+    let rows = vec![top(1, "Kanye West", "Through the Wire")];
+    for library in [
+        // Only another artist's song of that title.
+        &[("nd-cover", "Some Band", "Through the Wire")][..],
+        // The artist, but another take of the song.
+        &[("nd-live", "Ye", "Through the Wire (Live)")][..],
+    ] {
+        let found = TopSongsService::match_library(&rows, |query, songs| {
+            let hits = indexed_library(library, &query, songs);
+            async move { Some(hits) }
+        })
+        .await;
+        assert!(found[0].is_none(), "{library:?}");
+    }
+}
+
+#[tokio::test]
+async fn match_library_asks_once_for_a_song_by_an_artist_with_no_other_names() {
+    let rows: Vec<TopSong> = (1..=10)
+        .map(|i| top(i, "Radiohead", &format!("Song {i}")))
+        .collect();
+    let asked = AtomicUsize::new(0);
+    let found = TopSongsService::match_library(&rows, |_, _| {
+        asked.fetch_add(1, Ordering::SeqCst);
+        async { Some(Vec::new()) }
+    })
+    .await;
+    assert!(found.iter().all(Option::is_none));
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        10,
+        "a song the library lacks costs one search"
+    );
+}
+
+#[tokio::test]
+async fn match_library_records_both_searches_as_one_miss_but_not_an_unanswered_second() {
+    let rows = vec![top(1, "Kanye West", "Heartless")];
+    let cache = crate::services::library::LibraryMatchCache::default();
+    let session = cache.session_for_tests("alice", "k");
+    let asked = AtomicUsize::new(0);
+    for _ in 0..3 {
+        let found = TopSongsService::match_library_with(
+            &rows,
+            |_, _| {
+                asked.fetch_add(1, Ordering::SeqCst);
+                async { Some(Vec::new()) }
+            },
+            &session,
+        )
+        .await;
+        assert!(found[0].is_none());
+    }
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        2,
+        "by name and by title once, then the recorded miss skips both"
+    );
+
+    let cache = crate::services::library::LibraryMatchCache::default();
+    let session = cache.session_for_tests("alice", "k");
+    TopSongsService::match_library_with(
+        &rows,
+        |query, _| async move { (query == "Kanye West Heartless").then(Vec::new) },
+        &session,
+    )
+    .await;
+    assert!(!session.skips("Kanye West Heartless"));
 }
 
 #[test]
@@ -1125,7 +1260,7 @@ async fn match_library_never_searches_more_than_four_at_once() {
     let rows: Vec<TopSong> = (1..=20).map(|i| top(i, "Artist", &format!("Song {i}"))).collect();
     let running = Arc::new(AtomicUsize::new(0));
     let most = Arc::new(AtomicUsize::new(0));
-    TopSongsService::match_library(&rows, |_| {
+    TopSongsService::match_library(&rows, |_, _| {
         let (running, most) = (Arc::clone(&running), Arc::clone(&most));
         async move {
             let now = running.fetch_add(1, Ordering::SeqCst) + 1;

@@ -2260,6 +2260,15 @@ impl SongIdentity {
         }
     }
 
+    /// Whether the alias table knows other names for the artist's main credit: true for "Kanye
+    /// West" and for "Ye", false for an artist it has no entry for. A source may file such an
+    /// artist's songs under a name other than the one asked.
+    pub fn has_other_names(artist: &str) -> bool {
+        let key = Self::key(Self::parse_artists(artist).primary());
+        !key.is_empty()
+            && (ALIASES.contains_key(key.as_str()) || ALIASES.values().any(|canonical| *canonical == key))
+    }
+
     // ---- searching ----------------------------------------------------------------------
 
     /// The queries to try against a search API, in order, stopping at the first that finds the

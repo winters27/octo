@@ -839,6 +839,67 @@ const DEEZER_MARKED_BODY: &str = r#"{"data":[
    "artist":{"id":42,"name":"Quiet Harbor"},"album":{"id":402,"title":"Paper Lanterns","cover_xl":"https://cdn/b.jpg"}}
 ]}"#;
 
+const DEEZER_RENAMED_BODY: &str = r#"{"data":[
+  {"id":31,"title":"Through the Wire","duration":221,"explicit_lyrics":false,
+   "artist":{"id":230,"name":"Kanye West"},"album":{"id":501,"title":"The College Dropout","cover_xl":"https://cdn/c.jpg"}},
+  {"id":32,"title":"Heartless","duration":211,"explicit_lyrics":false,
+   "artist":{"id":230,"name":"Kanye West"},"album":{"id":502,"title":"808s & Heartbreak","cover_xl":"https://cdn/d.jpg"}},
+  {"id":11,"title":"Dracula","duration":185,"explicit_lyrics":false,
+   "artist":{"id":27,"name":"Tame Impala"},"album":{"id":302,"title":"Deadbeat","cover_xl":"https://cdn/xl.jpg"}}
+]}"#;
+
+#[tokio::test]
+async fn a_chart_finds_a_copy_filed_under_another_name_of_the_artist_and_bounds_its_searches() {
+    let lists = Lists::with_deezer("", DEEZER_RENAMED_BODY).await;
+    // Navidrome files the song under "Ye": the artist's name asked finds nothing, the title does.
+    lists
+        .library(vec![(
+            "Through the Wire",
+            json!([
+                {"id": "nd-wire-cover", "artist": "Some Band", "title": "Through the Wire"},
+                {"id": "nd-wire", "artist": "Ye", "title": "Through the Wire"}
+            ]),
+        )])
+        .await;
+    let mut moved = (*lists.settings.current()).clone();
+    moved.generated_playlists.chart_country = "gb".into();
+    lists.settings.set(moved);
+
+    let songs = lists.service.songs("alice", OVERALL, &auth()).await;
+
+    let ids: Vec<&str> = songs.iter().filter_map(|s| s["id"].as_str()).collect();
+    assert!(ids.contains(&"nd-wire"), "{ids:?}");
+    assert!(!ids.contains(&"nd-wire-cover"), "{ids:?}");
+    let requests = lists.navidrome.received_requests().await.unwrap_or_default();
+    let searches: Vec<(String, String)> = requests
+        .iter()
+        .filter(|r| r.url.path() == "/rest/search3")
+        .map(|r| {
+            let get = |name: &str| {
+                r.url
+                    .query_pairs()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.into_owned())
+                    .unwrap_or_default()
+            };
+            (get("query"), get("songCount"))
+        })
+        .collect();
+    // Each song once by its artist and title; only the two by an artist with other names once
+    // more by the bare title, for twenty songs. A song the library simply lacks costs one search.
+    assert_eq!(searches.len(), 5, "{searches:?}");
+    for title in ["Through the Wire", "Heartless"] {
+        assert!(
+            searches.contains(&(title.to_string(), "20".to_string())),
+            "{searches:?}"
+        );
+    }
+    assert!(
+        !searches.iter().any(|(query, _)| query == "Dracula"),
+        "{searches:?}"
+    );
+}
+
 fn set_filter(lists: &Lists, filter: ExplicitFilter) {
     let mut changed = (*lists.settings.current()).clone();
     changed.subsonic.explicit_filter = filter;

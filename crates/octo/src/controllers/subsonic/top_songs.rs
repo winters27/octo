@@ -535,7 +535,7 @@ pub async fn get_top_songs(State(state): State<AppState>, req: Request) -> AppRe
             .await;
         TopSongsService::match_library_with(
             &candidates,
-            |query| library_songs_matching(&call.proxy, &call.parameters, query),
+            |query, songs| library_songs_matching(&call.proxy, &call.parameters, query, songs),
             &session,
         )
         .await
@@ -660,7 +660,7 @@ async fn answer(state: &AppState, call: &SubsonicCall, list: &TopList, count: us
         .await;
     let library = TopSongsService::match_library_with(
         &candidates,
-        |query| library_songs_matching(&call.proxy, &call.parameters, query),
+        |query, songs| library_songs_matching(&call.proxy, &call.parameters, query, songs),
         &session,
     )
     .await;
@@ -705,17 +705,18 @@ fn count(call: &SubsonicCall, default: usize, max: usize) -> usize {
         .map_or(default, |c| c.min(max))
 }
 
-/// Navidrome's songs for a query, searched as the caller: Some (maybe empty) when it answered,
-/// None when it did not. Nothing outside the library: this goes to Navidrome, not through Octo's
-/// search.
+/// Up to `songs` of Navidrome's songs for a query, searched as the caller: Some (maybe empty) when
+/// it answered, None when it did not. Nothing outside the library: this goes to Navidrome, not
+/// through Octo's search.
 pub(crate) async fn library_songs_matching(
     proxy: &SubsonicProxyService,
     parameters: &Parameters,
     query: String,
+    songs: usize,
 ) -> Option<Vec<Value>> {
     let mut search = parameters.clone();
     search.insert("query".into(), query.clone());
-    search.insert("songCount".into(), "5".into());
+    search.insert("songCount".into(), songs.to_string());
     search.insert("albumCount".into(), "0".into());
     search.insert("artistCount".into(), "0".into());
     search.insert("f".into(), "json".into());

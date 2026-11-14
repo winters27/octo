@@ -27,8 +27,8 @@ use octo_core::charts::chart_settings::{
     playlist_name, table_genre_name,
 };
 use octo_core::charts::top_songs::{
-    APPLE_SOURCE, CatalogTrack, CountedTrack, DEEZER_SOURCE, MAX_ROWS, PlannedRow, library_hit,
-    library_query, merge, one_row_per_library_song,
+    APPLE_SOURCE, CatalogTrack, CountedTrack, DEEZER_SOURCE, LIBRARY_SONGS, LIBRARY_TITLE_SONGS, MAX_ROWS,
+    PlannedRow, library_hit, library_query, library_title_retry, merge, one_row_per_library_song,
 };
 use octo_core::common::dotnet::is_blank;
 use octo_core::common::{SongIdentity, skipped_takes};
@@ -1074,13 +1074,15 @@ impl TopSongsService {
         songs
     }
 
-    /// The library song each row already is, or None, in row order. `search_songs` searches the
-    /// caller's library and answers its song list (Navidrome's searchResult3 songs), or None when
-    /// it could not. A row is the library's only when it is the same recording, by the rule radio
-    /// uses to play a library copy in place of an outside one.
+    /// The library song each row already is, or None, in row order. `search_songs(query, songs)`
+    /// searches the caller's library for up to `songs` songs and answers its song list
+    /// (Navidrome's searchResult3 songs), or None when it could not. A row is the library's only
+    /// when it is the same recording, by the rule radio uses to play a library copy in place of an
+    /// outside one. A row searched by artist and title with no copy found is searched once more by
+    /// the bare title where that can find one ([`library_title_retry`]).
     pub async fn match_library<F, Fut>(rows: &[TopSong], search_songs: F) -> Vec<Option<Value>>
     where
-        F: Fn(String) -> Fut,
+        F: Fn(String, usize) -> Fut,
         Fut: Future<Output = Option<Vec<Value>>>,
     {
         Self::match_library_with(rows, search_songs, &MatchSession::none()).await
@@ -1088,29 +1090,38 @@ impl TopSongsService {
 
     /// [`Self::match_library`] under a session: a row the library already answered it lacks is
     /// not searched, and every answer is recorded. A row it matched is searched each time, so
-    /// the song comes back as the library has it now.
+    /// the song comes back as the library has it now. A row's two searches are recorded as one
+    /// answer under its first query; a second search that got no answer records nothing.
     pub async fn match_library_with<F, Fut>(
         rows: &[TopSong],
         search_songs: F,
         session: &MatchSession<'_>,
     ) -> Vec<Option<Value>>
     where
-        F: Fn(String) -> Fut,
+        F: Fn(String, usize) -> Fut,
         Fut: Future<Output = Option<Vec<Value>>>,
     {
         // Plain futures behind a semaphore, not a stream combinator: a combinator's closures
         // make a handler's future fail rustc's Send check ("not general enough").
         let gate = tokio::sync::Semaphore::new(LIBRARY_SEARCHES_AT_ONCE);
+        let search_songs = &search_songs;
         let searches = rows.iter().map(|row| {
             let (artist, title) = (row.song.artist.clone(), row.song.title.clone());
             let query = library_query(&artist, &title);
-            let search = (!session.skips(&query)).then(|| search_songs(query.clone()));
+            let search = (!session.skips(&query)).then(|| search_songs(query.clone(), LIBRARY_SONGS));
             let gate = &gate;
             async move {
                 let search = search?;
+                // Both searches of a row run in one turn, so no more than four run at once.
                 let _turn = gate.acquire().await.ok()?;
                 let hits = search.await?;
-                let hit = library_hit(&artist, &title, &hits).cloned();
+                let mut hit = library_hit(&artist, &title, &hits).cloned();
+                if hit.is_none()
+                    && let Some(by_title) = library_title_retry(&artist, &title, &hits)
+                {
+                    let more = search_songs(by_title, LIBRARY_TITLE_SONGS).await?;
+                    hit = library_hit(&artist, &title, &more).cloned();
+                }
                 session.record(&query, hit.as_ref());
                 hit
             }

@@ -305,6 +305,24 @@ fn known_name_none_for_a_name_that_is_not_an_alias() {
     }
 }
 
+#[test]
+fn has_other_names_for_both_sides_of_an_alias_and_only_the_main_credit() {
+    for artist in [
+        "Kanye West",
+        "Ye",
+        "Kanye West feat. Jay-Z",
+        "2Pac",
+        "Makaveli",
+        "Diddy",
+        "The Notorious B.I.G.",
+    ] {
+        assert!(SongIdentity::has_other_names(artist), "{artist}");
+    }
+    for artist in ["Radiohead", "Jay-Z feat. Kanye West", "Air", ""] {
+        assert!(!SongIdentity::has_other_names(artist), "{artist}");
+    }
+}
+
 // ---- The shared cases file ---------------------------------------------------------------------
 
 fn cases() -> Value {
