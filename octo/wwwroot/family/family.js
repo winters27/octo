@@ -1429,6 +1429,10 @@
     allSwitch.input.addEventListener('change', function () { ids.hidden = allSwitch.input.checked; changed(); });
     box.appendChild(setRow('Every shared library', 'Libraries you add later are shared too.', allSwitch.node));
     box.appendChild(ids);
+    // Whether every shared library there is now is on, however it was chosen.
+    box.seesEvery = function () {
+      return allSwitch.input.checked || Array.prototype.every.call(ids.querySelectorAll('input'), function (i) { return i.checked; });
+    };
     box.value = function () {
       if (allSwitch.input.checked) return 'All';
       return Array.prototype.filter.call(ids.querySelectorAll('input'), function (i) { return i.checked; })
@@ -1497,7 +1501,7 @@
     var libraries = await librariesPicker(m.sharedLibraries, function () { syncShared(); });
     var syncShared = function () {
       var shared = values.musicGoesTo === 'Shared';
-      sharedWarning.hidden = !(shared && libraries.value() !== 'All');
+      sharedWarning.hidden = !(shared && !libraries.seesEvery());
       if (!storage) return;
       storage.input.disabled = shared;
       storage.help.textContent = shared ? 'Not used while their music goes to the shared library.' : storage.words;

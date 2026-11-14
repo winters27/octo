@@ -713,7 +713,7 @@ input[type="number"].set-input { max-width: 160px; }
 
 .set-info { min-width: 0; }
 .set-info-t { display: block; font-size: var(--t-body); font-weight: 500; color: var(--ink); line-height: 1.35; }
-.set-info-d { display: block; margin-top: var(--s-2xs); font-size: var(--t-meta); color: var(--text-muted); line-height: 1.5; max-width: 62ch; }
+.set-info-d { display: block; margin-top: var(--s-2xs); font-size: var(--t-meta); color: var(--text-muted); line-height: 1.5; max-width: 62ch; overflow-wrap: anywhere; }
 .set-opt { color: var(--text-muted); font-weight: 400; font-size: var(--t-meta); }
 /* The songs downloaded ahead: what runs and what failed, close under the status line. */
 #prefetch-activity p { margin: 0; }
