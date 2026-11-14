@@ -636,6 +636,14 @@ impl MemberBridge {
             .clone()
     }
 
+    /// Holds off every repair of `user`'s hidden password until the answer is dropped: one
+    /// running now is waited for, and one asked for meanwhile waits and then reads the family as
+    /// it is by then. A member leaving the family with their account kept is taken out of it
+    /// under this hold, so no repair sets a hidden password over the one they chose.
+    pub async fn hold_repairs(&self, user: &str) -> tokio::sync::OwnedMutexGuard<Option<Instant>> {
+        self.repair_lock(user).lock_owned().await
+    }
+
     /// Navidrome refused a member's request signed with `used`. Answers the hidden password to
     /// try once more with: the current one when it changed meanwhile, or a new one set
     /// through Octo's admin sign-in. None when there is nothing to retry with (a repair ran

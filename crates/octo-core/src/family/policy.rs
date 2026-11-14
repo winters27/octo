@@ -175,7 +175,7 @@ pub fn request_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::family::abilities::{Preset, StreamCap};
+    use crate::family::abilities::{MusicGoesTo, Preset, StreamCap};
 
     fn listener() -> Abilities {
         Abilities::preset(Preset::Listener)
@@ -513,5 +513,18 @@ mod tests {
         );
         let owner = Abilities::preset(Preset::Owner);
         assert_eq!(storage_full(&owner, u64::MAX), None);
+    }
+
+    #[test]
+    fn music_that_goes_to_the_shared_library_is_never_held_by_their_own_storage_limit() {
+        let shared = Abilities {
+            music_goes_to: MusicGoesTo::Shared,
+            ..Abilities::preset(Preset::Member)
+        };
+        assert_eq!(storage_full(&shared, u64::MAX), None);
+        assert_eq!(
+            request_decision(&shared, RequestQuality::Best, 0, 60_000_000_000),
+            RequestDecision::AutoApprove
+        );
     }
 }

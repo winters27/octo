@@ -1620,6 +1620,121 @@ async fn delete_member_needs_typed_name() {
 }
 
 #[tokio::test]
+async fn a_member_can_leave_keeping_their_account_and_password() {
+    for files in ["keep", "promote", "delete"] {
+        let f = fam().await;
+        let page = f.state.browse_sessions.create_family("alex", SessionKind::Member);
+        let removed = f
+            .delete(
+                "/api/family/members/alex",
+                Some(&f.owner_cookie()),
+                Some(json!({ "confirm": "alex", "files": files, "keepAccount": true })),
+            )
+            .await;
+        assert_eq!(
+            removed.status,
+            StatusCode::NO_CONTENT,
+            "{files}: {}",
+            removed.body
+        );
+        // The account stays, seeing the shared library only, with the password they chose set
+        // last; their own library goes whatever became of their files.
+        assert_eq!(
+            f.accounts.calls(),
+            ["libraries u-alex [1]", "delete_library 3", "set_password u-alex"],
+            "{files}"
+        );
+        assert!(
+            f.accounts.users.lock().iter().any(|u| u.id() == "u-alex"),
+            "{files}"
+        );
+        assert_eq!(f.files.released.lock().len(), 1, "{files}");
+        assert!(f.state.family_store.member("alex").is_none());
+        assert!(f.state.family_store.device("d_app").is_none());
+        assert!(f.state.browse_sessions.family_session_of(Some(&page)).is_none());
+        // Outside the family now, so what they add goes to the shared library.
+        assert_eq!(
+            f.state.family_write_gate.decide(Some("alex")),
+            crate::services::family::WriteDecision::Shared
+        );
+    }
+}
+
+#[tokio::test]
+async fn keeping_an_account_is_refused_before_anything_changes() {
+    // No shared library to keep the account in.
+    let f = fam().await;
+    let mut alex = f.state.family_store.member("alex").expect("alex");
+    alex.shared_libraries = SharedLibraries::Ids(Vec::new());
+    f.state.family_store.upsert_member(alex);
+    let refused = f
+        .delete(
+            "/api/family/members/alex",
+            Some(&f.owner_cookie()),
+            Some(json!({ "confirm": "alex", "files": "delete", "keepAccount": true })),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    assert!(
+        refused.error().contains("Give them one first"),
+        "{}",
+        refused.error()
+    );
+    assert!(f.accounts.calls().is_empty());
+    assert!(f.files.released.lock().is_empty());
+    assert!(f.state.family_store.member("alex").is_some());
+
+    // No password of theirs Octo can open.
+    let f = fam().await;
+    f.state
+        .family_store
+        .upsert_member(member(&f.state, "kim", Preset::Listener, None, Some(5)));
+    let refused = f
+        .delete(
+            "/api/family/members/kim",
+            Some(&f.owner_cookie()),
+            Some(json!({ "confirm": "kim", "files": "keep", "keepAccount": true })),
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+    assert!(
+        refused.error().contains("Reset their password first"),
+        "{}",
+        refused.error()
+    );
+    assert!(f.accounts.calls().is_empty());
+    assert!(f.files.released.lock().is_empty());
+    assert!(f.state.family_store.member("kim").is_some());
+}
+
+#[tokio::test]
+async fn the_family_lists_and_tells_a_member_where_their_music_goes() {
+    let f = fam().await;
+    let mut alex = f.state.family_store.member("alex").expect("alex");
+    alex.edits.insert("MusicGoesTo".into(), json!("Shared"));
+    alex.edits.insert("StorageLimitGb".into(), json!(7));
+    f.state.family_store.upsert_member(alex);
+
+    let me = f.state.family.me_json(&f.state, "alex", None, NetworkPlace::Home);
+    assert_eq!(me["abilities"]["musicGoesTo"], json!("Shared"));
+    assert_eq!(
+        me["abilities"]["storageLimitGb"],
+        json!(0),
+        "no limit applies to shared music"
+    );
+    let sam = f.state.family.me_json(&f.state, "sam", None, NetworkPlace::Home);
+    assert_eq!(sam["abilities"]["musicGoesTo"], json!("Own"));
+
+    let alex = f.state.family_store.member("alex").expect("alex");
+    let full = f.state.family.member_full_json(&f.state, &alex);
+    assert_eq!(full["musicGoesTo"], json!("Shared"));
+    assert_eq!(full["storageLimitGb"], json!(0));
+    // The edit sheet still reads the limit kept for when their music goes back to their own.
+    assert_eq!(full["abilities"]["storageLimitGb"], json!(7));
+    assert_eq!(full["abilities"]["musicGoesTo"], json!("Shared"));
+}
+
+#[tokio::test]
 async fn invite_member_sends_a_new_sign_in_link() {
     let f = fam().await;
     let r = f

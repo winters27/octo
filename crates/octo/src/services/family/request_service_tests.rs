@@ -1603,3 +1603,93 @@ async fn a_removed_members_late_downloads_are_let_go_of_whenever_they_land() {
         }
     }
 }
+
+/// Makes `name` a member whose music goes to the shared library.
+fn music_to_shared(world: &World, name: &str, preset: Preset, library: i64) {
+    let mut shared = member(name, preset, library);
+    shared.edits.insert("MusicGoesTo".into(), json!("Shared"));
+    world.family.upsert_member(shared);
+}
+
+#[tokio::test]
+async fn an_approved_song_of_a_member_whose_music_goes_to_shared_lands_in_the_shared_library() {
+    let world = World::new(None);
+    let navidrome = navidrome_with_shared(&world, "43", &[]).await;
+    world.point_at(&navidrome.uri());
+    world.index.refresh().await.expect("read");
+    music_to_shared(&world, "alex", Preset::Member, 3);
+    let setup = setup(world);
+    // The fetcher is handed the shared library as the target; it lands the song there.
+    *setup.fetcher.lands_shared.lock() = Some(setup.world.music());
+
+    let made = setup
+        .service
+        .create("alex", "ext-test-song-43", RequestQuality::Best, None)
+        .await
+        .expect("made");
+    assert_eq!(made.state, RequestState::Approved);
+    assert!(
+        eventually(|| state_of(&setup, &made.id) == RequestState::Done).await,
+        "{:?}",
+        setup.service.get(&made.id)
+    );
+    let done = setup.service.get(&made.id).expect("kept");
+    assert_eq!(done.outcome, Some(RequestOutcome::AlreadyShared));
+    assert_eq!(done.library_song_id.as_deref(), Some("shared-43"));
+    let link = format!("{}/alex/Artist/Album/43.flac", setup.world.members());
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "nothing in Alex's own library"
+    );
+    assert!(setup.world.pool.store().list().is_empty(), "nothing in the pool");
+}
+
+#[tokio::test]
+async fn a_member_whose_music_goes_to_shared_takes_the_familys_copy_there_as_one_file() {
+    let world = World::new(None);
+    let navidrome = navidrome_with_shared(&world, "7", &[]).await;
+    world.point_at(&navidrome.uri());
+    world.index.refresh().await.expect("read");
+    music_to_shared(&world, "alex", Preset::Member, 3);
+    let setup = setup(world);
+    // Sam already has the song, in the pool and linked into Sam's own library.
+    let pooled = setup.world.pool_file("Artist/Album/7.flac", 10);
+    let song = setup.catalog.song("test", "7").await.expect("a song");
+    setup
+        .world
+        .pool
+        .placed(&pooled, &song, "test", "7", &["sam".to_string()], false)
+        .await;
+    setup.world.pool.link(&pooled, "sam").await.expect("linked");
+
+    let made = setup
+        .service
+        .create("alex", "ext-test-song-7", RequestQuality::Best, None)
+        .await
+        .expect("made");
+    assert_eq!(
+        made.state,
+        RequestState::Approved,
+        "the move runs, then it is done"
+    );
+    assert!(
+        eventually(|| state_of(&setup, &made.id) == RequestState::Done).await,
+        "{:?}",
+        setup.service.get(&made.id)
+    );
+    let done = setup.service.get(&made.id).expect("kept");
+    assert_eq!(done.outcome, Some(RequestOutcome::AddedFromFamily));
+    assert_eq!(done.library_song_id.as_deref(), Some("shared-7"));
+    assert!(setup.fetcher.asked.lock().is_empty(), "never downloaded again");
+    assert_eq!(setup.service.quota_used("alex"), 0, "no download, no slot");
+
+    // One file: the pool's moved into the shared library, Sam's link gone with it.
+    let shared = format!("{}/Artist/Album/7.flac", setup.world.music());
+    assert_eq!(std::fs::read(&shared).expect("moved there").len(), 10);
+    assert!(!std::path::Path::new(&pooled).exists());
+    assert!(setup.world.pool.store().list().is_empty());
+    let sams = format!("{}/sam/Artist/Album/7.flac", setup.world.members());
+    assert!(std::fs::symlink_metadata(&sams).is_err());
+    let alexs = format!("{}/alex/Artist/Album/7.flac", setup.world.members());
+    assert!(std::fs::symlink_metadata(&alexs).is_err());
+}

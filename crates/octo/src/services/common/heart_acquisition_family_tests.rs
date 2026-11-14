@@ -563,3 +563,60 @@ async fn a_members_late_judged_landed_file_is_linked_into_their_own_library() {
         "sam's own library has the file: {link}"
     );
 }
+
+#[tokio::test]
+async fn music_that_goes_to_shared_lands_there_and_an_approved_song_never_waits_on_lidarr() {
+    let world = World::new(None);
+    configure(
+        &world,
+        &[HeartDownloadSource::Lidarr, HeartDownloadSource::YouTube],
+        true,
+    );
+    for (name, preset, library) in [("ben", Preset::Member, 8), ("ria", Preset::Listener, 9)] {
+        let mut shared = member(name, preset, library);
+        shared.edits.insert("MusicGoesTo".into(), json!("Shared"));
+        world.family.upsert_member(shared);
+    }
+    let chain = chain(world);
+    let coordinator = chain.coordinator.clone();
+    assert_eq!(coordinator.request_target("ben"), AcquisitionTarget::Shared);
+    assert_eq!(coordinator.request_target("ria"), AcquisitionTarget::Shared);
+    assert_eq!(
+        coordinator.request_target("alex"),
+        AcquisitionTarget::Member("alex".into())
+    );
+    assert_eq!(coordinator.import_target("ben"), Ok(AcquisitionTarget::Shared));
+    assert_eq!(coordinator.import_target("ria"), Ok(AcquisitionTarget::Shared));
+    assert_eq!(
+        coordinator.import_target("alex"),
+        Ok(AcquisitionTarget::Member("alex".into()))
+    );
+
+    // An approved song waits for its file, which Lidarr never hands back.
+    let waiting = coordinator.clone();
+    let asked = tokio::spawn(async move {
+        waiting
+            .acquire_track_waiting(
+                "test",
+                "7",
+                Some("ria"),
+                None,
+                &AcquisitionTarget::Shared,
+                AcquisitionOrigin::Request,
+            )
+            .await
+    });
+    let request = next_queued(&chain.queue).await.expect("queued");
+    assert_eq!(
+        request.source_override,
+        Some(octo_core::settings::DownloadSource::YouTube)
+    );
+    assert_eq!(request.pool_destination(), None, "the shared library");
+    assert_eq!(chain.lidarr.calls(), 0);
+    asked.abort();
+
+    // Ben's play keeps its copy in the shared library.
+    coordinator.queue_play("test", "6", Some("ben"), None, Some("ben"));
+    let played = next_queued(&chain.queue).await.expect("queued");
+    assert_eq!(played.pool_destination(), None);
+}

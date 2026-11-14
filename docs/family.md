@@ -33,6 +33,27 @@ members' files.
 
 An install that already keeps members' music in `/members` goes on using it.
 
+### Music goes to
+
+Each member has a **Music goes to** setting on the Family page, under **Adding music**:
+
+- **Their own library** (the default for everyone): their songs land in their folder above.
+- **Shared library**: what they add, the copies their plays keep and the requests you approve
+  for them land in your shared library, the same place your own songs go. Their storage limit
+  does not apply, since it measures their own folder. Their request limit and approvals still
+  do.
+
+A song another member already has is never downloaded a second time for a member whose music
+goes to the shared library: Octo moves that file into the shared library, still one file,
+and every member who had it keeps their stars and family playlist entries for it.
+
+Such a member should see the shared library their songs land in. When the shared libraries
+they see leave some out, the edit sheet says so, since songs they add may not show up for
+them.
+
+The Octo apps read the setting from the member's own Family state (`abilities.musicGoesTo`,
+`Own` or `Shared`) and say where their songs go instead of showing a storage meter.
+
 ### Cloud and network storage
 
 Family keeps a song two members want once on disk by linking it into each member's folder.
@@ -43,3 +64,16 @@ who wants the song, and the Family page says what to change.
   Family off and on so Octo checks again.
 - **SMB or CIFS network shares:** add the `mfsymlinks` mount option to the share.
 - **NFS:** links work, nothing to change.
+
+## Removing a member
+
+Removing a member takes away their own library and their sign-in on the Family page. What
+happens to their songs is your choice: kept aside, added to the shared library, or deleted.
+Shared music is never touched.
+
+Their Navidrome account goes too, unless you turn on **Keep their account and password**.
+Then the account stays with the password they chose, so their apps keep signing in, and it
+keeps the shared libraries they saw. They lose their family settings and their open requests
+are closed; from then on what they add goes to the shared library, as for anyone outside the
+family. Octo refuses to keep an account that sees no shared library, or whose password it
+cannot use (reset their password first).

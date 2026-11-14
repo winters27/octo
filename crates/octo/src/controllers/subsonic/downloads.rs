@@ -279,7 +279,7 @@ pub async fn pick_found_song(State(state): State<AppState>, req: Request) -> App
             .into_response());
     }
     // A family member who must ask first asks for the song instead; one who only saves songs
-    // cannot pick one. Members who add songs at once get the copy in their own library.
+    // cannot pick one. Members who add songs at once get the copy where their music goes.
     if let Some(member) = caller.filter(|c| c.managed) {
         match state.family_write_gate.decide(Some(&member.user)) {
             WriteDecision::Shared | WriteDecision::Member(_) => {}

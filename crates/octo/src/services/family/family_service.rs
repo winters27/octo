@@ -788,12 +788,18 @@ impl FamilyService {
         let abilities = Self::abilities_of(state, user);
         let preference = state.family_store.preference(user);
         let now = Utc::now();
+        // The apps draw their library meter from the storage limit, which does not apply while
+        // the member's music goes to the shared library: they read no limit then.
+        let mut shown = json!(abilities);
+        if abilities.storage_limit_bytes().is_none() {
+            shown["storageLimitGb"] = json!(0);
+        }
         json!({
             "username": member.as_ref().map_or(user.to_string(), |m| m.username.clone()),
             "displayName": member.as_ref().map_or(user.to_string(), |m| m.shown_name().to_string()),
             "role": role,
             "managed": member.is_some(),
-            "abilities": abilities,
+            "abilities": shown,
             "requestsThisWeek": state.family_requests.quota_used(user, now),
             "storageUsedBytes": if member.is_some() { hooks.storage.used_bytes(user) } else { 0 },
             "place": place,
@@ -839,7 +845,9 @@ impl FamilyService {
             "playingNow": hooks.streams.user_playing(&m.username),
             "pendingRequests": pending.iter().filter(|r| eq_ignore_case(&r.username, &m.username)).count(),
             "storageUsedBytes": hooks.storage.used_bytes(&m.username),
-            "storageLimitGb": abilities.storage_limit_gb,
+            // 0, no limit, while their music goes to the shared library.
+            "storageLimitGb": abilities.storage_limit_bytes().map_or(0, |_| abilities.storage_limit_gb),
+            "musicGoesTo": abilities.music_goes_to,
         })
     }
 
@@ -1257,8 +1265,10 @@ impl FamilyService {
         Ok(member)
     }
 
-    /// Removes a member: their files by `files`, their Navidrome library and account, their
-    /// devices and sign-ins. `confirm` must be the member's username.
+    /// Removes a member: their files by `files`, their own library, their devices and sign-ins,
+    /// and their Navidrome account unless `keep_account`. A kept account signs in with the
+    /// password they chose and sees the shared libraries they saw; only their Family page
+    /// sign-ins end. `confirm` must be the member's username.
     pub async fn remove_member(
         &self,
         state: &AppState,
@@ -1266,6 +1276,7 @@ impl FamilyService {
         name: &str,
         confirm: &str,
         files: FilesChoice,
+        keep_account: bool,
     ) -> FamilyResult<()> {
         let member = state
             .family_store
@@ -1290,29 +1301,85 @@ impl FamilyService {
         let hooks = self.hooks(state);
         // Navidrome must be reachable as an admin before anything is changed.
         hooks.accounts.users().await?;
+        // A kept account needs the password they chose (a member's Navidrome password is a
+        // hidden one Octo set) and a shared library to stay in, since Navidrome gives every
+        // account at least one. Both are known before anything changes.
+        let kept = if keep_account {
+            let password = passwords::open(&state.family_vault, &member.account_password)
+                .filter(|_| !member.navidrome_user_id.trim().is_empty())
+                .ok_or_else(|| {
+                    FamilyError::Conflict(format!(
+                        "Octo can't keep {}'s account: it has no password of theirs to give it. Reset their password first.",
+                        member.username
+                    ))
+                })?;
+            let libraries = hooks.accounts.libraries().await?;
+            let ids = member
+                .shared_libraries
+                .resolve(&Self::shared_library_ids(state, &libraries));
+            if ids.is_empty() {
+                return Err(FamilyError::Conflict(format!(
+                    "{} sees no shared library, so their account would have nothing to play. Give them one first.",
+                    member.username
+                )));
+            }
+            Some((password, ids))
+        } else {
+            None
+        };
         hooks.files.release(&member.username, files).await?;
+        // A kept account sees the shared libraries before their own library goes.
+        if let Some((_, ids)) = &kept {
+            hooks
+                .accounts
+                .set_user_libraries(&member.navidrome_user_id, ids)
+                .await?;
+        }
         if let Some(library) = member.personal_library_id {
             match hooks.accounts.delete_library(library).await {
                 Ok(()) | Err(AdminError::Status { status: 404, .. }) => {}
                 Err(e) => return Err(e.into()),
             }
         }
-        if !member.navidrome_user_id.trim().is_empty() {
-            match hooks.accounts.delete_user(&member.navidrome_user_id).await {
-                Ok(()) | Err(AdminError::Status { status: 404, .. }) => {}
-                Err(e) => return Err(e.into()),
+        // Their password is set and they leave the family under one hold of the repairs of their
+        // hidden password: a sign-in of theirs meanwhile finds them gone and repairs nothing.
+        let repairs = match &kept {
+            Some((password, _)) => {
+                let hold = state.family_bridge.hold_repairs(&member.username).await;
+                hooks
+                    .accounts
+                    .set_password(&member.navidrome_user_id, password)
+                    .await?;
+                Some(hold)
             }
-        }
+            None => {
+                if !member.navidrome_user_id.trim().is_empty() {
+                    match hooks.accounts.delete_user(&member.navidrome_user_id).await {
+                        Ok(()) | Err(AdminError::Status { status: 404, .. }) => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                None
+            }
+        };
         state.family_store.remove_member(&member.username);
+        drop(repairs);
         state.family_request_service.close_member(&member.username).await;
         state.family_saved.remove_user(&member.username);
-        state.browse_sessions.revoke_user(&member.username);
+        if kept.is_some() {
+            // Only Family page sign-ins belong to the family; any other of theirs stays.
+            state.browse_sessions.revoke_family_user(&member.username);
+        } else {
+            state.browse_sessions.revoke_user(&member.username);
+        }
         self.applied_libraries
             .lock()
             .remove(&member.username.to_lowercase());
         info!(
-            "FAMILY member {} removed by {} (files {files:?})",
-            member.username, actor.user
+            "FAMILY member {} removed by {} (files {files:?}, account {})",
+            member.username,
+            actor.user,
+            if kept.is_some() { "kept" } else { "deleted" }
         );
         Ok(())
     }

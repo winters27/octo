@@ -1077,6 +1077,56 @@ async fn repair_runs_once_then_refuses() {
 }
 
 #[tokio::test]
+async fn a_sign_in_while_a_member_leaves_keeping_their_account_repairs_nothing() {
+    let f = family(true).await;
+    admin_mocks(&f).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/user/u-alex"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "u-alex" })))
+        .mount(&f.server)
+        .await;
+    f.navidrome_refuses_the_rest().await;
+    // The removal holds the repairs while it sets the password they chose.
+    let hold = f.state.family_bridge.hold_repairs("Alex").await;
+    let app = f.app.clone();
+    let mut signing_in = tokio::spawn(async move {
+        send(
+            &app,
+            Method::GET,
+            "/rest/getThing?u=alex&p=app-secret-1&f=json",
+            &[],
+            "",
+        )
+        .await
+    });
+    // Navidrome refused the sign-in, and its repair waits on the hold.
+    for _ in 0..200 {
+        if !f.rest_requests().await.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(f.rest_requests().await.len(), 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut signing_in)
+            .await
+            .is_err(),
+        "the repair waits while the removal holds it"
+    );
+    f.state.family_store.remove_member("alex");
+    drop(hold);
+
+    let r = signing_in.await.expect("answered");
+    assert_eq!(r.json()["subsonic-response"]["error"]["code"], 40);
+    assert_eq!(
+        puts(&f.server.received_requests().await.unwrap_or_default()),
+        0,
+        "no hidden password is set over the one they chose"
+    );
+}
+
+#[tokio::test]
 async fn repair_sets_a_new_password_and_retries() {
     let f = family(true).await;
     admin_mocks(&f).await;

@@ -6,12 +6,17 @@
 //! 2. Another member has it in the family pool: a link is added to the member's library and
 //!    it is done at once ("Added from the family library"). Not for a kid, or anyone whose
 //!    `InstantFromFamily` is off, or whose library is full: their request waits like any other.
+//!    For a member whose music goes to the shared library the pool file moves into it instead
+//!    (still one file, every holder's stars and family playlist entries following it), and the
+//!    request is done once the library shows it there.
 //! 3. Someone is downloading it right now: the member joins that download and gets a link when
 //!    it lands (same rules as 2).
 //! 4. Otherwise it waits for an approver, or is approved at once when the member may (see
 //!    [`policy::request_decision`]).
 //!
-//! An approved song request downloads into the family pool, linked for the member. It is done
+//! An approved song request downloads into the family pool, linked for the member, or into the
+//! shared library for a member whose music goes there, and never as a second file of a song
+//! the pool already holds: that file moves into the shared library as in 2. It is done
 //! only once the library index finds the song in the member's own library, which can take a
 //! scan or two; Octo looks for up to ten minutes. A song that lands in the shared library
 //! instead (someone wanted it there) is done ("Already in the family library") once the index
@@ -33,7 +38,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use octo_core::common::dotnet::eq_ignore_case;
-use octo_core::family::abilities::{AddToLibrary, Preset, RequestQuality};
+use octo_core::family::abilities::{AddToLibrary, MusicGoesTo, Preset, RequestQuality};
 use octo_core::family::policy::{self, RequestDecision, storage_full};
 use octo_core::family::request::{FamilyRequest, RequestKind, RequestOutcome, RequestState};
 use octo_core::fingerprint::heart_gate::AcquisitionOrigin;
@@ -51,9 +56,7 @@ use super::request_store::RequestStore;
 use crate::services::common::acquisition_tracker::key_of;
 use crate::services::common::base_download_service::NO_REAL_FLAC;
 use crate::services::common::heart_acquisition_coordinator::TrackOutcome;
-use crate::services::common::{
-    AcquisitionTarget, AcquisitionTracker, HeartAcquisitionCoordinator, TrackAcquisitionQueue,
-};
+use crate::services::common::{AcquisitionTracker, HeartAcquisitionCoordinator, TrackAcquisitionQueue};
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::imports::ImportService;
 use crate::services::library::{LibraryOwnership, OwnedCopy, UpgradeAsk, UpgradeQueue};
@@ -353,6 +356,13 @@ impl RequestService {
             ));
         }
         Ok(member)
+    }
+
+    /// Whether `user`'s songs go to the shared library rather than their own.
+    fn music_goes_to_shared(&self, user: &str) -> bool {
+        self.family
+            .member(user)
+            .is_some_and(|m| m.abilities().music_goes_to == MusicGoesTo::Shared)
     }
 
     /// Whether `user` may take a song another member already has, without asking.
@@ -670,6 +680,20 @@ impl RequestService {
         if let Some(file) = self.pooled(outside, song.as_ref(), quality).await
             && (file.refs.iter().any(|r| eq_ignore_case(r, &member.username)) || self.instant_allowed(member))
         {
+            // Theirs goes to the shared library: the run moves the pool file there and is done
+            // once the library shows it, as a joined download is.
+            if self.music_goes_to_shared(&member.username) {
+                request.state = RequestState::Approved;
+                let (made, new) = self.keep_live(request);
+                if new {
+                    info!(
+                        "FAMILY request {} {}: the family's copy moves into the shared library",
+                        made.id, made.username
+                    );
+                    self.start(made.clone(), true);
+                }
+                return Ok(made);
+            }
             return match self.pool().link(&file.path, &member.username).await {
                 Ok(_) => {
                     request.state = RequestState::Done;
@@ -1080,17 +1104,44 @@ impl RequestService {
         };
         let user = request.username.clone();
         let song = self.catalog.song(&outside.provider, &outside.external_id).await;
-        // Someone may have got it since it was asked for.
+        // Someone may have got it since it was asked for. For a member whose music goes to the
+        // shared library that file moves there, never a second download of it.
         if let Some(file) = self.pooled(&outside, song.as_ref(), request.quality).await
             && self.still_approved(request)
         {
-            match self.pool().link(&file.path, &user).await {
-                Ok(link) => {
-                    self.wait_done(request, &link, RequestOutcome::AddedFromFamily)
-                        .await;
-                    return;
+            if self.music_goes_to_shared(&user) {
+                let key = key_of(&outside.provider, &outside.external_id);
+                let placed = match self.pool().promote(&file.path).await {
+                    Ok(moved) => {
+                        self.outside_pool_place(&user, &moved, Some(&key), song.as_ref())
+                            .await
+                    }
+                    Err(e) => Err(e),
+                };
+                match placed {
+                    Ok((shown, _)) => {
+                        info!(
+                            "FAMILY request {} moved {} into the shared library",
+                            request.id, file.path
+                        );
+                        self.wait_done(request, &shown, RequestOutcome::AddedFromFamily)
+                            .await;
+                        return;
+                    }
+                    Err(e) => warn!(
+                        "FAMILY request {} could not move {} into the shared library: {e}",
+                        request.id, file.path
+                    ),
                 }
-                Err(e) => warn!("FAMILY request {} could not link {}: {e}", request.id, file.path),
+            } else {
+                match self.pool().link(&file.path, &user).await {
+                    Ok(link) => {
+                        self.wait_done(request, &link, RequestOutcome::AddedFromFamily)
+                            .await;
+                        return;
+                    }
+                    Err(e) => warn!("FAMILY request {} could not link {}: {e}", request.id, file.path),
+                }
             }
         }
         let fetched = self
@@ -1493,12 +1544,12 @@ impl RequestFetcher for LiveRequestFetcher {
             song.map(|s| s.title.as_str()),
             song.map(|s| s.album.as_str()),
         );
-        let target = AcquisitionTarget::Member(user.to_string());
+        let target = self.coordinator.request_target(user);
         let source = match quality {
             RequestQuality::Best => {
                 return match self
                     .coordinator
-                    .acquire_track_outcome(
+                    .acquire_track_waiting(
                         provider,
                         external_id,
                         Some(user),
