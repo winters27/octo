@@ -15,7 +15,7 @@ services:
   # ghcr.io), build octo-source, at the end of this file. Octo is written in Rust; the
   # environment below and the config folder are the ones the C# Octo read, unchanged.
   octo:
-    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.11.04}
+    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.11.13}
     container_name: octo
     restart: unless-stopped
     logging: *logging
@@ -425,7 +425,7 @@ services:
   # Pulled, not built, like Octo, and at the same tag, so the two always match.
   # Without access to ghcr.io, build it from this folder with yt-dlp-shim-source (below).
   yt-dlp-shim:
-    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.11.04}
+    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.11.13}
     container_name: yt-dlp-shim
     restart: unless-stopped
     logging: *logging
@@ -486,7 +486,7 @@ services:
   # Pulled, not built, like the shim: compiling it (Rust and FFmpeg) takes minutes and more
   # memory than a small machine has. octo-sonic-source (below) builds it from this folder.
   octo-sonic:
-    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.11.04}
+    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.11.13}
     container_name: octo-sonic
     restart: unless-stopped
     logging: *logging
@@ -634,10 +634,10 @@ services:
     # VERSION (CI checks it), so every release gets its own Mornye image ready.
     # SPOTIFLAC_BUILD_CONTEXT builds it from somewhere else, such as ./mornye in a checkout
     # that is not a release yet.
-    image: octo-mornye:2026.11.04
+    image: octo-mornye:2026.11.13
     pull_policy: never
     build:
-      context: ${SPOTIFLAC_BUILD_CONTEXT:-https://github.com/winters27/octo.git#2026.11.04:mornye}
+      context: ${SPOTIFLAC_BUILD_CONTEXT:-https://github.com/winters27/octo.git#2026.11.13:mornye}
       args:
         # Blank: the Mornye image mornye/Dockerfile pins.
         MORNYE_IMAGE: ${SPOTIFLAC_IMAGE:-}
@@ -680,7 +680,7 @@ services:
   # nothing, which is what an older update helper runs; that keeps even the update to this
   # release from compiling anything.
   octo-source:
-    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.11.04}
+    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.11.13}
     build:
       context: .
       args:
@@ -689,11 +689,11 @@ services:
         PLACES_REFRESH: ${PLACES_REFRESH:-}
     profiles: ["source"]
   yt-dlp-shim-source:
-    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.11.04}
+    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.11.13}
     build: ./yt-dlp-shim
     profiles: ["source"]
   octo-sonic-source:
-    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.11.04}
+    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.11.13}
     build: ./sonic
     profiles: ["source"]
 

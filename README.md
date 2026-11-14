@@ -188,7 +188,7 @@ scripts/updater/install-updater.sh --remove
 Without the helper, **About** shows the command for the new release. From the Octo folder:
 
 ```bash
-git fetch --tags && git checkout --detach 2026.11.04
+git fetch --tags && git checkout --detach 2026.11.13
 docker compose pull octo yt-dlp-shim octo-sonic || docker compose --profile source build octo-source yt-dlp-shim-source octo-sonic-source
 docker compose up -d
 ```
