@@ -543,6 +543,79 @@ async fn catalog_only_medium_fills_blanks_only_no_release_facts_written() {
     assert!(!report.fields.contains_key("album"));
 }
 
+// ---- G2: a song heart from a multi-artist album -------------------------------------------
+
+/// A soundtrack's song hearted on its own: the catalog's best hit for the song is the
+/// performer's single, and the soundtrack itself (album 7) is listed under `album_artist` with
+/// `tracks`.
+fn soundtrack_routes(album_artist: &str, tracks: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "/search/album?q=",
+            r#"{"data":[{"id":7,"title":"A Film Soundtrack","record_type":"album","nb_tracks":2,"artist":{"name":"ALBUM_ARTIST"}}]}"#
+                .replace("ALBUM_ARTIST", album_artist),
+        ),
+        ("/album/7/tracks", format!(r#"{{"data":[{tracks}]}}"#)),
+        (
+            "/album/7",
+            r#"{"id":7,"title":"A Film Soundtrack","record_type":"album","nb_tracks":2,"release_date":"2025-06-20","artist":{"name":"ALBUM_ARTIST"}}"#
+                .replace("ALBUM_ARTIST", album_artist),
+        ),
+        (
+            "/album/5",
+            r#"{"id":5,"record_type":"single","release_date":"2025-06-01","nb_tracks":1,"artist":{"name":"Performer A"}}"#
+                .to_string(),
+        ),
+        ("/track/51", r#"{"id":51,"track_position":1,"disk_number":1}"#.to_string()),
+        (
+            "/search?q=",
+            r#"{"data":[{"id":51,"title":"Song One","duration":200,"album":{"id":5,"title":"Song One"},"artist":{"name":"Performer A"}}]}"#
+                .to_string(),
+        ),
+    ]
+}
+
+/// The song hearted and landed; the download's folder lives as long as the returned `Tagging`.
+async fn soundtrack_song_heart(routes: Vec<(&'static str, String)>) -> (Tagging, String) {
+    let song = Song {
+        artist: "Performer A".into(),
+        title: "Song One".into(),
+        album: "A Film Soundtrack".into(),
+        ..Default::default()
+    };
+    let tagging = build_with(vec![("1", song)], serve(routes).await, Options::default()).await;
+    let root = tagging.root().to_path_buf();
+    tagging.harness.backend.land(move |_, _| {
+        landed_flac(&root, "peer share", |file| {
+            file.set_title(Some("Song One"));
+            file.set_performers(&["Performer A".to_string()]);
+            file.set_album(Some("A Film Soundtrack"));
+        })
+    });
+    let path = tagging.download("1").await.expect("downloaded");
+    (tagging, path)
+}
+
+#[tokio::test]
+async fn song_heart_from_a_multi_artist_album_takes_the_albums_own_artist() {
+    let tracks = r#"{"id":51,"title":"Song One","duration":200,"artist":{"name":"Performer A"}},
+                    {"id":52,"title":"Song Two","duration":180,"artist":{"name":"Performer B"}}"#;
+    let (_tagging, path) = soundtrack_song_heart(soundtrack_routes("Film Cast", tracks)).await;
+
+    assert_eq!(vorbis(&path, "ALBUM").as_deref(), Some("A Film Soundtrack"));
+    assert_eq!(vorbis(&path, "ALBUMARTIST").as_deref(), Some("Film Cast"));
+    assert_eq!(vorbis(&path, "ARTIST").as_deref(), Some("Performer A"));
+}
+
+#[tokio::test]
+async fn song_heart_keeps_its_performer_when_the_albums_namesake_does_not_list_the_song() {
+    let tracks = r#"{"id":81,"title":"Something Else","duration":210,"artist":{"name":"Someone Else"}}"#;
+    let (_tagging, path) = soundtrack_song_heart(soundtrack_routes("Someone Else", tracks)).await;
+
+    assert_eq!(vorbis(&path, "ALBUM").as_deref(), Some("A Film Soundtrack"));
+    assert_eq!(vorbis(&path, "ALBUMARTIST").as_deref(), Some("Performer A"));
+}
+
 // ---- H: the database down and the catalog throttled ---------------------------------------
 
 #[tokio::test]
