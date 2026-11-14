@@ -587,10 +587,11 @@ fn soundtrack_routes(album_artist: &str, tracks: &str) -> Vec<(&'static str, Str
 }
 
 /// Song One of the soundtrack, downloaded on its own in `layout`, with these catalog album ids
-/// as the albums it was listed from. The temp folder lives as long as the returned `Tagging`.
+/// as the albums it was listed from, filed by `template` with the Custom layout, else Flat. The
+/// temp folder lives as long as the returned `Tagging`.
 async fn soundtrack_song(
     routes: Vec<(&'static str, String)>,
-    layout: FolderStructure,
+    template: Option<&'static str>,
     listed: &[&str],
 ) -> (Tagging, String) {
     let song = Song {
@@ -601,7 +602,12 @@ async fn soundtrack_song(
         ..Default::default()
     };
     let options = Options {
-        layout,
+        layout: if template.is_some() {
+            FolderStructure::Custom
+        } else {
+            FolderStructure::Flat
+        },
+        template,
         ..Default::default()
     };
     let tagging = build_with(vec![("1", song)], serve(routes).await, options).await;
@@ -624,7 +630,7 @@ const SOUNDTRACK_TRACKS: &str = r#"{"id":51,"title":"Song One","duration":200,"a
 #[tokio::test]
 async fn one_song_of_a_soundtrack_is_filed_under_the_soundtracks_artist() {
     let routes = soundtrack_routes("Film Cast", SOUNDTRACK_TRACKS);
-    let (_tagging, path) = soundtrack_song(routes, FolderStructure::Flat, &[]).await;
+    let (_tagging, path) = soundtrack_song(routes, None, &[]).await;
 
     assert_eq!(vorbis(&path, "ALBUM").as_deref(), Some("A Film Soundtrack"));
     assert_eq!(vorbis(&path, "ALBUMARTIST").as_deref(), Some("Film Cast"));
@@ -635,7 +641,7 @@ async fn one_song_of_a_soundtrack_is_filed_under_the_soundtracks_artist() {
 async fn an_album_of_the_same_name_that_does_not_list_the_song_lends_no_artist() {
     let tracks = r#"{"id":81,"title":"Something Else","duration":210,"artist":{"name":"Someone Else"}}"#;
     let routes = soundtrack_routes("Someone Else", tracks);
-    let (_tagging, path) = soundtrack_song(routes, FolderStructure::Flat, &[]).await;
+    let (_tagging, path) = soundtrack_song(routes, None, &[]).await;
 
     assert_eq!(vorbis(&path, "ALBUM").as_deref(), Some("A Film Soundtrack"));
     assert_eq!(vorbis(&path, "ALBUMARTIST").as_deref(), Some("Performer A"));
@@ -645,32 +651,22 @@ async fn an_album_of_the_same_name_that_does_not_list_the_song_lends_no_artist()
 async fn the_album_a_song_was_listed_from_is_asked_before_any_namesake() {
     // Album 7, the name search's namesake, lists the song too, under another artist.
     let routes = soundtrack_routes("Namesake Cast", SOUNDTRACK_TRACKS);
-    let (_tagging, path) = soundtrack_song(routes, FolderStructure::Flat, &["9"]).await;
+    let (_tagging, path) = soundtrack_song(routes, None, &["9"]).await;
 
     assert_eq!(vorbis(&path, "ALBUMARTIST").as_deref(), Some("Listed Cast"));
 }
 
 #[tokio::test]
 async fn one_song_of_a_soundtrack_lands_in_the_soundtracks_album_folder() {
+    // A layout whose album folder sits under the album's artist, as an album heart files it.
     let routes = soundtrack_routes("Film Cast", SOUNDTRACK_TRACKS);
-    let (tagging, path) = soundtrack_song(routes, FolderStructure::Organized, &[]).await;
+    let template = Some("{Album Artist}/{Album}/{Track:00} - {Title}");
+    let (_tagging, path) = soundtrack_song(routes, template, &[]).await;
 
-    let mut files = Vec::new();
-    let mut dirs = vec![tagging.root().to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(&dir).expect("lists").flatten() {
-            let found = entry.path();
-            if found.is_dir() {
-                dirs.push(found);
-            } else {
-                files.push(found.display().to_string());
-            }
-        }
-    }
     assert_eq!(
         vorbis(&path, "ALBUMARTIST").as_deref(),
         Some("Film Cast"),
-        "{path}, among {files:?}"
+        "{path}"
     );
     let path = Path::new(&path);
     let album_folder = path.parent().expect("an album folder");
