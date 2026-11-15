@@ -203,7 +203,8 @@ impl LastFmRadioTrackResolver {
     }
 
     /// Up to `songs` of Navidrome's songs for a query, as the listener; None when it gave no
-    /// readable answer.
+    /// readable answer. Navidrome answers a search that found nothing with an empty
+    /// `searchResult3` (no `song` list), which is an empty list here, not "no answer".
     async fn library_songs(
         &self,
         query: &str,
@@ -226,13 +227,18 @@ impl LastFmRadioTrackResolver {
             let Some(response) = try_get_property(&document, "subsonic-response")? else {
                 return Ok(None);
             };
-            let Some(search) = try_get_property(response, "searchResult3")? else {
+            if response.get("status").and_then(Value::as_str) != Some("ok") {
                 return Ok(None);
+            }
+            let songs = match try_get_property(response, "searchResult3")? {
+                Some(search) => try_get_property(search, "song")?,
+                None => None,
             };
-            let Some(songs @ Value::Array(_)) = try_get_property(search, "song")? else {
-                return Ok(None);
-            };
-            Ok(Some(enumerate_array(songs)?.to_vec()))
+            match songs {
+                None => Ok(Some(Vec::new())),
+                Some(songs @ Value::Array(_)) => Ok(Some(enumerate_array(songs)?.to_vec())),
+                Some(_) => Ok(None),
+            }
         };
         match read() {
             Ok(songs) => songs,
