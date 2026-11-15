@@ -25,9 +25,11 @@ use crate::services::family::hooks::caller_for;
 use crate::services::family::{FamilyPlaylistStore, FamilyStore};
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::imports::{ImportService, import_streaming};
+use crate::services::library::NavidromePlaylistApi;
 use crate::services::library::{ChartPlaylistService, GeneratedPlaylistService};
 use crate::services::listening::ListeningLog;
 use crate::services::local::ILocalLibraryService;
+use crate::services::playlists::held_playlists::HeldSlot;
 use crate::services::soulseek::ExternalIdRegistry;
 
 /// Outside songs whose previews are copied, from the start of each list.
@@ -138,7 +140,8 @@ fn key(user: &str) -> String {
 pub struct ListSongs {
     pub id: String,
     pub name: String,
-    /// `import`, `mix`, `chart` or `family`.
+    /// `import`, `playlist` (a playlist of the person's own that holds songs found online),
+    /// `mix`, `chart` or `family`.
     pub kind: &'static str,
     pub songs: Vec<String>,
 }
@@ -581,6 +584,10 @@ pub struct AppKeepReadySources {
     pub listening: Arc<ListeningLog>,
     pub metadata: Arc<dyn IMusicMetadataService>,
     pub library: Arc<dyn ILocalLibraryService>,
+    /// The playlists that hold songs found online, once they have started.
+    pub held: HeldSlot,
+    /// Navidrome's playlists as the admin, for the held playlists' names.
+    pub playlists: Arc<NavidromePlaylistApi>,
 }
 
 #[async_trait]
@@ -605,6 +612,26 @@ impl KeepReadySources for AppKeepReadySources {
                 kind: "import",
                 songs,
             });
+        }
+        let held = self.held.read().clone();
+        if let Some(held) = held {
+            for view in held.views_of_owner(user) {
+                // A playlist whose name Navidrome does not give now is left for the next pass.
+                let Ok(Some(info)) = self.playlists.playlist_info(&view.id).await else {
+                    continue;
+                };
+                let songs = view
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.library_id.clone().or_else(|| entry.outside_id.clone()))
+                    .collect();
+                lists.push(ListSongs {
+                    id: view.id,
+                    name: info.name,
+                    kind: "playlist",
+                    songs,
+                });
+            }
         }
         for mix in self.mixes.current_lists(user) {
             // A mix drawn only when it is opened has no songs here until then.

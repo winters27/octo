@@ -24,6 +24,8 @@ pub(crate) mod caller_checks;
 pub mod downloads;
 pub mod extensions;
 pub mod family;
+pub mod folders;
+pub mod held;
 pub mod imports;
 pub mod lyrics;
 pub mod media;
@@ -173,4 +175,5 @@ pub fn routes() -> RouteSet {
         .merge(stations::routes())
         .merge(places::routes())
         .merge(animated_art::routes())
+        .merge(folders::routes())
 }

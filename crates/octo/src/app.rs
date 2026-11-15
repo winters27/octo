@@ -579,6 +579,8 @@ pub struct AppInner {
     pub family_playlist_requests: crate::services::family::family_playlists::PlaylistAddHook,
     /// `octo-playlists/`: playlists that hold songs found online, and every writer's lock.
     pub held_playlists: Arc<HeldPlaylists>,
+    /// `playlist-folders.json`: each person's playlist folders and which playlists sit in them.
+    pub playlist_folders: Arc<crate::services::playlists::PlaylistFolderStore>,
     /// `family-pool.json`: the one copy of each member download and who links it.
     pub family_pool: Arc<FamilyPoolStore>,
     /// `listening/`: each person's completed plays, for their Listening page.
@@ -777,6 +779,8 @@ fn keep_ready_service(
     metadata: &Arc<dyn IMusicMetadataService>,
     library: &Arc<dyn ILocalLibraryService>,
     prefetch: &Arc<PrefetchService>,
+    held: &crate::services::playlists::held_playlists::HeldSlot,
+    playlists: &Arc<crate::services::library::NavidromePlaylistApi>,
 ) -> Arc<KeepReadyService> {
     let sources = AppKeepReadySources {
         settings: settings.clone(),
@@ -789,6 +793,8 @@ fn keep_ready_service(
         listening: stores.listening.clone(),
         metadata: metadata.clone(),
         library: library.clone(),
+        held: Arc::clone(held),
+        playlists: Arc::clone(playlists),
     };
     KeepReadyService::new(
         settings.clone(),
@@ -3778,6 +3784,8 @@ impl AppState {
             &metadata_service,
             &navidrome.local_library,
             &prefetch,
+            &imports.held_slot,
+            &navidrome.navidrome_playlist_api,
         );
         {
             let keep_ready = keep_ready.clone();
@@ -3943,6 +3951,9 @@ impl AppState {
             family_playlists: stores.family_playlists,
             family_playlist_requests: Default::default(),
             held_playlists,
+            playlist_folders: Arc::new(crate::services::playlists::PlaylistFolderStore::new(Some(
+                config_dir.join("playlist-folders.json"),
+            ))),
             family_pool: stores.family_pool,
             listening: stores.listening,
             navidrome_admin: family_navidrome.0,
@@ -4276,6 +4287,8 @@ impl AppState {
             &metadata_service,
             &navidrome.local_library,
             &prefetch,
+            &imports.held_slot,
+            &navidrome.navidrome_playlist_api,
         );
         let inner = AppInner {
             restart_tracker,
@@ -4435,6 +4448,9 @@ impl AppState {
             family_playlists: stores.family_playlists,
             family_playlist_requests: Default::default(),
             held_playlists,
+            playlist_folders: Arc::new(crate::services::playlists::PlaylistFolderStore::new(Some(
+                config_dir.join("playlist-folders.json"),
+            ))),
             family_pool: stores.family_pool,
             listening: stores.listening,
             navidrome_admin: family_navidrome.0,

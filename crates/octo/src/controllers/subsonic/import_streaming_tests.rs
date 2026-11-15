@@ -233,6 +233,41 @@ async fn import_streaming_standard_clients_get_all_entries_in_order_as_json_and_
 }
 
 #[tokio::test]
+async fn import_streaming_snapshot_rows_carry_octo_import_in_json_and_xml() {
+    let r = rig().await;
+    let listing = get(&r.app, &format!("/rest/getPlaylists.view?{AUTH}&f=json"))
+        .await
+        .envelope();
+    let row = listing["playlists"]["playlist"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == r.playlist_id)
+        .cloned()
+        .unwrap();
+    assert_eq!(row["octoImport"], true);
+    let other = listing["playlists"]["playlist"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "nd-list")
+        .cloned()
+        .unwrap();
+    assert!(other.get("octoImport").is_none());
+    let playlist = get(
+        &r.app,
+        &format!("/rest/getPlaylist.view?{AUTH}&f=json&id={}", r.playlist_id),
+    )
+    .await
+    .envelope();
+    assert_eq!(playlist["playlist"]["octoImport"], true);
+    let xml = get(&r.app, &format!("/rest/getPlaylists.view?{AUTH}"))
+        .await
+        .text();
+    assert!(xml.contains(r#"octoImport="true""#), "{xml}");
+}
+
+#[tokio::test]
 async fn import_streaming_unknown_duration_is_numeric_for_psysonic_playback() {
     let r = rig_with_duration(false).await;
     let auth = auth("alice", "good", "Psysonic");

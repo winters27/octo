@@ -178,6 +178,17 @@ struct WalkMemo {
     at_utc: DateTime<Utc>,
 }
 
+/// The songs found online in the playlists a user can see (held playlists' streamed entries and
+/// family playlists' outside entries), each under the id its playlist lists, and what they are
+/// told apart by. A separate list: never matched against the library's titles and never cut by
+/// the cap.
+#[derive(Debug, Clone, Default)]
+pub struct HeldCatalog {
+    pub songs: Vec<Song>,
+    /// A hash of the ids; empty with no songs.
+    pub fingerprint: String,
+}
+
 /// A build in flight: its fingerprint and the shared build. `done` says whether the build has
 /// finished, set by the build itself (a `Shared` future only knows it has finished once someone
 /// polled it).
@@ -475,32 +486,70 @@ impl SyncCatalogService {
         stations: &[LastFmRadioStation],
         authenticated_parameters: &IndexMap<String, String>,
     ) {
-        // The build runs on its own task; dropping the answer does not stop it.
-        drop(self.get(username, stations, authenticated_parameters));
+        self.warm_with(
+            username,
+            stations,
+            &HeldCatalog::default(),
+            authenticated_parameters,
+        );
     }
 
-    /// The user's catalog for these stations: the cached one while the stations are unchanged and
-    /// it is younger than [`CATALOG_TTL`], else a build. One build per user at a time, shared by
-    /// every caller, and never canceled by the request that started it, because the next page of
-    /// the same walk is about to want it.
-    ///
-    /// The decision and the start of a build happen before this returns; only waiting for the
-    /// catalog is left to the returned future.
+    /// [`Self::warm`] with the songs found online in the playlists the user sees.
+    pub fn warm_with(
+        self: &Arc<Self>,
+        username: &str,
+        stations: &[LastFmRadioStation],
+        held: &HeldCatalog,
+        authenticated_parameters: &IndexMap<String, String>,
+    ) {
+        // The build runs on its own task; dropping the answer does not stop it.
+        drop(self.get_with(username, stations, held, authenticated_parameters));
+    }
+
+    /// The user's catalog for these stations, with no playlist songs.
     pub fn get(
         self: &Arc<Self>,
         username: &str,
         stations: &[LastFmRadioStation],
         authenticated_parameters: &IndexMap<String, String>,
     ) -> BoxFuture<'static, Arc<SyncCatalog>> {
-        if username.is_empty() || stations.is_empty() {
+        self.get_with(
+            username,
+            stations,
+            &HeldCatalog::default(),
+            authenticated_parameters,
+        )
+    }
+
+    /// The user's catalog for these stations and playlist songs: the cached one while both are
+    /// unchanged and it is younger than [`CATALOG_TTL`], else a build. One build per user at a
+    /// time, shared by every caller, and never canceled by the request that started it, because
+    /// the next page of the same walk is about to want it. A user with playlist songs and no
+    /// stations still gets a catalog.
+    ///
+    /// The decision and the start of a build happen before this returns; only waiting for the
+    /// catalog is left to the returned future.
+    pub fn get_with(
+        self: &Arc<Self>,
+        username: &str,
+        stations: &[LastFmRadioStation],
+        held: &HeldCatalog,
+        authenticated_parameters: &IndexMap<String, String>,
+    ) -> BoxFuture<'static, Arc<SyncCatalog>> {
+        if username.is_empty() || (stations.is_empty() && held.songs.is_empty()) {
             return futures::future::ready(SyncCatalog::empty()).boxed();
         }
         let settings = self.settings.current();
-        let fingerprint = Self::fingerprint(
+        let stations_fingerprint = Self::fingerprint(
             stations,
             &settings.subsonic,
             settings.soulseek.skip_covers_and_instrumentals,
         );
+        let fingerprint = if held.fingerprint.is_empty() {
+            stations_fingerprint
+        } else {
+            format!("{stations_fingerprint}#held:{}", held.fingerprint)
+        };
         let key = ordinal_ignore_case_key(username);
         let cached = self.catalogs.lock().get(&key).cloned();
         if let Some(cached) = cached
@@ -521,6 +570,7 @@ impl SyncCatalogService {
         let running = self.start_build(
             username,
             stations.to_vec(),
+            held.songs.clone(),
             authenticated_parameters.clone(),
             fingerprint,
         );
@@ -532,6 +582,7 @@ impl SyncCatalogService {
         self: &Arc<Self>,
         username: &str,
         stations: Vec<LastFmRadioStation>,
+        held: Vec<Song>,
         auth: IndexMap<String, String>,
         fingerprint: String,
     ) -> RunningBuild {
@@ -545,7 +596,7 @@ impl SyncCatalogService {
             let key = ordinal_ignore_case_key(&user);
             let previous = service.catalogs.lock().get(&key).cloned();
             let outcome =
-                AssertUnwindSafe(service.build(&user, &stations, &auth, &build_fingerprint, previous))
+                AssertUnwindSafe(service.build(&user, &stations, &held, &auth, &build_fingerprint, previous))
                     .catch_unwind()
                     .await;
             let catalog = match outcome {
@@ -643,6 +694,7 @@ impl SyncCatalogService {
         &self,
         username: &str,
         stations: &[LastFmRadioStation],
+        held: &[Song],
         auth: &IndexMap<String, String>,
         fingerprint: &str,
         previous: Option<Arc<SyncCatalog>>,
@@ -651,7 +703,7 @@ impl SyncCatalogService {
         let settings = current.subsonic.clone();
         let skip_covers_and_instrumentals = current.soulseek.skip_covers_and_instrumentals;
         let tracks = Self::interleave(stations, settings.effective_sync_catalog_max_songs());
-        if tracks.is_empty() {
+        if tracks.is_empty() && held.is_empty() {
             return SyncCatalog::new(
                 Vec::new(),
                 Vec::new(),
@@ -783,6 +835,34 @@ impl SyncCatalogService {
             }
 
             songs.push(hit);
+        }
+
+        // The songs found online in the playlists this user sees, under the ids the playlists
+        // list them by: never matched against the library's titles and never cut by the cap.
+        for song in held {
+            if song.id.is_empty() || !seen_ids.insert(song.id.clone()) {
+                continue;
+            }
+            let mut song = song.clone();
+            if is_blank(&song.album) {
+                song.album = song.title.clone();
+            }
+            if song.artist_id.as_deref().is_none_or(str::is_empty) {
+                song.artist_id = Some(self.registry.register(SoulseekRouting {
+                    kind: RoutingKind::Artist,
+                    artist: Some(song.artist.clone()),
+                    ..Default::default()
+                }));
+            }
+            if song.album_id.as_deref().is_none_or(str::is_empty) {
+                song.album_id = Some(self.registry.register(SoulseekRouting {
+                    kind: RoutingKind::Album,
+                    artist: Some(song.artist.clone()),
+                    album: Some(song.album.clone()),
+                    ..Default::default()
+                }));
+            }
+            songs.push(song);
         }
 
         let albums: Vec<Album> = group_by_id(

@@ -5,6 +5,7 @@
 //! served per viewer, and changed through `updatePlaylist` and `deletePlaylist` by whoever
 //! may (see [`crate::services::family::family_playlists`]).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -45,6 +46,8 @@ use crate::services::library::library_action_playlist_provisioner::{
     REMOVE_PLAYLIST, REQUEST_FLAC_PLAYLIST, REQUEST_PLAYLIST,
 };
 use crate::services::library::{GeneratedPlaylist, LibraryActionPlaylistProvisioner};
+use crate::services::playlists::held_playlists::ListedPlaylist;
+use crate::services::playlists::held_store::HeldEntry;
 use crate::services::subsonic::SubsonicResponseBuilderExt;
 use octo_core::family::abilities::RequestQuality;
 use tracing::info;
@@ -77,10 +80,13 @@ pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Respo
 
     let username = listener_name_of(&state, &call.parameters, &call.proxy, &call.parts.headers).await;
 
-    // This listener's Review and Duplicates playlists carry Octo's glyph cover.
-    let notices = notice_titles(&state, &username);
+    // The row pass: this listener's notice playlists carry Octo's glyph cover, their notice and
+    // upkeep playlists are marked, and a playlist Octo holds counts the songs found online it
+    // holds, as this viewer is shown them.
+    let listed = listed_rows(&relay.body, &format);
+    let marks = RowMarks::for_caller(&state, &call, &username).with_held(&state, caller.as_ref(), &listed);
     let mut relay = relay;
-    if let Some(body) = mark_notice_rows(&relay.body, &format, &username, &notices) {
+    if let Some(body) = marks.apply(&relay.body, &format) {
         relay.body = body.into();
     }
 
@@ -128,6 +134,9 @@ pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Respo
         .ok()
         .flatten()
         .unwrap_or_default();
+    // The owner's held playlists missing from this listing are checked, and creations left
+    // unfinished are attached, in the background.
+    super::held::after_listing(&state, &import_owner, listed);
     let imports = state.imports.streaming_lists(&import_owner);
     if stations.is_empty()
         && family.is_empty()
@@ -143,11 +152,7 @@ pub async fn get_playlists(State(state): State<AppState>, req: Request) -> Respo
         .iter()
         .map(|station| builder.radio_playlist_fields(station))
         .chain(family)
-        .chain(
-            imports
-                .iter()
-                .map(crate::services::imports::import_streaming::playlist_fields),
-        )
+        .chain(imports.iter().map(import_row_fields))
         .chain(charts.iter().map(|list| chart_playlist_fields(builder, list)))
         .chain(
             generated
@@ -273,80 +278,324 @@ fn notice_of(
         .map(|(_, word)| *word)
 }
 
-/// Marks the listener's notice playlists in a getPlaylists or getPlaylist answer: `coverArt`
-/// becomes the notice's painted cover and `octoNotice` names the notice, so every client shows
-/// the glyph and the Octo apps know which list it is. A playlist of anyone else, or one named
-/// like a notice that is off, is left as Navidrome sent it. None when nothing was marked, or the
-/// body is not one this reads.
-pub(super) fn mark_notice_rows(
-    body: &[u8],
-    format: &str,
-    username: &str,
-    notices: &[(String, &'static str)],
-) -> Option<Vec<u8>> {
-    if notices.is_empty() {
-        return None;
-    }
+/// The playlist rows of a `getPlaylists` answer: id, name and owner of each.
+pub(super) fn listed_rows(body: &[u8], format: &str) -> Vec<ListedPlaylist> {
+    let mut rows = Vec::new();
     if format.eq_ignore_ascii_case("json") {
-        let mut root = Node::parse(std::str::from_utf8(body).ok()?).ok()?;
-        let response = root
-            .as_object_mut()?
-            .get_mut("subsonic-response")?
-            .as_object_mut()?;
-        let mut rows: Vec<&mut IndexMap<String, Node>> = Vec::new();
-        for (key, value) in response.iter_mut() {
-            match (key.as_str(), value) {
-                ("playlists", Node::Object(holder)) => match holder.get_mut("playlist") {
-                    Some(Node::Array(list)) => rows.extend(list.iter_mut().filter_map(Node::as_object_mut)),
-                    Some(Node::Object(one)) => rows.push(one),
-                    _ => {}
-                },
-                ("playlist", Node::Object(one)) => rows.push(one),
-                _ => {}
+        let Ok(root) = serde_json::from_slice::<Value>(body) else {
+            return rows;
+        };
+        let list = &root["subsonic-response"]["playlists"]["playlist"];
+        let items: Vec<&Value> = match list {
+            Value::Array(items) => items.iter().collect(),
+            Value::Object(_) => vec![list],
+            _ => Vec::new(),
+        };
+        for item in items {
+            let text = |name: &str| {
+                item.get(name)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let id = text("id");
+            if !id.is_empty() {
+                rows.push(ListedPlaylist {
+                    id,
+                    name: text("name"),
+                    owner: text("owner"),
+                    created: super::held::parse_instant(&text("created")),
+                });
             }
         }
-        let mut marked = false;
-        for row in rows {
-            let word = notice_of(
-                row.get("owner").and_then(Node::as_str),
-                row.get("name").and_then(Node::as_str),
-                username,
-                notices,
-            );
-            if let Some(word) = word {
-                row.insert(
-                    "coverArt".into(),
-                    Node::String(format!("{NOTICE_COVER_PREFIX}{word}")),
+        return rows;
+    }
+    let Ok(root) = XElement::parse(&String::from_utf8_lossy(body)) else {
+        return rows;
+    };
+    for holder in root.elements().filter(|element| element.name == "playlists") {
+        for row in holder.elements().filter(|row| row.name == "playlist") {
+            let text = |name: &str| row.attribute(name).unwrap_or_default().to_string();
+            let id = text("id");
+            if !id.is_empty() {
+                rows.push(ListedPlaylist {
+                    id,
+                    name: text("name"),
+                    owner: text("owner"),
+                    created: super::held::parse_instant(&text("created")),
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// A held playlist's streamed songs as one viewer is shown them, and when its list last changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HeldRow {
+    pub songs: i64,
+    pub seconds: i64,
+    pub changed: DateTime<Utc>,
+}
+
+/// The streamed entries a viewer is shown of a held playlist whose list last changed at
+/// `changed`: a kid profile skips the explicit ones, from each snapshot's explicit status, as
+/// family playlist totals do.
+pub(super) fn held_row(
+    entries: &[HeldEntry],
+    changed: DateTime<Utc>,
+    kid: bool,
+    unrated_is_explicit: bool,
+) -> HeldRow {
+    let mut row = HeldRow {
+        songs: 0,
+        seconds: 0,
+        changed,
+    };
+    for entry in entries {
+        if entry.library_id.is_some() || entry.outside_id.is_none() {
+            continue;
+        }
+        let status = entry
+            .song
+            .as_ref()
+            .and_then(|song| song.explicit_status.as_deref())
+            .unwrap_or("");
+        if kid && ExplicitMark::from_status(status).blocks_clean_only(unrated_is_explicit) {
+            continue;
+        }
+        row.songs += 1;
+        row.seconds += i64::from(
+            entry
+                .song
+                .as_ref()
+                .and_then(|song| song.seconds)
+                .unwrap_or(0)
+                .max(0),
+        );
+    }
+    row
+}
+
+/// One field the row pass sets.
+enum RowField {
+    Text(String),
+    Flag,
+    Number(i64),
+}
+
+impl RowField {
+    fn node(self) -> Node {
+        match self {
+            RowField::Text(text) => Node::String(text),
+            RowField::Flag => Node::Bool(true),
+            RowField::Number(number) => Node::Number(number.to_string()),
+        }
+    }
+
+    fn text(self) -> String {
+        match self {
+            RowField::Text(text) => text,
+            RowField::Flag => "true".to_string(),
+            RowField::Number(number) => number.to_string(),
+        }
+    }
+
+    fn value(self) -> Value {
+        match self {
+            RowField::Text(text) => Value::String(text),
+            RowField::Flag => Value::Bool(true),
+            RowField::Number(number) => number.into(),
+        }
+    }
+}
+
+/// A number field of a row as JSON or XML writes it, read whole.
+fn whole_number(text: &str) -> i64 {
+    text.trim().parse::<f64>().map_or(0, |number| number as i64)
+}
+
+/// What the row pass writes on one caller's playlist rows: the notice playlists' glyph cover and
+/// `octoNotice`, `octoUpkeep` on the caller's own upkeep playlists (notices included), and the
+/// streamed songs of the playlists Octo holds in `songCount`, `duration` and `changed`.
+pub(super) struct RowMarks {
+    username: String,
+    notices: Vec<(String, &'static str)>,
+    upkeep: crate::services::library::library_action_playlist_provisioner::UpkeepTitles,
+    held: HashMap<String, HeldRow>,
+}
+
+impl RowMarks {
+    /// The caller's notice and upkeep titles; no held rows.
+    pub(super) fn for_caller(state: &AppState, call: &SubsonicCall, username: &str) -> RowMarks {
+        let upkeep = if username.trim().is_empty() {
+            Default::default()
+        } else {
+            LibraryActionPlaylistProvisioner::new(call.proxy.clone(), state.settings.clone())
+                .with_family(state.family_store.clone())
+                .upkeep_titles(username)
+        };
+        RowMarks {
+            username: username.to_string(),
+            notices: notice_titles(state, username),
+            upkeep,
+            held: HashMap::new(),
+        }
+    }
+
+    /// With the streamed songs of every listed playlist Octo holds, as `viewer` is shown them.
+    pub(super) fn with_held(
+        mut self,
+        state: &AppState,
+        viewer: Option<&FamilyCaller>,
+        rows: &[ListedPlaylist],
+    ) -> RowMarks {
+        let kid = viewer.is_some_and(kid_filter::is_kid);
+        let unrated = state.settings.current().family.kid_unrated_is_explicit;
+        for row in rows.iter().filter(|row| state.held_playlists.contains(&row.id)) {
+            if let Some(view) = state.held_playlists.view_of(&row.id) {
+                self.held.insert(
+                    row.id.clone(),
+                    held_row(&view.entries, view.changed, kid, unrated),
                 );
-                row.insert("octoNotice".into(), Node::String(word.to_string()));
+            }
+        }
+        self
+    }
+
+    fn is_empty(&self) -> bool {
+        self.notices.is_empty() && self.upkeep.is_empty() && self.held.is_empty()
+    }
+
+    /// The fields to set on one row, from what the row says now.
+    fn changes(
+        &self,
+        id: Option<&str>,
+        owner: Option<&str>,
+        name: Option<&str>,
+        songs: Option<i64>,
+        seconds: Option<i64>,
+        changed: Option<&str>,
+    ) -> Vec<(&'static str, RowField)> {
+        let mut out = Vec::new();
+        if let Some(word) = notice_of(owner, name, &self.username, &self.notices) {
+            out.push(("coverArt", RowField::Text(format!("{NOTICE_COVER_PREFIX}{word}"))));
+            out.push(("octoNotice", RowField::Text(word.to_string())));
+            out.push(("octoUpkeep", RowField::Flag));
+            let notice = crate::services::library::library_action_playlist_provisioner::UpkeepKind::Notice;
+            out.push(("octoUpkeepKind", RowField::Text(notice.wire().to_string())));
+        } else if let (Some(owner), Some(name)) = (owner, name)
+            && !self.username.trim().is_empty()
+            && dotnet::eq_ignore_case(owner, &self.username)
+            && let Some(kind) = self.upkeep.kind(name)
+        {
+            out.push(("octoUpkeep", RowField::Flag));
+            out.push(("octoUpkeepKind", RowField::Text(kind.wire().to_string())));
+        }
+        if let Some(held) = id.and_then(|id| self.held.get(id)) {
+            out.push(("songCount", RowField::Number(songs.unwrap_or(0) + held.songs)));
+            out.push(("duration", RowField::Number(seconds.unwrap_or(0) + held.seconds)));
+            let listed = changed.and_then(super::held::parse_instant);
+            let newest = listed.map_or(held.changed, |at| at.max(held.changed));
+            out.push(("changed", RowField::Text(utc_millis(&newest))));
+        }
+        out
+    }
+
+    /// The row pass over a getPlaylists or getPlaylist answer. None when nothing was marked, or
+    /// the body is not one this reads.
+    pub(super) fn apply(&self, body: &[u8], format: &str) -> Option<Vec<u8>> {
+        if self.is_empty() {
+            return None;
+        }
+        if format.eq_ignore_ascii_case("json") {
+            let mut root = Node::parse(std::str::from_utf8(body).ok()?).ok()?;
+            let response = root
+                .as_object_mut()?
+                .get_mut("subsonic-response")?
+                .as_object_mut()?;
+            let mut rows: Vec<&mut IndexMap<String, Node>> = Vec::new();
+            for (key, value) in response.iter_mut() {
+                match (key.as_str(), value) {
+                    ("playlists", Node::Object(holder)) => match holder.get_mut("playlist") {
+                        Some(Node::Array(list)) => {
+                            rows.extend(list.iter_mut().filter_map(Node::as_object_mut))
+                        }
+                        Some(Node::Object(one)) => rows.push(one),
+                        _ => {}
+                    },
+                    ("playlist", Node::Object(one)) => rows.push(one),
+                    _ => {}
+                }
+            }
+            let mut marked = false;
+            for row in rows {
+                let number = |name: &str| match row.get(name) {
+                    Some(Node::Number(text)) => Some(whole_number(text)),
+                    _ => None,
+                };
+                let changes = self.changes(
+                    row.get("id").and_then(Node::as_str),
+                    row.get("owner").and_then(Node::as_str),
+                    row.get("name").and_then(Node::as_str),
+                    number("songCount"),
+                    number("duration"),
+                    row.get("changed").and_then(Node::as_str),
+                );
+                for (name, field) in changes {
+                    row.insert(name.into(), field.node());
+                    marked = true;
+                }
+            }
+            return marked.then(|| root.to_json_string(false).into_bytes());
+        }
+        if !format.eq_ignore_ascii_case("xml") {
+            return None;
+        }
+        let mut root = XElement::parse(&String::from_utf8_lossy(body)).ok()?;
+        let mut marked = false;
+        let mut mark = |row: &mut XElement| {
+            let changes = self.changes(
+                row.attribute("id"),
+                row.attribute("owner"),
+                row.attribute("name"),
+                row.attribute("songCount").map(whole_number),
+                row.attribute("duration").map(whole_number),
+                row.attribute("changed"),
+            );
+            for (name, field) in changes {
+                row.set_attr(name, field.text());
                 marked = true;
             }
-        }
-        return marked.then(|| root.to_json_string(false).into_bytes());
-    }
-    if !format.eq_ignore_ascii_case("xml") {
-        return None;
-    }
-    let mut root = XElement::parse(&String::from_utf8_lossy(body)).ok()?;
-    let mut marked = false;
-    let mut mark = |row: &mut XElement| {
-        let word = notice_of(row.attribute("owner"), row.attribute("name"), username, notices);
-        if let Some(word) = word {
-            row.set_attr("coverArt", format!("{NOTICE_COVER_PREFIX}{word}"));
-            row.set_attr("octoNotice", word.to_string());
-            marked = true;
-        }
-    };
-    for element in root.elements_mut() {
-        if element.name == "playlists" {
-            for row in element.elements_mut().filter(|row| row.name == "playlist") {
-                mark(row);
+        };
+        for element in root.elements_mut() {
+            if element.name == "playlists" {
+                for row in element.elements_mut().filter(|row| row.name == "playlist") {
+                    mark(row);
+                }
+            } else if element.name == "playlist" {
+                mark(element);
             }
-        } else if element.name == "playlist" {
-            mark(element);
+        }
+        marked.then(|| root.to_xml_string().into_bytes())
+    }
+
+    /// The notice and upkeep marks on a row built as fields. Counts are left to the builder,
+    /// which counts the songs it writes.
+    pub(super) fn mark_fields(&self, fields: &mut serde_json::Map<String, Value>) {
+        let owner = fields.get("owner").and_then(Value::as_str).map(str::to_string);
+        let name = fields.get("name").and_then(Value::as_str).map(str::to_string);
+        for (key, field) in self.changes(None, owner.as_deref(), name.as_deref(), None, None, None) {
+            fields.insert(key.to_string(), field.value());
         }
     }
-    marked.then(|| root.to_xml_string().into_bytes())
+}
+
+/// An imported snapshot's playlist row, marked `octoImport` so Octo's apps keep it read-only.
+fn import_row_fields(list: &crate::services::imports::ImportList) -> serde_json::Map<String, Value> {
+    let mut fields = crate::services::imports::import_streaming::playlist_fields(list);
+    fields.insert("octoImport".into(), true.into());
+    fields
 }
 
 /// Liked Songs as a playlist row: the keys a mix has, read-only, with its real song count and
@@ -500,7 +749,7 @@ async fn outside_lookup(state: &AppState, id: &str) -> (Option<i64>, Option<Stri
     (song.duration.map(i64::from), Some(status.to_string()))
 }
 
-fn utc_millis(at: &DateTime<Utc>) -> String {
+pub(super) fn utc_millis(at: &DateTime<Utc>) -> String {
     at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
@@ -682,11 +931,7 @@ async fn get_playlist_inner(state: &AppState, req: Request, aborted: &RequestAbo
             .collect()
             .await;
         return builder
-            .create_entries_playlist_response(
-                format,
-                crate::services::imports::import_streaming::playlist_fields(&list),
-                &entries,
-            )
+            .create_entries_playlist_response(format, import_row_fields(&list), &entries)
             .into_response();
     }
 
@@ -835,14 +1080,22 @@ async fn get_playlist_inner(state: &AppState, req: Request, aborted: &RequestAbo
             .into_response();
     }
 
+    // A playlist Octo holds, or kept aside (this read moves it back): every song in its place,
+    // the library songs as Navidrome describes them to this caller.
+    if super::held::has_part(state, &id)
+        && let Some(answer) = super::held::get_held(state, &call, &id).await
+    {
+        return answer;
+    }
+
     let Some(station) = playlist_stations(state, &username)
         .into_iter()
         .find(|item| item.id == id)
     else {
         return match call.proxy.relay_safe("rest/getPlaylist", &call.parameters).await {
             Some(relay) if is_successful_subsonic_response(&relay.body, format) => {
-                let notices = notice_titles(state, &username);
-                match mark_notice_rows(&relay.body, format, &username, &notices) {
+                let marks = RowMarks::for_caller(state, &call, &username);
+                match marks.apply(&relay.body, format) {
                     Some(body) => call.file(&body.into(), relay.content_type.as_deref()),
                     None => call.file(&relay.body, relay.content_type.as_deref()),
                 }
@@ -895,9 +1148,53 @@ pub async fn mutate_playlist(State(state): State<AppState>, req: Request) -> Res
 }
 
 /// What a family action playlist does with a song put in it.
-enum FamilyPlaylistAction {
+pub(super) enum FamilyPlaylistAction {
     Request(RequestQuality),
     Remove,
+}
+
+/// The action of a family member's action playlist named `name` ("Request a copy", "Request a
+/// copy in FLAC", "Remove from my library"); None for any other name.
+pub(super) fn family_action_of(name: &str) -> Option<FamilyPlaylistAction> {
+    let name = name.trim();
+    if name.eq_ignore_ascii_case(REQUEST_PLAYLIST) {
+        Some(FamilyPlaylistAction::Request(RequestQuality::Best))
+    } else if name.eq_ignore_ascii_case(REQUEST_FLAC_PLAYLIST) {
+        Some(FamilyPlaylistAction::Request(RequestQuality::Flac))
+    } else if name.eq_ignore_ascii_case(REMOVE_PLAYLIST) {
+        Some(FamilyPlaylistAction::Remove)
+    } else {
+        None
+    }
+}
+
+/// Each song becomes a request, or leaves `user`'s library, as the action playlist `name` says.
+pub(super) async fn run_family_action(
+    state: &AppState,
+    user: &str,
+    name: &str,
+    action: &FamilyPlaylistAction,
+    songs: &[String],
+) {
+    for song in songs {
+        match action {
+            FamilyPlaylistAction::Request(quality) => {
+                match state
+                    .family_request_service
+                    .create(user, song, *quality, None)
+                    .await
+                {
+                    Ok(request) => info!("FAMILY {user} asked for {song} through {name} ({})", request.id),
+                    Err(e) => info!("FAMILY {user} could not ask for {song}: {}", e.message),
+                }
+            }
+            FamilyPlaylistAction::Remove => {
+                if let Err(e) = state.personal_library.remove_from_my_library(user, song).await {
+                    info!("FAMILY {user} could not remove {song}: {}", e.message);
+                }
+            }
+        }
+    }
 }
 
 /// `updatePlaylist` on one of a family member's own action playlists ("Request a copy",
@@ -932,15 +1229,7 @@ async fn family_action_playlist(
     let body: Value = serde_json::from_slice(&read.body).ok()?;
     let playlist = body.pointer("/subsonic-response/playlist")?;
     let name = playlist.get("name").and_then(Value::as_str)?.trim().to_string();
-    let action = if name.eq_ignore_ascii_case(REQUEST_PLAYLIST) {
-        FamilyPlaylistAction::Request(RequestQuality::Best)
-    } else if name.eq_ignore_ascii_case(REQUEST_FLAC_PLAYLIST) {
-        FamilyPlaylistAction::Request(RequestQuality::Flac)
-    } else if name.eq_ignore_ascii_case(REMOVE_PLAYLIST) {
-        FamilyPlaylistAction::Remove
-    } else {
-        return None;
-    };
+    let action = family_action_of(&name)?;
     let already: Vec<String> = playlist
         .get("entry")
         .and_then(Value::as_array)
@@ -959,25 +1248,8 @@ async fn family_action_playlist(
         .filter(|song| !song.is_empty())
         .map(str::to_string)
         .collect();
-    for song in already.iter().chain(added.iter()) {
-        match &action {
-            FamilyPlaylistAction::Request(quality) => {
-                match state
-                    .family_request_service
-                    .create(user, song, *quality, None)
-                    .await
-                {
-                    Ok(request) => info!("FAMILY {user} asked for {song} through {name} ({})", request.id),
-                    Err(e) => info!("FAMILY {user} could not ask for {song}: {}", e.message),
-                }
-            }
-            FamilyPlaylistAction::Remove => {
-                if let Err(e) = state.personal_library.remove_from_my_library(user, song).await {
-                    info!("FAMILY {user} could not remove {song}: {}", e.message);
-                }
-            }
-        }
-    }
+    let songs: Vec<String> = already.iter().chain(added.iter()).cloned().collect();
+    run_family_action(state, user, &name, &action, &songs).await;
     if !already.is_empty() {
         let mut empty = auth.clone();
         empty.push(("playlistId".into(), id.to_string()));
@@ -1034,6 +1306,14 @@ async fn mutate(state: AppState, req: Request, id_key: &str, _fallback: &str, fa
             .create_error(format, 70, "Octo's generated playlists are read-only")
             .into_response();
     }
+    // Playlist changes. Octo's own ids, refused above, are never anyone's upkeep playlist; the
+    // held routes refuse songs found online for the upkeep playlists first, then hold, convert or
+    // relay the change under the playlist's lock.
+    if id_key == "playlistId"
+        && let Some(change) = playlist_change(&call)
+    {
+        return super::held::route(state, call, id, change).await;
+    }
     // The endpoint is the path's last segment, without `.view`.
     let path = call.path();
     let endpoint = path.split('/').next_back().unwrap_or("").replace(".view", "");
@@ -1057,7 +1337,7 @@ fn is_family_playlist_id(state: &AppState, id: &str) -> bool {
 
 /// A playlist call that may name a family playlist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlaylistChange {
+pub(super) enum PlaylistChange {
     Create,
     Update,
     Delete,
@@ -1311,7 +1591,7 @@ async fn library_song_json(call: &SubsonicCall, id: &str) -> Option<Value> {
 }
 
 /// An outside song in the shape every outside song has.
-async fn outside_song_json(state: &AppState, id: &str) -> Option<Value> {
+pub(super) async fn outside_song_json(state: &AppState, id: &str) -> Option<Value> {
     let (external, provider, external_id) = state.local_library.parse_song_id(id);
     if !external {
         return None;

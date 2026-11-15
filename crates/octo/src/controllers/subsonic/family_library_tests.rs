@@ -200,13 +200,19 @@ async fn songs_already_in_a_request_playlist_are_asked_for_and_it_is_emptied() {
 #[tokio::test]
 async fn other_playlists_are_relayed_as_always() {
     let fixture = Fixture::new().await;
-    fixture
-        .update(&format!("playlistId=pl-trip&songIdToAdd={}", fixture.songs[0]))
-        .await;
+    fixture.update("playlistId=pl-trip&songIdToAdd=lib-1").await;
     assert!(fixture.state.family_request_service.requests_of("sam").is_empty());
     let updates = fixture.updates().await;
     assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].get("songIdToAdd"), Some(&fixture.songs[0]));
+    assert_eq!(updates[0].get("songIdToAdd").map(String::as_str), Some("lib-1"));
+
+    // A song found online for a playlist the caller does not own is refused before anything
+    // changes.
+    let refused = fixture
+        .update(&format!("playlistId=pl-trip&songIdToAdd={}", fixture.songs[0]))
+        .await;
+    assert_eq!(refused["subsonic-response"]["error"]["code"], 50);
+    assert_eq!(fixture.updates().await.len(), 1);
 }
 
 #[tokio::test]

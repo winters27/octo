@@ -30,8 +30,8 @@ use crate::http::error::AppError;
 use crate::services::family::kid_filter;
 use crate::services::library::Standing;
 use crate::services::subsonic::{
-    SearchBudget, SearchSongOrder, SearchSongOrderCache, SearchSongPagePlanner, SyncCatalog, SyncCatalogKind,
-    SyncCatalogService,
+    HeldCatalog, SearchBudget, SearchSongOrder, SearchSongOrderCache, SearchSongPagePlanner, SyncCatalog,
+    SyncCatalogKind, SyncCatalogService,
 };
 
 /// How long a sync page waits for the user's catalog to finish building before going
@@ -727,14 +727,22 @@ async fn sync_walk_page(
 
     // The first page of a walk starts the build, so it has the whole library's worth of
     // pages to finish in before the walk reaches the catalog.
+    // The songs found online in the playlists this listener sees, read at most once per page,
+    // and only by a page that needs the catalog.
+    let may_hold = super::held::may_have_catalog_songs(state);
+    let mut held: Option<HeldCatalog> = None;
     if pages
         .iter()
         .any(|(_, _, offset, count)| *offset == 0 && *count > 0)
     {
         queue_refresh_if_stale(state, &username);
-        state.sync_catalog.warm(&username, &stations, &call.parameters);
+        let songs = super::held::sync_catalog_songs(state, call, &username).await;
+        state
+            .sync_catalog
+            .warm_with(&username, &stations, &songs, &call.parameters);
+        held = Some(songs);
     }
-    if stations.is_empty() {
+    if stations.is_empty() && !may_hold {
         return Ok(unchanged());
     }
 
@@ -777,7 +785,14 @@ async fn sync_walk_page(
         let catalog = match pinned {
             Some(catalog) => catalog,
             None => {
-                let building = state.sync_catalog.get(&username, &stations, &call.parameters);
+                let songs = match held.take() {
+                    Some(songs) => songs,
+                    None => super::held::sync_catalog_songs(state, call, &username).await,
+                };
+                let building = state
+                    .sync_catalog
+                    .get_with(&username, &stations, &songs, &call.parameters);
+                held = Some(songs);
                 match tokio::time::timeout(SYNC_CATALOG_WAIT, building).await {
                     Ok(catalog) => catalog,
                     Err(_) => {

@@ -367,6 +367,54 @@ fn auth() -> IndexMap<String, String> {
         .collect()
 }
 
+/// A playlist's song found online, as the held routes hand it to the catalog.
+fn playlist_song(n: usize, title: &str) -> Song {
+    Song {
+        id: format!("ext-deezer-song-{n}"),
+        title: title.into(),
+        artist: "Owned Artist".into(),
+        artist_id: Some("ext-deezer-artist-1".into()),
+        album: "Elsewhere".into(),
+        album_id: Some("ext-deezer-album-1".into()),
+        duration: Some(200),
+        is_local: false,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn playlist_songs_make_a_catalog_with_no_stations_unmatched_against_the_library_and_uncapped() {
+    let fixture = fixture(&[]).await;
+    // More than the cap's top, all by an artist the library holds.
+    let songs: Vec<Song> = (0..5_001).map(|n| playlist_song(n, "Missing Hit")).collect();
+    let held = HeldCatalog {
+        songs: songs.clone(),
+        fingerprint: "1:a".into(),
+    };
+    let catalog = fixture.service.get_with("alice", &[], &held, &auth()).await;
+    assert_eq!(catalog.songs().len(), 5_001);
+    assert!(catalog.try_get_song("ext-deezer-song-0").is_some());
+    assert!(fixture.navidrome.queries.lock().is_empty(), "no library lookups");
+    assert_eq!(catalog.albums().len(), 1);
+
+    // The same songs and fingerprint: the cached catalog. A new generation builds again.
+    let again = fixture.service.get_with("alice", &[], &held, &auth()).await;
+    assert!(Arc::ptr_eq(&catalog, &again));
+    let fewer = HeldCatalog {
+        songs: songs[..1].to_vec(),
+        fingerprint: "2:b".into(),
+    };
+    let rebuilt = fixture.service.get_with("alice", &[], &fewer, &auth()).await;
+    assert_eq!(rebuilt.songs().len(), 1);
+
+    // No stations and no playlist songs: the empty catalog, as before.
+    let empty = fixture
+        .service
+        .get_with("alice", &[], &HeldCatalog::default(), &auth())
+        .await;
+    assert!(empty.songs().is_empty());
+}
+
 #[tokio::test]
 async fn build_leaves_out_what_the_library_owns_and_files_under_the_librarys_artist_and_album() {
     let stations = [your_mix(2)];

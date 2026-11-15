@@ -29,7 +29,7 @@ pub use subsonic_proxy_service::{
     IncomingRequest, RawRelayResult, RelayError, RelayResponse, SubsonicProxyService,
 };
 pub use subsonic_response_builder::{SubsonicResponseBuilderExt, new_subsonic_response_builder};
-pub use sync_catalog_service::{SyncCatalog, SyncCatalogKind, SyncCatalogService};
+pub use sync_catalog_service::{HeldCatalog, SyncCatalog, SyncCatalogKind, SyncCatalogService};
 
 #[cfg(test)]
 mod subsonic_wire_golden_tests;
