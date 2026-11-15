@@ -16,6 +16,7 @@ use super::preview_copies::{
     Copying, PreviewCopies, PreviewSource, WholePreview, asks_for_pieces, copy_after, is_video_id,
 };
 use crate::services::i_download_service::DirectStreamInfo;
+use std::time::Instant as StdInstant;
 
 const VIDEO: &str = "osN-dGs2d2A";
 
@@ -460,4 +461,177 @@ async fn kept_copies_stop_starting_once_they_fill_their_room() {
     assert_eq!(copies.start_kept("bbbbbbbbbbb", at(60)), Copying::Started);
     wait_ready(&copies, "bbbbbbbbbbb").await;
     assert!(!copies.kept_room(1_500));
+}
+
+fn soon() -> StdInstant {
+    StdInstant::now() + StdDuration::from_secs(5)
+}
+
+#[tokio::test]
+async fn a_complete_copy_is_fed_whole_and_held_while_its_feed_lives() {
+    let dir = tempfile::tempdir().unwrap();
+    let (clock, _) = clock();
+    let copies = copies(&dir, Arc::new(FakeSource::new(data(5_000))), clock, u64::MAX);
+    assert!(copies.start(VIDEO, None));
+    wait_ready(&copies, VIDEO).await;
+    let feed = copies.feed_copy(VIDEO, None, soon()).await.expect("the copy");
+    assert_eq!(feed.total, 5_000);
+    assert_eq!(feed.content_type, "audio/mp4");
+    assert!(feed.complete_path.as_ref().is_some_and(|path| path.is_file()));
+    assert!(copies.is_held(VIDEO));
+    let body: Vec<u8> = feed.body.map(|piece| piece.unwrap().to_vec()).concat().await;
+    assert_eq!(body, data(5_000));
+    drop(feed.hold);
+    assert!(!copies.is_held(VIDEO), "the hold goes with the feed");
+}
+
+#[tokio::test]
+async fn the_head_of_a_copy_is_its_first_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (clock, _) = clock();
+    let copies = copies(&dir, Arc::new(FakeSource::new(data(5_000))), clock, u64::MAX);
+    assert!(
+        copies.head(VIDEO, 64).await.is_none(),
+        "no copy and no fill: nothing to read"
+    );
+    assert!(copies.start(VIDEO, None));
+    wait_ready(&copies, VIDEO).await;
+    assert_eq!(copies.head(VIDEO, 64).await.unwrap(), data(5_000)[..64]);
+    assert_eq!(
+        copies.head(VIDEO, 10_000).await.unwrap(),
+        data(5_000),
+        "never more than the copy"
+    );
+}
+
+#[tokio::test]
+async fn a_told_head_waits_for_the_fill_to_write_its_first_boxes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (clock, _) = clock();
+    // An `ftyp` then a `moov`: an MP4 that streams from its start, sent 50 ms a piece, so the
+    // feed answers before any byte is in the part file.
+    let mut mp4 = vec![
+        0, 0, 0, 16, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0, 0, 0, 0, 0, 0, 0, 8, b'm', b'o',
+        b'o', b'v',
+    ];
+    mp4.resize(5_000, 0);
+    let mut source = FakeSource::new(mp4);
+    source.delay = StdDuration::from_millis(50);
+    let copies = copies(&dir, Arc::new(source), clock, u64::MAX);
+    let feed = copies
+        .feed_copy(VIDEO, None, soon())
+        .await
+        .expect("the fill's feed");
+    let until = tokio::time::Instant::now() + StdDuration::from_secs(5);
+    let head = copies.told_head(VIDEO, 64 * 1024, until).await.expect("a head");
+    assert_eq!(
+        crate::services::prefetch::convert_rules::mp4_streams_from_start(&head),
+        Some(true),
+        "the head waited for the boxes instead of reading an empty part"
+    );
+    drop(feed);
+}
+
+#[tokio::test]
+async fn a_filling_copy_is_fed_as_it_grows_and_ends_only_at_its_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let (clock, _) = clock();
+    let mut source = FakeSource::new(data(10_000));
+    source.delay = StdDuration::from_millis(5);
+    let copies = copies(&dir, Arc::new(source), clock, u64::MAX);
+    let feed = copies
+        .feed_copy(VIDEO, None, soon())
+        .await
+        .expect("the fill's feed");
+    assert!(feed.complete_path.is_none());
+    assert_eq!(feed.total, 10_000);
+    let body: Vec<u8> = feed
+        .body
+        .map(|piece| piece.expect("no error before the total").to_vec())
+        .concat()
+        .await;
+    assert_eq!(body, data(10_000));
+    let path = copies
+        .wait_complete(VIDEO)
+        .await
+        .expect("the copy once its fill ended");
+    assert_eq!(std::fs::read(path).unwrap(), data(10_000));
+}
+
+#[tokio::test]
+async fn a_fill_that_breaks_ends_its_feed_with_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (clock, _) = clock();
+    let mut source = FakeSource::new(data(10_000));
+    source.delay = StdDuration::from_millis(5);
+    source.break_after = Some(4_000);
+    let copies = copies(&dir, Arc::new(source), clock, u64::MAX);
+    let feed = copies
+        .feed_copy(VIDEO, None, soon())
+        .await
+        .expect("the fill's feed");
+    let pieces: Vec<std::io::Result<Bytes>> = feed.body.collect().await;
+    assert!(
+        pieces.last().is_some_and(|piece| piece.is_err()),
+        "never a clean end"
+    );
+    assert!(!copies.is_ready(VIDEO), "no copy is kept of a broken fill");
+    assert!(copies.wait_complete(VIDEO).await.is_none());
+}
+
+#[tokio::test]
+async fn a_feed_waits_for_a_free_fill_until_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (clock, _) = clock();
+    let mut source = FakeSource::new(data(10_000));
+    source.delay = StdDuration::from_millis(30);
+    let copies = copies(&dir, Arc::new(source), clock, u64::MAX);
+    for id in ["aaaaaaaaaa1", "aaaaaaaaaa2", "aaaaaaaaaa3", "aaaaaaaaaa4"] {
+        assert!(copies.start(id, None));
+    }
+    let short = StdInstant::now() + StdDuration::from_millis(20);
+    assert!(
+        copies.feed_copy(VIDEO, None, short).await.is_none(),
+        "every fill is taken"
+    );
+    let feed = copies.feed_copy(VIDEO, None, soon()).await;
+    assert!(feed.is_some(), "a fill came free before the deadline");
+}
+
+#[tokio::test]
+async fn a_fill_with_no_new_bytes_gives_up_after_its_set_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let (clock, _) = clock();
+    let mut source = FakeSource::new(data(3_000));
+    source.delay = StdDuration::from_millis(200);
+    let copies = PreviewCopies::with_stalls(
+        dir.path().join("previews"),
+        Arc::new(source),
+        clock,
+        || 0,
+        u64::MAX,
+        StdDuration::from_millis(40),
+        // The readers' own wait is long, so only the fill's settable 40 ms ends it in time.
+        StdDuration::from_secs(5),
+    );
+    let began = std::time::Instant::now();
+    // The feed follows the fill it starts; the fill gives up after 40 ms with no bytes, so the
+    // feed either answers None or a body that ends in an error, long before its 5 s deadline
+    // (with the old 30 s wait it would wait the deadline out). It never ends cleanly.
+    let ended_in_error = match copies.feed_copy(VIDEO, None, soon()).await {
+        None => true,
+        Some(feed) => feed
+            .body
+            .collect::<Vec<_>>()
+            .await
+            .last()
+            .is_some_and(|piece| piece.is_err()),
+    };
+    assert!(ended_in_error, "a stalled fill never ends cleanly");
+    assert!(
+        began.elapsed() < StdDuration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+    assert!(!copies.is_ready(VIDEO));
 }

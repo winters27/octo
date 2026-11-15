@@ -27,6 +27,7 @@ fn make(extension: &str) -> Option<Vec<u8>> {
         "mp3" => &["-c:a", "libmp3lame", "-b:a", "64k"],
         "m4a" => &["-c:a", "aac", "-b:a", "64k"],
         "ogg" => &["-c:a", "libvorbis"],
+        "webm" | "opus" => &["-c:a", "libopus", "-b:a", "64k"],
         _ => &[],
     };
     let status = Command::new("ffmpeg")
@@ -45,12 +46,25 @@ fn make(extension: &str) -> Option<Vec<u8>> {
     std::fs::read(&out).ok()
 }
 
-/// Returns early from a test, with the reason printed, when ffmpeg cannot make the audio.
+/// Whether a missing ffmpeg fails the test instead of skipping it: with
+/// `OCTO_TESTS_NEED_FFMPEG=1` (set on the gate), a test that needs real audio never passes by
+/// skipping.
+pub(crate) fn missing_ffmpeg_fails(setting: Option<&str>) -> bool {
+    setting.is_some_and(|value| value.trim() == "1")
+}
+
+/// Returns early from a test, with the reason printed, when ffmpeg cannot make the audio; fails
+/// it instead when `OCTO_TESTS_NEED_FFMPEG=1`.
 macro_rules! audio_or_skip {
     ($extension:expr) => {
         match $crate::services::test_audio::audio($extension) {
             Some(bytes) => bytes,
             None => {
+                if $crate::services::test_audio::missing_ffmpeg_fails(
+                    std::env::var("OCTO_TESTS_NEED_FFMPEG").ok().as_deref(),
+                ) {
+                    panic!("ffmpeg is not on the PATH, and OCTO_TESTS_NEED_FFMPEG=1 needs it");
+                }
                 eprintln!("skipped: ffmpeg is not on the PATH");
                 return;
             }
@@ -58,3 +72,17 @@ macro_rules! audio_or_skip {
     };
 }
 pub(crate) use audio_or_skip;
+
+#[cfg(test)]
+mod tests {
+    use super::missing_ffmpeg_fails;
+
+    #[test]
+    fn only_the_gates_setting_turns_a_skip_into_a_failure() {
+        assert!(missing_ffmpeg_fails(Some("1")));
+        assert!(missing_ffmpeg_fails(Some(" 1 ")));
+        assert!(!missing_ffmpeg_fails(Some("0")));
+        assert!(!missing_ffmpeg_fails(Some("")));
+        assert!(!missing_ffmpeg_fails(None));
+    }
+}

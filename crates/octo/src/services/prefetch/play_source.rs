@@ -9,6 +9,10 @@
 //! is gone, its later ranges are refused, so the player starts the song again from its first
 //! byte rather than mixing two files. A play on the preview keeps it while it is heard, each
 //! request renewing the song's length and ten minutes.
+//!
+//! Beside them, every play of an outside song notes the kind of answer it started with (the
+//! source as it is, or a converted copy), so its later ranges and time seeks keep that kind,
+//! for as long as it is heard by the same rule.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,10 +47,22 @@ enum Started {
 
 type Plays = HashMap<(String, String), (Started, DateTime<Utc>)>;
 
+/// The kind of answer a play of an outside song started with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answered {
+    /// The source as it is.
+    Source,
+    /// The converted copy of this key.
+    Conversion(String),
+}
+
+type Answers = HashMap<(String, String), (Answered, DateTime<Utc>)>;
+
 /// The source each device's play of each song started on.
 pub struct PlaySources {
     clock: Clock,
     plays: Mutex<Plays>,
+    answers: Mutex<Answers>,
 }
 
 impl PlaySources {
@@ -54,7 +70,48 @@ impl PlaySources {
         PlaySources {
             clock,
             plays: Mutex::new(HashMap::new()),
+            answers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether a play of `id` from the device `keys` names is being heard now: its last
+    /// request was less than the song's length and ten minutes ago.
+    pub fn live(&self, keys: &[String], id: &str) -> bool {
+        self.answered(keys, id).is_some()
+    }
+
+    /// The kind of answer the live play of `id` from the device `keys` names started with.
+    pub fn answered(&self, keys: &[String], id: &str) -> Option<Answered> {
+        let now = self.clock.now();
+        let answers = self.answers.lock();
+        keys.iter()
+            .filter_map(|key| answers.get(&(key.clone(), id.to_string())))
+            .find(|(_, until)| *until > now)
+            .map(|(answered, _)| answered.clone())
+    }
+
+    /// Notes a request of a play of `id`: a new play under the device's first key, or the live
+    /// play renewed under the key it started with, either way kept for the song's length and
+    /// ten minutes from now, with the kind of answer it has.
+    pub fn note(&self, keys: &[String], id: &str, length_seconds: Option<i32>, answered: Answered) {
+        let Some(first) = keys.first() else {
+            return;
+        };
+        let now = self.clock.now();
+        let length = length_seconds
+            .filter(|s| *s > 0)
+            .map_or(UNKNOWN_LENGTH, |s| Duration::seconds(i64::from(s)));
+        let until = now + length + GRACE;
+        let mut answers = self.answers.lock();
+        let key = keys
+            .iter()
+            .map(|key| (key.clone(), id.to_string()))
+            .find(|key| answers.get(key).is_some_and(|(_, kept)| *kept > now))
+            .unwrap_or_else(|| (first.clone(), id.to_string()));
+        if !answers.contains_key(&key) && answers.len() >= MAX_PLAYS {
+            trim_answers(&mut answers, now);
+        }
+        answers.insert(key, (answered, until));
     }
 
     /// The source for one request for `id` from the device `who` names: `who[0]` is the play's
@@ -139,6 +196,19 @@ fn trim(plays: &mut Plays, now: DateTime<Utc>) {
             .map(|(key, _)| key.clone())
     {
         plays.remove(&oldest);
+    }
+}
+
+/// Room for one more answered play: the plays over go, then the play heard longest ago.
+fn trim_answers(answers: &mut Answers, now: DateTime<Utc>) {
+    answers.retain(|_, (_, until)| *until > now);
+    if answers.len() >= MAX_PLAYS
+        && let Some(oldest) = answers
+            .iter()
+            .min_by_key(|(_, (_, until))| *until)
+            .map(|(key, _)| key.clone())
+    {
+        answers.remove(&oldest);
     }
 }
 
@@ -361,5 +431,61 @@ mod tests {
         ] {
             assert_eq!(from_start(range), start, "{range:?}");
         }
+    }
+
+    #[test]
+    fn a_noted_play_is_live_with_its_kind_until_its_time_runs_out() {
+        let w = world();
+        assert!(!w.plays.live(&alice(), "s1"));
+        w.plays.note(
+            &alice(),
+            "s1",
+            Some(60),
+            Answered::Conversion("v-a-1.mp3-128".to_string()),
+        );
+        assert!(w.plays.live(&alice(), "s1"));
+        assert_eq!(
+            w.plays.answered(&alice(), "s1"),
+            Some(Answered::Conversion("v-a-1.mp3-128".to_string()))
+        );
+        assert!(!w.plays.live(&alice(), "s2"));
+        w.later(Duration::minutes(10));
+        assert!(
+            w.plays.live(&alice(), "s1"),
+            "within the song's length and ten minutes"
+        );
+        w.later(Duration::minutes(2));
+        assert!(
+            !w.plays.live(&alice(), "s1"),
+            "a pause past its time ends the play"
+        );
+    }
+
+    #[test]
+    fn every_request_renews_an_answered_play_under_the_key_it_started_with() {
+        let w = world();
+        let address = vec!["|10.0.0.2|octo".to_string()];
+        w.plays.note(&address, "s1", Some(60), Answered::Source);
+        let named = vec!["alice|10.0.0.2|octo".to_string(), "|10.0.0.2|octo".to_string()];
+        for _ in 0..5 {
+            w.later(Duration::minutes(8));
+            assert_eq!(w.plays.answered(&named, "s1"), Some(Answered::Source));
+            w.plays.note(&named, "s1", Some(60), Answered::Source);
+        }
+        assert_eq!(w.plays.answers.lock().len(), 1);
+    }
+
+    #[test]
+    fn answered_plays_stay_under_their_bound() {
+        let w = world();
+        for n in 0..=MAX_PLAYS {
+            w.plays
+                .note(&alice(), &format!("s{n}"), Some(60), Answered::Source);
+        }
+        assert!(w.plays.answers.lock().len() <= MAX_PLAYS);
+        assert!(
+            w.plays.live(&alice(), &format!("s{MAX_PLAYS}")),
+            "the newest play is kept"
+        );
     }
 }

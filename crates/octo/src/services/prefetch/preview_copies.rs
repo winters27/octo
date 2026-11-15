@@ -8,6 +8,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use async_trait::async_trait;
@@ -19,7 +20,7 @@ use octo_core::fingerprint::heart_gate::HeardSource;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 
 use super::store::free_bytes;
@@ -211,6 +212,34 @@ pub enum HeardCopy {
     Gone,
 }
 
+/// Numbers the holds converted plays put on complete copies.
+static NEXT_FEED_HOLD: AtomicU64 = AtomicU64::new(0);
+
+/// A copy fed to a converted play: its total and type, a body that follows the fill and ends
+/// cleanly only once every byte of the total is through (any other end is an error), and the
+/// copy's file when it is already complete, held for as long as the feed lives.
+pub struct CopyFeed {
+    pub video: String,
+    pub total: u64,
+    pub content_type: String,
+    pub body: AudioStream,
+    pub complete_path: Option<PathBuf>,
+    pub hold: Option<CopyHold>,
+}
+
+/// A converted play's hold on a complete copy, let go when dropped.
+pub struct CopyHold {
+    copies: Arc<PreviewCopies>,
+    video: String,
+    holder: String,
+}
+
+impl Drop for CopyHold {
+    fn drop(&mut self) {
+        self.copies.release(&self.video, &self.holder);
+    }
+}
+
 /// Whether a holder id is a heart's, which is saved with the index; any other is a play's, kept
 /// in memory only.
 fn is_saved_holder(holder: &str) -> bool {
@@ -266,6 +295,12 @@ pub struct PreviewCopies {
     save_lock: Mutex<()>,
     /// One FLAC stand-in build at a time per video.
     flac_builds: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// A fill with no new bytes for this long is given up.
+    fill_stall: StdDuration,
+    /// A reader of a filling copy with no new bytes for this long ends its body.
+    serve_stall: StdDuration,
+    /// Woken each time a fill ends, for a converted play waiting on a free fill.
+    fill_ended: Notify,
 }
 
 impl PreviewCopies {
@@ -286,6 +321,19 @@ impl PreviewCopies {
         min_free: impl Fn() -> u64 + Send + Sync + 'static,
         cap: u64,
     ) -> Arc<Self> {
+        Self::with_stalls(folder, source, clock, min_free, cap, FILL_STALL, SERVE_STALL)
+    }
+
+    /// As `with_cap`, with the fills' and readers' waits for new bytes set.
+    pub fn with_stalls(
+        folder: PathBuf,
+        source: Arc<dyn PreviewSource>,
+        clock: Clock,
+        min_free: impl Fn() -> u64 + Send + Sync + 'static,
+        cap: u64,
+        fill_stall: StdDuration,
+        serve_stall: StdDuration,
+    ) -> Arc<Self> {
         let copies = PreviewCopies {
             folder,
             source,
@@ -295,6 +343,9 @@ impl PreviewCopies {
             state: Mutex::new(State::default()),
             save_lock: Mutex::new(()),
             flac_builds: Mutex::new(HashMap::new()),
+            fill_stall,
+            serve_stall,
+            fill_ended: Notify::new(),
         };
         copies.load();
         Arc::new(copies)
@@ -504,6 +555,7 @@ impl PreviewCopies {
             }
         }
         tx.send_modify(|p| p.ended = true);
+        self.fill_ended.notify_waiters();
     }
 
     /// Writes the whole preview into its unfinished file, telling readers each step.
@@ -514,7 +566,7 @@ impl PreviewCopies {
         part: &Path,
         tx: &watch::Sender<Progress>,
     ) -> Result<(u64, String), String> {
-        let whole = tokio::time::timeout(FILL_STALL, self.source.open_whole(id))
+        let whole = tokio::time::timeout(self.fill_stall, self.source.open_whole(id))
             .await
             .map_err(|_| "the shim did not answer".to_string())?
             .ok_or_else(|| "the shim had no stream".to_string())?;
@@ -537,8 +589,8 @@ impl PreviewCopies {
         let mut body = whole.body;
         let mut written = 0u64;
         while written < whole.total {
-            let chunk = match tokio::time::timeout(FILL_STALL, body.next()).await {
-                Err(_) => return Err("no new bytes for 30 s".to_string()),
+            let chunk = match tokio::time::timeout(self.fill_stall, body.next()).await {
+                Err(_) => return Err(format!("no new bytes for {} s", self.fill_stall.as_secs())),
                 Ok(None) => break,
                 Ok(Some(Err(e))) => return Err(e.to_string()),
                 Ok(Some(Ok(chunk))) => chunk,
@@ -587,7 +639,16 @@ impl PreviewCopies {
                 return None;
             }
             let file = tokio::fs::File::open(self.copy_path(video_id)).await.ok()?;
-            return answer(file, entry.size, entry.content_type, range, None, video_id).await;
+            return answer(
+                file,
+                entry.size,
+                entry.content_type,
+                range,
+                None,
+                video_id,
+                self.serve_stall,
+            )
+            .await;
         }
         let progress = filling?;
         let seen = progress.borrow().clone();
@@ -601,7 +662,16 @@ impl PreviewCopies {
                 return None;
             }
             let file = tokio::fs::File::open(self.copy_path(video_id)).await.ok()?;
-            return answer(file, entry.size, entry.content_type, range, None, video_id).await;
+            return answer(
+                file,
+                entry.size,
+                entry.content_type,
+                range,
+                None,
+                video_id,
+                self.serve_stall,
+            )
+            .await;
         }
         if confirmed_size.is_some_and(|size| size != total) {
             return None;
@@ -611,7 +681,16 @@ impl PreviewCopies {
             // Complete since it was looked up: the file has its own name now.
             Err(_) => tokio::fs::File::open(self.copy_path(video_id)).await.ok()?,
         };
-        answer(file, total, content_type, range, Some(progress), video_id).await
+        answer(
+            file,
+            total,
+            content_type,
+            range,
+            Some(progress),
+            video_id,
+            self.serve_stall,
+        )
+        .await
     }
 
     /// Holds this video's copy until `until`, for a playlist kept ready. Kept in memory: the
@@ -768,7 +847,7 @@ impl PreviewCopies {
         if !is_video_id(id) {
             return HeardCopy::Gone;
         }
-        let whole = match tokio::time::timeout(FILL_STALL, self.source.open_heard(id, *itag)).await {
+        let whole = match tokio::time::timeout(self.fill_stall, self.source.open_heard(id, *itag)).await {
             Ok(Ok(whole)) => whole,
             Ok(Err(Failure::Gone | Failure::Refused)) => return HeardCopy::Gone,
             Ok(Err(_)) | Err(_) => return HeardCopy::Busy,
@@ -777,7 +856,7 @@ impl PreviewCopies {
             return HeardCopy::Gone;
         }
         let part = self.folder.join(format!("{id}.heard.part"));
-        let written = write_whole(whole, &part).await;
+        let written = write_whole(whole, &part, self.fill_stall).await;
         let Some((total, fetched_type)) = written else {
             let _ = tokio::fs::remove_file(&part).await;
             return HeardCopy::Busy;
@@ -912,7 +991,7 @@ impl PreviewCopies {
             if progress.borrow().ended {
                 return;
             }
-            match tokio::time::timeout(SERVE_STALL, progress.changed()).await {
+            match tokio::time::timeout(self.serve_stall, progress.changed()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) | Err(_) => return,
             }
@@ -963,6 +1042,182 @@ impl PreviewCopies {
     /// Whether this video's copy is complete.
     pub fn is_ready(&self, video_id: &str) -> bool {
         self.state.lock().index.contains_key(video_id)
+    }
+
+    /// The copy of this video for a converted play: the complete copy (held while the feed
+    /// lives), or the fill started or joined now, once its total and type are known. A play
+    /// waits for a free fill the way any play's copy would, and for the fill's first facts,
+    /// both until `deadline`. None when the id is no video's, the copy is refused, the deadline
+    /// passes, or a fill it followed ended with no copy.
+    pub async fn feed_copy(
+        self: &Arc<Self>,
+        video_id: &str,
+        expected_total: Option<u64>,
+        deadline: Instant,
+    ) -> Option<CopyFeed> {
+        if !is_video_id(video_id) {
+            return None;
+        }
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let mut followed = false;
+        let mut ready_seen = false;
+        loop {
+            if let Some(feed) = self.complete_feed(video_id).await {
+                return Some(feed);
+            }
+            let filling = self
+                .state
+                .lock()
+                .fills
+                .get(video_id)
+                .map(|fill| fill.progress.clone());
+            if let Some(mut progress) = filling {
+                followed = true;
+                let seen = progress.borrow().clone();
+                if !seen.ended
+                    && let (Some(total), Some(content_type)) = (seen.total, seen.content_type)
+                    && let Some(info) = self.serve(video_id, None, None).await
+                {
+                    return Some(CopyFeed {
+                        video: video_id.to_string(),
+                        total: info.content_length.unwrap_or(total),
+                        content_type,
+                        body: info.audio_stream,
+                        complete_path: None,
+                        hold: None,
+                    });
+                }
+                match tokio::time::timeout_at(deadline, progress.changed()).await {
+                    Err(_) => return None,
+                    // Changed, or the fill is over: look again.
+                    Ok(_) => continue,
+                }
+            }
+            if followed {
+                return None;
+            }
+            let freed = self.fill_ended.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            match self.begin(video_id, expected_total, None) {
+                Copying::Refused => return None,
+                Copying::Ready => {
+                    if ready_seen {
+                        return None;
+                    }
+                    ready_seen = true;
+                }
+                Copying::Started => followed = true,
+                Copying::Busy => {
+                    if tokio::time::timeout_at(deadline, freed).await.is_err() {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Waits for this video's fill, if any, to end, and answers its complete copy's file; None
+    /// when there is none.
+    pub async fn wait_complete(&self, video_id: &str) -> Option<PathBuf> {
+        self.wait_for_fill(video_id).await;
+        self.copy_path_of(video_id, None, None)
+    }
+
+    /// Up to `max` of the first bytes written so far of this video's copy, complete or filling:
+    /// what a build reads to tell whether an MP4 can be read from its start as it grows. None
+    /// when there is no copy or fill to read.
+    pub async fn head(&self, video_id: &str, max: usize) -> Option<Vec<u8>> {
+        if !is_video_id(video_id) {
+            return None;
+        }
+        let path = if self.is_ready(video_id) {
+            self.copy_path(video_id)
+        } else {
+            self.part_path(video_id)
+        };
+        let mut file = tokio::fs::File::open(path).await.ok()?;
+        let mut head = vec![0u8; max];
+        let mut got = 0;
+        while got < max {
+            let read = file.read(&mut head[got..]).await.ok()?;
+            if read == 0 {
+                break;
+            }
+            got += read;
+        }
+        head.truncate(got);
+        Some(head)
+    }
+
+    /// The first bytes of this video's copy once they tell whether an MP4 streams from its start
+    /// (`mp4_streams_from_start` answers), or `max` bytes are written, or the fill ends, or
+    /// `deadline` passes: a filling copy is read again each time its fill writes more. None when
+    /// there is no copy or fill to read.
+    pub async fn told_head(
+        &self,
+        video_id: &str,
+        max: usize,
+        deadline: tokio::time::Instant,
+    ) -> Option<Vec<u8>> {
+        let mut progress = self
+            .state
+            .lock()
+            .fills
+            .get(video_id)
+            .map(|fill| fill.progress.clone());
+        loop {
+            let head = self.head(video_id, max).await;
+            let told = head.as_deref().is_some_and(|head| {
+                head.len() >= max
+                    || crate::services::prefetch::convert_rules::mp4_streams_from_start(head).is_some()
+            });
+            let Some(rx) = progress.as_mut() else {
+                return head;
+            };
+            if told || rx.borrow().ended {
+                return head;
+            }
+            match tokio::time::timeout_at(deadline, rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return self.head(video_id, max).await,
+            }
+        }
+    }
+
+    /// The complete copy of this video as a feed, held for a converted play while it lives.
+    async fn complete_feed(self: &Arc<Self>, video_id: &str) -> Option<CopyFeed> {
+        let (size, content_type) = self.copy_facts(video_id)?;
+        let path = self.copy_path_of(video_id, Some(size), None)?;
+        let holder = format!("play:convert:{}", NEXT_FEED_HOLD.fetch_add(1, Ordering::SeqCst));
+        if !self.hold(video_id, &holder) {
+            return None;
+        }
+        let hold = CopyHold {
+            copies: Arc::clone(self),
+            video: video_id.to_string(),
+            holder,
+        };
+        let file = tokio::fs::File::open(&path).await.ok()?;
+        self.touch(video_id);
+        let info = answer(
+            file,
+            size,
+            content_type.clone(),
+            None,
+            None,
+            video_id,
+            self.serve_stall,
+        )
+        .await?;
+        Some(CopyFeed {
+            video: video_id.to_string(),
+            total: size,
+            content_type,
+            body: info.audio_stream,
+            complete_path: Some(path),
+            hold: Some(hold),
+        })
     }
 
     /// Whether a new copy for a playlist kept ready fits under `kept_cap` bytes, counting the kept
@@ -1059,13 +1314,14 @@ fn same_type(a: &str, b: &str) -> bool {
     bare(a) == bare(b)
 }
 
-/// Writes a whole stream to `part`, giving up when it stalls or ends short. Its size and type.
-async fn write_whole(whole: WholePreview, part: &Path) -> Option<(u64, String)> {
+/// Writes a whole stream to `part`, giving up when it stalls (`stall`) or ends short. Its size
+/// and type.
+async fn write_whole(whole: WholePreview, part: &Path, stall: StdDuration) -> Option<(u64, String)> {
     let mut file = tokio::fs::File::create(part).await.ok()?;
     let mut body = whole.body;
     let mut written = 0u64;
     while written < whole.total {
-        let chunk = match tokio::time::timeout(FILL_STALL, body.next()).await {
+        let chunk = match tokio::time::timeout(stall, body.next()).await {
             Ok(Some(Ok(chunk))) => chunk,
             Ok(None) => break,
             Ok(Some(Err(_))) | Err(_) => return None,
@@ -1110,7 +1366,9 @@ async fn to_flac(copy: &Path, out: &Path) -> bool {
 }
 
 /// The answer for `range` of a copy `total` bytes long, read from `file`. With `growing`, the
-/// copy is still filling: the body follows it as it grows.
+/// copy is still filling: the body follows it as it grows, and ends with an error after
+/// `stall` with no new bytes.
+#[allow(clippy::too_many_arguments)]
 async fn answer(
     mut file: tokio::fs::File,
     total: u64,
@@ -1118,6 +1376,7 @@ async fn answer(
     range: Option<&str>,
     growing: Option<watch::Receiver<Progress>>,
     video_id: &str,
+    stall: StdDuration,
 ) -> Option<DirectStreamInfo> {
     if total == 0 {
         return None;
@@ -1139,6 +1398,7 @@ async fn answer(
         end: to,
         total,
         growing,
+        stall,
     };
     let body = futures::stream::unfold(Some(reader), |reader| async move {
         let mut reader = reader?;
@@ -1168,6 +1428,8 @@ struct Reader {
     end: u64,
     total: u64,
     growing: Option<watch::Receiver<Progress>>,
+    /// How long it waits for new bytes of a filling copy.
+    stall: StdDuration,
 }
 
 impl Reader {
@@ -1186,7 +1448,7 @@ impl Reader {
                 if seen.ended {
                     return Err(std::io::Error::other("the copy ended short"));
                 }
-                match tokio::time::timeout(SERVE_STALL, progress.changed()).await {
+                match tokio::time::timeout(self.stall, progress.changed()).await {
                     Ok(Ok(())) => {}
                     // The fill is over: what it wrote is all there is.
                     Ok(Err(_)) => {
