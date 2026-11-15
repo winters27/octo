@@ -791,7 +791,7 @@ fn load(dir: &Path) -> (Inner, Vec<String>) {
     // Newest first: a playlist keeps its newest committed record. Every other one is deleted: a
     // previous record whose delete a crash cut short, or a record whose main file was never
     // written (its main file is older than the record says).
-    records.sort_by(|a, b| b.1.revision.cmp(&a.1.revision));
+    records.sort_by_key(|(_, record)| std::cmp::Reverse(record.revision));
     for (path, record) in records {
         let committed = inner
             .playlists

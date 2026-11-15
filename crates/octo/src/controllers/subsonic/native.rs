@@ -1076,6 +1076,7 @@ struct NativePlaylist {
 }
 
 /// `GET api/playlist/{id}` as the caller. The error is the answer to send.
+#[allow(clippy::result_large_err)] // the error is the answer itself, sent at once
 async fn native_playlist(
     state: &AppState,
     request: &NativeRequest<'_>,
@@ -1111,6 +1112,7 @@ async fn native_playlist(
 
 /// The library rows of a playlist Navidrome lets the caller see, as their own native read; None
 /// when Navidrome did not answer, the answer to send when it refused.
+#[allow(clippy::result_large_err)] // the error is the answer itself, sent at once
 async fn caller_tracks(
     state: &AppState,
     headers: &HeaderMap,
@@ -1512,6 +1514,7 @@ async fn native_add(
 
 /// The owner, the served list and who is asking, for a native change by place. The error is the
 /// answer to send.
+#[allow(clippy::result_large_err)] // the error is the answer itself, sent at once
 async fn native_change_start(
     state: &AppState,
     request: &NativeRequest<'_>,

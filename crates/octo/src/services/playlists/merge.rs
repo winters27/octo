@@ -246,17 +246,17 @@ fn emit_unanchored(
     now: DateTime<Utc>,
     out: &mut Vec<HeldEntry>,
 ) {
-    for r in *next..until {
+    for (r, row) in raw.iter().enumerate().take(until).skip(*next) {
         if plan.anchored[r] {
             continue;
         }
         let entry = match plan.carried[r].and_then(|b| library.get(b)) {
             Some(moved) => {
                 let mut moved = (*moved).clone();
-                moved.library_id = Some(raw[r].id.clone());
+                moved.library_id = Some(row.id.clone());
                 moved
             }
-            None => new_entry(&raw[r], now),
+            None => new_entry(row, now),
         };
         out.push(entry);
     }
@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(ids(&out), ["ext-deezer-song-1", "b", "ext-deezer-song-2"]);
 
         // Occurrences: the second kept-aside copy of a song goes after the first.
-        let out = move_back_entries(&[s1.clone()], &[s1.clone(), s1.clone()]);
+        let out = move_back_entries(std::slice::from_ref(&s1), &[s1.clone(), s1.clone()]);
         assert_eq!(ids(&out), ["ext-deezer-song-1", "ext-deezer-song-1"]);
 
         // A library entry that is not present is not added back.

@@ -231,7 +231,7 @@ impl Lru {
             .map(|(id, (routing, stamp))| (*stamp, id, routing))
             .chain(self.kept.iter().map(|(id, kept)| (kept.stamp, id, &kept.routing)))
             .collect();
-        all.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        all.sort_unstable_by_key(|(stamp, _, _)| std::cmp::Reverse(*stamp));
         all.into_iter()
             .map(|(_, id, routing)| (id.clone(), routing.clone()))
             .collect()
@@ -605,10 +605,8 @@ impl ExternalIdRegistry {
                     }
                     k.merge_stream_facts(&n.stream_facts());
                 }
-                Some(own) if own == video => {
-                    if k.stream_facts().is_empty() {
-                        k.merge_stream_facts(&n.stream_facts());
-                    }
+                Some(own) if own == video && k.stream_facts().is_empty() => {
+                    k.merge_stream_facts(&n.stream_facts());
                 }
                 _ => {}
             }
@@ -1602,7 +1600,7 @@ impl ExternalIdRegistry {
                     )
                 })
                 .collect();
-            kept.sort_unstable_by(|a, b| b.3.cmp(&a.3));
+            kept.sort_unstable_by_key(|row| std::cmp::Reverse(row.3));
             (listed, kept, changed)
         };
         let mut text = String::from("[");
