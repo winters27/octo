@@ -108,6 +108,8 @@ getLibraryActions
 getLibraryTrash
 getLyricsCandidates
 getPlace
+getStreamVersionChanges
+getStreamVersions
 getTopChart
 getUpgrades
 importAction
@@ -116,6 +118,7 @@ pickFoundSong
 pinChartCountry
 setChartCountry
 setLyricsChoice
+setStreamVersion
 testPing
 
 # octoFamily

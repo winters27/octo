@@ -477,3 +477,145 @@ async fn a_download_ahead_never_writes_into_a_row_that_has_ended() {
     tracker.log("test", "t1", "note", "Lyrics found", None);
     assert_eq!(lines(&tracker), before + 1);
 }
+
+/// A song with a person's pick of `v1` over its own `v0`, fetched ahead and judged against `v0`.
+struct PickedAhead {
+    harness: Harness,
+    store: Arc<PrefetchStore>,
+    id: String,
+    _root: tempfile::TempDir,
+    _folder: tempfile::TempDir,
+}
+
+async fn picked_ahead() -> PickedAhead {
+    use crate::services::soulseek::stream_choices::{StreamChoice, StreamVersionKind};
+    let registry = Arc::new(crate::services::soulseek::ExternalIdRegistry::in_memory());
+    let id = registry.register(octo_core::soulseek::SoulseekRouting {
+        kind: octo_core::soulseek::RoutingKind::Song,
+        artist: Some("Artist".into()),
+        title: Some("Song picked".into()),
+        you_tube_id: Some("v0".into()),
+        ..Default::default()
+    });
+    registry
+        .choose_stream_video(
+            &id,
+            StreamChoice {
+                video: "v1".into(),
+                title: Some("Song picked".into()),
+                channel: None,
+                seconds: Some(200),
+                kind: StreamVersionKind::Release,
+                song_seconds: None,
+                by: "alice".into(),
+                at: chrono::Utc::now(),
+                auto: false,
+                seq: 0,
+            },
+        )
+        .expect("chosen");
+    let root = tempfile::tempdir().expect("the music folder");
+    let folder = tempfile::tempdir().expect("the prefetch folder");
+    let in_folder = folder.path().to_path_buf();
+    let store = Arc::new(PrefetchStore::new(
+        Arc::new(move || in_folder.clone()),
+        Clock::system(),
+    ));
+    let harness = build(
+        root.path(),
+        AppSettings::default(),
+        None,
+        Some(catalog(vec![(id.as_str(), song(&id))])),
+        DownloadServices {
+            prefetched: Some(store.clone() as Arc<dyn PrefetchedFiles>),
+            id_registry: Some(registry),
+            ..Default::default()
+        },
+    );
+    let staging = root.path().join(".octo-incoming").join("job");
+    harness.backend.land(move |_, track| {
+        std::fs::create_dir_all(&staging).expect("staging");
+        let path = staging.join(format!("{track}-{}.flac", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&path, crate::services::test_support::flac()).expect("the file");
+        path.to_string_lossy().into_owned()
+    });
+    let crate::services::i_download_service::Ahead::Kept { path } = harness
+        .service
+        .download_ahead("test", &id, folder.path(), &CancellationToken::new())
+        .await
+        .expect("downloaded ahead")
+    else {
+        panic!("kept");
+    };
+    // The copy was judged against the video the song played before the pick.
+    let mut facts: AheadSidecar =
+        serde_json::from_slice(&std::fs::read(sidecar_path(&path)).expect("the facts")).expect("JSON");
+    facts.judged_video = Some("v0".into());
+    write_sidecar(&path, &facts).expect("written");
+    PickedAhead {
+        harness,
+        store,
+        id,
+        _root: root,
+        _folder: folder,
+    }
+}
+
+#[tokio::test]
+async fn a_heart_passes_over_a_copy_fetched_ahead_as_another_version_than_the_pick() {
+    let w = picked_ahead().await;
+    assert_eq!(w.harness.backend.transfers(), 1);
+    heart(&w.harness.service, &w.id).await;
+    assert_eq!(
+        w.harness.backend.transfers(),
+        2,
+        "the chosen version is downloaded"
+    );
+    assert!(
+        w.store.ready("test", &w.id).is_none(),
+        "the other version's copy is gone"
+    );
+}
+
+#[tokio::test]
+async fn a_heart_whose_gate_heard_that_very_copy_still_keeps_it() {
+    use octo_core::fingerprint::heart_gate::{HeardReading, HeardRecord};
+    let w = picked_ahead().await;
+    let (ready_at, source_file) = w.store.copy_identity("test", &w.id).expect("a copy");
+    let gate = HeartGate {
+        user: "alice".into(),
+        origin: AcquisitionOrigin::Heart,
+        r: None,
+        heard: Some(HeardRecord {
+            heard_at: chrono::Utc::now(),
+            source: HeardSource::Copy {
+                key: format!("test:{}", w.id),
+                ready_at: Some(ready_at),
+                source_file,
+            },
+            sample_id: None,
+        }),
+        heard_seconds: None,
+        reading: HeardReading::NotHeard,
+        stand_in: None,
+    };
+    w.harness
+        .service
+        .download_song_internal(
+            "test",
+            &w.id,
+            DownloadOptions {
+                force_permanent: true,
+                place: AcquisitionPlace {
+                    origin: Some(AcquisitionOrigin::Heart),
+                    gates: vec![gate],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("kept");
+    assert_eq!(w.harness.backend.transfers(), 1, "no second download");
+}

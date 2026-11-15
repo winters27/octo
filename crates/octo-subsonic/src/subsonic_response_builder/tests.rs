@@ -1478,6 +1478,47 @@ fn extensions_list_playlist_songs_folders_and_form_post_once() {
 }
 
 #[test]
+fn extensions_list_stream_version_changes_always_and_stream_versions_for_pickers() {
+    let merged = || {
+        builder().merge_open_subsonic_extensions(
+            "json",
+            Some(NAVIDROME_JSON.as_bytes()),
+            Some("application/json"),
+            true,
+            true,
+        )
+    };
+    let picker = extension_names(&with_stream_versions_extensions(merged(), "json", true));
+    assert!(picker.iter().any(|n| n == "octoStreamVersions"));
+    assert!(picker.iter().any(|n| n == "octoStreamVersionChanges"));
+    let listener = extension_names(&with_stream_versions_extensions(merged(), "json", false));
+    assert!(!listener.iter().any(|n| n == "octoStreamVersions"));
+    assert!(listener.iter().any(|n| n == "octoStreamVersionChanges"));
+
+    let xml = with_stream_versions_extensions(
+        builder().merge_open_subsonic_extensions("xml", None, None, false, false),
+        "xml",
+        false,
+    );
+    let root = XElement::parse(&xml.text()).expect("xml");
+    let names: Vec<String> = root
+        .elements()
+        .filter(|e| e.name == "openSubsonicExtensions")
+        .filter_map(|e| e.attribute("name").map(str::to_string))
+        .collect();
+    assert!(names.iter().any(|n| n == "octoStreamVersionChanges"));
+    assert!(!names.iter().any(|n| n == "octoStreamVersions"));
+
+    let failed = r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"no"}}}"#;
+    let reply = with_stream_versions_extensions(
+        builder().merge_open_subsonic_extensions("json", Some(failed.as_bytes()), None, true, false),
+        "json",
+        true,
+    );
+    assert_eq!(reply.text(), failed);
+}
+
+#[test]
 fn extensions_json_adds_octos_own_and_missing_versions() {
     let reply = builder().merge_open_subsonic_extensions(
         "json",

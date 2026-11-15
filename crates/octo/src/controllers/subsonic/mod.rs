@@ -12,6 +12,7 @@ pub mod playlists;
 pub mod search;
 pub mod similar_songs;
 pub mod stations;
+pub mod stream_versions;
 pub mod top_songs;
 pub mod transitions;
 
@@ -78,6 +79,8 @@ mod scrobble_tests;
 mod search_album_ownership_tests;
 #[cfg(test)]
 mod stream_length_tests;
+#[cfg(test)]
+mod stream_versions_tests;
 #[cfg(test)]
 mod transitions_tests;
 
@@ -176,4 +179,5 @@ pub fn routes() -> RouteSet {
         .merge(places::routes())
         .merge(animated_art::routes())
         .merge(folders::routes())
+        .merge(stream_versions::routes())
 }

@@ -418,6 +418,30 @@ pub struct HeartAcquisitionCoordinator {
 
     // Plays whose download waits until they have played DownloadOnPlayAfterSeconds.
     listening: Arc<ListeningPlays>,
+
+    // The song chains running now, each under a number of its own, which choosing a song's
+    // version asks whether a person's own download of it runs.
+    chains: Mutex<HashMap<u64, RunningChain>>,
+    next_chain: std::sync::atomic::AtomicU64,
+}
+
+/// A song chain that runs now: the song's id, the people it runs for and why it runs.
+struct RunningChain {
+    external_id: String,
+    users: Vec<String>,
+    origin: AcquisitionOrigin,
+}
+
+/// Takes a running chain off the list when it ends, however it ends.
+pub(crate) struct ChainRun<'a> {
+    chains: &'a Mutex<HashMap<u64, RunningChain>>,
+    id: u64,
+}
+
+impl Drop for ChainRun<'_> {
+    fn drop(&mut self) {
+        self.chains.lock().remove(&self.id);
+    }
 }
 
 /// Which of a play's acquisitions start now. A play waiting to be listened to hands its album to
@@ -478,6 +502,8 @@ impl HeartAcquisitionCoordinator {
             deezer_events: std::sync::atomic::AtomicU64::new(0),
             deezer_seen: Mutex::new(HashMap::new()),
             listening: Arc::new(ListeningPlays::default()),
+            chains: Mutex::new(HashMap::new()),
+            next_chain: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -3000,6 +3026,104 @@ impl HeartAcquisitionCoordinator {
         }
     }
 
+    /// Whether `user`'s own heart, album heart or request of any of `ids` runs now: its gate holds
+    /// what they heard before, and landed it is a library file.
+    pub fn running_own(&self, ids: &[String], user: &str) -> bool {
+        let user = user.trim();
+        if user.is_empty() {
+            return false;
+        }
+        self.chains.lock().values().any(|chain| {
+            matches!(
+                chain.origin,
+                AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart | AcquisitionOrigin::Request
+            ) && ids.iter().any(|id| *id == chain.external_id)
+                && chain.users.iter().any(|known| eq_ignore_case(known, user))
+        })
+    }
+
+    /// Notes a song chain of `external_id` for `requested_by` and `holders`, run for `origin`,
+    /// for as long as the returned guard lives.
+    pub(crate) fn note_chain(
+        &self,
+        external_id: &str,
+        requested_by: Option<&str>,
+        holders: &[Holder],
+        origin: AcquisitionOrigin,
+    ) -> ChainRun<'_> {
+        let mut users: Vec<String> = Vec::new();
+        for user in holders
+            .iter()
+            .map(|holder| holder.user.trim())
+            .chain(requested_by.map(str::trim))
+        {
+            if !user.is_empty() && !users.iter().any(|known| eq_ignore_case(known, user)) {
+                users.push(user.to_string());
+            }
+        }
+        let id = self.next_chain.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.chains.lock().insert(
+            id,
+            RunningChain {
+                external_id: external_id.to_string(),
+                users,
+                origin,
+            },
+        );
+        ChainRun {
+            chains: &self.chains,
+            id,
+        }
+    }
+
+    /// `user` chose another version of the song whose ids are `ids`: in each of their holds of it,
+    /// the copy their old heard record held is let go first (so it can be deleted and fetched
+    /// again), then the record goes. A hold left without a heard record stands in with the song's
+    /// video, and one waiting on heard audio takes their next play's record as newer. How many
+    /// holds changed.
+    pub fn forget_heard_of_song(&self, ids: &[String], user: &str) -> usize {
+        let Some(holds) = self.extras.holds.as_ref() else {
+            return 0;
+        };
+        let user = user.trim();
+        let mut changed = 0;
+        for record in holds.snapshot() {
+            if record.kind != HeldKind::Track {
+                continue;
+            }
+            let of_song = ids.iter().any(|id| *id == record.external_id)
+                || record
+                    .album_track
+                    .as_ref()
+                    .is_some_and(|track| track.song_ids.iter().any(|id| ids.contains(id)));
+            if !of_song {
+                continue;
+            }
+            let Some(old) = record
+                .holders
+                .iter()
+                .find(|holder| eq_ignore_case(holder.user.trim(), user))
+                .and_then(|holder| holder.heard.as_ref())
+            else {
+                continue;
+            };
+            if let Some(heard) = &self.extras.heard {
+                heard.release_heard(&old.source, &record.copy_holder_id(user));
+            }
+            holds.update(&record.key(), |kept| {
+                if let Some(holder) = kept
+                    .holders
+                    .iter_mut()
+                    .find(|holder| eq_ignore_case(holder.user.trim(), user))
+                {
+                    holder.heard = None;
+                }
+            });
+            changed += 1;
+        }
+        changed
+    }
+
     /// `user` took their heart of the song back: they leave every hold of the song it keeps them
     /// in, whatever it waits for (a hearted album's held track keeps them while their heart of the
     /// album does), and each hold nobody is left in ends, its files with it. Once nothing of the
@@ -3967,6 +4091,7 @@ impl HeartAcquisitionCoordinator {
         // What each person heard is kept for as long as the chain runs, from before their gate is
         // built: no sweep takes the copy or the sample its checks compare with.
         let _heard = self.hold_while_running(provider, external_id, &holders, false);
+        let _running = self.note_chain(external_id, requested_by, &holders, origin);
         let scope = match target {
             AcquisitionTarget::Shared => LibraryScope::Shared,
             AcquisitionTarget::Member(user) => LibraryScope::Viewer(user.clone()),

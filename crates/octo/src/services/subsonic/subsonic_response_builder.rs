@@ -34,6 +34,7 @@ use crate::services::library::{
     GeneratedPlaylist, LibraryActionOutcome, LibraryEditOutcome, SongLookup, TrashedSong, UpgradeJob,
 };
 use crate::services::soulseek::ExternalIdRegistry;
+use crate::services::you_tube::stream_versions::{VersionsAnswer, kind_name};
 
 impl IdRegistry for ExternalIdRegistry {
     fn register(&self, routing: SoulseekRouting) -> String {
@@ -118,6 +119,24 @@ pub trait SubsonicResponseBuilderExt {
 
     /// pickFoundSong: what picking did.
     fn create_pick_response(&self, outcome: &PickOutcome) -> SubsonicReply;
+
+    /// getStreamVersions and setStreamVersion (octoStreamVersions): where the outside song plays
+    /// from, the video playing and who picked it, the caller's latest heard video when it is
+    /// another, whether the caller's own download of it runs, the other videos it can play from,
+    /// the sources that could not answer, and every id the song has. Always JSON; `playing` and
+    /// `heardVideoId` are left out when there is none.
+    fn create_stream_versions_response(&self, answer: &VersionsAnswer) -> SubsonicReply;
+
+    /// getStreamVersionChanges (octoStreamVersionChanges): the cursor to send next time (`epoch`,
+    /// `seq`), whether the list is whole, and each change with its number and the song's ids.
+    /// Always JSON.
+    fn create_stream_version_changes_response(
+        &self,
+        epoch: &str,
+        seq: u64,
+        complete: bool,
+        changes: &[(u64, Vec<String>)],
+    ) -> SubsonicReply;
 }
 
 impl SubsonicResponseBuilderExt for SubsonicResponseBuilder {
@@ -345,6 +364,90 @@ impl SubsonicResponseBuilderExt for SubsonicResponseBuilder {
             "version": SUBSONIC_VERSION,
             "type": "octo",
             "pick": pick_json(outcome),
+        }))
+    }
+
+    fn create_stream_versions_response(&self, answer: &VersionsAnswer) -> SubsonicReply {
+        let mut versions = Fields::new();
+        versions.insert("id".into(), json!(answer.id));
+        versions.insert("playsFrom".into(), json!(answer.plays_from.wire()));
+        if let Some(playing) = &answer.playing {
+            versions.insert(
+                "playing".into(),
+                json!({
+                    "videoId": playing.video_id,
+                    "title": playing.title,
+                    "channel": playing.channel,
+                    "duration": playing.seconds,
+                    "kind": playing.kind.as_ref().map(kind_name),
+                    "picked": playing.picked.wire(),
+                    "pickedBy": playing.picked_by,
+                    "mine": playing.mine,
+                    "pickedAt": playing.picked_at.as_ref().map(utc),
+                }),
+            );
+        }
+        if let Some(heard) = &answer.heard_video_id {
+            versions.insert("heardVideoId".into(), json!(heard));
+        }
+        versions.insert("busy".into(), json!(answer.busy));
+        versions.insert(
+            "version".into(),
+            Value::Array(
+                answer
+                    .versions
+                    .iter()
+                    .map(|row| {
+                        json!({
+                            "videoId": row.video_id,
+                            "title": row.title,
+                            "channel": row.channel,
+                            "duration": row.seconds,
+                            "kind": kind_name(&row.kind),
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+        versions.insert(
+            "missed".into(),
+            json!(
+                answer
+                    .missed
+                    .iter()
+                    .map(|source| source.wire())
+                    .collect::<Vec<_>>()
+            ),
+        );
+        versions.insert("ids".into(), json!(answer.ids));
+        self.create_json_response(json!({
+            "status": "ok",
+            "version": SUBSONIC_VERSION,
+            "type": "octo",
+            "streamVersions": versions,
+        }))
+    }
+
+    fn create_stream_version_changes_response(
+        &self,
+        epoch: &str,
+        seq: u64,
+        complete: bool,
+        changes: &[(u64, Vec<String>)],
+    ) -> SubsonicReply {
+        self.create_json_response(json!({
+            "status": "ok",
+            "version": SUBSONIC_VERSION,
+            "type": "octo",
+            "streamVersionChanges": {
+                "epoch": epoch,
+                "seq": seq,
+                "complete": complete,
+                "change": changes
+                    .iter()
+                    .map(|(seq, ids)| json!({ "seq": seq, "ids": ids }))
+                    .collect::<Vec<_>>(),
+            },
         }))
     }
 }
@@ -653,6 +756,116 @@ mod tests {
         assert_eq!(
             builder().create_upgrades_response(&[(job, Some(0.5))]).text(),
             r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"octo","openSubsonic":true,"upgrades":[{"id":"n1","title":"T","artist":null,"album":null,"state":"working","detail":null,"progress":0.5,"updatedAt":"2026-10-04T08:07:45.1234567Z","acquisition":null,"picked":null}]}}"#
+        );
+    }
+
+    /// The wire of octoStreamVersions v1, byte for byte: a person's pick with every fact, and a
+    /// song served from a file whose video nobody picked and little is known of.
+    #[test]
+    fn stream_versions_answer_in_the_shape_the_apps_read() {
+        use crate::services::soulseek::stream_choices::StreamVersionKind;
+        use crate::services::you_tube::stream_versions::{
+            Picked, PlayingVersion, PlaysFrom, VersionRow, VersionSource,
+        };
+        let picked = VersionsAnswer {
+            id: "X".into(),
+            plays_from: PlaysFrom::Stream,
+            playing: Some(PlayingVersion {
+                video_id: "v1".into(),
+                title: Some("Song".into()),
+                channel: Some("Artist - Topic".into()),
+                seconds: Some(215),
+                kind: Some(StreamVersionKind::Release),
+                picked: Picked::Person,
+                picked_by: Some("ede".into()),
+                mine: false,
+                picked_at: Some(Utc.with_ymd_and_hms(2026, 11, 14, 10, 0, 0).unwrap()),
+            }),
+            heard_video_id: Some("v0".into()),
+            busy: false,
+            versions: vec![VersionRow {
+                video_id: "v2".into(),
+                title: "Song (Live)".into(),
+                channel: Some("Artist".into()),
+                seconds: Some(240),
+                kind: StreamVersionKind::Video,
+                same: false,
+            }],
+            missed: vec![VersionSource::YouTubeMusic],
+            ids: vec!["X".into(), "Y".into()],
+        };
+        let reply = builder().create_stream_versions_response(&picked);
+        assert_eq!(reply.kind, ReplyKind::Json);
+        assert_eq!(
+            reply.text(),
+            concat!(
+                r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"octo","streamVersions":{"#,
+                r#""id":"X","playsFrom":"stream","playing":{"videoId":"v1","title":"Song","channel":"Artist - Topic","#,
+                r#""duration":215,"kind":"release","picked":"person","pickedBy":"ede","mine":false,"#,
+                r#""pickedAt":"2026-11-14T10:00:00Z"},"heardVideoId":"v0","busy":false,"version":[{"#,
+                r#""videoId":"v2","title":"Song (Live)","channel":"Artist","duration":240,"kind":"video"}],"#,
+                r#""missed":["youtubeMusic"],"ids":["X","Y"]}}}"#
+            )
+        );
+        let file = VersionsAnswer {
+            id: "X".into(),
+            plays_from: PlaysFrom::File,
+            playing: Some(PlayingVersion {
+                video_id: "v9".into(),
+                title: None,
+                channel: None,
+                seconds: None,
+                kind: None,
+                picked: Picked::Octo,
+                picked_by: None,
+                mine: false,
+                picked_at: None,
+            }),
+            heard_video_id: None,
+            busy: true,
+            versions: Vec::new(),
+            missed: Vec::new(),
+            ids: vec!["X".into()],
+        };
+        assert_eq!(
+            builder().create_stream_versions_response(&file).text(),
+            concat!(
+                r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"octo","streamVersions":{"#,
+                r#""id":"X","playsFrom":"file","playing":{"videoId":"v9","title":null,"channel":null,"#,
+                r#""duration":null,"kind":null,"picked":"octo","pickedBy":null,"mine":false,"pickedAt":null},"#,
+                r#""busy":true,"version":[],"missed":[],"ids":["X"]}}}"#
+            )
+        );
+        let unknown = VersionsAnswer {
+            playing: None,
+            plays_from: PlaysFrom::Download,
+            busy: false,
+            ..file
+        };
+        assert_eq!(
+            builder().create_stream_versions_response(&unknown).text(),
+            r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"octo","streamVersions":{"id":"X","playsFrom":"download","busy":false,"version":[],"missed":[],"ids":["X"]}}}"#
+        );
+    }
+
+    /// The wire of octoStreamVersionChanges v1, byte for byte.
+    #[test]
+    fn stream_version_changes_answer_in_the_shape_the_apps_read() {
+        let changes = vec![
+            (6, vec!["X".to_string(), "Y".to_string()]),
+            (7, vec!["Z".to_string()]),
+        ];
+        assert_eq!(
+            builder()
+                .create_stream_version_changes_response("e1", 7, true, &changes)
+                .text(),
+            r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"octo","streamVersionChanges":{"epoch":"e1","seq":7,"complete":true,"change":[{"seq":6,"ids":["X","Y"]},{"seq":7,"ids":["Z"]}]}}}"#
+        );
+        assert_eq!(
+            builder()
+                .create_stream_version_changes_response("e2", 0, false, &[])
+                .text(),
+            r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"octo","streamVersionChanges":{"epoch":"e2","seq":0,"complete":false,"change":[]}}}"#
         );
     }
 

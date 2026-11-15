@@ -105,8 +105,11 @@ pub async fn get_acquisitions(State(state): State<AppState>, req: Request) -> Ap
 ///
 /// A caller whose audio has a ceiling (a family limit, or their own quality for where they
 /// are) is not offered `transcoding`: its decisions would let a client play a file as it is.
+/// octoStreamVersionChanges is listed for everyone, octoStreamVersions for everyone but a
+/// family's Listener and Kid accounts.
 pub async fn get_open_subsonic_extensions(State(state): State<AppState>, req: Request) -> Response {
     let capped = family_caller(req.extensions()).is_some_and(|caller| audio_gate::ceiling(caller).is_some());
+    let may_pick = super::stream_versions::may_pick(family_caller(req.extensions()));
     let call = match SubsonicCall::read(&state, req).await {
         Ok(call) => call,
         Err(response) => return response,
@@ -134,6 +137,10 @@ pub async fn get_open_subsonic_extensions(State(state): State<AppState>, req: Re
         );
     // Playlists that keep songs found online, and playlist folders, are always on.
     reply = octo_subsonic::subsonic_response_builder::with_playlist_extensions(reply, &format);
+    // Every caller reads which songs' versions changed; only those who may choose are offered
+    // choosing.
+    reply =
+        octo_subsonic::subsonic_response_builder::with_stream_versions_extensions(reply, &format, may_pick);
     if capped && let Some(body) = audio_gate::without_extension(&reply.body, format == "json", "transcoding")
     {
         reply.body = body;

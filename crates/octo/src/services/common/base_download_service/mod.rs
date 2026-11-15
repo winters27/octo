@@ -443,6 +443,9 @@ pub struct DownloadServices {
     /// The gates of the album chains that run now: a walk of a hearted album files each track by
     /// its own sound against its own recording.
     pub album_gates: Option<Arc<AlbumGates>>,
+    /// What each outside song plays from: a song fetched ahead is taken only when it is the
+    /// version chosen for the song.
+    pub id_registry: Option<Arc<crate::services::soulseek::ExternalIdRegistry>>,
 }
 
 /// Everything a single download is asked with beyond its provider and id: the optional
@@ -1476,7 +1479,7 @@ impl BaseDownloadService {
         {
             None
         } else {
-            self.promote_ahead(external_provider, external_id, &mut song)
+            self.promote_ahead(external_provider, external_id, &mut song, &options.place)
         };
 
         // A heart's or a play's gates judge a song fetched ahead before it is kept; one they pass
@@ -2051,12 +2054,15 @@ impl BaseDownloadService {
     /// Takes a song fetched ahead into a staging folder of its own under the incoming folder (a
     /// copy, when the song is playing now), and gives the song back what its download learned.
     /// The staged path and the source that brought it, or None when there is no such song (or
-    /// it could not be taken, and the song is downloaded as usual).
+    /// it could not be taken, and the song is downloaded as usual). While a person's pick stands
+    /// for the song, a copy judged against another video is not taken (and goes), unless one of
+    /// `place`'s gates heard that very copy.
     fn promote_ahead(
         &self,
         external_provider: &str,
         external_id: &str,
         song: &mut Song,
+        place: &AcquisitionPlace,
     ) -> Option<(String, Option<String>, HeardSource)> {
         let prefetched = self.services.prefetched.as_ref()?;
         if !prefetched.has(external_provider, external_id) {
@@ -2078,6 +2084,33 @@ impl BaseDownloadService {
             let _ = std::fs::remove_dir(&staging);
             return None;
         };
+        // The copy's own identity, as a heard copy of it is recorded: the same entry under the same
+        // key, made ready from the same file.
+        let identity = HeardSource::Copy {
+            key: format!("{external_provider}:{external_id}"),
+            ready_at: taken.sidecar.ready_at,
+            source_file: taken.sidecar.source_file.clone(),
+        };
+        let heard_it = place
+            .gates
+            .iter()
+            .any(|gate| gate.heard.as_ref().is_some_and(|heard| heard.source == identity));
+        if !heard_it
+            && let Some(registry) = &self.services.id_registry
+            && crate::services::you_tube::stream_versions::copy_is_another_version(
+                registry,
+                external_id,
+                taken.sidecar.judged_video.as_deref(),
+            )
+        {
+            info!(
+                "'{} - {}' was downloaded ahead as another version than the one chosen; downloading the chosen one",
+                song.artist, song.title
+            );
+            let _ = std::fs::remove_file(&taken.path);
+            let _ = std::fs::remove_dir(&staging);
+            return None;
+        }
         song.transcoded_from = taken.sidecar.transcoded_from.clone();
         song.source_peer = taken.sidecar.source_peer.clone().or(song.source_peer.take());
         song.source_file = taken.sidecar.source_file.clone().or(song.source_file.take());
@@ -2095,13 +2128,6 @@ impl BaseDownloadService {
                 None,
             )
         });
-        // The copy's own identity, as a heard copy of it is recorded: the same entry under the same
-        // key, made ready from the same file.
-        let identity = HeardSource::Copy {
-            key: format!("{external_provider}:{external_id}"),
-            ready_at: taken.sidecar.ready_at,
-            source_file: taken.sidecar.source_file.clone(),
-        };
         Some((
             taken.path.to_string_lossy().into_owned(),
             taken.sidecar.fetched_from.clone(),

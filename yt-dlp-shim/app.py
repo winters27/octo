@@ -20,6 +20,13 @@ Endpoints:
       size in bytes, container and bit rate. /search carries the same fields
       for the video it found.
 
+  GET /candidates?q=<query>[&duration=<sec>][&skip=<id,id>][&limit=<n>]
+      Up to `limit` (1 to 20, 10 when not sent) videos for the query, ranked
+      as /search ranks them, without resolving any stream: {"candidates":
+      [{video_id, title, duration, channel}, ...], "rank"}. 404 no_hit when
+      there is none, 502 search_failed when the search failed, 503 busy when
+      the gate is full.
+
   GET /facts?id=<videoId>&fresh=1
       The same facts from a resolve run now for this request alone: no
       cache is read or written, the answer names the uploading channel and
@@ -690,6 +697,56 @@ def _search_with_hint(q: str, duration_hint: Optional[int], bg: bool = False, sk
         except GateFull:
             pass
     return _with_facts(payload)
+
+
+@app.get("/candidates")
+def candidates():
+    """Up to `limit` flat candidates for the query, ranked by `_rank_by_length` (named words,
+    other takes, then length), videos in `skip` left out, for a person choosing which video a
+    song plays from. No stream URL is resolved. Answers are kept in the search cache; a miss or a
+    failure is not."""
+    q = request.args.get("q", "").strip()
+    if not q:
+        abort(400, "missing q")
+    hint_str = request.args.get("duration", "").strip()
+    duration_hint = int(hint_str) if hint_str.isdigit() else None
+    skip = tuple(s for s in request.args.get("skip", "").split(",") if s)
+    limit = _arg_int("limit", 10, 1, 20)
+
+    cache_key = f"candidates|{q.lower()}|{duration_hint or ''}|{','.join(sorted(skip))}|{limit}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return jsonify(**cached)
+
+    # Enough rows that `limit` are left once the skipped ones are out.
+    out = _run(
+        [
+            f"ytsearch{min(limit + len(skip), 25)}:{q}",
+            "--flat-playlist",
+            "--print", "%(.{id,title,duration,channel})j",
+        ],
+        timeout=20,
+        label="candidates",
+        bg=_is_bg(),
+    )
+    if out is None:
+        return jsonify(error="search_failed"), 502
+    rows = []
+    for ln in out.strip().split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rows.append(json.loads(ln))
+        except json.JSONDecodeError:
+            pass
+    rows = [r for r in rows if r.get("id") and r.get("id") not in skip]
+    if not rows:
+        return jsonify(error="no_hit"), 404
+    ranked = _rank_by_length(rows, q, duration_hint)[:limit]
+    payload = {"candidates": [_payload_from(r) for r in ranked], "rank": _RANK}
+    _cache_put(cache_key, payload)
+    return jsonify(**payload)
 
 
 _META_CACHE_LOCK = threading.Lock()

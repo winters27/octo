@@ -179,6 +179,7 @@ use crate::services::updates::UpdateHost;
 use crate::services::validation::{
     IStartupValidator, StartupValidationOrchestrator, SubsonicStartupValidator,
 };
+use crate::services::you_tube::stream_versions::{ListCaps, StreamVersions};
 use crate::services::you_tube::{PinRecheck, StreamSizeWarmer, YouTubeMusicClient, YouTubeResolver};
 use crate::workers::WorkerSupervisor;
 use octo_core::notifications::{NotificationEvent, NotificationEventType};
@@ -330,6 +331,9 @@ pub struct AppInner {
     pub you_tube_resolver: Arc<YouTubeResolver>,
     /// `ExternalIdRegistry`: short external ids, `external-ids.json` (flushed by a worker).
     pub external_id_registry: Arc<ExternalIdRegistry>,
+    /// `StreamVersions`: the videos an outside song can stream from, listed for choosing one, and
+    /// what each answer offered.
+    pub stream_versions: Arc<StreamVersions>,
     /// `StreamSizeWarmer`: learns the true size of outside songs listed without one; a worker.
     pub stream_size_warmer: Arc<StreamSizeWarmer>,
     /// `LocalCoverCache`: library covers kept on disk in `<config>/cover-cache/`, each size cut
@@ -1030,6 +1034,7 @@ impl Acquisition {
                         arrivals: Some(stores.download_arrivals.clone()),
                         prefetched: Some(stores.prefetch_store.clone() as Arc<dyn PrefetchedFiles>),
                         album_gates: Some(album_gates.clone()),
+                        id_registry: Some(stores.external_id_registry.clone()),
                     },
                     SoulseekDownloadParts {
                         slskd: downloads.soulseek_client.clone(),
@@ -3821,6 +3826,11 @@ impl AppState {
             download_concurrency: stores.download_concurrency,
             download_picks: stores.download_picks,
             soulseek_holds: stores.soulseek_holds,
+            stream_versions: Arc::new(StreamVersions::new(
+                stores.you_tube_resolver.clone(),
+                Clock::system(),
+                ListCaps::default(),
+            )),
             you_tube_resolver: stores.you_tube_resolver,
             external_id_registry: stores.external_id_registry,
             stream_size_warmer: stores.stream_size_warmer,
@@ -4318,6 +4328,11 @@ impl AppState {
             download_concurrency: stores.download_concurrency,
             download_picks: stores.download_picks,
             soulseek_holds: stores.soulseek_holds,
+            stream_versions: Arc::new(StreamVersions::new(
+                stores.you_tube_resolver.clone(),
+                Clock::system(),
+                ListCaps::default(),
+            )),
             you_tube_resolver: stores.you_tube_resolver,
             external_id_registry: stores.external_id_registry,
             stream_size_warmer: stores.stream_size_warmer,

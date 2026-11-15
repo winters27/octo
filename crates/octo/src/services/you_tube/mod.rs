@@ -3,6 +3,7 @@
 
 pub mod pin_recheck;
 pub mod stream_size_warmer;
+pub mod stream_versions;
 pub mod you_tube_music_client;
 pub mod you_tube_resolver;
 

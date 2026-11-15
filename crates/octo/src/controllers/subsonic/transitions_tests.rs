@@ -12,6 +12,8 @@ use wiremock::{Mock, MockServer, Request as MockRequest};
 use super::test_app::*;
 use crate::app::AppState;
 use crate::http::pipeline::App;
+use crate::services::local::ILocalLibraryService;
+use crate::services::sonic::SonicFile;
 
 const ALICE: &str = "u=alice&t=good&s=salt&v=1.16.1&c=test";
 const WRONG: &str = "u=alice&t=bad&s=salt&v=1.16.1&c=test";
@@ -50,6 +52,8 @@ async fn navidrome() -> MockServer {
 struct Harness {
     app: App,
     state: AppState,
+    library: Arc<FakeLibrary>,
+    files: tempfile::TempDir,
     _navidrome: MockServer,
 }
 
@@ -60,13 +64,34 @@ async fn harness(sounds_alike: bool) -> Harness {
         sounds_alike,
         ..Default::default()
     };
-    let state = state_with(settings, |inner| {
-        inner.local_library = Arc::new(FakeLibrary::with_external("Yt9aZ", "youtube", "dQw4w9WgXcQ"));
+    let library = Arc::new(FakeLibrary::with_external("Yt9aZ", "youtube", "dQw4w9WgXcQ"));
+    let held = Arc::clone(&library);
+    let state = state_with(settings, move |inner| {
+        inner.local_library = held as Arc<dyn ILocalLibraryService>;
     });
     Harness {
         app: app(&state),
         state,
+        library,
+        files: tempfile::tempdir().expect("a folder"),
         _navidrome: navidrome,
+    }
+}
+
+impl Harness {
+    /// The outside song's file here, which its plays are served, and the stamp a reading of it
+    /// keeps.
+    fn kept_file(&self, name: &str) -> (String, String) {
+        let path = self.files.path().join(name);
+        std::fs::write(&path, b"audio").expect("written");
+        let path = path.to_string_lossy().into_owned();
+        self.library
+            .local_paths
+            .lock()
+            .insert(("youtube".into(), "dQw4w9WgXcQ".into()), path.clone());
+        let file = SonicFile::stat(&path).expect("a file");
+        let stamp = format!("{}:{}", file.length, file.last_write_ticks);
+        (path, stamp)
     }
 }
 
@@ -138,13 +163,55 @@ async fn an_outside_song_is_found_by_the_id_the_app_plays_it_by() {
     let h = harness(true).await;
     let store = h.state.sonic_worker.transitions();
     store.set_current_version(1);
-    store.put("youtube:dQw4w9WgXcQ", "5:6", Some("/music/a.mp3"), &profile(1));
+    let (path, stamp) = h.kept_file("a.mp3");
+    store.put("youtube:dQw4w9WgXcQ", &stamp, Some(&path), &profile(1));
 
     let answer = ask(&h, &format!("getTransitionProfile?{ALICE}&id=Yt9aZ")).await;
 
     assert_eq!(answer["transitionProfile"]["id"], "Yt9aZ");
     assert_eq!(answer["transitionProfile"]["ready"], true);
     assert_eq!(answer["transitionProfile"]["tail"]["outroStartMs"], 230_000);
+}
+
+/// An outside song's profile is answered only while it was read from the file its play gets
+/// now: not while its play streams, not when its play gets another file, and not when that file
+/// changed since it was read.
+#[tokio::test]
+async fn an_outside_song_profiled_from_another_file_than_its_play_gets_is_not_ready() {
+    let h = harness(true).await;
+    let store = h.state.sonic_worker.transitions();
+    store.set_current_version(1);
+    let not_ready = json!({ "id": "Yt9aZ", "ready": false, "version": 1 });
+    let query = format!("getTransitionProfile?{ALICE}&id=Yt9aZ");
+
+    store.put(
+        "youtube:dQw4w9WgXcQ",
+        "5:6",
+        Some("/music/elsewhere.mp3"),
+        &profile(1),
+    );
+    assert_eq!(
+        ask(&h, &query).await["transitionProfile"],
+        not_ready,
+        "its play streams"
+    );
+
+    let (path, stamp) = h.kept_file("a.mp3");
+    assert_eq!(
+        ask(&h, &query).await["transitionProfile"],
+        not_ready,
+        "another file"
+    );
+
+    store.put("youtube:dQw4w9WgXcQ", "1:1", Some(&path), &profile(1));
+    assert_eq!(
+        ask(&h, &query).await["transitionProfile"],
+        not_ready,
+        "changed since"
+    );
+
+    store.put("youtube:dQw4w9WgXcQ", &stamp, Some(&path), &profile(1));
+    assert_eq!(ask(&h, &query).await["transitionProfile"]["ready"], true);
 }
 
 #[tokio::test]

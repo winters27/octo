@@ -221,6 +221,12 @@ impl YouTubeResolver {
     /// Rows one YouTube Music lookup asks for.
     pub const MUSIC_ROWS: i32 = 5;
 
+    /// How long a listing's YouTube Music search may take, its wait for a turn included.
+    pub const MUSIC_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// The most rows one listing asks a source for: the shim's own limit.
+    pub const LIST_ROWS_MAX: i32 = 20;
+
     /// YouTube Music lookups sent to the shim at once.
     pub const MUSIC_AT_ONCE: usize = 3;
 
@@ -557,6 +563,145 @@ impl YouTubeResolver {
                 debug!("shim ranked /search failed for '{query}': {e}");
                 Lookup::Failed(Failure::Other)
             }
+        }
+    }
+
+    /// YouTube Music's `filter` rows ("songs" or "videos") for `query`, at most `limit` (1 to
+    /// [`Self::LIST_ROWS_MAX`]), for a person choosing which video a song plays from. One request
+    /// is shared by every caller asking the same while it runs, under a key of its own, so it
+    /// never joins a play's lookup or holds one up past its turn; it takes the play lookups' gate
+    /// ([`Self::MUSIC_AT_ONCE`]). [`Lookup::None`] when YouTube Music answered with no rows, or
+    /// when the shim's address is not set; [`Lookup::Failed`] when it could not answer within
+    /// [`Self::MUSIC_LIST_TIMEOUT`], `busy` when the shim said so.
+    pub async fn music_list(&self, query: &str, filter: &str, limit: i32) -> Lookup<Vec<YtmRow>> {
+        let query = query.trim().to_string();
+        if !self.music.configured() || query.is_empty() {
+            return Lookup::None;
+        }
+        let limit = limit.clamp(1, Self::LIST_ROWS_MAX);
+        let filter = filter.to_string();
+        let key = format!("{}|{filter}|{limit}|list", query.to_lowercase());
+        let music = Arc::clone(&self.music);
+        let gate = Arc::clone(&self.music_gate);
+        self.music_lookups
+            .run(&key, async move {
+                let lookup = async {
+                    let Ok(_permit) = gate.acquire_owned().await else {
+                        return Lookup::Failed(Failure::Other);
+                    };
+                    match music.search_limited(&query, &filter, limit).await {
+                        Ok(YtmAnswer::Rows(rows)) if rows.is_empty() => Lookup::None,
+                        Ok(YtmAnswer::Rows(rows)) => Lookup::Found(rows),
+                        Ok(YtmAnswer::Busy) => Lookup::Failed(Failure::Busy),
+                        Ok(YtmAnswer::Failed) => Lookup::Failed(Failure::Other),
+                        Err(e) => {
+                            debug!("YouTube Music listing failed for '{query}': {e}");
+                            let connect = e
+                                .downcast_ref::<reqwest::Error>()
+                                .is_some_and(reqwest::Error::is_connect);
+                            Lookup::Failed(if connect {
+                                Failure::Unreachable
+                            } else {
+                                Failure::Other
+                            })
+                        }
+                    }
+                };
+                tokio::time::timeout(Self::MUSIC_LIST_TIMEOUT, lookup)
+                    .await
+                    .unwrap_or(Lookup::Failed(Failure::Other))
+            })
+            .await
+    }
+
+    /// The shim's ranked candidates for `query` (`/candidates`), at most `limit` (1 to
+    /// [`Self::LIST_ROWS_MAX`]), the length `duration_hint` breaking ties, for a person choosing
+    /// which video a song plays from; asked in the shim's interactive lane. [`Lookup::None`] for
+    /// the shim's 404 `{"error":"no_hit"}`. A 404 without that error comes from a shim older than
+    /// Octo and is [`Lookup::Failed`], as are a busy answer ([`Failure::Busy`]), a failed search
+    /// (502), an unreachable shim ([`Failure::Unreachable`]) and an answer that is not its JSON.
+    pub async fn search_list(
+        &self,
+        query: &str,
+        duration_hint: Option<i32>,
+        limit: i32,
+    ) -> Lookup<Vec<YouTubeHit>> {
+        if query.trim().is_empty() {
+            return Lookup::None;
+        }
+        let mut url = self.query_url("candidates", query, duration_hint, false);
+        url.push_str(&format!("&limit={}", limit.clamp(1, Self::LIST_ROWS_MAX)));
+        let resp = match self.search_client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                debug!("shim /candidates failed for '{query}': {e}");
+                return Lookup::Failed(if e.is_connect() {
+                    Failure::Unreachable
+                } else {
+                    Failure::Other
+                });
+            }
+        };
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        let root: Option<Value> = serde_json::from_str(&body).ok();
+        let error = root
+            .as_ref()
+            .and_then(|root| root.get("error"))
+            .and_then(Value::as_str);
+        match (status, error) {
+            (200, _) => {}
+            (404, Some("no_hit")) => return Lookup::None,
+            (503, Some("busy")) => return Lookup::Failed(Failure::Busy),
+            _ => {
+                debug!("shim /candidates HTTP {status} for '{query}'");
+                return Lookup::Failed(Failure::Other);
+            }
+        }
+        let Some(rows) = root
+            .as_ref()
+            .and_then(|root| root.get("candidates"))
+            .and_then(Value::as_array)
+        else {
+            debug!("shim /candidates answered without candidates for '{query}'");
+            return Lookup::Failed(Failure::Other);
+        };
+        let hits: Vec<YouTubeHit> = rows
+            .iter()
+            .filter_map(|row| parse_hit(row, true).ok().flatten())
+            .collect();
+        if hits.is_empty() {
+            Lookup::None
+        } else {
+            Lookup::Found(hits)
+        }
+    }
+
+    /// Octo's own pick for `artist - title`, found as a play with no video finds it: YouTube
+    /// Music's row for the song ([`pick_song`], `length` being the song's catalog length), else
+    /// the shim's ranked search with `length` as its hint. A video in `refused` is never the pick.
+    /// [`Lookup::None`] when both answered with nothing usable; [`Lookup::Failed`] when the
+    /// search could not answer, or found nothing while YouTube Music could not answer either.
+    pub async fn auto_pick(
+        &self,
+        artist: &str,
+        title: &str,
+        length: Option<i32>,
+        refused: &[String],
+    ) -> Lookup<YouTubeHit> {
+        let refuses = |video: &str| refused.iter().any(|r| r == video);
+        let music_failure = match self.music_song_lookup(artist, title, length, false).await {
+            Lookup::Found(hit) if !refuses(&hit.video_id) => return Lookup::Found(hit),
+            Lookup::Failed(failure) => Some(failure),
+            _ => None,
+        };
+        match self
+            .search_lookup(&format!("{artist} {title}"), length, false, refused)
+            .await
+        {
+            Lookup::Found(hit) if !hit.video_id.is_empty() && !refuses(&hit.video_id) => Lookup::Found(hit),
+            Lookup::Failed(failure) => Lookup::Failed(failure),
+            _ => music_failure.map_or(Lookup::None, Lookup::Failed),
         }
     }
 
@@ -1868,6 +2013,212 @@ mod tests {
         assert_eq!(
             resolver.open_stream_fresh("", None, None).await.err(),
             Some(Failure::Other)
+        );
+    }
+
+    // ---- Listings for choosing a version -------------------------------------------------
+
+    /// `/candidates` is asked in the interactive lane with the hint and the limit; every
+    /// candidate with an id is read with its channel; the shim's no_hit is none; a 404 without it
+    /// (an older shim), a failed search, a busy shim and an odd answer could not answer.
+    #[tokio::test]
+    async fn a_listing_reads_every_candidate_and_tells_none_from_an_older_shim() {
+        let shim = MockServer::start().await;
+        Mock::given(path("/candidates"))
+            .and(query_param("q", "Massive Attack Teardrop"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"candidates":[
+                    {"video_id":"a","title":"Teardrop","duration":330,"channel":"Massive Attack - Topic"},
+                    {"video_id":"","title":"no id"},
+                    {"video_id":"b","title":"Teardrop (Live)","duration":400,"channel":"Fan"}
+                ],"rank":3}"#,
+            ))
+            .mount(&shim)
+            .await;
+        Mock::given(path("/candidates"))
+            .and(query_param("q", "Nothing Here"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(r#"{"error":"no_hit"}"#))
+            .mount(&shim)
+            .await;
+        Mock::given(path("/candidates"))
+            .and(query_param("q", "Old Shim"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string("<!doctype html><title>404 Not Found</title>"),
+            )
+            .mount(&shim)
+            .await;
+        Mock::given(path("/candidates"))
+            .and(query_param("q", "Broken Search"))
+            .respond_with(ResponseTemplate::new(502).set_body_string(r#"{"error":"search_failed"}"#))
+            .mount(&shim)
+            .await;
+        Mock::given(path("/candidates"))
+            .and(query_param("q", "Busy Shim"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(r#"{"error":"busy"}"#))
+            .mount(&shim)
+            .await;
+        Mock::given(path("/candidates"))
+            .and(query_param("q", "Odd Answer"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&shim)
+            .await;
+        let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+
+        let Lookup::Found(hits) = resolver
+            .search_list("Massive Attack Teardrop", Some(330), 10)
+            .await
+        else {
+            panic!("candidates");
+        };
+        assert_eq!(
+            hits.iter().map(|h| h.video_id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(hits[0].channel.as_deref(), Some("Massive Attack - Topic"));
+        assert_eq!(hits[1].duration, Some(400));
+        let asked = queries(&shim).await;
+        assert!(asked[0].contains("duration=330"), "{asked:?}");
+        assert!(asked[0].contains("limit=10"), "{asked:?}");
+        assert!(!asked[0].contains("bg="), "{asked:?}");
+
+        assert_eq!(resolver.search_list("Nothing Here", None, 10).await, Lookup::None);
+        assert_eq!(
+            resolver.search_list("Old Shim", None, 10).await,
+            Lookup::Failed(Failure::Other)
+        );
+        assert_eq!(
+            resolver.search_list("Broken Search", None, 10).await,
+            Lookup::Failed(Failure::Other)
+        );
+        assert_eq!(
+            resolver.search_list("Busy Shim", None, 10).await,
+            Lookup::Failed(Failure::Busy)
+        );
+        assert_eq!(
+            resolver.search_list("Odd Answer", None, 10).await,
+            Lookup::Failed(Failure::Other)
+        );
+        resolver.search_list("Nothing Here", None, 99).await;
+        assert!(queries(&shim).await.last().expect("asked").contains("limit=20"));
+        assert_eq!(
+            YouTubeResolver::with_base_url(Some("http://127.0.0.1:1"))
+                .search_list("Artist Song", None, 10)
+                .await,
+            Lookup::Failed(Failure::Unreachable)
+        );
+    }
+
+    /// A listing's YouTube Music search is never joined with a play's lookup of the same song,
+    /// two listings of the same search share one request, and its rows, filter and limit are the
+    /// ones asked for; a busy YouTube Music is a busy failure, and no address is none.
+    #[tokio::test]
+    async fn a_listing_lookup_of_youtube_music_has_a_key_of_its_own() {
+        let shim = MockServer::start().await;
+        Mock::given(path("/ytm/search"))
+            .and(query_param("q", "Adele Hello"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(HELLO_ROWS)
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&shim)
+            .await;
+        Mock::given(path("/ytm/search"))
+            .and(query_param("q", "Busy Song"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(r#"{"error":"busy"}"#))
+            .mount(&shim)
+            .await;
+        let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+
+        let (play, listed) = tokio::join!(
+            resolver.music_song("Adele", "Hello", Some(296), false),
+            resolver.music_list("Adele Hello", "songs", 10)
+        );
+        assert!(play.is_some());
+        let Lookup::Found(rows) = listed else {
+            panic!("rows");
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            queries(&shim).await.len(),
+            2,
+            "a listing never joins a play's lookup"
+        );
+
+        let (one, two) = tokio::join!(
+            resolver.music_list("Adele Hello", "videos", 20),
+            resolver.music_list("Adele Hello", "videos", 20)
+        );
+        assert_eq!(one, two);
+        let asked = queries(&shim).await;
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert!(
+            asked[2].contains("filter=videos") && asked[2].contains("limit=20"),
+            "{asked:?}"
+        );
+        assert!(!asked[2].contains("bg="), "{asked:?}");
+
+        assert_eq!(
+            resolver.music_list("Busy Song", "songs", 10).await,
+            Lookup::Failed(Failure::Busy)
+        );
+        assert_eq!(
+            YouTubeResolver::with_base_url(None)
+                .music_list("Adele Hello", "songs", 10)
+                .await,
+            Lookup::None
+        );
+    }
+
+    /// Octo's own pick is YouTube Music's row for the song first, then the ranked search with the
+    /// catalog length as its hint and the refused videos left out; a refused row is never it; a
+    /// busy YouTube Music with no search hit could not answer, and two answers of none is none.
+    #[tokio::test]
+    async fn octos_own_pick_takes_youtube_musics_row_then_the_ranked_search() {
+        let shim = MockServer::start().await;
+        Mock::given(path("/ytm/search"))
+            .and(query_param("q", "Adele Hello"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(HELLO_ROWS))
+            .mount(&shim)
+            .await;
+        Mock::given(path("/search"))
+            .and(query_param("q", "Adele Hello"))
+            .and(query_param("skip", "atv1"))
+            .and(query_param("duration", "296"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"video_id":"s1","title":"Adele - Hello","duration":297,"channel":"Adele","rank":3}"#,
+            ))
+            .mount(&shim)
+            .await;
+        Mock::given(path("/ytm/search"))
+            .and(query_param("q", "Busy Song"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(r#"{"error":"busy"}"#))
+            .mount(&shim)
+            .await;
+        Mock::given(path("/ytm/search"))
+            .and(query_param("q", "Nobody Song"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"tracks":[]}"#))
+            .mount(&shim)
+            .await;
+        Mock::given(path("/search"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(r#"{"error":"no_hit"}"#))
+            .mount(&shim)
+            .await;
+        let resolver = YouTubeResolver::with_base_url(Some(&shim.uri()));
+
+        let first = resolver.auto_pick("Adele", "Hello", Some(296), &[]).await;
+        assert_eq!(first.found().map(|h| h.video_id).as_deref(), Some("atv1"));
+        let refused = resolver
+            .auto_pick("Adele", "Hello", Some(296), &["atv1".to_string()])
+            .await;
+        assert_eq!(refused.found().map(|h| h.video_id).as_deref(), Some("s1"));
+        assert_eq!(
+            resolver.auto_pick("Busy", "Song", None, &[]).await,
+            Lookup::Failed(Failure::Busy)
+        );
+        assert_eq!(
+            resolver.auto_pick("Nobody", "Song", None, &[]).await,
+            Lookup::None
         );
     }
 }
