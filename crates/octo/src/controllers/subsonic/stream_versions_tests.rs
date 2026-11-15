@@ -325,6 +325,13 @@ impl Fixture {
         }
     }
 
+    /// A play of the song starts from its first byte: the song switches to what was chosen.
+    fn start(&self, id: &str) {
+        let registry = &self.state.external_id_registry;
+        let routing = registry.resolve_song(id, false).expect("known");
+        registry.apply_choice_at_start(&routing);
+    }
+
     async fn asked(&self, at: &str) -> usize {
         self.shim
             .received_requests()
@@ -649,6 +656,7 @@ async fn going_back_stores_octos_pick_and_an_unreachable_youtube_keeps_the_pick(
 
     f.versions(&x, "alice").await;
     f.choose(&x, "live", "alice").await;
+    f.start(&x);
     let back = f.choose(&x, "auto", "alice").await;
     assert_eq!(back["status"], "ok", "{back}");
     assert_eq!(back["streamVersions"]["playing"]["videoId"], "rel");
