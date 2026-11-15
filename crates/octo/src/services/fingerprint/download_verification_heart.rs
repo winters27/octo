@@ -265,9 +265,9 @@ impl DownloadVerificationService {
             if gate.r.as_ref().is_none_or(|r| r.ids.is_empty()) {
                 // With no video to stand in and no recording named, nothing could ever prove a
                 // copy: the heart ends with the plain line rather than waiting.
-                let no_video = routing
-                    .you_tube_id
-                    .as_deref()
+                let no_video = parts
+                    .registry
+                    .song_video(&routing)
                     .is_none_or(|video| video.trim().is_empty());
                 if no_video {
                     return GateBuild::End {
@@ -516,26 +516,11 @@ impl DownloadVerificationService {
         catalog: &HeardRecording,
         min: f64,
     ) {
-        let Some(video) = routing
-            .you_tube_id
-            .clone()
-            .filter(|video| !video.trim().is_empty())
-        else {
+        let Some(record) = stand_in_record(&parts.registry, external_id, routing, Utc::now()) else {
             return;
         };
-        let facts = parts.registry.stream_facts(external_id).unwrap_or_default();
-        let record = HeardRecord {
-            heard_at: Utc::now(),
-            source: HeardSource::Video {
-                id: video.clone(),
-                size: facts.size.filter(|_| facts.size_confirmed),
-                content_type: match facts.ext.as_deref() {
-                    Some("webm") => "audio/webm".to_string(),
-                    _ => "audio/mp4".to_string(),
-                },
-                itag: facts.itag.as_deref().and_then(|itag| itag.trim().parse().ok()),
-            },
-            sample_id: None,
+        let Some(video) = record.source.video_id().map(str::to_string) else {
+            return;
         };
         let answer = match self
             .heard_lookup(parts, &record, routing, &mut ClipPrints::default())
@@ -1056,6 +1041,34 @@ fn advisory_of(path: &str) -> Option<i32> {
     let file = octo_media::tags::TagFile::open(path).ok()?;
     tag_writer_extras::read_advisory(&file)
         .or_else(|| tag_writer_extras::read_text(&file, RATING).and_then(|text| text.trim().parse().ok()))
+}
+
+/// What a heart that never played stands in with: the song's video for new work (a person's
+/// chosen version included), with what is known of its stream only while the song plays that
+/// very video. None when the song has no video.
+pub(crate) fn stand_in_record(
+    registry: &crate::services::soulseek::ExternalIdRegistry,
+    external_id: &str,
+    routing: &SoulseekRouting,
+    heard_at: chrono::DateTime<Utc>,
+) -> Option<HeardRecord> {
+    let video = registry
+        .song_video(routing)
+        .filter(|video| !video.trim().is_empty())?;
+    let facts = registry.song_stream_facts(external_id).unwrap_or_default();
+    Some(HeardRecord {
+        heard_at,
+        source: HeardSource::Video {
+            id: video,
+            size: facts.size.filter(|_| facts.size_confirmed),
+            content_type: match facts.ext.as_deref() {
+                Some("webm") => "audio/webm".to_string(),
+                _ => "audio/mp4".to_string(),
+            },
+            itag: facts.itag.as_deref().and_then(|itag| itag.trim().parse().ok()),
+        },
+        sample_id: None,
+    })
 }
 
 fn hold(gate: HeartGate, waiting_for: WaitingFor, line: &str, question: Option<String>) -> GateBuild {

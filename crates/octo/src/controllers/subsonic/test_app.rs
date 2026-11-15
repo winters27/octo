@@ -165,6 +165,8 @@ pub(crate) struct FakeStreams {
     answers: Mutex<HashMap<(String, String), Arc<StreamAnswer>>>,
     /// Every `get_direct_stream` call: provider, external id, the Range passed on.
     pub stream_calls: Mutex<Vec<(String, String, Option<String>)>>,
+    /// The play each `get_direct_stream` call was handed, in order.
+    pub stream_plays: Mutex<Vec<Option<crate::services::i_download_service::StreamPlay>>>,
     pub download_and_stream_calls: Mutex<usize>,
 }
 
@@ -205,6 +207,11 @@ impl FakeStreams {
 
     pub fn stream_calls(&self) -> Vec<(String, String, Option<String>)> {
         self.stream_calls.lock().clone()
+    }
+
+    /// The play each stream call was handed.
+    pub fn stream_plays(&self) -> Vec<Option<crate::services::i_download_service::StreamPlay>> {
+        self.stream_plays.lock().clone()
     }
 }
 
@@ -270,8 +277,10 @@ impl IDownloadService for FakeStreams {
         provider: &str,
         external_id: &str,
         range_header: Option<&str>,
+        play: Option<&crate::services::i_download_service::StreamPlay>,
         _: &CancellationToken,
     ) -> anyhow::Result<Option<DirectStreamInfo>> {
+        self.stream_plays.lock().push(play.cloned());
         self.stream_calls.lock().push((
             provider.to_string(),
             external_id.to_string(),

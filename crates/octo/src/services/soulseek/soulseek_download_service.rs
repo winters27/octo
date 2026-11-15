@@ -46,7 +46,7 @@ use regex::Regex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::external_id_registry::{ExternalIdRegistry, SharedRouting};
+use super::external_id_registry::{ExternalIdRegistry, LiveGuard, SharedRouting};
 use super::rejected_peer_registry::RejectedPeerRegistry;
 use super::soulseek_candidates::{self, Judged};
 use super::soulseek_client::{SoulseekClient, SoulseekClientError};
@@ -67,7 +67,7 @@ use crate::services::fingerprint::download_verification_service::{LabelSource, t
 use crate::services::fingerprint::preview_check::{
     self, Heard, PreviewFacts, PreviewOutcome, PreviewRequest,
 };
-use crate::services::i_download_service::DirectStreamInfo;
+use crate::services::i_download_service::{AudioStream, DirectStreamInfo, StreamPlay};
 use crate::services::library::library_review_sweep_worker::LibraryReviewSweepWorker;
 use crate::services::library::navidrome_song_path_resolver::get_full_path;
 use crate::services::library::upgrade_queue::AudioSummary;
@@ -75,8 +75,10 @@ use crate::services::lidarr::{ILidarrTrackFetcher, LidarrImport, LidarrImportHan
 use crate::services::prefetch::PreviewCopies;
 use crate::services::prefetch::preview_copies::copy_after;
 use crate::services::spotiflac::SpotiflacClient;
+use crate::services::you_tube::ShimStream;
 use crate::services::you_tube::YouTubeResolver;
-use crate::services::you_tube::pin_recheck::starts_at_first_byte;
+use crate::services::you_tube::pin_recheck::{PlayStart, play_start, starts_at_first_byte};
+use crate::services::you_tube::you_tube_resolver::{Failure, Lookup};
 use octo_core::common::acquisition_tracker::user_safe;
 use octo_core::lidarr::lidarr_track_fetcher::LidarrStep;
 
@@ -643,6 +645,27 @@ impl SoulseekDownloadService {
             }
         }
 
+        // While a person's choice of the song's version stands, the download takes the video its
+        // own gates heard (another person's heart keeps what that person heard), then the chosen
+        // video, and never a searched or another pinned video.
+        let chosen: Option<Vec<String>> = {
+            let snapshot = routing.snapshot();
+            self.id_registry.pin_guarded(&snapshot).then(|| {
+                let heard = download
+                    .gates
+                    .iter()
+                    .filter_map(|gate| gate.heard.as_ref())
+                    .filter_map(|heard| heard.source.video_id())
+                    .map(str::to_string);
+                let mut order: Vec<String> = Vec::new();
+                for video in heard.chain(self.id_registry.song_video(&snapshot)) {
+                    if !order.contains(&video) {
+                        order.push(video);
+                    }
+                }
+                order
+            })
+        };
         /// How many videos one download tries before it gives up.
         const MAX_VIDEOS: usize = 3;
         // Every video this download used, so none is downloaded twice.
@@ -664,13 +687,19 @@ impl SoulseekDownloadService {
                 .chain(refused_here.iter())
                 .cloned()
                 .collect();
-            let mut video_id = r
-                .you_tube_id
-                .clone()
-                .filter(|v| !v.is_empty() && !skip.contains(v));
+            let mut video_id = match &chosen {
+                Some(order) => order
+                    .iter()
+                    .find(|v| !skip.contains(v) && !self.denied_for_gates(download, YOUTUBE_PEER, v))
+                    .cloned(),
+                None => r
+                    .you_tube_id
+                    .clone()
+                    .filter(|v| !v.is_empty() && !skip.contains(v)),
+            };
             // What is known of a video looked up here; a pinned one is known by its id alone.
             let mut picked: Option<PreviewFacts> = None;
-            if video_id.is_none() {
+            if video_id.is_none() && chosen.is_none() {
                 // YouTube Music's row for the song first, as a play picks: its title, artist and
                 // length are the song's. Else the shim's search. A video refused for the song or
                 // already tried is never taken.
@@ -938,6 +967,11 @@ impl SoulseekDownloadService {
                 .await;
             return Ok(path);
         }
+        if chosen.is_some() {
+            return Err(file_not_found(
+                "The version chosen for this song could not be fetched from YouTube".to_string(),
+            ));
+        }
         Err(file_not_found(last_refusal.unwrap_or_else(|| {
             format!("No YouTube match for '{artist} - {title}'")
         })))
@@ -966,6 +1000,8 @@ impl SoulseekDownloadService {
         background: bool,
     ) -> PreviewSays {
         let (artist, title) = names(routing);
+        // The video the song plays for new work: a person's choice when one stands.
+        let video = self.id_registry.song_video(routing);
         let request = PreviewRequest {
             artist: &artist,
             title: &title,
@@ -980,7 +1016,7 @@ impl SoulseekDownloadService {
                     )
                 }))
                 .filter(|s| *s > 0),
-            video_id: routing.you_tube_id.as_deref(),
+            video_id: video.as_deref(),
             background,
         };
         let outcome = self
@@ -2795,6 +2831,257 @@ fn listed_album_ids_of(routing: &SoulseekRouting, album: &str) -> Vec<String> {
     ids
 }
 
+impl SoulseekDownloadService {
+    /// The song's own pick for a routing with no video: YouTube Music's row for the song first
+    /// (one quick search, and the stream is resolved as it opens), else the shim's yt-dlp search,
+    /// which resolves both at once. A video refused for the song is never taken.
+    async fn pick_video(&self, external_id: &str, routing: &SharedRouting) -> Option<String> {
+        let r = routing.snapshot();
+        if !r.has_artist_title() {
+            return None;
+        }
+        let (artist, title) = names(&r);
+        let music_hit = self
+            .youtube
+            .music_song(&artist, &title, r.duration, false)
+            .await
+            .filter(|h| !r.refuses_video(&h.video_id));
+        let hit = match music_hit {
+            Some(hit) => {
+                debug!(
+                    "play of '{artist} - {title}': video {} from YouTube Music",
+                    hit.video_id
+                );
+                Some(hit)
+            }
+            None => {
+                let hit = self
+                    .youtube
+                    .search_skipping(&format!("{artist} {title}"), r.duration, false, &r.refused_videos)
+                    .await
+                    .filter(|h| !h.video_id.is_empty() && !r.refuses_video(&h.video_id));
+                if let Some(hit) = &hit {
+                    debug!("play of '{artist} - {title}': video {} from yt-dlp", hit.video_id);
+                }
+                hit
+            }
+        };
+        // Pin it on the song so a second click on the same placeholder skips the
+        // yt-dlp ytsearch1: round trip: that 3-8s saving is the difference between
+        // Arpeggi (~10s HTTP timeout) playing the song or canceling and falling back
+        // to a local one. Every later stream request for this id reads the same pin.
+        if let Some(hit) = &hit {
+            self.id_registry.set_you_tube_id(external_id, &hit.video_id);
+            self.id_registry
+                .remember_pick(external_id, &hit.video_id, hit.pick);
+            // A video the song refuses gives it nothing.
+            if !routing.lock().refuses_video(&hit.video_id) {
+                self.id_registry
+                    .remember_stream(external_id, &hit.video_id, &hit.stream);
+                // The video that plays says how long the song runs, for every later row.
+                if !self
+                    .id_registry
+                    .remember_length(external_id, hit.duration, LengthSource::Video)
+                    && routing.remember_length(hit.duration, LengthSource::Video)
+                {
+                    self.id_registry.mark_changed(external_id);
+                }
+            }
+        }
+        hit.map(|h| h.video_id)
+    }
+
+    /// The video a play starts on would not open. When it is a person's choice (or an earlier one)
+    /// that YouTube says is gone or refused, the choice is forgotten and the song's own pick is
+    /// found and opened in its place, for this very request. None otherwise.
+    async fn after_dead_pick(
+        &self,
+        external_id: &str,
+        routing: &SharedRouting,
+        video: &str,
+        at_start: bool,
+        range_header: Option<&str>,
+    ) -> Option<(String, ShimStream)> {
+        let snapshot = routing.snapshot();
+        if !at_start
+            || !self.id_registry.pin_guarded(&snapshot)
+            || self.id_registry.song_video(&snapshot).as_deref() != Some(video)
+        {
+            return None;
+        }
+        match self.youtube.facts_fresh(video).await {
+            Lookup::Failed(Failure::Gone | Failure::Refused) => {}
+            _ => return None,
+        }
+        info!(
+            "The version chosen for {external_id} (video {video}) cannot be played any more; Octo's own pick plays"
+        );
+        self.id_registry.forget_pick_video(external_id, video);
+        let found = self.pick_video(external_id, routing).await?;
+        let opened = self.youtube.open_stream(&found, range_header).await?;
+        Some((found, opened))
+    }
+
+    /// The answer of an opened shim stream: its true size kept for the song's video, a whole copy
+    /// started for a player that reads in pieces, and the format when the song is pinned to the
+    /// video that played. The response owns the shim's connection: dropping the stream closes it.
+    fn answer_opened(
+        &self,
+        external_id: &str,
+        routing: &SharedRouting,
+        r: &SoulseekRouting,
+        video_id: String,
+        opened: ShimStream,
+        range_header: Option<&str>,
+    ) -> DirectStreamInfo {
+        // The bytes on their way are the last word on the size.
+        if let Some(size) = played_size(
+            opened.status_code,
+            opened.content_length,
+            opened.content_range.as_deref(),
+        ) {
+            self.id_registry.remember_stream(
+                external_id,
+                &video_id,
+                &StreamFacts {
+                    size: Some(size),
+                    size_confirmed: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        info!(
+            "YouTube preview '{} - {}' (vid={video_id}, status={}, {} bytes{})",
+            r.artist.as_deref().unwrap_or(""),
+            r.title.as_deref().unwrap_or(""),
+            opened.status_code,
+            opened.content_length.map(|l| l.to_string()).unwrap_or_default(),
+            opened
+                .content_range
+                .as_deref()
+                .map(|range| format!(", range={range}"))
+                .unwrap_or_default()
+        );
+
+        // A player that reads the preview in pieces (a probe of its first bytes, or a range past
+        // its start) gets a whole copy made once, and its next pieces come from there.
+        if let Some(copies) = &self.preview_copies
+            && copy_after(opened.status_code, range_header)
+        {
+            let total = played_size(
+                opened.status_code,
+                opened.content_length,
+                opened.content_range.as_deref(),
+            );
+            copies.start(&video_id, total);
+        }
+
+        // The format is the pinned video's, when the song is pinned to the video that played.
+        let itag = {
+            let now = routing.snapshot();
+            now.you_tube_id
+                .as_deref()
+                .filter(|pinned| *pinned == video_id)
+                .and(now.stream_itag.as_deref())
+                .and_then(|itag| itag.trim().parse::<u32>().ok())
+        };
+        DirectStreamInfo {
+            audio_stream: Box::pin(opened.response.bytes_stream().map_err(std::io::Error::other)),
+            content_type: opened.content_type,
+            content_length: opened.content_length,
+            quality: Some("youtube-m4a".to_string()),
+            status_code: opened.status_code,
+            content_range: opened.content_range,
+            video_id: Some(video_id),
+            itag,
+        }
+    }
+
+    /// A player's answer: its body counted as streaming while it is sent, the play bound to the
+    /// answer's video when it starts here (`binds`, for a 200 or 206), the video's whole size kept
+    /// on the play's binding, and the binding marked finished once a body reached the file's last
+    /// byte. A look at the song, and Octo's own reads, get the answer as it is.
+    fn bound_answer(
+        &self,
+        external_id: &str,
+        play: Option<&StreamPlay>,
+        binds: bool,
+        info: DirectStreamInfo,
+    ) -> DirectStreamInfo {
+        let Some(play) = play.filter(|play| !play.peeks()) else {
+            return info;
+        };
+        let Some(video) = info.video_id.clone() else {
+            return info;
+        };
+        let live = self.id_registry.live_play(external_id, play);
+        if binds && matches!(info.status_code, 200 | 206) {
+            self.id_registry.bind_play(external_id, play, &video);
+        }
+        if let Some(size) = played_size(
+            info.status_code,
+            info.content_length,
+            info.content_range.as_deref(),
+        ) {
+            self.id_registry.confirm_play_size(external_id, play, size);
+        }
+        let finish = reaches_end(info.status_code, info.content_range.as_deref()).then(|| {
+            let registry = Arc::clone(&self.id_registry);
+            let (id, play) = (external_id.to_string(), play.clone());
+            Box::new(move || registry.finish_play(&id, &play)) as Box<dyn FnOnce() + Send>
+        });
+        DirectStreamInfo {
+            audio_stream: bound_body(info.audio_stream, live, finish),
+            ..info
+        }
+    }
+}
+
+/// Whether an answer's body ends at the file's last byte: a whole file, or a range that runs to
+/// its end.
+fn reaches_end(status: u16, content_range: Option<&str>) -> bool {
+    match status {
+        200 => true,
+        206 => content_range
+            .and_then(|range| range.trim().strip_prefix("bytes "))
+            .and_then(|spec| spec.split_once('/'))
+            .and_then(|(span, total)| {
+                let end = span.split_once('-')?.1.trim().parse::<u64>().ok()?;
+                let total = total.trim().parse::<u64>().ok()?;
+                Some(end + 1 == total)
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// `body`, counted as streaming by `live` until it is dropped, calling `finish` once it ended
+/// with no error.
+fn bound_body(body: AudioStream, live: LiveGuard, finish: Option<Box<dyn FnOnce() + Send>>) -> AudioStream {
+    use futures::StreamExt;
+    let failed = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&failed);
+    let end = futures::stream::once(async move {
+        let _live = live;
+        if !seen.load(Ordering::SeqCst)
+            && let Some(finish) = finish
+        {
+            finish();
+        }
+        None::<std::io::Result<bytes::Bytes>>
+    })
+    .filter_map(futures::future::ready);
+    Box::pin(
+        body.inspect(move |item| {
+            if item.is_err() {
+                failed.store(true, Ordering::SeqCst);
+            }
+        })
+        .chain(end),
+    )
+}
+
 #[async_trait]
 impl DownloadBackend for SoulseekDownloadService {
     fn provider_name(&self) -> &str {
@@ -2856,6 +3143,7 @@ impl DownloadBackend for SoulseekDownloadService {
         external_provider: &str,
         external_id: &str,
         range_header: Option<&str>,
+        play: Option<&StreamPlay>,
         _cancellation_token: &CancellationToken,
     ) -> anyhow::Result<Option<DirectStreamInfo>> {
         if !dotnet::eq_ignore_case(external_provider, SoulseekMetadataService::PROVIDER_NAME) {
@@ -2866,158 +3154,102 @@ impl DownloadBackend for SoulseekDownloadService {
             return Ok(None);
         };
 
-        // A video the current ranking prefers is taken only by a play that starts at the first
-        // byte, so no player is ever given bytes of two videos.
-        if starts_at_first_byte(range_header)
+        // What the request is to its play. Octo's own reads (no play) start one only from the
+        // first byte, as before, and are never bound.
+        let binding = play.and_then(|play| self.id_registry.bound_play(external_id, play));
+        let decision = match play {
+            Some(play) => play_start(play, range_header, binding.as_ref()),
+            None if starts_at_first_byte(range_header) => PlayStart::Start { switch: true },
+            None => PlayStart::Continue,
+        };
+        // A device that sends no token and starts the song while a body of its own play streams
+        // is two devices the server cannot tell apart: it is served that play's video and starts
+        // nothing.
+        let shared = match (play, decision) {
+            (Some(play), PlayStart::Start { .. }) => self.id_registry.live_binding(external_id, play),
+            _ => None,
+        };
+        let held = match decision {
+            PlayStart::Continue | PlayStart::Peek => binding,
+            PlayStart::Start { .. } => shared.clone(),
+        };
+        let switches = matches!(decision, PlayStart::Start { switch: true }) && shared.is_none();
+        let starts = matches!(decision, PlayStart::Start { .. }) && shared.is_none();
+
+        // A chosen version is taken at a play's start from the first byte, at a look at the song,
+        // and by a song with no video yet; a video the current ranking prefers only at a play's
+        // start from the first byte. A play already bound keeps its video either way, so no player
+        // is ever given bytes of two videos.
+        let unpinned = !routing.lock().has_you_tube();
+        if (switches || decision == PlayStart::Peek || unpinned)
+            && let Some(left) = self.id_registry.apply_choice_at_start(&routing)
+            && let Some(copies) = &self.preview_copies
+        {
+            copies.drop_copy(&left);
+        }
+        if switches
             && let Some(left) = self.id_registry.apply_pending_video(&routing)
             && let Some(copies) = &self.preview_copies
         {
             copies.drop_copy(&left);
         }
+        if starts && play.is_some() {
+            self.id_registry.note_play(external_id);
+        }
 
         let r = routing.snapshot();
-        let mut video_id = r
-            .you_tube_id
-            .clone()
-            .filter(|v| !v.is_empty() && !r.refuses_video(v));
-        if video_id.is_none() && r.has_artist_title() {
-            let (artist, title) = names(&r);
-            // YouTube Music's row for the song first: one quick search, and the stream is
-            // resolved as it opens. Else the shim's yt-dlp search, which resolves both at once.
-            // A video refused for the song is never taken.
-            let music_hit = self
-                .youtube
-                .music_song(&artist, &title, r.duration, false)
-                .await
-                .filter(|h| !r.refuses_video(&h.video_id));
-            let hit = match music_hit {
-                Some(hit) => {
-                    debug!(
-                        "play of '{artist} - {title}': video {} from YouTube Music",
-                        hit.video_id
-                    );
-                    Some(hit)
-                }
-                None => {
-                    let hit = self
-                        .youtube
-                        .search_skipping(&format!("{artist} {title}"), r.duration, false, &r.refused_videos)
-                        .await
-                        .filter(|h| !h.video_id.is_empty() && !r.refuses_video(&h.video_id));
-                    if let Some(hit) = &hit {
-                        debug!("play of '{artist} - {title}': video {} from yt-dlp", hit.video_id);
-                    }
-                    hit
-                }
-            };
-            // Pin it on the song so a second click on the same placeholder skips the
-            // yt-dlp ytsearch1: round trip: that 3-8s saving is the difference between
-            // Arpeggi (~10s HTTP timeout) playing the song or canceling and falling back
-            // to a local one. Every later stream request for this id reads the same pin.
-            if let Some(hit) = &hit {
-                self.id_registry.set_you_tube_id(external_id, &hit.video_id);
-                self.id_registry
-                    .remember_pick(external_id, &hit.video_id, hit.pick);
-                // A video the song refuses gives it nothing.
-                if !routing.lock().refuses_video(&hit.video_id) {
-                    self.id_registry
-                        .remember_stream(external_id, &hit.video_id, &hit.stream);
-                    // The video that plays says how long the song runs, for every later row.
-                    if !self
-                        .id_registry
-                        .remember_length(external_id, hit.duration, LengthSource::Video)
-                        && routing.remember_length(hit.duration, LengthSource::Video)
-                    {
-                        self.id_registry.mark_changed(external_id);
-                    }
-                }
-            }
-            video_id = hit.map(|h| h.video_id);
-        }
+        let video_id = match &held {
+            Some(bound) => Some(bound.video.clone()),
+            None => match r
+                .you_tube_id
+                .clone()
+                .filter(|v| !v.is_empty() && !r.refuses_video(v))
+            {
+                Some(video) => Some(video),
+                None => self.pick_video(external_id, &routing).await,
+            },
+        };
         let Some(video_id) = video_id else {
             return Ok(None);
         };
 
-        // A whole copy answers on its own, as long as it is the size the song is known to be.
-        let confirmed = self
-            .id_registry
-            .stream_facts(external_id)
-            .filter(|facts| facts.size_confirmed)
-            .and_then(|facts| facts.size);
-        if let Some(copies) = &self.preview_copies
-            && let Some(copy) = copies.serve(&video_id, range_header, confirmed).await
-        {
-            return Ok(Some(copy));
-        }
-
-        let Some(opened) = self.youtube.open_stream(&video_id, range_header).await else {
-            warn!("yt-dlp shim failed to open stream for vid={video_id}");
-            return Ok(None);
+        // A whole copy answers on its own, as long as it is the size the play knows its video to be.
+        let confirmed = match &held {
+            Some(bound) => bound.size,
+            None => self
+                .id_registry
+                .stream_facts(external_id)
+                .filter(|facts| facts.size_confirmed)
+                .and_then(|facts| facts.size),
         };
-
-        // The bytes on their way are the last word on the size.
-        if let Some(size) = played_size(
-            opened.status_code,
-            opened.content_length,
-            opened.content_range.as_deref(),
-        ) {
-            self.id_registry.remember_stream(
-                external_id,
-                &video_id,
-                &StreamFacts {
-                    size: Some(size),
-                    size_confirmed: true,
-                    ..Default::default()
-                },
-            );
-        }
-
-        info!(
-            "YouTube preview '{} - {}' (vid={video_id}, status={}, {} bytes{})",
-            r.artist.as_deref().unwrap_or(""),
-            r.title.as_deref().unwrap_or(""),
-            opened.status_code,
-            opened.content_length.map(|l| l.to_string()).unwrap_or_default(),
-            opened
-                .content_range
-                .as_deref()
-                .map(|range| format!(", range={range}"))
-                .unwrap_or_default()
-        );
-
-        // A player that reads the preview in pieces (a probe of its first bytes, or a range past
-        // its start) gets a whole copy made once, and its next pieces come from there.
-        if let Some(copies) = &self.preview_copies
-            && copy_after(opened.status_code, range_header)
-        {
-            let total = played_size(
-                opened.status_code,
-                opened.content_length,
-                opened.content_range.as_deref(),
-            );
-            copies.start(&video_id, total);
-        }
-
-        // The format is the pinned video's, when the song is pinned to the video that played.
-        let itag = {
-            let now = routing.snapshot();
-            now.you_tube_id
-                .as_deref()
-                .filter(|pinned| *pinned == video_id)
-                .and(now.stream_itag.as_deref())
-                .and_then(|itag| itag.trim().parse::<u32>().ok())
+        let copy = match &self.preview_copies {
+            Some(copies) => copies.serve(&video_id, range_header, confirmed).await,
+            None => None,
         };
-        // The response owns the shim's connection: dropping the stream closes it.
-        Ok(Some(DirectStreamInfo {
-            audio_stream: Box::pin(opened.response.bytes_stream().map_err(std::io::Error::other)),
-            content_type: opened.content_type,
-            content_length: opened.content_length,
-            quality: Some("youtube-m4a".to_string()),
-            status_code: opened.status_code,
-            content_range: opened.content_range,
-            video_id: Some(video_id),
-            itag,
-        }))
+        let info = match copy {
+            Some(copy) => copy,
+            None => {
+                let opened = match self.youtube.open_stream(&video_id, range_header).await {
+                    Some(opened) => Some((video_id.clone(), opened)),
+                    None => {
+                        self.after_dead_pick(
+                            external_id,
+                            &routing,
+                            &video_id,
+                            held.is_none() && switches,
+                            range_header,
+                        )
+                        .await
+                    }
+                };
+                let Some((video_id, opened)) = opened else {
+                    warn!("yt-dlp shim failed to open stream for vid={video_id}");
+                    return Ok(None);
+                };
+                self.answer_opened(external_id, &routing, &r, video_id, opened, range_header)
+            }
+        };
+        Ok(Some(self.bound_answer(external_id, play, starts, info)))
     }
 
     async fn judge_ahead(

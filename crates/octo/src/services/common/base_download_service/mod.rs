@@ -88,7 +88,9 @@ use crate::services::common::{
 use crate::services::cover_art::DownloadCoverResolver;
 use crate::services::family::FamilyPlacement;
 use crate::services::fingerprint::MusicBrainzClient;
-use crate::services::i_download_service::{Ahead, AudioStream, DirectStreamInfo, IDownloadService};
+use crate::services::i_download_service::{
+    Ahead, AudioStream, DirectStreamInfo, IDownloadService, StreamPlay,
+};
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::last_fm::LastFmService;
 use crate::services::library::library_write_gate::LibraryWriteGate;
@@ -259,6 +261,7 @@ pub trait DownloadBackend: Send + Sync + 'static {
         _external_provider: &str,
         _external_id: &str,
         _range_header: Option<&str>,
+        _play: Option<&StreamPlay>,
         _cancellation_token: &CancellationToken,
     ) -> anyhow::Result<Option<DirectStreamInfo>> {
         Ok(None)
@@ -2128,6 +2131,9 @@ impl BaseDownloadService {
         }
         let sidecar = AheadSidecar {
             video_id: fetched_video.map(str::to_string),
+            // The song's video as its identity was checked now: a person's choice is served only
+            // from a copy judged against it.
+            judged_video: self.metadata.song_video(external_id),
             ..AheadSidecar::of(
                 external_provider,
                 external_id,
@@ -3282,6 +3288,7 @@ impl IDownloadService for BaseDownloadService {
         external_provider: &str,
         external_id: &str,
         range_header: Option<&str>,
+        play: Option<&StreamPlay>,
         cancellation_token: &CancellationToken,
     ) -> anyhow::Result<Option<DirectStreamInfo>> {
         self.backend
@@ -3290,6 +3297,7 @@ impl IDownloadService for BaseDownloadService {
                 external_provider,
                 external_id,
                 range_header,
+                play,
                 cancellation_token,
             )
             .await

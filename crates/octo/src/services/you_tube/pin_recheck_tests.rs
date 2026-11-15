@@ -4,6 +4,185 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 
+fn request(token: Option<&str>, method: &str, purpose: Option<&str>) -> StreamPlay {
+    StreamPlay {
+        key: "x_phone".into(),
+        token: token.map(str::to_string),
+        address: Some("10.0.0.2".into()),
+        method: method.into(),
+        purpose: purpose.map(str::to_string),
+        octo_device: false,
+        user_agent: "Symfonium/9".into(),
+    }
+}
+
+fn bound(token: Option<&str>) -> PlayBinding {
+    PlayBinding {
+        key: "x_phone".into(),
+        token: token.map(str::to_string),
+        video: "old".into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_token_goes_on_with_its_own_binding_and_a_new_one_starts_a_play() {
+    let same = request(Some("e1.0"), "GET", None);
+    assert_eq!(
+        play_start(&same, Some("bytes=500-"), Some(&bound(Some("e1.0")))),
+        PlayStart::Continue
+    );
+    assert_eq!(
+        play_start(&same, None, Some(&bound(Some("e1.0")))),
+        PlayStart::Continue
+    );
+    let restarted = request(Some("e1.1"), "GET", None);
+    assert_eq!(
+        play_start(&restarted, Some("bytes=0-"), Some(&bound(Some("e1.0")))),
+        PlayStart::Start { switch: true }
+    );
+    assert_eq!(
+        play_start(&restarted, Some("bytes=0-0"), None),
+        PlayStart::Start { switch: true }
+    );
+    // A new token picking up past the first byte binds what the song has, without a switch.
+    assert_eq!(
+        play_start(&restarted, Some("bytes=4096-"), None),
+        PlayStart::Start { switch: false }
+    );
+}
+
+#[test]
+fn without_a_token_only_an_open_read_or_avplayers_probe_restarts_a_bound_play() {
+    let app = request(None, "GET", None);
+    assert_eq!(
+        play_start(&app, Some("bytes=0-1"), None),
+        PlayStart::Start { switch: true }
+    );
+    assert_eq!(
+        play_start(&app, Some("bytes=900-"), None),
+        PlayStart::Start { switch: false }
+    );
+    let b = bound(None);
+    assert_eq!(
+        play_start(&app, None, Some(&b)),
+        PlayStart::Start { switch: true }
+    );
+    assert_eq!(
+        play_start(&app, Some(""), Some(&b)),
+        PlayStart::Start { switch: true }
+    );
+    assert_eq!(
+        play_start(&app, Some("bytes=0-"), Some(&b)),
+        PlayStart::Start { switch: true }
+    );
+    assert_eq!(play_start(&app, Some("bytes=0-0"), Some(&b)), PlayStart::Continue);
+    assert_eq!(play_start(&app, Some("bytes=0-1"), Some(&b)), PlayStart::Continue);
+    assert_eq!(
+        play_start(&app, Some("bytes=0-65535"), Some(&b)),
+        PlayStart::Continue
+    );
+    assert_eq!(
+        play_start(&app, Some("bytes=900-"), Some(&b)),
+        PlayStart::Continue
+    );
+    let avplayer = StreamPlay {
+        user_agent: "AppleCoreMedia/1.0.0.21E236 (iPhone; U; CPU OS 17_4 like Mac OS X)".into(),
+        ..request(None, "GET", None)
+    };
+    assert_eq!(
+        play_start(&avplayer, Some("bytes=0-1"), Some(&b)),
+        PlayStart::Start { switch: true }
+    );
+    assert_eq!(
+        play_start(&avplayer, Some("bytes=0-4000000"), Some(&b)),
+        PlayStart::Continue
+    );
+}
+
+#[test]
+fn an_older_octo_app_bound_to_a_video_is_never_switched() {
+    let older = StreamPlay {
+        octo_device: true,
+        ..request(None, "GET", None)
+    };
+    let b = bound(None);
+    for range in [None, Some("bytes=0-"), Some("bytes=0-0"), Some("bytes=300-")] {
+        assert_eq!(
+            play_start(&older, range, Some(&b)),
+            PlayStart::Continue,
+            "{range:?}"
+        );
+    }
+    assert_eq!(play_start(&older, None, None), PlayStart::Start { switch: true });
+}
+
+#[test]
+fn an_older_octo_apps_play_that_is_over_starts_again_and_its_offline_reads_take_the_plain_rule() {
+    let older = StreamPlay {
+        octo_device: true,
+        ..request(None, "GET", None)
+    };
+    let over = PlayBinding {
+        finished: true,
+        ..bound(None)
+    };
+    assert_eq!(
+        play_start(&older, Some("bytes=0-"), Some(&over)),
+        PlayStart::Start { switch: true }
+    );
+    assert_eq!(
+        play_start(&older, None, Some(&over)),
+        PlayStart::Start { switch: true }
+    );
+    // Its probes and later ranges still go on with the play.
+    assert_eq!(
+        play_start(&older, Some("bytes=0-0"), Some(&over)),
+        PlayStart::Continue
+    );
+    assert_eq!(
+        play_start(&older, Some("bytes=300-"), Some(&over)),
+        PlayStart::Continue
+    );
+    // An offline read (save ahead, the prefetcher) takes the rule other apps take.
+    let offline = StreamPlay {
+        purpose: Some("offline".into()),
+        ..older.clone()
+    };
+    assert_eq!(
+        play_start(&offline, Some("bytes=0-"), Some(&bound(None))),
+        PlayStart::Start { switch: true }
+    );
+    assert_eq!(
+        play_start(&offline, Some("bytes=0-0"), Some(&bound(None))),
+        PlayStart::Continue
+    );
+    assert_eq!(
+        play_start(&offline, Some("bytes=900-"), Some(&bound(None))),
+        PlayStart::Continue
+    );
+}
+
+#[test]
+fn a_head_or_a_scout_read_only_looks() {
+    for play in [
+        request(None, "HEAD", None),
+        request(Some("e1.0"), "GET", Some("scout")),
+        request(None, "GET", Some("scout")),
+    ] {
+        assert_eq!(play_start(&play, None, None), PlayStart::Peek);
+        assert_eq!(
+            play_start(&play, Some("bytes=0-"), Some(&bound(None))),
+            PlayStart::Peek
+        );
+    }
+    // An offline copy is a play like any other (its own key tells it apart).
+    assert_eq!(
+        play_start(&request(None, "GET", Some("offline")), None, None),
+        PlayStart::Start { switch: true }
+    );
+}
+
 fn song(artist: &str, title: &str) -> SoulseekRouting {
     SoulseekRouting {
         kind: RoutingKind::Song,

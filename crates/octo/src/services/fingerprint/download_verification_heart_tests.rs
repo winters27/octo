@@ -787,3 +787,61 @@ async fn a_busy_answer_backs_the_person_pace_off() {
     assert!(heart.service.client.backing_off(LookupClass::Heart));
     assert!(!heart.service.client.backing_off(LookupClass::Bulk));
 }
+
+#[test]
+fn a_hearts_stand_in_is_the_chosen_version_with_no_facts_of_the_video_it_leaves() {
+    let registry = crate::services::soulseek::ExternalIdRegistry::in_memory();
+    let id = registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("Drake".into()),
+        title: Some("Started".into()),
+        ..Default::default()
+    });
+    registry.set_you_tube_id(&id, "old");
+    registry.remember_stream(
+        &id,
+        "old",
+        &octo_core::soulseek::StreamFacts {
+            size: Some(4_000_000),
+            size_confirmed: true,
+            ext: Some("webm".into()),
+            itag: Some("251".into()),
+            ..Default::default()
+        },
+    );
+    let at = chrono::Utc::now();
+    let routing = || registry.lookup(&id).expect("registered").snapshot();
+    let pinned = stand_in_record(&registry, &id, &routing(), at).expect("a video");
+    assert_eq!(
+        pinned.source,
+        HeardSource::Video {
+            id: "old".into(),
+            size: Some(4_000_000),
+            content_type: "audio/webm".into(),
+            itag: Some(251),
+        }
+    );
+
+    registry
+        .choose_stream_video(
+            &id,
+            crate::services::soulseek::StreamChoice {
+                video: "new".into(),
+                by: "ede".into(),
+                at,
+                ..Default::default()
+            },
+        )
+        .expect("stored");
+    let chosen = stand_in_record(&registry, &id, &routing(), at).expect("a video");
+    assert_eq!(
+        chosen.source,
+        HeardSource::Video {
+            id: "new".into(),
+            size: None,
+            content_type: "audio/mp4".into(),
+            itag: None,
+        },
+        "the chosen video, with none of the old video's size or format"
+    );
+}

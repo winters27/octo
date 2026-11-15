@@ -74,6 +74,12 @@ pub trait IMusicMetadataService: Send + Sync {
     /// that still name the song by that id carry the length it really runs.
     fn remember_file_length(&self, _external_id: &str, _seconds: i32) {}
 
+    /// The video the outside song `external_id` plays for new work (a person's chosen version
+    /// when one stands), when one is known. The default knows none.
+    fn song_video(&self, _external_id: &str) -> Option<String> {
+        None
+    }
+
     /// Resolves the real YouTube video (and its duration) for the top of a search
     /// result so the shown length matches the audio that plays. Bounded + cached;
     /// also stores the videoId so playback reuses the same video. When `background`

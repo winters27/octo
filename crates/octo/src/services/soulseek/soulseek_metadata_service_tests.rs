@@ -113,6 +113,57 @@ async fn build_service_with_delay(routes: Vec<(&str, &str)>, delay: Option<Durat
     }
 }
 
+#[tokio::test]
+async fn a_chosen_version_keeps_its_video_and_length_from_a_lookup() {
+    let h = build_service(Vec::new()).await;
+    let id = h.registry.register(octo_core::soulseek::SoulseekRouting {
+        kind: octo_core::soulseek::RoutingKind::Song,
+        artist: Some("Drake".into()),
+        title: Some("Started".into()),
+        ..Default::default()
+    });
+    h.registry.set_you_tube_id(&id, "old");
+    h.registry
+        .choose_stream_video(
+            &id,
+            crate::services::soulseek::StreamChoice {
+                video: "new".into(),
+                seconds: Some(240),
+                by: "ede".into(),
+                at: chrono::Utc::now(),
+                ..Default::default()
+            },
+        )
+        .expect("stored");
+    let hit = YouTubeHit {
+        video_id: "found".into(),
+        title: None,
+        duration: Some(200),
+        channel: None,
+        album: None,
+        stream: Default::default(),
+        pick: octo_core::soulseek::SoulseekRouting::VIDEO_PICK,
+    };
+    assert_eq!(h.service.inner.keep_video(&id, &hit, false), None);
+    let r = h.lookup(&id);
+    assert_eq!(r.you_tube_id.as_deref(), Some("old"));
+    assert_eq!((r.duration, r.shown_duration), (None, None));
+
+    // Octo's own pick holds nothing: the lookup pins as before.
+    h.registry
+        .undo_stream_choice(
+            &id,
+            crate::services::soulseek::StreamChoice {
+                video: "octo".into(),
+                at: chrono::Utc::now(),
+                ..Default::default()
+            },
+        )
+        .expect("stored");
+    assert_eq!(h.service.inner.keep_video(&id, &hit, false), Some(200));
+    assert_eq!(h.lookup(&id).you_tube_id.as_deref(), Some("found"));
+}
+
 const PROVIDER: &str = SoulseekMetadataService::PROVIDER_NAME;
 
 const ALBUM_SEARCH_JSON: &str = r#"{"data":[

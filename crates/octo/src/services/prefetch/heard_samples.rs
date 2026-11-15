@@ -892,14 +892,17 @@ impl HeardSamples {
         self.note_sample(capture, &sample_id);
     }
 
-    /// The person's heard record names its sample, found by the song's id now.
+    /// The person's heard record names its sample, found by the song's id now, only while it is
+    /// still the record the sample was taken of: a record dropped meanwhile (the person chose
+    /// another version) is never brought back.
     fn note_sample(&self, capture: &Capture, sample_id: &str) {
-        let record = HeardRecord {
-            sample_id: Some(sample_id.to_string()),
-            ..capture.record.clone()
-        };
-        self.registry
-            .remember_heard(&capture.external_id, &capture.user, record, None);
+        self.registry.attach_sample(
+            &capture.external_id,
+            &capture.user,
+            capture.record.heard_at,
+            &capture.record.source,
+            sample_id,
+        );
     }
 
     /// Prints a held file of the heard audio (a copy, a library file) as the person's sample, off

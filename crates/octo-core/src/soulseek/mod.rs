@@ -22,7 +22,7 @@ pub use soulseek_client::{
     TransferWatch,
 };
 pub use soulseek_link::{SoulseekLinkState, SoulseekServerReading};
-pub use soulseek_metadata_service::{RoutingKind, SoulseekRouting};
+pub use soulseek_metadata_service::{PlayBinding, RoutingKind, SoulseekRouting};
 pub use soulseek_sharing::{
     PortCheckResult, PortState, ShareControl, ShareSwitchState, SharedFolder, SharingReport, SharingWarning,
     UploadActivity,

@@ -115,10 +115,7 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
         }
         // An outside song already playing from YouTube names its video: its radio needs no
         // search.
-        seed_video = state
-            .external_id_registry
-            .lookup(&id)
-            .and_then(|routing| routing.lock().you_tube_id.clone());
+        seed_video = outside_seed_video(&state.external_id_registry, &id);
     } else {
         // A library song, or an album or artist, which Subsonic's getSimilarSongs also takes.
         // Read with the caller's own credentials, so it is their library being asked.
@@ -234,6 +231,14 @@ pub async fn get_similar_songs(State(state): State<AppState>, req: Request) -> R
     build_similar_songs_response(&state, format, &resolved_songs, response_key)
 }
 
+/// The video song radio seeds from for the outside song under `id`: the song's video for new
+/// work (a person's chosen version included). None when none is known yet.
+fn outside_seed_video(registry: &crate::services::soulseek::ExternalIdRegistry, id: &str) -> Option<String> {
+    registry
+        .lookup(id)
+        .and_then(|routing| registry.song_video(&routing.snapshot()))
+}
+
 fn build_similar_songs_response(
     state: &AppState,
     format: &str,
@@ -263,4 +268,36 @@ fn build_similar_songs_response(
         .attr("version", SUBSONIC_VERSION)
         .child(similar);
     SubsonicReply::xml(&document).into_response()
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+    use octo_core::soulseek::SoulseekRouting;
+
+    #[test]
+    fn song_radio_seeds_from_the_chosen_version() {
+        let registry = crate::services::soulseek::ExternalIdRegistry::in_memory();
+        let id = registry.register(SoulseekRouting {
+            kind: RoutingKind::Song,
+            artist: Some("Drake".into()),
+            title: Some("Started".into()),
+            ..Default::default()
+        });
+        assert_eq!(outside_seed_video(&registry, &id), None);
+        registry.set_you_tube_id(&id, "old");
+        assert_eq!(outside_seed_video(&registry, &id).as_deref(), Some("old"));
+        registry
+            .choose_stream_video(
+                &id,
+                crate::services::soulseek::StreamChoice {
+                    video: "new".into(),
+                    by: "ede".into(),
+                    at: chrono::Utc::now(),
+                    ..Default::default()
+                },
+            )
+            .expect("stored");
+        assert_eq!(outside_seed_video(&registry, &id).as_deref(), Some("new"));
+    }
 }

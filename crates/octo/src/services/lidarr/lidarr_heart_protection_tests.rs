@@ -339,6 +339,7 @@ impl IDownloadService for Pipeline {
         _: &str,
         _: &str,
         _: Option<&str>,
+        _: Option<&crate::services::i_download_service::StreamPlay>,
         _: &CancellationToken,
     ) -> anyhow::Result<Option<DirectStreamInfo>> {
         Ok(None)

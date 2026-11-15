@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use super::SoulseekMetadataService;
+use super::stream_choices::StreamChoices;
 use crate::services::state_file;
 
 /// Told of every heard record the registry stores: the registered routing's short id, the user
@@ -117,6 +118,10 @@ pub struct ExternalIdRegistry {
     /// Asked on a lookup miss before `recovery`, in order; what one answers is filed under the id
     /// asked for as it is ([`Self::restore_as`]), with no hash check.
     sources: Mutex<Vec<RoutingRecovery>>,
+    /// The versions people chose for songs, and the ids each song played under.
+    choices: StreamChoices,
+    /// How many bodies of each bound play are streaming now, by the play's live key.
+    live_plays: Arc<Mutex<HashMap<String, usize>>>,
     /// The videos found to be another recording than a song, by [`Self::song_key`], newest last:
     /// at most [`Self::MAX_REFUSED_PER_SONG`] a song and [`Self::MAX_REFUSED_SONGS`] songs, the
     /// oldest song going first. Written to `refused-videos.json` beside the registry's file.
@@ -339,6 +344,7 @@ impl ExternalIdRegistry {
         let path = path
             .map(|p| p.as_ref().to_path_buf())
             .filter(|p| !p.as_os_str().to_string_lossy().trim().is_empty());
+        let choices = StreamChoices::open(path.as_deref());
         let registry = ExternalIdRegistry {
             path,
             lru: Mutex::new(Lru::default()),
@@ -346,6 +352,8 @@ impl ExternalIdRegistry {
             flush_lock: Mutex::new(()),
             recovery: Mutex::new(None),
             sources: Mutex::new(Vec::new()),
+            choices,
+            live_plays: Arc::new(Mutex::new(HashMap::new())),
             refused: Mutex::new(IndexMap::new()),
             refused_dirty: AtomicBool::new(false),
             heard_listeners: Mutex::new(Vec::new()),
@@ -402,11 +410,17 @@ impl ExternalIdRegistry {
 
         let merged_into = match previous {
             Some(previous) if existing_kept => {
-                Self::merge_into_kept(&previous, &routing);
+                let guarded = self.pin_guarded(&previous.snapshot());
+                Self::merge_into_kept(&previous, &routing, guarded);
                 Some(previous)
             }
             Some(previous) => {
-                Self::merge_into_newcomer(&routing, &previous);
+                // A video a person chose (or one still marked chosen) stays over a fresh mint's.
+                let keeps_pin = {
+                    let p = previous.snapshot();
+                    p.video_pick == SoulseekRouting::VIDEO_CHOSEN || self.pin_guarded(&p)
+                };
+                Self::merge_into_newcomer(&routing, &previous, keeps_pin);
                 None
             }
             None => None,
@@ -435,7 +449,8 @@ impl ExternalIdRegistry {
             drop(guard);
             let took = handle.ptr_eq(&newcomer) || merged_into.as_ref().is_some_and(|m| m.ptr_eq(&handle));
             if !took {
-                Self::merge_into_kept(&handle, &newcomer);
+                let guarded = self.pin_guarded(&handle.snapshot());
+                Self::merge_into_kept(&handle, &newcomer, guarded);
             }
             self.mark_changed(&id);
             return (id, handle);
@@ -451,8 +466,11 @@ impl ExternalIdRegistry {
         (id, stored)
     }
 
-    /// What a fresh routing takes from the one it replaces in the LRU under the same id.
-    fn merge_into_newcomer(routing: &SharedRouting, previous: &SharedRouting) {
+    /// What a fresh routing takes from the one it replaces in the LRU under the same id. With
+    /// `keeps_pin` (a person chose the previous routing's video, or it is still marked chosen),
+    /// the previous video, its mark and its stream facts win over a video the newcomer was minted
+    /// with. The plays bound to their videos always carry over.
+    fn merge_into_newcomer(routing: &SharedRouting, previous: &SharedRouting, keeps_pin: bool) {
         // Read the earlier routing under its own lock, then let it go before taking the
         // new one's, so two registrations never hold both.
         let (prev_album_id, (seconds, source), prev_isrc, prev_artist_id, prev_explicit, prev_album) = {
@@ -466,7 +484,7 @@ impl ExternalIdRegistry {
                 p.album.clone(),
             )
         };
-        let (prev_video, prev_stream, prev_refused, prev_pick, prev_contexts, prev_heard) = {
+        let (prev_video, prev_stream, prev_refused, prev_pick, prev_contexts, prev_heard, prev_plays) = {
             let p = previous.lock();
             (
                 p.you_tube_id.clone().filter(|v| !v.is_empty()),
@@ -475,6 +493,7 @@ impl ExternalIdRegistry {
                 p.video_pick,
                 p.contexts.clone(),
                 p.heard.clone(),
+                p.plays.clone(),
             )
         };
         let mut r = routing.lock();
@@ -546,8 +565,29 @@ impl ExternalIdRegistry {
                         r.merge_stream_facts(&prev_stream);
                     }
                 }
+                Some(_) if keeps_pin => {
+                    if r.pin_video(&prev_video) {
+                        r.video_pick = prev_pick;
+                        r.merge_stream_facts(&prev_stream);
+                    }
+                }
                 Some(_) => {}
             }
+        }
+        // And the plays running on the song, each on the video it started on: a re-registration
+        // must never move one to another video.
+        if !prev_plays.is_empty() {
+            let own = std::mem::take(&mut r.plays);
+            let mut plays = prev_plays;
+            for play in own {
+                plays.retain(|known| {
+                    !(known.key == play.key && known.token == play.token && known.address == play.address)
+                });
+                plays.push(play);
+            }
+            let excess = plays.len().saturating_sub(SoulseekRouting::MAX_PLAYS);
+            plays.drain(..excess);
+            r.plays = plays;
         }
     }
 
@@ -556,7 +596,9 @@ impl ExternalIdRegistry {
     /// and the newcomer's video (with its stream facts and pick) only when the kept routing has
     /// none and does not refuse it. The kept routing's own video and stream facts stay; for the
     /// same video, facts it lacks are filled. Holds one routing's lock at a time.
-    fn merge_into_kept(kept: &SharedRouting, newcomer: &SharedRouting) {
+    /// With `guarded` (a person's choice, or an earlier one, holds the kept routing's video) no
+    /// video is pinned onto it.
+    fn merge_into_kept(kept: &SharedRouting, newcomer: &SharedRouting, guarded: bool) {
         let n = newcomer.snapshot();
         let mut k = kept.lock();
         let (seconds, source) = SongLength::shown(&n);
@@ -599,7 +641,7 @@ impl ExternalIdRegistry {
         }
         if let Some(video) = n.you_tube_id.as_deref().filter(|v| !v.is_empty()) {
             match k.you_tube_id.as_deref().filter(|v| !v.is_empty()) {
-                None if !k.refuses_video(video) => {
+                None if !guarded && !k.refuses_video(video) => {
                     if k.pin_video(video) {
                         k.video_pick = n.video_pick;
                     }
@@ -692,10 +734,14 @@ impl ExternalIdRegistry {
         for video in &refused {
             routing.refuse_video(video);
         }
+        // A seed is a copy from any time: the plays it names are long over, a chosen mark no
+        // record backs is Octo's pick, and the chooser heard nothing older than their choice.
+        self.settle_restored(&mut routing);
         let newcomer = SharedRouting::new(routing);
         let existing = self.peek(id);
         if let Some(existing) = &existing {
-            Self::merge_into_kept(existing, &newcomer);
+            let guarded = self.pin_guarded(&existing.snapshot());
+            Self::merge_into_kept(existing, &newcomer, guarded);
         }
         let (_, stored) = self.store(id.to_string(), newcomer, existing);
         self.dirty.store(true, Ordering::SeqCst);
@@ -1075,6 +1121,10 @@ impl ExternalIdRegistry {
         let Some(routing) = self.peek(short_id) else {
             return false;
         };
+        // A song whose video a person chose keeps it: only a play's start changes it.
+        if self.pin_guarded(&routing.snapshot()) {
+            return false;
+        }
         let changed = {
             let mut r = routing.lock();
             if r.refuses_video(video) {
@@ -1104,6 +1154,10 @@ impl ExternalIdRegistry {
         let Some(routing) = self.peek(short_id) else {
             return false;
         };
+        // The chosen mark is written only by a play's start; a chosen song's mark stays.
+        if pick == SoulseekRouting::VIDEO_CHOSEN || self.pin_guarded(&routing.snapshot()) {
+            return false;
+        }
         let changed = {
             let mut r = routing.lock();
             if r.you_tube_id.as_deref() != Some(video) || r.video_pick == pick {
@@ -1182,6 +1236,9 @@ impl ExternalIdRegistry {
         let Some(routing) = self.peek(short_id) else {
             return false;
         };
+        if self.pin_guarded(&routing.snapshot()) {
+            return false;
+        }
         let mut r = routing.lock();
         if r.you_tube_id.as_deref() != Some(current) || r.refuses_video(better) {
             return false;
@@ -1196,6 +1253,11 @@ impl ExternalIdRegistry {
     /// copy can go. None when nothing was waiting (or the waiting video is refused or already
     /// playing), or when another routing still pins the old video.
     pub fn apply_pending_video(&self, routing: &SharedRouting) -> Option<String> {
+        // A ranking's video never replaces one a person chose: it is dropped.
+        if self.pin_guarded(&routing.snapshot()) {
+            routing.lock().pending_video = None;
+            return None;
+        }
         let old = {
             let mut r = routing.lock();
             let better = r.pending_video.take()?;
@@ -1286,6 +1348,7 @@ impl ExternalIdRegistry {
         }
         drop(refused);
         self.refused_dirty.store(true, Ordering::SeqCst);
+        self.forget_refused_choice(artist, title, video);
         true
     }
 
@@ -1573,6 +1636,7 @@ impl ExternalIdRegistry {
         let Some(path) = &self.path else { return };
         let _flushing = self.flush_lock.lock();
         self.flush_refused();
+        self.choices.flush();
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -1667,7 +1731,12 @@ impl ExternalIdRegistry {
         token: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<()> {
         let registry = self.clone();
-        state_file::flush_every(self.flush_interval, token, Arc::new(move || registry.flush())).await
+        let flushed =
+            state_file::flush_every(self.flush_interval, token, Arc::new(move || registry.flush())).await;
+        // The last write before the stop marks the played index as stopped cleanly.
+        let stopping = self.clone();
+        let _ = tokio::task::spawn_blocking(move || stopping.choices.stop_cleanly()).await;
+        flushed
     }
 }
 
@@ -1693,3 +1762,11 @@ mod tests;
 #[cfg(test)]
 #[path = "external_id_registry_kept_tests.rs"]
 mod kept_tests;
+
+#[path = "external_id_registry_choices.rs"]
+mod choices;
+pub use choices::{ChooseError, LiveGuard, PickState};
+
+#[cfg(test)]
+#[path = "external_id_registry_choice_tests.rs"]
+mod choice_tests;

@@ -12,11 +12,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use octo_core::soulseek::SoulseekRouting;
+use octo_core::soulseek::{PlayBinding, SoulseekRouting};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::you_tube_resolver::{Failure, Lookup, YouTubeHit, YouTubeResolver};
+use crate::services::i_download_service::StreamPlay;
 use crate::services::soulseek::ExternalIdRegistry;
 
 /// Whether a request reads from the first byte on: no `Range`, or a single range `bytes=0-`
@@ -30,6 +31,89 @@ pub fn starts_at_first_byte(range: Option<&str>) -> bool {
         .strip_prefix("bytes=")
         .and_then(|spec| spec.split_once('-'))
         .is_some_and(|(from, to)| from.trim() == "0" && to.trim().is_empty())
+}
+
+/// What one stream request is to its play.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayStart {
+    /// The request starts a play. With `switch` it starts from the first byte, so the song may
+    /// move to the video chosen or waiting for it; without, the play takes the video the song
+    /// has.
+    Start { switch: bool },
+    /// The request goes on with a play already bound to its video.
+    Continue,
+    /// A look at the song (a HEAD, or a scout read): it starts nothing.
+    Peek,
+}
+
+/// Whether a Range asks from the first byte: none, blank, or any `bytes=0-...`.
+fn from_byte_zero(range: Option<&str>) -> bool {
+    match range.map(str::trim) {
+        None | Some("") => true,
+        Some(range) => range
+            .get(..8)
+            .is_some_and(|start| start.eq_ignore_ascii_case("bytes=0-")),
+    }
+}
+
+/// Whether a Range is AVPlayer's opening two-byte read, `bytes=0-1`.
+fn opening_probe(range: Option<&str>) -> bool {
+    let Some(range) = range.map(str::trim) else {
+        return false;
+    };
+    let Some(spec) = range
+        .get(..6)
+        .filter(|unit| unit.eq_ignore_ascii_case("bytes="))
+        .map(|_| &range[6..])
+    else {
+        return false;
+    };
+    spec.split_once('-')
+        .is_some_and(|(from, to)| from.trim() == "0" && to.trim() == "1")
+}
+
+/// The one rule for whether a stream request starts a play, used for the switch to a chosen or
+/// waiting video, for the play's binding and for the file a play of an Octo app keeps.
+///
+/// A HEAD or a scout read only looks. A request with a play token goes on with the binding of
+/// that token, and a new token starts a play (switching from the first byte only). With no token,
+/// an unbound request starts a play, switching from the first byte; a bound one goes on, unless
+/// it asks from the first byte with no end (or has no Range), or is AVPlayer's opening
+/// `bytes=0-1`, which start the song again. A bound Octo app that sends no token (an older one)
+/// goes on, since its own scouts read the song the way a restart does, until its play is over:
+/// once the binding is `finished` (as the registry hands it back: a body reached the last byte and
+/// none streams now), a read from the first byte with no end starts the song again. An offline
+/// read (`X-Octo-Purpose: offline`) is never a scout and takes the plain rule.
+pub fn play_start(play: &StreamPlay, range: Option<&str>, binding: Option<&PlayBinding>) -> PlayStart {
+    if play.peeks() {
+        return PlayStart::Peek;
+    }
+    if let Some(token) = play.token.as_deref() {
+        if binding.is_some_and(|bound| bound.token.as_deref() == Some(token)) {
+            return PlayStart::Continue;
+        }
+        return PlayStart::Start {
+            switch: from_byte_zero(range),
+        };
+    }
+    let Some(bound) = binding else {
+        return PlayStart::Start {
+            switch: from_byte_zero(range),
+        };
+    };
+    if play.octo_device && play.purpose.as_deref() != Some("offline") {
+        if bound.finished && starts_at_first_byte(range) {
+            return PlayStart::Start { switch: true };
+        }
+        return PlayStart::Continue;
+    }
+    let restarts =
+        starts_at_first_byte(range) || (opening_probe(range) && play.user_agent.contains("AppleCoreMedia"));
+    if restarts {
+        PlayStart::Start { switch: true }
+    } else {
+        PlayStart::Continue
+    }
 }
 
 /// What one pass came to.

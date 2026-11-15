@@ -591,6 +591,13 @@ impl Inner {
     /// Nothing is kept for a video the song refuses.
     fn keep_video(&self, song_id: &str, hit: &YouTubeHit, background: bool) -> Option<i32> {
         let d = hit.duration.filter(|&d| d > 0)?;
+        // A song whose version a person chose keeps its video and the length it has.
+        if self
+            .lookup(song_id)
+            .is_some_and(|routing| self.id_registry.pin_guarded(&routing.snapshot()))
+        {
+            return None;
+        }
         if self
             .lookup(song_id)
             .is_some_and(|r| r.lock().refuses_video(&hit.video_id))
@@ -1357,6 +1364,11 @@ impl IMusicMetadataService for SoulseekMetadataService {
         self.inner
             .id_registry
             .remember_length(external_id, Some(seconds), LengthSource::File);
+    }
+
+    fn song_video(&self, external_id: &str) -> Option<String> {
+        let routing = self.inner.id_registry.resolve_song(external_id, false)?;
+        self.inner.id_registry.song_video(&routing.snapshot())
     }
 
     fn complete_song_lengths(&self, songs: &mut [Song]) {

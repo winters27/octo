@@ -542,6 +542,10 @@ struct SlskdState {
     last_download: String,
     /// Videos whose /download the shim fails with a 502.
     failing_downloads: HashSet<String>,
+    /// Videos gone from YouTube: /stream refuses them and a fresh /facts says they are gone.
+    dead_videos: HashSet<String>,
+    /// Videos /stream refuses while a fresh /facts finds the shim busy.
+    busy_videos: HashSet<String>,
 }
 
 /// slskd as far as one walk needs: logged in, searches answered from a script, and every batch
@@ -702,6 +706,28 @@ impl Respond for FakeSlskd {
                 .cloned()
                 .unwrap_or_else(|| json!({"status": "ok", "results": []}));
             return json_answer(&answer, 200);
+        }
+        let asked_video = request
+            .url
+            .query_pairs()
+            .find(|(k, _)| k == "id")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
+        let (dead, busy) = {
+            let state = self.state.lock();
+            (
+                state.dead_videos.contains(&asked_video),
+                state.busy_videos.contains(&asked_video),
+            )
+        };
+        if path == "/stream" && (dead || busy) {
+            return json_answer(&json!({"error": "video_unavailable"}), 410);
+        }
+        if path == "/facts" && dead {
+            return json_answer(&json!({"error": "video_unavailable", "fresh": true}), 410);
+        }
+        if path == "/facts" && busy {
+            return json_answer(&json!({"error": "busy", "fresh": true}), 503);
         }
         if path == "/stream"
             && let Some(preview) = self.state.lock().preview.clone()
@@ -2315,7 +2341,13 @@ async fn a_play_pins_the_found_video_and_learns_its_true_size_from_the_stream() 
 
     let stream = walk
         .service
-        .get_direct_stream("soulseek", &id, Some("bytes=0-1"), &CancellationToken::new())
+        .get_direct_stream(
+            "soulseek",
+            &id,
+            Some("bytes=0-1"),
+            None,
+            &CancellationToken::new(),
+        )
         .await
         .expect("no error")
         .expect("a stream");
@@ -2343,7 +2375,13 @@ async fn a_play_takes_youtube_musics_video_for_the_song_before_the_yt_dlp_search
     }]));
 
     walk.service
-        .get_direct_stream("soulseek", &id, Some("bytes=0-1"), &CancellationToken::new())
+        .get_direct_stream(
+            "soulseek",
+            &id,
+            Some("bytes=0-1"),
+            None,
+            &CancellationToken::new(),
+        )
         .await
         .expect("no error")
         .expect("a stream");
@@ -2449,7 +2487,13 @@ async fn a_play_picking_up_past_the_first_byte_streams_the_old_video_and_leaves_
     copies.drop_copy(OLD_VIDEO);
 
     walk.service
-        .get_direct_stream("soulseek", &id, Some("bytes=1000-"), &CancellationToken::new())
+        .get_direct_stream(
+            "soulseek",
+            &id,
+            Some("bytes=1000-"),
+            None,
+            &CancellationToken::new(),
+        )
         .await
         .expect("no error")
         .expect("a stream");
@@ -2466,7 +2510,7 @@ async fn a_play_from_the_first_byte_streams_the_new_video_and_drops_the_old_copy
     let (walk, id, copies) = waiting_walk(&root).await;
 
     walk.service
-        .get_direct_stream("soulseek", &id, None, &CancellationToken::new())
+        .get_direct_stream("soulseek", &id, None, None, &CancellationToken::new())
         .await
         .expect("no error")
         .expect("a stream");
@@ -2487,7 +2531,7 @@ async fn the_old_copy_stays_while_another_song_still_pins_the_old_video() {
     walk.registry.set_you_tube_id(&other, OLD_VIDEO);
 
     walk.service
-        .get_direct_stream("soulseek", &id, Some("bytes=0-"), &CancellationToken::new())
+        .get_direct_stream("soulseek", &id, Some("bytes=0-"), None, &CancellationToken::new())
         .await
         .expect("no error")
         .expect("a stream");
@@ -2508,7 +2552,13 @@ async fn a_play_falls_back_to_the_yt_dlp_search_when_youtube_music_has_no_such_s
     }]));
 
     walk.service
-        .get_direct_stream("soulseek", &id, Some("bytes=0-1"), &CancellationToken::new())
+        .get_direct_stream(
+            "soulseek",
+            &id,
+            Some("bytes=0-1"),
+            None,
+            &CancellationToken::new(),
+        )
         .await
         .expect("no error")
         .expect("a stream");
@@ -2749,7 +2799,13 @@ async fn a_refused_video_is_not_taken_again() {
     walk.registry.refuse_video(&id, "ytm-atv");
 
     walk.service
-        .get_direct_stream("soulseek", &id, Some("bytes=0-1"), &CancellationToken::new())
+        .get_direct_stream(
+            "soulseek",
+            &id,
+            Some("bytes=0-1"),
+            None,
+            &CancellationToken::new(),
+        )
         .await
         .expect("no error")
         .expect("a stream");
@@ -3447,3 +3503,6 @@ async fn the_remuxed_heard_stream_is_byte_identical_to_the_copy() {
 
 #[path = "soulseek_gate_tests.rs"]
 mod gate;
+
+#[path = "soulseek_stream_choice_tests.rs"]
+mod stream_choice;

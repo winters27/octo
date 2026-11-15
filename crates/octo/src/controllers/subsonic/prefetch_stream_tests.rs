@@ -103,6 +103,74 @@ fn is_preview(reply: &Reply) -> bool {
     reply.body.as_ref() == PREVIEW
 }
 
+/// The world's song filed in the registry under its outside id, with a person's choice of video.
+fn chosen(w: &World, video: &str) {
+    let registry = &w.state.external_id_registry;
+    registry.restore_as(
+        "song1",
+        octo_core::soulseek::SoulseekRouting {
+            kind: octo_core::soulseek::RoutingKind::Song,
+            artist: Some("Artist".into()),
+            title: Some("Song".into()),
+            you_tube_id: Some("oldvideo-1".into()),
+            ..Default::default()
+        },
+    );
+    registry
+        .choose_stream_video(
+            "song1",
+            crate::services::soulseek::StreamChoice {
+                video: video.into(),
+                by: "alice".into(),
+                at: chrono::Utc::now(),
+                ..Default::default()
+            },
+        )
+        .expect("stored");
+}
+
+/// The song ready in the folder, its identity checked against `judged`.
+fn land_judged(w: &World, judged: &str) {
+    let path = w.folder.path().join(file_name("soulseek", "song1", "flac"));
+    std::fs::write(&path, FLAC).expect("the file");
+    let song = Song {
+        artist: "Artist".into(),
+        title: "Song".into(),
+        ..Default::default()
+    };
+    write_sidecar(
+        &path,
+        &AheadSidecar {
+            judged_video: Some(judged.to_string()),
+            ..AheadSidecar::of("soulseek", "song1", &path, &song, None, chrono::Utc::now())
+        },
+    )
+    .expect("the facts");
+    w.state.prefetch.store().adopt(&path);
+}
+
+#[tokio::test]
+async fn a_copy_checked_against_another_version_than_the_chosen_one_is_not_served() {
+    let w = world(|_| {}).await;
+    chosen(&w, "newvideo-1");
+    w.land();
+    let reply = w.play("Octo", None).await;
+    assert!(is_preview(&reply), "{:?}", reply.body);
+
+    let w = world(|_| {}).await;
+    chosen(&w, "newvideo-1");
+    land_judged(&w, "oldvideo-1");
+    assert!(is_preview(&w.play("Octo", None).await));
+
+    let w = world(|_| {}).await;
+    chosen(&w, "newvideo-1");
+    land_judged(&w, "newvideo-1");
+    assert!(
+        is_flac(&w.play("Octo", None).await),
+        "a copy of the chosen version is served"
+    );
+}
+
 #[tokio::test]
 async fn an_octo_app_gets_the_flac_of_a_song_downloaded_ahead() {
     let w = world(|_| {}).await;

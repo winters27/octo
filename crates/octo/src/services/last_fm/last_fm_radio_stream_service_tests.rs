@@ -93,6 +93,7 @@ impl IDownloadService for Downloads {
         provider: &str,
         id: &str,
         _: Option<&str>,
+        _: Option<&crate::services::i_download_service::StreamPlay>,
         _: &CancellationToken,
     ) -> anyhow::Result<Option<DirectStreamInfo>> {
         self.asked.lock().push((provider.to_string(), id.to_string()));

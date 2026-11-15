@@ -572,6 +572,15 @@ impl KeepReadyService {
     }
 }
 
+/// The video the song under `id` plays for new work (a person's chosen version included), when
+/// one is known; picks none.
+pub(crate) fn known_video_in(registry: &ExternalIdRegistry, id: &str) -> Option<String> {
+    registry
+        .lookup(id)
+        .and_then(|routing| registry.song_video(&routing.snapshot()))
+        .filter(|video| !video.is_empty())
+}
+
 /// The lists, plays and videos as the app has them.
 pub struct AppKeepReadySources {
     pub settings: Arc<SettingsStore>,
@@ -726,9 +735,6 @@ impl KeepReadySources for AppKeepReadySources {
     }
 
     fn known_video(&self, id: &str) -> Option<String> {
-        self.registry
-            .lookup(id)
-            .and_then(|routing| routing.snapshot().you_tube_id)
-            .filter(|video| !video.is_empty())
+        known_video_in(&self.registry, id)
     }
 }

@@ -206,13 +206,43 @@ pub trait IDownloadService: Send + Sync {
     /// header from the incoming client request: it gets forwarded upstream so
     /// the response can be a 206 with Content-Range. iOS Subsonic clients
     /// require Range support for non-FLAC audio or they refuse to play.
+    /// `play` is the player's request the stream answers, which decides whether it starts a play
+    /// and which video a running play keeps; None for Octo's own reads, which start no play.
     async fn get_direct_stream(
         &self,
         external_provider: &str,
         external_id: &str,
         range_header: Option<&str>,
+        play: Option<&StreamPlay>,
         cancellation_token: &CancellationToken,
     ) -> anyhow::Result<Option<DirectStreamInfo>>;
+}
+
+/// One player request for an outside song's stream, as far as its play is concerned.
+#[derive(Debug, Clone, Default)]
+pub struct StreamPlay {
+    /// The device the request comes from: the signed-in person's device as Octo tells devices
+    /// apart, else the address and the app; with `\noffline` for an offline copy.
+    pub key: String,
+    /// The play token Octo's apps send (`octoPlay`), the same on every request of one play.
+    pub token: Option<String>,
+    /// The client address, behind trusted proxies.
+    pub address: Option<String>,
+    /// The HTTP method.
+    pub method: String,
+    /// `X-Octo-Purpose`, lower case: `scout` for a read that analyzes the song, `offline` for an
+    /// offline copy.
+    pub purpose: Option<String>,
+    /// The request came from an Octo app (it sent `X-Octo-Device-Id`).
+    pub octo_device: bool,
+    pub user_agent: String,
+}
+
+impl StreamPlay {
+    /// Whether the request only looks at the song (a HEAD, or a scout read): it starts no play.
+    pub fn peeks(&self) -> bool {
+        self.method.eq_ignore_ascii_case("HEAD") || self.purpose.as_deref() == Some("scout")
+    }
 }
 
 /// What [`IDownloadService::download_ahead`] did.

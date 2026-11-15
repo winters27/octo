@@ -59,6 +59,23 @@ pub struct AheadSidecar {
     /// The YouTube video it was made from, when it came from YouTube.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_id: Option<String>,
+    /// The video the song played when the copy landed, which its identity was checked against: a
+    /// person's choice of the song's version is served only from a copy judged against that very
+    /// video.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub judged_video: Option<String>,
+}
+
+/// What [`PrefetchStore::drop_misjudged`] did with a song's copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Misjudged {
+    /// No copy, or one judged against the video asked for.
+    Fits,
+    /// Judged against another video: deleted.
+    Deleted,
+    /// Judged against another video, and kept: a heart or a play holds it, or the folder is not
+    /// Octo's own.
+    Kept,
 }
 
 impl AheadSidecar {
@@ -89,6 +106,7 @@ impl AheadSidecar {
             verification: song.verification.as_deref().map(VerificationMirror::of),
             promoted: false,
             video_id: None,
+            judged_video: None,
         }
     }
 }
@@ -315,6 +333,8 @@ struct Entry {
     source_file: Option<String>,
     /// The YouTube video it was made from, when it came from YouTube.
     video_id: Option<String>,
+    /// The video its identity was checked against when it landed.
+    judged_video: Option<String>,
     /// Hearts and plays holding it as what they heard: no sweep removes it meanwhile. Kept in
     /// memory; a hold takes its copies again at start.
     holders: HashSet<String>,
@@ -584,6 +604,39 @@ impl PrefetchStore {
             entry.holders.remove(holder);
         }
     }
+
+    /// The video the song's copy was judged against when it landed.
+    pub fn judged_video(&self, provider: &str, external_id: &str) -> Option<String> {
+        self.current()
+            .entries
+            .get(&key(provider, external_id))
+            .and_then(|entry| entry.judged_video.clone())
+    }
+
+    /// Deletes the song's copy when it was judged against another video than `video` (a play on
+    /// it then gets `Gone` and starts again, so no play mixes two files), unless a heart or a play
+    /// holds it, which keeps it, unserved, until it is let go. Nothing goes from a folder that is
+    /// not Octo's own.
+    pub fn drop_misjudged(&self, provider: &str, external_id: &str, video: &str) -> Misjudged {
+        let mut state = self.current();
+        let key = key(provider, external_id);
+        let Some(entry) = state.entries.get(&key) else {
+            return Misjudged::Fits;
+        };
+        if entry.judged_video.as_deref() == Some(video) {
+            return Misjudged::Fits;
+        }
+        if !entry.holders.is_empty() || !state.read_from.as_deref().is_some_and(owns_folder) {
+            return Misjudged::Kept;
+        }
+        if let Some(entry) = state.entries.remove(&key) {
+            delete(&entry.path);
+            info!(
+                "Deleted the copy of {key} downloaded ahead: it was checked against another version than the one chosen"
+            );
+        }
+        Misjudged::Deleted
+    }
 }
 
 impl PrefetchedFiles for PrefetchStore {
@@ -767,6 +820,7 @@ fn read_entry(path: &Path) -> Option<(String, Entry)> {
             verification: None,
             source_file: sidecar.source_file,
             video_id: sidecar.video_id,
+            judged_video: sidecar.judged_video,
             holders: HashSet::new(),
         },
     ))
@@ -1104,6 +1158,34 @@ mod tests {
         assert!(store.ready("soulseek", "x").is_none());
         *which.lock() = dir.path().join("two");
         assert_eq!(store.ready("soulseek", "x"), Some(path));
+    }
+
+    #[test]
+    fn a_copy_judged_against_another_video_is_deleted_unless_it_is_held() {
+        let w = world();
+        let path = w.put("x", 10);
+        let mut sidecar: AheadSidecar =
+            serde_json::from_slice(&std::fs::read(sidecar_path(&path)).expect("the facts")).expect("reads");
+        sidecar.judged_video = Some("old".into());
+        write_sidecar(&path, &sidecar).expect("written");
+        // A store that reads the folder anew, as a restart would.
+        let folder = w.folder();
+        let store = PrefetchStore::new(Arc::new(move || folder.clone()), Clock::system());
+        assert_eq!(store.judged_video("soulseek", "x").as_deref(), Some("old"));
+        assert_eq!(store.drop_misjudged("soulseek", "x", "old"), Misjudged::Fits);
+
+        assert!(store.hold("soulseek:x", "ede"));
+        assert_eq!(store.drop_misjudged("soulseek", "x", "new"), Misjudged::Kept);
+        assert!(path.is_file(), "a held copy stays");
+        store.release("soulseek:x", "ede");
+        assert_eq!(store.drop_misjudged("soulseek", "x", "new"), Misjudged::Deleted);
+        assert!(!path.is_file());
+        assert_eq!(store.ready("soulseek", "x"), None);
+        assert_eq!(
+            store.drop_misjudged("soulseek", "x", "new"),
+            Misjudged::Fits,
+            "nothing left"
+        );
     }
 
     #[test]

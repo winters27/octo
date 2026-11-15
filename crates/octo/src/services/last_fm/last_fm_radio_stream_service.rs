@@ -1199,7 +1199,7 @@ impl LastFmRadioStreamService {
             return self
                 .shared
                 .downloads
-                .get_direct_stream(&provider, &external_id, None, cancellation_token)
+                .get_direct_stream(&provider, &external_id, None, None, cancellation_token)
                 .await;
         }
 
@@ -1221,7 +1221,7 @@ impl LastFmRadioStreamService {
             .unwrap_or_else(|| SoulseekMetadataService::PROVIDER_NAME.to_string());
         self.shared
             .downloads
-            .get_direct_stream(&provider, resolved_id, None, cancellation_token)
+            .get_direct_stream(&provider, resolved_id, None, None, cancellation_token)
             .await
     }
 

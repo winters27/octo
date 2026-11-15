@@ -513,3 +513,31 @@ async fn a_picked_list_hidden_for_now_stays_picked() {
         Err(UnknownList("oi-zzz".into()))
     );
 }
+
+#[test]
+fn keep_ready_knows_the_chosen_version_as_the_songs_video() {
+    let registry = crate::services::soulseek::ExternalIdRegistry::in_memory();
+    let id = registry.register(octo_core::soulseek::SoulseekRouting {
+        kind: octo_core::soulseek::RoutingKind::Song,
+        artist: Some("Drake".into()),
+        title: Some("Started".into()),
+        ..Default::default()
+    });
+    assert_eq!(super::keep_ready::known_video_in(&registry, &id), None);
+    registry.set_you_tube_id(&id, "old");
+    registry
+        .choose_stream_video(
+            &id,
+            crate::services::soulseek::StreamChoice {
+                video: "new".into(),
+                by: "ede".into(),
+                at: Utc::now(),
+                ..Default::default()
+            },
+        )
+        .expect("stored");
+    assert_eq!(
+        super::keep_ready::known_video_in(&registry, &id).as_deref(),
+        Some("new")
+    );
+}

@@ -227,6 +227,11 @@ impl StreamSizeWarmer {
     }
 
     fn needs_size(&self, song_id: &str, search: bool) -> bool {
+        // A song waiting for its next play to take a chosen video has no size to learn yet: its
+        // pin is the video it leaves.
+        if self.registry.awaits_switch(song_id) {
+            return false;
+        }
         self.registry.lookup(song_id).is_some_and(|routing| {
             let r = routing.lock();
             r.kind == RoutingKind::Song
@@ -257,6 +262,9 @@ impl StreamSizeWarmer {
     /// same search a play would make, pinned so the size is the size of what plays. None when
     /// nothing was asked; else whether the lookup brought an answer.
     pub async fn warm_one(&self, song_id: &str) -> Option<bool> {
+        if self.registry.awaits_switch(song_id) {
+            return None;
+        }
         let routing = self.registry.lookup(song_id)?;
         let r: SoulseekRouting = routing.snapshot();
         let loudness = self.loudness_wanted.lock().remove(song_id) && r.track_gain.is_none();
@@ -447,8 +455,10 @@ impl IdRegistry for StreamSizeWarmer {
         self.registry.register(routing)
     }
 
+    /// Only while the song's video is the one it is pinned to: a song waiting for its switch
+    /// lists no size of the video it leaves.
     fn stream_facts(&self, song_id: &str) -> Option<StreamFacts> {
-        self.registry.stream_facts(song_id)
+        self.registry.song_stream_facts(song_id)
     }
 
     /// Within an answer, noted for when it is done; outside one (nothing says how long the

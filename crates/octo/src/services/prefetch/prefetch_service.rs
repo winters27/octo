@@ -533,6 +533,21 @@ impl PrefetchService {
                 state.resting_for_mornye.remove(&key);
             }
         }
+        // A copy judged against another video than the one a person chose for the song is
+        // deleted and fetched again; one a heart or a play holds stays (unserved) until it is let
+        // go, and is not fetched again meanwhile.
+        if let Some(names) = &self.parts.names
+            && let Some(routing) = names.peek(external_id)
+        {
+            let routing = routing.snapshot();
+            if names.pin_guarded(&routing)
+                && let Some(video) = names.song_video(&routing)
+                && self.parts.store.drop_misjudged(provider, external_id, &video)
+                    == crate::services::prefetch::store::Misjudged::Kept
+            {
+                return false;
+            }
+        }
         if self.parts.store.is_ready(provider, external_id)
             || self.parts.queue.is_in_flight(provider, external_id)
         {

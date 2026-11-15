@@ -431,3 +431,41 @@ async fn a_play_during_a_lookup_still_gets_its_loudness_asked_for() {
         "queued again for its loudness"
     );
 }
+
+#[test]
+fn a_song_waiting_for_its_chosen_video_is_neither_warmed_nor_listed_with_the_old_size() {
+    let registry = Arc::new(ExternalIdRegistry::in_memory());
+    let id = registry.register(SoulseekRouting {
+        kind: RoutingKind::Song,
+        artist: Some("Drake".into()),
+        title: Some("Started".into()),
+        ..Default::default()
+    });
+    registry.set_you_tube_id(&id, "old");
+    registry.remember_stream(
+        &id,
+        "old",
+        &StreamFacts {
+            itag: Some("140".into()),
+            ..Default::default()
+        },
+    );
+    registry
+        .choose_stream_video(
+            &id,
+            crate::services::soulseek::StreamChoice {
+                video: "new".into(),
+                by: "ede".into(),
+                at: chrono::Utc::now(),
+                ..Default::default()
+            },
+        )
+        .expect("stored");
+    let warmer = StreamSizeWarmer::new(Arc::clone(&registry), Arc::new(FakeShim::default()));
+    assert!(!warmer.want(&id, true));
+    assert_eq!(IdRegistry::stream_facts(&warmer, &id), None);
+    assert!(
+        registry.stream_facts(&id).is_some(),
+        "the old video's facts are still on the routing"
+    );
+}

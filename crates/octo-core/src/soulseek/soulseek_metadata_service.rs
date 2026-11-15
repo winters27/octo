@@ -23,6 +23,26 @@ pub enum RoutingKind {
     Artist = 2,
 }
 
+/// One play of a song on one device, with the video it started on: every later request of that
+/// play gets the same video's bytes, even after the song's video changed. Kept on the routing,
+/// so a restart keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct PlayBinding {
+    /// The device's play key.
+    pub key: String,
+    /// The play token the app sent with the play, when it sends one.
+    pub token: Option<String>,
+    /// The client address the play started from.
+    pub address: Option<String>,
+    /// The video the play gets.
+    pub video: String,
+    /// That video's whole size, once a response named it.
+    pub size: Option<u64>,
+    /// Whether a body of the play reached the file's last byte.
+    pub finished: bool,
+}
+
 /// Where an outside song, album or artist came from, enough to find it again: what the short
 /// external ids Octo hands to Subsonic clients stand for.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -133,6 +153,10 @@ pub struct SoulseekRouting {
     /// What each person heard of this song, one per person, at most 8, the least recently heard
     /// first out.
     pub heard: Vec<HeardBy>,
+
+    /// The plays of this song bound to their videos, at most [`Self::MAX_PLAYS`], the least
+    /// recently bound first out. Written only when there are some.
+    pub plays: Vec<PlayBinding>,
 }
 
 /// The gain and peak are plain measured numbers, never NaN, so equality is total.
@@ -147,6 +171,12 @@ impl SoulseekRouting {
 
     /// The mark of a video the song was named by, which no ranking picked.
     pub const VIDEO_NAMED: u8 = u8::MAX;
+
+    /// The mark of a video a person chose for the song.
+    pub const VIDEO_CHOSEN: u8 = 254;
+
+    /// How many plays a song keeps bound to their videos; the least recently bound goes first.
+    pub const MAX_PLAYS: usize = 16;
 
     /// How many album contexts a song keeps; the least recently listed goes first.
     pub const MAX_CONTEXTS: usize = 8;
@@ -431,6 +461,7 @@ impl Serialize for SoulseekRouting {
             self.video_pick > 0,
             !self.contexts.is_empty(),
             !self.heard.is_empty(),
+            !self.plays.is_empty(),
         ]
         .into_iter()
         .filter(|known| *known)
@@ -493,6 +524,9 @@ impl Serialize for SoulseekRouting {
         }
         if !self.heard.is_empty() {
             s.serialize_field("Heard", &self.heard)?;
+        }
+        if !self.plays.is_empty() {
+            s.serialize_field("Plays", &self.plays)?;
         }
         if from_file {
             s.serialize_field(SHOWN_FROM_FILE, &true)?;
@@ -757,6 +791,36 @@ mod tests {
 
         routing.pin_video("vid-b");
         assert_eq!(routing.stream_facts(), StreamFacts::default());
+    }
+
+    #[test]
+    fn plays_are_written_only_when_there_are_some_and_read_back() {
+        let none = crate::json::to_string(&SoulseekRouting::default());
+        assert!(!none.contains("\"Plays\""), "{none}");
+
+        let routing = SoulseekRouting {
+            you_tube_id: Some("v2".into()),
+            video_pick: SoulseekRouting::VIDEO_CHOSEN,
+            plays: vec![PlayBinding {
+                key: "x_device".into(),
+                token: Some("entry-7.0".into()),
+                address: Some("10.0.0.2".into()),
+                video: "v1".into(),
+                size: Some(4_000_000),
+                finished: false,
+            }],
+            ..Default::default()
+        };
+        let json = crate::json::to_string(&routing);
+        assert!(json.contains(r#""VideoPick":254"#), "{json}");
+        assert!(
+            json.contains(r#""Plays":[{"Key":"x_device","Token":"entry-7.0""#),
+            "{json}"
+        );
+        let back: SoulseekRouting = serde_json::from_str(&json).expect("reads back");
+        assert_eq!(back, routing);
+        let older: SoulseekRouting = serde_json::from_str(r#"{"Kind":0,"YouTubeId":"v"}"#).expect("reads");
+        assert!(older.plays.is_empty());
     }
 
     use crate::fingerprint::heart_gate::HeardSource;
