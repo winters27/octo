@@ -361,6 +361,65 @@ fn the_search_duration_wait_binds_from_the_environment_and_is_clamped() {
     );
 }
 
+/// The album fill switch is on unless the environment or settings.json turns it off, and the
+/// environment variable only binds under its Subsonic section.
+#[test]
+fn the_album_fill_switch_binds_from_env_and_settings_json() {
+    let file = settings_file(None);
+    let store = SettingsStore::from_env(env(&[]), Some(file.path.clone()));
+    assert!(store.current().subsonic.fill_missing_album_tracks, "default on");
+
+    let store = SettingsStore::from_env(
+        env(&[("Subsonic__FillMissingAlbumTracks", "false")]),
+        Some(file.path.clone()),
+    );
+    assert!(!store.current().subsonic.fill_missing_album_tracks);
+    assert_eq!(
+        store.raw("Subsonic:FillMissingAlbumTracks").as_deref(),
+        Some("false")
+    );
+
+    // Without the section prefix the variable binds another path, so the switch stays on.
+    let store = SettingsStore::from_env(
+        env(&[("FILL_MISSING_ALBUM_TRACKS", "false")]),
+        Some(file.path.clone()),
+    );
+    assert!(store.current().subsonic.fill_missing_album_tracks);
+    assert_eq!(store.raw("FILL_MISSING_ALBUM_TRACKS").as_deref(), Some("false"));
+
+    // An unconvertible value keeps the default, as every typed setting does.
+    let store = SettingsStore::from_env(
+        env(&[("Subsonic__FillMissingAlbumTracks", "maybe")]),
+        Some(file.path.clone()),
+    );
+    assert!(store.current().subsonic.fill_missing_album_tracks);
+
+    // settings.json beats the environment.
+    let file = settings_file(Some(r#"{"Subsonic": {"FillMissingAlbumTracks": false}}"#));
+    let store = SettingsStore::from_env(
+        env(&[("Subsonic__FillMissingAlbumTracks", "true")]),
+        Some(file.path.clone()),
+    );
+    assert!(!store.current().subsonic.fill_missing_album_tracks);
+}
+
+/// The switch serializes as `Subsonic.FillMissingAlbumTracks`, the key it binds from.
+#[test]
+fn the_album_fill_switch_round_trips_through_json() {
+    let settings: AppSettings =
+        serde_json::from_str(r#"{"Subsonic": {"FillMissingAlbumTracks": false}}"#).expect("json");
+    assert!(!settings.subsonic.fill_missing_album_tracks);
+
+    let written = serde_json::to_value(&settings).expect("json");
+    assert_eq!(
+        written["Subsonic"]["FillMissingAlbumTracks"],
+        serde_json::json!(false)
+    );
+
+    let empty: AppSettings = serde_json::from_str("{}").expect("json");
+    assert!(empty.subsonic.fill_missing_album_tracks);
+}
+
 // ---- The File layout through .env -------------------------------------------------------------
 
 fn repo_file(name: &str) -> String {

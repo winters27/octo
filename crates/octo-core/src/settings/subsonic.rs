@@ -339,6 +339,15 @@ pub struct SubsonicSettings {
     /// Environment variable: SKIP_OWNED_SONGS
     pub skip_owned_songs: bool,
 
+    /// Fill an album's missing slots from the external catalog (default: true).
+    /// Environment variable: Subsonic__FillMissingAlbumTracks
+    ///
+    /// On, an album requested by its library id answers with the local songs and the catalog's
+    /// tracks for the slots the library does not have. Off, an album with at least one local
+    /// song answers with its local songs only, and an album with no local song still answers
+    /// with the catalog's tracklist, so an unowned album stays discoverable.
+    pub fill_missing_album_tracks: bool,
+
     /// In Permanent mode, block the first play until the lossless copy has been fetched
     /// (default: false).
     /// Environment variable: WAIT_FOR_LOSSLESS_ON_PLAY
@@ -460,6 +469,7 @@ impl Default for SubsonicSettings {
             record_requested_by: true,
             star_downloads_for_requester: false,
             skip_owned_songs: true,
+            fill_missing_album_tracks: true,
             wait_for_lossless_on_play: false,
             lossless_wait_timeout_seconds: 0,
             download_on_play: false,
