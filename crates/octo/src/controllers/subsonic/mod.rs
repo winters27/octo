@@ -30,6 +30,7 @@ pub mod held;
 pub mod imports;
 pub mod lyrics;
 pub mod media;
+pub mod media_convert;
 pub mod stars;
 
 pub(crate) mod playlist_names;
@@ -61,6 +62,8 @@ mod list_groups_tests;
 mod lyrics_endpoint_tests;
 #[cfg(test)]
 mod marked_lists_tests;
+#[cfg(test)]
+mod media_convert_tests;
 #[cfg(test)]
 mod media_tests;
 #[cfg(test)]

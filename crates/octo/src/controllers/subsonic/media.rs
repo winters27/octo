@@ -32,9 +32,10 @@ use tracing::{debug, error, info, warn};
 
 use super::action_helpers::MAX_REQUEST_BODY;
 use super::caller_checks::{
-    SubsonicCall, file, is_first_byte_request, is_successful_subsonic_response, refuse_unless_signed_in,
-    requester_for, signed_in_user,
+    SubsonicCall, file, is_successful_subsonic_response, refuse_unless_signed_in, requester_for,
+    signed_in_user,
 };
+use super::media_convert::{self, Funnel};
 use crate::app::AppState;
 use crate::http::catch_all;
 use crate::http::error::{AppError, AppResult, json_status, problem};
@@ -48,9 +49,11 @@ use crate::services::cover_art::local_cover_cache::{CoverPicture, Fetched, NotKe
 use crate::services::family::device_registry::detected_device_id;
 use crate::services::family::{FamilyCaller, LibraryScope, audio_gate, family_caller};
 use crate::services::fingerprint::music_brainz_client::heart_song;
+use crate::services::i_download_service::DirectStreamInfo;
 use crate::services::i_download_service::StreamPlay;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::library::{GeneratedPlaylist, navidrome_song_list};
+use crate::services::prefetch::convert_rules::{Ask, AskOf, GateClient};
 use crate::services::prefetch::{Capture, FpcalcClass, Source, from_start, sample_cap, sample_id_of};
 use crate::services::soulseek::soulseek_download_service::played_size;
 use crate::services::subsonic::subsonic_proxy_service::content_type_of;
@@ -74,6 +77,10 @@ pub fn routes() -> RouteSet {
             "getTranscodeDecision",
             get(get_transcode_decision).post(get_transcode_decision),
         )
+        .subsonic(
+            "getTranscodeStream",
+            get(get_transcode_stream).post(get_transcode_stream),
+        )
 }
 
 // ---------------------------------------------------------------------------------------
@@ -82,13 +89,20 @@ pub fn routes() -> RouteSet {
 
 /// Downloads on-the-fly if needed, or streams directly in Stream mode.
 pub async fn stream(State(state): State<AppState>, req: Request) -> AppResult {
-    serve_stream(state, req, true).await
+    serve_stream(state, req, true, None).await
 }
 
 /// `stream`'s answer. `player_stream`: the request is a player's stream, so one from the first
 /// byte is that player starting the song; `download` serves an outside song through here too,
-/// and a download starts nothing.
-async fn serve_stream(state: AppState, req: Request, player_stream: bool) -> AppResult {
+/// and a download starts nothing. `forced`: the song id and the ask `getTranscodeStream`
+/// decoded, in place of the request's own.
+async fn serve_stream(
+    state: AppState,
+    req: Request,
+    player_stream: bool,
+    forced: Option<(String, AskOf)>,
+) -> AppResult {
+    let arrived = tokio::time::Instant::now();
     let caller = family_caller(req.extensions()).cloned();
     let address = req
         .extensions()
@@ -98,7 +112,10 @@ async fn serve_stream(state: AppState, req: Request, player_stream: bool) -> App
         Ok(call) => call,
         Err(response) => return Ok(response),
     };
-    let id = call.param("id").to_string();
+    let (id, forced) = match forced {
+        Some((id, ask)) => (id, Some(ask)),
+        None => (call.param("id").to_string(), None),
+    };
     // Needed so a failure here can answer with a real Subsonic error envelope instead
     // of the bare JSON this method used to emit.
     let format = call.format();
@@ -123,7 +140,7 @@ async fn serve_stream(state: AppState, req: Request, player_stream: bool) -> App
         "STREAM-IN client={client_name} id={id} isExternal={} range={range_in} ua={ua_in}",
         if is_external { "True" } else { "False" }
     );
-    if player_stream {
+    if player_stream && !is_external {
         note_listening(&state, &call, address, &id).await;
     }
 
@@ -145,9 +162,17 @@ async fn serve_stream(state: AppState, req: Request, player_stream: bool) -> App
 
     let provider = provider.unwrap_or_default();
     let external_id = external_id.unwrap_or_default();
+    // What the client asks of the song (its format and size, a time seek), read once: every play
+    // check below reads it, so a time seek of a playing song never counts as a new play.
     let request = stream_play(&state, &call, caller.as_ref(), address).await;
+    let endpoint = if player_stream { "stream" } else { "download" };
+    let outside = media_convert::read_outside(&state, &call, &request, &id, endpoint, forced, arrived);
+    let _ = call.outside.set(outside);
+    if player_stream {
+        note_listening(&state, &call, address, &id).await;
+    }
 
-    if plays_from_first_byte(&call, call.header("Range").as_deref()) {
+    if call.starts_play() {
         // A stream and a heart of one song id meet on one registered routing.
         state.external_id_registry.resolve_song(&external_id, true);
         warm_up_playing(&state, &external_id);
@@ -236,7 +261,7 @@ async fn serve_stream(state: AppState, req: Request, player_stream: bool) -> App
                         state.prefetch.store().touch(&provider, &external_id);
                     }
                     heard_file(&state, &call, &provider, &external_id, source, &local_path).await;
-                    return serve_file(&call, &local_path).await;
+                    return media_convert::serve_outside_file(&state, &call, &external_id, &local_path).await;
                 }
                 OutsideFile::Relayed(response) => return Ok(response),
                 // Not this caller's to have as a file: it plays from its source below.
@@ -273,7 +298,7 @@ async fn serve_stream(state: AppState, req: Request, player_stream: bool) -> App
 /// Download on play holds there for another song. Looked at only while some play waits.
 async fn note_listening(state: &AppState, call: &SubsonicCall, address: Option<IpAddr>, id: &str) {
     let listening = state.heart_acquisition_coordinator.listening();
-    if listening.is_empty() || !plays_from_first_byte(call, call.header("Range").as_deref()) {
+    if listening.is_empty() || !call.starts_play() {
         return;
     }
     let Ok(who) = signed_in_user(state, call).await else {
@@ -291,9 +316,7 @@ fn note_playing(
     id: &str,
     who: Option<String>,
 ) {
-    if !state.settings.current().prefetch.enabled
-        || !plays_from_first_byte(call, call.header("Range").as_deref())
-    {
+    if !state.settings.current().prefetch.enabled || !call.starts_play() {
         return;
     }
     let (state, caller, id) = (state.clone(), caller.cloned(), id.to_string());
@@ -347,10 +370,10 @@ fn warm_up_playing(state: &AppState, external_id: &str) {
     );
 }
 
-/// Who a first-byte play of an outside song is heard by: the signed-in listener, when there is
-/// one and the request starts at the first byte.
-async fn heard_by_whom(state: &AppState, call: &SubsonicCall) -> Option<String> {
-    if !plays_from_first_byte(call, call.header("Range").as_deref()) {
+/// Who a play of an outside song that starts here is heard by: the signed-in listener, when
+/// there is one and the request starts a play.
+pub(super) async fn heard_by_whom(state: &AppState, call: &SubsonicCall) -> Option<String> {
+    if !call.starts_play() {
         return None;
     }
     signed_in_user(state, call)
@@ -393,7 +416,7 @@ fn played_mark(state: &AppState, call: &SubsonicCall, external_id: &str, user: &
 }
 
 /// The song's length as the routing knows it.
-fn song_seconds(state: &AppState, external_id: &str) -> Option<i32> {
+pub(super) fn song_seconds(state: &AppState, external_id: &str) -> Option<i32> {
     state
         .external_id_registry
         .resolve_song(external_id, false)
@@ -402,7 +425,7 @@ fn song_seconds(state: &AppState, external_id: &str) -> Option<i32> {
 }
 
 /// Whose `fpcalc` run a play's sample is: a heart's when the listener holds the song.
-fn sample_class(state: &AppState, provider: &str, external_id: &str, user: &str) -> FpcalcClass {
+pub(super) fn sample_class(state: &AppState, provider: &str, external_id: &str, user: &str) -> FpcalcClass {
     let holds = state
         .soulseek_holds
         .records_for(&track_base_key(provider, external_id));
@@ -449,7 +472,7 @@ async fn own_version(
 
 /// Keeps `source` as what `user` heard of the song now, with the played mark, and the id of its
 /// sample when its prints are already stored. Answers the record kept.
-fn keep_heard(
+pub(super) fn keep_heard(
     state: &AppState,
     call: &SubsonicCall,
     external_id: &str,
@@ -537,7 +560,7 @@ const VIDEO_HEADER: &str = "x-octo-video";
 
 /// Names the video an outside song's answer was made from, so an Octo app tells a saved copy of
 /// another video from this one.
-fn name_video(response: &mut Response, video: Option<&str>) {
+pub(super) fn name_video(response: &mut Response, video: Option<&str>) {
     if let Some(value) = video
         .filter(|video| !video.is_empty())
         .and_then(|video| HeaderValue::from_str(video).ok())
@@ -621,18 +644,6 @@ async fn stream_play(
     }
 }
 
-/// Whether a request is a scout read (`X-Octo-Purpose: scout`): an Octo app analyzing a song it
-/// plays or will play, which starts nothing.
-fn is_scout(call: &SubsonicCall) -> bool {
-    call.header("X-Octo-Purpose")
-        .is_some_and(|purpose| purpose.trim().eq_ignore_ascii_case("scout"))
-}
-
-/// [`is_first_byte_request`] for a play: a scout read from the first byte starts none.
-fn plays_from_first_byte(call: &SubsonicCall, range: Option<&str>) -> bool {
-    !is_scout(call) && is_first_byte_request(call.method().as_str(), range)
-}
-
 /// A play of an outside song in an Octo app, while getting songs ahead is on or the song is kept
 /// here. A request from the first byte gets the song's FLAC when one is ready for this caller
 /// (downloaded ahead, or kept by a heart), and the
@@ -677,7 +688,7 @@ async fn play_in_octo_app(
     let source = state.prefetch.sources().choose(
         std::slice::from_ref(&play.stream.key),
         play.id,
-        starts,
+        starts && call.outside_ask().map_or(0, |outside| outside.ask.offset) == 0,
         ready.as_deref().map(Path::new),
         length,
         !looks,
@@ -695,7 +706,7 @@ async fn play_in_octo_app(
                     info!("Playing {} from its FLAC copy ({file})", play.id);
                     let heard =
                         heard_file(state, call, play.provider, play.external_id, heard_source, &file).await;
-                    let response = serve_file(call, &file)
+                    let response = media_convert::serve_outside_file(state, call, play.external_id, &file)
                         .await
                         .unwrap_or_else(IntoResponse::into_response);
                     (response, heard)
@@ -747,8 +758,7 @@ async fn start_play_acquisition(
     heard: Option<HeardRecord>,
 ) -> anyhow::Result<()> {
     let settings = state.settings.current().subsonic.clone();
-    let range = call.header("Range");
-    let first_byte = plays_from_first_byte(call, range.as_deref());
+    let first_byte = call.starts_play();
     if !first_byte && !settings.wait_for_lossless_on_play {
         return Ok(());
     }
@@ -842,7 +852,7 @@ pub async fn download(State(state): State<AppState>, req: Request) -> AppResult 
     let outside = state.local_library.parse_song_id(call.param("id")).0;
     let req = Request::from_parts(parts, Body::from(body));
     if outside {
-        serve_stream(state, req, false).await
+        serve_stream(state, req, false, None).await
     } else {
         Ok(catch_all::catch_all(State(state), req).await)
     }
@@ -867,11 +877,10 @@ async fn play_external(
     // acquisition unless DownloadOnPlay or LidarrAlbumOnPlay are on: owned ids
     // already went to Navidrome above, and missing ids stream from YouTube below.
     // Hearts are the normal permanent-copy gesture.
-    // Only a request from the first byte is a play. Clients ask again with a later
-    // Range on every seek and while buffering. A transcoded request (format,
-    // maxBitRate) is still a play and counts.
-    let range = call.header("Range");
-    let first_byte = plays_from_first_byte(call, range.as_deref());
+    // Only a request that starts a play counts. Clients ask again with a later Range (or a
+    // time seek) on every seek and while buffering. A transcoded request (format, maxBitRate)
+    // is still a play and counts.
+    let first_byte = call.starts_play();
     // The play is queued once its source is chosen, with what that source played.
     let queue_play = |heard: Option<HeardRecord>| async move {
         if !first_byte {
@@ -1059,7 +1068,12 @@ async fn serve_acquired(
                 &path,
             )
             .await;
-            Ok((serve_file(call, &path).await.map_err(anyhow::Error::new)?, heard))
+            Ok((
+                media_convert::serve_outside_file(state, call, external_id, &path)
+                    .await
+                    .map_err(anyhow::Error::new)?,
+                heard,
+            ))
         }
         OutsideFile::Relayed(response) => Ok((response, None)),
         OutsideFile::Withheld => {
@@ -1096,6 +1110,19 @@ async fn flac_stand_in(
     provider: &str,
     external_id: &str,
 ) -> anyhow::Result<Option<(Response, Option<HeardRecord>)>> {
+    // A client that asked for a format or a smaller copy gets it, made from the same video; the
+    // stand-in is built as before when that copy cannot be had.
+    if let Some(outside) = call.outside_ask().cloned()
+        && !matches!(outside.ask.ask, Ask::None)
+    {
+        match media_convert::converted_stream(state, call, provider, external_id, true).await? {
+            Funnel::Answer(response, heard) => return Ok(Some((response, heard))),
+            Funnel::AsIs => {
+                return direct_stream(state, call, request, provider, external_id, &outside.id).await;
+            }
+            Funnel::Today => {}
+        }
+    }
     let registry = &state.external_id_registry;
     let range = call.header("Range");
     let (decision, pinned, confirmed) = stand_in_video(state, request, range.as_deref(), external_id);
@@ -1279,7 +1306,15 @@ async fn outside_file(
     };
     let mut parameters = call.parameters.clone();
     parameters.insert("id".into(), song.id);
-    audio_gate::rewrite_parameters(caller, "stream", &mut parameters);
+    let user_agent = call.header("User-Agent").unwrap_or_default();
+    let client = call
+        .own_ask
+        .as_ref()
+        .map_or_else(|| GateClient::of(call.param("c"), &user_agent), |own| own.client);
+    let offline = call
+        .header("X-Octo-Purpose")
+        .is_some_and(|purpose| purpose.trim().eq_ignore_ascii_case("offline"));
+    audio_gate::rewrite_parameters(caller, "stream", &mut parameters, client, offline);
     OutsideFile::Relayed(call.proxy.relay_stream(&parameters).await)
 }
 
@@ -1294,6 +1329,12 @@ async fn direct_stream(
     external_id: &str,
     id: &str,
 ) -> anyhow::Result<Option<(Response, Option<HeardRecord>)>> {
+    // A client that asked for a format or a smaller copy is answered first, before the range
+    // check below, which reads the source's size, not the copy's.
+    match media_convert::converted_stream(state, call, provider, external_id, false).await? {
+        Funnel::Answer(response, heard) => return Ok(Some((response, heard))),
+        Funnel::AsIs | Funnel::Today => {}
+    }
     // Forward the client's Range header up the chain so the shim can
     // ask googlevideo for the requested byte range and we can return
     // a proper 206. iOS Subsonic clients refuse to play non-FLAC
@@ -1347,7 +1388,7 @@ async fn direct_stream(
     );
     // The shim measures a played song's loudness; ask for it once it has had time to.
     let played = matches!(direct.status_code, 200 | 206);
-    if played && plays_from_first_byte(call, range_header.as_deref()) {
+    if played && call.starts_play() {
         state.stream_size_warmer.after_play(external_id);
     }
 
@@ -1395,7 +1436,17 @@ async fn direct_stream(
 
     // Manual stream copy: the network stream isn't seekable, so the upstream's status code +
     // Content-Range are forwarded verbatim and the bytes copied to the response body.
-    let mut response = Response::new(Body::from_stream(body));
+    let direct = DirectStreamInfo {
+        audio_stream: body,
+        ..direct
+    };
+    Ok(Some((stream_response(direct), heard)))
+}
+
+/// A stream's answer as it came: its status, length, type and range, `Accept-Ranges`, and the
+/// video it was made from (`X-Octo-Video`).
+pub(super) fn stream_response(direct: DirectStreamInfo) -> Response {
+    let mut response = Response::new(Body::from_stream(direct.audio_stream));
     *response.status_mut() = StatusCode::from_u16(direct.status_code).unwrap_or(StatusCode::OK);
     name_video(&mut response, direct.video_id.as_deref());
     let headers = response.headers_mut();
@@ -1411,7 +1462,7 @@ async fn direct_stream(
     {
         headers.insert(header::CONTENT_RANGE, range);
     }
-    Ok(Some((response, heard)))
+    response
 }
 
 /// 416 with `Content-Range: bytes */<size>`, as a file past its end answers.
@@ -1427,11 +1478,20 @@ fn range_not_satisfiable(size: u64) -> Response {
 }
 
 /// The file, typed by its extension, with single-range support and no ETag or Last-Modified.
-async fn serve_file(call: &SubsonicCall, path: &str) -> Result<Response, AppError> {
-    let content_type = content_type_for_file(path);
-    let mut file = tokio::fs::File::open(path).await?;
+pub(super) async fn serve_file(call: &SubsonicCall, path: &str) -> Result<Response, AppError> {
+    let file = tokio::fs::File::open(path).await?;
     let length = file.metadata().await?.len();
+    serve_handle(call, file, length, content_type_for_file(path)).await
+}
 
+/// An opened file of `length` bytes as `content_type`, with single-range support and no ETag or
+/// Last-Modified.
+pub(super) async fn serve_handle(
+    call: &SubsonicCall,
+    mut file: tokio::fs::File,
+    length: u64,
+    content_type: &str,
+) -> Result<Response, AppError> {
     // An If-Range the file cannot be checked against (it has no validators) sends it whole.
     let range = call
         .headers()
@@ -1460,7 +1520,9 @@ async fn serve_file(call: &SubsonicCall, path: &str) -> Result<Response, AppErro
     *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_LENGTH, HeaderValue::from(count));
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    let content_type =
+        HeaderValue::from_str(content_type).unwrap_or(HeaderValue::from_static("application/octet-stream"));
+    headers.insert(header::CONTENT_TYPE, content_type);
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if let Some(range) = content_range.and_then(|r| HeaderValue::from_str(&r).ok()) {
         headers.insert(header::CONTENT_RANGE, range);
@@ -1468,8 +1530,9 @@ async fn serve_file(call: &SubsonicCall, path: &str) -> Result<Response, AppErro
     Ok(response)
 }
 
-/// `GetContentType`: the audio type of a file by its extension, `audio/mpeg` by default.
-fn content_type_for_file(path: &str) -> &'static str {
+/// `GetContentType`: the audio type of a file by its extension; `application/octet-stream` for
+/// one it does not know.
+pub(super) fn content_type_for_file(path: &str) -> &'static str {
     let extension = Path::new(path)
         .extension()
         .map(|e| dotnet::to_lower_invariant(&e.to_string_lossy()))
@@ -1477,11 +1540,16 @@ fn content_type_for_file(path: &str) -> &'static str {
     match extension.as_str() {
         "mp3" => "audio/mpeg",
         "flac" => "audio/flac",
-        "ogg" => "audio/ogg",
-        "m4a" => "audio/mp4",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "m4a" | "mp4" => "audio/mp4",
         "wav" => "audio/wav",
         "aac" => "audio/aac",
-        _ => "audio/mpeg",
+        "aiff" | "aif" => "audio/aiff",
+        "webm" => "audio/webm",
+        "wv" => "audio/x-wavpack",
+        "ape" => "audio/x-monkeys-audio",
+        "caf" => "audio/x-caf",
+        _ => "application/octet-stream",
     }
 }
 
@@ -2312,8 +2380,8 @@ pub async fn get_transcode_decision(State(state): State<AppState>, req: Request)
     let (is_external, _, _) = state.local_library.parse_song_id(&media_id);
 
     if is_external {
-        debug!("getTranscodeDecision: direct-play for external id {media_id}");
-        return Ok(direct_play_response(&state));
+        debug!("getTranscodeDecision: Octo decides for external id {media_id}");
+        return Ok(media_convert::transcode_decision(&state, &call, &media_id));
     }
 
     match call
@@ -2340,7 +2408,7 @@ pub async fn get_transcode_decision(State(state): State<AppState>, req: Request)
 /// Feishin's subsonic-controller.ts: requiresTranscoding = !td?.canDirectPlay. Returning the
 /// minimal envelope lets it advance to /rest/stream which is where our own controller takes
 /// over for externals.
-fn direct_play_response(state: &AppState) -> Response {
+pub(super) fn direct_play_response(state: &AppState) -> Response {
     state
         .subsonic_response_builder
         .create_json_response(json!({
@@ -2349,6 +2417,30 @@ fn direct_play_response(state: &AppState) -> Response {
             "transcodeDecision": { "canDirectPlay": true, "canTranscode": false },
         }))
         .into_response()
+}
+
+/// OpenSubsonic `getTranscodeStream`. For an outside song the `transcodeParams` Octo's decision
+/// made are read back into an ask and the song is answered as `stream` answers it; any other id
+/// is Navidrome's.
+pub async fn get_transcode_stream(State(state): State<AppState>, req: Request) -> AppResult {
+    let (parts, body) = req.into_parts();
+    let Ok(body) = axum::body::to_bytes(body, MAX_REQUEST_BODY).await else {
+        return Ok(StatusCode::PAYLOAD_TOO_LARGE.into_response());
+    };
+    let call = SubsonicCall::from_parts(&state, &parts, body.clone());
+    let media_id = call.param("mediaId").to_string();
+    let req = Request::from_parts(parts, Body::from(body));
+    if !state.local_library.parse_song_id(&media_id).0 {
+        return Ok(catch_all::catch_all(State(state), req).await);
+    }
+    let Some(ask) = media_convert::ask_from_params(call.param("transcodeParams"), call.param("offset"))
+    else {
+        return Ok(json_status(
+            StatusCode::BAD_REQUEST,
+            &json!({ "error": "transcodeParams is not one Octo made" }),
+        ));
+    };
+    serve_stream(state, req, true, Some((media_id, ask))).await
 }
 
 #[cfg(test)]
@@ -2378,11 +2470,20 @@ mod tests {
             ("/m/a.mp3", "audio/mpeg"),
             ("/m/a.FLAC", "audio/flac"),
             ("/m/a.ogg", "audio/ogg"),
+            ("/m/a.oga", "audio/ogg"),
+            ("/m/a.opus", "audio/ogg"),
             ("/m/a.m4a", "audio/mp4"),
+            ("/m/a.mp4", "audio/mp4"),
             ("/m/a.wav", "audio/wav"),
             ("/m/a.aac", "audio/aac"),
-            ("/m/a.opus", "audio/mpeg"),
-            ("/m/a", "audio/mpeg"),
+            ("/m/a.aiff", "audio/aiff"),
+            ("/m/a.aif", "audio/aiff"),
+            ("/m/a.webm", "audio/webm"),
+            ("/m/a.wv", "audio/x-wavpack"),
+            ("/m/a.ape", "audio/x-monkeys-audio"),
+            ("/m/a.caf", "audio/x-caf"),
+            ("/m/a", "application/octet-stream"),
+            ("/m/a.xyz", "application/octet-stream"),
         ] {
             assert_eq!(content_type_for_file(path), content_type, "{path}");
         }

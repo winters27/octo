@@ -151,6 +151,7 @@ use crate::services::playlists::held_playlists::{
 };
 use crate::services::playlists::held_store::HeldStore;
 use crate::services::playlists::seed_index::SeedIndex;
+use crate::services::prefetch::converted_copies::ConvertedCopies;
 use crate::services::prefetch::{
     AppKeepReadySources, HeardSampleParts, HeardSamples, KeepReadyService, KeepReadyStore, PrefetchParts,
     PrefetchService, PrefetchStore, PrefetchedFiles, PreviewCopies,
@@ -346,6 +347,11 @@ pub struct AppInner {
     pub prefetch: Arc<PrefetchService>,
     /// `PreviewCopies`: whole copies of outside songs' previews, `<config>/preview-copies`.
     pub preview_copies: Arc<PreviewCopies>,
+    /// `ConvertedCopies`: songs found online made in the format a client asks for,
+    /// `<config>/preview-copies/converted`.
+    pub converted_copies: Arc<ConvertedCopies>,
+    /// The time seeks of songs found online running now, one per play.
+    pub seek_runs: Arc<crate::controllers::subsonic::media_convert::SeekRuns>,
     /// `HeardSamples`: the prints of what each person heard, `<config>/heard-samples`, with
     /// scratch files under `<config>/preview-copies/scratch`; the `fpcalc` queue and the shim's
     /// rounds.
@@ -1668,6 +1674,7 @@ struct Stores {
     radio_queues: Arc<RadioQueueStore>,
     prefetch_store: Arc<PrefetchStore>,
     preview_copies: Arc<PreviewCopies>,
+    converted_copies: Arc<ConvertedCopies>,
     heard_samples: Arc<HeardSamples>,
     directory_browser: Arc<DirectoryBrowser>,
     browse_sessions: Arc<BrowseSessionStore>,
@@ -1745,6 +1752,14 @@ impl Stores {
             Clock::system(),
             move || copies_settings.current().prefetch.effective_min_free_bytes(),
         );
+        // Songs found online made in the format a client asks for, beside the copies they are
+        // made from, under the same free-space floor.
+        let converted_settings = settings.clone();
+        let converted_copies = ConvertedCopies::new(
+            config_dir.join("preview-copies").join("converted"),
+            Clock::system(),
+            move || converted_settings.current().prefetch.effective_min_free_bytes(),
+        );
         let cover_settings = settings.clone();
         let local_cover_cache = Arc::new(LocalCoverCache::new(
             config_dir.join("cover-cache"),
@@ -1784,6 +1799,7 @@ impl Stores {
             radio_queues: Arc::new(RadioQueueStore::new()),
             prefetch_store,
             preview_copies,
+            converted_copies,
             heard_samples,
             directory_browser: Arc::new(DirectoryBrowser::new()),
             browse_sessions: Arc::new(BrowseSessionStore::new(Some(
@@ -3606,6 +3622,7 @@ impl AppState {
         );
         prefetch.use_mixes(radio.generated_playlists.clone());
         prefetch.use_preview_copies(stores.preview_copies.clone());
+        prefetch.use_converted_copies(stores.converted_copies.clone());
         {
             let prefetch = prefetch.clone();
             workers.register("PrefetchService", move |stopping| prefetch.clone().run(stopping));
@@ -3838,6 +3855,8 @@ impl AppState {
             radio_queues: stores.radio_queues,
             prefetch,
             preview_copies: stores.preview_copies,
+            converted_copies: stores.converted_copies,
+            seek_runs: Default::default(),
             heard_samples: stores.heard_samples,
             keep_ready,
             directory_browser: stores.directory_browser,
@@ -4165,6 +4184,7 @@ impl AppState {
         );
         prefetch.use_mixes(radio.generated_playlists.clone());
         prefetch.use_preview_copies(stores.preview_copies.clone());
+        prefetch.use_converted_copies(stores.converted_copies.clone());
         // Apple's pages from the test's mock server, else an address that refuses at once (a
         // port the system handed out and let go: never port 1, which WSL's mirrored networking
         // lets time out). The warm worker is not run.
@@ -4340,6 +4360,8 @@ impl AppState {
             radio_queues: stores.radio_queues,
             prefetch,
             preview_copies: stores.preview_copies,
+            converted_copies: stores.converted_copies,
+            seek_runs: Default::default(),
             heard_samples: stores.heard_samples,
             keep_ready,
             directory_browser: stores.directory_browser,

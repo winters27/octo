@@ -28,7 +28,7 @@ use indexmap::IndexMap;
 use octo_core::common::dotnet::eq_ignore_case;
 use octo_core::family::abilities::Role;
 use octo_core::family::device::NetworkPlace;
-use octo_core::family::policy::{ClientAsk, Refusal, StreamRewrite, cap_for, stream_rewrite};
+use octo_core::family::policy::{ClientAsk, GateKind, Refusal, StreamRewrite, cap_for, stream_rewrite};
 use octo_core::settings::SettingsStore;
 use octo_subsonic::subsonic_request_parser::{
     Parameters, RequestParts, RequestReading, escape_data_string, json_object, read_request,
@@ -46,6 +46,7 @@ use super::stream_tracker::{SongName, StreamPurpose, StreamStart, StreamTracker}
 use crate::app::AppState;
 use crate::services::i_music_metadata_service::IMusicMetadataService;
 use crate::services::local::ILocalLibraryService;
+use crate::services::prefetch::convert_rules::{GateClient, OwnAsk};
 use crate::services::subsonic::SubsonicProxyService;
 
 pub const NOT_AVAILABLE: &str = "Not available on this account.";
@@ -544,21 +545,39 @@ impl ParamRewrite {
     }
 }
 
+/// The parameter a stream's rate is asked in: `bitrate` on `download`, `maxBitRate` otherwise.
+fn rate_key(endpoint: &str) -> &'static str {
+    if eq_ignore_case(endpoint, "download") {
+        "bitrate"
+    } else {
+        "maxBitRate"
+    }
+}
+
+/// The gate's own word for which Octo app asks.
+pub fn gate_kind(client: GateClient) -> GateKind {
+    match client {
+        GateClient::OctoDesktop => GateKind::Desktop,
+        GateClient::OctoPhone => GateKind::Phone,
+        GateClient::Other => GateKind::Other,
+    }
+}
+
 /// The quality rewrite for one audio request, or Err when the caller is away from home with
-/// away listening off.
+/// away listening off. `kind` is the app asking; `offline` an offline copy.
 pub fn quality_rewrite(
     caller: &FamilyCaller,
     endpoint: &str,
     parameters: &Parameters,
+    kind: GateKind,
+    offline: bool,
 ) -> Result<ParamRewrite, Refusal> {
-    let rate_key = if eq_ignore_case(endpoint, "download") {
-        "bitrate"
-    } else {
-        "maxBitRate"
-    };
+    let rate_key = rate_key(endpoint);
     let client = ClientAsk {
         format: parameter(parameters, "format"),
         max_bit_rate: parameter(parameters, rate_key).and_then(|v| v.trim().parse().ok()),
+        client: kind,
+        offline,
     };
     let rewrite: StreamRewrite = stream_rewrite(
         &caller.abilities,
@@ -570,24 +589,53 @@ pub fn quality_rewrite(
     let mut set = Vec::new();
     if let Some(format) = rewrite.format {
         set.push(("format".to_string(), format.to_string()));
-    } else if rewrite.drop_raw
-        && client
-            .format
-            .is_some_and(|f| f.trim().eq_ignore_ascii_case("raw"))
-    {
-        set.push(("format".to_string(), "opus".to_string()));
     }
     if let Some(rate) = rewrite.max_bit_rate {
         set.push((rate_key.to_string(), rate.to_string()));
+    }
+    if rewrite.estimate {
+        set.push(("estimateContentLength".to_string(), "true".to_string()));
     }
     Ok(ParamRewrite { set })
 }
 
 /// Sets the caller's quality on parameters Octo relays itself (a library copy it plays in place
 /// of a file). Does nothing when no ceiling applies.
-pub fn rewrite_parameters(caller: &FamilyCaller, endpoint: &str, parameters: &mut Parameters) {
-    if let Ok(rewrite) = quality_rewrite(caller, endpoint, parameters) {
+pub fn rewrite_parameters(
+    caller: &FamilyCaller,
+    endpoint: &str,
+    parameters: &mut Parameters,
+    client: GateClient,
+    offline: bool,
+) {
+    if let Ok(rewrite) = quality_rewrite(caller, endpoint, parameters, gate_kind(client), offline) {
         rewrite.apply_to(parameters);
+    }
+}
+
+/// What the client itself asked of a stream, before the gate set its quality: its own `format`
+/// and rate, the ceiling the gate applied (none when it set no rate) and which app asks.
+pub fn own_ask_of(
+    endpoint: &str,
+    parameters: &Parameters,
+    rewrite: &ParamRewrite,
+    client: GateClient,
+) -> OwnAsk {
+    let rate_key = rate_key(endpoint);
+    let ceiling = rewrite
+        .set
+        .iter()
+        .find(|(name, _)| name == rate_key)
+        .and_then(|(_, value)| value.parse().ok());
+    OwnAsk {
+        format: parameter(parameters, "format")
+            .map(|format| format.trim().to_string())
+            .filter(|format| !format.is_empty()),
+        rate: parameter(parameters, rate_key)
+            .and_then(|value| value.trim().parse().ok())
+            .filter(|rate: &u32| *rate > 0),
+        ceiling,
+        client,
     }
 }
 
@@ -752,12 +800,19 @@ pub struct UnreadableBody;
 pub struct AudioPlan {
     rewrite: ParamRewrite,
     start: Option<StreamStart>,
+    /// What the client itself asked, for the handler (an audio request only).
+    own: Option<OwnAsk>,
 }
 
 impl AudioPlan {
     /// The parameters the request gets.
     pub fn rewrite(&self) -> &ParamRewrite {
         &self.rewrite
+    }
+
+    /// What the client itself asked of the stream, before the gate set its quality.
+    pub fn own_ask(&self) -> Option<&OwnAsk> {
+        self.own.as_ref()
     }
 
     /// The query and body with this plan's quality set: in the query, and taken out of a
@@ -946,9 +1001,22 @@ pub async fn admit(
             return Err(refuse(50, &format!("Playing on {name} now.")));
         }
     }
-    let rewrite = quality_rewrite(caller, endpoint, parameters).map_err(|r| refuse(50, r.message()))?;
+    let client = GateClient::of(
+        parameter(parameters, "c").unwrap_or(""),
+        headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+    );
+    let rewrite = quality_rewrite(caller, endpoint, parameters, gate_kind(client), offline)
+        .map_err(|r| refuse(50, r.message()))?;
+    let own = Some(own_ask_of(endpoint, parameters, &rewrite, client));
     if method == Method::HEAD {
-        return Ok(AudioPlan { rewrite, start: None });
+        return Ok(AudioPlan {
+            rewrite,
+            start: None,
+            own,
+        });
     }
     let pace = if caller.managed && !abilities.download_files {
         let factor = u64::from(state.settings.current().family.fast_pull_factor);
@@ -993,6 +1061,7 @@ pub async fn admit(
     Ok(AudioPlan {
         rewrite,
         start: Some(start),
+        own,
     })
 }
 
@@ -1031,6 +1100,7 @@ pub fn admit_radio(
     });
     Ok(AudioPlan {
         rewrite: ParamRewrite::default(),
+        own: None,
         start: Some(StreamStart {
             user: caller.user.clone(),
             device_id: caller.device_id.clone(),
@@ -1176,6 +1246,7 @@ mod tests {
                 set: vec![("format".into(), "opus".into())],
             },
             start: None,
+            own: None,
         };
         let form = plan
             .apply_to(
@@ -1311,38 +1382,111 @@ mod tests {
             &caller,
             "stream",
             &params(&[("id", "s1"), ("Format", "raw"), ("maxBitRate", "320")]),
+            GateKind::Other,
+            false,
         )
         .expect("allowed");
         assert_eq!(
             rewrite.set,
             vec![
-                ("format".to_string(), "opus".to_string()),
+                ("format".to_string(), "mp3".to_string()),
                 ("maxBitRate".to_string(), "192".to_string())
             ]
         );
         assert_eq!(
             rewrite.query("u=alex&id=s1&Format=raw&maxBitRate=320&f=json"),
-            "u=alex&id=s1&f=json&format=opus&maxBitRate=192"
+            "u=alex&id=s1&f=json&format=mp3&maxBitRate=192"
         );
-        let download = quality_rewrite(&caller, "download", &params(&[("id", "s1")])).expect("allowed");
+        let download = quality_rewrite(
+            &caller,
+            "download",
+            &params(&[("id", "s1")]),
+            GateKind::Other,
+            false,
+        )
+        .expect("allowed");
         assert_eq!(
             download.set,
             vec![
-                ("format".to_string(), "opus".to_string()),
+                ("format".to_string(), "mp3".to_string()),
                 ("bitrate".to_string(), "192".to_string())
             ]
         );
         let mut relayed = params(&[("id", "s1"), ("format", "raw")]);
-        rewrite_parameters(&caller, "stream", &mut relayed);
-        assert_eq!(relayed.get("format").map(String::as_str), Some("opus"));
+        rewrite_parameters(&caller, "stream", &mut relayed, GateClient::Other, false);
+        assert_eq!(relayed.get("format").map(String::as_str), Some("mp3"));
         assert_eq!(relayed.get("maxBitRate").map(String::as_str), Some("192"));
         // Nothing to do for the owner with no preference.
         let owner = FamilyCaller::unmanaged("winters", true);
         assert!(
-            quality_rewrite(&owner, "stream", &params(&[("format", "raw")]))
-                .expect("allowed")
-                .is_empty()
+            quality_rewrite(
+                &owner,
+                "stream",
+                &params(&[("format", "raw")]),
+                GateKind::Other,
+                false
+            )
+            .expect("allowed")
+            .is_empty()
         );
+    }
+
+    #[test]
+    fn each_octo_app_gets_its_own_capped_request() {
+        let caller = capped_listener();
+        let raw = params(&[("id", "s1"), ("format", "raw")]);
+        let desktop = quality_rewrite(&caller, "stream", &raw, GateKind::Desktop, false).expect("allowed");
+        assert_eq!(
+            desktop.set,
+            vec![
+                ("format".to_string(), "opus".to_string()),
+                ("maxBitRate".to_string(), "192".to_string())
+            ]
+        );
+        let phone = quality_rewrite(&caller, "stream", &raw, GateKind::Phone, false).expect("allowed");
+        assert_eq!(
+            phone.set,
+            vec![
+                ("format".to_string(), "mp3".to_string()),
+                ("maxBitRate".to_string(), "192".to_string()),
+                ("estimateContentLength".to_string(), "true".to_string())
+            ]
+        );
+        let offline = quality_rewrite(&caller, "stream", &raw, GateKind::Phone, true).expect("allowed");
+        assert!(
+            !offline
+                .set
+                .iter()
+                .any(|(name, _)| name == "estimateContentLength")
+        );
+        assert_eq!(gate_kind(GateClient::OctoPhone), GateKind::Phone);
+        assert_eq!(gate_kind(GateClient::OctoDesktop), GateKind::Desktop);
+        assert_eq!(gate_kind(GateClient::Other), GateKind::Other);
+    }
+
+    #[test]
+    fn the_clients_own_ask_is_read_before_the_gate_sets_its_quality() {
+        let caller = capped_listener();
+        let sent = params(&[("id", "s1"), ("format", "raw"), ("maxBitRate", "320")]);
+        let rewrite = quality_rewrite(&caller, "stream", &sent, GateKind::Phone, false).expect("allowed");
+        let own = own_ask_of("stream", &sent, &rewrite, GateClient::OctoPhone);
+        assert_eq!(
+            own,
+            OwnAsk {
+                format: Some("raw".into()),
+                rate: Some(320),
+                ceiling: Some(192),
+                client: GateClient::OctoPhone,
+            }
+        );
+        // A download names its rate `bitrate`; no ceiling leaves none.
+        let owner = FamilyCaller::unmanaged("winters", true);
+        let sent = params(&[("id", "s1"), ("format", "mp3"), ("bitrate", "96")]);
+        let rewrite = quality_rewrite(&owner, "download", &sent, GateKind::Other, false).expect("allowed");
+        let own = own_ask_of("download", &sent, &rewrite, GateClient::Other);
+        assert_eq!(own.rate, Some(96));
+        assert_eq!(own.ceiling, None);
+        assert_eq!(own.format.as_deref(), Some("mp3"));
     }
 
     #[test]

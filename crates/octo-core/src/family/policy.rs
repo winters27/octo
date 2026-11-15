@@ -31,13 +31,29 @@ pub fn heart_action(abilities: Option<&Abilities>, is_outside: bool) -> HeartAct
 /// How a library `stream` (or `download`) request is rewritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StreamRewrite {
-    /// The format to ask Navidrome for: `opus` when a ceiling applies and the client named no
-    /// format of its own; None leaves the client's format as it is.
+    /// The format to ask Navidrome for when a ceiling applies and the client named no lossy
+    /// format of its own: `opus` for Octo's desktop, `mp3` for Octo's phones and every other
+    /// player. None leaves the client's format as it is.
     pub format: Option<&'static str>,
     /// The `maxBitRate` to ask for.
     pub max_bit_rate: Option<u32>,
     /// Remove `format=raw`, which skips every ceiling.
     pub drop_raw: bool,
+    /// Ask for a length estimate (`estimateContentLength=true`), as Octo's phones do themselves
+    /// at a cap; never for an offline copy, which must not be cut to an estimate.
+    pub estimate: bool,
+}
+
+/// Which app a capped stream is for, as far as the format the gate adds goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GateKind {
+    /// Octo's desktop app, whose player reads Opus and seeks a transcode by time.
+    Desktop,
+    /// Octo's Android or iPhone app, which streams constant-bitrate MP3 with a length at a cap.
+    Phone,
+    /// Any other player, or a speaker fetching an Octo app's address.
+    #[default]
+    Other,
 }
 
 /// Why a stream is refused, with the words the member reads.
@@ -65,11 +81,13 @@ pub fn cap_for(a: &Abilities, place: NetworkPlace) -> Option<u32> {
 }
 
 /// What the client itself asked for on a stream: its `format` and `maxBitRate` (0 or absent
-/// means none).
+/// means none), which app asks, and whether the request is an offline copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClientAsk<'a> {
     pub format: Option<&'a str>,
     pub max_bit_rate: Option<u32>,
+    pub client: GateKind,
+    pub offline: bool,
 }
 
 /// The rewrite for one library stream. The client's own request comes first. A device in
@@ -99,15 +117,26 @@ pub fn stream_rewrite(
         Some(asked) => asked.min(ceiling),
         None => ceiling,
     };
-    let own_format = client
-        .format
-        .map(str::trim)
-        .is_some_and(|f| !f.is_empty() && !f.eq_ignore_ascii_case("raw"));
+    let own_format = client.format.map(str::trim).is_some_and(is_lossy_format);
+    let format = (!own_format).then_some(match client.client {
+        GateKind::Desktop => "opus",
+        GateKind::Phone | GateKind::Other => "mp3",
+    });
     Ok(StreamRewrite {
-        format: (!own_format).then_some("opus"),
+        format,
         max_bit_rate: Some(rate),
         drop_raw: true,
+        estimate: format.is_some() && client.client == GateKind::Phone && !client.offline,
     })
+}
+
+/// Whether `format` names a lossy format a client keeps under a ceiling; any other word (`raw`,
+/// the lossless ones, an unknown one) gets the gate's own format, so a ceiling is never stepped
+/// around.
+fn is_lossy_format(format: &str) -> bool {
+    ["mp3", "opus", "aac", "ogg", "m4a"]
+        .iter()
+        .any(|lossy| format.eq_ignore_ascii_case(lossy))
 }
 
 /// `download` and zips.
@@ -199,6 +228,80 @@ mod tests {
         assert_eq!(heart_action(Some(&member), false), HeartAction::Relay);
     }
 
+    #[test]
+    fn the_added_format_follows_the_app() {
+        let rewrite = |client, offline| {
+            stream_rewrite(
+                &capped(),
+                NetworkPlace::Home,
+                no_preference(),
+                DeviceQualityMode::Account,
+                ClientAsk {
+                    format: Some("raw"),
+                    max_bit_rate: None,
+                    client,
+                    offline,
+                },
+            )
+            .expect("allowed")
+        };
+        assert_eq!(
+            rewrite(GateKind::Desktop, false),
+            StreamRewrite {
+                format: Some("opus"),
+                max_bit_rate: Some(192),
+                drop_raw: true,
+                estimate: false,
+            }
+        );
+        assert_eq!(
+            rewrite(GateKind::Phone, false),
+            StreamRewrite {
+                format: Some("mp3"),
+                max_bit_rate: Some(192),
+                drop_raw: true,
+                estimate: true,
+            }
+        );
+        assert!(
+            !rewrite(GateKind::Phone, true).estimate,
+            "an offline copy gets no estimate"
+        );
+        assert_eq!(rewrite(GateKind::Other, false).format, Some("mp3"));
+        assert!(!rewrite(GateKind::Other, false).estimate);
+    }
+
+    #[test]
+    fn only_a_lossy_format_of_the_clients_own_is_kept_under_a_ceiling() {
+        for (own, kept) in [
+            ("mp3", true),
+            ("MP3", true),
+            ("opus", true),
+            ("aac", true),
+            ("ogg", true),
+            ("m4a", true),
+            ("flac", false),
+            ("wav", false),
+            ("alac", false),
+            ("raw", false),
+            ("anything", false),
+        ] {
+            let rewrite = stream_rewrite(
+                &capped(),
+                NetworkPlace::Home,
+                no_preference(),
+                DeviceQualityMode::Account,
+                ClientAsk {
+                    format: Some(own),
+                    ..ClientAsk::default()
+                },
+            )
+            .expect("allowed");
+            assert_eq!(rewrite.format.is_none(), kept, "{own}");
+            assert_eq!(rewrite.max_bit_rate, Some(192), "{own}");
+        }
+    }
+
     use crate::family::quality::StreamQuality;
 
     /// A listener the owner limited to 192 kbps at home and 128 away.
@@ -215,7 +318,11 @@ mod tests {
     }
 
     fn ask(format: Option<&str>, max_bit_rate: Option<u32>) -> ClientAsk<'_> {
-        ClientAsk { format, max_bit_rate }
+        ClientAsk {
+            format,
+            max_bit_rate,
+            ..ClientAsk::default()
+        }
     }
 
     /// The rewrite in Account mode with no preference and nothing asked.
@@ -280,7 +387,7 @@ mod tests {
         assert_eq!(home.max_bit_rate, Some(192));
         let away = plain(&capped(), NetworkPlace::Away).expect("allowed");
         assert_eq!(away.max_bit_rate, Some(128));
-        assert_eq!(away.format, Some("opus"));
+        assert_eq!(away.format, Some("mp3"));
         // An away cap of 0 means the stream cap away too.
         let same = Abilities {
             away_cap: 0,
@@ -367,9 +474,10 @@ mod tests {
         assert_eq!(
             away,
             StreamRewrite {
-                format: Some("opus"),
+                format: Some("mp3"),
                 max_bit_rate: Some(160),
                 drop_raw: true,
+                estimate: false,
             }
         );
         // At home the account chose the original: raw stays raw.

@@ -860,6 +860,9 @@ async fn pass_rest(state: &AppState, request: RestRequest, next: Next, caller: O
     };
     req.extensions_mut().insert(caller.clone());
     req.extensions_mut().insert(view.clone());
+    if let Some(own) = audio.own_ask() {
+        req.extensions_mut().insert(own.clone());
+    }
     let noting = note_when_checked(state, &view, &caller, !checked && !needs_no_sign_in(&endpoint));
     let response = next.run(req).await;
     if let Some(noting) = noting {
@@ -1051,6 +1054,9 @@ async fn member_rest(
         req.extensions_mut().insert(caller.clone());
         req.extensions_mut()
             .insert(GateReading::checked(reading, view_parameters, caller.clone()));
+        if let Some(own) = audio.own_ask() {
+            req.extensions_mut().insert(own.clone());
+        }
         Ok(req)
     };
 

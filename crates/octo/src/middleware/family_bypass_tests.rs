@@ -421,7 +421,7 @@ async fn local_file_shortcut_relays_the_library_copy_with_the_ceiling() {
     let sent = f.streamed().await;
     assert_eq!(value(&sent, "id"), Some("lib-9"));
     assert_eq!(value(&sent, "maxBitRate"), Some("192"));
-    assert_eq!(value(&sent, "format"), Some("opus"));
+    assert_eq!(value(&sent, "format"), Some("mp3"));
 }
 
 /// `who`'s own Wait for lossless play of the song, landed already with `file`: the acquisition their
@@ -523,7 +523,7 @@ async fn an_allowed_download_takes_the_ceiling() {
     assert_eq!(r.body, LIBRARY_AUDIO);
     let asked = f.asked("/rest/download").await;
     let sent = pairs(asked[0].url.query().unwrap_or(""));
-    assert_eq!(value(&sent, "format"), Some("opus"));
+    assert_eq!(value(&sent, "format"), Some("mp3"));
     assert_eq!(value(&sent, "bitrate"), Some("192"));
 }
 
@@ -774,7 +774,7 @@ async fn account_away_preference_caps_raw() {
     let r = get(&f, &format!("/rest/stream?{ALEX}&id=lib-1&format=raw"), AWAY).await;
     assert_eq!(r.body, LIBRARY_AUDIO);
     let sent = f.streamed().await;
-    assert_eq!(value(&sent, "format"), Some("opus"));
+    assert_eq!(value(&sent, "format"), Some("mp3"));
     assert_eq!(value(&sent, "maxBitRate"), Some("160"));
     assert_eq!(
         sent.iter().filter(|(k, _)| k == "format").count(),
@@ -830,7 +830,7 @@ async fn family_limit_wins_over_original_preference() {
     )
     .await;
     let sent = f.streamed().await;
-    assert_eq!(value(&sent, "format"), Some("opus"));
+    assert_eq!(value(&sent, "format"), Some("mp3"));
     assert_eq!(value(&sent, "maxBitRate"), Some("192"));
 }
 
@@ -860,7 +860,7 @@ async fn owner_preference_applies() {
     );
     let _ = get(&f, &format!("/rest/stream?{OWNER}&id=lib-1"), HOME).await;
     let sent = f.streamed().await;
-    assert_eq!(value(&sent, "format"), Some("opus"));
+    assert_eq!(value(&sent, "format"), Some("mp3"));
     assert_eq!(value(&sent, "maxBitRate"), Some("256"));
     // The owner's own ceiling also keeps transcode decisions from them.
     let r = get(
@@ -1106,7 +1106,7 @@ async fn a_capped_member_cannot_ask_for_the_original_in_a_json_body() {
     let relayed = relayed_streams(&f).await;
     assert_eq!(relayed.len(), 1, "{relayed:?}");
     let (sent, body) = &relayed[0];
-    assert_eq!(value(sent, "format"), Some("opus"), "{relayed:?}");
+    assert_eq!(value(sent, "format"), Some("mp3"), "{relayed:?}");
     assert_eq!(value(sent, "maxBitRate"), Some("192"), "{relayed:?}");
     assert!(!body.contains("raw"), "{body}");
 }
@@ -1124,7 +1124,7 @@ async fn a_capped_member_cannot_ask_for_the_original_in_a_form_body_in_any_case(
     let relayed = relayed_streams(&f).await;
     assert_eq!(relayed.len(), 1, "{relayed:?}");
     let (sent, body) = &relayed[0];
-    assert_eq!(value(sent, "format"), Some("opus"), "{relayed:?}");
+    assert_eq!(value(sent, "format"), Some("mp3"), "{relayed:?}");
     assert_eq!(value(sent, "maxBitRate"), Some("192"), "{relayed:?}");
     assert!(!body.to_ascii_lowercase().contains("raw"), "{body}");
 }
@@ -1140,7 +1140,7 @@ async fn a_capped_member_gets_the_family_limit_whatever_the_body_type() {
     )
     .await;
     let sent = f.streamed().await;
-    assert_eq!(value(&sent, "format"), Some("opus"));
+    assert_eq!(value(&sent, "format"), Some("mp3"));
     assert_eq!(value(&sent, "maxBitRate"), Some("192"));
     // In a JSON body whose type has a charset, and in a form body next to the song.
     for (content_type, body) in [
@@ -1157,7 +1157,7 @@ async fn a_capped_member_gets_the_family_limit_whatever_the_body_type() {
         let _ = send_body(&f, &format!("/rest/stream?{ALEX}&id=lib-1"), content_type, body).await;
         let relayed = relayed_streams(&f).await;
         assert_eq!(relayed.len(), 1, "{content_type}: {relayed:?}");
-        assert_eq!(value(&relayed[0].0, "format"), Some("opus"), "{content_type}");
+        assert_eq!(value(&relayed[0].0, "format"), Some("mp3"), "{content_type}");
         assert_eq!(value(&relayed[0].0, "maxBitRate"), Some("192"), "{content_type}");
     }
     // In a multipart form, which Octo cannot rewrite: refused, nothing relayed.
@@ -1965,4 +1965,99 @@ async fn a_member_with_the_import_ability_imports_from_a_file_and_pasted_text() 
         "{}",
         lists.body
     );
+}
+
+/// The format the gate adds for a capped member follows the app asking: Octo's phones get CBR
+/// MP3 with a length, Octo's desktop keeps Opus, and a speaker fetching an Octo app's address
+/// (`c=Octo` with its own User-Agent) or any other player gets MP3.
+#[tokio::test]
+async fn the_gate_adds_each_apps_own_capped_request() {
+    for (agent, format, estimate) in [
+        ("Octo/1.13.0 (Android)", "mp3", Some("true")),
+        ("Octo/1.13.0 (iPhone)", "mp3", Some("true")),
+        ("Octo", "opus", None),
+        ("Octo/1.13.0 (Windows)", "opus", None),
+        ("Lavf/60.3.100", "mp3", None),
+    ] {
+        let f = family(true, capped(), |_| {}).await;
+        let _ = send(
+            &f,
+            Method::GET,
+            &format!("/rest/stream?{ALEX}&id=lib-1&format=raw"),
+            &[("User-Agent", agent)],
+            HOME,
+        )
+        .await;
+        let sent = f.streamed().await;
+        assert_eq!(value(&sent, "format"), Some(format), "{agent}");
+        assert_eq!(value(&sent, "maxBitRate"), Some("192"), "{agent}");
+        assert_eq!(value(&sent, "estimateContentLength"), estimate, "{agent}");
+    }
+}
+
+/// A lossless or unknown format of the client's own never steps around the ceiling.
+#[tokio::test]
+async fn a_lossless_format_under_a_ceiling_gets_the_gates_format() {
+    let f = family(true, capped(), |_| {}).await;
+    let _ = get(&f, &format!("/rest/stream?{ALEX}&id=lib-1&format=flac"), HOME).await;
+    let sent = f.streamed().await;
+    assert_eq!(value(&sent, "format"), Some("mp3"));
+    assert_eq!(value(&sent, "maxBitRate"), Some("192"));
+}
+
+/// The client's own ask reaches the stream handler past the real gate (the `OwnAsk` the gate
+/// keeps on the request it hands on): a capped member's `format=raw` for a song found online is
+/// a cap, so a 128 kbps M4A under the 192 ceiling stays as it is. Read from the gate's
+/// rewritten query instead, the ask would be the format the gate added, and a HEAD before any
+/// copy exists would answer that format's type with no length.
+#[tokio::test]
+async fn a_capped_members_own_raw_ask_reaches_the_stream_handler_as_a_cap() {
+    use octo_core::soulseek::StreamFacts;
+    use octo_core::soulseek::soulseek_metadata_service::{RoutingKind, SoulseekRouting};
+    for (agent, added_type) in [("Octo", "audio/ogg"), ("Octo/1.13.0 (Android)", "audio/mpeg")] {
+        let f = family(true, capped(), |_| {}).await;
+        let id = f.state.external_id_registry.register(SoulseekRouting {
+            kind: RoutingKind::Song,
+            artist: Some("Artist".into()),
+            title: Some("Song".into()),
+            duration: Some(60),
+            ..Default::default()
+        });
+        // A builder who finds this false stops and reports: the test needs an id the library
+        // reads as a song found online.
+        assert!(
+            f.state.local_library.parse_song_id(&id).0,
+            "a registry id is a song found online"
+        );
+        f.state.external_id_registry.set_you_tube_id(&id, "AAAAAAAAAA1");
+        f.state.external_id_registry.remember_stream(
+            &id,
+            "AAAAAAAAAA1",
+            &StreamFacts {
+                itag: Some("140".into()),
+                ..Default::default()
+            },
+        );
+        let response = f
+            .app
+            .clone()
+            .oneshot(request(
+                Method::HEAD,
+                &format!("/rest/stream?{ALEX}&id={id}&format=raw"),
+                &[("User-Agent", agent)],
+                HOME,
+            ))
+            .await
+            .expect("infallible");
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        assert_ne!(
+            content_type.as_deref(),
+            Some(added_type),
+            "{agent}: the gate's added format was read as the ask"
+        );
+    }
 }

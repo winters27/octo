@@ -2,7 +2,7 @@
 //! Navidrome answer, the caller checks (a ping, the credential check), who a request is, and the
 //! small result helpers.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::extract::Request;
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -13,9 +13,11 @@ use octo_subsonic::subsonic_request_parser::Parameters;
 use octo_subsonic::subsonic_response_builder::SubsonicReply;
 use octo_subsonic::xml::XElement;
 
+use super::media_convert::OutsideAsk;
 use crate::app::AppState;
 use crate::http::error::AppError;
 use crate::services::common::StarOnArrival;
+use crate::services::prefetch::convert_rules::OwnAsk;
 use crate::services::subsonic::{CredentialVerdict, IncomingRequest, SubsonicProxyService};
 
 /// The largest request body accepted, in bytes.
@@ -28,6 +30,10 @@ pub(crate) struct SubsonicCall {
     pub incoming: Arc<IncomingRequest>,
     pub parameters: Parameters,
     pub proxy: SubsonicProxyService,
+    /// The client's own audio ask, as the family gate read it before setting its quality.
+    pub own_ask: Option<OwnAsk>,
+    /// What the client asks of a song found online, read once by `stream`.
+    pub outside: OnceLock<OutsideAsk>,
 }
 
 impl SubsonicCall {
@@ -55,6 +61,29 @@ impl SubsonicCall {
             incoming,
             parameters,
             proxy,
+            own_ask: parts.extensions.get::<OwnAsk>().cloned(),
+            outside: OnceLock::new(),
+        }
+    }
+
+    /// What the client asks of a song found online, once `stream` read it.
+    pub fn outside_ask(&self) -> Option<&OutsideAsk> {
+        self.outside.get()
+    }
+
+    /// Whether this request starts a play: for a song found online as `stream` read it (a time
+    /// seek of a playing song is not a new play), for any other request from its first byte. A
+    /// scout read (`X-Octo-Purpose: scout`), an Octo app analyzing a song it plays or will play,
+    /// starts none.
+    pub fn starts_play(&self) -> bool {
+        match self.outside.get() {
+            Some(outside) => outside.play_start,
+            None => {
+                let scout = self
+                    .header("X-Octo-Purpose")
+                    .is_some_and(|purpose| purpose.trim().eq_ignore_ascii_case("scout"));
+                !scout && is_first_byte_request(self.method().as_str(), self.header("Range").as_deref())
+            }
         }
     }
 
