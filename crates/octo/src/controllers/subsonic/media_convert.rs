@@ -1174,24 +1174,29 @@ async fn seek_answer(
             let _ = sink.shutdown().await;
         });
     }
-    let mut first = vec![0u8; 64 * 1024];
     // The wait for the first sound counts from the request's arrival, so a permit's wait and this
     // one together stay within one `seek_input`. A newer seek of the same play ends it at once:
-    // returning drops the guard (ffmpeg is killed) and the permit.
+    // returning drops the guard (ffmpeg is killed) and the permit. A container's opening (Ogg's
+    // header pages, FLAC's metadata) is not sound: ffmpeg can write it before the input reaches
+    // the place.
     let token = run.token.clone();
-    let read = tokio::select! {
-        () = token.cancelled() => return unavailable(),
-        read = tokio::time::timeout_at(outside.arrived + wait, stdout.read(&mut first)) => read,
-    };
-    let read = match read {
-        Ok(Ok(read)) if read > 0 => read,
-        Ok(_) => {
-            warn!("ffmpeg made no sound for a time seek of {}", outside.id);
-            return cannot_seek();
+    let until = outside.arrived + wait;
+    let mut first = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    while !holds_sound(&first, content_type) {
+        let read = tokio::select! {
+            () = token.cancelled() => return unavailable(),
+            read = tokio::time::timeout_at(until, stdout.read(&mut buf)) => read,
+        };
+        match read {
+            Ok(Ok(read)) if read > 0 => first.extend_from_slice(&buf[..read]),
+            Ok(_) => {
+                warn!("ffmpeg made no sound for a time seek of {}", outside.id);
+                return cannot_seek();
+            }
+            Err(_) => return unavailable(),
         }
-        Err(_) => return unavailable(),
-    };
-    first.truncate(read);
+    }
     // The permit bounds how many re-encodes start at once, not how many people listen: it goes once
     // the first sound exists.
     drop(permit);
@@ -1287,6 +1292,59 @@ impl Drop for SeekRun {
             .is_some_and(|(number, _, _)| *number == self.number)
         {
             runs.remove(&self.key);
+        }
+    }
+}
+
+/// Whether `bytes`, the start of a time seek's answer of `content_type`, hold sound and not only
+/// the container's opening. MP3 and ADTS have no opening; bytes that are not the container's own
+/// opening count as sound.
+fn holds_sound(bytes: &[u8], content_type: &str) -> bool {
+    match content_type {
+        "audio/ogg" => ogg_sound_begins(bytes),
+        "audio/flac" => flac_frames_begin(bytes),
+        _ => !bytes.is_empty(),
+    }
+}
+
+/// Whether an Ogg stream's bytes reach a page past its header pages, whose granule position is 0.
+fn ogg_sound_begins(bytes: &[u8]) -> bool {
+    let mut at = 0;
+    loop {
+        let page = &bytes[at.min(bytes.len())..];
+        if page.len() >= 4 && !page.starts_with(b"OggS") {
+            return true;
+        }
+        if page.len() < 27 {
+            return false;
+        }
+        let granule = u64::from_le_bytes([
+            page[6], page[7], page[8], page[9], page[10], page[11], page[12], page[13],
+        ]);
+        if granule != 0 && granule != u64::MAX {
+            return true;
+        }
+        let segments = usize::from(page[26]);
+        let Some(table) = page.get(27..27 + segments) else {
+            return false;
+        };
+        at += 27 + segments + table.iter().map(|&size| usize::from(size)).sum::<usize>();
+    }
+}
+
+/// Whether a FLAC stream's bytes reach past its metadata blocks to its first frame.
+fn flac_frames_begin(bytes: &[u8]) -> bool {
+    if bytes.len() >= 4 && !bytes.starts_with(b"fLaC") {
+        return true;
+    }
+    let mut at = 4;
+    loop {
+        let Some(block) = bytes.get(at..at + 4) else {
+            return false;
+        };
+        at += 4 + ((usize::from(block[1]) << 16) | (usize::from(block[2]) << 8) | usize::from(block[3]));
+        if block[0] & 0x80 != 0 {
+            return bytes.len() > at;
         }
     }
 }
@@ -1639,6 +1697,35 @@ mod tests {
         ] {
             assert!(ask_from_params(other, "").is_none(), "{other}");
         }
+    }
+
+    /// One Ogg page with `granule` and `body`.
+    fn ogg_page(granule: u64, body: &[u8]) -> Vec<u8> {
+        let mut page = b"OggS\0\0".to_vec();
+        page.extend_from_slice(&granule.to_le_bytes());
+        page.extend_from_slice(&[0; 12]);
+        page.push(1);
+        page.push(u8::try_from(body.len()).expect("one segment"));
+        page.extend_from_slice(body);
+        page
+    }
+
+    #[test]
+    fn a_containers_opening_is_not_yet_sound() {
+        let mut ogg = ogg_page(0, b"OpusHead");
+        ogg.extend(ogg_page(0, b"OpusTags"));
+        assert!(!holds_sound(&ogg, "audio/ogg"), "the header pages alone");
+        assert!(!holds_sound(&ogg[..10], "audio/ogg"), "a cut header page");
+        ogg.extend(ogg_page(960, b"sound"));
+        assert!(holds_sound(&ogg, "audio/ogg"));
+        assert!(holds_sound(&[0xFF; 8], "audio/ogg"), "bytes that are no Ogg page");
+        let mut flac = b"fLaC".to_vec();
+        flac.extend_from_slice(&[0x80, 0, 0, 2, 7, 7]);
+        assert!(!holds_sound(&flac, "audio/flac"), "the metadata alone");
+        flac.extend_from_slice(&[0xFF, 0xF8]);
+        assert!(holds_sound(&flac, "audio/flac"));
+        assert!(!holds_sound(&[], "audio/mpeg"));
+        assert!(holds_sound(&[0xFF, 0xFB], "audio/mpeg"));
     }
 
     #[test]

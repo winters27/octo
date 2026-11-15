@@ -124,10 +124,8 @@ fn decoded(bytes: &[u8]) -> Vec<i16> {
         .output()
         .expect("ffmpeg ran");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    out.stdout
-        .chunks_exact(2)
-        .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
-        .collect()
+    let (pairs, _) = out.stdout.as_chunks::<2>();
+    pairs.iter().map(|pair| i16::from_le_bytes(*pair)).collect()
 }
 
 /// The tone in the 100 ms of `samples` from `from` seconds, in Hz, by its zero crossings.
