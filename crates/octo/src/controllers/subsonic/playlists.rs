@@ -1091,7 +1091,7 @@ fn playlist_error(state: &AppState, call: &SubsonicCall, error: PlaylistError) -
         PlaylistError::NotFound => 70,
         PlaylistError::NotAllowed(_) => 50,
         PlaylistError::BlankName => 10,
-        PlaylistError::Changed => 0,
+        PlaylistError::Changed | PlaylistError::Refused(_) => 0,
     };
     family_error(state, call, code, error.message())
 }

@@ -1,8 +1,11 @@
 //! Playlists that keep songs found online, and playlist folders: the stores and the pure rules
 //! shared by the held playlist service, the Subsonic and native routes and the folder endpoints.
 
+pub mod binder;
 pub mod caps;
+pub mod entries;
 pub mod folder_store;
+pub mod held_playlists;
 pub mod held_store;
 pub mod merge;
 pub mod same_take;

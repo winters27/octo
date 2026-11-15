@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use super::ImportList;
 use super::import_models::import_sources;
 use crate::services::library::NavidromePlaylistApi;
+use crate::services::playlists::held_playlists::HeldSlot;
 use crate::services::subsonic::NavidromeIdentityService;
 
 /// How keeping a list's playlist went.
@@ -115,6 +116,9 @@ impl PlaylistNavidrome for NavidromePlaylists {
 /// id is handed back so the next try fills that one.
 pub struct ImportPlaylists {
     navidrome: Arc<dyn PlaylistNavidrome>,
+    /// The held playlists, once they are built: each sync then holds the playlist's lock, keeps
+    /// only songs the owner can read, and writes a held playlist through the held service.
+    held: Option<HeldSlot>,
 }
 
 impl ImportPlaylists {
@@ -122,7 +126,16 @@ impl ImportPlaylists {
     const ADD_CHUNK: usize = 500;
 
     pub fn new(navidrome: Arc<dyn PlaylistNavidrome>) -> Self {
-        ImportPlaylists { navidrome }
+        ImportPlaylists {
+            navidrome,
+            held: None,
+        }
+    }
+
+    /// Syncs through the held playlists in `slot` once they are there.
+    pub fn with_held(mut self, slot: HeldSlot) -> Self {
+        self.held = Some(slot);
+        self
     }
 
     pub async fn sync(&self, list: &ImportList) -> PlaylistSyncResult {
@@ -178,6 +191,36 @@ impl ImportPlaylists {
             if !wanted.contains(id) {
                 wanted.push(id.clone());
             }
+        }
+        // The rest of the sync holds the playlist's lock. Only songs the owner can read go in; when
+        // that can't be told now, the sync waits for its next turn.
+        let held = self.held.as_ref().and_then(|slot| slot.read().clone());
+        let guard = match &held {
+            Some(held) => match held.lock(&playlist_id).await {
+                Ok(guard) => Some(guard),
+                Err(_) => return self.give_up(playlist_id, note, made, 0).await,
+            },
+            None => None,
+        };
+        if let Some(held) = &held {
+            wanted = match held.readable_library_ids(&list.owner, wanted).await {
+                Ok(readable) => readable,
+                Err(_) => return self.give_up(playlist_id, note, made, 0).await,
+            };
+        }
+        if let (Some(held), Some(guard)) = (&held, &guard)
+            && held.is_held(guard)
+        {
+            return match held.apply_library_list(guard, &wanted).await {
+                Ok(()) => PlaylistSyncResult {
+                    ok: true,
+                    playlist_id: Some(playlist_id),
+                    note,
+                    deleted: false,
+                    songs: wanted.len() as i32,
+                },
+                Err(_) => PlaylistSyncResult::failed(Some(playlist_id), note, 0),
+            };
         }
         let Some(current) = self.navidrome.read_tracks(&playlist_id).await else {
             return self.give_up(playlist_id, note, made, 0).await;

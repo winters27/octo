@@ -350,6 +350,8 @@ async fn upgrade_repoints_every_link() {
             pending: false,
             duration: None,
             explicit_status: None,
+            seed_id: None,
+            seed: None,
         }],
     );
 

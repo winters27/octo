@@ -61,6 +61,7 @@ use crate::services::common::TopSongsService;
 use crate::services::common::album_gates::AlbumGates;
 use crate::services::cover_art::{AnimatedArt, ArtworkHints, HintedArtwork};
 use crate::services::family::LibraryWriteGate as FamilyWriteGate;
+use crate::services::family::family_playlist_store::FamilyKept;
 use crate::services::family::request_service::{
     FamilyEvents, LiveRequestCatalog, LiveRequestFetcher, RequestParts, RequestService,
 };
@@ -144,6 +145,12 @@ use crate::services::metadata::{
 };
 use crate::services::metadata::{GenreBackfillJournal, GenreBackfillStore, GenreBackfillWorker};
 use crate::services::notifications::{DiscordSink, INotificationSink, NotificationService, NtfySink};
+use crate::services::playlists::caps::PlaylistCaps;
+use crate::services::playlists::held_playlists::{
+    AdminNavidrome, AppHeldLibrary, HeldParts, HeldPlaylists, HeldSlot, HeldTiming,
+};
+use crate::services::playlists::held_store::HeldStore;
+use crate::services::playlists::seed_index::SeedIndex;
 use crate::services::prefetch::{
     AppKeepReadySources, HeardSampleParts, HeardSamples, KeepReadyService, KeepReadyStore, PrefetchParts,
     PrefetchService, PrefetchStore, PrefetchedFiles, PreviewCopies,
@@ -570,6 +577,8 @@ pub struct AppInner {
     pub family_playlists: Arc<FamilyPlaylistStore>,
     /// Where family playlist additions that wait for approval are reported.
     pub family_playlist_requests: crate::services::family::family_playlists::PlaylistAddHook,
+    /// `octo-playlists/`: playlists that hold songs found online, and every writer's lock.
+    pub held_playlists: Arc<HeldPlaylists>,
     /// `family-pool.json`: the one copy of each member download and who links it.
     pub family_pool: Arc<FamilyPoolStore>,
     /// `listening/`: each person's completed plays, for their Listening page.
@@ -2340,6 +2349,8 @@ impl GenreAndCoverJobs {
 struct Imports {
     service: Arc<crate::services::imports::ImportService>,
     trickle: Arc<crate::services::imports::TrickleWorker>,
+    /// Filled with the held playlists once they are built, so the keeper syncs under their locks.
+    held_slot: HeldSlot,
 }
 
 impl Imports {
@@ -2384,6 +2395,7 @@ impl Imports {
                 spotiflac: Some(acquisition.spotiflac.clone()),
             },
         );
+        let held_slot: HeldSlot = Arc::default();
         let service = ImportService::new(ImportParts {
             store: Arc::new(ImportStore::new(file("imports.json"))),
             queue,
@@ -2392,7 +2404,8 @@ impl Imports {
             playlists: ImportPlaylists::new(Arc::new(NavidromePlaylists {
                 api: navidrome.navidrome_playlist_api.clone(),
                 identity: navidrome.navidrome_identity.clone(),
-            })),
+            }))
+            .with_held(Arc::clone(&held_slot)),
             links: Arc::new(SpotifyLinkReader::new(SpotifyLinkReader::client())),
             settings: settings.clone(),
             tracker: Some(acquisition.acquisition_tracker.clone()),
@@ -2401,7 +2414,11 @@ impl Imports {
         stores
             .external_id_registry
             .set_recovery(Arc::new(move |id| weak.upgrade()?.preview_routing(id)));
-        Imports { service, trickle }
+        Imports {
+            service,
+            trickle,
+            held_slot,
+        }
     }
 
     fn register_workers(&self, workers: &WorkerSupervisor) {
@@ -2414,6 +2431,75 @@ impl Imports {
             service.clone().run_loop(stopping)
         });
     }
+}
+
+/// Starts the held playlists in their order: the held store and its kept ids (held files and
+/// `Replaced` records), the family seeds backfilled from the registry and their kept ids, the caps
+/// counted, the registry's start finished (releasing keys nothing named again), then the recovery
+/// sources (the playlists' seed index, asked before the imports hook the import group set). Then
+/// binding listens to the tracker, and keep-marks and the import keeper write under the
+/// playlists' locks. With `workers`, the start sweep, the attach pass and the store's flush pass
+/// run as a worker.
+#[allow(clippy::too_many_arguments)] // one argument per group the held playlists read from
+fn start_held(
+    stores: &Stores,
+    navidrome: &NavidromeServices,
+    acquisition: &Acquisition,
+    metadata: &Arc<dyn IMusicMetadataService>,
+    imports: &Imports,
+    library_health: &Arc<LibraryHealthService>,
+    dir: Option<PathBuf>,
+    workers: Option<&WorkerSupervisor>,
+) -> Arc<HeldPlaylists> {
+    let registry = Arc::clone(&stores.external_id_registry);
+    let seed_index = Arc::new(SeedIndex::new());
+    let caps = Arc::new(PlaylistCaps::with_limits(
+        PlaylistCaps::PERSON,
+        PlaylistCaps::SERVER,
+    ));
+    let held = HeldPlaylists::start(HeldParts {
+        store: HeldStore::new(dir),
+        navidrome: Arc::new(AdminNavidrome {
+            api: Arc::clone(&navidrome.navidrome_playlist_api),
+        }),
+        library: Arc::new(AppHeldLibrary {
+            local: Arc::clone(&navidrome.local_library),
+            resolver: Arc::clone(&navidrome.navidrome_song_path_resolver),
+            scope: navidrome.library_scope.clone(),
+            metadata: Arc::clone(metadata),
+            history: Arc::clone(&stores.download_history),
+        }),
+        registry: Arc::clone(&registry),
+        seed_index: Arc::clone(&seed_index),
+        caps: Arc::clone(&caps),
+        family: Some(Arc::clone(&stores.family_playlists)),
+        timing: HeldTiming::default(),
+        clock: Clock::system(),
+    });
+    stores.family_playlists.attach_kept(FamilyKept {
+        registry: Arc::clone(&registry),
+        seed_index: Arc::clone(&seed_index),
+        caps: Arc::clone(&caps),
+    });
+    stores.family_playlists.backfill_seeds();
+    stores.family_playlists.publish_kept();
+    let mut counts = held.counted_by_owner();
+    for (owner, n) in stores.family_playlists.counted_by_owner() {
+        *counts.entry(owner).or_default() += n;
+    }
+    caps.reset(counts);
+    registry.finish_start();
+    registry.set_recovery_sources(vec![seed_index.recovery()]);
+    held.listen(&acquisition.acquisition_tracker);
+    if let Some(keep) = library_health.keep_marks() {
+        keep.use_held(Arc::clone(&held));
+    }
+    *imports.held_slot.write() = Some(Arc::clone(&held));
+    if let Some(workers) = workers {
+        let worker = Arc::clone(&held);
+        workers.register("HeldPlaylists", move |stopping| Arc::clone(&worker).run(stopping));
+    }
+    held
 }
 
 /// The Soulseek services, over the stores and clients they read.
@@ -3658,6 +3744,16 @@ impl AppState {
             Some(clients.music_brainz.clone()),
         );
         imports.register_workers(&workers);
+        let held_playlists = start_held(
+            &stores,
+            &navidrome,
+            &acquisition,
+            &metadata_service,
+            &imports,
+            &library_health,
+            Some(config_dir.join("octo-playlists")),
+            Some(workers.as_ref()),
+        );
         let family_requests = FamilyRequests::build(
             &settings,
             &stores,
@@ -3846,6 +3942,7 @@ impl AppState {
             family_saved: stores.family_saved,
             family_playlists: stores.family_playlists,
             family_playlist_requests: Default::default(),
+            held_playlists,
             family_pool: stores.family_pool,
             listening: stores.listening,
             navidrome_admin: family_navidrome.0,
@@ -4145,6 +4242,16 @@ impl AppState {
             soulseek.link.clone(),
             None,
         );
+        let held_playlists = start_held(
+            &stores,
+            &navidrome,
+            &acquisition,
+            &metadata_service,
+            &imports,
+            &library_health,
+            None,
+            None,
+        );
         let family_requests = FamilyRequests::build(
             &settings,
             &stores,
@@ -4327,6 +4434,7 @@ impl AppState {
             family_saved: stores.family_saved,
             family_playlists: stores.family_playlists,
             family_playlist_requests: Default::default(),
+            held_playlists,
             family_pool: stores.family_pool,
             listening: stores.listening,
             navidrome_admin: family_navidrome.0,

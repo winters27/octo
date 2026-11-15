@@ -470,6 +470,7 @@ fn playlist_failure(e: PlaylistError) -> FamilyError {
         PlaylistError::NotAllowed(message) => FamilyError::Refused(message.into()),
         PlaylistError::BlankName => FamilyError::Invalid("Give the playlist a name.".into()),
         PlaylistError::Changed => FamilyError::Conflict(PlaylistError::Changed.message().into()),
+        PlaylistError::Refused(refused) => FamilyError::Conflict(refused.message().into()),
     }
 }
 

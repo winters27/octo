@@ -724,6 +724,14 @@ impl HeldStore {
     pub(crate) fn fail_writes_when(&self, hook: Option<WriteHook>) {
         *self.write_hook.lock() = hook;
     }
+
+    /// Runs `work` while this thread holds the store's mutex, for the test that no registry or
+    /// Navidrome call is made under it.
+    #[cfg(test)]
+    pub(crate) fn while_locked<R>(&self, work: impl FnOnce() -> R) -> R {
+        let _locked = self.lock();
+        work()
+    }
 }
 
 fn put(inner: &mut Inner, id: &str, state: &PlaylistState) {

@@ -38,6 +38,7 @@ use crate::services::library::{
     ResolvedSongFile,
 };
 use crate::services::local::ILocalLibraryService;
+use crate::services::playlists::held_playlists::HeldPlaylists;
 
 /// One copy of a set, as the pick reads it: its id and when Navidrome first saw it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,6 +522,9 @@ pub struct KeepMarks {
     uses: Mutex<Option<PlaylistUses>>,
     /// Things worth saying at the end of the run.
     notes: Mutex<Vec<String>>,
+    /// The held playlists, once they are built: every playlist swap runs under the playlist's
+    /// lock, and a held playlist is swapped through them.
+    held: Mutex<Option<Arc<HeldPlaylists>>>,
 }
 
 /// What [`KeepMarks`] is built from.
@@ -556,7 +560,17 @@ impl KeepMarks {
             uncarrying: Mutex::new(Vec::new()),
             uses: Mutex::new(None),
             notes: Mutex::new(Vec::new()),
+            held: Mutex::new(None),
         }
+    }
+
+    /// Swaps playlist entries under the held playlists' locks from now on.
+    pub fn use_held(&self, held: Arc<HeldPlaylists>) {
+        *self.held.lock() = Some(held);
+    }
+
+    fn held(&self) -> Option<Arc<HeldPlaylists>> {
+        self.held.lock().clone()
     }
 
     /// Reads and writes Family members' marks through `members` from now on.
@@ -1371,6 +1385,30 @@ impl KeepMarks {
                     .collect()
             });
             if wanted.as_ref().is_some_and(Vec::is_empty) {
+                continue;
+            }
+            // Every playlist is swapped under its lock; one that holds songs found online has its
+            // entries swapped by the held service, each keeping its place and its fallback.
+            let held = self.held();
+            let guard = match &held {
+                Some(held) => match held.lock(&playlist.id).await {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        done.failed.push(playlist.name.clone());
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            if let (Some(held), Some(guard)) = (&held, &guard)
+                && held.is_held(guard)
+            {
+                match held.swap_library(guard, from, to, wanted.as_deref()).await {
+                    Ok(moved) => done
+                        .moved
+                        .extend(moved.into_iter().map(|position| (playlist.id.clone(), position))),
+                    Err(_) => done.failed.push(playlist.name.clone()),
+                }
                 continue;
             }
             let Ok(Some(tracks)) = self.api.read_all_tracks(&playlist.id).await else {

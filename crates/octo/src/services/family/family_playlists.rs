@@ -18,7 +18,9 @@ use octo_core::family::abilities::Role;
 use parking_lot::RwLock;
 
 use super::caller::FamilyCaller;
-use super::family_playlist_store::{FamilyPlaylist, FamilyPlaylistEntry, FamilyPlaylistStore};
+use super::family_playlist_store::{
+    FamilyAddRefusal, FamilyPlaylist, FamilyPlaylistEntry, FamilyPlaylistStore,
+};
 
 /// The scope of an entry whose library song is shared.
 pub const SHARED_SCOPE: &str = "Shared";
@@ -74,6 +76,8 @@ pub enum PlaylistError {
     BlankName,
     /// The playlist changed while its songs were read.
     Changed,
+    /// An add past a cap of songs found online, or one whose save failed.
+    Refused(FamilyAddRefusal),
 }
 
 impl PlaylistError {
@@ -85,6 +89,7 @@ impl PlaylistError {
             PlaylistError::Changed => {
                 "This family playlist changed while Octo read it, so nothing was taken out. Try again."
             }
+            PlaylistError::Refused(refused) => refused.message(),
         }
     }
 }
@@ -304,6 +309,8 @@ pub fn add(
             pending,
             duration: song.duration,
             explicit_status: song.explicit_status,
+            seed_id: None,
+            seed: None,
         })
         .collect();
     let added = entries.len();
@@ -311,7 +318,12 @@ pub fn add(
         return Ok(0);
     }
     let first = playlist.entries.len();
-    store.add_entries(id, entries.clone());
+    if !store
+        .try_add_entries(id, entries.clone())
+        .map_err(PlaylistError::Refused)?
+    {
+        return Err(PlaylistError::NotFound);
+    }
     if pending && let Some(after) = store.get(id) {
         for (offset, entry) in entries.iter().enumerate() {
             requests.addition_waits(&after, first + offset, entry, &caller.user);
@@ -750,6 +762,8 @@ mod tests {
             pending: true,
             duration: None,
             explicit_status: None,
+            seed_id: None,
+            seed: None,
         };
         hook.get().addition_waits(&playlist, 0, &entry, "sam");
         hook.set(told.clone());
