@@ -886,7 +886,16 @@ async fn t15_t47_a_genuine_swap_from_any_other_client_is_kept() {
     assert_eq!(f.tracks(ROAD), ["s-a", "s-b", "s-glory-live"]);
 
     // From an old Octo phone an unrelated song in the gap is a real add, and the streamed one a
-    // real removal.
+    // real removal. The playlist goes back to its two library songs first.
+    let reset = f
+        .rest_as(
+            third_party,
+            &format!("createPlaylist?playlistId={ROAD}&songId=s-a&songId=s-b&f=json"),
+        )
+        .await
+        .json();
+    assert_eq!(reset["subsonic-response"]["status"], "ok", "{reset}");
+    assert_eq!(f.tracks(ROAD), ["s-a", "s-b"]);
     held_road(&f).await;
     let pushed = f
         .rest_as(
@@ -1436,20 +1445,46 @@ async fn t38_the_sync_catalog_lists_held_songs_and_keep_ready_offers_held_playli
 #[tokio::test]
 async fn t49_the_caps_refuse_an_add_past_either_bound_with_their_own_words() {
     let f = fixture().await;
+    // The caps count songs the registry keeps; catalog songs (ext- ids) cost it nothing.
+    let registered = |title: &str| {
+        f.state.external_id_registry.register(SoulseekRouting {
+            kind: RoutingKind::Song,
+            artist: Some("Somebody".into()),
+            title: Some(title.into()),
+            duration: Some(190),
+            ..Default::default()
+        })
+    };
+    let (first, second) = (registered("First"), registered("Second"));
     f.state.held_playlists.set_caps_for_tests(1, 30_000);
-    held_road(&f).await;
+    let added = f
+        .json(
+            "winters",
+            &format!("updatePlaylist?playlistId={ROAD}&songIdToAdd={first}"),
+        )
+        .await;
+    assert_eq!(added["status"], "ok", "{added}");
     let refused = f
         .json(
             "winters",
-            &format!("updatePlaylist?playlistId={ROAD}&songIdToAdd={OUTSIDE_THIRD}"),
+            &format!("updatePlaylist?playlistId={ROAD}&songIdToAdd={second}"),
         )
         .await;
-    assert_eq!(refused["error"]["code"], 0);
+    assert_eq!(refused["error"]["code"], 0, "{refused}");
     assert_eq!(
         refused["error"]["message"],
         "Your playlists hold as many songs found online as Octo keeps."
     );
-    assert_eq!(f.held(ROAD).unwrap(), ["s-a", "s-b", OUTSIDE]);
+    assert_eq!(f.held(ROAD).unwrap(), ["s-a", "s-b", first.as_str()]);
+    // A catalog song is never counted, so it goes in at the cap.
+    let catalog = f
+        .json(
+            "winters",
+            &format!("updatePlaylist?playlistId={ROAD}&songIdToAdd={OUTSIDE}"),
+        )
+        .await;
+    assert_eq!(catalog["status"], "ok", "{catalog}");
+    assert_eq!(f.held(ROAD).unwrap(), ["s-a", "s-b", first.as_str(), OUTSIDE]);
     // Downloaded songs never count: a library add goes through.
     let library = f
         .json(
@@ -1463,7 +1498,7 @@ async fn t49_the_caps_refuse_an_add_past_either_bound_with_their_own_words() {
     let refused = f
         .json(
             "winters",
-            &format!("updatePlaylist?playlistId={PLAIN}&songIdToAdd={OUTSIDE_THIRD}"),
+            &format!("updatePlaylist?playlistId={PLAIN}&songIdToAdd={second}"),
         )
         .await;
     assert_eq!(
@@ -1486,7 +1521,11 @@ async fn t49_the_caps_refuse_an_add_past_either_bound_with_their_own_words() {
 
 #[tokio::test]
 async fn t14_t25_a_kid_removes_by_the_places_it_was_shown_and_counts_only_clean_songs() {
-    let f = fixture_with(true, |_| {}).await;
+    // The owner's listing shows members' playlists only with OwnerSeesMemberPlaylists on.
+    let f = fixture_with(true, |settings| {
+        settings.family.owner_sees_member_playlists = true
+    })
+    .await;
     let added = f
         .json(
             "kid",

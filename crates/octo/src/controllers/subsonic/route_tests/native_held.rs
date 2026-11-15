@@ -136,9 +136,11 @@ async fn t24_t44_native_refusals_owner_album_smart_and_upkeep() {
 #[tokio::test]
 async fn t44_native_upkeep_playlists_refuse_outside_songs() {
     let f = fixture_with(false, |settings| {
+        // Review on brings the Keep action playlist with it.
         settings.library_actions = octo_core::settings::LibraryActionSettings {
             enabled: true,
             playlists_enabled: true,
+            review_enabled: true,
             allowed_users: vec!["winters".into()],
             ..Default::default()
         };
