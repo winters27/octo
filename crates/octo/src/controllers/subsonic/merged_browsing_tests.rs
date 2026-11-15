@@ -18,11 +18,13 @@ use wiremock::{Mock, MockServer, Request as MockRequest, Respond, ResponseTempla
 use super::test_app::*;
 use crate::app::AppState;
 use crate::services::cover_art::CoverArtAggregator;
+use crate::services::cover_art::animated_art::Clip;
 use crate::services::metadata::{DeezerMetadataService, DeezerRateLimitHandler, DeezerRateLimiter};
 use crate::services::soulseek::SoulseekMetadataService;
 use crate::services::you_tube::YouTubeResolver;
 
 const AUTH: &str = "u=alice&t=good&s=salt&v=1.16.1&c=test";
+const OCTO_AUTH: &str = "u=alice&t=good&s=salt&v=1.16.1&c=Octo";
 
 fn json(body: &str) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_raw(body.as_bytes().to_vec(), "application/json")
@@ -131,6 +133,24 @@ impl Respond for FakeNavidrome {
                   ]}}}"#,
             );
         }
+        if path.ends_with("/rest/getAlbum") && query.get("id").map(String::as_str) == Some("al-full") {
+            return json(
+                r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","album":{
+                  "id":"al-full","name":"Test Album","artist":"Test Artist","songCount":4,"duration":1000,
+                  "song":[
+                    {"id":"f-1","title":"One","album":"Test Album","artist":"Test Artist","track":1,"duration":100,"isrc":["GBAAA0000001"]},
+                    {"id":"f-2","title":"Two","album":"Test Album","artist":"Test Artist","track":2,"duration":200,"isrc":["GBAAA0000002"]},
+                    {"id":"f-3","title":"Three","album":"Test Album","artist":"Test Artist","track":3,"duration":300,"isrc":["GBAAA0000003"]},
+                    {"id":"f-4","title":"Four","album":"Test Album","artist":"Test Artist","track":4,"duration":400,"isrc":["GBAAA0000004"]}
+                  ]}}}"#,
+            );
+        }
+        if path.ends_with("/rest/getAlbum") && query.get("id").map(String::as_str) == Some("al-ext") {
+            return json(
+                r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","album":{
+                  "id":"al-ext","name":"Test Album","artist":"Test Artist","songCount":4,"duration":1000}}}"#,
+            );
+        }
         if path.ends_with("/rest/getAlbum") {
             return if is_json {
                 json(
@@ -176,6 +196,15 @@ struct Merged {
 
 impl Merged {
     async fn new() -> Merged {
+        Merged::with_settings(|_| {}).await
+    }
+
+    /// The same app with `Subsonic:FillMissingAlbumTracks` set to `fill`.
+    async fn with_fill(fill: bool) -> Merged {
+        Merged::with_settings(|settings| settings.subsonic.fill_missing_album_tracks = fill).await
+    }
+
+    async fn with_settings(change: impl FnOnce(&mut AppSettings)) -> Merged {
         let navidrome = FakeNavidrome::default();
         let navidrome_server = MockServer::builder().start().await;
         Mock::given(any())
@@ -190,7 +219,9 @@ impl Merged {
             .await;
 
         let deezer_base = deezer_server.uri();
-        let state = state_with(settings(&navidrome_server.uri()), move |inner| {
+        let mut app_settings = settings(&navidrome_server.uri());
+        change(&mut app_settings);
+        let state = state_with(app_settings, move |inner| {
             let deezer_settings = Arc::new(SettingsStore::for_tests(AppSettings::default()));
             let http = Arc::new(DeezerRateLimitHandler::new(Arc::new(DeezerRateLimiter::new())));
             let catalog = Arc::new(DeezerMetadataService::with_base_url(
@@ -238,6 +269,22 @@ fn names(values: &Value, key: &str) -> Vec<String> {
         .expect("a list")
         .iter()
         .map(|v| v[key].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn ids(values: &Value) -> Vec<String> {
+    names(values, "id")
+}
+
+fn sorted(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values
+}
+
+fn xml_ids(album: &XElement) -> Vec<String> {
+    children(album, "song")
+        .iter()
+        .map(|song| song.attribute("id").unwrap_or_default().to_string())
         .collect()
 }
 
@@ -417,6 +464,189 @@ async fn get_album_xml_writes_lists_and_objects_the_open_subsonic_way() {
     // Plain values are attributes, never child elements.
     assert_eq!(one.attribute("track"), Some("1"));
     assert!(children(one, "track").is_empty());
+}
+
+#[tokio::test]
+async fn get_album_fill_defaults_on_and_merges_the_catalog_tracks() {
+    let fixture = Merged::new().await;
+    assert!(
+        fixture
+            .state
+            .settings
+            .current()
+            .subsonic
+            .fill_missing_album_tracks
+    );
+
+    let json = fixture
+        .json(&format!("/rest/getAlbum.view?{AUTH}&f=json&id=al-1"))
+        .await;
+    let album = &json["subsonic-response"]["album"];
+
+    assert_eq!(names(&album["song"], "title"), ["One", "Two", "Three", "Four"]);
+    assert_eq!(album["songCount"], 4);
+    assert!(album.get("ownedCount").is_none());
+    assert!(
+        fixture
+            .deezer
+            .calls
+            .lock()
+            .iter()
+            .any(|call| call == "/album/1/tracks"),
+        "the catalog was not asked: {:?}",
+        fixture.deezer.calls.lock()
+    );
+}
+
+#[tokio::test]
+async fn get_album_fill_off_keeps_a_complete_local_album() {
+    let fixture = Merged::with_fill(false).await;
+
+    let json = fixture
+        .json(&format!("/rest/getAlbum.view?{AUTH}&f=json&id=al-full"))
+        .await;
+    let album = &json["subsonic-response"]["album"];
+
+    assert_eq!(ids(&album["song"]), ["f-1", "f-2", "f-3", "f-4"]);
+    assert_eq!(album["songCount"], 4);
+    assert!(album.get("ownedCount").is_none());
+    assert!(
+        fixture.deezer.calls.lock().is_empty(),
+        "the catalog was asked: {:?}",
+        fixture.deezer.calls.lock()
+    );
+}
+
+#[tokio::test]
+async fn get_album_fill_off_keeps_a_partial_local_album() {
+    let fixture = Merged::with_fill(false).await;
+
+    let json = fixture
+        .json(&format!("/rest/getAlbum.view?{AUTH}&f=json&id=al-1"))
+        .await;
+    let album = &json["subsonic-response"]["album"];
+
+    assert_eq!(ids(&album["song"]), ["s-1", "s-3"]);
+    assert_eq!(names(&album["song"], "title"), ["One", "Three"]);
+    assert_eq!(album["songCount"], 2);
+    assert!(album.get("ownedCount").is_none());
+    assert!(
+        fixture.deezer.calls.lock().is_empty(),
+        "the catalog was asked: {:?}",
+        fixture.deezer.calls.lock()
+    );
+}
+
+#[tokio::test]
+async fn get_album_fill_off_xml_matches_json() {
+    let fixture = Merged::with_fill(false).await;
+
+    let json = fixture
+        .json(&format!("/rest/getAlbum.view?{AUTH}&f=json&id=al-1"))
+        .await;
+    let json_ids = sorted(ids(&json["subsonic-response"]["album"]["song"]));
+
+    let response = fixture.get(&format!("/rest/getAlbum.view?{AUTH}&id=al-1")).await;
+    assert_eq!(response.media_type().as_deref(), Some("application/xml"));
+    let xml = XElement::parse(&response.text()).expect("XML");
+    let album = child(&xml, "album");
+    let xml_song_ids = sorted(xml_ids(album));
+
+    assert_eq!(json_ids, ["s-1", "s-3"]);
+    assert_eq!(xml_song_ids, json_ids);
+    assert_eq!(album.attribute("songCount"), Some("2"));
+    assert!(
+        fixture.deezer.calls.lock().is_empty(),
+        "the catalog was asked: {:?}",
+        fixture.deezer.calls.lock()
+    );
+}
+
+#[tokio::test]
+async fn get_album_fill_off_still_returns_an_external_only_album() {
+    let fixture = Merged::with_fill(false).await;
+    let id = fixture.state.external_id_registry.register(SoulseekRouting {
+        kind: RoutingKind::Album,
+        artist: Some("Test Artist".into()),
+        album: Some("Test Album".into()),
+        external_album_id: Some("1".into()),
+        ..Default::default()
+    });
+
+    let json = fixture
+        .json(&format!("/rest/getAlbum.view?{AUTH}&f=json&id={id}"))
+        .await;
+    let album = &json["subsonic-response"]["album"];
+
+    assert_eq!(album["name"], "Test Album");
+    assert_eq!(names(&album["song"], "title"), ["One", "Two", "Three", "Four"]);
+    assert!(
+        fixture
+            .deezer
+            .calls
+            .lock()
+            .iter()
+            .any(|call| call == "/album/1/tracks"),
+        "the catalog was not asked: {:?}",
+        fixture.deezer.calls.lock()
+    );
+}
+
+#[tokio::test]
+async fn get_album_fill_off_still_consults_the_catalog_for_an_album_with_no_local_songs() {
+    let fixture = Merged::with_fill(false).await;
+
+    let json = fixture
+        .json(&format!("/rest/getAlbum.view?{AUTH}&f=json&id=al-ext"))
+        .await;
+    let album = &json["subsonic-response"]["album"];
+
+    assert!(album.get("song").is_none());
+    assert!(
+        fixture
+            .deezer
+            .calls
+            .lock()
+            .iter()
+            .any(|call| call.starts_with("/search/album")),
+        "the catalog was not asked: {:?}",
+        fixture.deezer.calls.lock()
+    );
+}
+
+#[tokio::test]
+async fn get_album_fill_off_keeps_the_animated_art() {
+    let fixture = Merged::with_fill(false).await;
+    fixture.state.animated_art.keep(
+        "Test Artist",
+        "Test Album",
+        Some(Clip {
+            video: "https://example.invalid/animated/square.m3u8".into(),
+            poster: Some("https://example.invalid/animated/square.jpg".into()),
+            color: Some("0a0b0c".into()),
+            width: 1080,
+            height: 1080,
+        }),
+        None,
+    );
+
+    let json = fixture
+        .json(&format!("/rest/getAlbum.view?{OCTO_AUTH}&f=json&id=al-1"))
+        .await;
+    let album = &json["subsonic-response"]["album"];
+
+    assert_eq!(ids(&album["song"]), ["s-1", "s-3"]);
+    assert_eq!(
+        album["animatedArt"]["square"]["video"],
+        "https://example.invalid/animated/square.m3u8"
+    );
+    assert_eq!(album["animatedArt"]["square"]["color"], "0a0b0c");
+    assert!(album["animatedArt"].get("tall").is_none());
+    assert!(
+        fixture.deezer.calls.lock().is_empty(),
+        "the catalog was asked: {:?}",
+        fixture.deezer.calls.lock()
+    );
 }
 
 #[tokio::test]
