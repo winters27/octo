@@ -479,7 +479,7 @@ impl ExternalIdRegistry {
 
     /// A video refused for the song `artist - title`: a record that chose it is removed with a
     /// tombstone. Called with no lock held.
-    fn forget_refused_choice(&self, artist: &str, title: &str, video: &str) {
+    pub(super) fn forget_refused_choice(&self, artist: &str, title: &str, video: &str) {
         for key in StreamChoices::keys_for_names(artist, title) {
             let chose_it = self
                 .choices
@@ -770,7 +770,7 @@ impl ExternalIdRegistry {
     /// A seed about to be restored: its bindings go (a seed is a copy from any time), a chosen
     /// mark no record backs becomes Octo's pick, and under a person's choice the chooser's heard
     /// records older than the choice go.
-    fn settle_restored(&self, routing: &mut SoulseekRouting) {
+    pub(super) fn settle_restored(&self, routing: &mut SoulseekRouting) {
         routing.plays.clear();
         match self.pick_for(routing) {
             PickState::Person(record) => {
