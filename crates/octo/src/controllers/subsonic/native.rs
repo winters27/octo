@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -26,11 +27,22 @@ use super::action_helpers::{
     error_object, file_reply, int_try_parse, is_octo_playlist_id, materialize_station, native_username,
     playlist_stations, queue_refresh_if_stale, written_body,
 };
-use super::playlists::to_node;
+use super::held;
+use super::playlists::{family_action_of, held_row, run_family_action, to_node};
 use crate::app::AppState;
 use crate::http::error::AppError;
+use crate::services::family::audio_gate::ExplicitMark;
+use crate::services::family::hooks::caller_for;
+use crate::services::family::{FamilyCaller, kid_filter};
+use crate::services::playlists::entries::Built;
+use crate::services::playlists::held_playlists::{
+    self, HeldCaller, HeldError, Pick, RelayAnswer, ServedView, UpdateOutcome, UpdateRequest,
+};
+use crate::services::playlists::held_store::HeldEntry;
 use crate::services::soulseek::SoulseekMetadataService;
-use crate::services::subsonic::{RawRelayResult, SubsonicProxyService};
+use crate::services::subsonic::{IncomingRequest, RawRelayResult, SubsonicProxyService};
+use parking_lot::Mutex;
+use tracing::warn;
 
 /// The request as the catch-all read it.
 pub struct NativeRequest<'a> {
@@ -40,11 +52,16 @@ pub struct NativeRequest<'a> {
     pub parameters: &'a Parameters,
     pub format: &'a str,
     pub proxy: &'a SubsonicProxyService,
+    /// The body as the client sent it.
+    pub body: &'a Bytes,
 }
 
 /// The catch-all's own answers, tried in order. `None` when the request goes on to the faithful
 /// relay.
 pub async fn answer(state: &AppState, request: &NativeRequest<'_>) -> Result<Option<Response>, AppError> {
+    if let Some(held) = try_serve_native_held(state, request).await? {
+        return Ok(Some(held));
+    }
     if let Some(radio) = try_serve_native_radio(state, request).await? {
         return Ok(Some(radio));
     }
@@ -247,6 +264,14 @@ async fn try_serve_native_radio(
         let Ok(Node::Array(mut rows)) = Node::parse(text) else {
             return Ok(Some(unchanged()));
         };
+        if !state.held_playlists.is_empty() {
+            let viewer = native_viewer(state, request);
+            for row in rows.iter_mut() {
+                if let Node::Object(fields) = row {
+                    count_native_row(state, &viewer, fields);
+                }
+            }
+        }
         let writable_only = request
             .parameters
             .get("smart")
@@ -930,5 +955,695 @@ fn sanitize(text: &str) -> String {
         "Unknown".to_string()
     } else {
         text.replace(['/', '\\'], "_")
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Held playlists through Navidrome's own API
+// ---------------------------------------------------------------------------------------
+
+/// The native caller as the family rules see them, and whether they hear clean songs only.
+#[derive(Clone)]
+struct NativeViewer {
+    user: String,
+    caller: FamilyCaller,
+    kid: bool,
+    unrated: bool,
+}
+
+fn native_viewer(state: &AppState, request: &NativeRequest<'_>) -> NativeViewer {
+    let user = native_username(state, request.parameters, request.headers);
+    let caller = caller_for(&state.family_store, &user);
+    let settings = state.settings.current();
+    NativeViewer {
+        kid: settings.family.enabled && kid_filter::is_kid(&caller),
+        unrated: settings.family.kid_unrated_is_explicit,
+        user,
+        caller,
+    }
+}
+
+impl NativeViewer {
+    /// Who the held service records a native change as: native requests name no client.
+    fn held_caller(&self) -> HeldCaller {
+        HeldCaller {
+            username: self.user.trim().to_string(),
+            user: self.user.trim().to_string(),
+            client: String::new(),
+        }
+    }
+}
+
+/// A held playlist's native row with its streamed songs counted for this viewer, and
+/// `updatedAt` the newer of Navidrome's and the list's own.
+fn count_native_row(state: &AppState, viewer: &NativeViewer, row: &mut indexmap::IndexMap<String, Node>) {
+    let Some(id) = row
+        .get("id")
+        .and_then(Node::as_str)
+        .filter(|id| state.held_playlists.contains(id))
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(view) = state.held_playlists.view_of(&id) else {
+        return;
+    };
+    let counted = held_row(&view.entries, view.changed, viewer.kid, viewer.unrated);
+    let number = |node: Option<&Node>| match node {
+        Some(Node::Number(text)) => text.trim().parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    };
+    let songs = number(row.get("songCount")) as i64 + counted.songs;
+    let seconds = number(row.get("duration")) + counted.seconds as f64;
+    let listed = row
+        .get("updatedAt")
+        .and_then(Node::as_str)
+        .and_then(held::parse_instant);
+    row.insert("songCount".into(), Node::Number(songs.to_string()));
+    row.insert(
+        "duration".into(),
+        Node::Number(octo_core::json::format_double(seconds)),
+    );
+    let newest = listed.map_or(counted.changed, |at| at.max(counted.changed));
+    row.insert("updatedAt".into(), Node::String(format_utc(&newest)));
+}
+
+/// A JSON answer with status 200.
+fn native_json(value: &Value) -> Response {
+    written_json(
+        octo_core::json::to_string(value).into_bytes(),
+        HeaderMap::new(),
+        "application/json",
+    )
+}
+
+/// The native answer to a held playlist error: its HTTP status and `{"error": message}`.
+fn native_held_error(failure: HeldError) -> Response {
+    let status = StatusCode::from_u16(failure.http_status()).unwrap_or(StatusCode::BAD_REQUEST);
+    error_object(status, failure.message())
+}
+
+/// A relayed answer as it came: status, the allowlisted headers and the body.
+fn relayed_raw(state: &AppState, raw: RawRelayResult) -> Response {
+    crate::http::catch_all::write_raw_relay(raw, "json", &state.subsonic_response_builder)
+}
+
+/// A proxy that calls Navidrome's own API as the native caller (their sign-in headers), with
+/// its own method and JSON body.
+fn caller_proxy(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: Method,
+    body: Option<Bytes>,
+) -> SubsonicProxyService {
+    let mut headers = headers.clone();
+    headers.remove(header::CONTENT_LENGTH);
+    if body.is_some() {
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    } else {
+        headers.remove(header::CONTENT_TYPE);
+    }
+    let incoming = IncomingRequest::new(method, headers, None, body.unwrap_or_default());
+    state.subsonic_proxy.with_request(Arc::new(incoming))
+}
+
+/// A playlist as the caller's native read shows it.
+struct NativePlaylist {
+    name: String,
+    owner: String,
+    smart: bool,
+    synced: bool,
+}
+
+/// `GET api/playlist/{id}` as the caller. The error is the answer to send.
+async fn native_playlist(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    id: &str,
+) -> Result<NativePlaylist, Response> {
+    let raw = caller_proxy(state, request.headers, Method::GET, None)
+        .relay_raw(&format!("api/playlist/{id}"), std::iter::empty::<(&str, &str)>())
+        .await
+        .map_err(|failure| AppError::from(failure).into_response())?;
+    if !(200..300).contains(&raw.status) {
+        return Err(relayed_raw(state, raw));
+    }
+    let value: Value = serde_json::from_slice(&raw.body).unwrap_or(Value::Null);
+    let text = |name: &str| {
+        value
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let smart = value.get("rules").is_some_and(|rules| match rules {
+        Value::Null => false,
+        Value::Object(fields) => !fields.is_empty(),
+        _ => true,
+    });
+    Ok(NativePlaylist {
+        name: text("name"),
+        owner: text("ownerName"),
+        smart,
+        synced: value.get("sync").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// The library rows of a playlist Navidrome lets the caller see, as their own native read; None
+/// when Navidrome did not answer, the answer to send when it refused.
+async fn caller_tracks(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+) -> Result<Vec<Value>, Option<Response>> {
+    let raw = caller_proxy(state, headers, Method::GET, None)
+        .relay_raw(
+            &format!("api/playlist/{id}/tracks"),
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .await
+        .map_err(|_| None)?;
+    if !(200..300).contains(&raw.status) {
+        return Err(Some(relayed_raw(state, raw)));
+    }
+    Ok(serde_json::from_slice::<Value>(&raw.body)
+        .ok()
+        .and_then(|rows| rows.as_array().cloned())
+        .unwrap_or_default())
+}
+
+/// One row of a held playlist as the native API serves it, with the place of its entry.
+struct NativeRow {
+    entry: usize,
+    row: Value,
+}
+
+/// The held entries as the native caller is served them (the service's `walk` over the caller's
+/// own rows): a library entry takes the next unused row the caller's read gave for that song,
+/// else its outside fallback; a streamed entry is its snapshot in native shape. A managed kid is
+/// not served explicit songs. `id` is the 1-based place over this list.
+fn held_rows(
+    state: &AppState,
+    entries: &[HeldEntry],
+    library: Vec<Value>,
+    viewer: &NativeViewer,
+    id: &str,
+) -> Vec<NativeRow> {
+    let media: Vec<String> = library
+        .iter()
+        .map(|row| {
+            row.get("mediaFileId")
+                .and_then(Value::as_str)
+                .or_else(|| row.get("id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let mut rows = Vec::new();
+    for pick in held_playlists::walk(entries, &media) {
+        match pick {
+            Pick::Library { entry, row } => {
+                let answered = library[row].get("explicitStatus").and_then(Value::as_str);
+                if viewer.kid
+                    && kid_filter::song_is_explicit(
+                        &state.library_index,
+                        &media[row],
+                        answered,
+                        viewer.unrated,
+                    )
+                {
+                    continue;
+                }
+                rows.push(NativeRow {
+                    entry,
+                    row: library[row].clone(),
+                });
+            }
+            Pick::Outside { entry, id: outside } => {
+                let Some(song) =
+                    held_playlists::snapshot_song(&entries[entry]).filter(|song| song.id == outside)
+                else {
+                    continue;
+                };
+                if viewer.kid
+                    && ExplicitMark::from_catalog(song.explicit_content_lyrics)
+                        .blocks_clean_only(viewer.unrated)
+                {
+                    continue;
+                }
+                let mut row = native_song_object(state, &song);
+                if let Some(fields) = row.as_object_mut() {
+                    fields.insert("mediaFileId".into(), outside.into());
+                }
+                rows.push(NativeRow { entry, row });
+            }
+        }
+    }
+    for (place, served) in rows.iter_mut().enumerate() {
+        if let Some(fields) = served.row.as_object_mut() {
+            fields.insert("id".into(), (place + 1).to_string().into());
+            fields.insert("playlistId".into(), id.into());
+        }
+    }
+    rows
+}
+
+/// The native caller's served list, worked out under the playlist's lock with a fresh read of
+/// their own rows: what the held service counts places over.
+struct NativeList {
+    state: AppState,
+    headers: HeaderMap,
+    viewer: NativeViewer,
+    id: String,
+}
+
+#[async_trait]
+impl ServedView for NativeList {
+    async fn served(&self, entries: &[HeldEntry]) -> Option<Vec<usize>> {
+        let library = caller_tracks(&self.state, &self.headers, &self.id).await.ok()?;
+        Some(
+            held_rows(&self.state, entries, library, &self.viewer, &self.id)
+                .into_iter()
+                .map(|served| served.entry)
+                .collect(),
+        )
+    }
+}
+
+/// A held playlist read, changed or deleted through Navidrome's own API, a playlist deleted, or
+/// songs added to any playlist. None for the faithful relay.
+async fn try_serve_native_held(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+) -> Result<Option<Response>, AppError> {
+    const PREFIX: &str = "api/playlist/";
+    let endpoint = request.endpoint;
+    if !dotnet::starts_with_ignore_case(endpoint, PREFIX) {
+        return Ok(None);
+    }
+    let parts: Vec<&str> = endpoint[PREFIX.len()..]
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(id) = parts.first().map(|id| id.to_string()) else {
+        return Ok(None);
+    };
+    if is_octo_playlist_id(&id, state.settings.current().family.enabled) {
+        return Ok(None);
+    }
+    let tracks = parts
+        .get(1)
+        .is_some_and(|part| part.eq_ignore_ascii_case("tracks"));
+    let method = request.method;
+    match (parts.len(), tracks) {
+        (1, _) if method == Method::GET => native_read(state, request, &id).await,
+        (1, _) if method == Method::DELETE => native_delete_playlist(state, request, &id).await.map(Some),
+        (2, true) if method == Method::GET => native_tracks(state, request, &id).await,
+        (2, true) if method == Method::POST => native_add(state, request, &id).await,
+        (2, true) if method == Method::DELETE => native_remove(state, request, &id).await,
+        (3, true) if method == Method::PUT => native_move(state, request, &id, parts[2]).await,
+        _ => Ok(None),
+    }
+}
+
+/// `GET api/playlist/{id}` of a held playlist: Navidrome's row with the streamed songs counted.
+async fn native_read(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    id: &str,
+) -> Result<Option<Response>, AppError> {
+    if !held::held_now(state, id) {
+        return Ok(None);
+    }
+    let raw = request
+        .proxy
+        .relay_raw(request.endpoint, request.parameters)
+        .await?;
+    if !(200..300).contains(&raw.status) {
+        return Ok(Some(relayed_raw(state, raw)));
+    }
+    let parsed = std::str::from_utf8(&raw.body)
+        .ok()
+        .and_then(|text| Node::parse(text).ok());
+    let Some(Node::Object(mut row)) = parsed else {
+        return Ok(Some(relayed_raw(state, raw)));
+    };
+    let viewer = native_viewer(state, request);
+    count_native_row(state, &viewer, &mut row);
+    let mut headers = HeaderMap::new();
+    for (name, value) in &raw.response_headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    Ok(Some(written_json(
+        Node::Object(row).to_json_string(false).into_bytes(),
+        headers,
+        "application/json",
+    )))
+}
+
+/// `GET api/playlist/{id}/tracks` of a held playlist: the caller's own read first (the sign-in
+/// and the library rows they may see), then every entry in place, paged with `X-Total-Count`
+/// over the served list.
+async fn native_tracks(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    id: &str,
+) -> Result<Option<Response>, AppError> {
+    if !held::held_now(state, id) {
+        return Ok(None);
+    }
+    let library = match caller_tracks(state, request.headers, id).await {
+        Ok(rows) => rows,
+        Err(Some(answer)) => return Ok(Some(answer)),
+        Err(None) => return Ok(Some(native_held_error(HeldError::Busy))),
+    };
+    let playlist = match state.held_playlists.serve(id).await {
+        Ok(Some(playlist)) => playlist,
+        Ok(None) => return Ok(None),
+        Err(failure) => return Ok(Some(native_held_error(failure))),
+    };
+    let viewer = native_viewer(state, request);
+    let rows: Vec<Value> = held_rows(state, &playlist.entries, library, &viewer, id)
+        .into_iter()
+        .map(|served| served.row)
+        .collect();
+    let total = rows.len();
+    let start = page_number(request.parameters, "_start").unwrap_or(0).max(0);
+    let end = page_number(request.parameters, "_end").unwrap_or(total as i32);
+    let page: Vec<Node> = page(&rows, start, end).iter().map(to_node).collect();
+    Ok(Some(file_with_total(
+        Node::Array(page).to_json_string(false).into_bytes(),
+        total,
+    )))
+}
+
+/// A managed member's own family action playlist reached natively: what is added, and what the
+/// playlist already holds, become requests or removals, and the playlist is emptied, as the
+/// Subsonic route does. None for any other playlist or caller.
+async fn native_family_action(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    id: &str,
+    ids: &[String],
+    viewer: &NativeViewer,
+) -> Option<Response> {
+    if !state.settings.current().family.enabled || !viewer.caller.managed {
+        return None;
+    }
+    let playlist = native_playlist(state, request, id).await.ok()?;
+    if !dotnet::eq_ignore_case(playlist.owner.trim(), viewer.user.trim()) {
+        return None;
+    }
+    let action = family_action_of(&playlist.name)?;
+    let already: Vec<String> = caller_tracks(state, request.headers, id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row.get("mediaFileId").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let songs: Vec<String> = already.iter().chain(ids.iter()).cloned().collect();
+    run_family_action(state, &viewer.caller.user, playlist.name.trim(), &action, &songs).await;
+    if !already.is_empty() {
+        let places: Vec<(String, String)> = (1..=already.len())
+            .map(|place| ("id".to_string(), place.to_string()))
+            .collect();
+        let emptied = caller_proxy(state, request.headers, Method::DELETE, None)
+            .relay_raw(
+                &format!("api/playlist/{id}/tracks"),
+                places.iter().map(|(k, v)| (k, v)),
+            )
+            .await;
+        if !emptied.is_ok_and(|raw| (200..300).contains(&raw.status)) {
+            warn!("Could not empty {}'s {} playlist", viewer.user, playlist.name);
+        }
+    }
+    Some(native_json(&json!({ "added": 0 })))
+}
+
+/// The native caller's request relayed as it came, run when the held service awaits it.
+fn native_plain(request: &NativeRequest<'_>) -> held_playlists::Relay {
+    let proxy = request.proxy.clone();
+    let endpoint = request.endpoint.to_string();
+    let parameters = request.parameters.clone();
+    Box::pin(async move {
+        let raw = proxy.relay_raw(&endpoint, &parameters).await.ok()?;
+        Some(RelayAnswer {
+            ok: (200..300).contains(&raw.status),
+            body: raw.body.to_vec(),
+            content_type: raw.content_type,
+        })
+    })
+}
+
+/// `POST api/playlist/{id}/tracks` (`ids`, `albumIds`, `artistIds`) in this order: a managed
+/// member's family action playlist first; outside albums and artists refused; then, for songs
+/// found online or any add to a held playlist, the caller's upkeep playlists and smart or synced
+/// playlists refused, the owner checked, and the held service adds them (converting a plain
+/// playlist) under the lock. Library songs added to a plain playlist are relayed as they came.
+async fn native_add(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    id: &str,
+) -> Result<Option<Response>, AppError> {
+    let body: Value = serde_json::from_slice(request.body).unwrap_or(Value::Null);
+    let list = |name: &str| -> Vec<String> {
+        body.get(name)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (ids, albums, artists) = (list("ids"), list("albumIds"), list("artistIds"));
+    let viewer = native_viewer(state, request);
+    if let Some(answer) = native_family_action(state, request, id, &ids, &viewer).await {
+        return Ok(Some(answer));
+    }
+    let outside = |item: &String| {
+        state.local_library.parse_song_id(item).0 || state.local_library.parse_external_id(item).0
+    };
+    if albums.iter().chain(&artists).any(outside) {
+        return Ok(Some(error_object(
+            StatusCode::BAD_REQUEST,
+            held_playlists::ONE_BY_ONE,
+        )));
+    }
+    if !ids.iter().any(outside) && !held::held_now(state, id) {
+        return Ok(None);
+    }
+    let playlist = match native_playlist(state, request, id).await {
+        Ok(playlist) => playlist,
+        Err(answer) => return Ok(Some(answer)),
+    };
+    let own = dotnet::eq_ignore_case(playlist.owner.trim(), viewer.user.trim());
+    let built = if own {
+        match state
+            .held_playlists
+            .build_entries(&playlist.owner, &ids, &state.held_playlists.record_ids(id))
+            .await
+        {
+            Ok(built) => built,
+            Err(failure) => return Ok(Some(native_held_error(failure))),
+        }
+    } else {
+        Vec::new()
+    };
+    if held::brings_streamed(&built) {
+        if held::refuses_outside(state, request.proxy, &viewer.user, &playlist.name) {
+            return Ok(Some(native_held_error(HeldError::Upkeep)));
+        }
+        if playlist.smart || playlist.synced {
+            return Ok(Some(native_held_error(HeldError::MadeByRules)));
+        }
+    }
+    if !own {
+        return Ok(Some(native_held_error(HeldError::NotOwner)));
+    }
+    let added = built
+        .iter()
+        .filter(|song| matches!(song, Built::Entry { .. } | Built::Takeover(_)))
+        .count();
+    let change = UpdateRequest {
+        id: id.to_string(),
+        caller: viewer.held_caller(),
+        owner: playlist.owner.clone(),
+        remove_indexes: Vec::new(),
+        remove_songs: Vec::new(),
+        adds: built,
+        fields: None,
+        plain: native_plain(request),
+        view: Arc::new(NativeList {
+            state: state.clone(),
+            headers: request.headers.clone(),
+            viewer: viewer.clone(),
+            id: id.to_string(),
+        }),
+    };
+    match state.held_playlists.update(change).await {
+        Ok(UpdateOutcome::Held { skipped, .. }) => Ok(Some(native_json(
+            &json!({ "added": added.saturating_sub(skipped.len()) }),
+        ))),
+        Ok(UpdateOutcome::Plain(Some(answer)) | UpdateOutcome::Relayed(answer)) => {
+            let mut response = file_reply(
+                &Bytes::from(answer.body),
+                Some(answer.content_type.as_deref().unwrap_or("application/json")),
+                "json",
+            );
+            if !answer.ok {
+                *response.status_mut() = StatusCode::BAD_REQUEST;
+            }
+            Ok(Some(response))
+        }
+        Ok(UpdateOutcome::Plain(None)) => Ok(Some(native_held_error(HeldError::Busy))),
+        Err(failure) => Ok(Some(native_held_error(failure))),
+    }
+}
+
+/// The owner, the served list and who is asking, for a native change by place. The error is the
+/// answer to send.
+async fn native_change_start(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    id: &str,
+) -> Result<(NativeViewer, Arc<NativeList>), Response> {
+    let viewer = native_viewer(state, request);
+    let playlist = native_playlist(state, request, id).await?;
+    if !dotnet::eq_ignore_case(playlist.owner.trim(), viewer.user.trim()) {
+        return Err(native_held_error(HeldError::NotOwner));
+    }
+    let view = Arc::new(NativeList {
+        state: state.clone(),
+        headers: request.headers.clone(),
+        viewer: viewer.clone(),
+        id: id.to_string(),
+    });
+    Ok((viewer, view))
+}
+
+/// `DELETE api/playlist/{id}/tracks?id=<place>...` on a held playlist: the places count over the
+/// caller's served list and come out of the entries under the lock. None for a plain playlist,
+/// which is relayed.
+async fn native_remove(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    id: &str,
+) -> Result<Option<Response>, AppError> {
+    if !held::held_now(state, id) {
+        return Ok(None);
+    }
+    let (viewer, view) = match native_change_start(state, request, id).await {
+        Ok(start) => start,
+        Err(answer) => return Ok(Some(answer)),
+    };
+    let places: Vec<usize> = request
+        .parameters
+        .get("id")
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|place| place.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    match state
+        .held_playlists
+        .native_remove(id, viewer.held_caller(), places.clone(), view)
+        .await
+    {
+        Ok(Some(_)) => {
+            let ids: Vec<String> = places.iter().map(usize::to_string).collect();
+            Ok(Some(native_json(&json!({ "ids": ids }))))
+        }
+        Ok(None) => Ok(None),
+        Err(failure) => Ok(Some(native_held_error(failure))),
+    }
+}
+
+/// `PUT api/playlist/{id}/tracks/{place}` (`insert_before`) on a held playlist: the song at that
+/// place over the caller's served list moves to `insert_before` under the lock. None for a plain
+/// playlist, which is relayed.
+async fn native_move(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    id: &str,
+    place: &str,
+) -> Result<Option<Response>, AppError> {
+    if !held::held_now(state, id) {
+        return Ok(None);
+    }
+    let body: Value = serde_json::from_slice(request.body).unwrap_or(Value::Null);
+    let insert_before = match body.get("insert_before") {
+        Some(Value::String(text)) => text.trim().parse::<usize>().ok(),
+        Some(Value::Number(number)) => number.as_u64().and_then(|n| usize::try_from(n).ok()),
+        _ => None,
+    };
+    let (Some(from), Some(insert_before)) = (place.trim().parse::<usize>().ok(), insert_before) else {
+        return Ok(Some(native_held_error(HeldError::NotFound)));
+    };
+    let (viewer, view) = match native_change_start(state, request, id).await {
+        Ok(start) => start,
+        Err(answer) => return Ok(Some(answer)),
+    };
+    match state
+        .held_playlists
+        .native_move(id, viewer.held_caller(), from, insert_before, view)
+        .await
+    {
+        Ok(Some(_)) => Ok(Some(native_json(&json!({ "id": place.trim() })))),
+        Ok(None) => Ok(None),
+        Err(failure) => Ok(Some(native_held_error(failure))),
+    }
+}
+
+/// `DELETE api/playlist/{id}`: relayed under the lock by the held service, which drops the held
+/// file on success; once the lock is released the caller's placement of the playlist goes too.
+async fn native_delete_playlist(
+    state: &AppState,
+    request: &NativeRequest<'_>,
+    id: &str,
+) -> Result<Response, AppError> {
+    let user = native_username(state, request.parameters, request.headers);
+    let answered: Arc<Mutex<Option<RawRelayResult>>> = Arc::default();
+    let relay = {
+        let proxy = request.proxy.clone();
+        let endpoint = request.endpoint.to_string();
+        let parameters = request.parameters.clone();
+        let answered = Arc::clone(&answered);
+        Box::pin(async move {
+            let raw = proxy.relay_raw(&endpoint, &parameters).await.ok()?;
+            let answer = RelayAnswer {
+                ok: (200..300).contains(&raw.status),
+                body: raw.body.to_vec(),
+                content_type: raw.content_type.clone(),
+            };
+            *answered.lock() = Some(raw);
+            Some(answer)
+        })
+    };
+    match state.held_playlists.delete(id, relay).await {
+        Ok(answer) => {
+            if answer.as_ref().is_some_and(|answer| answer.ok) && !user.trim().is_empty() {
+                state
+                    .playlist_folders
+                    .remove_places(&user, &[id.to_string()], chrono::Utc::now());
+            }
+            let raw = answered.lock().take();
+            match raw {
+                Some(raw) => Ok(relayed_raw(state, raw)),
+                None => Ok(native_held_error(HeldError::Busy)),
+            }
+        }
+        Err(failure) => Ok(native_held_error(failure)),
     }
 }

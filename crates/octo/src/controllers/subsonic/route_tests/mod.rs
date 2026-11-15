@@ -1,7 +1,10 @@
 //! Handler tests for the Subsonic routes, through the assembled pipeline (`tower::oneshot`)
 //! against Navidrome and the other upstreams stood in for by wiremock.
 
+mod folders;
+mod held_playlists;
 mod native;
+mod native_held;
 mod radio;
 mod search_paging;
 mod similar_songs;

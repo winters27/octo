@@ -65,6 +65,7 @@ pub async fn catch_all(State(state): State<AppState>, req: Request) -> Response 
         parameters: &parameters,
         format: &format,
         proxy: &relay,
+        body: &incoming.body,
     };
     match native::answer(&state, &native_request).await {
         Ok(Some(response)) => return response,
@@ -204,7 +205,11 @@ pub fn is_octo_owned(endpoint: &str) -> bool {
 
 /// The answer to a faithful relay: the upstream status, the allowlisted headers (the last value
 /// of a name wins), the upstream content type or `application/{f}`, and the body, sent chunked.
-fn write_raw_relay(raw: RawRelayResult, format: &str, builder: &SubsonicResponseBuilder) -> Response {
+pub(crate) fn write_raw_relay(
+    raw: RawRelayResult,
+    format: &str,
+    builder: &SubsonicResponseBuilder,
+) -> Response {
     let status = StatusCode::from_u16(raw.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = raw
         .content_type
