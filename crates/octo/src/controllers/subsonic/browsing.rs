@@ -466,111 +466,115 @@ pub async fn get_album(State(state): State<AppState>, req: Request) -> AppResult
         .map(|song| AlbumFillIn::from_subsonic(Some(song)))
         .collect();
 
-    // The first catalog album by this name that holds the library's songs, known by ISRC
-    // or by title and length. A name alone can belong to another record: "Nightcore" by
-    // "Nightcore" (octo-player#1).
-    //
-    // On a server Deezer does not serve, Deezer still answers a song by its ISRC, and that
-    // song's album is Deezer's with every song's ISRC: those albums are tried first. The name
-    // search, answered from Apple there, comes after.
-    let isrcs = AlbumFillIn::isrcs(&library, FILL_IN_ISRCS);
-    let closed = || {
-        state
-            .deezer_reach
-            .as_ref()
-            .is_some_and(|reach| matches!(reach.reach(), Reach::Closed { .. }))
-    };
-    let mut isrc_route_ran = false;
-    let mut deezer_album: Option<Album> = None;
-    if !isrcs.is_empty() && closed() {
-        isrc_route_ran = true;
-        deezer_album = album_holding(&library, metadata.catalog_albums_by_isrc(&isrcs).await);
-    }
-    let search_query = format!("{artist_name} {album_name}");
-    let deezer_albums = if deezer_album.is_none() {
-        metadata.search_albums(&search_query, 5).await
-    } else {
-        Vec::new()
-    };
-    let library_songs = i32::try_from(AlbumFillIn::count_songs(&library)).unwrap_or(i32::MAX);
-    let candidates = AlbumFillIn::candidates(&deezer_albums, &artist_name, &album_name, library_songs);
-    // The name search found Deezer closed (it then answers from Apple, whether or not Apple has the
-    // album): the ISRC albums first.
-    if deezer_album.is_none() && !isrc_route_ran && !isrcs.is_empty() && closed() {
-        deezer_album = album_holding(&library, metadata.catalog_albums_by_isrc(&isrcs).await);
-    }
-    // Only when no ISRC album held the library's songs.
-    let candidates = if deezer_album.is_none() {
-        candidates
-    } else {
-        Vec::new()
-    };
-    for candidate in candidates {
-        // The provider must come from the candidate. A hardcoded "deezer" never
-        // matches the metadata service's provider name, so this always returned null.
-        let detail = metadata
-            .get_album(
-                candidate.external_provider.as_deref().unwrap_or_default(),
-                candidate.external_id.as_deref().unwrap_or_default(),
-            )
-            .await;
-        let Some(detail) = detail.filter(|d| !d.songs.is_empty()) else {
-            continue;
+    // An empty library still goes to the catalog; the animated-art block below runs either way.
+    let fill_from_catalog = state.settings.current().subsonic.fill_missing_album_tracks || library.is_empty();
+    if fill_from_catalog {
+        // The first catalog album by this name that holds the library's songs, known by ISRC
+        // or by title and length. A name alone can belong to another record: "Nightcore" by
+        // "Nightcore" (octo-player#1).
+        //
+        // On a server Deezer does not serve, Deezer still answers a song by its ISRC, and that
+        // song's album is Deezer's with every song's ISRC: those albums are tried first. The name
+        // search, answered from Apple there, comes after.
+        let isrcs = AlbumFillIn::isrcs(&library, FILL_IN_ISRCS);
+        let closed = || {
+            state
+                .deezer_reach
+                .as_ref()
+                .is_some_and(|reach| matches!(reach.reach(), Reach::Closed { .. }))
         };
-        if AlbumFillIn::holds(&library, &detail.songs) {
-            deezer_album = Some(detail);
-            break;
+        let mut isrc_route_ran = false;
+        let mut deezer_album: Option<Album> = None;
+        if !isrcs.is_empty() && closed() {
+            isrc_route_ran = true;
+            deezer_album = album_holding(&library, metadata.catalog_albums_by_isrc(&isrcs).await);
         }
-        debug!(
-            "getAlbum '{artist_name} - {album_name}': catalog album {} shares the name but not the songs; not filled in from it",
-            candidate.external_id.as_deref().unwrap_or("")
-        );
-    }
-
-    if let Some(deezer_album) = deezer_album {
-        // Every song on the page is filed under the album it was opened as, so an app that
-        // groups songs by their album lists the outside ones with the rest.
-        let album_id = album_data
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(str::to_string);
-        let mut merged_songs = local_songs;
-        let owned = AlbumFillIn::owned_rows(&library, &deezer_album.songs);
-        for (deezer_song, owned) in deezer_album.songs.iter().zip(owned) {
-            if !owned {
-                let mut row = builder.convert_song_to_json(deezer_song);
-                if let Some(album_id) = &album_id {
-                    row.insert("albumId".into(), album_id.clone().into());
-                    row.insert("parent".into(), album_id.clone().into());
-                }
-                merged_songs.push(Value::Object(row));
-            }
+        let search_query = format!("{artist_name} {album_name}");
+        let deezer_albums = if deezer_album.is_none() {
+            metadata.search_albums(&search_query, 5).await
+        } else {
+            Vec::new()
+        };
+        let library_songs = i32::try_from(AlbumFillIn::count_songs(&library)).unwrap_or(i32::MAX);
+        let candidates = AlbumFillIn::candidates(&deezer_albums, &artist_name, &album_name, library_songs);
+        // The name search found Deezer closed (it then answers from Apple, whether or not Apple has the
+        // album): the ISRC albums first.
+        if deezer_album.is_none() && !isrc_route_ran && !isrcs.is_empty() && closed() {
+            deezer_album = album_holding(&library, metadata.catalog_albums_by_isrc(&isrcs).await);
         }
-
-        // OrderBy: a stable sort on each song's track, 0 for none.
-        let mut keyed = Vec::with_capacity(merged_songs.len());
-        for song in merged_songs {
-            let track = match song.as_object().and_then(|dict| dict.get("track")) {
-                Some(track) => convert_to_int32(track)?,
-                None => 0,
+        // Only when no ISRC album held the library's songs.
+        let candidates = if deezer_album.is_none() {
+            candidates
+        } else {
+            Vec::new()
+        };
+        for candidate in candidates {
+            // The provider must come from the candidate. A hardcoded "deezer" never
+            // matches the metadata service's provider name, so this always returned null.
+            let detail = metadata
+                .get_album(
+                    candidate.external_provider.as_deref().unwrap_or_default(),
+                    candidate.external_id.as_deref().unwrap_or_default(),
+                )
+                .await;
+            let Some(detail) = detail.filter(|d| !d.songs.is_empty()) else {
+                continue;
             };
-            keyed.push((track, song));
+            if AlbumFillIn::holds(&library, &detail.songs) {
+                deezer_album = Some(detail);
+                break;
+            }
+            debug!(
+                "getAlbum '{artist_name} - {album_name}': catalog album {} shares the name but not the songs; not filled in from it",
+                candidate.external_id.as_deref().unwrap_or("")
+            );
         }
-        keyed.sort_by_key(|(track, _)| *track);
-        let merged_songs: Vec<Value> = keyed.into_iter().map(|(_, song)| song).collect();
 
-        if let Some(album_dict) = album_data.as_object_mut() {
-            let mut total_duration: i32 = 0;
-            for song in &merged_songs {
-                if let Some(duration) = song.as_object().and_then(|dict| dict.get("duration")) {
-                    total_duration = total_duration.wrapping_add(convert_to_int32(duration)?);
+        if let Some(deezer_album) = deezer_album {
+            // Every song on the page is filed under the album it was opened as, so an app that
+            // groups songs by their album lists the outside ones with the rest.
+            let album_id = album_data
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+            let mut merged_songs = local_songs;
+            let owned = AlbumFillIn::owned_rows(&library, &deezer_album.songs);
+            for (deezer_song, owned) in deezer_album.songs.iter().zip(owned) {
+                if !owned {
+                    let mut row = builder.convert_song_to_json(deezer_song);
+                    if let Some(album_id) = &album_id {
+                        row.insert("albumId".into(), album_id.clone().into());
+                        row.insert("parent".into(), album_id.clone().into());
+                    }
+                    merged_songs.push(Value::Object(row));
                 }
             }
-            let count = merged_songs.len();
-            album_dict.insert("song".into(), Value::Array(merged_songs));
-            album_dict.insert("songCount".into(), count.into());
-            album_dict.insert("duration".into(), total_duration.into());
+
+            // OrderBy: a stable sort on each song's track, 0 for none.
+            let mut keyed = Vec::with_capacity(merged_songs.len());
+            for song in merged_songs {
+                let track = match song.as_object().and_then(|dict| dict.get("track")) {
+                    Some(track) => convert_to_int32(track)?,
+                    None => 0,
+                };
+                keyed.push((track, song));
+            }
+            keyed.sort_by_key(|(track, _)| *track);
+            let merged_songs: Vec<Value> = keyed.into_iter().map(|(_, song)| song).collect();
+
+            if let Some(album_dict) = album_data.as_object_mut() {
+                let mut total_duration: i32 = 0;
+                for song in &merged_songs {
+                    if let Some(duration) = song.as_object().and_then(|dict| dict.get("duration")) {
+                        total_duration = total_duration.wrapping_add(convert_to_int32(duration)?);
+                    }
+                }
+                let count = merged_songs.len();
+                album_dict.insert("song".into(), Value::Array(merged_songs));
+                album_dict.insert("songCount".into(), count.into());
+                album_dict.insert("duration".into(), total_duration.into());
+            }
         }
     }
 

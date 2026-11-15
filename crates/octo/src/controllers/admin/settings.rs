@@ -166,6 +166,10 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             ),
             ("SkipOwnedSongs", Node::Bool(subsonic.skip_owned_songs)),
             (
+                "FillMissingAlbumTracks",
+                Node::Bool(subsonic.fill_missing_album_tracks),
+            ),
+            (
                 "WaitForLosslessOnPlay",
                 Node::Bool(subsonic.wait_for_lossless_on_play),
             ),
