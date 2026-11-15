@@ -35,7 +35,7 @@ pub mod request_service;
 pub mod request_store;
 pub mod rules;
 pub mod saved_store;
-mod store_file;
+pub(crate) mod store_file;
 pub mod stream_tracker;
 #[cfg(test)]
 pub(crate) mod test_support;

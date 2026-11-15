@@ -297,9 +297,16 @@ impl StreamSizeWarmer {
         self.registry.remember_pick(song_id, &hit.video_id, hit.pick);
         self.registry.remember_stream(song_id, &hit.video_id, &hit.stream);
         if let (Some(d), Some(routing)) = (hit.duration, self.registry.lookup(song_id)) {
-            let mut r = routing.lock();
-            if SongLength::stream_length_may_replace(r.duration, d) {
-                r.duration = Some(d);
+            let replaced = {
+                let mut r = routing.lock();
+                let replace = SongLength::stream_length_may_replace(r.duration, d);
+                if replace {
+                    r.duration = Some(d);
+                }
+                replace
+            };
+            if replaced {
+                self.registry.mark_changed(song_id);
             }
         }
         self.registry

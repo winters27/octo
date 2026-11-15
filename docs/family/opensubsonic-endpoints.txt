@@ -138,3 +138,9 @@ getFamilySignInPending
 decideFamilySignIn
 putFamilySignInBox
 getFamilySignInRedeem
+
+# octoPlaylistFolders
+getPlaylistFolders
+savePlaylistFolder
+deletePlaylistFolder
+setPlaylistFolder

@@ -297,10 +297,22 @@ fn a_load_and_flush_writes_the_fixture_back_unchanged() {
         assert!(!registry.remember_length(first, Some(100), LengthSource::Video));
         registry.dirty.store(true, Ordering::SeqCst);
     }
+    // A write adds each id's recency stamp and changes nothing else: the same ids in the same
+    // order, the same routings, the stamps newest first, and no `Kept` on any line.
+    let original: Vec<Persisted> = serde_json::from_str(&text).expect("the fixture reads");
+    let rewritten: Vec<Persisted> =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("reads")).expect("parses");
     assert_eq!(
-        std::fs::read_to_string(&path).expect("reads"),
-        text.trim_end_matches('\n')
+        rewritten.iter().map(|p| (&p.id, &p.routing)).collect::<Vec<_>>(),
+        original.iter().map(|p| (&p.id, &p.routing)).collect::<Vec<_>>()
     );
+    assert!(rewritten.iter().all(|p| p.kept.is_empty() && p.recency.is_some()));
+    assert!(rewritten.windows(2).all(|w| w[0].recency > w[1].recency));
+    let stripped: Vec<Persisted> = rewritten
+        .into_iter()
+        .map(|p| Persisted { recency: None, ..p })
+        .collect();
+    assert_eq!(octo_core::json::to_string(&stripped), text.trim_end_matches('\n'));
     assert!(!state_file::tmp_path(&path).exists());
 }
 

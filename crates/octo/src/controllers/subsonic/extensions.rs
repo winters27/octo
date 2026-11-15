@@ -132,6 +132,8 @@ pub async fn get_open_subsonic_extensions(State(state): State<AppState>, req: Re
             places_available(&state).await,
             state.animated_art.offered(),
         );
+    // Playlists that keep songs found online, and playlist folders, are always on.
+    reply = octo_subsonic::subsonic_response_builder::with_playlist_extensions(reply, &format);
     if capped && let Some(body) = audio_gate::without_extension(&reply.body, format == "json", "transcoding")
     {
         reply.body = body;

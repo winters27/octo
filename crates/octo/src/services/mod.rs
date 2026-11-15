@@ -24,6 +24,7 @@ pub mod local;
 pub mod lyrics;
 pub mod metadata;
 pub mod notifications;
+pub mod playlists;
 pub mod prefetch;
 pub mod radio;
 pub mod sonic;

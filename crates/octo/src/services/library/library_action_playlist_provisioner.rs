@@ -118,19 +118,45 @@ impl LibraryActionPlaylistProvisioner {
     /// The titles this request should create: wanted, absent from `existing_names`, and claimed
     /// from every other request. No I/O, so a caller can skip spawning when it is empty.
     pub fn missing(&self, username: &str, existing_names: &[String]) -> Vec<String> {
-        let current = self.settings.current();
-        let settings = &current.library_actions;
-        let family_titles = self.family_titles(username);
-        let actions_on = settings.enabled
-            && (settings.playlists_enabled || settings.notices_enabled())
-            && settings.is_allowed(Some(username));
-        if !actions_on && family_titles.is_empty() {
+        let titles = self.upkeep_titles(username);
+        if titles.is_empty() {
             return Vec::new();
         }
         if !self.done.lock().insert(dotnet::ordinal_ignore_case_key(username)) {
             return Vec::new();
         }
 
+        let mut wanted: Vec<String> = Vec::new();
+        for title in titles
+            .actions
+            .into_iter()
+            .chain(titles.notices)
+            .chain(titles.family)
+        {
+            let exists = existing_names
+                .iter()
+                .any(|name| dotnet::eq_ignore_case(name, &title));
+            let repeated = wanted.iter().any(|name| dotnet::eq_ignore_case(name, &title));
+            if !exists && !repeated {
+                wanted.push(title);
+            }
+        }
+        let current = self.settings.current();
+        let server = current.subsonic.url.as_deref().unwrap_or_default();
+        wanted.retain(|title| claim(server, username, title));
+        wanted
+    }
+
+    /// The titles of `username`'s library upkeep playlists as the settings stand now: the library
+    /// action titles that are on for them, the notice titles that are on, and their own family
+    /// action titles while Family is on. A playlist is an upkeep one when it is theirs and its
+    /// name is one of these, ignoring case. No I/O and no once-per-boot mark.
+    pub fn upkeep_titles(&self, username: &str) -> UpkeepTitles {
+        let current = self.settings.current();
+        let settings = &current.library_actions;
+        let actions_on = settings.enabled
+            && (settings.playlists_enabled || settings.notices_enabled())
+            && settings.is_allowed(Some(username));
         // The notice playlists Octo fills are the user's own too, for the same reason: they are
         // private, and the admin identity fills them.
         let actions: Vec<String> = if actions_on && settings.playlists_enabled {
@@ -152,19 +178,11 @@ impl LibraryActionPlaylistProvisioner {
         } else {
             Vec::new()
         };
-        let mut wanted: Vec<String> = Vec::new();
-        for title in actions.into_iter().chain(notices).chain(family_titles) {
-            let exists = existing_names
-                .iter()
-                .any(|name| dotnet::eq_ignore_case(name, &title));
-            let repeated = wanted.iter().any(|name| dotnet::eq_ignore_case(name, &title));
-            if !exists && !repeated {
-                wanted.push(title);
-            }
+        UpkeepTitles {
+            actions,
+            notices,
+            family: self.family_titles(username),
         }
-        let server = current.subsonic.url.as_deref().unwrap_or_default();
-        wanted.retain(|title| claim(server, username, title));
-        wanted
     }
 
     /// Creates `titles` with the user's own sign-in; each one that fails is released.
@@ -262,6 +280,79 @@ pub const REQUEST_FLAC_PLAYLIST: &str = "Request a copy in FLAC";
 
 /// A family member's playlist: songs added to it leave their own library.
 pub const REMOVE_PLAYLIST: &str = "Remove from my library";
+
+/// One person's library upkeep playlist titles
+/// ([`LibraryActionPlaylistProvisioner::upkeep_titles`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpkeepTitles {
+    /// Library action titles: a song put in one is an instruction for the action worker.
+    pub actions: Vec<String>,
+    /// Notice titles: Octo fills them with the songs it asks about.
+    pub notices: Vec<String>,
+    /// A family member's own action titles: a song added becomes a request or a removal.
+    pub family: Vec<String>,
+}
+
+impl UpkeepTitles {
+    pub fn is_empty(&self) -> bool {
+        self.actions.is_empty() && self.notices.is_empty() && self.family.is_empty()
+    }
+
+    /// Whether `name` is one of the titles, ignoring case.
+    pub fn is_upkeep(&self, name: &str) -> bool {
+        self.actions
+            .iter()
+            .chain(&self.notices)
+            .chain(&self.family)
+            .any(|title| dotnet::eq_ignore_case(title, name))
+    }
+
+    /// Whether a playlist named `name` refuses songs found online: a library action or a notice
+    /// playlist. A family action playlist takes them, as requests.
+    pub fn refuses_outside(&self, name: &str) -> bool {
+        self.actions
+            .iter()
+            .chain(&self.notices)
+            .any(|title| dotnet::eq_ignore_case(title, name))
+    }
+
+    /// Which kind of upkeep playlist `name` is, ignoring case: an action title first, then a
+    /// notice title, then a family title; `None` when it is none of them.
+    pub fn kind(&self, name: &str) -> Option<UpkeepKind> {
+        let named = |titles: &[String]| titles.iter().any(|title| dotnet::eq_ignore_case(title, name));
+        if named(&self.actions) {
+            Some(UpkeepKind::Action)
+        } else if named(&self.notices) {
+            Some(UpkeepKind::Notice)
+        } else if named(&self.family) {
+            Some(UpkeepKind::Request)
+        } else {
+            None
+        }
+    }
+}
+
+/// What a library upkeep playlist is for, as a playlist row's `octoUpkeepKind` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpkeepKind {
+    /// A library action playlist: a song put in one is an instruction for the action worker.
+    Action,
+    /// A notice playlist (Review, Duplicates): Octo fills it with the songs it asks about.
+    Notice,
+    /// A family member's own request or remove playlist: a song added becomes a request.
+    Request,
+}
+
+impl UpkeepKind {
+    /// The word a row's `octoUpkeepKind` carries.
+    pub fn wire(self) -> &'static str {
+        match self {
+            UpkeepKind::Action => "action",
+            UpkeepKind::Notice => "notice",
+            UpkeepKind::Request => "request",
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -426,6 +517,40 @@ mod tests {
         assert_eq!(creates(&requests), 2, "the refused one, then the one that worked");
     }
 
+    /// Upkeep titles are the action and notice titles that are on for the person, read without
+    /// touching the once-per-boot provisioning.
+    #[test]
+    fn upkeep_titles_name_the_action_and_notice_playlists_that_are_on() {
+        let settings = Arc::new(SettingsStore::for_tests(AppSettings {
+            library_actions: LibraryActionSettings {
+                enabled: true,
+                review_enabled: true,
+                allowed_users: vec!["alice".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let provisioner =
+            LibraryActionPlaylistProvisioner::new(SubsonicProxyService::new(settings.clone()), settings);
+        let titles = provisioner.upkeep_titles("Alice");
+        assert!(titles.is_upkeep("▸ review"));
+        assert!(titles.is_upkeep("🛠 KEEP"));
+        assert!(titles.refuses_outside("▸ Review"));
+        assert!(titles.refuses_outside("🛠 Keep"));
+        assert_eq!(titles.kind("▸ REVIEW"), Some(UpkeepKind::Notice));
+        assert_eq!(titles.kind("🛠 keep"), Some(UpkeepKind::Action));
+        assert_eq!(titles.kind("Road trip"), None);
+        assert_eq!(
+            (UpkeepKind::Action.wire(), UpkeepKind::Notice.wire()),
+            ("action", "notice")
+        );
+        assert!(!titles.is_upkeep("Road trip"));
+        assert_eq!(provisioner.upkeep_titles("alice"), titles);
+        assert!(provisioner.upkeep_titles("bob").is_empty());
+        let listed = ["▸ Review".to_string(), "🛠 KEEP".to_string()];
+        assert!(provisioner.missing("alice", &listed).is_empty());
+    }
+
     /// Nothing missing means nothing to spawn: the listing path skips the create step.
     #[test]
     fn nothing_is_missing_when_every_title_is_listed() {
@@ -498,6 +623,26 @@ mod family_tests {
                     .map(|(_, v)| v.into_owned())
             })
             .collect()
+    }
+
+    #[test]
+    fn a_members_own_action_titles_are_upkeep_but_take_songs_found_online() {
+        let mut app = AppSettings::default();
+        app.family.enabled = true;
+        let settings = Arc::new(SettingsStore::for_tests(app));
+        let family = Arc::new(FamilyStore::in_memory());
+        family.upsert_member(member("sam", Preset::Listener, 4));
+        let provisioner =
+            LibraryActionPlaylistProvisioner::new(SubsonicProxyService::new(settings.clone()), settings)
+                .with_family(family);
+        let titles = provisioner.upkeep_titles("sam");
+        assert!(titles.is_upkeep("request a copy"));
+        assert!(titles.is_upkeep(REMOVE_PLAYLIST));
+        assert!(!titles.refuses_outside(REQUEST_PLAYLIST));
+        assert_eq!(titles.kind(REQUEST_PLAYLIST), Some(UpkeepKind::Request));
+        assert_eq!(titles.kind(REMOVE_PLAYLIST), Some(UpkeepKind::Request));
+        assert_eq!(UpkeepKind::Request.wire(), "request");
+        assert!(provisioner.upkeep_titles("winters").is_empty());
     }
 
     #[tokio::test]

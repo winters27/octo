@@ -43,6 +43,9 @@ const JSON_UTF8: &str = "application/json; charset=utf-8";
 /// time and answers in M3U, which breaks "Keep as playlist".
 const JSON_EXACT: &str = "application/json";
 
+/// How many tracks one native page read asks for.
+const TRACK_PAGE: usize = 500;
+
 impl NavidromePlaylistApi {
     pub fn new(
         http: reqwest::Client,
@@ -507,6 +510,89 @@ impl NavidromePlaylistApi {
         }
     }
 
+    /// One playlist as the admin reads it. `Ok(None)` only when Navidrome says there is no such
+    /// playlist (404); no answer, another failure or no admin sign-in is `Err`, so a caller never
+    /// takes a failure for a deleted playlist.
+    pub async fn playlist_info(&self, playlist_id: &str) -> Result<Option<PlaylistInfo>, String> {
+        let call = Call::get(format!(
+            "{}/api/playlist/{}",
+            self.base_url(),
+            escape_data_string(playlist_id)
+        ));
+        let Some(root) = self.read_found(call).await? else {
+            return Ok(None);
+        };
+        parse_playlist_info(&root)
+            .map(Some)
+            .ok_or_else(|| format!("Navidrome's answer for playlist {playlist_id} named no playlist"))
+    }
+
+    /// Every track of a playlist in order, however long, with what Octo compares: its place, the
+    /// media file, title, artist, length and whether the file is missing. Missing files are listed
+    /// too, so the places are Navidrome's own. `Ok(None)` when the playlist is gone (404), `Err`
+    /// when it could not be read.
+    pub async fn read_track_facts(&self, playlist_id: &str) -> Result<Option<Vec<TrackFacts>>, String> {
+        let mut rows = Vec::new();
+        let mut start = 0;
+        loop {
+            let call = Call::get(format!(
+                "{}/api/playlist/{}/tracks?_start={start}&_end={}",
+                self.base_url(),
+                escape_data_string(playlist_id),
+                start + TRACK_PAGE
+            ));
+            let Some(root) = self.read_found(call).await? else {
+                return Ok(None);
+            };
+            let Some(page) = root.as_array() else {
+                return Err(format!(
+                    "Navidrome's answer for the tracks of playlist {playlist_id} is not a list"
+                ));
+            };
+            let read = page.len();
+            rows.extend(parse_track_facts(&root));
+            if read < TRACK_PAGE {
+                return Ok(Some(rows));
+            }
+            start += TRACK_PAGE;
+        }
+    }
+
+    /// One song as the admin reads it: its words, length, ISRCs, explicit mark, library and
+    /// whether its file is missing. `Ok(None)` when Navidrome has no such song (404), `Err` when
+    /// it could not be read.
+    pub async fn song_facts(&self, song_id: &str) -> Result<Option<SongFacts>, String> {
+        let call = Call::get(format!(
+            "{}/api/song/{}",
+            self.base_url(),
+            escape_data_string(song_id)
+        ));
+        let Some(root) = self.read_found(call).await? else {
+            return Ok(None);
+        };
+        parse_song_facts(&root)
+            .map(Some)
+            .ok_or_else(|| format!("Navidrome's answer for song {song_id} named no song"))
+    }
+
+    /// The JSON of an answer that says whether the thing asked for exists: `Ok(None)` for a 404,
+    /// the JSON for a success, and `Err` for everything else (no admin sign-in, no answer, another
+    /// status, a body that is not JSON).
+    async fn read_found(&self, call: Call) -> Result<Option<Value>, String> {
+        let Some(response) = self.try_send(call).await? else {
+            return Err("Octo has no Navidrome admin sign-in".to_string());
+        };
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(format!("HTTP {}", status.as_u16()));
+        }
+        let body = response.bytes().await.map_err(|e| e.to_string())?;
+        serde_json::from_slice(&body).map(Some).map_err(|e| e.to_string())
+    }
+
     /// The JSON of a successful answer: `Ok(None)` when there is no answer or it is not a
     /// success, `Err` when the call or the parse failed.
     async fn read_json(&self, call: Call) -> Result<Option<Value>, String> {
@@ -599,6 +685,156 @@ impl PlaylistKind {
     pub fn editable(&self) -> bool {
         !self.smart && !self.synced
     }
+}
+
+/// A playlist as Navidrome's native API describes it to the admin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistInfo {
+    pub id: String,
+    pub name: String,
+    /// The owner's Navidrome username.
+    pub owner: String,
+    /// Made by rules: Navidrome fills it, and nobody can add to it.
+    pub smart: bool,
+    /// Read from a playlist file, which Navidrome keeps it in step with.
+    pub synced: bool,
+    /// When Navidrome last changed it, as Navidrome wrote it.
+    pub changed: Option<String>,
+    pub song_count: i64,
+    /// Seconds, rounded.
+    pub duration: i64,
+}
+
+impl PlaylistInfo {
+    /// Whether its tracks are people's own, so songs can be added to it.
+    pub fn editable(&self) -> bool {
+        !self.smart && !self.synced
+    }
+}
+
+/// One row of a playlist as the admin reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackFacts {
+    /// The row's place, as Navidrome numbers it (1-based, renumbered on every change).
+    pub position: String,
+    pub media_file_id: String,
+    pub title: String,
+    pub artist: String,
+    pub seconds: Option<i32>,
+    /// The file is gone from the library folder; Navidrome still lists the row.
+    pub missing: bool,
+}
+
+/// One song as the admin reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SongFacts {
+    pub id: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub seconds: Option<i32>,
+    /// The ISRCs its tags carry.
+    pub isrcs: Vec<String>,
+    /// Navidrome's mark: `e` explicit, `c` clean, none when it does not say.
+    pub explicit_status: Option<String>,
+    /// The Navidrome library the song is in.
+    pub library_id: Option<i64>,
+    pub missing: bool,
+}
+
+pub fn parse_playlist_info(item: &Value) -> Option<PlaylistInfo> {
+    let id = text_of(item, "id").filter(|id| !id.is_empty())?;
+    Some(PlaylistInfo {
+        id,
+        name: text_of(item, "name").unwrap_or_default(),
+        owner: text_of(item, "ownerName").unwrap_or_default(),
+        smart: has_rules(item),
+        synced: item.get("sync").and_then(Value::as_bool).unwrap_or(false),
+        changed: text_of(item, "updatedAt").filter(|at| !at.is_empty()),
+        song_count: number_of(item, "songCount").map_or(0, |count| count.round() as i64),
+        duration: number_of(item, "duration").map_or(0, |seconds| seconds.round_ties_even() as i64),
+    })
+}
+
+pub fn parse_track_facts(root: &Value) -> Vec<TrackFacts> {
+    let Value::Array(items) = root else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let media_file_id = text_of(item, "mediaFileId").filter(|m| !m.is_empty())?;
+            Some(TrackFacts {
+                position: text_of(item, "id").unwrap_or_default(),
+                media_file_id,
+                title: text_of(item, "title").unwrap_or_default(),
+                artist: text_of(item, "artist").unwrap_or_default(),
+                seconds: seconds_of(item),
+                missing: item.get("missing").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+pub fn parse_song_facts(item: &Value) -> Option<SongFacts> {
+    let id = text_of(item, "id").filter(|id| !id.is_empty())?;
+    let isrcs = item
+        .pointer("/tags/isrc")
+        .and_then(Value::as_array)
+        .map(|codes| {
+            codes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(SongFacts {
+        id,
+        title: text_of(item, "title").unwrap_or_default(),
+        artist: text_of(item, "artist").unwrap_or_default(),
+        album: text_of(item, "album").unwrap_or_default(),
+        seconds: seconds_of(item),
+        isrcs,
+        explicit_status: text_of(item, "explicitStatus").filter(|status| !status.trim().is_empty()),
+        library_id: item.get("libraryId").and_then(Value::as_i64),
+        missing: item.get("missing").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// Whether a playlist has rules: a smart playlist's songs come from them.
+fn has_rules(item: &Value) -> bool {
+    item.get("rules").is_some_and(|rules| match rules {
+        Value::Null => false,
+        Value::Object(fields) => !fields.is_empty(),
+        _ => true,
+    })
+}
+
+/// A string member, or a number's text; anything else is missing.
+fn text_of(item: &Value, name: &str) -> Option<String> {
+    match item.get(name)? {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// A number member, or a string holding one.
+fn number_of(item: &Value, name: &str) -> Option<f64> {
+    match item.get(name)? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// A length in whole seconds (rounded half to even), when Navidrome gave a positive one.
+fn seconds_of(item: &Value) -> Option<i32> {
+    number_of(item, "duration")
+        .map(f64::round_ties_even)
+        .filter(|seconds| *seconds > 0.0 && *seconds < f64::from(i32::MAX))
+        .map(|seconds| seconds as i32)
 }
 
 /// One listener's marks on one song: a favorite, a rating from 1 to 5 (0 for none) and plays.
@@ -905,6 +1141,148 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].media_file_id, "b");
         assert_eq!(api.delete_playlist("p1").await, Ok(true));
+    }
+
+    #[tokio::test]
+    async fn a_playlist_is_described_and_a_missing_one_is_told_from_a_failure() {
+        let server = MockServer::start().await;
+        login(&server, &["jwt"]).await;
+        Mock::given(method("GET"))
+            .and(path("/api/playlist/p1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "p1", "name": "Gym", "ownerName": "alice", "sync": false, "rules": null,
+                "songCount": 3, "duration": 612.6, "updatedAt": "2026-11-14T10:00:00.123Z",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/playlist/smart"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "smart", "name": "Top", "ownerName": "bob", "rules": { "all": [] }, "sync": true,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/playlist/broken"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let api = api(&server.uri());
+
+        assert_eq!(
+            api.playlist_info("p1").await,
+            Ok(Some(PlaylistInfo {
+                id: "p1".into(),
+                name: "Gym".into(),
+                owner: "alice".into(),
+                smart: false,
+                synced: false,
+                changed: Some("2026-11-14T10:00:00.123Z".into()),
+                song_count: 3,
+                duration: 613,
+            }))
+        );
+        let smart = api.playlist_info("smart").await.expect("read").expect("there");
+        assert!(smart.smart && smart.synced && !smart.editable());
+        // An unknown path is a 404 here, which is "gone"; a 500 is a failure, never "gone".
+        assert_eq!(api.playlist_info("gone").await, Ok(None));
+        assert!(api.playlist_info("broken").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_playlists_track_facts_are_read_a_page_at_a_time_missing_files_included() {
+        let server = MockServer::start().await;
+        login(&server, &["jwt"]).await;
+        let first: Vec<serde_json::Value> = (1..=500)
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.to_string(), "mediaFileId": format!("m{n}"), "title": format!("Song {n}"),
+                    "artist": "A", "duration": 200.4, "missing": n == 2,
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/api/playlist/p1/tracks"))
+            .and(query_param("_start", "0"))
+            .and(query_param("_end", "500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::Value::Array(first)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/playlist/p1/tracks"))
+            .and(query_param("_start", "500"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "id": "501", "mediaFileId": "m501", "title": "Last", "artist": "B" },
+            ])))
+            .mount(&server)
+            .await;
+        let api = api(&server.uri());
+
+        let rows = api.read_track_facts("p1").await.expect("read").expect("there");
+        assert_eq!(rows.len(), 501);
+        assert_eq!(
+            rows[0],
+            TrackFacts {
+                position: "1".into(),
+                media_file_id: "m1".into(),
+                title: "Song 1".into(),
+                artist: "A".into(),
+                seconds: Some(200),
+                missing: false,
+            }
+        );
+        assert!(rows[1].missing);
+        assert_eq!((rows[500].title.as_str(), rows[500].seconds), ("Last", None));
+        assert_eq!(api.read_track_facts("gone").await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn a_songs_facts_carry_its_isrcs_mark_and_library() {
+        let server = MockServer::start().await;
+        login(&server, &["jwt"]).await;
+        Mock::given(method("GET"))
+            .and(path("/api/song/s1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "s1", "title": "Nude", "artist": "Radiohead", "album": "In Rainbows",
+                "duration": 255.5, "explicitStatus": "e", "libraryId": 2, "missing": false,
+                "tags": { "isrc": ["GBSTK0700015"], "genre": ["Rock"] },
+            })))
+            .mount(&server)
+            .await;
+        let api = api(&server.uri());
+
+        assert_eq!(
+            api.song_facts("s1").await,
+            Ok(Some(SongFacts {
+                id: "s1".into(),
+                title: "Nude".into(),
+                artist: "Radiohead".into(),
+                album: "In Rainbows".into(),
+                seconds: Some(256),
+                isrcs: vec!["GBSTK0700015".into()],
+                explicit_status: Some("e".into()),
+                library_id: Some(2),
+                missing: false,
+            }))
+        );
+        assert_eq!(api.song_facts("nope").await, Ok(None));
+
+        // No admin sign-in is a failure, never "no such song".
+        let unsigned = NavidromePlaylistApi::new(
+            crate::services::http_client_factory::default_client(),
+            NavidromeIdentityService::new(
+                Arc::new(SettingsStore::for_tests(AppSettings::default())),
+                crate::services::http_client_factory::default_client(),
+            ),
+            Arc::new(SettingsStore::for_tests(AppSettings {
+                subsonic: SubsonicSettings {
+                    url: Some(server.uri()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })),
+        );
+        assert!(unsigned.song_facts("s1").await.is_err());
     }
 
     fn api_at(url: &str) -> NavidromePlaylistApi {

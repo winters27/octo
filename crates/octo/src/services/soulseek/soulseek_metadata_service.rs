@@ -510,18 +510,21 @@ impl Inner {
     fn reflect_on_routing(&self, id: &str, meta: &TrackMeta) {
         // Reflect onto the shared routing so getSong stays consistent.
         if let Some(routing) = self.lookup(id) {
-            let mut r = routing.lock();
-            if let Some(d) = meta.duration.filter(|&d| d > 0) {
-                r.duration = Some(d);
-            }
-            if r.album.as_deref().is_none_or(dotnet::is_blank)
-                && let Some(album) = meta.album_title.as_deref().filter(|a| !dotnet::is_blank(a))
             {
-                r.album = Some(album.to_string());
+                let mut r = routing.lock();
+                if let Some(d) = meta.duration.filter(|&d| d > 0) {
+                    r.duration = Some(d);
+                }
+                if r.album.as_deref().is_none_or(dotnet::is_blank)
+                    && let Some(album) = meta.album_title.as_deref().filter(|a| !dotnet::is_blank(a))
+                {
+                    r.album = Some(album.to_string());
+                }
+                if let Some(said) = meta.explicit_content {
+                    r.explicit_content = Some(said);
+                }
             }
-            if let Some(said) = meta.explicit_content {
-                r.explicit_content = Some(said);
-            }
+            self.id_registry.mark_changed(id);
         }
         self.id_registry
             .remember_length(id, meta.duration, LengthSource::Deezer);
@@ -598,6 +601,7 @@ impl Inner {
             self.id_registry.remember_pick(song_id, &hit.video_id, hit.pick);
             if let Some(routing) = self.lookup(song_id) {
                 routing.lock().duration = Some(d);
+                self.id_registry.mark_changed(song_id);
             }
         } else if background && self.lookup(song_id).is_some() {
             return None;
@@ -666,6 +670,7 @@ impl Inner {
         self.id_registry.remember_pick(id, &hit.video_id, hit.pick);
         if let Some(d) = hit.duration {
             routing.lock().duration = Some(d);
+            self.id_registry.mark_changed(id);
         }
         self.id_registry
             .remember_length(id, hit.duration, LengthSource::Video);

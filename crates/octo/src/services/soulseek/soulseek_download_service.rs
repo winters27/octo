@@ -784,6 +784,7 @@ impl SoulseekDownloadService {
                         {
                             // Another recording altogether: refused for the song, as for any download.
                             routing.lock().refuse_video(&video_id);
+                            self.id_registry.mark_changed_routing(&routing);
                             self.id_registry.refuse_video(&track_key, &video_id);
                             self.id_registry.refuse_song_video(&artist, &title, &video_id);
                         } else {
@@ -879,6 +880,7 @@ impl SoulseekDownloadService {
                     );
                     let _ = std::fs::remove_file(&path);
                     routing.lock().refuse_video(&video_id);
+                    self.id_registry.mark_changed_routing(&routing);
                     self.id_registry.refuse_video(&track_key, &video_id);
                     self.id_registry.refuse_song_video(&artist, &title, &video_id);
                     last_refusal = Some(format!(
@@ -2925,7 +2927,9 @@ impl DownloadBackend for SoulseekDownloadService {
                         .id_registry
                         .remember_length(external_id, hit.duration, LengthSource::Video)
                     {
-                        routing.remember_length(hit.duration, LengthSource::Video);
+                        if routing.remember_length(hit.duration, LengthSource::Video) {
+                            self.id_registry.mark_changed(external_id);
+                        }
                     }
                 }
             }

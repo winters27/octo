@@ -173,6 +173,11 @@ pub const REST_ENDPOINTS: &[(&str, EndpointClass)] = &[
     ("decideFamilySignIn", Read),
     ("putFamilySignInBox", Read),
     ("getFamilySignInRedeem", Read),
+    // Playlist folders (`octoPlaylistFolders`): each reads or changes only the caller's own.
+    ("getPlaylistFolders", Read),
+    ("savePlaylistFolder", Read),
+    ("deletePlaylistFolder", Read),
+    ("setPlaylistFolder", Read),
 ];
 
 /// The `/rest` endpoint a path names (`/rest/getAlbum.view` is `getAlbum`), or None for any
@@ -402,6 +407,23 @@ mod tests {
         assert_eq!(classify("/api/family/me", &Method::GET), Read);
         assert_eq!(classify("/app/", &Method::GET), Read);
         assert_eq!(classify("/apiary", &Method::POST), Read);
+    }
+
+    #[test]
+    fn playlist_folder_endpoints_are_reads_even_for_strict_callers() {
+        for name in [
+            "getPlaylistFolders",
+            "savePlaylistFolder",
+            "deletePlaylistFolder",
+            "setPlaylistFolder",
+        ] {
+            assert_eq!(rest_class(name), Some(Read), "{name}");
+            assert_eq!(
+                classify_for(&format!("/rest/{name}.view"), &Method::POST, true),
+                Read,
+                "{name}"
+            );
+        }
     }
 
     #[test]

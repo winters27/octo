@@ -16,9 +16,18 @@ use tracing::warn;
 
 use crate::services::state_file;
 
-/// The value in `path` (the default when the file is missing or there is no path), and a
-/// warning when the file was there but unreadable and has been kept aside.
+/// The words a family file's messages name its store by.
+const FAMILY: &str = "Family";
+
+/// [`load_in`] for the family's files.
 pub(crate) fn load<T: DeserializeOwned + Default>(path: Option<&Path>) -> (T, Option<String>) {
+    load_in(path, FAMILY)
+}
+
+/// The value in `path` (the default when the file is missing or there is no path), and a
+/// warning naming `area` (the part of Octo the store belongs to: "Family", "Playlists") when the
+/// file was there but unreadable and has been kept aside.
+pub(crate) fn load_in<T: DeserializeOwned + Default>(path: Option<&Path>, area: &str) -> (T, Option<String>) {
     let Some(path) = path else {
         return (T::default(), None);
     };
@@ -34,34 +43,60 @@ pub(crate) fn load<T: DeserializeOwned + Default>(path: Option<&Path>) -> (T, Op
     let kept = broken_path(path, chrono::Utc::now().timestamp());
     let message = match std::fs::rename(path, &kept) {
         Ok(()) => format!(
-            "{} could not be read ({problem}); it was kept as {} and Family started without it",
+            "{} could not be read ({problem}); it was kept as {} and {area} started without it",
             file_name(path),
             file_name(&kept)
         ),
         Err(e) => format!(
-            "{} could not be read ({problem}) or kept aside ({e}); Family started without it",
+            "{} could not be read ({problem}) or kept aside ({e}); {area} started without it",
             file_name(path)
         ),
     };
-    warn!("FAMILY {message}");
+    warn!("{} {message}", area.to_uppercase());
     (T::default(), Some(message))
 }
 
-/// Writes what `snapshot` reads to `path` whole (through a temporary file synced to disk),
-/// logging a failure, holding `lock` so two saves never write at
-/// once and the later one writes the newer state. The wait for `lock` is blocking work too
-/// ([`blocking`]), so a save waiting behind another's write never holds up the other tasks on
-/// its async worker.
+/// [`save_with_in`] for the family's files.
 pub(crate) fn save_with<T: Serialize>(path: Option<&Path>, lock: &Mutex<()>, snapshot: impl FnOnce() -> T) {
-    let Some(path) = path else { return };
+    save_with_in(path, lock, FAMILY, snapshot);
+}
+
+/// Writes what `snapshot` reads to `path` whole (through a temporary file synced to disk),
+/// logging a failure under `area`, holding `lock` so two saves never write at once and the later
+/// one writes the newer state. The wait for `lock` is blocking work too ([`blocking`]), so a save
+/// waiting behind another's write never holds up the other tasks on its async worker.
+pub(crate) fn save_with_in<T: Serialize>(
+    path: Option<&Path>,
+    lock: &Mutex<()>,
+    area: &str,
+    snapshot: impl FnOnce() -> T,
+) {
+    // `try_save_with` logs a failure; a store that saves this way carries on.
+    let _ = try_save_with(path, lock, area, snapshot);
+}
+
+/// [`save_with_in`] that hands a failed write back, for a store that undoes its change in memory
+/// when the file could not be written. The failure is logged under `area` as well.
+pub(crate) fn try_save_with<T: Serialize>(
+    path: Option<&Path>,
+    lock: &Mutex<()>,
+    area: &str,
+    snapshot: impl FnOnce() -> T,
+) -> anyhow::Result<()> {
+    let Some(path) = path else { return Ok(()) };
     let written = blocking(|| {
         let _saving = lock.lock();
         let text = octo_core::json::to_string(&snapshot());
         state_file::save_atomic(path, &text)
     });
-    if let Err(e) = written {
-        warn!("FAMILY {} could not be written: {e}", file_name(path));
-    }
+    written.map_err(|e| {
+        warn!(
+            "{} {} could not be written: {e}",
+            area.to_uppercase(),
+            file_name(path)
+        );
+        anyhow::anyhow!("{} could not be written: {e}", file_name(path))
+    })
 }
 
 /// Runs `work` (file writes) as blocking work: on a worker of the multi-threaded runtime the
@@ -137,6 +172,38 @@ mod tests {
             "an empty store file is broken, not an empty store"
         );
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn messages_name_the_stores_area() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("playlist-folders.json");
+        std::fs::write(&path, "{ torn").expect("a torn file");
+        let (read, warning) = load_in::<Vec<String>>(Some(&path), "Playlist folders");
+        assert!(read.is_empty());
+        let warning = warning.expect("a warning");
+        assert!(
+            warning.contains("Playlist folders started without it"),
+            "{warning}"
+        );
+        assert!(!warning.contains("Family"), "{warning}");
+
+        std::fs::write(&path, "").expect("an empty file");
+        let (_, family) = load::<Vec<String>>(Some(&path));
+        assert!(family.is_some_and(|w| w.contains("Family started without it")));
+
+        // A write that fails is handed back, naming the file.
+        let blocked = dir.path().join("held.json");
+        std::fs::create_dir_all(&blocked).expect("a folder where the file goes");
+        let failed = try_save_with(Some(&blocked), &Mutex::new(()), "Playlists", || vec![1]);
+        assert!(failed.is_err_and(|e| e.to_string().contains("held.json")));
+        let fine = try_save_with(
+            Some(&dir.path().join("ok.json")),
+            &Mutex::new(()),
+            "Playlists",
+            || vec![1],
+        );
+        assert!(fine.is_ok());
     }
 
     #[test]

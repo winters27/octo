@@ -1410,6 +1410,73 @@ fn wrong_lyrics_and_wrong_cover_are_offered_only_when_switched_on() {
 
 const NAVIDROME_JSON: &str = r#"{"subsonic-response":{"status":"ok","version":"1.16.1","type":"navidrome","openSubsonic":true,"openSubsonicExtensions":[{"name":"songLyrics","versions":[1]},{"name":"octoLyrics","versions":[0,1]}]}}"#;
 
+fn extension_names(reply: &SubsonicReply) -> Vec<String> {
+    let value: Value = serde_json::from_slice(&reply.body).expect("json");
+    value["subsonic-response"]["openSubsonicExtensions"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter_map(|e| e["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn extensions_list_playlist_songs_folders_and_form_post_once() {
+    let merged = builder().merge_open_subsonic_extensions(
+        "json",
+        Some(NAVIDROME_JSON.as_bytes()),
+        Some("application/json"),
+        true,
+        true,
+    );
+    let names = extension_names(&with_playlist_extensions(merged, "json"));
+    assert!(names.iter().any(|n| n == "octoPlaylistSongs"));
+    assert!(names.iter().any(|n| n == "octoPlaylistFolders"));
+    assert_eq!(names.iter().filter(|n| *n == "formPost").count(), 1);
+
+    // A Navidrome that lists formPost keeps its one entry and its versions.
+    let listed = r#"{"subsonic-response":{"status":"ok","openSubsonicExtensions":[{"name":"formPost","versions":[1]}]}}"#;
+    let reply = with_playlist_extensions(
+        builder().merge_open_subsonic_extensions("json", Some(listed.as_bytes()), None, false, false),
+        "json",
+    );
+    assert_eq!(
+        extension_names(&reply)
+            .iter()
+            .filter(|n| *n == "formPost")
+            .count(),
+        1
+    );
+    let value: Value = serde_json::from_slice(&reply.body).expect("json");
+    assert_eq!(
+        value["subsonic-response"]["openSubsonicExtensions"][0]["versions"],
+        json!([1])
+    );
+
+    // XML, with no answer from Navidrome at all.
+    let xml = with_playlist_extensions(
+        builder().merge_open_subsonic_extensions("xml", None, None, false, false),
+        "xml",
+    );
+    let root = XElement::parse(&xml.text()).expect("xml");
+    let names: Vec<String> = root
+        .elements()
+        .filter(|e| e.name == "openSubsonicExtensions")
+        .filter_map(|e| e.attribute("name").map(str::to_string))
+        .collect();
+    assert!(names.iter().any(|n| n == "octoPlaylistSongs"));
+    assert!(names.iter().any(|n| n == "octoPlaylistFolders"));
+    assert_eq!(names.iter().filter(|n| *n == "formPost").count(), 1);
+
+    // A failed answer goes out as it came.
+    let failed = r#"{"subsonic-response":{"status":"failed","error":{"code":40,"message":"no"}}}"#;
+    let reply = with_playlist_extensions(
+        builder().merge_open_subsonic_extensions("json", Some(failed.as_bytes()), None, true, false),
+        "json",
+    );
+    assert_eq!(reply.text(), failed);
+}
+
 #[test]
 fn extensions_json_adds_octos_own_and_missing_versions() {
     let reply = builder().merge_open_subsonic_extensions(
