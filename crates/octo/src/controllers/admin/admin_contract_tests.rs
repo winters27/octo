@@ -6,8 +6,10 @@
 //! from either is a setting the next save silently blanks or deletes. Checking every settings
 //! property (here: every field the settings structs serialize) makes the next one fail here.
 
+use std::sync::Arc;
+
 use axum::http::{Method, StatusCode};
-use octo_core::settings::{AppSettings, SubsonicSettings};
+use octo_core::settings::{AppSettings, SettingsFileWriter, SettingsStore, SubsonicSettings};
 use serde_json::Value;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -694,6 +696,60 @@ async fn settings_list_how_long_search_waits_for_lengths() {
     let document = get(&app, "/api/admin/settings").await.json();
     assert_eq!(document["Subsonic"]["SearchDurationWaitMs"], 1000);
     assert_eq!(document["Subsonic"]["SearchLastFmWaitMs"], 1000);
+}
+
+/// The album-fill switch is listed so the edit form pre-fills it, and a saved false survives the
+/// write and reload, so the next page load ticks the box off.
+#[tokio::test]
+async fn the_album_fill_switch_is_listed_and_round_trips_through_a_save() {
+    let directory =
+        std::env::temp_dir().join(format!("octo-album-fill-admin-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&directory).expect("a temp folder");
+    let path = directory.join("settings.json");
+    std::fs::write(&path, "{}").expect("the settings file");
+    let store = Arc::new(SettingsStore::from_env(
+        vec![
+            ("Subsonic__Url".to_string(), "http://127.0.0.1:1".to_string()),
+            (
+                "Subsonic__AutoDetectDownloadPath".to_string(),
+                "false".to_string(),
+            ),
+            (
+                "Library__DownloadPath".to_string(),
+                directory.join("music").to_string_lossy().into_owned(),
+            ),
+            ("Admin__SignIn".to_string(), "off".to_string()),
+        ],
+        Some(path.clone()),
+    ));
+    let writer = Arc::new(SettingsFileWriter::new(&path));
+
+    // A file-backed store, so the save path's reload is what a page load would see.
+    let mut state = AppState::for_tests(factory_settings());
+    {
+        let inner = Arc::get_mut(&mut state.inner).expect("nothing else holds the test state yet");
+        inner.settings = Arc::clone(&store);
+        inner.settings_writer = writer;
+    }
+    let app = app(state.clone());
+
+    let before = get(&app, "/api/admin/settings").await.json();
+    assert_eq!(before["Subsonic"]["FillMissingAlbumTracks"], Value::Bool(true));
+
+    let reply = admin_write(
+        &app,
+        Method::POST,
+        "/api/admin/settings",
+        Some(r#"{"Subsonic":{"FillMissingAlbumTracks":false}}"#),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+
+    let after = get(&app, "/api/admin/settings").await.json();
+    assert_eq!(after["Subsonic"]["FillMissingAlbumTracks"], Value::Bool(false));
+    let saved = std::fs::read_to_string(&path).expect("the file was written");
+    assert!(saved.contains("\"FillMissingAlbumTracks\": false"), "{saved}");
+    std::fs::remove_dir_all(&directory).ok();
 }
 
 #[tokio::test]
