@@ -536,6 +536,8 @@ async fn the_store_reads_its_encoders_once_it_is_made() {
     }
 }
 
+// The disk's free space is read on Unix only, where the server runs.
+#[cfg(unix)]
 #[tokio::test]
 async fn no_build_starts_on_a_nearly_full_disk() {
     let dir = tempfile::tempdir().unwrap();
