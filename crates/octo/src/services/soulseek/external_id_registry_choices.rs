@@ -646,7 +646,7 @@ impl ExternalIdRegistry {
                     let at = plays
                         .iter()
                         .position(|b| tokened(b) && !streaming(b))
-                        .or_else(|| plays.iter().position(|b| tokened(b)));
+                        .or_else(|| plays.iter().position(&tokened));
                     match at {
                         Some(at) => {
                             plays.remove(at);

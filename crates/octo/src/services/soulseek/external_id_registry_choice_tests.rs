@@ -101,7 +101,7 @@ fn a_start_takes_the_chosen_video_with_its_mark_and_the_old_facts_go() {
     let ids = registry
         .choose_stream_video(&id, choice("new", 220))
         .expect("stored");
-    assert_eq!(ids, [id.clone()]);
+    assert_eq!(ids, std::slice::from_ref(&id));
     // Nothing moves before a play starts.
     assert_eq!(routing_of(&registry, &id).you_tube_id.as_deref(), Some("old"));
     assert_eq!(

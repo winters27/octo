@@ -3037,7 +3037,7 @@ impl HeartAcquisitionCoordinator {
             matches!(
                 chain.origin,
                 AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart | AcquisitionOrigin::Request
-            ) && ids.iter().any(|id| *id == chain.external_id)
+            ) && ids.contains(&chain.external_id)
                 && chain.users.iter().any(|known| eq_ignore_case(known, user))
         })
     }
@@ -3091,7 +3091,7 @@ impl HeartAcquisitionCoordinator {
             if record.kind != HeldKind::Track {
                 continue;
             }
-            let of_song = ids.iter().any(|id| *id == record.external_id)
+            let of_song = ids.contains(&record.external_id)
                 || record
                     .album_track
                     .as_ref()

@@ -291,8 +291,8 @@ fn playing_version(
             .or_else(|| record.and_then(|choice| choice.seconds))
             .or(routing.shown_duration),
         kind: row
-            .map(|row| row.kind.clone())
-            .or_else(|| record.map(|choice| choice.kind.clone())),
+            .map(|row| row.kind)
+            .or_else(|| record.map(|choice| choice.kind)),
         picked,
         picked_by,
         mine,
@@ -449,7 +449,7 @@ pub async fn set_stream_version(State(state): State<AppState>, req: Request) -> 
         title: Some(row.title.clone()),
         channel: row.channel.clone(),
         seconds: row.seconds,
-        kind: row.kind.clone(),
+        kind: row.kind,
         song_seconds: StreamChoices::catalog_seconds(&song.routing),
         by: user.trim().to_string(),
         at: Utc::now(),
