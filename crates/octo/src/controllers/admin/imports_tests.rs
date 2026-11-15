@@ -791,6 +791,15 @@ async fn for_another_user_makes_the_list_its_playlist_and_its_downloads_theirs()
         .respond_with(answer(serde_json::json!([])))
         .mount(&rig._navidrome)
         .await;
+    // The keeper reads each song's facts before it adds it: a song Navidrome does not know is
+    // left out.
+    Mock::given(method("GET"))
+        .and(path("/api/song/nd-1"))
+        .respond_with(answer(
+            serde_json::json!({ "id": "nd-1", "title": "One", "artist": "Band", "libraryId": 1 }),
+        ))
+        .mount(&rig._navidrome)
+        .await;
     Mock::given(method("POST"))
         .and(path("/api/playlist/pl-1/tracks"))
         .and(body_string_contains("nd-1"))
