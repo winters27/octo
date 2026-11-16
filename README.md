@@ -77,6 +77,10 @@ On the starter stack Navidrome runs from the same `docker-compose.yml`, turned o
 
 </details>
 
+## One-Click Deploy
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/Octo/)
+
 ## Octo's own apps
 
 Any Subsonic app works with Octo. Its own apps, [Octo Player](https://github.com/winters27/octo-player) for Android, iPhone, Windows and Linux, are made for it: the music Octo finds sits beside your library, and keeping a song is just **Add to library**.
