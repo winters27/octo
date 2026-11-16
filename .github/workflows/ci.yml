@@ -65,8 +65,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --tests -- -D warnings
 
+      # Building the octo crate's tests while others build beside it, then running them, needs
+      # more memory than the runner has; with no room to page, the runner is killed and the job
+      # says only that it lost communication. A 12 GB swap file and two compiles at a time keep
+      # it inside the machine.
+      - name: Swap for the test build
+        run: |
+          sudo swapoff -a
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 12G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace -j 2
 
       # octo-sonic (sonic/) sits inside this workspace's folder but is its own project
       # (exclude in Cargo.toml). If that line goes, cargo refuses to run in sonic/; catch it
