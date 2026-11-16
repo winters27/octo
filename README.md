@@ -77,9 +77,24 @@ On the starter stack Navidrome runs from the same `docker-compose.yml`, turned o
 
 </details>
 
-## One-Click Deploy
+## Try it in the cloud
 
+No server at home? Each button below rents you a small server and starts Octo on it, with the starter Navidrome beside it. Octo is free; the host bills you for the server.
+
+[![Deploy on Hostinger](https://assets.hostinger.com/vps/deploy.svg)](https://www.hostinger.com/docker-hosting?compose_url=https://raw.githubusercontent.com/winters27/octo/main/deploy/cloud/docker-compose.yml)
+[![Deploy on Elestio](https://docs.elest.io/img/deploy-on-elestio.png)](https://dash.elest.io/deploy?source=cicd&social=dockerCompose&url=https://github.com/winters27/octo)
 [![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/Octo/)
+
+- **Hostinger** runs [`deploy/cloud/docker-compose.yml`](deploy/cloud/docker-compose.yml) on one of its VPS plans.
+- **Elestio** runs the same file on a server of its own, with HTTPS in front, and makes up both passwords for you.
+- **RepoCloud** has an AI agent read this repository and set Octo up on a VPS for you, billed by RepoCloud. It is not a fixed template, so check what it made.
+
+Before you start:
+
+- **Set the two passwords** in the host's environment settings, unless it makes them up for you: `NAVIDROME_ADMIN_PASSWORD` (the `admin` login for Navidrome, the dashboard and your apps) and `SLSKD_PASSWORD` (Octo's own login for slskd). Without them the deploy stops and says which is missing. Add `LASTFM_API_KEY` and your Soulseek login too, or set them later on the dashboard.
+- **The disk fills with music.** Every song you keep is a file on that server, so pick a plan with room to grow.
+- **Put HTTPS in front** before you sign in to the dashboard over the public internet. Octo itself serves plain HTTP on port 5274 (Elestio already adds HTTPS).
+- **You are responsible** for what you download and for your host's terms of service.
 
 ## Octo's own apps
 
