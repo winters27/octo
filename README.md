@@ -12,6 +12,8 @@ Search any song and play it right away. Keep the ones you love as files on your 
 [![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED)](https://docs.docker.com/compose/)
 [![CI](https://github.com/winters27/octo/actions/workflows/ci.yml/badge.svg)](https://github.com/winters27/octo/actions/workflows/ci.yml)
 
+**[Get the Octo apps](https://github.com/winters27/octo-player/releases/latest)** for Android, iPhone, Windows and Linux · [Octo Player on GitHub](https://github.com/winters27/octo-player)
+
 </div>
 
 ---
@@ -30,7 +32,7 @@ It runs on [Navidrome](https://www.navidrome.org/), the open-source music server
 - **Radio that learns.** Your Radio, discovery, artist and genre stations grow from what you play, plus optional genre and decade mixes from your own library.
 - **Keep what you love.** Press **+** or heart a song and Octo downloads the best copy it can find from Soulseek or your own Lidarr, FLAC first, catches a "lossless" file that was made from an MP3, tags it, adds the cover and lyrics, and files it in your library. Whole albums work too.
 - **Bring your music.** Import your liked songs and playlists from Spotify or any other service, see what you already have, and let Octo fetch the rest a few songs an hour. See [Importing your music](#importing-your-music).
-- **Apps for every device.** [Octo's own apps](#octos-own-apps) for Windows, Linux and Android, and [any Subsonic app](#compatible-apps) on iPhone, Mac and everywhere else.
+- **Apps for every device.** [Octo's own apps](#octos-own-apps) for Android, iPhone, Windows and Linux, and [any Subsonic app](#compatible-apps) on Mac and everywhere else.
 - **Yours to run.** The files are on your disk, everyone in the house gets their own login and their own stations, and there is nothing to pay each month.
 
 > If you pay for Qobuz, Deezer or Yandex Music and want that catalog in your library, [V1ck3s/octo-fiesta](https://github.com/V1ck3s/octo-fiesta) fits better, since it downloads from those services directly. Octo needs no paid streaming account.
@@ -77,7 +79,16 @@ On the starter stack Navidrome runs from the same `docker-compose.yml`, turned o
 
 ## Octo's own apps
 
-Any Subsonic app works with Octo. Its own apps for desktop and Android are made for it: the music Octo finds sits beside your library, and keeping a song is just **Add to library**.
+Any Subsonic app works with Octo. Its own apps, [Octo Player](https://github.com/winters27/octo-player) for Android, iPhone, Windows and Linux, are made for it: the music Octo finds sits beside your library, and keeping a song is just **Add to library**.
+
+| Device | Get it from the [latest Octo Player release](https://github.com/winters27/octo-player/releases/latest) |
+| --- | --- |
+| Android 10 and newer | the `.apk`, or add [Octo's F-Droid repository](https://winters27.github.io/octo/fdroid/) so it updates through F-Droid, Droid-ify or Neo Store |
+| iPhone, iOS 26 and newer | the `.ipa`, installed with a sideloading app such as AltStore or SideStore (TestFlight is coming) |
+| Windows | the `.msi` installer or the portable zip |
+| Linux | the AppImage, the Flatpak, the `.deb` or `.rpm`, the Arch Linux package or the portable zip |
+
+Each version is one release with every device's file and what changed, and the apps you have installed update themselves.
 
 ![Home in the Octo desktop app](docs/images/players/desktop-home.webp)
 
@@ -98,13 +109,13 @@ Any Subsonic app works with Octo. Its own apps for desktop and Android are made 
 <tr><td width="33%"><img src="docs/images/players/phone-search.webp" alt="Search in the Octo Android app"></td><td width="33%"><img src="docs/images/players/phone-album.webp" alt="An album in the Octo Android app"></td><td width="33%"><img src="docs/images/players/phone-player.webp" alt="The player in the Octo Android app"></td></tr>
 </table>
 
-The desktop app runs on Windows and Linux, and the Android app on Android 10 and newer. They need Octo 2026.09.29 or newer, and they work as regular players with Navidrome too. Download them from [Octo for Windows and Linux](https://github.com/winters27/octo/releases/tag/desktop-v1.6.0) and [Octo for Android](https://github.com/winters27/octo/releases/tag/android-v1.6.0), or add [Octo's F-Droid repository](https://winters27.github.io/octo/fdroid/) so the Android app updates through F-Droid, Droid-ify or Neo Store. The source is at [winters27/octo-player](https://github.com/winters27/octo-player).
+The apps work as regular players with Navidrome too. The newest features (playlist folders, songs found online in your playlists, Try another version) need Octo 2026.11.15 or newer. The source is at [winters27/octo-player](https://github.com/winters27/octo-player).
 
 ## Compatible apps
 
 | Works | App | Platform |
 |---|---|---|
-| ✅ | [Octo's own apps](#octos-own-apps) | Windows, Linux, Android |
+| ✅ | [Octo's own apps](#octos-own-apps) | Android, iPhone, Windows, Linux |
 | ✅ | [Feishin](https://github.com/jeffvli/feishin) | desktop |
 | ✅ | [Supersonic](https://github.com/dweymouth/supersonic) | desktop |
 | ✅ | [Sublime Music](https://github.com/sublime-music/sublime-music) | Linux |
