@@ -1,0 +1,156 @@
+# Octo on one cloud server, for a one-click deploy (Hostinger's Docker Manager, Elestio, or
+# any host that runs a compose file). The same images as the root docker-compose.yml, with
+# the starter Navidrome always on and one shared music volume instead of folders on the host.
+#
+# Two passwords are required, and the deploy stops with a message if either is missing:
+#   NAVIDROME_ADMIN_PASSWORD  the "admin" login for Navidrome, the dashboard and your apps
+#   SLSKD_PASSWORD            the login Octo uses for slskd (its web page is never published)
+# Optional: LASTFM_API_KEY (radio and search past your library), SLSKD_SOULSEEK_USERNAME and
+# SLSKD_SOULSEEK_PASSWORD (a free Soulseek account, for downloads), TZ.
+#
+# Published ports: 5274 (Octo, for your apps and the dashboard), 4533 (Navidrome's own pages)
+# and 50300 (Soulseek peers). Octo serves plain HTTP: put HTTPS in front of 5274 before signing
+# in to the dashboard over the internet.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  # Octo itself. Its image tag is this release's number (bumped with the VERSION file; CI
+  # checks it). Every other setting has a dashboard control and a sensible default.
+  octo:
+    image: ghcr.io/winters27/octo:${OCTO_IMAGE_TAG:-2026.11.15}
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "5274:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      TZ: ${TZ:-}
+      # The Navidrome below, signed in as its admin for rescans and the dashboard sign-in.
+      Subsonic__Url: http://navidrome:4533
+      Subsonic__AdminUsername: admin
+      Subsonic__AdminPassword: ${NAVIDROME_ADMIN_PASSWORD:?Set NAVIDROME_ADMIN_PASSWORD to a password of your own for the Navidrome admin}
+      Library__DownloadPath: /music
+      YouTube__ShimUrl: http://yt-dlp-shim:8080
+      RadioSources__SonicUrl: http://octo-sonic:8080
+      Soulseek__BaseUrl: http://slskd:5030
+      Soulseek__Username: slskd
+      Soulseek__Password: ${SLSKD_PASSWORD:?Set SLSKD_PASSWORD to a password of your own for slskd}
+      # Sharing your library on Soulseek starts off on a rented server; the dashboard's Share
+      # my library switch turns it on.
+      Soulseek__ShareLibrary: ${SLSKD_SHARE_LIBRARY:-false}
+      LastFm__ApiKey: ${LASTFM_API_KEY:-}
+      LastFm__ApiSecret: ${LASTFM_API_SECRET:-}
+      # No update helper runs here: the dashboard says when a release is out, and redeploying
+      # this file at the new release's tag updates.
+      Updates__Check: "true"
+      Admin__SignIn: required
+    volumes:
+      - music:/music
+      - octo-config:/app/config
+    depends_on:
+      - navidrome
+      - yt-dlp-shim
+      - slskd
+
+  # yt-dlp behind a small HTTP service: songs found online play through it. Internal only.
+  yt-dlp-shim:
+    image: ghcr.io/winters27/octo-yt-dlp-shim:${OCTO_IMAGE_TAG:-2026.11.15}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      YTDLP_PLAYER_CLIENT: visionos
+      DOWNLOAD_ROOT: /music
+      # yt-dlp runs from a volume, so its self-update outlives a redeploy.
+      YTDLP_PATH: /opt/ytdlp/yt-dlp
+      META_DB_PATH: /var/lib/ytshim/meta.db
+    expose:
+      - "8080"
+    volumes:
+      - ytdlp-cache:/root/.cache/yt-dlp
+      - ytshim-cache:/var/lib/ytshim
+      - ytdlp-bin:/opt/ytdlp
+      - music:/music
+
+  # Reads each song once, read-only, for the apps' blends and Sounds alike radio. Internal only.
+  octo-sonic:
+    image: ghcr.io/winters27/octo-sonic:${OCTO_IMAGE_TAG:-2026.11.15}
+    restart: unless-stopped
+    logging: *logging
+    init: true
+    expose:
+      - "8080"
+    environment:
+      MUSIC_ROOT: /music
+      ANALYSE_CONCURRENCY: "1"
+      SONIC_ENABLED: "true"
+    cpus: 1
+    mem_limit: 2g
+    user: "65534:65534"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - music:/music:ro
+
+  # Soulseek client. Only the peer port is published; its web page (5030) stays inside this
+  # network, where Octo signs in to it.
+  slskd:
+    image: slskd/slskd:latest
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "50300:50300"
+    environment:
+      # Lets Octo change slskd's settings through its API (the Share my library switch).
+      SLSKD_REMOTE_CONFIGURATION: "true"
+      # Finished downloads land in the shared music volume, where Octo files them.
+      SLSKD_DOWNLOADS_DIR: /music
+      SLSKD_SLSK_USERNAME: ${SLSKD_SOULSEEK_USERNAME:-}
+      SLSKD_SLSK_PASSWORD: ${SLSKD_SOULSEEK_PASSWORD:-}
+      SLSKD_USERNAME: slskd
+      SLSKD_PASSWORD: ${SLSKD_PASSWORD:?Set SLSKD_PASSWORD to a password of your own for slskd}
+      # Octo's working files are never shared.
+      SLSKD_SHARE_FILTER: '[\\/]\.octo-;\.octo-tmp$$;\.part$$;\.tmp$$'
+      # Uploads at once and their total speed in KiB/s, so sharing never crowds out streaming.
+      SLSKD_UPLOAD_SLOTS: "4"
+      SLSKD_UPLOAD_SPEED_LIMIT: "2048"
+    volumes:
+      - slskd-state:/app
+      - music:/music
+      # The same library again, read-only, for sharing.
+      - music:/share:ro
+
+  # The music server Octo sits in front of. Its first start creates the user "admin" with
+  # NAVIDROME_ADMIN_PASSWORD; add the people who listen on its own pages at port 4533.
+  navidrome:
+    image: deluan/navidrome:latest
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "4533:4533"
+    environment:
+      ND_MUSICFOLDER: /music
+      ND_DATAFOLDER: /data
+      ND_LOGLEVEL: info
+      ND_DEVAUTOCREATEADMINPASSWORD: ${NAVIDROME_ADMIN_PASSWORD:?Set NAVIDROME_ADMIN_PASSWORD to a password of your own for the Navidrome admin}
+    volumes:
+      - music:/music
+      - navidrome-data:/data
+
+# Everything Octo keeps: the music, its settings, slskd's and Navidrome's state, and caches.
+volumes:
+  music:
+  octo-config:
+  slskd-state:
+  navidrome-data:
+  ytdlp-cache:
+  ytshim-cache:
+  ytdlp-bin:

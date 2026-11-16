@@ -1,0 +1,47 @@
+# Elestio's one-click deploy (the README's Deploy on Elestio button). It runs the cloud
+# compose file, deploy/cloud/docker-compose.yml, and Elestio replaces each random_password
+# with a password it generates for that deploy.
+config:
+  runTime: "dockerCompose"
+  version: ""
+  framework: ""
+  installCommand: ""
+  buildCommand: "docker-compose --project-directory . -f deploy/cloud/docker-compose.yml pull"
+  buildDir: "/"
+  runCommand: "docker-compose --project-directory . -f deploy/cloud/docker-compose.yml up -d"
+  isMonoRepoPackageInRoot: false
+environments:
+  - key: "NAVIDROME_ADMIN_PASSWORD"
+    value: "random_password"
+  - key: "SLSKD_PASSWORD"
+    value: "random_password"
+  - key: "LASTFM_API_KEY"
+    value: ""
+  - key: "SLSKD_SOULSEEK_USERNAME"
+    value: ""
+  - key: "SLSKD_SOULSEEK_PASSWORD"
+    value: ""
+ports:
+  # Octo, for your apps and the dashboard, behind Elestio's HTTPS.
+  - protocol: "HTTPS"
+    targetProtocol: "HTTP"
+    listeningPort: "443"
+    targetPort: "5274"
+    targetIP: "172.17.0.1"
+    public: true
+    path: "/"
+    isAuth: false
+  # Navidrome's own pages, to add the people who listen.
+  - protocol: "HTTPS"
+    targetProtocol: "HTTP"
+    listeningPort: "4443"
+    targetPort: "4533"
+    targetIP: "172.17.0.1"
+    public: true
+    path: "/"
+    isAuth: false
+webUI:
+  - url: "https://[CI_CD_DOMAIN]/admin/"
+    label: "Octo dashboard"
+    login: "admin"
+    password: "[NAVIDROME_ADMIN_PASSWORD]"
