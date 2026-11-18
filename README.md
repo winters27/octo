@@ -10,6 +10,7 @@ Search any song and play it right away. Keep the ones you love as files on your 
 [![License: GPL v3](https://img.shields.io/badge/License-GPL_v3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust](https://img.shields.io/badge/Rust-1.99-B7410E)](https://www.rust-lang.org/)
 [![Docker Compose](https://img.shields.io/badge/docker-compose-2496ED)](https://docs.docker.com/compose/)
+[![Downloads](https://img.shields.io/github/downloads/winters27/octo/total?label=downloads)](https://github.com/winters27/octo/releases)
 [![CI](https://github.com/winters27/octo/actions/workflows/ci.yml/badge.svg)](https://github.com/winters27/octo/actions/workflows/ci.yml)
 
 **[Get the Octo apps](https://github.com/winters27/octo-player/releases/latest)** for Android, iPhone, Windows and Linux · [Octo Player on GitHub](https://github.com/winters27/octo-player)
