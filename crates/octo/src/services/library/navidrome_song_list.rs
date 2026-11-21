@@ -125,7 +125,7 @@ pub(crate) async fn each_song(
     let mut start = 0;
     while start < 200_000 {
         let url = format!(
-            "{}/api/song?_start={start}&_end={}&_sort=id&_order=ASC",
+            "{}/api/song?_start={start}&_end={}&_sort=media_file.id&_order=ASC",
             base_url.trim_end_matches('/'),
             start + PAGE
         );
