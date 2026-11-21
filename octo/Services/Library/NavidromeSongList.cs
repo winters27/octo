@@ -47,7 +47,7 @@ public static class NavidromeSongList
             for (var start = 0; start < 200_000; start += page)
             {
                 using var request = new HttpRequestMessage(HttpMethod.Get,
-                    $"{baseUrl.TrimEnd('/')}/api/song?_start={start}&_end={start + page}&_sort=id&_order=ASC");
+                    $"{baseUrl.TrimEnd('/')}/api/song?_start={start}&_end={start + page}&_sort=media_file.id&_order=ASC");
                 request.Headers.TryAddWithoutValidation("X-Nd-Authorization", $"Bearer {jwt}");
                 using var response = await http.CreateClient().SendAsync(request, ct);
                 if (!response.IsSuccessStatusCode) break;

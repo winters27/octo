@@ -77,7 +77,7 @@ public sealed class NavidromePlaylistApi
         try
         {
             using var response = await SendAsync(jwt => Request(HttpMethod.Get,
-                $"{BaseUrl}/api/song?_start={start}&_end={start + count}&_sort=id&_order=ASC", jwt), ct);
+                $"{BaseUrl}/api/song?_start={start}&_end={start + count}&_sort=media_file.id&_order=ASC", jwt), ct);
             if (response is not { IsSuccessStatusCode: true }) return null;
             using var doc = JsonDocument.Parse(await response.Content.ReadAsByteArrayAsync(ct));
             return QualityUpgradeWorker.ParseSongs(doc.RootElement);

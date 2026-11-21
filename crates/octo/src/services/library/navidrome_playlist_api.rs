@@ -103,7 +103,7 @@ impl NavidromePlaylistApi {
     /// library path, and the weekly upgrade remembers files by path (#70).
     pub async fn list_songs(&self, start: i32, count: i32) -> Option<(Vec<LibrarySongRow>, usize)> {
         let call = Call::get(format!(
-            "{}/api/song?_start={start}&_end={}&_sort=id&_order=ASC",
+            "{}/api/song?_start={start}&_end={}&_sort=media_file.id&_order=ASC",
             self.base_url(),
             start + count
         ));
