@@ -378,3 +378,48 @@ fn a_track_with_no_recording_holds_a_fitting_file_whatever_it_reads() {
         GateVerdict::Refuse(_)
     ));
 }
+
+/// A permissive heart's verdict: the file nothing contradicted, kept as heard.
+fn unconfirmed() -> GateVerdict {
+    GateVerdict::Accept {
+        by: Acceptance::Unconfirmed,
+        tags: TagClaim::AsHeard,
+    }
+}
+
+/// A permissive file lands on the track whose own title tag and length it fits, never on the first
+/// track the album lists: a file that says which track it is is filed there.
+#[test]
+fn a_permissive_file_lands_on_the_track_it_fits() {
+    let checks = [
+        check(0, unconfirmed(), None, false),
+        check(1, unconfirmed(), None, true),
+        check(2, unconfirmed(), None, false),
+    ];
+    assert!(matches!(
+        file_among(&checks),
+        TrackFiling::Land {
+            track: 1,
+            by: Acceptance::Unconfirmed,
+            tags: TagClaim::AsHeard,
+        }
+    ));
+}
+
+/// Read against an album's only track, a permissive file lands there whatever it calls itself:
+/// there is no other track it could be.
+#[test]
+fn a_permissive_file_among_one_track_lands_whatever_its_name() {
+    assert_eq!(album_verdict(check(0, unconfirmed(), None, false)), unconfirmed());
+}
+
+/// Among many tracks, a file nothing says the track of lands on none of them: it is refused, so the
+/// next candidate is tried, rather than filed on a track by its position.
+#[test]
+fn a_permissive_file_fitting_no_track_of_many_lands_on_none() {
+    let checks = [
+        check(0, unconfirmed(), None, false),
+        check(1, unconfirmed(), None, false),
+    ];
+    assert!(!matches!(file_among(&checks), TrackFiling::Land { .. }));
+}

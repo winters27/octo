@@ -8,8 +8,8 @@ use octo_core::fingerprint::acoust_id_client::{AcoustIdAnswer, AcoustIdOutcome};
 use octo_core::fingerprint::heard_master::HeardMasterVerdict;
 use octo_core::fingerprint::heart_gate::{
     AcquisitionOrigin, AlbumContext, ClipReading, FileFacts, FileLabels, FileNames, HeardAnswerReading,
-    HeardMaster, HeardReading, HeardRecord, HeardRecording, Judgement, MusicBrainzFact, Need, StandIn,
-    TagClaim, became, heard_codes, is_heard_audio, read_heard_answer, read_stand_in,
+    HeardMaster, HeardReading, HeardRecord, HeardRecording, HeartVerification, Judgement, MusicBrainzFact,
+    Need, StandIn, TagClaim, became, heard_codes, is_heard_audio, read_heard_answer, read_stand_in,
 };
 use octo_core::fingerprint::heart_release::{GroupFacts, HeardIdentity, HeartSong, listened_release};
 use octo_core::fingerprint::verification::{
@@ -99,6 +99,12 @@ impl DownloadVerificationService {
 
     fn min_score(&self) -> f64 {
         self.settings.current().soulseek.effective_min_score_fraction()
+    }
+
+    /// Whether a heart's file must be proven to be the very recording heard or chosen before it is
+    /// kept. On unless the person turned exact heart verification off.
+    pub fn heart_verification(&self) -> HeartVerification {
+        HeartVerification::from_requiring(self.settings.current().soulseek.require_exact_heart_verification)
     }
 
     /// What prints a downloaded file: the heard samples' printer, which every heart's sound work
@@ -196,6 +202,10 @@ impl DownloadVerificationService {
             gate.r = known_r;
             return GateBuild::Ready(gate);
         };
+        // A heart whose exact recording the person chose not to require: its file is judged by
+        // what it names and how long it runs, and nothing about it waits for a play or a shim.
+        let permissive = self.heart_verification().permits_unproven()
+            && matches!(origin, AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart);
         let song = heart_song(&routing);
         gate.heard_seconds = routing.duration.filter(|seconds| *seconds > 0);
         let min = self.min_score();
@@ -210,7 +220,14 @@ impl DownloadVerificationService {
                     heard_answer = Some(outcome);
                 }
                 HeardLookup::ShimBusy => {
-                    return hold(gate, WaitingFor::Shim, waiting_line(WaitingFor::Shim), None);
+                    if !permissive {
+                        return hold(gate, WaitingFor::Shim, waiting_line(WaitingFor::Shim), None);
+                    }
+                    // A permissive heart never waits for the shim: what played cannot be had now,
+                    // so its file is judged by what it names and how long it runs.
+                    info!(
+                        "YouTube does not answer for what {external_id}'s holder heard; their heart does not wait for it"
+                    );
                 }
                 HeardLookup::Gone => {}
             }
@@ -231,6 +248,14 @@ impl DownloadVerificationService {
             Ok(catalog) => catalog,
             // A family request never holds: it goes on with the routing's names alone.
             Err(_) if origin == AcquisitionOrigin::Request => named_r(&song),
+            // Nor does a permissive heart: nothing settled which recording it is, so its file is
+            // judged by the names and the length the catalog gives.
+            Err(_) if permissive => {
+                info!(
+                    "MusicBrainz or Deezer did not settle the recording of {external_id}; the heart is judged by its names and length alone"
+                );
+                named_r(&song)
+            }
             Err(HeartBusy::MusicBrainz(question)) => {
                 return hold(
                     gate,
@@ -257,7 +282,9 @@ impl DownloadVerificationService {
             }
             // A play, and a hearted album's track, are judged against R alone: an album track is
             // never helped by a stand-in, and one nothing proves waits for a play or the person.
-            if matches!(origin, AcquisitionOrigin::Play | AcquisitionOrigin::AlbumHeart) {
+            // A permissive heart is one with neither: no stand-in is fetched for it, and nothing
+            // about it waits for a play.
+            if permissive || matches!(origin, AcquisitionOrigin::Play | AcquisitionOrigin::AlbumHeart) {
                 return GateBuild::Ready(gate);
             }
             self.stand_in(&parts, external_id, &routing, &mut gate, &catalog, min)
@@ -763,8 +790,9 @@ impl DownloadVerificationService {
         path: &Path,
     ) -> GateVerdict {
         let min = self.min_score();
+        let verification = self.heart_verification();
         for _ in 0..MOST_NEEDS {
-            match gate.judge(facts, min) {
+            match gate.judge_with(facts, min, verification) {
                 Judgement::Verdict(verdict) => return verdict,
                 Judgement::Needs(Need::HeardMaster) => {
                     let (master, measured) = heard_master(parts, gate, candidate, path).await;

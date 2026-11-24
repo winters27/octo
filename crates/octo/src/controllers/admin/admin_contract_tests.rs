@@ -1293,8 +1293,8 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     // Notifications:NotifyMornyeCheck, listed last, and the file layout's three templates beside
     // Subsonic:FolderStructure: Subsonic:FolderTemplate, :FolderTemplateSingles and
     // :FolderTemplateCompilations, and Subsonic:DownloadOnPlayAfterSeconds beside
-    // Subsonic:DownloadOnPlay.
-    assert_eq!(rows.len(), 212);
+    // Subsonic:DownloadOnPlay, then Soulseek:RequireExactHeartVerification, listed last.
+    assert_eq!(rows.len(), 213);
     assert!(!rows.iter().any(|r| {
         r["Key"]
             .as_str()
@@ -1318,6 +1318,7 @@ async fn config_sources_masks_secrets_and_lists_lists_as_empty() {
     assert_eq!(row("LibraryActions:YoutubeCheckPerHour")["IsSecret"], false);
     assert_eq!(rows[210]["Key"], "LibraryActions:ReviewSweepAutoReplacePreview");
     assert_eq!(rows[211]["Key"], "Notifications:NotifyMornyeCheck");
+    assert_eq!(rows[212]["Key"], "Soulseek:RequireExactHeartVerification");
     assert_eq!(row("Notifications:NotifyMornyeCheck")["IsSecret"], false);
     assert_eq!(row("Subsonic:FolderTemplate")["IsSecret"], false);
     assert_eq!(row("Subsonic:FolderTemplateSingles")["IsSecret"], false);

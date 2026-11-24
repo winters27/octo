@@ -694,6 +694,14 @@
               <div class="set-info-d" id="heart-source-order-help"
                    role="status" aria-live="polite" hidden></div>
             </div>
+            <div class="set-row">
+              <div class="set-info">
+                <div class="set-info-t">Require exact recording verification for hearts</div>
+                <div class="set-info-d">A hearted song or album track lands only once Octo proves it is the very recording you heard or chose. On by default.</div>
+                <div class="set-info-more"><p>Off, a heart's file is kept when nothing about it says it is another song or another version: a different sound, another song's tags, a live or remix name, a length far from the song's or a title naming another song. It is kept as heard, claiming no recording id, ISRC or MusicBrainz id, and Octo never waits for you to play the song first.</p><p>Downloads on play, replacements and family requests are unchanged, and Verify downloads still polices every other download.</p></div>
+              </div>
+              <label class="switch"><input type="checkbox" name="Soulseek.RequireExactHeartVerification" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
+            </div>
           </form>
         </div>
         <div class="set-section" id="prefetch-section">
@@ -2075,7 +2083,7 @@
               <div class="set-info">
                 <div class="set-info-t"><svg class="icon brand" aria-hidden="true"><use href="#b-acoustid"/></svg>Verify downloads</div>
                 <div class="set-info-d">Fingerprints each download and asks AcoustID what it really is. On by default.</div>
-                <div class="set-info-more"><p>Hearts and plays are always checked by their sound: a file that is not the recording you heard is refused, and Octo keeps the version you heard instead.</p><p>Other downloads: covers, karaoke versions, live takes and mislabeled compilation tracks are refused, a peer that sends a different recording is never tried again, a YouTube video AcoustID names as another recording is never used for that song again, and a song AcoustID has never heard of is kept and marked not proven.</p></div>
+                <div class="set-info-more"><p>Hearts and plays are always checked by their sound: a file that is not the recording you heard is refused, and Octo keeps the version you heard instead. Whether a heart must <em>prove</em> the recording before it keeps a file is set in Streams &amp; hearts, under Hearts; a play always must.</p><p>Other downloads: covers, karaoke versions, live takes and mislabeled compilation tracks are refused, a peer that sends a different recording is never tried again, a YouTube video AcoustID names as another recording is never used for that song again, and a song AcoustID has never heard of is kept and marked not proven.</p></div>
               </div>
               <label class="switch"><input type="checkbox" name="Soulseek.VerifyDownloads" /><span class="sw-track"></span><span class="sw-thumb"></span></label>
             </div>

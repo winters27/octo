@@ -84,6 +84,10 @@ fn verdict_words(verdict: &GateVerdict) -> (&'static str, &'static str) {
                 "The same take you heard",
                 "It sounds like what played and runs as long, and names no other version",
             ),
+            octo_core::fingerprint::heart_gate::Acceptance::Unconfirmed => (
+                "Kept for you, version not proven",
+                "Nothing about it says it is another song or another version, and nothing proved the exact recording",
+            ),
         },
         GateVerdict::Refuse(refusal) => (
             "Not the version you heard; thrown away",

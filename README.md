@@ -743,7 +743,14 @@ can forget them all at once. `SLSKD_MIN_MATCH_SCORE` (50-99, default 85) is how 
 must be before its answer may reject anything, so raising it makes Octo *more* permissive,
 because weaker matches are ignored rather than acted on. For hearts and plays, a file is kept
 only when its sound proves it is the recording you heard; otherwise Octo keeps the version you
-heard. For other downloads, a track AcoustID has never heard of is kept and marked not proven.
+heard. `SLSKD_REQUIRE_EXACT_HEART_VERIFICATION` (on by default) is what requires that proof for a
+heart: with it off, a hearted song's or album track's file is kept when nothing that was read says
+it is another song or another version of this one (a different sound, another song's tags, a live
+or remix name, a length far from the song's, a title naming another song), it is kept "as heard"
+with no recording id, ISRC or MusicBrainz recording id claimed, Octo fetches no stand-in video for
+it, and it never waits for you to play the song first. Plays are always held to the proof, and this
+setting changes neither them nor any other download. For other downloads, a track AcoustID has
+never heard of is kept and marked not proven.
 `SLSKD_TAG_FROM_MUSICBRAINZ` writes the matched recording's MusicBrainz title, artist, album
 and year over the peer's own tags. `NAME_FROM_MATCH` goes one step further and names the file
 from the match as well (artist folder, title, album and track number), so the path and the

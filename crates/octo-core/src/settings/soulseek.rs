@@ -124,13 +124,31 @@ pub struct SoulseekSettings {
     /// the Review playlist on, asked about. Needs the fpcalc binary. On by default: Octo's
     /// published images carry Octo's own AcoustID key, so a default install from them checks what
     /// it downloads (a build given no key needs a key of the user's own). Hearts and plays are
-    /// checked by their sound whatever this says.
+    /// checked by their sound whatever this says; [`Self::require_exact_heart_verification`]
+    /// decides only what a heart's file does when no proof settles it.
     ///
     /// This also switches on the rejected-peer memory. A file discarded for being the wrong
     /// recording, by this check OR by the pre-existing duration check, is remembered by peer
     /// and filename and never offered as a candidate again.
     /// Environment variable: SLSKD_VERIFY_DOWNLOADS
     pub verify_downloads: bool,
+
+    /// Require a heart's file to be proven to be the very recording that was heard or chosen before
+    /// it is kept. On by default, which is the strict behaviour: a hearted song or album track
+    /// lands only when AcoustID reads its sound as the recording, when it is the master that
+    /// played, or when the person keeps it anyway.
+    ///
+    /// Off, a heart's and a hearted album's track's file lands when nothing that was read says it
+    /// is another song or another version of this one: a different sound by proof 2, audio that
+    /// cannot be decoded, a sound or a tag naming another song, a name carrying another version
+    /// (live, remix, edit, instrumental), a length outside the duration tolerance, or a title tag
+    /// naming another song. What no proof settles is kept "as heard": it carries no recording id,
+    /// no ISRC and no MusicBrainz recording id, and its row says the version is not proven. Octo
+    /// never waits for a play of the song in this mode, and a stand-in video is not fetched for a
+    /// heart that was never played. Independent of VerifyDownloads, which still checks every other
+    /// download: this only decides whether a heart's own file must be proven.
+    /// Environment variable: SLSKD_REQUIRE_EXACT_HEART_VERIFICATION
+    pub require_exact_heart_verification: bool,
 
     /// Never download a cover, a karaoke backing track or an instrumental, even for a song whose
     /// title asks for one, and leave such outside songs out of search, radio, mixes and charts.
@@ -259,6 +277,7 @@ impl Default for SoulseekSettings {
             preferred_extension: "flac".to_string(),
             download_timeout_seconds: 180,
             verify_downloads: true,
+            require_exact_heart_verification: true,
             skip_covers_and_instrumentals: true,
             acoust_id_api_key: String::new(),
             tag_from_music_brainz: false,
@@ -546,6 +565,27 @@ mod acoust_id_key_tests {
         assert!(example.lines().any(|line| line == "SLSKD_VERIFY_DOWNLOADS=true"));
         assert!(example.lines().any(|line| line == "ACOUSTID_API_KEY="));
         assert!(example.contains("ACOUSTID_API_KEY=off"));
+    }
+
+    /// A heart's file is required to be the proven recording by default, in the code and in the
+    /// three files an install starts from: nothing changes for an existing install unless the
+    /// person turns it off.
+    #[test]
+    fn a_hearts_file_is_proven_by_default_everywhere() {
+        assert!(SoulseekSettings::default().require_exact_heart_verification);
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read =
+            |name: &str| std::fs::read_to_string(repo.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(read("octo/appsettings.json").contains(r#""RequireExactHeartVerification": true,"#));
+        assert!(read("docker-compose.yml").contains(
+            "Soulseek__RequireExactHeartVerification: ${SLSKD_REQUIRE_EXACT_HEART_VERIFICATION:-true}"
+        ));
+        let example = read(".env.example");
+        assert!(
+            example
+                .lines()
+                .any(|line| line == "SLSKD_REQUIRE_EXACT_HEART_VERIFICATION=true")
+        );
     }
 
     /// The published server image is built with Octo's own AcoustID key from the repository's

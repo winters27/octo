@@ -124,6 +124,12 @@ services:
       # library. A peer that sends a different recording gets that file remembered
       # and never tried again. On by default; Octo brings its own AcoustID key.
       Soulseek__VerifyDownloads: ${SLSKD_VERIFY_DOWNLOADS:-true}
+      # A heart's file must be proven to be the very recording heard or chosen
+      # before it is kept. On by default. Off, a hearted song or album track
+      # lands when nothing says it is another song or another version, kept as
+      # heard with no recording id, ISRC or MusicBrainz id claimed, and never
+      # waiting for a play.
+      Soulseek__RequireExactHeartVerification: ${SLSKD_REQUIRE_EXACT_HEART_VERIFICATION:-true}
       # Never download a cover, a karaoke backing track or an instrumental, even
       # when a title asks for one, and leave such outside songs out of search,
       # radio, mixes and charts. On by default.

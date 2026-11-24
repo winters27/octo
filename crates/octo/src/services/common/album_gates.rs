@@ -334,11 +334,44 @@ pub fn file_among(checks: &[TrackCheck]) -> TrackFiling {
     // A track with no recording to prove is never proven by a reading against nothing; the very
     // master a person played still proves it.
     if let Some((check, by, tags)) = checks.iter().find_map(|check| match &check.verdict {
-        GateVerdict::Accept { by, tags } if !(check.no_recording && *by == Acceptance::Sound) => {
+        // A permissive file is filed by the track it fits, below, not by being first in the list.
+        GateVerdict::Accept { by, tags }
+            if *by != Acceptance::Unconfirmed && !(check.no_recording && *by == Acceptance::Sound) =>
+        {
             Some((check, *by, tags.clone()))
         }
         _ => None,
     }) {
+        return TrackFiling::Land {
+            track: check.track,
+            by,
+            tags,
+        };
+    }
+    // A permissive heart's file nothing contradicted: it lands on a track whose own title tag and
+    // length it fits, so a file that says which track it is is filed there and not by its position.
+    // The file read against the album's only track lands there whatever it calls itself, since
+    // there is no other track it could be.
+    if let Some((check, by, tags)) = checks
+        .iter()
+        .filter(|check| check.fits)
+        .find_map(|check| match &check.verdict {
+            GateVerdict::Accept {
+                by: Acceptance::Unconfirmed,
+                tags,
+            } => Some((check, Acceptance::Unconfirmed, tags.clone())),
+            _ => None,
+        })
+        .or_else(|| {
+            checks.first().and_then(|check| match &check.verdict {
+                GateVerdict::Accept {
+                    by: Acceptance::Unconfirmed,
+                    tags,
+                } if checks.len() == 1 => Some((check, Acceptance::Unconfirmed, tags.clone())),
+                _ => None,
+            })
+        })
+    {
         return TrackFiling::Land {
             track: check.track,
             by,

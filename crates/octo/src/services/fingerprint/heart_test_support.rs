@@ -381,6 +381,9 @@ pub(crate) struct GateSetup {
     pub acoust_id_off: bool,
     /// MusicBrainz at its own mock server.
     pub music_brainz: bool,
+    /// The setting's word on whether a heart's file must be proven: on by default, as an install
+    /// starts.
+    pub require_exact_heart_verification: bool,
     /// Deezer's side of a heart's questions.
     pub catalog: Arc<dyn CatalogQuestions>,
 }
@@ -390,6 +393,7 @@ impl Default for GateSetup {
         Self {
             acoust_id_off: false,
             music_brainz: true,
+            require_exact_heart_verification: true,
             catalog: Arc::new(NoCatalog),
         }
     }
@@ -429,6 +433,7 @@ pub(crate) async fn gate_rig(setup: GateSetup) -> GateRig {
     let settings = Arc::new(SettingsStore::for_tests(AppSettings {
         soulseek: SoulseekSettings {
             acoust_id_timeout_seconds: 2,
+            require_exact_heart_verification: setup.require_exact_heart_verification,
             acoust_id_api_key: if setup.acoust_id_off {
                 octo_core::settings::soulseek::ACOUSTID_OFF.to_string()
             } else {

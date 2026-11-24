@@ -1028,3 +1028,90 @@ async fn with_acoust_id_off_a_mrs_robinson_stream_for_help_is_refused_for_this_h
         .snapshot();
     assert!(!routing.refuses_video(VIDEO), "never for every user");
 }
+
+// ---- A heart nobody played under a permissive setting ----------------------------------------
+
+/// A heart nobody played, with exact verification turned off, fetches no stand-in and waits for
+/// nothing: Octo never asks YouTube about a song it will not require a proof of. The file is judged
+/// by the names and the length the catalog gives, and one AcoustID knows nothing of is kept as
+/// heard, claiming no recording of its own.
+#[tokio::test]
+async fn a_permissive_heart_never_played_fetches_no_stand_in_and_keeps_what_nothing_contradicts() {
+    let rig = gate_rig(GateSetup {
+        music_brainz: false,
+        require_exact_heart_verification: false,
+        ..Default::default()
+    })
+    .await;
+    rig.shim_streams(VIDEO, sound_bytes("stand-in", "stand-in-master", "stand-in"))
+        .await;
+    let id = rig.rig.registry.register(help(Some(139), None));
+
+    let built = build(&rig, &id, None).await;
+    assert_eq!(waits(&built), None, "a permissive heart waits for nothing");
+    let gate = gate_of(built);
+    assert!(gate.stand_in.is_none(), "no stand-in is fetched for it");
+    assert_eq!(rig.streams_of(VIDEO).await, 0, "the shim was never asked");
+    assert_eq!(gate.reading, HeardReading::NotHeard);
+    let r = gate.r.clone().expect("the catalog's names are its R");
+    assert!(r.ids.is_empty(), "no recording is claimed for it");
+    assert_eq!((r.artist.as_str(), r.title.as_str()), ("The Beatles", "Help!"));
+
+    // A file AcoustID knows nothing of, as long as the song, is kept as heard.
+    let path = rig.dir.path().join("unplaceable.flac");
+    sound_flac(
+        &path,
+        139,
+        &sound_bytes("unplaceable", "unplaceable-master", "nothing"),
+        None,
+    );
+    rig.answers.answer("nothing", &answer(&[]));
+    let check = rig.service.verify_for_heart(&path, &candidate(&id), &gate).await;
+    assert_eq!(
+        check.verdict,
+        GateVerdict::Accept {
+            by: Acceptance::Unconfirmed,
+            tags: TagClaim::AsHeard,
+        }
+    );
+    // It carries no recording of its own: nothing proved one.
+    let kept = DownloadVerificationService::kept_verification(&check, &gate);
+    assert!(
+        matches!(kept.proof, RecordingProof::AsHeard { .. }),
+        "kept as heard, its version unproven: {:?}",
+        kept.proof
+    );
+}
+
+/// The same heart with exact verification on, as an install starts: YouTube is asked for the song's
+/// stand-in, and a stand-in whose answer fits nothing holds the heart instead of keeping a file.
+#[tokio::test]
+async fn a_strict_heart_never_played_still_asks_youtube() {
+    let rig = gate_rig(GateSetup {
+        music_brainz: false,
+        ..Default::default()
+    })
+    .await;
+    rig.shim_streams(VIDEO, sound_bytes("stand-in", "stand-in-master", "stand-in"))
+        .await;
+    rig.answers.answer(
+        "stand-in",
+        &answer(&[(
+            "another-recording",
+            "Something Else",
+            "Someone",
+            300,
+            40,
+            "GBAYE0601499",
+        )]),
+    );
+    let id = rig.rig.registry.register(help(Some(139), None));
+
+    let built = build(&rig, &id, None).await;
+    assert_eq!(rig.streams_of(VIDEO).await, 1, "the stand-in was fetched");
+    assert_eq!(
+        waits(&built).map(|(waiting_for, _)| waiting_for),
+        Some(WaitingFor::NotYetProven),
+        "a stand-in fitting nothing holds the heart until a play"
+    );
+}
