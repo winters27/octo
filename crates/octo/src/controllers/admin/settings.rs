@@ -272,6 +272,10 @@ pub fn effective_document(state: &AppState, raw_config: bool) -> JsonObject {
             ("DownloadTimeoutSeconds", n_num(soulseek.download_timeout_seconds)),
             ("VerifyDownloads", Node::Bool(soulseek.verify_downloads)),
             (
+                "RequireExactHeartVerification",
+                Node::Bool(soulseek.require_exact_heart_verification),
+            ),
+            (
                 "SkipCoversAndInstrumentals",
                 Node::Bool(soulseek.skip_covers_and_instrumentals),
             ),

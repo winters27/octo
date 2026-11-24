@@ -12,6 +12,7 @@ use crate::common::{SongIdentity, SongMatchOptions, SongTitle};
 use crate::fingerprint::acoust_id_client::{AcoustIdAnswer, AcoustIdOutcome, AnswerRecording};
 use crate::fingerprint::clip_check;
 use crate::fingerprint::heart_release::MOST_HEARD_RECORDINGS;
+use crate::fingerprint::track_match_comparer::TrackMatchComparer;
 use crate::fingerprint::verification::{
     AnswerReading, MIN_SHARE, MIN_SOURCES_TO_CONFIRM, Reading, SongName, WeighedRecording,
     believed_other_song, is_same_song, length_fits, one_recording, r_song, read_answer, same_song,
@@ -83,6 +84,33 @@ impl AcquisitionOrigin {
             Self::Replacement => "Replacement",
             Self::SongFinderPick => "SongFinderPick",
         }
+    }
+}
+
+/// Whether a heart's file must be proven to be the very recording heard or chosen, or may be kept
+/// when nothing proves it another song or another version of this one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HeartVerification {
+    /// Nothing lands that a proof did not pass: the shipped behaviour, and the default.
+    #[default]
+    Strict,
+    /// A file lands when nothing that was read says it is another song or another version of the
+    /// song, even when no proof names its recording. It lands as heard: no recording id, ISRC or
+    /// MusicBrainz recording id is claimed for it, and its row says the version is not proven.
+    /// Heart and AlbumHeart only; a play's file is judged strictly whatever this says.
+    Permissive,
+}
+
+impl HeartVerification {
+    /// The policy a setting asks for: requiring exact verification is [`Self::Strict`], the
+    /// default; only the person turning that off asks for [`Self::Permissive`].
+    pub fn from_requiring(exact: bool) -> Self {
+        if exact { Self::Strict } else { Self::Permissive }
+    }
+
+    /// Whether a file nothing proved may be kept anyway.
+    pub fn permits_unproven(self) -> bool {
+        self == Self::Permissive
     }
 }
 
@@ -389,6 +417,9 @@ pub struct HeartGate {
 pub enum Acceptance {
     /// The very audio that played, by identity.
     HeardAudio,
+    /// Nothing about the file contradicts the song, and nothing proved which recording it is: kept
+    /// as heard under a permissive heart, claiming no recording of its own.
+    Unconfirmed,
     /// AcoustID's clear reading alone.
     Sound,
     /// The master that played, window by window, both ways.
@@ -844,6 +875,123 @@ pub fn import_judgement(reading: &AnswerReading, facts: &FileFacts, r: &HeardRec
 }
 
 impl HeartGate {
+    /// Judges one downloaded file strictly: nothing lands that a proof did not pass.
+    pub fn judge(&self, facts: &FileFacts, min_score: f64) -> Judgement {
+        self.judge_exact(facts, min_score)
+    }
+
+    /// [`Self::judge`] under a verification policy.
+    ///
+    /// [`HeartVerification::Strict`] is exactly [`Self::judge`]. [`HeartVerification::Permissive`],
+    /// for a heart's or a hearted album's track's own gate only, keeps a file as
+    /// [`Acceptance::Unconfirmed`] with [`TagClaim::AsHeard`] whenever the exact rule would hold it,
+    /// leave it undecided, or refuse it for want of an answer (an AcoustID entry it has none of, a
+    /// fingerprint nothing links, a label whose question went unanswered) and nothing the gate did
+    /// read contradicts the song ([`Self::contradicted`]). Proof 2's distance, audio that cannot be
+    /// decoded, a sound or a label naming another song, a name carrying another version, a length
+    /// that is not the song's, an advisory tag that says the other words, and a title tag naming
+    /// another song are all still refusals. A question still being asked is asked: the exact
+    /// rule's [`Judgement::Needs`] is never pre-empted.
+    pub fn judge_with(
+        &self,
+        facts: &FileFacts,
+        min_score: f64,
+        verification: HeartVerification,
+    ) -> Judgement {
+        let exact = self.judge_exact(facts, min_score);
+        if !verification.permits_unproven() || !self.keeps_unproven() {
+            return exact;
+        }
+        let Judgement::Verdict(verdict) = &exact else {
+            return exact;
+        };
+        if matches!(verdict, GateVerdict::Accept { .. }) || self.contradicted(facts, min_score) {
+            return exact;
+        }
+        accept(Acceptance::Unconfirmed, TagClaim::AsHeard)
+    }
+
+    /// Whether this gate's unproven files may be kept as heard: a heart's, or a hearted album's
+    /// track's, never a play's.
+    pub fn keeps_unproven(&self) -> bool {
+        matches!(
+            self.origin,
+            AcquisitionOrigin::Heart | AcquisitionOrigin::AlbumHeart
+        )
+    }
+
+    /// Whether something the gate read says the file is not the song: proof 2's distance from what
+    /// played, audio that cannot be decoded, a sound or a label naming another song, a name carrying
+    /// another version (a live take, a remix, an edit, an instrumental), a length outside the
+    /// shipped duration tolerance ([`length_fits`]), an advisory tag that says the other words, or a
+    /// title tag naming another song ([`TrackMatchComparer::title_matches`], which never refuses a
+    /// missing title or a remaster's tidying).
+    ///
+    /// Absence of an answer contradicts nothing: a question still being asked, an AcoustID that
+    /// knows nothing of the file, a file with no names of its own, and a length either side does
+    /// not know.
+    pub fn contradicted(&self, facts: &FileFacts, min_score: f64) -> bool {
+        if self.proof_two_applies()
+            && facts
+                .heard_distance
+                .is_some_and(|distance| distance > clip_check::MATCH_AT_MOST)
+        {
+            return true;
+        }
+        if matches!(facts.answer, AcoustIdOutcome::Unreadable { .. }) {
+            return true;
+        }
+        let catalog = self.r.clone().unwrap_or_default();
+        let (reading, r) = match &facts.answer {
+            AcoustIdOutcome::Answered(answer) => match file_reading(answer, &catalog, facts, min_score) {
+                Ok((reading, r)) => (Some(reading), r),
+                // A question the gate has not been answered yet says nothing of the file.
+                Err(_) => (None, catalog),
+            },
+            _ => (None, catalog),
+        };
+        if !self.same_duration(facts.seconds) {
+            return true;
+        }
+        if advisory_opposes(r.explicit, facts.advisory) {
+            return true;
+        }
+        // The album tag describes the release, not the take: a live album's file is not another
+        // version of its track for saying where it was recorded.
+        let names = FileNames {
+            album: None,
+            ..facts.names.clone()
+        };
+        if names_another_version(&names, &r) || !names_the_song(&facts.names, &r) {
+            return true;
+        }
+        let Some(reading) = &reading else {
+            return false;
+        };
+        if label_findings(Some(reading), facts, &r)
+            .iter()
+            .any(|finding| matches!(finding, LabelCheck::NamesAnother { other_song: true }))
+        {
+            return true;
+        }
+        reading.reading == Reading::Another
+            && reading
+                .dominant()
+                .is_some_and(|dominant| !same_song(reading, &r, dominant))
+    }
+
+    /// Whether a file of `seconds` is as long as the song, when both lengths are known: the shipped
+    /// duration tolerance. Unknown lengths contradict nothing.
+    fn same_duration(&self, seconds: Option<f64>) -> bool {
+        match (
+            seconds.filter(|seconds| *seconds > 0.0),
+            self.heard_seconds.filter(|seconds| *seconds > 0),
+        ) {
+            (Some(file), Some(song)) => length_fits(file, f64::from(song)),
+            _ => true,
+        }
+    }
+
     /// Judges one downloaded file, or names the next fact it needs before it can. The first match
     /// wins:
     ///
@@ -871,7 +1019,7 @@ impl HeartGate {
     /// Before the file's reading names another recording, a dominant recording of R's song
     /// outside R is asked of MusicBrainz, since AcoustID never follows MusicBrainz's merges.
     /// Undecided keeps the heard copy when something was heard, else holds "not yet proven".
-    pub fn judge(&self, facts: &FileFacts, min_score: f64) -> Judgement {
+    pub fn judge_exact(&self, facts: &FileFacts, min_score: f64) -> Judgement {
         let catalog = self.r.clone().unwrap_or_default();
         if self.proof_two_applies()
             && facts
@@ -1186,6 +1334,24 @@ fn advisory_opposes(song: Option<i32>, advisory: Option<i32>) -> bool {
         (Some(explicit_status::EXPLICIT), Some(ADVISORY_CLEAN))
             | (Some(explicit_status::CLEAN), Some(ADVISORY_EXPLICIT))
     )
+}
+
+/// Whether a file's own title tag names the song, when it carries one: [`TrackMatchComparer`]'s
+/// reading, which passes a missing title on either side and a remaster's tidying, and never passes
+/// an unasked-for take. A file with no title tag, and a song whose title is unknown, say nothing.
+fn names_the_song(names: &FileNames, r: &HeardRecording) -> bool {
+    let Some(title) = names
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    else {
+        return true;
+    };
+    if r.title.trim().is_empty() {
+        return true;
+    }
+    TrackMatchComparer::title_matches(&r.title, title)
 }
 
 /// Whether a file's own names add a version the heard title (R's) does not carry: live,

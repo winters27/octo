@@ -182,6 +182,202 @@ fn verdict_of(gate: &HeartGate, facts: FileFacts, master: Option<HeardMaster>) -
     settle(gate, facts, master).0
 }
 
+/// [`settle`] under a verification policy: the same questions answered, the verdict judged with the
+/// policy the person's setting asks for.
+fn settle_with(
+    gate: &HeartGate,
+    mut facts: FileFacts,
+    master: Option<HeardMaster>,
+    verification: HeartVerification,
+) -> (GateVerdict, Vec<Need>) {
+    let mut asked = Vec::new();
+    for _ in 0..8 {
+        match gate.judge_with(&facts, MATCH_SCORE, verification) {
+            Judgement::Verdict(verdict) => return (verdict, asked),
+            Judgement::Needs(need) => {
+                asked.push(need.clone());
+                match need {
+                    Need::HeardMaster => {
+                        facts.heard_master = Some(master.expect("the heard master was asked for"));
+                    }
+                    Need::CurrentRecording(id) => {
+                        facts
+                            .current_recordings
+                            .push((id.clone(), MusicBrainzFact::Known(id)));
+                    }
+                    Need::IsrcRecordings(code) => panic!("ISRC {code} asked of MusicBrainz"),
+                }
+            }
+        }
+    }
+    panic!("the gate kept asking: {asked:?}");
+}
+
+fn verdict_under(gate: &HeartGate, facts: FileFacts, verification: HeartVerification) -> GateVerdict {
+    settle_with(gate, facts, None, verification).0
+}
+
+const PERMISSIVE: HeartVerification = HeartVerification::Permissive;
+const STRICT: HeartVerification = HeartVerification::Strict;
+
+/// An answer AcoustID can give a file that is this song's, in a version its reading cannot place
+/// against the catalog's recording.
+fn unplaceable() -> AcoustIdOutcome {
+    answered(Vec::new())
+}
+
+/// A file the gate read as this song in a version it cannot tell apart: the strict rule leaves it
+/// "not yet proven", the permissive one keeps it as heard.
+#[test]
+fn a_permissive_heart_keeps_what_no_proof_settles() {
+    let gate = never_played();
+    let strict = verdict_under(&gate, facts(unplaceable()), STRICT);
+    assert!(!matches!(strict, GateVerdict::Accept { .. }), "{strict:?}");
+    assert_eq!(
+        verdict_under(&gate, facts(unplaceable()), PERMISSIVE),
+        as_heard(Acceptance::Unconfirmed)
+    );
+}
+
+/// A heart never played whose sound reads as the song but not as its recording: strict holds it,
+/// permissive keeps it, and neither claims a recording the sound did not prove.
+#[test]
+fn a_permissive_heart_keeps_an_ambiguous_reading_as_heard() {
+    let gate = never_played();
+    let ambiguous = answered(clustered());
+    let strict = verdict_under(&gate, facts(ambiguous.clone()), STRICT);
+    assert!(!matches!(strict, GateVerdict::Accept { .. }), "{strict:?}");
+    let permissive = verdict_under(&gate, facts(ambiguous), PERMISSIVE);
+    assert_eq!(permissive, as_heard(Acceptance::Unconfirmed));
+}
+
+/// What the sound proves, both policies keep for the recording it proved.
+#[test]
+fn a_permissive_heart_keeps_a_proven_recording_for_what_it_proved() {
+    let gate = never_played();
+    let clear = facts(answered(clear()));
+    let strict = verdict_under(&gate, clear.clone(), STRICT);
+    assert!(matches!(
+        strict,
+        GateVerdict::Accept {
+            by: Acceptance::Sound,
+            ..
+        }
+    ));
+    assert_eq!(verdict_under(&gate, clear, PERMISSIVE), strict);
+}
+
+/// Another song's sound is refused whatever the setting says: a permissive heart keeps what nothing
+/// contradicts, and another song is a contradiction.
+#[test]
+fn a_permissive_heart_refuses_another_song() {
+    let gate = r_stays();
+    let other = facts(answered(vec![wonderwall(12)]));
+    let strict = verdict_under(&gate, other.clone(), STRICT);
+    assert!(!matches!(strict, GateVerdict::Accept { .. }), "{strict:?}");
+    assert_eq!(verdict_under(&gate, other, PERMISSIVE), strict);
+}
+
+/// A name that carries a version the song does not is refused under both policies: a live take is
+/// not the take the person hearted.
+#[test]
+fn a_permissive_heart_refuses_a_live_take_by_its_name() {
+    let gate = never_played();
+    let mut live = facts(unplaceable());
+    live.names = FileNames {
+        title: Some("Help! (Live at Shea)".into()),
+        ..Default::default()
+    };
+    let strict = verdict_under(&gate, live.clone(), STRICT);
+    assert!(!matches!(strict, GateVerdict::Accept { .. }), "{strict:?}");
+    let permissive = verdict_under(&gate, live, PERMISSIVE);
+    assert!(
+        !matches!(permissive, GateVerdict::Accept { .. }),
+        "{permissive:?}"
+    );
+}
+
+/// A file that names another song than the hearted one is refused under both policies.
+#[test]
+fn a_permissive_heart_refuses_a_file_naming_another_song() {
+    let gate = never_played();
+    let mut other = facts(unplaceable());
+    other.names = FileNames {
+        title: Some("Wonderwall".into()),
+        ..Default::default()
+    };
+    let permissive = verdict_under(&gate, other, PERMISSIVE);
+    assert!(
+        !matches!(permissive, GateVerdict::Accept { .. }),
+        "{permissive:?}"
+    );
+}
+
+/// A length far from the song's is refused under both policies, when both lengths are known.
+#[test]
+fn a_permissive_heart_refuses_a_length_far_from_the_songs() {
+    let gate = never_played();
+    let mut long = facts(unplaceable());
+    long.seconds = Some(400.0);
+    let permissive = verdict_under(&gate, long, PERMISSIVE);
+    assert!(
+        !matches!(permissive, GateVerdict::Accept { .. }),
+        "{permissive:?}"
+    );
+    let mut fitting = facts(unplaceable());
+    fitting.seconds = Some(140.0);
+    assert_eq!(
+        verdict_under(&gate, fitting, PERMISSIVE),
+        as_heard(Acceptance::Unconfirmed)
+    );
+}
+
+/// A file AcoustID could not decode is refused under both policies.
+#[test]
+fn a_permissive_heart_refuses_audio_it_cannot_decode() {
+    let gate = never_played();
+    let unreadable = facts(AcoustIdOutcome::Unreadable { code: Some(3) });
+    let permissive = verdict_under(&gate, unreadable, PERMISSIVE);
+    assert!(
+        !matches!(permissive, GateVerdict::Accept { .. }),
+        "{permissive:?}"
+    );
+}
+
+/// A play's file is held to the proof whatever the setting says: only a heart's and a hearted
+/// album's track's files may be kept unproven.
+#[test]
+fn a_permissive_setting_never_loosens_a_play() {
+    let gate = HeartGate {
+        origin: AcquisitionOrigin::Play,
+        ..never_played()
+    };
+    let strict = verdict_under(&gate, facts(unplaceable()), STRICT);
+    assert!(!matches!(strict, GateVerdict::Accept { .. }), "{strict:?}");
+    assert_eq!(verdict_under(&gate, facts(unplaceable()), PERMISSIVE), strict);
+}
+
+/// A fact the gate still has to ask for is asked, never pre-empted by the policy: the answer may
+/// prove the recording, and a proof is always better than a file kept as heard.
+#[test]
+fn a_permissive_heart_still_asks_its_questions() {
+    let gate = r_stays();
+    let file = facts(answered(clear()));
+    let (verdict, asked) = settle_with(&gate, file, Some(HeardMaster::Same), PERMISSIVE);
+    assert!(asked.contains(&Need::HeardMaster), "{asked:?}");
+    assert!(matches!(verdict, GateVerdict::Accept { .. }), "{verdict:?}");
+}
+
+/// The setting's word is read one way only: requiring the proof is strict, and only turning that
+/// off is permissive.
+#[test]
+fn the_policy_follows_the_setting() {
+    assert_eq!(HeartVerification::from_requiring(true), STRICT);
+    assert_eq!(HeartVerification::from_requiring(false), PERMISSIVE);
+    assert!(!STRICT.permits_unproven());
+    assert!(PERMISSIVE.permits_unproven());
+}
+
 #[test]
 fn the_heard_answer_reads_in_branch_order() {
     let r = help_r();
