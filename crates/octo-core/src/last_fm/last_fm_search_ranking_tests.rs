@@ -281,11 +281,12 @@ fn a_query_naming_a_version_keeps_the_version_asked_for() {
         ],
     );
 
+    // The take the query names goes first: it is the only row that holds every word.
     assert_eq!(
         rows,
         pairs(&[
-            ("Taylor Swift", "Love Story"),
             ("Taylor Swift", "Love Story (Taylor's Version)"),
+            ("Taylor Swift", "Love Story"),
             ("Taylor Swift", "Love Story - Live"),
         ])
     );
@@ -302,12 +303,83 @@ fn a_version_whose_marker_shares_a_word_with_the_query_keeps_its_row() {
         ],
     );
 
-    // The marker the query names stays; one it does not is still folded away.
+    // The marker the query names stays, and first, since it holds the query's last word; one
+    // the query does not name is still folded away.
     assert_eq!(
         rows,
         pairs(&[
-            ("Taylor Swift", "Love Story"),
             ("Taylor Swift", "Love Story (Taylor's Version)"),
+            ("Taylor Swift", "Love Story"),
         ])
     );
+}
+
+#[test]
+fn a_title_and_artist_typed_together_put_that_artists_song_first() {
+    // Every "After the Storm" track.search finds for the query, the better-known ones first.
+    // Ordered by listeners alone, Kali Uchis's song was under all of them.
+    let rows = rank(
+        "after the storm kali uchis",
+        vec![
+            t("Mumford & Sons", "After the Storm", Some(900_000)),
+            t("Bethel Music", "After the Storm", Some(300_000)),
+            t("Aaron Smith", "After The Storm", Some(120_000)),
+            t(
+                "Kali Uchis",
+                "After The Storm (feat. Tyler, The Creator & Bootsy Collins)",
+                Some(80_000),
+            ),
+            t("Kali Uchis", "Telepatía", Some(1_500_000)),
+        ],
+    );
+
+    assert_eq!(
+        rows,
+        pairs(&[
+            (
+                "Kali Uchis",
+                "After The Storm (feat. Tyler, The Creator & Bootsy Collins)"
+            ),
+            ("Mumford & Sons", "After the Storm"),
+            ("Bethel Music", "After the Storm"),
+            ("Aaron Smith", "After The Storm"),
+            ("Kali Uchis", "Telepatía"),
+        ])
+    );
+}
+
+#[test]
+fn a_whole_title_named_goes_before_longer_titles_that_hold_it() {
+    let rows = rank(
+        "stay",
+        vec![
+            t("Sam Smith", "Stay With Me", Some(2_500_000)),
+            t("The Kid LAROI", "Stay", Some(1_800_000)),
+            t("Rihanna", "Stay", Some(1_600_000)),
+        ],
+    );
+
+    assert_eq!(
+        rows,
+        pairs(&[
+            ("The Kid LAROI", "Stay"),
+            ("Rihanna", "Stay"),
+            ("Sam Smith", "Stay With Me"),
+        ])
+    );
+}
+
+#[test]
+fn a_misspelt_word_leaves_the_rest_of_the_query_to_decide() {
+    // No row holds "deap"; the rows that hold the other words still go first.
+    let rows = rank(
+        "rolling in the deap adele",
+        vec![
+            t("Adele", "Skyfall", Some(1_430_000)),
+            t("Aretha Franklin", "Rolling in the Deep", Some(200_000)),
+            t("Adele", "Rolling in the Deep", Some(2_680_000)),
+        ],
+    );
+
+    assert_eq!(rows[0], ("Adele".to_string(), "Rolling in the Deep".to_string()));
 }
