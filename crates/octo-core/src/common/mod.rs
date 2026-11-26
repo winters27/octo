@@ -18,6 +18,7 @@ pub mod octo_user_agent;
 pub mod path_helper;
 pub mod playlist_id_helper;
 pub mod romanize;
+pub mod search_match;
 pub mod single_flight;
 pub mod skipped_takes;
 pub mod song_identity;
@@ -31,6 +32,7 @@ pub use clock::Clock;
 pub use error::{Error, ErrorType};
 pub use layout::{Layout, LayoutKind, LayoutValues, RenderedName, TagSnapshot};
 pub use path_helper::{AlbumHook, PathHelper, SettleHooks, Settled};
+pub use search_match::SearchMatch;
 pub use single_flight::SingleFlight;
 pub use song_identity::{
     ArtistAgreement, Lookup, SongArtists, SongIdentity, SongMatch, SongMatchOptions, SongQuery, SongRef,

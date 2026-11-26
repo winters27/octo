@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use octo_core::common::dotnet::{self, ordinal_ignore_case_key};
-use octo_core::common::{SongIdentity, SupersedableBuildCoordinator, skipped_takes};
+use octo_core::common::{SearchMatch, SongIdentity, SupersedableBuildCoordinator, skipped_takes};
 use octo_core::last_fm::SimilarTrack;
 use octo_core::last_fm::last_fm_search_cleanup::LastFmSearchCleanup;
 use octo_core::last_fm::last_fm_search_ranking::LastFmSearchRanking;
@@ -364,12 +364,14 @@ struct BuildShared {
 
 /// Fans out to Last.fm, then fills in the metadata a client needs to render and play
 /// the rows. Order:
-///   1. track.search hits for the query as typed, most listened first
+///   1. track.search hits for the query as typed, the best match for its words first and the
+///      most listened first among equal matches (see `LastFmSearchRanking`)
 ///   2. canonical artist's top tracks (in case (1) was thin: common for
 ///      single-word artist queries)
 ///
 /// When Last.fm has not answered within `last_fm_wait`, the rows are Deezer's own track search
-/// for the query instead, in Deezer's order, and Last.fm's answer is kept for the next search
+/// for the query instead, the best match for its words first and in Deezer's order among equal
+/// matches (see `SearchMatch`), and Last.fm's answer is kept for the next search
 /// of the same words.
 ///
 /// Deduped by `SongIdentity::match_key`, so the same track cannot appear twice however its
@@ -536,7 +538,12 @@ async fn song_rows(
                     recent.remove(&key);
                 }
             });
-            (deduped(rows.into_iter()), SongSource::Deezer)
+            // Deezer's relevance can still put a better-known song that only shares the title
+            // ahead of the one by the artist the query names.
+            (
+                deduped(SearchMatch::order_rows(query, rows).into_iter()),
+                SongSource::Deezer,
+            )
         }
         _ => (
             last_fm_rows(query, &answer.await.unwrap_or_default(), last_fm).await,
